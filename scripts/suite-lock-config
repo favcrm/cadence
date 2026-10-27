@@ -1,0 +1,22 @@
+# Shared configuration for shell runners; acquisition stays with the caller.
+# Ordinary shell variables are returned so the wait setting need not reach tests.
+suite_lock_config() {
+    SUITE_LOCK_PATH=${CADENCE_SUITE_LOCK:-}
+    case $SUITE_LOCK_PATH in
+        /*) ;;
+        *)
+            echo "suite-lock: requires CADENCE_SUITE_LOCK to name an absolute shared lock path" >&2
+            return 1 ;;
+    esac
+
+    SUITE_LOCK_WAIT_SECS=${CADENCE_SUITE_LOCK_WAIT_SECS-3600}
+    case $SUITE_LOCK_WAIT_SECS in
+        ''|*[!0-9]*)
+            echo "suite-lock: CADENCE_SUITE_LOCK_WAIT_SECS must be whole seconds from 0 to 86400" >&2
+            return 1 ;;
+    esac
+    if ! [ "$SUITE_LOCK_WAIT_SECS" -le 86400 ] 2>/dev/null; then
+        echo "suite-lock: CADENCE_SUITE_LOCK_WAIT_SECS must be whole seconds from 0 to 86400" >&2
+        return 1
+    fi
+}

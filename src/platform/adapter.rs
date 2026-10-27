@@ -89,11 +89,168 @@ impl std::fmt::Display for AppCapabilityError {
 
 impl std::error::Error for AppCapabilityError {}
 
+/// CAD-1315: why a standalone image job did not produce a retained image.
+/// The code is the ONLY thing recorded on the intent: a fixed allow-list, no
+/// provider text, URL or secret. Classified at the failing site by type,
+/// never from message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageReason {
+    NotApproved,
+    PlanInvalid,
+    MediaDisabled,
+    NotAuthorized,
+    InsufficientFunds,
+    SubmitRefused,
+    SubmitError,
+    ProviderBusy,
+    PollTimeout,
+    ProviderUncertain,
+    JobMalformed,
+    JobFailed,
+    PriceChanged,
+    ArtifactUnavailable,
+    ArtifactMismatch,
+    ArtifactTooLarge,
+    UnsupportedImage,
+    NotSquare,
+    DecodeFailed,
+}
+
+/// How a worker settles a failed attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageSettle {
+    /// Transient: the same idempotency key is retried with backoff until the
+    /// job deadline, then the intent settles `uncertain`.
+    Retry,
+    /// The job may still hold funds or be running: `uncertain`. Only a
+    /// re-check of the SAME key may move it; a new key is never minted.
+    Unresolved,
+    /// The job is over with no usable image (or never ran): terminal.
+    Terminal,
+}
+
+impl ImageReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NotApproved => "not_approved",
+            Self::PlanInvalid => "plan_invalid",
+            Self::MediaDisabled => "media_disabled",
+            Self::NotAuthorized => "not_authorized",
+            Self::InsufficientFunds => "insufficient_funds",
+            Self::SubmitRefused => "submit_refused",
+            Self::SubmitError => "submit_error",
+            Self::ProviderBusy => "provider_busy",
+            Self::PollTimeout => "poll_timeout",
+            Self::ProviderUncertain => "provider_uncertain",
+            Self::JobMalformed => "job_malformed",
+            Self::JobFailed => "job_failed",
+            Self::PriceChanged => "price_changed",
+            Self::ArtifactUnavailable => "artifact_unavailable",
+            Self::ArtifactMismatch => "artifact_mismatch",
+            Self::ArtifactTooLarge => "artifact_too_large",
+            Self::UnsupportedImage => "unsupported_image",
+            Self::NotSquare => "not_square",
+            Self::DecodeFailed => "decode_failed",
+        }
+    }
+
+    pub fn settle(self) -> ImageSettle {
+        match self {
+            Self::SubmitError
+            | Self::ProviderBusy
+            | Self::PollTimeout
+            | Self::ArtifactUnavailable => ImageSettle::Retry,
+            Self::ProviderUncertain | Self::JobMalformed | Self::ArtifactMismatch => {
+                ImageSettle::Unresolved
+            }
+            Self::NotApproved
+            | Self::PlanInvalid
+            | Self::MediaDisabled
+            | Self::NotAuthorized
+            | Self::InsufficientFunds
+            | Self::SubmitRefused
+            | Self::JobFailed
+            | Self::PriceChanged
+            | Self::ArtifactTooLarge
+            | Self::UnsupportedImage
+            | Self::NotSquare
+            | Self::DecodeFailed => ImageSettle::Terminal,
+        }
+    }
+}
+
+/// A typed image failure. `detail` is for logs and the run-bound path only;
+/// it never reaches an intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageFailure {
+    pub reason: ImageReason,
+    /// The provider confirmed (or the host proved) nothing executed.
+    pub not_executed: bool,
+    pub detail: String,
+}
+
+impl ImageFailure {
+    pub fn refused(reason: ImageReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            not_executed: true,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn uncertain(reason: ImageReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            not_executed: false,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl From<ImageFailure> for AppCapabilityError {
+    fn from(failure: ImageFailure) -> Self {
+        if failure.not_executed {
+            Self::Refused(failure.detail)
+        } else {
+            Self::Uncertain(failure.detail)
+        }
+    }
+}
+
 /// One platform's adapter — the proxy's outward leg.
 pub trait PlatformAdapter: Send + Sync {
     /// The adapter's declared tool table, reviewed like code and pinned
     /// to the manifest version it was reviewed against (§5.2).
     fn table(&self) -> &ToolTable;
+
+    /// Whether a plain `platform_call` can execute `tool`. Adapters whose
+    /// only execution path is a frozen app-run capability return `false`;
+    /// `platform tools` reports it so a listing never promises a call the
+    /// gate would refuse.
+    fn direct_call(&self, _tool: &str) -> bool {
+        true
+    }
+
+    /// Whether the adapter resolves its own account credential (the saved
+    /// `--web` login) instead of a custody-enrolled one.
+    fn credentialless(&self) -> bool {
+        false
+    }
+
+    /// Execute with the gate-authorized account available. Adapters whose
+    /// credential is selected by that account override this; everyone else
+    /// delegates to [`Self::execute`].
+    fn execute_for_account(
+        &self,
+        _account: &str,
+        credential: &[u8],
+        tool: &str,
+        input: &Value,
+        idempotency_key: &str,
+        expected_hash: Option<&str>,
+    ) -> std::result::Result<Value, String> {
+        self.execute(credential, tool, input, idempotency_key, expected_hash)
+    }
 
     /// Reviewed discovery metadata. Legacy adapters default unavailable.
     fn connection_descriptor(&self) -> Option<super::connections::ProviderDescriptor> {
@@ -133,8 +290,10 @@ pub trait PlatformAdapter: Send + Sync {
     /// call, not merely compare an earlier discovery response — unless the
     /// operator policy is pass-through pricing, in which case the provider
     /// bills at the upstream rate and records the actual charge in the
-    /// receipt. Either way the daemon's execution-time re-quote still refuses
-    /// a rate that changed since approval. The default refuses every provider.
+    /// receipt. CAD-1141: the daemon's execution-time re-quote accepts a
+    /// changed rate; `authority.quote` is that fresh quote. It still refuses a
+    /// provider without the charge precondition or a quote outside the
+    /// supported bound. The default refuses every provider.
     fn execute_app_capability(
         &self,
         _credential: &[u8],
@@ -160,6 +319,47 @@ pub trait PlatformAdapter: Send + Sync {
             .map_err(AppCapabilityError::Uncertain)
     }
 
+    /// CAD-1315: the standalone image job's typed execution. The default
+    /// maps the generic typed outcome conservatively; only the AgenticOS
+    /// adapter classifies real reasons.
+    fn execute_app_image(
+        &self,
+        credential: &[u8],
+        authority: &Value,
+        input: &Value,
+        idempotency_key: &str,
+    ) -> std::result::Result<super::AppCapabilityOutput, ImageFailure> {
+        self.execute_app_capability_outcome(credential, authority, input, idempotency_key)
+            .map_err(|error| match error {
+                AppCapabilityError::Refused(m) => {
+                    ImageFailure::refused(ImageReason::SubmitRefused, m)
+                }
+                AppCapabilityError::Uncertain(m) => {
+                    ImageFailure::uncertain(ImageReason::ProviderUncertain, m)
+                }
+            })
+    }
+
+    /// CAD-1365: retrieve the verified retained ORIGINAL bytes behind a
+    /// stored `original_artifact` provenance descriptor. `credential` is
+    /// the enrolled custody bytes (or the proven builtin lease's empty
+    /// bytes) and `config` the frozen binding config — the same authority
+    /// `execute_app_capability` runs under; `descriptor` is the trusted
+    /// stored `{ref, sha256, bytes, media_type}` receipt, never a raw
+    /// frame locator. Implementations fetch ONLY the recorded ref under
+    /// the recorded account — no submit, poll, billing, claim, enroll or
+    /// signed public URL — verify byte count, digest and image safety,
+    /// and return the exact verified `(media_type, bytes)`.
+    /// The default refuses every provider.
+    fn read_app_media_original(
+        &self,
+        _credential: &[u8],
+        _config: &Value,
+        _descriptor: &Value,
+    ) -> std::result::Result<(String, Vec<u8>), String> {
+        Err("provider does not support original media retrieval".into())
+    }
+
     /// Quote the exact reviewed mapping and credential account in a frozen
     /// binding. Providers without live price discovery remain unavailable.
     fn quote_app_capability(
@@ -168,6 +368,17 @@ pub trait PlatformAdapter: Send + Sync {
         _binding: &Value,
     ) -> std::result::Result<super::AppCapabilityQuote, String> {
         Err("provider does not support app capability price discovery".into())
+    }
+
+    /// Image-to-image rate for a reference edit. The default stays on the
+    /// text-to-image quote so a provider that has not reviewed the variant
+    /// cannot silently bill the wrong slug.
+    fn quote_reference_app_capability(
+        &self,
+        credential: &[u8],
+        binding: &Value,
+    ) -> std::result::Result<super::AppCapabilityQuote, String> {
+        self.quote_app_capability(credential, binding)
     }
 
     /// Translate trusted persisted text into the provider's exact input.
@@ -260,5 +471,40 @@ pub trait PlatformAdapter: Send + Sync {
     /// name format.
     fn implied_source(&self, _agent: &str, _tool: &str, _input: &Value) -> Option<String> {
         None
+    }
+}
+
+#[cfg(test)]
+mod image_reason_tests {
+    use super::{ImageReason as R, ImageSettle as S};
+
+    #[test]
+    fn image_failure_code_and_settlement_are_pure_reason_mappings() {
+        let cases = [
+            (R::SubmitError, "submit_error", S::Retry),
+            (R::ProviderBusy, "provider_busy", S::Retry),
+            (R::PollTimeout, "poll_timeout", S::Retry),
+            (R::ArtifactUnavailable, "artifact_unavailable", S::Retry),
+            (R::ProviderUncertain, "provider_uncertain", S::Unresolved),
+            (R::JobMalformed, "job_malformed", S::Unresolved),
+            (R::ArtifactMismatch, "artifact_mismatch", S::Unresolved),
+            (R::NotApproved, "not_approved", S::Terminal),
+            (R::PlanInvalid, "plan_invalid", S::Terminal),
+            (R::MediaDisabled, "media_disabled", S::Terminal),
+            (R::NotAuthorized, "not_authorized", S::Terminal),
+            (R::InsufficientFunds, "insufficient_funds", S::Terminal),
+            (R::SubmitRefused, "submit_refused", S::Terminal),
+            (R::JobFailed, "job_failed", S::Terminal),
+            (R::PriceChanged, "price_changed", S::Terminal),
+            (R::ArtifactTooLarge, "artifact_too_large", S::Terminal),
+            (R::UnsupportedImage, "unsupported_image", S::Terminal),
+            (R::NotSquare, "not_square", S::Terminal),
+            (R::DecodeFailed, "decode_failed", S::Terminal),
+        ];
+
+        for (reason, expected_code, expected_settle) in cases {
+            assert_eq!(reason.code(), expected_code, "{reason:?}");
+            assert_eq!(reason.settle(), expected_settle, "{reason:?}");
+        }
     }
 }

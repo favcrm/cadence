@@ -12,6 +12,61 @@ fn scoped_live_count_uses_only_visible_rows() {
 }
 
 #[test]
+fn placement_filter_recomputes_live_and_footer_counts() {
+    let mut view = json!({"agents": [
+        {"alias": "a", "provider": "pi", "endpoint_kind": "managed", "state": "busy", "dead": false},
+        {"alias": "b", "provider": "devin", "endpoint_kind": "cloud", "state": "idle", "dead": false}
+    ], "live": 2, "footer": {"live": 2}});
+    retain_by_placement(&mut view, registry::Placement::Cloud);
+    assert_eq!(view["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(view["agents"][0]["alias"], "b");
+    assert_eq!(view["live"], json!(1));
+    assert_eq!(view["footer"]["live"], json!(1));
+}
+
+#[test]
+fn send_wait_refuses_flags_that_the_ask_path_cannot_carry() {
+    let cases: &[&[&str]] = &[
+        &["cadence", "send", "w", "--wait", "--priority", "urgent"],
+        &["cadence", "send", "w", "--wait", "--supersedes", "m1"],
+        &["cadence", "send", "w", "--wait", "--nudge"],
+    ];
+    for argv in cases {
+        let err = Cli::try_parse_from(argv.iter().copied())
+            .err()
+            .expect("must conflict");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{argv:?}"
+        );
+    }
+    assert!(Cli::try_parse_from(["cadence", "send", "w", "--wait"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "send", "w", "--wait", "30"]).is_ok());
+}
+
+#[test]
+fn send_wait_and_message_ask_accept_the_same_wait_values() {
+    for secs in ["0", "1", "600", "601"] {
+        assert!(
+            Cli::try_parse_from(["cadence", "send", "w", "--wait", secs]).is_ok(),
+            "send --wait {secs}"
+        );
+        assert!(
+            Cli::try_parse_from(["cadence", "message", "ask", "w", "--text", "hi", "--wait", secs])
+                .is_ok(),
+            "message ask --wait {secs}"
+        );
+    }
+}
+
+#[test]
+fn dispatch_parses_without_to_for_the_master_route() {
+    assert!(Cli::try_parse_from(["cadence", "dispatch", "CAD-1"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "dispatch", "CAD-1", "--to", "w"]).is_ok());
+}
+
+#[test]
 fn hosted_enrollment_cli_requires_explicit_trust_and_has_no_secret_argv() {
     let args = [
         "cadence",
@@ -49,7 +104,12 @@ fn hosted_enrollment_cli_requires_explicit_trust_and_has_no_secret_argv() {
 }
 
 #[test]
-fn remote_auth_cli_requires_explicit_issuer_org_and_never_accepts_token_argv() {
+fn remote_auth_cli_supports_hosted_portal_and_never_accepts_token_argv() {
+    assert!(Cli::try_parse_from(["cadence", "login"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "login", "fav-limited"]).is_ok());
+    assert!(
+        Cli::try_parse_from(["cadence", "login", "--issuer", "https://api.example.com"]).is_ok()
+    );
     assert!(Cli::try_parse_from([
         "cadence",
         "login",
@@ -60,10 +120,32 @@ fn remote_auth_cli_requires_explicit_issuer_org_and_never_accepts_token_argv() {
         "--token-stdin"
     ])
     .is_ok());
-    assert!(Cli::try_parse_from(["cadence", "login", "--token", "secret"]).is_err());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "login",
+        "--issuer",
+        "https://api.example.com",
+        "--token-stdin"
+    ])
+    .is_err());
     assert!(
-        Cli::try_parse_from(["cadence", "login", "--issuer", "https://api.example.com"]).is_err()
+        Cli::try_parse_from(["cadence", "login", "--org", "ws_test", "--token-stdin"]).is_err()
     );
+    assert!(Cli::try_parse_from(["cadence", "login", "--token", "secret"]).is_err());
+    assert!(Cli::try_parse_from(["cadence", "login", "--token-stdin"]).is_err());
+    assert!(Cli::try_parse_from(["cadence", "register"]).is_ok());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "register",
+        "--name",
+        "Acme Labs",
+        "--slug",
+        "acme-labs",
+        "--use",
+        "--no-open",
+        "--json"
+    ])
+    .is_ok());
     assert!(Cli::try_parse_from([
         "cadence",
         "auth",
@@ -108,8 +190,9 @@ fn cad314_backup_export_restore_parse() {
             source,
             repos,
             force,
+            ..
         } => {
-            assert_eq!(source, PathBuf::from("/tmp/b"));
+            assert_eq!(source, Some(PathBuf::from("/tmp/b")));
             assert_eq!(repos, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
             assert!(force);
         }
@@ -761,6 +844,63 @@ fn send_steering_flags_parse() {
 }
 
 #[test]
+fn message_list_parses_both_spellings_and_rejects_a_bad_filter() {
+    let cli = Cli::try_parse_from([
+        "cadence",
+        "message",
+        "ls",
+        "--to",
+        "worker",
+        "--state",
+        "queued,running",
+        "--limit",
+        "5",
+    ])
+    .unwrap();
+    match cli.command {
+        Commands::Message {
+            action: MessageAction::List {
+                to, state, limit, ..
+            },
+        } => {
+            assert_eq!(to.as_deref(), Some("worker"));
+            assert_eq!(state, ["queued", "running"]);
+            assert_eq!(limit, Some(5));
+        }
+        _ => panic!("expected message list"),
+    }
+    assert!(Cli::try_parse_from(["cadence", "message", "list", "worker"]).is_ok());
+    let missing = super::message::list_params(None, None, None, None, vec![], None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(missing.contains("recipient"), "{missing}");
+    let bad = super::message::list_params(
+        Some("worker".into()),
+        None,
+        None,
+        None,
+        vec!["nope".into()],
+        None,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(bad.contains("unknown"), "{bad}");
+    let wide = super::message::list_params(
+        Some("worker".into()),
+        None,
+        None,
+        None,
+        vec![],
+        Some(51),
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(wide.contains("1 to 50"), "{wide}");
+}
+
+#[test]
 fn message_cancel_parses() {
     let cli = Cli::try_parse_from([
         "cadence",
@@ -902,7 +1042,8 @@ fn agent_remove_and_gc_parse() {
         cli.command,
         Commands::Agent {
             action: AgentAction::Gc {
-                older_than: Some(d)
+                older_than: Some(d),
+                force: false,
             }
         } if d == "2d"
     ));
@@ -958,22 +1099,45 @@ fn agents_block_is_idempotent() {
     assert_eq!(text.matches(AGENTS_BEGIN).count(), 1);
 }
 
+/// CAD-1530: a block an earlier build wrote is repaired, because a
+/// repository carrying it verbatim never edited it. Anything else —
+/// including a block a repository did edit — is left exactly as found.
 #[test]
-fn skill_subcommands_parse() {
-    let cli = Cli::try_parse_from(["cadence", "skill", "install"]).unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Skill {
-            action: SkillAction::Install
-        }
-    ));
-    let cli = Cli::try_parse_from(["cadence", "skill", "status"]).unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Skill {
-            action: SkillAction::Status
-        }
-    ));
+fn agents_block_repairs_only_a_block_it_recognises_as_its_own() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("AGENTS.md");
+    let old = super::briefing::SUPERSEDED_AGENTS_BLOCKS[0];
+    let current = super::briefing::agents_block();
+    assert_ne!(old, current, "the superseded block is the current one");
+
+    // The known older block, with repository text on both sides.
+    std::fs::write(&path, format!("# My repo\n\n{old}\n## Notes\nafter\n")).unwrap();
+    ensure_agents_block(dir.path()).unwrap();
+    let repaired = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        repaired,
+        format!("# My repo\n\n{current}\n## Notes\nafter\n")
+    );
+
+    // Repairing is idempotent.
+    ensure_agents_block(dir.path()).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired);
+
+    // A block that is neither the current one nor a superseded one is an
+    // edit: markers present, and still nothing is touched.
+    let edited = repaired.replacen("and discover peers", "and also discover peers", 1);
+    std::fs::write(&path, &edited).unwrap();
+    ensure_agents_block(dir.path()).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+
+    // A begin marker with no end marker is not an invitation to append a
+    // second block: the file is left alone, as it was before CAD-1530.
+    // The review caught this — the first version of this change appended
+    // here, widening what cadence will write into someone else's repo.
+    let unclosed = "# My repo\n\n<!-- cadence:begin -->\nstray\n";
+    std::fs::write(&path, unclosed).unwrap();
+    ensure_agents_block(dir.path()).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), unclosed);
 }
 
 #[test]
@@ -1367,6 +1531,18 @@ fn cad800_single_id_sweep_flags_rejected() {
     assert!(Cli::try_parse_from(["cadence", "issue", "finish", "CAD-1"]).is_ok());
 }
 
+/// Piped list output is already JSON, so `--fields` and `--summary` do
+/// not require a redundant `--json` at parse time. Table mode still
+/// refuses them in the handler.
+#[test]
+fn list_fields_parse_without_an_explicit_json_flag() {
+    assert!(Cli::try_parse_from(["cadence", "issue", "ls", "--fields", "id"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "issue", "ls", "--summary"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "issue", "epic", "ls", "--fields", "id"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "milestone", "ls", "--fields", "id"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "memory", "ls", "--fields", "slug"]).is_ok());
+}
+
 /// CAD-879: `cadence self` asks the daemon for running turns only.
 #[test]
 fn cad879_self_requests_no_history() {
@@ -1385,10 +1561,11 @@ fn cad879_self_requests_no_history() {
 fn recovery_record_verdict_fails_closed_on_every_bad_shape() {
     use cadence_agent::daemon::{INSTANCE_FILE, LAST_RECOVERY_FILE};
     let dir = tempfile::tempdir().unwrap();
-    let verdict = |dir: &std::path::Path| super::recovery_record_verdict(dir, Some("run-b"));
+    let verdict =
+        |dir: &std::path::Path| super::daemon::recovery_record_verdict(dir, Some("run-b"));
 
     // No start answer at all cannot stand in for a binding.
-    assert!(super::recovery_record_verdict(dir.path(), None).is_some());
+    assert!(super::daemon::recovery_record_verdict(dir.path(), None).is_some());
     // No record at all — the predecessor's drain is unverifiable.
     assert!(verdict(dir.path()).is_some());
     // Unparseable JSON is evidence that never reached the writer.
@@ -1487,13 +1664,153 @@ fn recovery_record_verdict_fails_closed_on_every_bad_shape() {
 fn started_instance_binds_only_to_a_spawned_daemon() {
     let health = json!({"instance": "run-x", "pid": 7});
     assert_eq!(
-        super::started_instance(&json!({"state": "started", "health": health})),
+        super::daemon::started_instance(&json!({"state": "started", "health": health})),
         Some("run-x".to_string())
     );
     assert_eq!(
-        super::started_instance(&json!({"state": "already_running", "health": health})),
+        super::daemon::started_instance(&json!({"state": "already_running", "health": health})),
         None
     );
-    assert_eq!(super::started_instance(&json!({"health": health})), None);
-    assert_eq!(super::started_instance(&json!({"state": "started"})), None);
+    assert_eq!(
+        super::daemon::started_instance(&json!({"health": health})),
+        None
+    );
+    assert_eq!(
+        super::daemon::started_instance(&json!({"state": "started"})),
+        None
+    );
+}
+
+/// Every `"key":` token in `text`, tagged with the JSON nesting depth it
+/// sits at (1 is the outermost object).
+fn doc_keys(text: &str) -> Vec<(usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth = depth.saturating_sub(1),
+            '"' => {
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j] != '"' {
+                    j += 1;
+                }
+                let mut k = j + 1;
+                while k < chars.len() && chars[k] == ' ' {
+                    k += 1;
+                }
+                if k < chars.len() && chars[k] == ':' && depth > 0 {
+                    out.push((depth, chars[start..j].iter().collect::<String>()));
+                }
+                i = j;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The distinct keys a document records at one nesting depth.
+fn keys_at_depth(keys: &[(usize, String)], depth: usize) -> Vec<String> {
+    let mut v: Vec<String> = keys
+        .iter()
+        .filter(|(d, _)| *d == depth)
+        .map(|(_, k)| k.clone())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// The sorted keys of a payload object.
+fn payload_keys(value: &serde_json::Value) -> Vec<String> {
+    let mut v: Vec<String> = value
+        .as_object()
+        .expect("a payload object")
+        .keys()
+        .cloned()
+        .collect();
+    v.sort();
+    v
+}
+
+/// CAD-1514: the two `cadence self` shapes documented in
+/// `skills/cadence/SKILL.md` must be the shapes the CLI builds. The inbox
+/// half drifted once — it said `{"queued": N}` while the CLI emitted five
+/// keys — and nothing caught it (CAD-884). Re-wording either example out
+/// of recognition fails this test on purpose: the documents are the
+/// contract an agent reads.
+#[test]
+fn documented_self_payload_keys_match_the_builders() {
+    let doc = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/skills/cadence/SKILL.md"
+    ))
+    .expect("skills/cadence/SKILL.md");
+
+    let actor_line = doc
+        .lines()
+        .find(|l| l.contains("cadence self") && l.contains("\"running\""))
+        .expect("the actor `cadence self` example is gone from SKILL.md");
+    let inbox_span = doc
+        .split("answers `")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .filter(|s| s.contains("oldest_unread_age_secs"))
+        .expect("the inbox `cadence self` example is gone from SKILL.md");
+
+    let show = json!({
+        "agent": {"alias": "worker-a", "provider": "claude", "endpoint_kind": "pty"},
+        "queued": 3,
+        "inbox": {"queued": 2, "oldest_age_secs": 12.5},
+        "messages": [
+            {"id": "m1", "turn_id": "t1", "task_id": "job-a", "state": "running"},
+            {"id": "m2", "turn_id": "t2", "task_id": null, "state": "running"},
+            {"id": "m3", "turn_id": "t3", "task_id": null, "state": "done"}
+        ]
+    });
+
+    let actor = super::action_dispatch::self_actor_payload("worker-a", &show);
+    let actor_keys = doc_keys(actor_line);
+    assert_eq!(
+        keys_at_depth(&actor_keys, 1),
+        payload_keys(&actor),
+        "the documented actor keys and the built ones disagree"
+    );
+    assert_eq!(
+        keys_at_depth(&actor_keys, 3),
+        payload_keys(&actor["running"][0]),
+        "the documented running-entry keys and the built ones disagree"
+    );
+    assert_eq!(
+        actor["running"].as_array().map(Vec::len),
+        Some(2),
+        "only running turns belong in the actor payload"
+    );
+
+    let inbox = super::action_dispatch::self_inbox_payload(&show, "inbox");
+    assert_eq!(
+        keys_at_depth(&doc_keys(inbox_span), 1),
+        payload_keys(&inbox),
+        "the documented inbox keys and the built ones disagree"
+    );
+}
+
+#[test]
+fn duplicate_dispatch_names_the_existing_message_and_state() {
+    let duplicate = json!({
+        "duplicate": true,
+        "message": "cadence-dispatch:t1:r2",
+        "message_state": "running",
+    });
+    assert_eq!(
+        super::job::duplicate_dispatch_line(&duplicate).as_deref(),
+        Some("duplicate of cadence-dispatch:t1:r2 (state running)"),
+    );
+    let fresh = json!({"duplicate": false, "message": "cadence-dispatch:t1:r1"});
+    assert_eq!(super::job::duplicate_dispatch_line(&fresh), None);
 }

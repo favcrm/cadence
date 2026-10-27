@@ -25,13 +25,15 @@
 use std::net::TcpListener;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::client;
 use crate::error::{Error, Result};
+
+mod provider;
 
 /// The file that makes a directory a sandbox root. `reset` deletes
 /// nothing that lacks it.
@@ -49,7 +51,7 @@ const PORTS: std::ops::RangeInclusive<u16> = 3110..=3199;
 pub const ALLOW_GLOBAL_ENV: &str = "CADENCE_SANDBOX_ALLOW_GLOBAL";
 
 #[derive(Subcommand)]
-pub enum SandboxAction {
+pub enum DevAction {
     /// Create (or reuse) the dev Cadence and start its daemon and board:
     /// its own state dir, tracker and a free port in 3110-3199, plus a
     /// durable dev marker in the new store. Prints the paths, URL and
@@ -100,13 +102,84 @@ pub enum SandboxAction {
     /// List the sandboxes under the base with running status.
     #[command(visible_alias = "list")]
     Ls,
+    /// Point this sandbox at real AgenticOS and wire one app.
+    Agenticos {
+        #[command(subcommand)]
+        action: AgenticosAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AgenticosAction {
+    /// Write the sandbox provider profile and 0600 credentials.
+    ///
+    /// `--token-dir` must contain `send.token` (`publish.send`) and either
+    /// `provider.token` (`provider.read` + `provider.draft`) or
+    /// `read.token`; `draft.token` is optional and defaults to the read
+    /// credential.
+    Setup {
+        /// The dev Cadence [default: `CADENCE_PROFILE`, else `dev`].
+        #[arg(long)]
+        name: Option<String>,
+        /// AgenticOS API origin (no path).
+        #[arg(long, default_value = "https://api-v2.agenticos.hk")]
+        origin: String,
+        /// Exact company workspace account, `ws_<uuid>`.
+        #[arg(long)]
+        workspace: String,
+        /// Reviewed external-provider manifest pin.
+        #[arg(long, default_value = "agenticos-external-provider-tools@4")]
+        pin: String,
+        /// Directory holding provider.token (or read.token) and send.token.
+        #[arg(long)]
+        token_dir: PathBuf,
+    },
+    /// Install one app and bind its source/image/writer/publication slots.
+    Bind {
+        /// The dev Cadence [default: `CADENCE_PROFILE`, else `dev`].
+        #[arg(long)]
+        name: Option<String>,
+        /// App bundle root (`app.md` at the top level).
+        #[arg(long, default_value = "app")]
+        bundle: PathBuf,
+        /// Context label to create (or reuse).
+        #[arg(long, default_value = "Default")]
+        context: String,
+        /// Connected Instagram destination; the first live row when omitted.
+        #[arg(long)]
+        destination_id: Option<String>,
+        /// IANA timezone recorded on the publication binding.
+        #[arg(long, default_value = "UTC")]
+        timezone: String,
+        /// Do not set the publication destination or sender.
+        #[arg(long)]
+        no_publish: bool,
+    },
+    /// Approve every awaiting run and waiting effect for one installation.
+    ///
+    /// Sandbox-only: it refuses a state directory that is not a dev store.
+    /// Each approval uses the row's exact snapshot or effect digest.
+    Approve {
+        /// The dev Cadence [default: `CADENCE_PROFILE`, else `dev`].
+        #[arg(long)]
+        name: Option<String>,
+        /// Installation ID to clear.
+        #[arg(long)]
+        install_id: String,
+        /// Optional exact context.
+        #[arg(long)]
+        context_id: Option<String>,
+        /// List the candidates without approving.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// `cadence dev …`. `state_dir` is the store this shell points at; it
 /// names the default target of `reload`, `env`, `down` and `status`.
-pub fn run_cli(state_dir: &Path, action: &SandboxAction) -> Result<i32> {
+pub fn run_cli(state_dir: &Path, action: &DevAction) -> Result<i32> {
     let out = match action {
-        SandboxAction::Up {
+        DevAction::Up {
             name,
             name_flag,
             port,
@@ -118,14 +191,12 @@ pub fn run_cli(state_dir: &Path, action: &SandboxAction) -> Result<i32> {
                 .unwrap_or(DEFAULT_NAME);
             let exe = match build {
                 Some(path) => runnable(path)?,
-                None => std::env::current_exe()?,
+                None => running_exe()?,
             };
             up(&Sandbox::open(name)?, *port, &exe)?
         }
-        SandboxAction::Reload { name, build } => {
-            reload(state_dir, name.as_deref(), build.as_deref())?
-        }
-        SandboxAction::Env { name } => {
+        DevAction::Reload { name, build } => reload(state_dir, name.as_deref(), build.as_deref())?,
+        DevAction::Env { name } => {
             let sb = target(state_dir, name.as_deref())?;
             refuse_production(&sb)?;
             let marker = require_marker(&sb)?;
@@ -133,23 +204,446 @@ pub fn run_cli(state_dir: &Path, action: &SandboxAction) -> Result<i32> {
             print!("{}", env_lines(&sb, persisted_port(&sb.state_dir()), allow));
             return Ok(0);
         }
-        SandboxAction::Down { name } => {
+        DevAction::Down { name } => {
             let sb = target(state_dir, name.as_deref())?;
             refuse_production(&sb)?;
             require_marker(&sb)?;
             down(&sb)?
         }
-        SandboxAction::Status { name } => {
+        DevAction::Status { name } => {
             let sb = target(state_dir, name.as_deref())?;
             refuse_production(&sb)?;
             require_marker(&sb)?;
             status(&sb)
         }
-        SandboxAction::Reset { name } => reset(&Sandbox::open(name)?)?,
-        SandboxAction::Ls => ls()?,
+        DevAction::Reset { name } => reset(&Sandbox::open(name)?)?,
+        DevAction::Ls => ls()?,
+        DevAction::Agenticos { action } => run_agenticos(state_dir, action)?,
     };
     println!("{}", crate::output::json_text(&out).unwrap_or_default());
     Ok(0)
+}
+
+// ---------- real AgenticOS provider profile ----------
+
+fn run_agenticos(_state_dir: &Path, action: &AgenticosAction) -> Result<Value> {
+    match action {
+        AgenticosAction::Setup {
+            name,
+            origin,
+            workspace,
+            pin,
+            token_dir,
+        } => {
+            let sb = agenticos_sandbox(name.as_deref())?;
+            refuse_production(&sb)?;
+            let existing = read_marker(&sb)?;
+            refuse_unmarked_nonempty(&sb, existing.as_ref())?;
+            std::fs::create_dir_all(&sb.root)?;
+            // `up` refuses a non-empty root without a marker. Setup may run
+            // before `up`, so leave the minimal marker `up` would accept.
+            if existing.is_none() {
+                std::fs::write(
+                    sb.marker(),
+                    json!({
+                        "name": sb.name,
+                        "created_at": crate::issue::time::iso(crate::issue::time::now_epoch()),
+                    })
+                    .to_string(),
+                )?;
+            }
+            provider::setup(&sb.root, origin, workspace, pin, token_dir)
+        }
+        AgenticosAction::Bind {
+            name,
+            bundle,
+            context,
+            destination_id,
+            timezone,
+            no_publish,
+        } => bind_agenticos(
+            name.as_deref(),
+            bundle,
+            context,
+            destination_id.as_deref(),
+            timezone,
+            !*no_publish,
+        ),
+        AgenticosAction::Approve {
+            name,
+            install_id,
+            context_id,
+            dry_run,
+        } => approve_agenticos(name.as_deref(), install_id, context_id.as_deref(), *dry_run),
+    }
+}
+
+/// The sandbox a dev-agenticos verb acts on: the named one, else the
+/// profile this shell points at, else `dev`.
+fn agenticos_sandbox(name: Option<&str>) -> Result<Sandbox> {
+    let name = name
+        .map(str::to_owned)
+        .or_else(profile)
+        .unwrap_or_else(|| DEFAULT_NAME.to_owned());
+    if let Some(profile) = profile() {
+        if name != profile {
+            return Err(Error::rejected(format!(
+                "this shell points at sandbox '{profile}', not '{name}' — pass --name {name} \
+                 from a shell without CADENCE_PROFILE"
+            )));
+        }
+    }
+    let sb = Sandbox::open(&name)?;
+    refuse_production(&sb)?;
+    Ok(sb)
+}
+
+fn bind_agenticos(
+    name: Option<&str>,
+    bundle: &Path,
+    context: &str,
+    destination_id: Option<&str>,
+    timezone: &str,
+    publish: bool,
+) -> Result<Value> {
+    let sb = agenticos_sandbox(name)?;
+    require_marker(&sb)?;
+    let profile = provider::load(&sb.root)?
+        .ok_or_else(|| Error::rejected("run `cadence dev agenticos setup` first"))?;
+    let bundle = std::fs::canonicalize(bundle)
+        .map_err(|_| Error::rejected("app bundle path does not exist"))?;
+    if !bundle.join("app.md").is_file() {
+        return Err(Error::rejected("app bundle has no app.md at its root"));
+    }
+    let manifest = crate::issue::app::parse_manifest(
+        &std::fs::read_to_string(bundle.join("app.md"))
+            .map_err(|_| Error::rejected("app.md is unreadable"))?,
+    )?;
+
+    let installed = match client::rpc_state(
+        &sb.state_dir(),
+        "app_workspace_install",
+        json!({"source": bundle}),
+    ) {
+        Ok(installed) => installed,
+        Err(error)
+            if error
+                .to_string()
+                .contains("already has workspace installation") =>
+        {
+            return Err(Error::rejected(format!(
+                "{error}; reset the sandbox (`cadence dev reset {}`) or upgrade the \
+                 existing installation before rebinding",
+                sb.name
+            )))
+        }
+        Err(error) => return Err(error),
+    };
+    let install_id = installed["install_id"]
+        .as_str()
+        .ok_or_else(|| Error::internal("install returned no install_id"))?
+        .to_owned();
+    let digest = installed["digest"]
+        .as_str()
+        .ok_or_else(|| Error::internal("install returned no digest"))?
+        .to_owned();
+    // Sandbox auto-approval: the exact installed digest only.
+    let approved = client::rpc_state(
+        &sb.state_dir(),
+        "app_local_install_approve",
+        json!({"install_id": install_id, "digest": digest}),
+    )?;
+
+    let created_context = client::rpc_state(
+        &sb.state_dir(),
+        "app_context_create",
+        json!({
+            "install_id": install_id,
+            "label": context,
+            "input_defaults": {},
+            "request_id": "dev-context",
+        }),
+    )?;
+    let context_id = created_context["context"]["id"]
+        .as_str()
+        .ok_or_else(|| Error::internal("context create returned no id"))?
+        .to_owned();
+
+    // The host keeps one connection per provider/account, so a combined
+    // `provider.token` (read + draft) is the default. A read-only fallback
+    // still binds source; image/writer then fail at the provider with the
+    // missing scope rather than refusing the second enrollment here.
+    let token = profile
+        .credentials
+        .provider
+        .as_deref()
+        .unwrap_or(&profile.credentials.read);
+    let provider = enroll(&sb, &profile, &["provider.read", "provider.draft"], token)?;
+
+    let mut bindings = serde_json::Map::new();
+    for slot in ["source", "image", "writer"] {
+        if !manifest.capabilities.contains_key(slot) {
+            continue;
+        }
+        let binding = client::rpc_state(
+            &sb.state_dir(),
+            "app_binding_create",
+            json!({
+                "install_id": install_id,
+                "context_id": context_id,
+                "slot": slot,
+                "connection_id": provider,
+                "request_id": format!("dev-{slot}"),
+            }),
+        )?;
+        bindings.insert(slot.to_owned(), binding);
+    }
+
+    let mut publication = Value::Null;
+    let mut warnings = Vec::new();
+    if publish {
+        let destinations = client::rpc_state(&sb.state_dir(), "social_destinations", json!({}))?;
+        let selected = destination_id.map(str::to_owned).or_else(|| {
+            destinations["destinations"]
+                .as_array()
+                .and_then(|rows| rows.first())
+                .and_then(|row| row["destination_id"].as_str())
+                .map(str::to_owned)
+        });
+        match selected {
+            Some(destination_id) => {
+                let existing = client::rpc_state(
+                    &sb.state_dir(),
+                    "app_binding_list",
+                    json!({"install_id": install_id, "context_id": context_id}),
+                )?;
+                let revision = existing["bindings"]
+                    .as_array()
+                    .and_then(|rows| {
+                        rows.iter()
+                            .find(|row| row["slot"].as_str() == Some("publication"))
+                    })
+                    .and_then(|row| row["revision"].as_u64());
+                let mut params = json!({
+                    "install_id": install_id,
+                    "context_id": context_id,
+                    "destination_id": destination_id,
+                    "request_id": "dev-publication",
+                    "timezone": timezone,
+                });
+                if let Some(revision) = revision {
+                    params["expected_revision"] = json!(revision);
+                }
+                let binding =
+                    client::rpc_state(&sb.state_dir(), "app_binding_use_destination", params)?;
+                bindings.insert("publication".to_owned(), binding.clone());
+                publication = binding;
+            }
+            None => warnings
+                .push("no connected Instagram destination; publication binding not set".to_owned()),
+        }
+    }
+
+    Ok(json!({
+        "schema": 1,
+        "sandbox": sb.name,
+        "install_id": install_id,
+        "digest": digest,
+        "approval": approved,
+        "context_id": context_id,
+        "connections": {"provider": provider},
+        "bindings": bindings,
+        "publication": publication,
+        "warnings": warnings,
+    }))
+}
+
+fn approve_agenticos(
+    name: Option<&str>,
+    install_id: &str,
+    context_id: Option<&str>,
+    dry_run: bool,
+) -> Result<Value> {
+    let sb = agenticos_sandbox(name)?;
+    require_marker(&sb)?;
+    if dev_owner(&sb.state_dir())?.is_none() {
+        return Err(Error::rejected(
+            "dev agenticos approve only runs in a dev store",
+        ));
+    }
+    crate::proto::identifier(install_id, "installation ID")?;
+    let mut run_filter = json!({"install_id": install_id});
+    let mut effect_filter = json!({"install_id": install_id});
+    if let Some(context) = context_id {
+        crate::proto::identifier(context, "context ID")?;
+        run_filter["context_id"] = json!(context);
+        effect_filter["context_id"] = json!(context);
+    }
+    effect_filter["state"] = json!("waiting");
+    if dry_run {
+        effect_filter["read_only"] = json!(true);
+    }
+    let runs = client::rpc_state(&sb.state_dir(), "app_run_list", run_filter)?;
+    let pending_runs = pending_approvals(&runs, &json!({"effects": []}));
+    let run_candidates = pending_runs
+        .runs
+        .iter()
+        .map(|(id, digest)| json!({"id": id, "digest": digest}))
+        .collect::<Vec<_>>();
+    let mut approved_runs = Vec::new();
+    if !dry_run {
+        for (id, digest) in &pending_runs.runs {
+            approved_runs.push(client::rpc_state(
+                &sb.state_dir(),
+                "app_run_approve",
+                json!({"run_id": id, "digest": digest}),
+            )?);
+        }
+    }
+    let mut effect_candidates = Vec::new();
+    let mut approved_effects = Vec::new();
+    let mut skipped_effects = Vec::new();
+    let mut warnings = Vec::new();
+    // `app_effect_list` returns the daemon's 100-row window. Dry-run pages
+    // it read-only with `offset`; live mode approves each batch and
+    // re-queries, so later waiting rows become the next window.
+    let mut offset = 0;
+    for batch in 0..1_000 {
+        if dry_run {
+            effect_filter["offset"] = json!(offset);
+        }
+        let effects = client::rpc_state(&sb.state_dir(), "app_effect_list", effect_filter.clone())?;
+        let visible = effects["effects"].as_array().map_or(0, Vec::len);
+        let (pending, mut skipped) = pending_effect_rows(&effects);
+        skipped_effects.append(&mut skipped);
+        if !dry_run && pending.is_empty() {
+            break;
+        }
+        effect_candidates.extend(
+            pending
+                .iter()
+                .map(|(id, digest)| json!({"id": id, "digest": digest})),
+        );
+        if dry_run {
+            if visible < 100 {
+                break;
+            }
+            offset += 100;
+            continue;
+        }
+        for (id, digest) in &pending {
+            approved_effects.push(client::rpc_state(
+                &sb.state_dir(),
+                "app_effect_decide",
+                json!({"effect_id": id, "digest": digest, "decision": "accept", "execute": false}),
+            )?);
+        }
+        if batch == 999 {
+            warnings.push("stopped after 1000 effect batches; rerun to continue".to_owned());
+        }
+    }
+    if dry_run && offset >= 100_000 {
+        warnings.push("stopped after 1000 effect pages; rerun to continue".to_owned());
+    }
+    Ok(json!({
+        "schema": 1,
+        "sandbox": sb.name,
+        "install_id": install_id,
+        "context_id": context_id,
+        "dry_run": dry_run,
+        "runs": {
+            "selected": pending_runs.runs.len(),
+            "candidates": run_candidates,
+            "approved": approved_runs,
+            "skipped": pending_runs.skipped_runs,
+        },
+        "effects": {
+            "selected": effect_candidates.len(),
+            "candidates": effect_candidates,
+            "approved": approved_effects,
+            "skipped": skipped_effects,
+        },
+        "warnings": warnings,
+    }))
+}
+
+struct PendingApprovals {
+    runs: Vec<(String, String)>,
+    effects: Vec<(String, String)>,
+    skipped_runs: Vec<Value>,
+    skipped_effects: Vec<Value>,
+}
+
+fn pending_approvals(runs: &Value, effects: &Value) -> PendingApprovals {
+    let mut pending = PendingApprovals {
+        runs: Vec::new(),
+        effects: Vec::new(),
+        skipped_runs: Vec::new(),
+        skipped_effects: Vec::new(),
+    };
+    for run in runs["runs"].as_array().map_or(&[][..], Vec::as_slice) {
+        if run["state"].as_str() != Some("awaiting_approval") {
+            continue;
+        }
+        match (run["id"].as_str(), run["snapshot_digest"].as_str()) {
+            (Some(id), Some(digest)) => pending.runs.push((id.to_owned(), digest.to_owned())),
+            _ => pending.skipped_runs.push(json!({
+                "id": run["id"],
+                "reason": "awaiting run has no id or snapshot digest",
+            })),
+        }
+    }
+    let (effects, skipped) = pending_effect_rows(effects);
+    pending.effects = effects;
+    pending.skipped_effects = skipped;
+    pending
+}
+
+fn pending_effect_rows(effects: &Value) -> (Vec<(String, String)>, Vec<Value>) {
+    let mut pending = Vec::new();
+    let mut skipped = Vec::new();
+    for effect in effects["effects"].as_array().map_or(&[][..], Vec::as_slice) {
+        if effect["state"].as_str() != Some("waiting") {
+            continue;
+        }
+        let id = effect["effect_id"]
+            .as_str()
+            .or_else(|| effect["id"].as_str());
+        match (id, effect["digest"].as_str()) {
+            (Some(id), Some(digest)) => pending.push((id.to_owned(), digest.to_owned())),
+            _ => skipped.push(json!({
+                "id": effect["effect_id"],
+                "reason": "waiting effect has no id or digest",
+            })),
+        }
+    }
+    (pending, skipped)
+}
+
+fn enroll(
+    sb: &Sandbox,
+    profile: &provider::Profile,
+    scopes: &[&str],
+    path: &Path,
+) -> Result<String> {
+    let token = std::fs::read_to_string(path)
+        .map_err(|_| Error::rejected("provider credential is unreadable"))?;
+    let enrolled = client::rpc_state(
+        &sb.state_dir(),
+        "connection_create",
+        json!({
+            "provider": "agenticos_external",
+            "account": profile.workspace,
+            "shape": "token",
+            "token": token.trim(),
+            "scopes": scopes,
+            "accept_same_uid_risk": true,
+        }),
+    )?;
+    enrolled["connection"]["id"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::internal("connection create returned no id"))
 }
 
 // ---------- profile gating ----------
@@ -199,8 +693,8 @@ fn global_gate(profile: Option<&str>, allowed: Option<bool>, what: &str) -> Resu
         Some(false) => Err(Error::rejected(format!(
             "{what} is global to this host — refused under \
              CADENCE_PROFILE={PROFILE_PREFIX}{name}; to allow it, restart the \
-             sandbox with the opt-in: `cadence sandbox down {name}` then \
-             `{ALLOW_GLOBAL_ENV}=1 cadence sandbox up {name}`"
+             dev instance with the opt-in: `cadence dev down {name}` then \
+             `{ALLOW_GLOBAL_ENV}=1 cadence dev up {name}`"
         ))),
         None => Err(Error::rejected(format!(
             "{what} is global to this host — refused under \
@@ -309,7 +803,7 @@ fn validate_name(name: &str) -> Result<()> {
     } else {
         Err(Error::rejected(format!(
             "sandbox name '{name}' must match [a-z0-9][a-z0-9-]{{0,31}} — \
-             e.g. `cadence sandbox up smoke`"
+             e.g. `cadence dev up smoke`"
         )))
     }
 }
@@ -367,7 +861,7 @@ pub(crate) fn resolved(path: &Path) -> PathBuf {
 /// refusal: production's defaults (`CADENCE_STATE_DIR` and
 /// `CADENCE_PM_DIR` unset), plus whatever the caller exports now — a
 /// shell pointed at a live cadence — unless that shell is this very
-/// sandbox's (`eval "$(cadence sandbox env <name>)"`). `exported: false`
+/// dev instance's (`eval "$(cadence dev env <name>)"`). `exported: false`
 /// keeps the defaults only.
 fn production_dirs(sb: &Sandbox, exported: bool) -> Result<Vec<(&'static str, PathBuf)>> {
     let mut dirs = vec![
@@ -463,13 +957,37 @@ fn read_marker(sb: &Sandbox) -> Result<Option<Value>> {
     if marker["name"].as_str() != Some(sb.name.as_str()) {
         return Err(Error::rejected(format!(
             "{} belongs to sandbox {}, not '{}' — pick another name \
-             (`cadence sandbox ls` lists them)",
+             (`cadence dev ls` lists them)",
             sb.root.display(),
             marker["name"],
             sb.name
         )));
     }
     Ok(Some(marker))
+}
+
+/// A root without a marker must be empty; otherwise `up` or `setup` would
+/// treat unrelated contents as a sandbox (and `reset` could delete them).
+fn refuse_unmarked_nonempty(sb: &Sandbox, existing: Option<&Value>) -> Result<()> {
+    if existing.is_some() {
+        return Ok(());
+    }
+    match std::fs::read_dir(&sb.root) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(Error::rejected(format!(
+                    "{} exists and holds no sandbox marker — pick another name",
+                    sb.root.display()
+                )));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::rejected(format!(
+            "cannot read {} ({e}) — refusing; pick another name",
+            sb.root.display()
+        ))),
+    }
 }
 
 /// `<root>/.cadence-sandbox` when `state_dir` is `<root>/state` beside a
@@ -626,7 +1144,7 @@ pub fn adopt(state_dir: &Path) -> Result<Option<String>> {
 fn require_marker(sb: &Sandbox) -> Result<Value> {
     read_marker(sb)?.ok_or_else(|| {
         Error::rejected(format!(
-            "no sandbox '{}' at {} — `cadence sandbox up {}` creates it",
+            "no dev instance '{}' at {} — `cadence dev up {}` creates it",
             sb.name,
             sb.root.display(),
             sb.name
@@ -726,6 +1244,20 @@ fn choose_port(
     wanted: Option<u16>,
     lock_dir: &Option<PathBuf>,
 ) -> Result<(u16, Option<std::fs::File>)> {
+    choose_port_skip(sb, wanted, lock_dir, &[])
+}
+
+/// `choose_port` plus ports the caller already proved unusable — `up`'s
+/// bind-collision retry must not re-pick a candidate whose own child
+/// just died `AddrInUse`, and must not be pointed back at the failed
+/// port's own `ui.json` record (a fresh allocation's persisted port is
+/// the failed candidate's, not an established claim).
+fn choose_port_skip(
+    sb: &Sandbox,
+    wanted: Option<u16>,
+    lock_dir: &Option<PathBuf>,
+    skip: &[u16],
+) -> Result<(u16, Option<std::fs::File>)> {
     let state = sb.state_dir();
     let running = crate::ui::detached_pid(&state)
         .is_some()
@@ -737,42 +1269,47 @@ fn choose_port(
         (Some(p), Some(r)) if p != r => {
             return Err(Error::rejected(format!(
                 "sandbox '{}' board is running on port {r} — \
-                 `cadence sandbox down {}` first to move it",
+                 `cadence dev down {}` first to move it",
                 sb.name, sb.name
             )))
         }
         (Some(p), _) => (p, true, None),
         (None, Some(r)) => (r, false, None),
-        (None, None) => match persisted_port(&state) {
-            Some(p) => (p, false, None),
-            None => {
-                let taken = sandbox_roots(&sb.base)
-                    .iter()
-                    .filter_map(|root| persisted_port(&root.join("state")))
-                    .collect::<Vec<_>>();
-                let mut free = None;
-                for port in PORTS {
-                    if taken.contains(&port) {
-                        continue;
+        (None, None) => {
+            // A `ui.json` port this `up` already proved a failed
+            // bind is a skipped candidate, not an established claim.
+            let persisted = persisted_port(&state).filter(|p| !skip.contains(p));
+            match persisted {
+                Some(p) => (p, false, None),
+                None => {
+                    let taken = sandbox_roots(&sb.base)
+                        .iter()
+                        .filter_map(|root| persisted_port(&root.join("state")))
+                        .collect::<Vec<_>>();
+                    let mut free = None;
+                    for port in PORTS {
+                        if taken.contains(&port) || skip.contains(&port) {
+                            continue;
+                        }
+                        let Ok(lease) = fenced_lease(lock_dir, port) else {
+                            continue;
+                        };
+                        if bindable(port) {
+                            free = Some((port, lease));
+                            break;
+                        }
                     }
-                    let Ok(lease) = fenced_lease(lock_dir, port) else {
-                        continue;
-                    };
-                    if bindable(port) {
-                        free = Some((port, lease));
-                        break;
-                    }
-                }
-                match free {
-                    Some((p, lease)) => (p, false, lease),
-                    None => {
-                        return Err(Error::rejected(
-                            "no free port in 3110-3199 — pass `--port <n>`",
-                        ))
+                    match free {
+                        Some((p, lease)) => (p, false, lease),
+                        None => {
+                            return Err(Error::rejected(
+                                "no free port in 3110-3199 — pass `--port <n>`",
+                            ))
+                        }
                     }
                 }
             }
-        },
+        }
     };
     let hint = if flag {
         "pass another `--port` or omit it"
@@ -827,7 +1364,7 @@ fn production_port_gate(profile: Option<&str>, port: u16) -> Result<()> {
         Some(name) if port == PRODUCTION_UI_PORT => Err(Error::rejected(format!(
             "port {PRODUCTION_UI_PORT} is the production board — refused under \
              CADENCE_PROFILE={PROFILE_PREFIX}{name}; pass `--port <n>`, or \
-             `cadence sandbox up {name}` picks a free one"
+             `cadence dev up {name}` picks a free one"
         ))),
         _ => Ok(()),
     }
@@ -848,17 +1385,22 @@ fn env_lines(sb: &Sandbox, port: Option<u16>, allow_global: bool) -> String {
         "CADENCE_ALIAS CADENCE_ROLLOUT_AS CADENCE_SANDBOX_ALLOW_GLOBAL"
     };
     let mut text = format!(
-        "# cadence sandbox {name} — `eval \"$(cadence sandbox env {name})\"`\n\
+        "# cadence dev {name} — `eval \"$(cadence dev env {name})\"`\n\
          unset {unset}\n\
          export CADENCE_STATE_DIR={state}\n\
          export CADENCE_PM_DIR={pm}\n\
-         export CADENCE_PROFILE={profile}\n",
+         export CADENCE_PROFILE={profile}\n\
+         export CADENCE_SANDBOX_ROOT={base}\n",
         name = sb.name,
         unset = unset,
         state = sh_quote(&sb.state_dir().to_string_lossy()),
         pm = sh_quote(&sb.pm_dir().to_string_lossy()),
         profile = sh_quote(&sb.profile()),
+        base = sh_quote(&sb.base.to_string_lossy()),
     );
+    if let Ok(Some(profile)) = provider::load(&sb.root) {
+        text.push_str(&profile.env_exports(&sb.root));
+    }
     if allow_global {
         text.push_str(&format!("export {ALLOW_GLOBAL_ENV}=1\n"));
     }
@@ -903,23 +1445,103 @@ fn child(sb: &Sandbox, exe: &Path, args: &[&str], grant: bool) -> Command {
     cmd
 }
 
-/// Run one child verb to completion; its JSON stdout is the result.
-fn run_child(sb: &Sandbox, exe: &Path, args: &[&str], grant: bool) -> Result<Value> {
-    let out = crate::reaper::output(&mut child(sb, exe, args, grant))?;
-    if !out.status.success() {
+/// Run an exit-only child verb; successful output is deliberately ignored.
+fn run_child(sb: &Sandbox, exe: &Path, args: &[&str], grant: bool) -> Result<()> {
+    run_child_output(sb, exe, args, grant, &[]).map(|_| ())
+}
+
+/// Startup commands must report a usable state, not merely exit successfully.
+fn run_child_state(
+    sb: &Sandbox,
+    exe: &Path,
+    args: &[&str],
+    grant: bool,
+    env: &[(String, String)],
+) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct ChildState {
+        state: String,
+    }
+
+    let output = run_child_output(sb, exe, args, grant, env)?;
+    // Struct decoding also accepts positional arrays; this protocol needs an object.
+    let start = output
+        .iter()
+        .position(|byte| !matches!(*byte, b' ' | b'\n' | b'\r' | b'\t'))
+        .unwrap_or(output.len());
+    let output = &output[start..];
+    if output.first() != Some(&b'{') {
         return Err(Error::rejected(format!(
-            "`cadence {}` in sandbox '{}' failed: {} — see {}/*.log; \
-             `cadence sandbox down {}` stops what did start, \
-             `cadence sandbox reset {}` starts the sandbox over",
+            "`cadence {}` in dev '{}' returned invalid startup state: expected a JSON object",
             args.join(" "),
-            sb.name,
-            String::from_utf8_lossy(&out.stderr).trim(),
-            sb.state_dir().display(),
-            sb.name,
             sb.name
         )));
     }
-    Ok(serde_json::from_slice(&out.stdout).unwrap_or(Value::Null))
+    let response: ChildState = serde_json::from_slice(output).map_err(|error| {
+        Error::rejected(format!(
+            "`cadence {}` in dev '{}' returned invalid startup state: {error}",
+            args.join(" "),
+            sb.name
+        ))
+    })?;
+    if response.state.trim().is_empty() {
+        return Err(Error::rejected(format!(
+            "`cadence {}` in dev '{}' returned an empty startup state",
+            args.join(" "),
+            sb.name
+        )));
+    }
+    Ok(response.state)
+}
+
+/// Run a child with its own environment and retain stdout for state consumers.
+/// `up` passes only the board retry's remaining budget, without changing this
+/// process's environment or another child's.
+fn run_child_output(
+    sb: &Sandbox,
+    exe: &Path,
+    args: &[&str],
+    grant: bool,
+    env: &[(String, String)],
+) -> Result<Vec<u8>> {
+    let mut cmd = child(sb, exe, args, grant);
+    match provider::load(&sb.root) {
+        Ok(Some(profile)) => profile.apply_env(&mut cmd, &sb.root),
+        Ok(None) => {}
+        // A broken profile must not make `down` or `reload` unable to reach
+        // the sandbox. Startup (`up`) validates it before any child starts.
+        Err(error) => eprintln!("dev provider profile ignored: {error}"),
+    }
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let out = crate::reaper::output(&mut cmd)?;
+    if !out.status.success() {
+        // The child's own error frame is typed: preserve its `kind`,
+        // never reclassify from the message text. Only the one kind `up`
+        // retries — a verified own-child `AddrInUse` — becomes the
+        // distinct variant; every other kind is the ordinary wrap.
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let kind = serde_json::from_str::<Value>(&detail)
+            .ok()
+            .and_then(|v| v["kind"].as_str().map(str::to_string));
+        let what = format!(
+            "`cadence {}` in dev '{}' failed: {} — see {}/*.log; \
+             `cadence dev down {}` stops what did start, \
+             `cadence dev reset {}` starts the dev instance over",
+            args.join(" "),
+            sb.name,
+            detail,
+            sb.state_dir().display(),
+            sb.name,
+            sb.name
+        );
+        return Err(match kind.as_deref() {
+            Some("ui_bind_in_use") => Error::ui_bind_in_use(what),
+            _ => Error::rejected(what),
+        });
+    }
+    Ok(out.stdout)
 }
 
 /// `sun_path` holds 108 bytes including the NUL — a longer socket path
@@ -969,6 +1591,9 @@ fn persisted_share(sb: &Sandbox) -> Result<bool> {
 
 fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
     refuse_production(sb)?;
+    // Refuse a malformed profile before any child starts; `down`/`reload`
+    // stay reachable even if the profile later breaks.
+    provider::load(&sb.root)?;
     let socket = client::socket_path(&sb.state_dir());
     let len = socket.as_os_str().len();
     if len > SOCKET_PATH_MAX {
@@ -980,27 +1605,20 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
     }
     let _up_lock = up_lock(sb)?;
     let existing = read_marker(sb)?;
-    match std::fs::read_dir(&sb.root) {
-        Ok(mut entries) => {
-            if existing.is_none() && entries.next().is_some() {
-                return Err(Error::rejected(format!(
-                    "{} exists and holds no sandbox marker — pick another name",
-                    sb.root.display()
-                )));
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(Error::rejected(format!(
-                "cannot read {} ({e}) — refusing; pick another name",
-                sb.root.display()
-            )))
-        }
-    }
+    refuse_unmarked_nonempty(sb, existing.as_ref())?;
+    // CAD-1283: eligibility for a bind-collision retry is captured
+    // BEFORE the first `ui start` writes `ui.json` — after it,
+    // `persisted_port` would always find the port `choose_port` picked
+    // and a fresh automatic pick would be indistinguishable from a
+    // persisted one. Only a fresh default allocation may retry.
+    let fresh_auto = wanted_port.is_none()
+        && persisted_port(&sb.state_dir()).is_none()
+        && crate::ui::detached_pid(&sb.state_dir()).is_none();
+    let lock_dir = port_lock_dir();
     // The chosen port's lease is held from the pick until `ui start`
     // has bound the board: a cooperating suite can neither take the
     // port we picked nor have its own leased port stolen in the gap.
-    let (port, _lease) = choose_port(sb, wanted_port, &port_lock_dir())?;
+    let (port, lease) = choose_port(sb, wanted_port, &lock_dir)?;
     std::fs::create_dir_all(sb.state_dir())?;
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1025,7 +1643,7 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
     {
         return Err(Error::rejected(format!(
             "sandbox '{}' is running with {ALLOW_GLOBAL_ENV} {}; its processes \
-             keep that environment — `cadence sandbox down {}` first, then `up` \
+             keep that environment — `cadence dev down {}` first, then `up` \
              with the grant you want",
             sb.name,
             if recorded { "granted" } else { "not granted" },
@@ -1041,7 +1659,7 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
              ungranted `up` would refuse it at `ui start` with the \
              daemon already running. Stop sharing under the grant first: \
              `{ALLOW_GLOBAL_ENV}=1 cadence --state-dir {} ui tailscale \
-             stop`, or `cadence sandbox reset {}` starts over",
+             stop`, or `cadence dev reset {}` starts over",
             sb.name,
             sb.state_dir().display(),
             sb.name
@@ -1063,9 +1681,87 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
     // daemon starts from it.
     write_dev_marker(sb)?;
     run_child(sb, exe, &["issue", "init"], allow_global)?;
-    let daemon = run_child(sb, exe, &["daemon", "start"], allow_global)?;
-    let port_arg = port.to_string();
-    let ui = run_child(sb, exe, &["ui", "start", "--port", &port_arg], allow_global)?;
+    // The daemon starts once, before the board retry window opens: a
+    // bind collision is the board's port, never the daemon's socket,
+    // so a retried `ui start` reuses this daemon and nothing is
+    // replayed.
+    let daemon = run_child_state(sb, exe, &["daemon", "start"], allow_global, &[])?;
+    // CAD-1283: only a fresh automatic allocation gets the retry
+    // window and the remaining-budget env (a clamp, never a raise) —
+    // an explicit `--port`, a persisted `ui.json` port or an
+    // already-running board runs the single unchanged `ui start`.
+    const BOARD_START_BUDGET: Duration = Duration::from_secs(60);
+    let deadline = fresh_auto.then(|| Instant::now() + BOARD_START_BUDGET);
+    // `tried` holds the ports this `up` already saw lose their bind,
+    // so a retried pick can neither re-pick a failed candidate nor be
+    // pointed back at the failed port's own `ui.json` record.
+    let mut tried = Vec::new();
+    let mut port = port;
+    let mut lease = lease;
+    let ui;
+    // The `ui start` may retry a fresh automatic allocation when its
+    // own child proved the bind lost to another listener
+    // (`Error::UiBindInUse`). Each candidate's lease stays held until
+    // that start's child provably bound or died; it is dropped only
+    // after the verified own exit, before the next pick frees the
+    // claim for a successor. Nothing else is replayed — no daemon
+    // start, no marker, no tailnet, no device-login work.
+    loop {
+        // The retry budget env exists only on a fresh automatic
+        // allocation's `ui start`; other candidates inherit nothing.
+        let env = match (fresh_auto, deadline) {
+            (true, Some(dl)) => {
+                let left = dl.saturating_duration_since(Instant::now()).as_secs();
+                if left == 0 {
+                    return Err(Error::rejected(format!(
+                        "sandbox '{}' board start ran out of its {}s retry window \
+                         before the next candidate could start",
+                        sb.name,
+                        BOARD_START_BUDGET.as_secs()
+                    )));
+                }
+                vec![(crate::ui::START_REMAINING_ENV.to_string(), left.to_string())]
+            }
+            _ => Vec::new(),
+        };
+        let port_arg = port.to_string();
+        let result = run_child_state(
+            sb,
+            exe,
+            &["ui", "start", "--port", &port_arg],
+            allow_global,
+            &env,
+        );
+        match result {
+            // The verified bind collision — own dead child, exact
+            // pid/nonce/kind frame — retries a fresh automatic
+            // allocation only. An explicit `--port`, a persisted
+            // `ui.json` port or an already-running board fails closed.
+            Err(e @ Error::UiBindInUse(_)) if fresh_auto => {
+                tried.push(port);
+                // The failed candidate's own lease frees its claim for
+                // the next pick — only now that its own child provably
+                // exited and `start_inner` cleaned up.
+                drop(lease);
+                match choose_port_skip(sb, None, &lock_dir, &tried) {
+                    Ok((next, next_lease)) => {
+                        port = next;
+                        lease = next_lease;
+                    }
+                    Err(_) => return Err(e),
+                }
+            }
+            _ => {
+                ui = result?;
+                break;
+            }
+        }
+    }
+    // The board may have landed on a retried port; the env file must
+    // name the port that actually bound, not the first candidate.
+    if fresh_auto {
+        std::fs::write(sb.env_file(), env_lines(sb, Some(port), allow_global))?;
+    }
     Ok(json!({
         "name": sb.name,
         "root": sb.root,
@@ -1075,9 +1771,30 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
         "url": format!("http://127.0.0.1:{port}"),
         "env_file": sb.env_file(),
         "profile": sb.profile(),
-        "daemon": daemon["state"],
-        "ui": ui["state"],
+        "daemon": daemon,
+        "ui": ui,
     }))
+}
+
+/// The binary `dev up` starts the sandbox from when no `--build` is
+/// given: the running one. Held to the same name rule as `--build`
+/// ([`runnable`]), checked before anything is started, so the default
+/// path cannot start a board `dev down` could never find (CAD-1207).
+fn running_exe() -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    if !exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(crate::ui::is_cadence_exe_name)
+    {
+        return Err(Error::rejected(format!(
+            "this binary {} is not named `cadence` or `cadence-<suffix>` — the board it \
+             would start is found again by that name, so `dev down` could not stop it. \
+             Nothing was started; run it under a conforming name or pass --build",
+            exe.display()
+        )));
+    }
+    Ok(exe)
 }
 
 /// A binary `--build` may name: an absolute, symlink-resolved regular
@@ -1233,18 +1950,18 @@ fn reload(state_dir: &Path, name: Option<&str>, build: Option<&Path>) -> Result<
     if had_daemon {
         run_child(&sb, &current, &["daemon", "stop"], grant)?;
     }
-    let daemon = run_child(&sb, &exe, &["daemon", "start"], grant)?;
+    let daemon = run_child_state(&sb, &exe, &["daemon", "start"], grant, &[])?;
     let ui = match port {
         Some(port) if had_ui => {
             let port_arg = port.to_string();
-            run_child(&sb, &exe, &["ui", "start", "--port", &port_arg], grant)?["state"].clone()
+            run_child_state(&sb, &exe, &["ui", "start", "--port", &port_arg], grant, &[])?
         }
-        _ => json!("not_running"),
+        _ => "not_running".to_string(),
     };
     Ok(json!({
         "name": sb.name,
         "build": exe,
-        "daemon": daemon["state"],
+        "daemon": daemon,
         "ui": ui,
         "port": port,
         "lease": "none claimed",
@@ -1270,7 +1987,7 @@ fn daemon_running(state_dir: &Path) -> bool {
 /// `agent_stop` every enabled agent that has an actor — stopped, not
 /// removed, so a later `up` can resume it. Returns how many stopped.
 fn stop_agents(state_dir: &Path) -> usize {
-    let Ok(list) = client::rpc(state_dir, "agent_list", json!({})) else {
+    let Ok(list) = client::rpc_state(state_dir, "agent_list", json!({})) else {
         return 0;
     };
     list["agents"]
@@ -1285,7 +2002,7 @@ fn stop_agents(state_dir: &Path) -> usize {
                 )
         })
         .filter_map(|a| a["alias"].as_str())
-        .filter(|alias| client::rpc(state_dir, "agent_stop", json!({"alias": alias})).is_ok())
+        .filter(|alias| client::rpc_state(state_dir, "agent_stop", json!({"alias": alias})).is_ok())
         .count()
 }
 
@@ -1332,7 +2049,7 @@ fn reset(sb: &Sandbox) -> Result<Value> {
     let _up_lock = up_lock(sb)?;
     if std::fs::symlink_metadata(&sb.root).is_err() {
         return Err(Error::rejected(format!(
-            "no sandbox '{}' at {} — `cadence sandbox ls` lists them",
+            "no dev instance '{}' at {} — `cadence dev ls` lists them",
             sb.name,
             sb.root.display()
         )));
@@ -1432,6 +2149,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn state_socket_refuses_a_symlinked_socket() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("production.sock"),
+            state.join("cadence.sock"),
+        )
+        .unwrap();
+        let error = crate::client::rpc_state(&state, "health", json!({})).unwrap_err();
+        assert!(
+            error.to_string().contains("must not be a symlink"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn state_socket_refuses_a_hard_linked_socket() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let socket = state.join("cadence.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        if std::fs::hard_link(&socket, state.join("other.sock")).is_err() {
+            return;
+        }
+        let error = crate::client::rpc_state(&state, "health", json!({})).unwrap_err();
+        assert!(error.to_string().contains("hard-linked"), "{error}");
+    }
+
+    #[test]
     fn profile_parses_only_the_sandbox_prefix() {
         assert_eq!(
             parse_profile(Some("sandbox:smoke")).as_deref(),
@@ -1446,16 +2194,7 @@ mod tests {
         assert!(global_gate(None, None, "x").is_ok());
         let hard = global_gate(Some("s"), None, "`ui tailscale`").unwrap_err();
         assert!(hard.to_string().contains("sandbox:s"), "{hard}");
-        let soft = global_gate(Some("s"), Some(false), "merge").unwrap_err();
-        assert!(
-            soft.to_string().contains("`cadence sandbox down s`"),
-            "{soft}"
-        );
-        assert!(
-            soft.to_string()
-                .contains("`CADENCE_SANDBOX_ALLOW_GLOBAL=1 cadence sandbox up s`"),
-            "{soft}"
-        );
+        assert!(global_gate(Some("s"), Some(false), "merge").is_err());
         assert!(global_gate(Some("s"), Some(true), "merge").is_ok());
     }
 
@@ -1616,6 +2355,10 @@ mod tests {
             text.contains("export CADENCE_PROFILE='sandbox:q'"),
             "{text}"
         );
+        assert!(
+            text.contains(r"export CADENCE_SANDBOX_ROOT='/t/it'\''s'"),
+            "{text}"
+        );
         // Like the sandbox's own children, never a pane or rollout
         // identity — and no grant the marker did not record.
         assert!(
@@ -1718,5 +2461,39 @@ mod tests {
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
             assert_eq!(runnable(&bin).is_ok(), ok, "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod agenticos_approve_tests {
+    use super::*;
+
+    #[test]
+    fn pending_approvals_selects_only_exact_waiting_states() {
+        let runs = json!({"runs": [
+            {"id": "run-a", "state": "awaiting_approval", "snapshot_digest": "sha256:a"},
+            {"id": "run-b", "state": "approved", "snapshot_digest": "sha256:b"},
+            {"id": "run-c", "state": "awaiting_approval"},
+        ]});
+        let effects = json!({"effects": [
+            {"effect_id": "eff-a", "state": "waiting", "digest": "sha256:c"},
+            {"effect_id": "eff-b", "state": "waiting", "digest": "sha256:d"},
+            {"effect_id": "eff-c", "state": "approved", "digest": "sha256:e"},
+            {"id": "eff-d", "state": "waiting"},
+        ]});
+        let pending = pending_approvals(&runs, &effects);
+        assert_eq!(
+            pending.runs,
+            vec![("run-a".to_owned(), "sha256:a".to_owned())]
+        );
+        assert_eq!(
+            pending.effects,
+            vec![
+                ("eff-a".to_owned(), "sha256:c".to_owned()),
+                ("eff-b".to_owned(), "sha256:d".to_owned()),
+            ]
+        );
+        assert_eq!(pending.skipped_runs.len(), 1);
+        assert_eq!(pending.skipped_effects.len(), 1);
     }
 }

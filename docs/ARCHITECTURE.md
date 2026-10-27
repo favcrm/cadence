@@ -39,13 +39,19 @@ Three storage concerns stay distinct:
   artifacts. A tracker reference binds work to the real repo/branch/worktree;
   folder names alone are not ownership proof.
 
+Ordinary daemon RPC replies buffer JSON formatting writes per connection and
+flush after each newline-delimited response, including errors. This avoids a
+socket syscall for each formatting fragment without delaying a complete frame.
+Original-media transfers bypass that buffer: each binary send retains its
+existing authority recheck and absolute deadline.
+
 ## Code ownership map
 
 | Path | Responsibility / first read |
 |---|---|
 | [src/main.rs](../src/main.rs) | Binary entry point, process error/exit handling; delegates commands to CLI. |
 | [src/cli/mod.rs](../src/cli/mod.rs), [src/cli/](../src/cli/) | CLI definitions, routing and launch composition; command behavior split into verb modules. |
-| [src/cli/briefing.rs](../src/cli/briefing.rs) | Briefing modes, document and cloud bootstrap rendering, role carry-forward and opt-in AGENTS.md block. |
+| [src/briefing.rs](../src/briefing.rs) | Briefing modes, document and cloud bootstrap rendering, role carry-forward and opt-in AGENTS.md block. |
 | [src/client.rs](../src/client.rs), [src/proto.rs](../src/proto.rs) | Local RPC client and protocol vocabulary. |
 | [src/remote_auth.rs](../src/remote_auth.rs), [src/remote_enrollment.rs](../src/remote_enrollment.rs), [src/remote_result_outbox.rs](../src/remote_result_outbox.rs), [src/cli/remote_result.rs](../src/cli/remote_result.rs) | Distinct issuer sign-in, protected hosted child enrollment, immutable offline result custody and explicit sender CLI. The sender uses the issuer-bound record and original outbox pin; it does not enable a production gateway or grant daemon authority. See [issuer/enrollment contract](REMOTE-AUTH.md). |
 | [src/daemon.rs](../src/daemon.rs), [src/daemon/](../src/daemon/) | Shared runtime coordination and central dispatch; area RPC handlers, identity, timers and actor lifecycle. |
@@ -53,12 +59,12 @@ Three storage concerns stay distinct:
 | [src/backup/](../src/backup/) | Online-backup manifests, secret-scanned exports, restore with repository remap. |
 | [src/adapter/mod.rs](../src/adapter/mod.rs), [src/adapter/registry.rs](../src/adapter/registry.rs) | Common adapter types and provider capability descriptors. |
 | [src/adapter/](../src/adapter/), [src/adapter/pty/](../src/adapter/pty/) | Structured provider transports and owned terminal lifecycle. Check the registry for accepted combinations; screen classification is not provider approval. |
-| [src/issue/](../src/issue/) | Project/issue files, start/dispatch/finish, history, report intake, relay and read-only retros. |
+| [src/issue/](../src/issue/), [src/context_pack.rs](../src/context_pack.rs) | Project/issue files, start/dispatch/finish, history, report intake, relay and read-only retros. Context planner: deterministic task manifest, source dispositions, delivery/restore plan and supply receipts for issue-bound turns. |
 | [src/memory/](../src/memory/) | Proposal/curation CLI, scoped matching, bounded rendering and staleness observations. |
-| [src/review.rs](../src/review.rs), [src/audit.rs](../src/audit.rs) | Revision-bound review evidence and merge/audit reconstruction. |
-| [src/slots.rs](../src/slots.rs), [src/doctor/host/mod.rs](../src/doctor/host/mod.rs), [src/doctor/host/](../src/doctor/host/) | Build/test admission and partitioned host/session ownership/resource checks. |
+| [src/review.rs](../src/review.rs), [src/audit/](../src/audit/mod.rs) | Revision-bound review evidence and merge/audit reconstruction. |
+| [src/slots.rs](../src/slots.rs), [src/slots/persistence.rs](../src/slots/persistence.rs), [src/doctor/host/mod.rs](../src/doctor/host/mod.rs), [src/doctor/host/](../src/doctor/host/) | Slots: live build/test admission and coordination; persistence: serialization, strict commit, rejected-file evidence preservation and restart recovery. Doctor: partitioned host/session ownership/resource checks. |
 | [src/session.rs](../src/session.rs), [src/worktree.rs](../src/worktree.rs), [src/proc.rs](../src/proc.rs) | Session/worktree operations and process helpers. |
-| [src/ui.rs](../src/ui.rs), [src/overview.rs](../src/overview.rs), [src/overview/monitoring.rs](../src/overview/monitoring.rs) | HTTP/API surface and aggregated project/agent/actionable observations. |
+| [src/ui.rs](../src/ui.rs), [src/overview.rs](../src/overview.rs), [src/overview/sources.rs](../src/overview/sources.rs), [src/overview/assembly.rs](../src/overview/assembly.rs), [src/overview/monitoring.rs](../src/overview/monitoring.rs) | UI: HTTP/API surface. Overview root: orchestration and shared read model; sources: bounded acquisition with owned fresh or borrowed reused snapshots; assembly: project/agent/actionable rows with contextual tracker/runtime/Git reads retained; monitoring: monitor health and durable alert projections. |
 | [ui/src/features/](../ui/src/features/), [ui/src/lib/](../ui/src/lib/), [ui/src/ui/](../ui/src/ui/) | React feature screens, shared frontend libraries and UI primitives. |
 | [tests/](../tests/) | Retired in CAD-1073 clean-slate. The integration suite and fixtures were removed; only the safety-floor binary remains. |
 | [scripts/](../scripts/), [.config/nextest.toml](../.config/nextest.toml), [.github/workflows/](../.github/workflows/) | Review receipts, pinned test tooling and CI. |
@@ -82,13 +88,251 @@ Resource admission and provider quota are also different. A free build slot does
 not prove provider allowance, and attaching/detaching a terminal does not prove
 its provider process ended. Reclamation must prove ownership at action time.
 
+### Task context delivery (CAD-1822, CAD-1846)
+
+A project opts in by setting `agent_delivery: true` in its tracked
+`docs/cadence/project-context.yaml` at HEAD; absent or false leaves every
+existing dispatch path unchanged. A manifest the daemon cannot read or parse
+cannot prove the opt-in, so delivery stays off; once `agent_delivery: true` is
+parsed, an invalid manifest, a missing required source or an over-cap payload
+refuses. An
+opted-in issue-bound managed dispatch pins one deterministic schema-2 task
+manifest (`src/context_pack.rs`) before the kickoff becomes claimable.
+Plain issue dispatch, explicit issue `--job` and native issue-linked task
+dispatch share project-document and current-policy eligible-lesson selection.
+The contract contains canonical issue prose, complete criteria, distinct
+parent issue/task identities, and the job's full effective spec and native
+execution/report contract where applicable. Tracker frontmatter and comments
+are not task prose; criteria and spec are not repeated in the kickoff.
+Plain revisions hash the one captured issue source; job composite revisions
+also cover the effective spec, task criteria and execution contract.
+`context_guard` never rereads the issue to relabel already-selected criteria.
+Selection reuses the bounded documentation allowlist (`src/issue/context.rs`)
+against the assigned project's declared repository at HEAD, never a
+client-supplied project or revision. Job specs are separately restricted to
+the canonical issue directory, its real task worktree or a tracked regular
+file in that declared repository. Descriptor-relative bounded reads reject
+escapes; a spec's working-byte digest is not Git verification.
+For newly created opted-in canonical issue-as-default-spec jobs, the native
+job's spec hash covers the complete body (criteria included), while the pin
+retains exact raw issue provenance. Native bookkeeping may change frontmatter
+without revising the spec; a material body change still refuses, never refreshes
+the accepted hash. Other spec files retain raw-byte job hashes. Task-specific
+acceptance cannot erase distinct criteria belonging to the effective spec.
+
+Read-only job inspection retains the stored job/task view and an `attention`
+diagnostic when optional canonical-spec drift inspection cannot read its source;
+it never refreshes the accepted hash or relaxes mandatory dispatch admission.
+
+An opted-in manifest always requires a prompt-capable endpoint, even when no
+document body is selected: the canonical task contract is still mandatory.
+
+Required sources are mandatory; optional ones are best-effort. The pin is an
+event on the target alias bound to the exact message id. Opting in
+also establishes the alias's native home conversation when the pin is written,
+so enqueue notes, provider compaction notes and receipts share one thread.
+Before delivery the actor records one durable activation binding per pin in
+that conversation (exact pin, task and task revision); a follow-up without its
+own pin restores from it, never from an alias-latest pin or optional rollups,
+so a lost supply receipt cannot lose the task. The activation is task identity,
+not residency: only `context_supplied` proves supply, and its absence forces a
+full restore. An activation write failure refuses the turn before the provider.
+The pin (or a disabled selection) commits in the same admission transaction as
+the accepted message row: a rejected or duplicate envelope writes nothing, and
+the assignment is claimable only after both are durable. A native dispatch
+whose assigned scope is not opted in passes a disabled selection that persists
+one exact-message `context_disabled` marker only if the alias already has
+feature state at that commit (never for a never-opted-in alias); before
+delivering it the actor clears the conversation's active binding (one
+`context_deactivated` marker, only for a real prior binding), and a failed
+clear refuses the turn before the provider. An already-accepted id is decided
+by the store's exact-envelope comparison: an exact lost-acknowledgement retry
+returns the known accepted outcome without re-capturing project context or
+adding metadata, and only a genuinely new id is evaluated for required sources.
+A same-issue
+re-dispatch after opt-out cannot reuse the old pin; a legitimate issue follow-up
+without a marker keeps the immutable current pin. These markers are metadata
+only (no source bodies, not per-turn). Acceptance presence is verified against
+the actual delivered body in order, never inferred from the message source; a
+body missing any criterion gets the complete canonical acceptance. A retained
+turn reports only sources confirmed resident by an earlier receipt plus the
+actual prior gap state for anything undelivered; a required source that is not
+confirmed resident degrades the turn to a delta and is appended. The body
+itself must fit the combined cap, and the actor's two-byte join is counted.
+Known local adapter-added prompt material is reserved in the same cap — the
+44-byte guarded Pi-adapter task prefix for every registry-defined Pi-family
+provider, even while the guard is off (readiness can change). This is a local byte
+reservation, not provider-window accounting; the receipt carries
+`adapter_reserved_bytes`, never as appended source. An opted-in plain issue's
+changed actionable contract or kickoff body supersedes a reported duplicate.
+The completed-only comparison uses a domain-separated, length-prefixed task
+digest excluding incidental raw tracker revision. An exact alias/message pin
+lookup through the existing daemon read surface returns only this digest, not
+source bodies; malformed/incomplete old pins do not compare equal. This digest
+never replaces immutable provenance or conversation/session residency proofs.
+Pre-turn delivery
+(`src/daemon.rs`, `src/daemon/actor.rs`) appends the full payload when the
+provider session is new, lost or compacted, and appends nothing when the same
+contract is confirmed resident in the same conversation, task and provider
+session/generation. The mandatory task context is planned against the delivery
+body and member profile first (adapter-owned guard material is untouched); an
+assembled optional continuity pack is included only when the whole prefix fits
+the remaining combined budget, otherwise it is omitted whole with a recorded
+reason. A definite provider result — completed, failed or interrupted — writes
+a supply receipt (the local append is confirmed, not model success); a
+pre-submission refusal, an uncertain outcome or a not-rendered paste writes
+none, so the next turn restores instead of claiming
+residency. Required-source failure, an unusable manifest and a combined payload
+over the local 48 000-byte cap refuse before provider submission; a required
+document over the reader's 64 KiB cap refuses rather than being truncated.
+Source text is quoted data, never instruction or authorization.
+
+Job admission plans capture the full task/job/worker preimage outside the
+write transaction. Inside the existing manual/automatic admission guards,
+the store rechecks that preimage before atomically writing the message, its
+pin/disabled selection and the task revision. Accepted retries return their
+original binding without source I/O. CLI preflight separates plain and job
+kickoffs before lane/job creation, proves a unique open job's canonical task,
+and only reuses an undispatched draft whose material scope matches.
+An explicit task-bound follow-up must match its own pin or active binding,
+never an undispatched sibling's context. Passive routed results do not
+activate a reported task. Lost sessions restore the current complete
+contract, including native execution/report requirements; old incomplete
+pins are not relabeled as complete.
+
+Eligible lessons use the versioned native memory evaluator, scope/team-role
+selection and validity withholding (including v2 unused expiry). Their one
+bounded optional inline source records selected IDs and explicit gaps; it is
+omitted whole when it cannot fit, and `--no-lessons` selects none. This replaces,
+rather than duplicates, the opted-in path's legacy lesson sidecar. Its revision
+hashes rendered guidance, not policy audit history or feedback counters.
+Neither inclusion nor a supply receipt claims source verification, observed
+model consumption, business correctness or billed savings.
+
+
+### Bounded workflow preauthorization
+
+Unattended authority is an explicit operator opt-in on an existing standalone
+workflow, not permission for an agent to approve arbitrary plans or merges.
+For a stored `ship` workflow with a `worker` input, the operator can bind one
+render to a registered GitHub repository and file allowlist:
+
+```sh
+cadence workflow approve ship --project widgets --unattended \
+  --repo acme/widgets --allow-path 'src/**' --input worker=dev-1 --ttl 3600
+```
+
+The master consumes that authority with
+`cadence plan propose --project widgets --workflow ship --input worker=dev-1`.
+The full template and rendered content must still match; changing wording,
+inputs, the registered repository or worker does not admit a different plan.
+One grant admits one plan. Repeating the same proposal recovers the same IDs,
+not another dispatchable copy. Free-form files, app workflows and approvals
+without `--unattended` keep their ordinary manual plan-approval path.
+
+Grant lifetime defaults to 3600 seconds and is bounded to 1–86400 seconds.
+Only the operator may renew the same grant with
+`cadence workflow approve ship --project widgets --renew <grant-id> --ttl 3600`;
+renewal preserves its immutable bounds and one-plan credit. Ordinary
+`cadence workflow approve ship --project widgets` replaces the approval without
+a grant and revokes future automatic authority. These commands require native
+operator proof; a chat decision or client-supplied identity is not a grant.
+Native renewal revisions order same-second changes. Reappending a captured
+approval cannot resurrect a replaced grant or roll back a newer renewal,
+including a deliberately shortened lifetime. This relies on intact native
+history; it is not confinement against arbitrary same-UID database rewrites.
+
+Issue semantics use deterministic JSON of the selected identity, plan,
+dependency and body fields, with sorted dependency IDs. Escaped strings and
+typed options/arrays keep multiline content and metadata boundaries unambiguous;
+runtime-status changes remain excluded.
+
+Canonical issue dispatch and its native revision/CI-fix turns recheck current
+authority and use the recorded issue's repository and worker lane. Automatic
+dispatch preserves daemon-authenticated origin through its self-RPC and
+revalidates at the final enqueue gate, after blocking worktree/Git setup.
+Bound kickoff and follow-up writes carry the server-derived grant deadline
+into the queue transaction; connection/SQLite writer waits cannot extend it.
+The initial admission intent also checks its server-derived deadline after
+acquiring the SQL writer, before creating any logical issue or tracker commit.
+The tracker snapshot stays locked from each final canonical check through
+kickoff/follow-up enqueue and landing intent/remote attempt; ordinary edits
+serialize against that snapshot. Explicit operator hand-dispatch and repair
+retain their existing authority. A done report alone
+cannot start review: the owned queue turn must have completed
+with that exact SHA. Unknown outcomes remain held for reconciliation; a known
+failed provider turn stays failed and requires deliberate recovery, not a
+fabricated successful result or a blind replay. A grant does not authorize
+caller-authored job/task specifications or monitor dispatch; those unsupported
+bound-job paths refuse rather than borrowing the issue's approval.
+
+Before a bound repair produces another head, any earlier native merge request
+must be proved removed: fresh same-head OPEN PR, no auto-merge request and no
+queue entry. Active or unreadable state holds for operator inspection/removal,
+not an automatic cancellation or retry. Grant→delivery locks serialize repair
+and enqueue; an admitted repair clears its old standing PASS. Landing rechecks
+the latest owned completion even after review, covering a crash between native
+follow-up insertion and saving `Working`. Initial and follow-up instructions
+require a final `SHA: <full head>` result line matching the done report.
+
+Automatic landing requires a native independent exact-head PASS with explicit
+`risk: auto` verdict frontmatter, applicable current CI and complete file/policy
+evidence. Sensitive, protected, out-of-scope, unknown, deleted, renamed or
+mode-changing work still needs an explicit operator decision. The latest
+canonical `ci.yml` PR run supplies prequeue head feedback: a newer pending or
+failed attempt cannot be hidden by an older success. Neither historical run
+titles nor mutable `pull_requests[]` metadata prove current-base integration.
+
+Automatic landing remains default-branch-only; approved integration targets use
+ordinary delivery approval. Final integration authority comes from an enforced
+merge queue with no bypass actors or mutation-identity bypass. Administrator-enforced
+protection must bind the canonical `fmt`, `clippy`, `test`, `build` and `ui`
+gates to GitHub Actions, plus `cross-build (required)` when that existing
+aggregate is present. The trusted workflow must handle `merge_group`.
+Missing settings or an unsupported gate inventory hold automatic landing for
+operator setup; agents do not change repository rules. This reuses existing
+CI jobs and the queue rather than adding a status publisher or secrets.
+`--auto` enabled alone is not admission: a native `mergeQueueEntry` must be
+observed and recorded before the loop calls the work enqueued.
+Final PR/queue reads bind destination branch and base OID, with another target
+check after the intent writer wait and before the remote attempt. Intent/queue
+receipts retain the destination for repair and postmerge; missing or changed
+target evidence holds.
+
+The final tracker snapshot also binds the whole resolved delivery policy,
+including approval source and drift note. Native project-policy approval uses
+that same tracker lock, so it cannot cross intent or remote mutation.
+
+Native admission and enqueue intents precede logical tracker writes and remote
+mutation. ID directories reserve resources across interrupted admission; they
+are not approval evidence. Identical files are not commit proof. An uncertain
+enqueue is reconciled against the exact remote queue state, never blindly
+repeated. Same-grant renewal does not rewrite the original intent's historical
+expiry. Postmerge completion, including retries, must still have applicable
+native authority, recorded queue admission and enforceable integration checks.
+After remote collection, final canonical and deadline validation shares the
+actual non-waiting tracker writer with the status CAS and ordinary plan gate;
+observed `MERGED` alone is insufficient. Revocation stops future daemon actions;
+it does not itself guarantee cancellation of an already-issued remote queue request.
+
+An `unattended_held` observation belongs to the operator. Its existing board
+Details show the reason and inspection command; a matching owned-turn lane
+fence and ticket hold share one escalation with both causes. Dismissal is not
+resolution. Audit output distinguishes scoped workflow authority from a
+per-head operator approval and does not claim a verified external attestation.
+Implementation and isolated fixtures do not establish deployment, genuine
+provider operation or completion of CAD-225's full acceptance.
+
 ## Memory implementation boundaries
 
-`src/issue/dispatch.rs` matches accepted project memories, writes a bounded
-lessons file and records included and withheld IDs. `src/cli/briefing.rs` adds accepted
-project-wide rules to generated briefings. `--job` kickoffs are
-daemon-templated and carry no lessons (CAD-194); do not assume every entry point
-shares this retrieval behavior.
+For projects not opted into agent delivery, `src/issue/dispatch.rs` matches
+accepted project memories, writes a bounded lessons file and records included
+and withheld IDs. Legacy `--job` kickoffs remain daemon-templated without a
+lessons sidecar. In opted-in projects, plain issue, explicit issue `--job` and
+native issue-linked task dispatch instead share the bounded optional inline
+`native:lessons` source described under task context delivery above.
+`src/briefing.rs` adds accepted project-wide rules to generated briefings;
+do not assume every entry point shares the opted-in task delivery behavior.
 
 A memory record carries the daemon-authenticated proposer proof, one receipt
 per independent reviewer (identity, digest, evidence) and PM finalization

@@ -17,7 +17,7 @@ check(updates[0].text === "Checking the layout", "newest update first");
 check(updates[1].label === "Task completed", "task completion requires its recorded event");
 check(updates[2].label === "Finished a turn", "turn completion does not assert a completed job");
 check(recentAgentUpdates(null, []).length === 0, "missing evidence never fabricates progress");
-const agents = Array.from({ length: 20 }, (_, i) => ({ provider: "test", endpoint_kind: "test", state: "idle", group: "test", unknown: 0, parked: 0, fenced: false, alias: `a${i}`, on: [], running: 0, queued: 0, last_activity: new Date(1000 * i).toISOString() } as Agent));
+const agents = Array.from({ length: 20 }, (_, i) => ({ provider: "test", endpoint_kind: "test", state: "idle", group: "test", group_root: true, tasks: [], unknown: 0, parked: 0, fenced: false, alias: `a${i}`, on: [], running: 0, queued: 0, last_activity: new Date(1000 * i).toISOString() } as Agent));
 const selected = recentWorkingAgents([...agents, { ...agents[0], alias: "master" }]);
 check(selected.length === 12 && selected[0].alias === "a19", "bounded reads select recently active agents");
 check(!selected.some((a) => a.alias === "master"), "Master has its own conversation");

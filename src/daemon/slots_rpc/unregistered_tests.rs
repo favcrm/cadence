@@ -24,7 +24,27 @@ impl Peer {
             .unwrap();
         let pid = child.id();
         std::mem::forget(child); // killed (and reaped by init) in drop
-        Peer(pid)
+        let peer = Peer(pid);
+        // CAD-1535: spawn returns once the child has switched images, but
+        // the kernel fills its environ a moment later; until then the
+        // ancestry walk sees no alias and names another reason. Wait for
+        // the forged alias, as `detached` does, so every read sees one peer.
+        let alias_ok = || {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .unwrap_or_default()
+                .split(|b| *b == 0)
+                .any(|e| e == b"CADENCE_ALIAS=cc13-pm")
+        };
+        let mut ready = alias_ok();
+        for _ in 0..100 {
+            if ready {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            ready = alias_ok();
+        }
+        assert!(ready, "forged sleep {pid} environ not readable within 2s");
+        peer
     }
 
     /// The same, detached the way an agent's `setsid` child is: its
@@ -39,19 +59,38 @@ impl Peer {
             .output()
             .unwrap();
         let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
-        // The shell has exited; wait until /proc shows the new parent.
+        // Owned from here on: a panic below drops it and kills only this pid.
+        let peer = Peer(pid);
+        // The shell has exited; wait until the child is the exec'd, live
+        // `sleep` carrying the forged alias and reparented away from us.
+        let me = std::process::id().to_string();
+        let mut ready = false;
         for _ in 0..100 {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-            let ppid = stat
-                .rsplit(')')
-                .next()
-                .and_then(|r| r.split_whitespace().nth(1));
-            if ppid != Some(&std::process::id().to_string()) && ppid.is_some() {
+            let mut fields = stat.rsplit(')').next().unwrap_or("").split_whitespace();
+            let state = fields.next();
+            let ppid = fields.next();
+            let exec_ok = std::fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n == "sleep"))
+                .unwrap_or(false);
+            let live = !matches!(state, None | Some("Z") | Some("X"));
+            let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+            let alias_ok = environ
+                .split(|b| *b == 0)
+                .any(|e| e == b"CADENCE_ALIAS=cc13-pm");
+            let reparented = ppid.is_some_and(|p| p != me);
+            if exec_ok && live && alias_ok && reparented {
+                ready = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        Peer(pid)
+        assert!(
+            ready,
+            "detached sleep {pid} not ready within 2s (exec image, state, environ or reparent)"
+        );
+        peer
     }
 }
 
@@ -214,11 +253,14 @@ fn concurrent_unregistered_callers_never_exceed_the_pool() {
             });
         }
     });
-    // Default pool is 3: exactly three grants, five queued, no double-grant.
-    assert_eq!(granted.load(std::sync::atomic::Ordering::SeqCst), 3);
-    assert_eq!(held(&shared).len(), 3);
+    // The build pool is 3 but CAD-1268's combined default cap is 2:
+    // exactly two grants, six queued, no double-grant.
+    assert_eq!(granted.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(held(&shared).len(), 2);
     let st = shared.rpc_slot_status(&json!({}), peers[0].0).unwrap();
-    assert_eq!(st["waiting"].as_array().unwrap().len(), 5);
+    assert_eq!(st["total_capacity"], 2);
+    assert_eq!(st["config"]["total_slots"], 2);
+    assert_eq!(st["waiting"].as_array().unwrap().len(), 6);
     assert!(st["waiting"]
         .as_array()
         .unwrap()

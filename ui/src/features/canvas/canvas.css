@@ -1,0 +1,116 @@
+/* CAD-1726: the agent canvas, after the approved mockup
+   (preview 20261022-043138/cadence-agent-canvas). z-index 15: above app
+   screen frames (5) and the header (10), below every scrim, modal drawer and
+   popover (20 and up). */
+.canvas-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  max-width: 100vw;
+  min-width: 0;
+  background: var(--color-ink-875);
+  border-left: 1px solid var(--color-ink-700);
+  animation: canvas-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.canvas-drawer[data-mode="cover"] { box-shadow: -18px 0 40px rgb(0 0 0 / 0.35); }
+.canvas-drawer[data-mode="sheet"] { width: 100%; left: 0; border-left: 0; animation-name: sheet-in; }
+@keyframes canvas-in { from { transform: translateX(24px); opacity: 0; } }
+@keyframes sheet-in { from { transform: translateY(24px); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .canvas-drawer { animation: none; }
+  .cv-bar-run, .cv-stage li[data-s="now"]::before { animation: none; }
+}
+/* push: the page keeps room for the drawer; Home's to-do rail and its floating
+   button step aside while the canvas is open. */
+[data-canvas="push"] [data-canvas-main] { padding-right: var(--canvas-w); }
+[data-canvas] .needbtn { display: none; }
+[data-canvas] .home-workspace { grid-template-columns: minmax(0, 1fr); }
+[data-canvas] .home-workspace > aside { display: none; }
+[data-canvas="sheet"] body { overflow: hidden; }
+
+/* Resize grip on the left edge (pointer + arrow keys). */
+.cv-grip { position: absolute; top: 0; bottom: 0; left: -4px; z-index: 3; width: 8px; cursor: col-resize; touch-action: none; }
+.cv-grip::after { content: ""; position: absolute; top: 50%; left: 3px; width: 2px; height: 36px; margin-top: -18px; border-radius: 9999px; background: var(--color-ink-600); transition: background 0.15s ease; }
+.cv-grip:hover::after, .cv-grip:focus-visible::after { background: var(--color-accent); }
+.cv-grip:focus-visible { outline: none; }
+
+/* Tabs (only with more than one artifact open). */
+.cv-tabs { display: flex; min-width: 0; overflow-x: auto; gap: 4px; padding: 6px 8px 0; background: var(--color-ink-850); scrollbar-width: thin; }
+.cv-tab { display: inline-flex; flex-shrink: 0; align-items: center; max-width: 14rem; border-radius: 6px 6px 0 0; color: var(--color-ink-400); }
+.cv-tab[data-active] { background: var(--color-ink-875); color: var(--color-ink-100); }
+.cv-tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 4px 4px 4px 10px; font-size: var(--text-micro); }
+.cv-tab-close { display: inline-grid; place-items: center; min-width: 1.5rem; min-height: 1.5rem; color: var(--color-ink-500); }
+.cv-tab-close:hover { color: var(--color-ink-100); }
+
+/* Header: kind badge, title + status, close; version buttons and actions below. */
+.cv-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; padding: 8px 8px 8px 12px; border-bottom: 1px solid var(--color-ink-800); background: var(--color-ink-850); }
+.cv-title { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1px; min-width: 0; flex: 1; overflow: hidden; }
+.cv-title b { color: var(--color-ink-100); font-size: var(--text-label); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cv-title > span { display: flex; align-items: center; gap: 6px; color: var(--color-ink-500); font: var(--text-micro) var(--font-mono); white-space: nowrap; }
+.cv-iconbtn { display: inline-grid; place-items: center; width: 1.75rem; height: 1.75rem; border-radius: 6px; color: var(--color-ink-400); }
+.cv-iconbtn:hover { color: var(--color-ink-100); background: var(--color-ink-800); }
+.cv-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; flex: 1 0 100%; min-width: 0; }
+.cv-tools .vers { margin-right: auto; }
+
+.arttype { display: grid; place-items: center; flex-shrink: 0; width: 36px; height: 40px; border-radius: 6px; border: 1px solid var(--color-ink-700); background: var(--color-ink-875); color: var(--color-accent); font: 600 9px/1 var(--font-mono); letter-spacing: 0.05em; }
+.artbadge { display: inline-flex; align-items: center; padding: 1px 7px; border-radius: 9999px; background: color-mix(in srgb, var(--color-accent) 16%, transparent); color: var(--color-accent); font: 500 var(--text-micro) var(--font-sans); }
+.artbadge.ok { background: color-mix(in srgb, var(--color-ok) 16%, transparent); color: var(--color-ok); }
+
+.vers { display: inline-flex; flex-wrap: wrap; padding: 2px; gap: 2px; border: 1px solid var(--color-ink-700); border-radius: 7px; background: var(--color-ink-900); max-width: 100%; }
+.vers button { height: 22px; padding: 0 8px; border: 0; border-radius: 5px; background: transparent; color: var(--color-ink-400); font: 500 var(--text-micro) var(--font-mono); cursor: pointer; }
+.vers button[aria-pressed="true"] { background: var(--color-ink-800); color: var(--color-ink-100); }
+.vers button:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+
+/* Working view: the agent's words, the steps so far, the live step, a bar. */
+.cv-work { display: grid; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--color-ink-800); }
+.cv-plan { margin: 0; color: var(--color-ink-200); font-size: var(--text-label); white-space: pre-wrap; max-height: 5rem; overflow: auto; }
+.cv-stage { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; font-size: var(--text-micro); color: var(--color-ink-500); }
+.cv-stage li { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cv-stage li::before { content: ""; flex-shrink: 0; width: 8px; height: 8px; border-radius: 9999px; border: 1px solid var(--color-ink-600); }
+.cv-stage li[data-s="done"] { color: var(--color-ink-300); }
+.cv-stage li[data-s="done"]::before { background: var(--color-ok); border-color: var(--color-ok); }
+.cv-stage li[data-s="now"] { color: var(--color-ink-100); }
+.cv-stage li[data-s="now"]::before { background: var(--color-accent); border-color: var(--color-accent); animation: cv-pulse 1.4s ease-in-out infinite; }
+@keyframes cv-pulse { 50% { opacity: 0.35; } }
+.cv-live { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--color-ink-400); font: var(--text-micro) var(--font-mono); }
+.cv-live > span:not(.workdot):not(.artbadge) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cv-bar { height: 3px; border-radius: 9999px; background: var(--color-ink-800); overflow: hidden; }
+.cv-bar-run { display: block; height: 100%; width: 35%; background: var(--color-accent); animation: cv-run 1.4s ease-in-out infinite; }
+@keyframes cv-run { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
+
+.cv-body { position: relative; flex: 1; min-height: 0; overflow: auto; background: var(--color-ink-900); padding: 12px; display: flex; flex-direction: column; }
+.canvas-doc { min-width: 0; }
+.cv-csv { display: flex; flex: 1; flex-direction: column; gap: 6px; min-height: 0; }
+.cv-csv-scroll { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--color-ink-800); border-radius: 6px; }
+.cv-csv table { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; font: var(--text-micro) var(--font-mono); color: var(--color-ink-200); }
+.cv-csv th, .cv-csv td { padding: 4px 10px; border-bottom: 1px solid var(--color-ink-800); text-align: left; white-space: nowrap; max-width: 28rem; overflow: hidden; text-overflow: ellipsis; }
+.cv-csv th { position: sticky; top: 0; z-index: 1; background: var(--color-ink-850); color: var(--color-ink-100); font-weight: 600; }
+.cv-csv tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--color-ink-850) 50%, transparent); }
+.canvas-frame { flex: 1; width: 100%; min-height: 20rem; border: 0; background: white; }
+.canvas-pdf { display: grid; gap: 6px; align-content: start; }
+.canvas-image { max-width: 100%; height: auto; }
+.cv-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 7px 12px; border-top: 1px solid var(--color-ink-800); background: var(--color-ink-850); color: var(--color-ink-500); font: var(--text-micro) var(--font-mono); }
+
+/* The thread's artifact card. */
+.artcard { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; max-width: min(100%, 26rem); padding: 9px 10px; border: 1px solid var(--color-ink-700); border-radius: 10px; background: var(--color-ink-850); cursor: pointer; transition: border-color 0.15s ease; }
+.artcard:hover { border-color: var(--color-edge-hover, var(--color-ink-500)); }
+.artcard:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.artcard[data-open] { border-color: color-mix(in srgb, var(--color-accent) 45%, var(--color-ink-700)); }
+.arttext { display: grid; gap: 2px; min-width: 0; }
+.arttext b { color: var(--color-ink-100); font-size: var(--text-label); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.artmeta { color: var(--color-ink-500); font: var(--text-micro) var(--font-mono); white-space: nowrap; overflow: hidden; }
+.artopen { color: var(--color-accent); font-size: var(--text-label); }
+
+/* The chat panel's dock (20), jump pill (25), slash menu (30) and chip menu
+   (40) are positioned with no stacking context above them; contain them so
+   they cannot paint over the canvas (15). */
+[data-chat-panel] { isolation: isolate; }
+
+/* Working view: the raw steps stay behind "details". */
+.cv-details { color: var(--color-ink-500); font: var(--text-micro) var(--font-mono); }
+.cv-details summary { cursor: pointer; width: max-content; font-family: var(--font-sans); }
+.cv-details ul { margin: 4px 0 0; padding: 0; list-style: none; display: grid; gap: 2px; overflow-wrap: anywhere; }

@@ -3,14 +3,15 @@ import { ApiError } from "../../lib/api";
 /** Waits between automatic retries of a busy daemon: three tries, then a manual retry. */
 export const BUSY_BACKOFF_MS: readonly number[] = [1000, 2000, 4000];
 
-/** The daemon is busy (PM write lock held): transient, so worth retrying. */
+/** The daemon is busy (PM write lock held): transient, so worth retrying. A 503 `daemon_unavailable` is not busy. */
 export function isBusyError(cause: unknown): boolean {
-  return cause instanceof ApiError && (cause.status === 503 || cause.code === "resource_busy");
+  return cause instanceof ApiError && (cause.code === "resource_busy");
 }
 
 /** What the operator reads when a list could not be loaded. */
 export function loadFailureMessage(cause: unknown): string {
   if (isBusyError(cause)) return "The workspace is busy, so the app list could not be refreshed.";
+  if (cause instanceof ApiError && cause.code === "daemon_unavailable") return "Daemon unreachable. The app list could not be refreshed.";
   return cause instanceof Error && cause.message ? cause.message : "The app list could not be loaded.";
 }
 

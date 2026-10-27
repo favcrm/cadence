@@ -1,11 +1,13 @@
 import { useWriteBlock } from "../auth/WriteGate";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
-import { streamInto, type SseErrorState } from "../../lib/sse";
+import type { SseErrorState } from "../../lib/sse";
 import { useQuery, useResource } from "../../lib/useResource";
-import type { MasterCommandResult, Overview, ThreadRef } from "../../lib/types";
+import { useTranslate } from "../../lib/locale";
+import type { MasterAppOrigin, MasterCommandResult, Overview, ThreadRef } from "../../lib/types";
+import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import {
   composerBlock,
@@ -19,13 +21,33 @@ import {
   type MasterStatus,
   type TurnState,
 } from "./master";
+import { useCanvasFeed } from "../canvas/feed";
 import Composer from "./Composer";
-import { atTail, jumpLabel, tailTop } from "./dock";
+import {
+  AssistantAboutButton,
+  AssistantActorProvider,
+  AssistantFace,
+  useAssistantActor,
+  useConversationActor,
+} from "../assistant/AssistantIdentity";
+import { displayName, readConversationIdentity, scopeDescriptor } from "../assistant/identity";
+import type { AttachDestination } from "../app-shell/chat/attach";
+import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
 import NeedsRail from "./NeedsRail";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
+import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
 import Conversation from "../app-shell/chat/Conversation";
+import { TurnBar } from "../app-shell/chat/TurnBar";
+import { usePendingPermission } from "../app-shell/chat/usePendingApproval";
+import { noteHomeSeen } from "../app-shell/chat/homeUnread";
+import { earlierStep, useThreadStream } from "../app-shell/chat/conversationThread";
+import { turnBarState } from "../app-shell/chat/turnBarState";
+import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
+import MemberChat from "./MemberChat";
+import { memberScope } from "./memberThread";
+import { StreamBanner, ThreadTurn, time } from "./ThreadView";
 import {
   initialFollow,
   motionBehavior,
@@ -35,18 +57,18 @@ import {
   onSend,
   onTailChange,
   onViewportScroll,
+  reducedMotion,
   type Follow,
 } from "./scrollFollow";
 import { sendToMaster } from "./send";
+import { agentOn } from "../../lib/agentOn";
 import SinceCard from "./SinceCard";
 import {
   discardPending,
   lastSeq,
-  applyEarlier,
-  fetchEarlier,
+  newMessageId,
   openStep,
   planAnchors,
-  reduceFrame,
   stepSummary,
   threadItems,
   visibleWindow,
@@ -69,72 +91,164 @@ function fmtElapsed(secs: number): string {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
-const reducedMotion = () =>
-  typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
-
 /**
  * The in-flight turn line (CAD-551): the pulse and elapsed clock while a
  * turn works, the live step cross-fading as it moves, queued/compacting
  * badges, and Stop → `/stop`. `queued`/`submitting` give the operator
  * the honest "behind a turn"/"still sending" states instead of silence.
  */
-function WorkingRow({
-  turn,
-  step,
-  onStop,
-}: {
-  turn: TurnState;
-  step: ThreadEntry | null;
-  onStop: () => void;
-}) {
+function appOriginHref(
+  origin: MasterAppOrigin | null,
+  resolveAppPath: (installId: string) => string | null,
+): string | null {
+  if (!origin || typeof origin !== "object") return null;
+  const { install_id, context_id, conversation_id } = origin;
+  // Strict, fail-closed ids: malformed or foreign shapes give no link. An
+  // empty context is a real destination (a no-context app conversation),
+  // so it only omits the `ctx` selector.
+  const strict = (id: unknown): id is string => typeof id === "string" && id.length > 0 && id.trim() === id;
+  if (!strict(install_id) || !strict(conversation_id)) return null;
+  if (context_id !== "" && !strict(context_id)) return null;
+  // CAD-1438: the canonical `/apps/<key>` route, resolved against the
+  // authorized install list. An ambiguous, removed or unknown install has
+  // no link — never another key's route. `install` pins the immutable id
+  // so a reinstalled/renamed app at the same key can never open this
+  // context and conversation under the replacement.
+  const appPath = resolveAppPath(install_id);
+  if (appPath === null) return null;
+  const ctx = context_id === "" ? "" : `ctx=${encodeURIComponent(context_id)}&`;
+  return `${appPath}?install=${encodeURIComponent(install_id)}&${ctx}conversation=${encodeURIComponent(conversation_id)}`;
+}
+
+/** CAD-1462: the subtle live state on the running turn's own name row
+ *  (the approved mock's `.who .live`): pulse dot, "Working" and the
+ *  elapsed clock right-aligned beside the row's real name and
+ *  timestamp. The row itself supplies who/when; Stop and the truthful
+ *  queued/submitting/compacting information stay in the dock's status
+ *  line, outside the message rows. */
+function AssistantActivity({ since }: { since: number | null }) {
+  const t = useTranslate();
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (turn.kind !== "working") return;
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, [turn.kind]);
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  const elapsed = since !== null && Number.isFinite(since) ? fmtElapsed(Math.max(0, Math.floor(now / 1000 - since))) : null;
+  return (
+    <span className="flex gap-1.5 items-center" data-assistant-activity>
+      <span className="workdot live" aria-hidden />
+      <span>{t("Working")}</span>
+      {/* The 1s-ticking counter is decorative — the dock `.workrow`
+         role=status already announces the truthful state, so this
+         stays silent (CAD-1419: no elapsed-second SR chatter). */}
+      {elapsed !== null && <span className="text-ink-500" aria-hidden>{elapsed}</span>}
+    </span>
+  );
+}
+
+/** A timestamped Assistant name row — the mock's `.who` — for in-flight
+ *  content that has no bubble of its own (tool steps, commentary), so
+ *  the running turn still shows its name, timestamp and live state on
+ *  one header. `at` is the anchored entry's own timestamp. */
+function AssistantNameRow({ at, live }: { at?: string; live: ReactNode }) {
+  const t = useTranslate();
+  const actor = useAssistantActor();
+  return (
+    <div className="flex gap-2 items-center text-micro text-ink-400" data-kind="assistant-name">
+      <span className="text-ink-100 font-medium">{displayName(actor.read, actor.scope, t)}</span>
+      {at ? <span>{at}</span> : null}
+      {/* The same `.chat-live` wrapper Bubble uses: right-aligned accent. */}
+      <span className="chat-live num">{live}</span>
+    </div>
+  );
+}
+
+/** The item the running turn's name-row activity belongs to: the last
+ *  thread item holding a stored entry stamped with the turn's own
+ *  `message` id. Stored entries are per-turn, so commentary, tool
+ *  groups and the answering row of THIS turn carry it; a newer queued
+ *  or failed pending message — or another conversation's turn —
+ *  carries a different id and can never steal the indicator. A pending
+ *  row holds no stored entry yet, so it never matches; an unidentified
+ *  turn anchors nothing here rather than guessing a row. */
+export function activityAnchor(items: ThreadItem[], message: string | undefined | null): string | null {
+  if (typeof message !== "string" || message === "") return null;
+  let found: string | null = null;
+  let answerKey: string | null = null;
+  let cardKey: string | null = null;
+  for (const item of items) {
+    // An artifact card sits after the run that put it (or between two runs'
+    // cards): the header never rides on one while the run itself is there.
+    if (item.type === "artifact") {
+      if (item.entry.message === message) cardKey = item.key;
+      continue;
+    }
+    const entries =
+      item.type === "tools"
+        ? item.entries
+        : item.type === "pending"
+          ? []
+          : [item.entry];
+    if (entries.some((e) => e.message === message)) {
+      found = item.key;
+      if (item.type === "answer") answerKey = item.key;
+    }
+  }
+  // An answer bubble carries the indicator on its own timestamped name
+  // row — prefer it over in-progress steps/commentary of the same turn.
+  return answerKey ?? found ?? cardKey;
+}
+
+/** The dock's one-line turn status (CAD-551, placed in `chatdock` by
+ *  CAD-1462): the truthful queued/submitting/compacting/queued-count
+ *  state, the live step while the turn works, the app-scope link, and
+ *  Stop — the supported interruption, always outside the message rows.
+ *  The working state's row presentation itself moved onto the turn's
+ *  own name row (`AssistantActivity`), so nothing here re-paints a
+ *  full-width loading bar inside the thread. */
+function WorkingRow({
+  turn,
+  appOrigin,
+  step,
+  resolveAppPath,
+}: {
+  turn: TurnState;
+  appOrigin: MasterAppOrigin | null;
+  step: ThreadEntry | null;
+  /** CAD-1438: resolves an install id to its unique canonical path (or null). */
+  resolveAppPath: (installId: string) => string | null;
+}) {
+  const t = useTranslate();
+  const appHref = appOriginHref(appOrigin, resolveAppPath);
   if (turn.kind === "idle") return null;
   const stepText = step ? stepSummary(step.text) : null;
-  const elapsed =
-    turn.kind === "working" &&
-    typeof turn.since === "number" &&
-    Number.isFinite(turn.since)
-      ? fmtElapsed(Math.max(0, Math.floor(now / 1000 - turn.since)))
-      : null;
   return (
     <div className="workrow" role="status" aria-live="polite" data-turn={turn.kind}>
-      <span className={`workdot${turn.kind === "working" ? " live" : ""}`} aria-hidden />
-      {turn.kind === "working" && (
-        <span className="text-ink-200 font-medium shrink-0">Working</span>
-      )}
-      {elapsed !== null && <span className="num text-ink-500 shrink-0">{elapsed}</span>}
       {turn.kind === "queued" && (
         <span className="text-ink-400 min-w-0">
-          Queued{turn.summary ? ` — ${stepSummary(turn.summary)}` : ""}
+          {t("Queued")}{turn.summary ? ` — ${stepSummary(turn.summary)}` : ""}
         </span>
       )}
-      {turn.kind === "submitting" && <span className="text-ink-400">Sending…</span>}
+      {turn.kind === "submitting" && <span className="text-ink-400">{t("Sending…")}</span>}
       {turn.kind === "working" && stepText && (
         <span key={stepText} className="stepfade num text-ink-500 truncate min-w-0">
-          · {stepText}
+          {stepText}
         </span>
       )}
+      {turn.kind === "working" && !stepText && (
+        <span className="text-ink-500 min-w-0">{t("Turn in progress")}</span>
+      )}
       {turn.kind === "working" && turn.compacting === true && (
-        <span className="chip bg-warn/10 text-warn shrink-0">compacting</span>
+        <span className="chip bg-warn/10 text-warn shrink-0">{t("compacting")}</span>
       )}
       {turn.kind === "working" && (turn.queued ?? 0) > 0 && (
         <span className="chip bg-ink-800 text-ink-400 shrink-0">{turn.queued} queued</span>
       )}
       <span className="flex-1" />
-      {turn.kind === "working" && (
-        <button
-          type="button"
-          className="stopbtn shrink-0"
-          onClick={onStop}
-          title="Interrupt the running turn (same as /stop)"
-        >
-          Stop
-        </button>
+      {appHref && (turn.kind === "working" || turn.kind === "queued") && (
+        <Link href={appHref} className="lnk text-micro shrink-0">
+          {t("Open its conversation")} <span aria-hidden>↗</span>
+        </Link>
       )}
     </div>
   );
@@ -191,6 +305,7 @@ function CmdJson({ value }: { value: unknown }) {
 }
 
 function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: string) => void }) {
+  const t = useTranslate();
   return (
     <div className="cmdcard card px-3 py-2 ml-8 min-w-0" data-cmd={cmd.name}>
       <div className="flex items-center gap-2 text-micro">
@@ -199,11 +314,11 @@ function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: strin
           {cmd.arg ? ` ${cmd.arg}` : ""}
         </span>
         {cmd.running ? (
-          <span className="steps-running text-ink-500">running…</span>
+          <span className="steps-running text-ink-500">{t("running…")}</span>
         ) : cmd.ok === false ? (
-          <span className="text-fail">failed</span>
+          <span className="text-fail">{t("failed")}</span>
         ) : (
-          <span className="text-ink-500">done</span>
+          <span className="text-ink-500">{t("done")}</span>
         )}
       </div>
       {cmd.value !== undefined ? (
@@ -238,35 +353,36 @@ function fmtCommandResult(r: MasterCommandResult): { text?: string; value?: unkn
 }
 
 function NotStarted({ status, hosted }: { status: MasterStatus; hosted: boolean | null }) {
+  const t = useTranslate();
   const stopped = status.kind === "stopped";
   return (
     <div className="card px-4 py-4 space-y-3" data-empty="master">
       <h2 className="text-cardtitle font-semibold text-ink-100">
-        {hosted === null ? "Checking assistant availability…" : hosted ? "Your assistant is unavailable" : stopped ? "The master is stopped" : "Start the master to chat"}
+        {hosted === null ? t("Checking assistant availability…") : hosted ? t("Your assistant is unavailable") : stopped ? t("The master is stopped") : t("Start the master to chat")}
       </h2>
       <p className="text-secondary text-ink-400">
-        {hosted === null ? "Checking this board’s session and assistant state." : hosted ? "Your workspace administrator can check the assistant’s setup and restore it. You can send messages once it is available." : "The master is the agent you talk to here. It plans work with you and hands approved tickets to your agents. Start or resume it from a terminal on this machine:"}
+        {hosted === null ? t("Checking this board’s session and assistant state.") : hosted ? t("Your workspace administrator can check the assistant’s setup and restore it. You can send messages once it is available.") : t("The master is the agent you talk to here. It plans work with you and hands approved tickets to your agents. Start or resume it from a terminal on this machine:")}
       </p>
       {hosted === false && <pre className="num text-secondary text-ink-200 bg-ink-800 rounded px-3 py-2 overflow-x-auto">
         {stopped ? RESUME_COMMAND : START_COMMAND}
       </pre>}
       <div className="grid sm:grid-cols-2 gap-3 text-label">
         <div>
-          <div className="slabel mb-1">it can</div>
+          <div className="slabel mb-1">{t("it can")}</div>
           <ul className="list-disc pl-4 space-y-0.5 text-ink-300">
-            <li>read the tracker, reports and what agents are doing</li>
-            <li>propose a plan — tickets with size and acceptance</li>
-            <li>dispatch tickets of a plan you approved</li>
-            <li>answer workers' questions, and bring you the ones it can't</li>
+            <li>{t("read the tracker, reports and what agents are doing")}</li>
+            <li>{t("propose a plan — tickets with size and acceptance")}</li>
+            <li>{t("dispatch tickets of a plan you approved")}</li>
+            <li>{t("answer workers' questions, and bring you the ones it can't")}</li>
           </ul>
         </div>
         <div>
-          <div className="slabel mb-1">it can't</div>
+          <div className="slabel mb-1">{t("it can't")}</div>
           <ul className="list-disc pl-4 space-y-0.5 text-ink-300">
-            <li>approve its own plans — only you do, here or with `cadence plan approve`</li>
-            <li>start work outside an approved plan</li>
-            <li>merge, push or reach your git credentials</li>
-            <li>change settings or other agents</li>
+            <li>{t("approve its own plans — only you do, here or with `cadence plan approve`")}</li>
+            <li>{t("start work outside an approved plan")}</li>
+            <li>{t("merge, push or reach your git credentials")}</li>
+            <li>{t("change settings or other agents")}</li>
           </ul>
         </div>
       </div>
@@ -275,10 +391,12 @@ function NotStarted({ status, hosted }: { status: MasterStatus; hosted: boolean 
 }
 
 function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabled: boolean }) {
+  const t = useTranslate();
+  const actor = useAssistantActor();
   return (
     <div className="card px-4 py-4" data-empty="thread">
-      <h2 className="text-cardtitle font-semibold text-ink-100">Ask the master for work</h2>
-      <p className="text-secondary text-ink-400 mt-1">No conversation yet. Try one of these:</p>
+      <h2 className="text-cardtitle font-semibold text-ink-100">{`${t("Ask")} ${displayName(actor.read, actor.scope, t)}`}</h2>
+      <p className="text-secondary text-ink-400 mt-1">{t("No conversation yet. Try one of these:")}</p>
       <div className="mt-3 grid gap-2">
         {EXAMPLES.map((ex) => (
           <button
@@ -287,7 +405,7 @@ function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabl
             onClick={() => onPick(ex)}
             className="text-left px-3 py-2 rounded border border-ink-700 text-secondary text-ink-200 hover:border-accent/60 hover:text-accent disabled:opacity-50 disabled:hover:border-ink-700 disabled:hover:text-ink-200"
           >
-            {ex}
+            {t(ex)}
           </button>
         ))}
       </div>
@@ -295,7 +413,13 @@ function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabl
   );
 }
 
-const retry = (message: string, text: string, refs?: ThreadRef[]) => sendToMaster(text, message, refs);
+const retry = (
+  message: string,
+  text: string,
+  refs?: ThreadRef[],
+  attachments?: { id: string }[],
+  conversation?: string,
+) => sendToMaster(text, message, refs, attachments, conversation);
 const discard = (message: string) => resources.masterThread.write((s) => discardPending(s, message));
 
 /**
@@ -316,6 +440,8 @@ const ThreadList = memo(function ThreadList({
   onOpenIssue,
   liveAfter,
   onRetry,
+  working,
+  stale,
 }: {
   items: ThreadItem[];
   limit: number;
@@ -325,17 +451,56 @@ const ThreadList = memo(function ThreadList({
   readOnly: boolean;
   onOpenIssue: (id: string) => void;
   liveAfter: number;
-  onRetry: (message: string, text: string, refs?: ThreadRef[]) => void;
+  onRetry: (
+    message: string,
+    text: string,
+    refs?: ThreadRef[],
+    attachments?: { id: string }[],
+    conversation?: string,
+  ) => void;
+  /** The live turn: its own `message` id picks the row the activity
+   *  belongs to; `since` drives the elapsed clock. Null otherwise. */
+  working: { message: string | null; since: number | null } | null;
+  /** CAD-1782: the thread stream is down, so these rows are a snapshot. */
+  stale: boolean;
 }) {
+  const t = useTranslate();
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
   const anchors = useMemo(() => planAnchors(items), [items]);
+  // The name-row activity's row: this turn's own last item only — a
+  // newer pending message or a plan card's anchor never steals it, and
+  // it renders independently of PlanCard (separate slots).
+  const anchorKey = working ? activityAnchor(shown, working.message) : null;
+  // The item the anchored key names: its entry's own timestamp drives
+  // the standalone name row (the turn's newest in-flight moment).
+  const anchorItem = anchorKey === null ? null : shown.find((i) => i.key === anchorKey) ?? null;
+  const anchorEntry: ThreadEntry | null =
+    anchorItem === null
+      ? null
+      : anchorItem.type === "tools"
+        ? anchorItem.entries[anchorItem.entries.length - 1] ?? null
+        : anchorItem.type === "pending"
+          ? null
+          : anchorItem.entry;
+  // A daemon that cannot name its running turn's message still owes an
+  // honest Working signal, and so does a named turn whose first stored
+  // entry has not landed yet: the bounded fallback rides the tail item —
+  // including an answer tail that belongs to an EARLIER turn (a stale or
+  // failed reply). That answer keeps its own header slot, and the
+  // running turn gets a standalone row after it, so a turn is never
+  // invisible in the transcript while the dock counts it working
+  // (CAD-1533).
+  const fallbackItem =
+    working && anchorItem === null && shown.length > 0 ? shown[shown.length - 1] : null;
+  const activityItem = anchorItem ?? fallbackItem;
   if (items.length === 0) return null;
   return (
     <>
+      {stale && <StreamBanner onRetry={() => window.location.reload()} />}
       {(hidden > 0 || moreBefore) && (
         <div className="flex justify-center">
           <button className="lnk text-label disabled:opacity-50" disabled={loadingEarlier} onClick={onEarlier}>
-            {loadingEarlier ? "Loading…" : "Load earlier messages"}
+            {loadingEarlier ? t("Loading…") : t("Load earlier messages")}
           </button>
         </div>
       )}
@@ -344,9 +509,44 @@ const ThreadList = memo(function ThreadList({
         items={shown}
         readOnly={readOnly}
         liveAfter={liveAfter}
+        running={working?.message ?? null} /* null while a send is only submitting */
+        legacyTranscript={!items.some((item) => item.type === "answer")}
         onOpenIssue={onOpenIssue}
         onRetry={onRetry}
         onDiscard={discard}
+        activity={(item) => {
+          if (!working || activityItem === null || item.key !== activityItem.key) return null;
+          const live = <AssistantActivity since={working.since} />;
+          // The anchored row shows this turn's own newest entry time. A
+          // fallback row rides the tail item, which may belong to an
+          // EARLIER turn (a stale or failed reply), so it is stamped with
+          // the running turn's start — never with that foreign time
+          // (CAD-1533 review, finding 1).
+          const at =
+            anchorItem !== null
+              ? anchorEntry
+                ? time(anchorEntry.created)
+                : undefined
+              : working.since !== null
+                ? time(new Date(working.since * 1000).toISOString())
+                : undefined;
+          // The answer bubble carries the indicator on its own name row;
+          // a standalone row covers in-flight steps/commentary that have
+          // none of their own, and the running turn when the row it would
+          // anchor to is another turn's reply (CAD-1533). A turn with no
+          // stored entry yet has nothing to anchor to, so it shows the
+          // inline typing bubble after the operator's own message instead.
+          if (item.type === "answer" && anchorItem !== null) return { kind: "header", node: live };
+          const below = item.type === "operator" || item.type === "pending" || item.type === "answer";
+          const needsTypingTurn =
+            anchorItem === null || item.type === "operator" || item.type === "pending";
+          return {
+            kind: "row",
+            node: needsTypingTurn ? <ThreadTurn items={[]} running /> : <AssistantNameRow at={at} live={live} />,
+            position: below ? "after" : "before",
+            ...(anchorItem === null ? { fallback: true as const } : {}),
+          };
+        }}
         after={(item) =>
           anchors.has(item.key) ? (
             <div className="ml-8">
@@ -371,19 +571,123 @@ const ThreadList = memo(function ThreadList({
  * floating dock at its bottom, and the empty/not-started states sit
  * centred in it with the dock disabled.
  */
+/**
+ * CAD-1485: the outer Home owns the mode decision only. A signed-in
+ * member (or an explicit `?chat=assistant` on a hosted board) gets the
+ * private-assistant surface; everyone else gets the Master workspace.
+ * The two are siblings — MemberChat never mounts MasterHome's hooks,
+ * so a member never subscribes, reads or sends on any Master resource.
+ */
 export default function Home({
+  readOnly,
+  hosted = null,
+  viewerSub = null,
+  viewerIsMember = false,
+  sessionId = null,
+  overview,
+  onOpenIssue,
+  onOpenDecision,
+  overviewHref,
+  permissionsHref,
+  resolveAppPath,
+  setupNotice = null,
+  operator = null,
+}: {
+  readOnly: boolean;
+  hosted?: boolean | null;
+  /** CAD-1817: the verified session proves operator authority, the only
+   *  viewer that may edit the workspace coordinator's identity. `null`
+   *  is unproven, never an operator. */
+  operator?: boolean | null;
+  /** CAD-1485: the verified public session's subject — member or
+   *  operator/owner — when the session names one. `?chat=assistant`
+   *  keys the owner's private chat on it; a member's default view is
+   *  already private. */
+  viewerSub?: string | null;
+  /** The verified session's `role === "member"`. Members use the private
+   *  assistant layout; owners/operators keep the master-transport layout
+   *  unless they select the private layout. The backend still determines
+   *  the actual conversation actor. */
+  viewerIsMember?: boolean;
+  /** The verified session's id — scopes the member-chat store so a
+   *  re-login as another member never reads the previous chat. */
+  sessionId?: string | null;
+  overview: ResourceState<Overview>;
+  onOpenIssue: (id: string) => void;
+  /** Open a reading item in the shared work-item detail (App owns the mount). */
+  onOpenDecision: (open: HomeDecisionOpen) => void;
+  overviewHref: string;
+  /** Settings → Master permissions (the standing "Always" rules). */
+  permissionsHref: string;
+  /** CAD-1438: resolves an install id to its unique canonical `/apps/<key>` path, or null. */
+  resolveAppPath: (installId: string) => string | null;
+  /** The first-run setup strip (CAD-1312): rendered inside the chat
+   *  panel below the Assistant heading so the Needs-you rail beside it
+   *  keeps the workspace's top edge. */
+  setupNotice?: ReactNode;
+}) {
+  // `?chat=assistant` is a UI-mode selector only — it names the signed-in
+  // user's OWN private assistant, never another actor. It changes no actor
+  // and no authority. The private surface is a HOSTED-board feature: a
+  // local or tailnet board's named session (device grant, unsigned local
+  // sign-in) never enters it — those keep the Master workspace, exactly
+  // like a standalone board. On a hosted board a member lands on their own
+  // assistant by default; an owner reaches theirs only through the query.
+  const chatParam = new URLSearchParams(window.location.search).get("chat") === "assistant";
+  const memberChat = hosted === true && viewerSub !== null && (viewerIsMember || chatParam);
+  if (memberChat && viewerSub !== null) {
+    const scope = memberScope(sessionId, viewerSub);
+    return (
+      <MemberChat
+        key={scope}
+        scope={scope}
+        readOnly={readOnly}
+        onOpenIssue={onOpenIssue}
+      />
+    );
+  }
+  return (
+    <MasterHome
+      readOnly={readOnly}
+      hosted={hosted}
+      overview={overview}
+      onOpenIssue={onOpenIssue}
+      onOpenDecision={onOpenDecision}
+      overviewHref={overviewHref}
+      permissionsHref={permissionsHref}
+      resolveAppPath={resolveAppPath}
+      setupNotice={setupNotice}
+      operator={operator}
+    />
+  );
+}
+
+/** The shared master-transport pane: Native coordinator or verified hosted
+ *  actor. The outer Home chooses the layout without changing recipients. */
+function MasterHome({
   readOnly,
   hosted = null,
   overview,
   onOpenIssue,
+  onOpenDecision,
   overviewHref,
+  permissionsHref,
+  resolveAppPath,
+  setupNotice = null,
+  operator = null,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
+  operator?: boolean | null;
   overview: ResourceState<Overview>;
   onOpenIssue: (id: string) => void;
+  onOpenDecision: (open: HomeDecisionOpen) => void;
   overviewHref: string;
+  permissionsHref: string;
+  resolveAppPath: (installId: string) => string | null;
+  setupNotice?: ReactNode;
 }) {
+  const t = useTranslate();
   const thread = useQuery(resources.masterThread);
   const agents = useResource(resources.agents);
   const master = useQuery(resources.masterState);
@@ -394,11 +698,13 @@ export default function Home({
   // CAD-574: the rail's collapse is a layout concern — the grid column
   // narrows with it, so the state lives here and the rail renders it.
   const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
-  const [link, setLink] = useState<SseErrorState | "live" | null>(null);
+  const [link, setLink] = useState<SseErrorState | "live" | null>("reconnecting");
   const [limit, setLimit] = useState(WINDOW);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [cmds, setCmds] = useState<CmdResult[]>([]);
   const [unseen, setUnseen] = useState(0);
+  // Same-row growth while the reader is in history (no count to show).
+  const [activity, setActivity] = useState(false);
   const [glideTick, setGlideTick] = useState(0);
   const cmdSeq = useRef(0);
   const follow = useRef<Follow>(initialFollow());
@@ -418,31 +724,140 @@ export default function Home({
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.data !== null;
   const moreBefore = thread.data?.moreBefore === true;
+  // The default master-state response already resolves Home before its first
+  // transcript exists. Keep that server-issued binding when the empty thread
+  // (or its first streamed entries) does not carry a thread ID yet.
+  const homeProjection = master.status === "ok" ? master.data?.actor_identity : null;
+  const homeConversation = thread.data?.conversation
+    ?? (homeProjection?.scope === "personal"
+      && typeof homeProjection.conversation_id === "string"
+      && readConversationIdentity(master.data, homeProjection.conversation_id).read.state === "ready"
+      ? homeProjection.conversation_id
+      : undefined);
+  useEffect(() => {
+    if (homeConversation === undefined || thread.data === null
+      || thread.data.conversation !== undefined
+      || resources.masterState.get().data !== master.data) return;
+    // Stream admission and turn controls use the same canonical binding.
+    // Never replace a transcript's ID or seed a superseded session's store.
+    resources.masterThread.mutate((current) => current.conversation === undefined
+      ? { ...current, conversation: homeConversation }
+      : current);
+  }, [homeConversation, thread.data, master.data]);
+  const attachDestination: AttachDestination | undefined = loaded && !missing
+    ? homeConversation ? { conversation: homeConversation } : {}
+    : undefined;
+  const canAttach = !readOnly && attachDestination !== undefined;
 
   const masterRow = agents.data?.agents.find((a) => a.alias === MASTER);
   const submitting = (thread.data?.pending ?? []).some((p) => p.state !== "failed");
   const turn = turnState(master.data, masterRow, submitting);
+  // The turn bar (turnBar.ts) is the same derivation Conversation uses, so
+  // the two surfaces cannot disagree: Stop only for the running turn's own
+  // message, Cancel only for this surface's own queued message. Home uses
+  // the server-issued thread ID, just as app conversations do.
+  const threadEntries = thread.data?.entries ?? [];
+  const permissionPending = usePendingPermission(threadEntries);
+  // Results older than this Home visit are history, not a live outcome.
+  const liveSince = useMemo(() => Date.now(), []);
+  const streamReconnecting = link !== null && link !== "live";
+  const turnBar = turnBarState(
+    {
+      master: master.data,
+      entries: threadEntries,
+      pendingMessages: (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message),
+      awaitingApproval: permissionPending,
+      reconnecting: streamReconnecting,
+      liveSince,
+    },
+    homeConversation ?? null,
+  );
+  // The Pi watch closes normally between turns; the SPA reconnects with a
+  // fresh cursor. That is not a stale conversation while no turn is active.
+  // `writing` and `approval` are presentations of a running turn; `sending`
+  // is a message already in flight. All three still need the outage notice.
+  const activeTurn =
+    turnBar.kind === "working" ||
+    turnBar.kind === "writing" ||
+    turnBar.kind === "approval" ||
+    turnBar.kind === "sending" ||
+    turnBar.kind === "queued";
+  const aheadHref = useConversationDestination(
+    turnBar.kind === "queued" ? turnBar.aheadConversation : null,
+    master.data,
+    homeConversation,
+  );
+  const failedEntry = turnBar.kind === "failed" && turnBar.message !== null
+    ? threadEntries.find((entry) => entry.role === "operator" && entry.message === turnBar.message) ?? null
+    : null;
+  const serverTurn = master.data?.turn;
+  // `turnState` retains the message id for working turns. For queued turns
+  // it drops that id, so recover it only when its server-derived display
+  // fields still match the same queued master turn (before its row fallback).
+  const displayedTurnMessage =
+    turn.kind === "working"
+      ? turn.message
+      : turn.kind === "queued" &&
+          serverTurn?.state === "queued" &&
+          turn.summary === serverTurn.summary &&
+          turn.since === serverTurn.since
+        ? serverTurn.message
+        : undefined;
+  const turnOrigin =
+    master.status === "ok" &&
+    !master.inFlight &&
+    serverTurn !== undefined &&
+    serverTurn !== null &&
+    displayedTurnMessage !== undefined &&
+    displayedTurnMessage === serverTurn.message &&
+    serverTurn.app_origin != null &&
+    serverTurn.conversation === serverTurn.app_origin.conversation_id
+      ? serverTurn.app_origin
+      : null;
   const step = useMemo(() => openStep(thread.data?.entries ?? []), [thread.data]);
+  useCanvasFeed({
+    conversation: homeConversation ?? null,
+    surface: "home",
+    composerKey: "home",
+    items,
+    loaded: loaded && !missing,
+    // The turn must be this conversation's own: an app-origin turn is not.
+    running: turn.kind === "working" && turnOrigin === null ? turn.message : null,
+  });
+  // The running turn's name-row activity anchors to this turn's own
+  // message id — the item holding its newest stored entry (a pending
+  // row has no stored entry yet, so its row is the anchor while it
+  // waits). Once the terminal `turn_result` lands the daemon flips
+  // `turn.state` off working and the indicator clears with the reply.
+  // The inline typing bubble starts the moment the send begins: `submitting`
+  // is the composer's own POST in flight (no stored entry to anchor on yet),
+  // `working` the daemon's verified turn. A queued wait keeps the dock's
+  // honest "behind a turn" line instead of claiming to type.
+  const workingActivity =
+    turn.kind === "working"
+      ? { message: turn.message, since: typeof turn.since === "number" ? turn.since : null }
+      : turn.kind === "submitting"
+        ? { message: null, since: null }
+        : null;
+  // The ResizeObserver re-subscribes when the name-row indicator appears
+  // or clears (its content lives inside the observed list): a running
+  // turn with any row to ride, whether it anchors to its own entry or
+  // falls back to any tail item — answers included (CAD-1533 review,
+  // finding 2).
+  const nameRowShown = workingActivity !== null && items.length > 0;
 
   // Live entries: the store opened on the newest page, so the stream
   // resumes after its last seq — never a replay of the history. On a
   // reconnect `streamInto` resumes with `?after=<last id>` and the
   // reducer dedupes by seq: no gaps, no repeats.
-  useEffect(() => {
-    if (!loaded || missing) return;
-    const sub = streamInto(resources.masterThread, reduceFrame, {
-      url: `/api/threads/${MASTER}/stream`,
-      events: ["entry"],
-      lastEventId: String(lastSeq(resources.masterThread.get().data) ?? 0),
-      onError: (state) => {
-        setLink(state);
-        // The alias went away (a 4xx for good): re-read to show why.
-        if (state === "stopped") void resources.masterThread.refresh();
-      },
-    });
-    setLink("live");
-    return () => sub.close();
-  }, [loaded, missing]);
+  useThreadStream(
+    resources.masterThread,
+    `/api/threads/${MASTER}/stream`,
+    loaded && !missing && (master.data === null
+      || !Object.hasOwn(master.data, "actor_identity")
+      || thread.data?.conversation !== undefined),
+    setLink,
+  );
 
   // The seq watermark for the enter animation: items at or below the
   // mount tail are history — they render still; only what lands after
@@ -454,18 +869,13 @@ export default function Home({
   }, [loaded, thread.data]);
 
   // Keep master_state honest: it follows the agents resource's
-  // invalidations (turn boundaries land there), and polls gently while a
-  // turn works — context use drifts inside a turn without touching the
-  // agents row. A daemon that answered 501 (no master_state) stops the
+  // invalidations (turn boundaries land there) and the `master` stream
+  // frame (CAD-1700: turn, queue, tool steps and permissions in any
+  // conversation). A daemon that answered 501 (no master_state) stops the
   // follow — send/command refreshes still retry it explicitly.
   useEffect(() => {
     if (master.status !== "failed") void resources.masterState.refresh();
   }, [agents.data, master.status]);
-  useEffect(() => {
-    if (turn.kind !== "working") return;
-    const t = setInterval(() => void resources.masterState.refresh(), 12_000);
-    return () => clearInterval(t);
-  }, [turn.kind]);
   // Turn boundaries land on the thread stream before the agents row
   // moves — a `turn_result` or a queued `message` tail revalidates the
   // state immediately so the working row clears with the reply, not a
@@ -477,6 +887,11 @@ export default function Home({
       void resources.masterState.refresh();
     }
   }, [tailSeq]);
+  // Opening Home marks its complete latest reply watermark, not a bounded tail.
+  const homeReplySeq = thread.data?.replySeq ?? 0;
+  useEffect(() => {
+    if (homeReplySeq > 0) noteHomeSeen(homeReplySeq);
+  }, [homeReplySeq]);
 
   // Smart scroll (CAD-551, panel-scoped CAD-600) plus send-pin
   // (CAD-610). Follow the tail while the operator is already there.
@@ -502,12 +917,31 @@ export default function Home({
     const next = onSend(follow.current);
     follow.current = next.state;
     setUnseen(0);
+    setActivity(false);
     setGlideTick((n) => n + 1);
   }, []);
+  const sendPersonalRequest = useCallback(async (text: string) => {
+    if (readOnly || block || homeConversation === undefined) throw new Error("Sending is unavailable.");
+    engage();
+    const receipt = await sendToMaster(text, newMessageId(), undefined, undefined, homeConversation);
+    if (!receipt.ok) throw new Error(receipt.error);
+  }, [readOnly, block, homeConversation, engage]);
+  const actor = useConversationActor(
+    master,
+    operator === true && !readOnly,
+    homeConversation ?? null,
+    readOnly || !!block || homeConversation === undefined ? null : sendPersonalRequest,
+  );
   const onRetrySend = useCallback(
-    (message: string, text: string, refs?: ThreadRef[]) => {
+    (
+      message: string,
+      text: string,
+      refs?: ThreadRef[],
+      attachments?: { id: string }[],
+      conversation?: string,
+    ) => {
       engage();
-      retry(message, text, refs);
+      retry(message, text, refs, attachments, conversation);
     },
     [engage],
   );
@@ -515,6 +949,7 @@ export default function Home({
     const el = scrollRef.current;
     if (!el) return;
     const near = atTail(el.scrollTop, el.scrollHeight, el.clientHeight);
+    if (near) setActivity(false);
     applyFollow(onViewportScroll(follow.current, near));
   }, []);
 
@@ -525,6 +960,7 @@ export default function Home({
     const onScrollEnd = () => {
       const settled = onScrollSettled(follow.current, nearNow());
       applyFollow(settled.state);
+      if (settled.state.pinned) setActivity(false);
       if (settled.scroll === "jump") scrollPanel("jump");
     };
     // Only an in-flight send glide is cancelled here. Once it has
@@ -568,6 +1004,47 @@ export default function Home({
     };
   }, [scrollPanel]);
 
+  // Same-row growth (a streamed reply, a tool step, the name row's
+  // working line) keeps `items.length` and `lastKey` unchanged, so the
+  // tail effect below does not run for it. Observe the thread's own
+  // content box and follow only while pinned: a reader in history keeps
+  // its position and the pill counts nothing here.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let last = el.scrollHeight;
+    const ro = new ResizeObserver(() => {
+      const h = el.scrollHeight;
+      const grew = h > last;
+      last = h;
+      if (!grew || follow.current.programmatic) return;
+      if (follow.current.pinned) scrollPanel("jump");
+      else setActivity(true);
+    });
+    // Observe every direct child so growth in any block (the reply row,
+    // the working line, a tool group) reaches the observer.
+    for (const child of Array.from(el.children)) ro.observe(child);
+    return () => ro.disconnect();
+  }, [scrollPanel, items.length, nameRowShown, turn.kind, cmds.length]);
+
+  // The scroller's own box changing height (a shorter window, a notice
+  // mounting above it) can leave the tail under the dock: on any change
+  // while the pinned flag is set, jump back to the tail; a reader who
+  // scrolled up is not pinned and keeps their place.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let prev = el.clientHeight;
+    const ro = new ResizeObserver(() => {
+      const next = el.clientHeight;
+      const repin = repinOnResize(follow.current.pinned, prev, next);
+      prev = next;
+      if (repin) scrollPanel("jump");
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [scrollPanel]);
+
   // The dock's measured height is the thread's bottom padding and the
   // pill's floor (`--dock-h`, styles.css); while pinned, a growing dock
   // (a longer draft, a wrapped hint) keeps the tail in view.
@@ -575,8 +1052,12 @@ export default function Home({
     const dock = dockRef.current;
     if (!dock || typeof ResizeObserver === "undefined") return;
     const apply = () => {
+      // Judge "on the tail" before the new padding lands: a strip that
+      // appears (Queued) must not push the last bubble under the dock.
+      const el = scrollRef.current;
+      const onTail = el ? atTail(el.scrollTop, el.scrollHeight, el.clientHeight) : false;
       document.documentElement.style.setProperty("--dock-h", `${dock.offsetHeight}px`);
-      if (follow.current.pinned) scrollPanel("jump");
+      if (follow.current.pinned || onTail) scrollPanel("jump");
     };
     const ro = new ResizeObserver(apply);
     ro.observe(dock);
@@ -632,6 +1113,7 @@ export default function Home({
     const next = onPill(follow.current);
     follow.current = next.state;
     setUnseen(0);
+    setActivity(false);
     scrollPanel(next.scroll);
   };
 
@@ -676,24 +1158,30 @@ export default function Home({
     [],
   );
 
+  const runTurnCommand = useCallback((command: "stop" | "cancel", message: string) => {
+    if (writeBlock !== null) return;
+    const id = ++cmdSeq.current;
+    api
+      .masterCommand(command, undefined, undefined, message)
+      .then((r) => {
+        void resources.masterState.refresh();
+        if (!r.ok) setCmds((c) => [...c, { id, name: command, ok: false, text: "The master did not accept the command." }]);
+      })
+      .catch((e: ApiError) => setCmds((c) => [...c, { id, name: command, ok: false, text: e.message }]));
+  }, [writeBlock]);
+
   const onEarlier = useCallback(() => {
-    const data = resources.masterThread.get().data;
-    if (!data) return;
-    const hidden = Math.max(0, threadItems(data).length - limit);
-    if (hidden > 0) {
+    const step = earlierStep(resources.masterThread, threadReader(MASTER), limit);
+    if (step === null || step.kind === "complete") return;
+    if (step.kind === "widen") {
       setLimit((l) => l + WINDOW);
       return;
     }
-    const page = fetchEarlier(threadReader(MASTER), data);
-    if (!page) {
-      resources.masterThread.write((cur) => ({ ...(cur ?? data), moreBefore: false }));
-      return;
-    }
     setLoadingEarlier(true);
-    page
+    step.page
       .then((older) => {
         earlierLanded.current = true;
-        resources.masterThread.write((cur) => applyEarlier(cur, older));
+        step.land(older);
         setLimit((l) => l + WINDOW);
       })
       .catch(() => undefined)
@@ -705,8 +1193,8 @@ export default function Home({
 
   /** Ask master: a prefilled draft with the row's subject as refs —
    *  never sends; the operator reviews it in the composer. */
-  const onAsk = (need: HomeNeed) => {
-    const draft = askDraft(need);
+  const onAsk = (need: HomeNeed, lead?: string) => {
+    const draft = askDraft(need, lead);
     setSeed((s) => ({ text: draft.text, refs: draft.refs, n: s.n + 1 }));
   };
   const toggleRail = () => {
@@ -717,6 +1205,7 @@ export default function Home({
   };
 
   return (
+    <AssistantActorProvider actor={actor}>
     <main
       className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
         railCollapsed
@@ -733,55 +1222,71 @@ export default function Home({
           readOnly={readOnly}
           onOpenIssue={onOpenIssue}
           overviewHref={overviewHref}
+          permissionsHref={permissionsHref}
           onAsk={onAsk}
+          onOpenDecision={onOpenDecision}
           onAskAgent={(agent, update) => setSeed((s) => ({
-            text: `Check in with ${agent.alias}${agent.on.length ? ` on ${agent.on.join(", ")}` : ""}. ${update ? `Their latest update: ${update.label}${update.text ? ` — ${update.text.slice(0, 1200)}` : ""}. ` : ""}What is the current progress, and does anything need my input?`,
+            text: `Check in with ${agent.alias}${agentOn(agent).length ? ` on ${agentOn(agent).join(", ")}` : ""}. ${update ? `Their latest update: ${update.label}${update.text ? ` — ${update.text.slice(0, 1200)}` : ""}. ` : ""}What is the current progress, and does anything need my input?`,
             refs: [], n: s.n + 1,
           }))}
           collapsed={railCollapsed}
           onToggleCollapse={toggleRail}
+          onSent={engage}
         />
       </aside>
 
-      <section className="min-w-0 rail:order-1 flex flex-col min-h-0 gap-4" aria-label="master thread">
-        <SinceCard onOpenIssue={onOpenIssue} />
+      <section className="min-w-0 rail:order-1 flex flex-col min-h-0 gap-4" aria-label={t("master thread")}>
+        <SinceCard onOpenIssue={onOpenIssue} hosted={hosted} />
 
         {/* CAD-600: the conversation panel — the master's header, the
             thread scrolling inside it, and the composer docked to its
             bottom. It fills the height below the board header; the page
             itself never scrolls for the chat. */}
         <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
-          <div className="master-heading flex items-center gap-2 flex-wrap pb-2.5 border-b border-ink-700/70">
-            <h1 className="text-section font-semibold text-ink-100">Master</h1>
-            <span
-              className={`chip ${
-                status.kind === "running"
-                  ? "bg-ok/15 text-ok"
-                  : status.kind === "unknown"
-                    ? "bg-ink-800 text-ink-400"
-                    : "bg-warn/10 text-warn"
-              }`}
-            >
-              {status.kind === "running" ? status.state : status.kind === "absent" ? "not started" : status.kind}
-            </span>
-            <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
-            {link && link !== "live" && status.kind === "running" && (
-              <span className="text-micro text-ink-500">{link === "stopped" ? "stream stopped" : "reconnecting…"}</span>
-            )}
+          <div
+            className="master-heading assistant-heading pb-2.5 border-b border-ink-700/70"
+            data-assistant-identity={actor.scope ?? undefined}
+            data-identity-state={actor.read.state}
+          >
+            <AssistantFace size={30} active={status.kind === "running"} />
+            <div className="assistant-heading-text">
+              <div className="assistant-heading-name">
+                <h1 className="text-section font-semibold text-ink-100" data-assistant-name>{displayName(actor.read, actor.scope, t)}</h1>
+                <span
+                  className={`chip ${
+                    status.kind === "running"
+                      ? "bg-ok/15 text-ok"
+                      : status.kind === "unknown"
+                        ? "bg-ink-800 text-ink-400"
+                        : "bg-warn/10 text-warn"
+                  }`}
+                >
+                  {status.kind === "running" ? status.state : status.kind === "absent" ? t("not started") : status.kind}
+                </span>
+                <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
+                {streamReconnecting && activeTurn && status.kind === "running" && (
+                  <span className="text-micro text-ink-500">{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
+                )}
+              </div>
+              <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
+            </div>
+            <div className="assistant-heading-actions">
+              <AssistantAboutButton />
+            </div>
           </div>
 
-          <p className="text-label text-ink-500 pt-2 pb-1">Plan work, check in with your agents, and discuss what comes next. <span className="text-ink-400">All projects</span></p>
+          {setupNotice}
 
           {thread.status === "failed" && (
             <div className="card px-3.5 py-3 mt-3 text-label text-fail break-words" role="alert">
-              The thread could not be read — {thread.error}{" "}
+              {t("The thread could not be read —")} {thread.error}{" "}
               <button className="lnk" onClick={() => void resources.masterThread.refresh()}>
-                Retry
+                {t("Retry")}
               </button>
             </div>
           )}
           {!loaded && thread.status !== "failed" && (
-            <p className="text-label text-ink-500 pt-3">Reading the thread…</p>
+            <p className="text-label text-ink-500 pt-3">{t("Reading the thread…")}</p>
           )}
 
           <div
@@ -811,24 +1316,100 @@ export default function Home({
               onOpenIssue={onOpenIssue}
               liveAfter={liveAfter.current ?? 0}
               onRetry={onRetrySend}
+              working={workingActivity}
+              stale={streamReconnecting && activeTurn}
             />
             {cmds.map((c) => (
               <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />
             ))}
-            <WorkingRow turn={turn} step={step} onStop={() => runCommand("stop", "")} />
           </div>
 
-          {unseen > 0 && (
+          {/* The status node stays mounted so a screen reader announces the
+              pill's arrival (a live region added with its text is not). */}
+          <span role="status" aria-live="polite" className="sr-only">
+            {showJumpPill(unseen, activity) ? jumpLabel(unseen, t) : ""}
+          </span>
+          {showJumpPill(unseen, activity) && (
             <button type="button" className="newpill num" onClick={jumpToLatest} data-jump-to-latest>
-              ↓ {jumpLabel(unseen)}
+              <span aria-hidden="true">↓</span> {jumpLabel(unseen, t)}
             </button>
           )}
 
           <div className="chatdock" ref={dockRef} data-chat-dock>
-            <Composer block={block} seed={seed} onCommand={runCommand} onSent={engage} />
+            {/* The turn bar (CAD-1700) owns the turn's state and its Stop and
+                Cancel; the working presentation itself is the subtle name-row
+                indicator (CAD-1462). */}
+            <TurnBar
+              state={turnBar}
+              reconnecting={streamReconnecting && activeTurn}
+              since={serverTurn?.since ?? null}
+              actions={{
+                onStop: writeBlock === null ? (message) => runTurnCommand("stop", message) : undefined,
+                onCancel: writeBlock === null ? (message) => runTurnCommand("cancel", message) : undefined,
+                onRetry:
+                  writeBlock === null && failedEntry !== null
+                    ? () => {
+                        engage();
+                        const payload = failedEntry.payload ?? {};
+                        const list = (key: string) => (Array.isArray(payload[key]) ? (payload[key] as unknown[]) : []);
+                        const refs = list("refs").flatMap((item) => {
+                          const r = item as { kind?: unknown; id?: unknown };
+                          return typeof r.kind === "string" && typeof r.id === "string"
+                            ? [{ kind: r.kind, id: r.id }]
+                            : [];
+                        });
+                        const attachments = list("attachments").flatMap((item) => {
+                          const a = item as { id?: unknown };
+                          return typeof a.id === "string" ? [{ id: a.id }] : [];
+                        });
+                        const mediaRefs = list("media_refs").flatMap((item) => {
+                          if (!item || typeof item !== "object") return [];
+                          const ref = item as Record<string, unknown>;
+                          return typeof ref.asset_id === "string" && typeof ref.revision === "number" && typeof ref.sha256 === "string"
+                            ? [{ asset_id: ref.asset_id, revision: ref.revision, sha256: ref.sha256 }]
+                            : [];
+                        });
+                        const conversation =
+                          typeof payload.conversation === "string" ? payload.conversation : undefined;
+                        void sendToMaster(failedEntry.text, newMessageId(), refs, attachments.length ? attachments : undefined, conversation, undefined, mediaRefs.length ? mediaRefs : undefined);
+                      }
+                    : undefined,
+                onView: turnBar.kind === "queued" && aheadHref !== null
+                  ? aheadHref === "/" ? jumpToLatest : () => window.location.assign(aheadHref)
+                  : undefined,
+                onReview: () => {
+                  const card = scrollRef.current?.querySelector<HTMLElement>("[data-permission-status='pending']");
+                  card?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });
+                },
+              }}
+            />
+            {/* Another conversation's turn (an app's), with its link: Home's
+                own turn is the turn bar above. */}
+            {turnBar.kind === "idle" && (
+              <WorkingRow
+                turn={turn}
+                appOrigin={turnOrigin}
+                step={step}
+                resolveAppPath={resolveAppPath}
+              />
+            )}
+            <Composer
+              block={block}
+              seed={seed}
+              onCommand={runCommand}
+              onSent={engage}
+              attachEnabled={canAttach}
+              attachDestination={attachDestination}
+              attachReason={readOnly
+                ? "The board is read-only."
+                : missing
+                  ? "The Master conversation is unavailable."
+                  : "A Home conversation must be ready before attaching files."}
+            />
           </div>
         </div>
       </section>
     </main>
+    </AssistantActorProvider>
   );
 }

@@ -154,11 +154,11 @@ impl Fx {
     fn arm_resolver(&self) {
         let stub = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = stub.server_addr().to_string();
-        let body = json!({"ok": true, "data": [{
+        let body = json!({"ok": true, "data": {"version": "1", "destinations": [{
             "connectionId": CONN, "toolkit": "facebook",
             "displayName": "Harbour", "destinationId": DEST,
             "status": "active", "available": true, "publishable": true,
-        }]})
+        }]}})
         .to_string();
         std::thread::spawn(move || {
             for request in stub.incoming_requests() {
@@ -364,6 +364,16 @@ impl Fx {
             let token = cadence_agent::adapter::registry::CLAUDE_MANAGED_TURN_TOKENS.mint("g1");
             store.mark_running(&message, &token).unwrap();
             let msg = store.message(&message).unwrap().unwrap();
+            if step == 1 {
+                let artifact = run["artifacts"][0]["id"].as_str().unwrap();
+                store
+                    .app_artifact_with_digest(
+                        artifact,
+                        Some((&msg.id, msg.turn_id.as_deref().unwrap())),
+                        bundle,
+                    )
+                    .unwrap();
+            }
             let reply = json!({"turn_id": msg.turn_id, "text": reply.to_string()});
             store.finish(&msg, "completed", &reply, None).unwrap();
         };
@@ -729,21 +739,37 @@ fn forged_destination_grant_scope_approval_and_price_are_refused() {
 /// A minimal HTTP POST against a board on `dir` over an ephemeral port,
 /// asserting `who` through the seam headers. Returns (status, body).
 fn http_post(dir: &std::path::Path, who: &str, path: &str, body: &str) -> (u16, String) {
-    let free = |p: &u16| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok();
-    let port = (3110..3200).find(free).unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
+    // Start-and-acknowledge: a probed-then-dropped port can be taken before
+    // this board binds, so a failed bind tries the next candidate (CAD-1724).
     let stop = Arc::new(AtomicBool::new(false));
-    let opts = cadence_agent::ui::ServeOpts {
-        host: "127.0.0.1".into(),
-        port,
-        stop: Some(stop.clone()),
-        startup: Some(tx),
-        test_seam: true,
-        ..Default::default()
-    };
-    let (dir_owned, pm) = (dir.to_path_buf(), dir.join("pm"));
-    let board = std::thread::spawn(move || cadence_agent::ui::serve(&dir_owned, &pm, &opts));
-    rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+    let (port, board) = (3110..3200)
+        .find_map(|port| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(stop.clone()),
+                startup: Some(tx),
+                test_seam: true,
+                ..Default::default()
+            };
+            let (dir_owned, pm) = (dir.to_path_buf(), dir.join("pm"));
+            let board =
+                std::thread::spawn(move || cadence_agent::ui::serve(&dir_owned, &pm, &opts));
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(())) => Some((port, board)),
+                Ok(Err(_)) => {
+                    // The board reported a bind failure and has returned; join it so
+                    // no server can survive the attempt.
+                    let _ = board.join();
+                    None
+                }
+                // A board that never reported is not a port collision: fail loudly
+                // rather than retry with a server possibly still running.
+                Err(_) => panic!("board on port {port} did not report startup"),
+            }
+        })
+        .expect("no board port in 3110-3199");
     let token = Seam::token_at(dir).unwrap();
     let host = format!("cadence-{port}.localhost:{port}");
     let req = format!(

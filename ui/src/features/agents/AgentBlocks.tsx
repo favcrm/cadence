@@ -1,6 +1,7 @@
 /** Presentational agent blocks shared by the Agents list and the agent drawer. */
 
 import { activityTimeMs, fmtTime } from "../../lib/fmt";
+import { useTranslate } from "../../lib/locale";
 import { agentStatus } from "./agentView";
 import type { Agent, AgentTask } from "../../lib/types";
 
@@ -48,8 +49,8 @@ export function activeTasks(a: Agent): AgentTask[] {
   );
 }
 
-function taskLabel(task: AgentTask): string {
-  const title = task.title ?? "untitled task";
+function taskLabel(task: AgentTask, t: (english: string) => string): string {
+  const title = task.title ?? t("untitled task");
   const issue = task.issue ? `${task.issue} · ` : "";
   const job = task.job_title ?? task.job;
   const jobText = job ? ` · ${job}` : "";
@@ -63,6 +64,7 @@ export function WorkBlock({
   agent: Agent;
   onOpenIssue?: (id: string) => void;
 }) {
+  const t = useTranslate();
   const tasks = activeTasks(agent);
   const runningTaskIds = new Set(
     (agent.running_messages ?? [])
@@ -81,8 +83,8 @@ export function WorkBlock({
   if (work.length > 0) {
     return (
       <div className="space-y-1.5 min-w-0">
-        {blocked && <div className="text-fail">blocked by quota</div>}
-        {approval && <div className="text-warn">Waiting for input</div>}
+        {blocked && <div className="text-fail">{t("blocked by quota")}</div>}
+        {approval && <div className="text-warn">{t("Waiting for input")}</div>}
         {work.map(({ task, live }) => (
           <div key={task.task} className="min-w-0">
             <div className="flex items-center gap-1.5 min-w-0">
@@ -100,26 +102,26 @@ export function WorkBlock({
                   {task.issue}
                 </button>
               ) : null}
-              <span className="truncate text-ink-200" title={taskLabel(task)}>
+              <span className="truncate text-ink-200" title={taskLabel(task, t)}>
                 {task.title ?? task.task}
               </span>
             </div>
             <div className="num text-micro text-ink-500 pl-3">
-              {live ? "running" : task.task_state}
+              {live ? t("running") : task.task_state}
               {task.job_title
                 ? ` · ${task.job_title}`
                 : task.job
                   ? ` · ${task.job}`
                   : ""}
-              {task.job_state ? ` · stage ${task.job_state}` : ""}
+              {task.job_state ? ` · ${t("stage")} ${task.job_state}` : ""}
             </div>
           </div>
         ))}
       </div>
     );
   }
-  if (blocked) return <span className="text-fail">blocked by quota</span>;
-  if (approval) return <span className="text-warn">Waiting for input</span>;
+  if (blocked) return <span className="text-fail">{t("blocked by quota")}</span>;
+  if (approval) return <span className="text-warn">{t("Waiting for input")}</span>;
   if (agent.running > 0) {
     const summaries = (agent.running_messages ?? [])
       .map((message) => message.summary)
@@ -130,28 +132,39 @@ export function WorkBlock({
       .filter(Boolean)
       .join(" · ");
     return (
-      <span className="text-info" title={summaries || ids || "ad-hoc running"}>
-        {summaries || ids || "Running without an issue"}
+      <span className="text-info" title={summaries || ids || t("ad-hoc running")}>
+        {summaries || (ids ? t("Working on a message") : t("Running without an issue"))}
       </span>
     );
   }
   if (agent.queued > 0)
-    return <span className="text-info">{agent.queued} queued</span>;
+    return (
+      <span className="text-info">
+        {t("{count} queued").replace("{count}", String(agent.queued))}
+      </span>
+    );
   if (agent.unknown > 0)
-    return <span className="text-fail">{agent.unknown} needs review</span>;
-  if (agent.inbox) return <span className="text-ink-500">mailbox</span>;
+    return (
+      <span className="text-fail">
+        {t("{count} needs review").replace("{count}", String(agent.unknown))}
+      </span>
+    );
+  if (agent.inbox) return <span className="text-ink-500">{t("mailbox")}</span>;
   if (agent.state === "idle")
-    return <span className="text-ink-500">idle · no active work</span>;
+    return <span className="text-ink-500">{t("idle · no active work")}</span>;
   if (agent.state === "stopped" && agent.state_label)
     return (
-      <span className="text-ink-500">{agent.state_label} · resumable</span>
+      <span className="text-ink-500">
+        {t("{label} · resumable").replace("{label}", () => String(agent.state_label))}
+      </span>
     );
   if (agent.state === "stopped")
-    return <span className="text-ink-500">stopped · no active work</span>;
-  return <span className="text-ink-500">{agent.state || "unknown"}</span>;
+    return <span className="text-ink-500">{t("stopped · no active work")}</span>;
+  return <span className="text-ink-500">{agent.state || t("unknown")}</span>;
 }
 
 export function AgentState({ agent }: { agent: Agent }) {
+  const t = useTranslate();
   const st = agentStatus(agent);
   return (
     <span className={`chip ${STATE_CHIP[st] ?? STATE_CHIP.stopped}`}>
@@ -159,41 +172,49 @@ export function AgentState({ agent }: { agent: Agent }) {
         aria-hidden="true"
         className={`w-1.5 h-1.5 rounded-full ${STATE_DOT[st] ?? STATE_DOT.stopped}`}
       />
-      {st}
+      {t(st)}
     </span>
   );
 }
 
 export function AgentQueue({ agent: a }: { agent: Agent }) {
+  const t = useTranslate();
   return (
     <div className="text-label">
       <span className="num text-ink-400">
-        {a.running} running · {a.queued} queued
+        {t("{running} running · {queued} queued")
+          .replace("{running}", String(a.running))
+          .replace("{queued}", String(a.queued))}
       </span>
       {a.unknown > 0 && (
-        <div className="text-fail mt-1">{a.unknown} outcome unknown</div>
+        <div className="text-fail mt-1">
+          {t("{count} outcome unknown").replace("{count}", String(a.unknown))}
+        </div>
       )}
       {a.parked > 0 && (
-        <div className="text-ink-500 mt-1">{a.parked} parked</div>
+        <div className="text-ink-500 mt-1">
+          {t("{count} parked").replace("{count}", String(a.parked))}
+        </div>
       )}
     </div>
   );
 }
 
 export function AgentActivity({ agent: a }: { agent: Agent }) {
+  const t = useTranslate();
   const stamp = activityTimeMs(a.last_activity);
   return (
     <div className="text-label text-ink-400">
       <span className="num">
-        {stamp ? fmtTime(new Date(stamp).toISOString()) : "No activity recorded"}
+        {stamp ? fmtTime(new Date(stamp).toISOString()) : t("No activity recorded")}
       </span>
       {a.stalled ? (
         <div className="text-warn mt-1">
-          Stalled · {fmtSilence(a.silent_secs ?? 0)}
+          {t("Stalled · {time}").replace("{time}", () => fmtSilence(a.silent_secs ?? 0))}
         </div>
       ) : (a.silent_secs ?? 0) >= 60 ? (
         <div className="text-micro text-ink-500 mt-1">
-          Silent · {fmtSilence(a.silent_secs!)}
+          {t("Silent · {time}").replace("{time}", () => fmtSilence(a.silent_secs!))}
         </div>
       ) : null}
     </div>

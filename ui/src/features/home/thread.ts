@@ -16,7 +16,7 @@ import type { SseEvent } from "../../lib/sse";
  */
 
 export type ThreadRole = "operator" | "agent" | "system";
-export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result";
+export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "hire_proposal";
 
 /** One stored entry (`thread_read` / the stream's `entry` frame). */
 export interface ThreadEntry {
@@ -36,21 +36,45 @@ export interface PendingMessage {
   text: string;
   state: "sending" | "sent" | "failed";
   error?: string;
+  /** CAD-1485 round-3 (member surface only): set when the send's
+   *  delivery is genuinely unknown — a lost response, a transport/5xx
+   *  failure, or a malformed/mismatching 2xx receipt. The member chat
+   *  renders "Delivery unconfirmed" (opt-in label) with the same
+   *  manual same-id retry/discard affordances; absent, every existing
+   *  surface keeps the Master "not sent" reading unchanged. */
+  delivery?: "unconfirmed";
   /** Epoch ms when it was first sent. */
   at: number;
   /** CAD-574: the cited needs subjects the send carried — a retry must
    *  resend the same refs or the daemon's idempotency check conflicts. */
   refs?: { kind: string; id: string }[];
+  /** CAD-1168: the retained-file ids the send carried. A retry resends
+   *  exactly these — sending text without them under the same message
+   *  id is the daemon's content-conflict refusal. */
+  attachments?: { id: string }[];
+  /** CAD-1168: the verified app binding the send carried. A retry
+   *  resends to this original destination, never the route's current
+   *  installation/context. */
+  app?: { install_id: string; context_id?: string };
+  /** CAD-1337: selected Home conversation is part of the retry envelope. */
+  conversation?: string;
 }
 
 export interface ThreadState {
   /** False when the master has no thread yet (`thread: null`). */
   exists: boolean;
+  /** Server-issued Home conversation id; absent for legacy/unusable pages. */
+  conversation?: string;
   /** The thread endpoint answered 404: no such agent is registered. */
   missing?: boolean;
   /** Older entries exist on the server than the ones held; null when
    *  the daemon cannot say (it predates backward reads). */
   moreBefore?: boolean | null;
+  /** CAD-1700: the newest visible assistant reply's `seq` in the COMPLETE
+   *  thread (`thread_read`'s `reply_seq`), independent of the loaded
+   *  window. Absent on a daemon that predates it; entries never advance
+   *  it, and a page never lowers it. */
+  replySeq?: number;
   entries: ThreadEntry[];
   pending: PendingMessage[];
 }
@@ -71,7 +95,13 @@ export function asEntry(value: unknown): ThreadEntry | null {
     payload:
       v.payload && typeof v.payload === "object" ? (v.payload as Record<string, unknown>) : null,
     message: typeof v.message === "string" ? v.message : null,
-    created: typeof v.created === "string" ? v.created : null,
+    // The daemon sends epoch seconds (f64); the UI keeps an ISO string.
+    created:
+      typeof v.created === "string"
+        ? v.created
+        : typeof v.created === "number" && Number.isFinite(v.created)
+          ? new Date(v.created * 1000).toISOString()
+          : null,
   };
 }
 
@@ -79,6 +109,17 @@ export function asEntry(value: unknown): ThreadEntry | null {
 export function lastSeq(state: ThreadState | null): number | null {
   const entries = state?.entries ?? [];
   return entries.length ? entries[entries.length - 1].seq : null;
+}
+
+/** A visible agent reply — the same rule as the daemon's complete
+ *  watermark: agent `assistant_text`/`turn_result`, nonblank after the
+ *  ECMAScript whitespace trim `String.prototype.trim` applies. */
+function isReplyEntry(e: ThreadEntry): boolean {
+  return (
+    e.role === "agent" &&
+    (e.kind === "assistant_text" || e.kind === "turn_result") &&
+    e.text.trim() !== ""
+  );
 }
 
 /**
@@ -92,17 +133,33 @@ export function mergeEntries(state: ThreadState | null, incoming: ThreadEntry[])
   const bySeq = new Map<number, ThreadEntry>();
   for (const e of base.entries) bySeq.set(e.seq, e);
   let changed = false;
+  // A live/folded visible reply is itself authoritative (CAD-1700): a
+  // streamed answer advances the watermark even before a page carries
+  // it. Non-reply and blank entries never do; a page can only raise it.
+  const previousReply = base.replySeq ?? 0;
+  let replySeq = previousReply;
   for (const e of incoming) {
     if (!bySeq.has(e.seq)) changed = true;
     bySeq.set(e.seq, e);
+    if (isReplyEntry(e) && e.seq > replySeq) replySeq = e.seq;
   }
   const entries = changed ? [...bySeq.values()].sort((a, b) => a.seq - b.seq) : base.entries;
   const stored = new Set(
     entries.filter((e) => e.role === "operator" && e.message).map((e) => e.message as string),
   );
   const pending = base.pending.filter((p) => !stored.has(p.message));
-  if (!changed && pending.length === base.pending.length && base.exists) return base;
-  return { ...base, exists: true, missing: false, entries, pending };
+  const replyAdvanced = replySeq > previousReply;
+  if (!changed && pending.length === base.pending.length && base.exists && !replyAdvanced) {
+    return base;
+  }
+  return {
+    ...base,
+    exists: true,
+    missing: false,
+    entries,
+    pending,
+    ...(replySeq > 0 ? { replySeq } : {}),
+  };
 }
 
 /** `streamInto`'s reducer: an `entry` frame merges; anything else is ignored. */
@@ -122,13 +179,32 @@ export function reduceFrame(state: ThreadState | null, event: SseEvent): ThreadS
 /** A page from `GET /api/threads/<alias>` folded into the state. */
 export function mergePage(
   state: ThreadState | null,
-  page: { thread?: unknown; entries?: unknown[] },
+  page: { thread?: unknown; entries?: unknown[]; reply_seq?: unknown },
 ): ThreadState {
   const entries = (page.entries ?? []).map(asEntry).filter((e): e is ThreadEntry => e !== null);
   const merged = mergeEntries(state, entries);
-  const found = merged.missing ? { ...merged, missing: false } : merged;
-  if (found.exists || page.thread == null) return found;
-  return { ...found, exists: true };
+  // The page reports the COMPLETE thread's reply watermark, so keep the
+  // maximum: a bounded, forward or older page (and a live frame that
+  // carries only an entry) can never erase a reply it does not hold.
+  const reply =
+    typeof page.reply_seq === "number" &&
+    Number.isSafeInteger(page.reply_seq) &&
+    page.reply_seq >= 0
+      ? page.reply_seq
+      : undefined;
+  const withReply =
+    reply === undefined
+      ? merged
+      : { ...merged, replySeq: Math.max(merged.replySeq ?? 0, reply) };
+  const found = withReply.missing ? { ...withReply, missing: false } : withReply;
+  const wireThread = page.thread && typeof page.thread === "object"
+    ? (page.thread as Record<string, unknown>)
+    : null;
+  const conversation =
+    typeof wireThread?.id === "string" && wireThread.id.length > 0 ? wireThread.id : undefined;
+  const exists = found.exists || page.thread != null;
+  if (found.exists === exists && found.conversation === conversation) return found;
+  return { ...found, exists, conversation };
 }
 
 /** Add an optimistic message (or mark a retried one sending again). */
@@ -138,10 +214,13 @@ export function addPending(
   text: string,
   at: number,
   refs?: { kind: string; id: string }[],
+  attachments?: { id: string }[],
+  app?: { install_id: string; context_id?: string },
+  conversation?: string,
 ): ThreadState {
   const base = state ?? EMPTY_THREAD;
   const rest = base.pending.filter((p) => p.message !== message);
-  return { ...base, pending: [...rest, { message, text, state: "sending", at, refs }] };
+  return { ...base, pending: [...rest, { message, text, state: "sending", at, refs, attachments, app, conversation }] };
 }
 
 /** The POST answered: sent (awaiting its stored entry) or failed. */
@@ -175,9 +254,12 @@ export function discardPending(state: ThreadState | null, message: string): Thre
 export type ThreadItem =
   | { type: "operator"; key: string; entry: ThreadEntry }
   | { type: "system"; key: string; entry: ThreadEntry }
+  | { type: "thinking"; key: string; entry: ThreadEntry }
   | { type: "commentary"; key: string; entry: ThreadEntry }
   | { type: "tools"; key: string; entries: ThreadEntry[] }
   | { type: "answer"; key: string; entry: ThreadEntry }
+  | { type: "artifact"; key: string; entry: ThreadEntry }
+  | { type: "hire"; key: string; entry: ThreadEntry; reason: string | null }
   | { type: "pending"; key: string; pending: PendingMessage };
 
 const TOOL_KINDS = new Set(["tool_call", "tool_result"]);
@@ -190,29 +272,134 @@ const TOOL_KINDS = new Set(["tool_call", "tool_result"]);
  */
 export function threadItems(state: ThreadState | null): ThreadItem[] {
   const items: ThreadItem[] = [];
+  // The daemon stores an artifact's card inside the put RPC, before the put's
+  // own `tool_result`. A card met inside a tools run waits until the run ends
+  // so it cannot split the call from its result (CAD-1728).
+  let held: ThreadItem[] = [];
+  const flush = () => {
+    items.push(...held);
+    held = [];
+  };
   for (const entry of state?.entries ?? []) {
     const key = `e${entry.seq}`;
+    if (entry.kind === "artifact" && items[items.length - 1]?.type === "tools") {
+      held.push({ type: "artifact", key, entry });
+      continue;
+    }
+    if (!TOOL_KINDS.has(entry.kind)) flush();
     if (TOOL_KINDS.has(entry.kind)) {
       const last = items[items.length - 1];
       if (last?.type === "tools") last.entries.push(entry);
       else items.push({ type: "tools", key, entries: [entry] });
+    } else if (entry.kind === "thinking") {
+      items.push({ type: "thinking", key, entry });
     } else if (entry.kind === "assistant_text") {
       items.push({ type: "commentary", key, entry });
     } else if (entry.kind === "turn_result") {
       items.push({ type: "answer", key, entry });
+    } else if (entry.kind === "hire_proposal") {
+      // CAD-1752: Master's inert proposal. Its reasoning is the turn's own
+      // commentary just before the card; that line moves into the card
+      // instead of showing twice.
+      const last = items[items.length - 1];
+      const lead =
+        last?.type === "commentary" && last.entry.message === entry.message ? items.pop() : null;
+      const reason = lead?.type === "commentary" ? lead.entry.text.trim() || null : null;
+      items.push({ type: "hire", key, entry, reason });
+    } else if (entry.kind === "artifact") {
+      // CAD-1726: a card for a canvas artifact — metadata, never content.
+      items.push({ type: "artifact", key, entry });
     } else if (entry.role === "operator") {
       items.push({ type: "operator", key, entry });
     } else {
       items.push({ type: "system", key, entry });
     }
   }
+  flush();
   for (const pending of state?.pending ?? []) {
     items.push({ type: "pending", key: `p${pending.message}`, pending });
   }
   return items;
 }
 
+/** Item types that belong to an assistant turn. */
+const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "artifact", "hire"]);
+
+/** One render run: an assistant turn (its flat items), or one item that is
+ *  not part of a turn. The items themselves stay flat — `threadItems` is
+ *  still the one contract for the canvas feed, the working state and the
+ *  window; a turn is only how a contiguous run of them paints. */
+export type ThreadRun =
+  | { turn: true; key: string; items: ThreadItem[] }
+  | { turn: false; key: string; item: ThreadItem };
+
+/**
+ * Group the flat render list into turns. Reasoning, commentary, tool runs,
+ * the answer and its artifact cards are one turn while they stay contiguous.
+ * A terminal `answer` closes the turn: a further reasoning/commentary/tool
+ * item starts the next one, while artifact cards may still follow it. A run
+ * of artifact cards with no agent text is not a turn (no head, no trace).
+ */
+export function threadRuns(items: ThreadItem[]): ThreadRun[] {
+  const runs: ThreadRun[] = [];
+  let run: ThreadItem[] = [];
+  let runMessage: string | null = null;
+  const flush = () => {
+    if (run.length === 0) return;
+    if (run.some((item) => item.type !== "artifact")) {
+      runs.push({ turn: true, key: run[0].key, items: run });
+    } else {
+      for (const item of run) runs.push({ turn: false, key: item.key, item });
+    }
+    run = [];
+    runMessage = null;
+  };
+  for (const item of items) {
+    if (!TURN_MEMBERS.has(item.type)) {
+      flush();
+      runs.push({ turn: false, key: item.key, item });
+      continue;
+    }
+    const message = itemMessage(item);
+    // Never join two operator turns just because the intervening row is a
+    // system note; the message id is the turn's identity when both sides
+    // carry one.
+    if (run.length > 0 && message !== null && runMessage !== null && message !== runMessage) {
+      flush();
+    }
+    if (item.type !== "artifact" && run.some((i) => i.type === "answer")) flush();
+    run.push(item);
+    if (message !== null) runMessage = message;
+  }
+  flush();
+  return runs;
+}
+
+/** The queued message id an item's entries carry — the turn it belongs to. */
+export function itemMessage(item: ThreadItem): string | null {
+  if (item.type === "pending") return item.pending.message;
+  if (item.type === "tools") return item.entries.find((e) => e.message)?.message ?? null;
+  return item.entry.message ?? null;
+}
+
 // ---- CAD-551: steps, refusals, and the working row's "what now" ----
+
+/** A tool call that runs `cadence artifact put` (not text that merely names
+ *  it), with or without global flags (`cadence --org x artifact put …`). Reads
+ *  at most the first words, so its cost does not grow with the text. */
+export function isArtifactPutCall(text: string): boolean {
+  const words = text.slice(0, 1000).replace(/^\s*(?:bash:\s*)?/i, "").split(/\s+/, 24);
+  if (!/^(?:\S*\/)?cadence$/i.test(words[0] ?? "")) return false;
+  let flagValue = false;
+  for (let i = 1; i < words.length; i++) {
+    const w = words[i].toLowerCase();
+    if (w === "artifact" && words[i + 1]?.toLowerCase() === "put") return true;
+    if (w.startsWith("-")) flagValue = !w.includes("=");
+    else if (flagValue) flagValue = false;
+    else return false;
+  }
+  return false;
+}
 
 /** One tool call and the result that answered it (when it has). */
 export interface ToolStep {
@@ -310,7 +497,22 @@ export function openStep(entries: ThreadEntry[]): ThreadEntry | null {
 
 const EPIC_ID = /[A-Z][A-Z0-9]{0,9}-\d+/;
 const EPIC_JSON = new RegExp(`"epic"\\s*:\\s*"(${EPIC_ID.source})"`);
-const PLAN_CMD = new RegExp(`\\bplan (?:propose[ds]?|show|approve|reject)\\b[^\\n]*?\\b(${EPIC_ID.source})\\b`);
+const PLAN_VERB = /\bplan (?:propose[ds]?|show|approve|reject)\b/;
+const EPIC_WORD = new RegExp(`\\b(${EPIC_ID.source})\\b`, "g");
+
+/** The epic a `plan propose|show|approve|reject … X-1` command names: on each
+ *  line, the first epic id after the first plan verb. One verb search and one
+ *  id search per line, so the cost is linear in the text. */
+function planCommandEpic(text: string): string | null {
+  for (const line of text.split("\n")) {
+    const verb = PLAN_VERB.exec(line);
+    if (!verb) continue;
+    EPIC_WORD.lastIndex = verb.index + verb[0].length;
+    const epic = EPIC_WORD.exec(line);
+    if (epic) return epic[1];
+  }
+  return null;
+}
 const PLAN_TICKETS = /"tickets"\s*:\s*\[/;
 const PLAN_BLOCK = /"plan"\s*:\s*\{/;
 const PLAN_PROSE = new RegExp(`\\b[Pp]lan (${EPIC_ID.source})\\b`);
@@ -332,7 +534,7 @@ export function planRef(entry: ThreadEntry): string | null {
   const planShaped = PLAN_TICKETS.test(text) || PLAN_BLOCK.test(text);
   return (
     (planShaped ? EPIC_JSON.exec(text)?.[1] : null) ??
-    (TOOL_KINDS.has(entry.kind) ? PLAN_CMD.exec(text)?.[1] : null) ??
+    (TOOL_KINDS.has(entry.kind) ? planCommandEpic(text) : null) ??
     PLAN_PROSE.exec(text)?.[1] ??
     null
   );
@@ -369,6 +571,10 @@ export interface ThreadPageLike {
   /** Backward reads only (CAD-328): older entries remain. Absent on a
    *  daemon that predates `tail`/`before` — it answered a forward page. */
   more_before?: boolean;
+  /** CAD-1700: the complete thread's newest visible assistant reply seq
+   *  (0 when none), independent of the page cursor. Absent on a daemon
+   *  that predates it. */
+  reply_seq?: number;
 }
 
 /** How the store reads pages: forward after a seq, the newest page, or
@@ -417,7 +623,10 @@ export async function loadThread(
       // Too far behind to replay: reopen on the newest page.
     }
     const page = await read.tail(limit);
-    const fresh = mergePage({ ...EMPTY_THREAD, pending: held.pending }, page);
+    const fresh = mergePage(
+      { ...EMPTY_THREAD, pending: held.pending, replySeq: held.replySeq },
+      page,
+    );
     return {
       ...fresh,
       moreBefore: typeof page.more_before === "boolean" ? page.more_before : null,

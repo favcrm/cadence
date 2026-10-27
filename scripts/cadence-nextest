@@ -10,8 +10,17 @@
 # sets CADENCE_REVIEW_SUITE_LOCK_HELD=1, so this wrapper never nests flock.
 set -eu
 
-PINNED_NEXTEST_VERSION=0.9.145
+# CAD-1210: drop every CADENCE_* routing variable before nextest or any test
+# binary runs, except the ones this script reads, so a pane's production
+# CADENCE_PM_DIR/CADENCE_STATE_DIR never reaches the tests (CAD-1197 approach).
+cadence_env_allow=" CADENCE_SUITE_LOCK CADENCE_SUITE_LOCK_WAIT_SECS CADENCE_NEXTTEST_BIN CADENCE_REVIEW_SUITE_LOCK_HELD CADENCE_REVIEW_PR CADENCE_REVIEW_HEAD "
+for v in $(env | sed -n 's/^\(CADENCE_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    case $cadence_env_allow in *" $v "*) ;; *) unset "$v" ;; esac
+done
+
+PINNED_NEXTEST_VERSION=0.9.150
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/scripts/suite-lock-config"
 # CADENCE_NEXTTEST_BIN wins; else the durable tools dir that
 # scripts/install-cadence-nextest writes by default (CAD-273); else PATH.
 # The checksum check below applies to whichever is chosen.
@@ -89,7 +98,7 @@ cd "$ROOT" || die "cannot enter cadence repository root: $ROOT"
 
 run_nextest() {
     if [ "$SUBCOMMAND" = run ]; then
-        exec env -u NEXTEST_RETRIES -u NEXTEST_PROFILE \
+        exec env -u CADENCE_SUITE_LOCK_WAIT_SECS -u NEXTEST_RETRIES -u NEXTEST_PROFILE \
             "$BIN_PATH" nextest "$SUBCOMMAND" \
             --config-file "$PROFILE" \
             --profile cadence \
@@ -97,7 +106,7 @@ run_nextest() {
             --no-tests fail \
             "$@"
     fi
-    exec env -u NEXTEST_RETRIES -u NEXTEST_PROFILE \
+    exec env -u CADENCE_SUITE_LOCK_WAIT_SECS -u NEXTEST_RETRIES -u NEXTEST_PROFILE \
         "$BIN_PATH" nextest "$SUBCOMMAND" \
         --config-file "$PROFILE" \
         --profile cadence \
@@ -120,9 +129,7 @@ if [ "${CADENCE_REVIEW_SUITE_LOCK_HELD:-}" = 1 ]; then
     run_nextest "$@"
 fi
 
-LOCK=${CADENCE_SUITE_LOCK:-}
-[ -n "$LOCK" ] ||
-    die "direct nextest requires CADENCE_SUITE_LOCK; use cadence review or set an explicit lock path"
+suite_lock_config
 command -v flock >/dev/null 2>&1 || die "flock is required for the outer suite lock"
 
 # The outer process owns the lock. Its child has an empty path and an
@@ -136,7 +143,12 @@ fi
 # CAD-955: `-o` closes the lock fd in the command's own process. Without
 # it every process the suite starts inherits the fd, and a detached child
 # that outlives nextest (a tmux server) keeps the lock held after the run.
-exec flock -o "$LOCK" env \
+# Report the deadline before exec; do not mistake a child's exit 75 for a
+# timeout. flock returns 75 on contention expiry and preserves child status.
+printf 'cadence-nextest: suite lock %s; wait limit %ss (contention exit 75)\n' \
+    "$SUITE_LOCK_PATH" "$SUITE_LOCK_WAIT_SECS" >&2
+exec flock -o -w "$SUITE_LOCK_WAIT_SECS" -E 75 "$SUITE_LOCK_PATH" \
+    env -u CADENCE_SUITE_LOCK_WAIT_SECS \
     CADENCE_SUITE_LOCK= \
     CADENCE_REVIEW_SUITE_LOCK_HELD=1 \
     CADENCE_REVIEW_PR="${CADENCE_REVIEW_PR:-direct}" \

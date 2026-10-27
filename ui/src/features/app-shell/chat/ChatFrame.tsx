@@ -1,5 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { sessionHeaders } from "../../../lib/sessionKey";
+import { beginPrivateOperation, onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration, type PrivateOperation } from "../../../lib/privateSession";
+import { useTranslate } from "../../../lib/locale";
 import { parseMount } from "../../workspace-apps/screen/screenLifecycle";
 import { ChatChannel, type FrameDirective } from "./chatChannel";
 import type { FrameSize } from "./contract";
@@ -30,6 +32,7 @@ export default function ChatFrame({
   directive: FrameDirective;
   onFail: (tag: string) => void;
 }) {
+  const t = useTranslate();
   const container = useRef<HTMLDivElement>(null);
   const channel = useRef<ChatChannel | null>(null);
   const latest = useRef(directive);
@@ -38,7 +41,18 @@ export default function ChatFrame({
   failRef.current = onFail;
   const [state, setState] = useState<"loading" | "ready">("loading");
   useLayoutEffect(() => {
+    const generation = privateSessionGeneration();
     const controller = new AbortController();
+    const unsubscribe = onPrivateReadsPaused(() => controller.abort());
+    let operation: PrivateOperation | null = null;
+    try {
+      operation = beginPrivateOperation(controller.signal);
+    } catch {
+      unsubscribe();
+      return;
+    }
+    if (operation === null) return;
+    const session = operation;
     let retired = false;
     let owned: ChatChannel | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -50,18 +64,20 @@ export default function ChatFrame({
     window.addEventListener("message", onMessage);
     void (async () => {
       try {
-        const response = await fetch(
+        const response = await privateFetch(
           `/api/app-installations/${encodeURIComponent(installId)}/screens/${encodeURIComponent(tag)}/mount`,
           {
             method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
             headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
             body: "{}",
           },
+          session,
         );
         if (!response.ok) throw new Error("Preview mount refused");
         const receipt = parseMount(await response.json(), tag);
         if (!receipt) throw new Error("Invalid preview mount receipt");
-        if (retired || !container.current) return;
+        session.assertCurrent();
+        if (retired || controller.signal.aborted || !privateReadsAllowed() || generation !== privateSessionGeneration() || !container.current) return;
         const frame = document.createElement("iframe");
         frame.title = "App preview";
         frame.setAttribute("sandbox", "allow-scripts");
@@ -76,11 +92,15 @@ export default function ChatFrame({
         frame.addEventListener("load", () => owned?.load());
         timer = setTimeout(() => { owned?.close(true); }, READY_MS);
       } catch {
-        if (!retired) { owned?.close(); container.current?.replaceChildren(); fail(); }
+        if (!retired && !session.signal.aborted && !controller.signal.aborted && privateReadsAllowed() && generation === privateSessionGeneration()) {
+          owned?.close(); container.current?.replaceChildren(); fail();
+        }
       }
     })();
     return () => {
       retired = true;
+      unsubscribe();
+      session.dispose();
       controller.abort();
       clearTimeout(timer);
       window.removeEventListener("message", onMessage);
@@ -92,7 +112,7 @@ export default function ChatFrame({
   useEffect(() => { channel.current?.update(directive); }, [directive]);
   return (
     <div data-chat-frame={tag} data-state={state} className="app-chat-frame">
-      {state === "loading" && <p className="text-micro text-ink-500" role="status">Loading preview…</p>}
+      {state === "loading" && <p className="text-micro text-ink-500" role="status">{t("Loading preview…")}</p>}
       <div ref={container} style={{ height: HEIGHT[size], display: state === "ready" ? "block" : "none" }} />
     </div>
   );

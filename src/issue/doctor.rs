@@ -190,12 +190,31 @@ pub fn run(pm: &Pm) -> Result<Value> {
             "next": "a live writer holds the tracker; the holder names it where the scan could",
         }),
         crate::issue::LockState::Free => json!({"ok": true, "state": "free"}),
-        crate::issue::LockState::Interrupted { paths, foreign } => json!({
+        crate::issue::LockState::Interrupted {
+            paths,
+            foreign,
+            hazards,
+        } if !hazards.is_empty() => json!({
+            "ok": false, "state": "interrupted_global_hazard",
+            "paths": paths, "foreign": foreign, "hazards": hazards,
+            "detail": format!(
+                "a Git-global state ({}) is not a path-local interruption",
+                hazards.join(", ")
+            ),
+            "next": "resolve the Git operation itself first (finish or abort the \
+                     merge/rebase, or clear the stale index.lock), then review again. No keep \
+                     or discard action is enabled: a path-local recovery cannot settle \
+                     Git-global state",
+        }),
+        crate::issue::LockState::Interrupted { paths, foreign, .. } => json!({
             "ok": false, "state": "interrupted", "paths": paths, "foreign": foreign,
-            "next": "a crashed writer left these paths; writes touching them are refused until \
-                     they are resolved, while writes to disjoint paths proceed. Check `git status` \
-                     and `cadence issue lint`, then commit or discard exactly those paths — \
-                     never foreign ones",
+            "detail": "Interrupted write needs a decision; no active holder",
+            "next": "a crashed writer left these paths and no writer holds the tracker. \
+                     `cadence issue recover review` inspects them in full; \
+                     `cadence issue recover decide --choice keep|discard|leave --path <p>` \
+                     previews the effect, and `cadence issue recover execute` applies it. \
+                     Writes touching these paths stay refused until they are resolved, while \
+                     writes to disjoint paths proceed. Never select a foreign path",
         }),
         crate::issue::LockState::LegacyUnknown { holder } => json!({
             "ok": false, "state": "legacy_unknown", "holder": holder,
@@ -208,7 +227,12 @@ pub fn run(pm: &Pm) -> Result<Value> {
     let lock_ok = write_lock["ok"] == true;
     let write_lock = {
         let mut w = write_lock;
-        w["detail"] = json!(lock.to_string());
+        // The interruption-specific detail is the promised observable.
+        // The generic lock description only fills in when there is
+        // none: overwriting it would hide what the state actually is.
+        if !w["detail"].as_str().is_some_and(|d| !d.is_empty()) {
+            w["detail"] = json!(lock.to_string());
+        }
         w
     };
     let ok = git_dir.is_some() && hooks_ok && lint_ok && push_ok && foreign_ok && lock_ok;

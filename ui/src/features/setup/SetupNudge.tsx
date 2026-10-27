@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslate } from "../../lib/locale";
 import Link from "../../ui/Link";
 import { useQuery } from "../../lib/useResource";
 import { routePath } from "../../lib/router";
@@ -24,6 +25,7 @@ export default function SetupNudge({ readOnly }: { readOnly: boolean | null }) {
 }
 
 function Nudge() {
+  const t = useTranslate();
   const state = useQuery(setupResource);
   const [dismissed, setDismissed] = useState(() => readNudgeDismissed(browserStorage()));
   if (dismissed || !state.data) return null;
@@ -33,26 +35,28 @@ function Nudge() {
     writeNudgeDismissed(browserStorage());
     setDismissed(true);
   };
+  // CAD-1312: the strip lives inside the chat panel, so it carries no
+  // shell padding or width of its own — the panel owns both.
   return (
-    <div className="px-4 lg:px-8 pt-4 max-w-[62rem] w-full min-w-0">
+    <div className="w-full min-w-0 shrink-0 mt-1">
       <div
-        className="card flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3 border-accent/40"
+        className="card flex flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2 border-accent/40"
         role="status"
       >
         <span className="min-w-0 flex-1 text-secondary text-ink-300">
-          <span className="font-medium text-ink-100">Setup isn't finished</span> — still to do:{" "}
+          <span className="font-medium text-ink-100">{t("Setup isn't finished")}</span> — {t("still to do:")}{" "}
           {missing.map(checkLabel).join(", ")}.
         </span>
         <Link href={routePath({ screen: "setup" })} className="lnk text-secondary font-medium">
-          Open setup →
+          {t("Open setup →")}
         </Link>
         <button
           type="button"
           onClick={dismiss}
           className="chip py-1 bg-ink-800 text-ink-400 hover:text-ink-100"
-          aria-label="dismiss the setup reminder"
+          aria-label={t("dismiss the setup reminder")}
         >
-          dismiss
+          {t("dismiss")}
         </button>
       </div>
     </div>

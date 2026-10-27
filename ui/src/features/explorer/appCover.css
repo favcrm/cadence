@@ -1,0 +1,34 @@
+.app-cover {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 2 / 1;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--color-accent) 12%, var(--color-ink-850));
+}
+.app-cover[data-art="schedule"] {
+  background: color-mix(in srgb, var(--color-info) 12%, var(--color-ink-850));
+}
+.app-cover[data-art="notes"] {
+  background: color-mix(in srgb, var(--color-warn) 12%, var(--color-ink-850));
+}
+.app-cover[data-art="menu"] {
+  background: color-mix(in srgb, var(--color-ok) 12%, var(--color-ink-850));
+}
+.app-cover svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.app-cover-name {
+  position: absolute;
+  inset-inline-start: 14px;
+  bottom: 10px;
+  max-width: calc(100% - 28px);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 10px;
+  line-height: 1.4;
+  font-weight: 500;
+  color: var(--color-ink-400);
+}

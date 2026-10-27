@@ -1,0 +1,22 @@
+{
+  "input": {
+    "v": 1,
+    "op": "issue.validate",
+    "input": {
+      "project_key": "agents"
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "issue.validate",
+    "value": {
+      "valid": false,
+      "refusals": [
+        {
+          "field": "project_key",
+          "message": "Project key 'agents' is reserved \u2014 <pm>/agents/ holds the agent files"
+        }
+      ]
+    }
+  }
+}

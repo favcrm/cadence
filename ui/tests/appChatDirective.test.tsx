@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 /**
  * CAD-1108 acceptance check (ticket author's, CAD-1110 comment): a directive
  * naming an undeclared action, or carrying a forged identity, renders as text
@@ -22,10 +23,6 @@ for (const name of ["addEventListener", "removeEventListener", "requestAnimation
   Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true, writable: true });
 Object.defineProperty(globalThis, "crypto", { value: require("crypto").webcrypto, configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
-Object.defineProperty(globalThis, "EventSource", {
-  configurable: true,
-  value: class { onopen = null; onerror = null; addEventListener() {} removeEventListener() {} close() {} },
-});
 const loader = require("module"), originalRequire = loader.prototype.require;
 loader.prototype.require = function (this: unknown, id: string) {
   if (id.endsWith(".css")) return {};
@@ -36,6 +33,7 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const Conversation = require("../src/features/app-shell/chat/Conversation").default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { loadAppChat } = require("../src/features/app-shell/chat/descriptorClient") as typeof import("../src/features/app-shell/chat/descriptorClient");
 
 const INSTALL = "install-notes";
@@ -71,13 +69,14 @@ const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { sta
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(input), "http://localhost");
   fetched.push({ url: url.pathname, method: init?.method ?? "GET" });
+  if (url.pathname.endsWith("/stream")) return streamFixture(url.href, { alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "p", endpoint_kind: "k", live: true, turn: null }, init?.signal);
   // The generic descriptor route, serving the approved package's file.
   if (url.pathname === `/api/app-installations/${INSTALL}/chat-descriptor`) return json({ descriptor, digest: DIGEST, app: "notes" });
   if (url.pathname === `/api/app-installations/${INSTALL}/conversations`) {
     return json({ conversations: [{ id: "c-gen", title: null, subject: null, is_general: true }] });
   }
   if (url.pathname === "/api/threads/master") return json({ entries, more_before: false });
-  if (url.pathname === "/api/master/state") return json({ alias: "master", provider: "p", endpoint_kind: "k", live: true, turn: null });
+  if (url.pathname === "/api/master/state") return json({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "p", endpoint_kind: "k", live: true, turn: null });
   throw new Error(`Unexpected request ${url.pathname}`);
 }) as typeof fetch;
 
@@ -97,7 +96,7 @@ document.body.append(host);
 const root = createRoot(host);
 const flush = () => React.act(async () => { await new Promise((r) => setTimeout(r, 0)); });
 await React.act(async () => {
-  root.render(React.createElement(Conversation, {
+  root.render(React.createElement(LocaleProvider, null, React.createElement(Conversation, {
     mode: { kind: "app", installId: INSTALL, contextId: "", screen: null, recordOpen: false, contextName: null, descriptor: chat },
     density: "compact",
     viewer: { operator: true, readOnly: false },
@@ -105,12 +104,18 @@ await React.act(async () => {
     collapsed: false,
     onCollapsed: () => undefined,
     onOpenView: (view: string) => { opened.push(view); },
-  }));
+  })));
 });
 for (let i = 0; i < 8; i++) await flush();
 
 const rows = Array.from(host.querySelectorAll("[data-chat-item]")) as HTMLElement[];
 equal(rows.length, 3, "three agent messages are listed");
+// CAD-1865: the pane's copy action lives in the header, never in a message row,
+// so a plain answer row still carries no actionable control of its own.
+const headerCopy = host.querySelector("[data-chat-header-copy]") as HTMLButtonElement | null;
+assert(headerCopy !== null, "the pane header offers the last answer's copy action");
+assert(headerCopy!.getAttribute("aria-label") === "Copy last answer", "the header action names what it copies");
+equal(headerCopy!.closest("[data-chat-item]"), null, "the copy action is outside every message row");
 const buttons = (row: HTMLElement) => Array.from(row.querySelectorAll("button, a, [role=button]"));
 
 // 1: the control renders its one declared button.

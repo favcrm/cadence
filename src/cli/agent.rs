@@ -1,10 +1,11 @@
 //! CAD-535: `cadence agent` — moved verbatim from src/main.rs.
 
+use super::local_agent;
 use super::*;
 
 /// `agent show` lists this many terminal messages by default (CAD-879);
 /// unfinished ones are always listed.
-const DEFAULT_SHOW_MESSAGES: u64 = 20;
+pub(crate) const DEFAULT_SHOW_MESSAGES: u64 = 20;
 
 /// The `agent_show` request for `agent show` (CAD-879): bounded unless
 /// `--all`. A `--since` alone is its own bound; otherwise the recent
@@ -20,6 +21,59 @@ fn show_params(alias: &str, limit: Option<u64>, since: Option<String>, all: bool
         }
     }
     params
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_bridge_verbs_map_to_the_existing_actions() {
+        assert!(matches!(
+            AgentAction::Connect {
+                alias: Some("w".into()),
+                repo: None,
+                name: None,
+            }
+            .bridge(),
+            Some(local_agent::LocalAgentAction::Connect { .. })
+        ));
+        assert!(matches!(
+            AgentAction::Watch.bridge(),
+            Some(local_agent::LocalAgentAction::Watch)
+        ));
+        assert!(matches!(
+            AgentAction::Assignments.bridge(),
+            Some(local_agent::LocalAgentAction::Status)
+        ));
+        assert!(matches!(
+            AgentAction::Disconnect.bridge(),
+            Some(local_agent::LocalAgentAction::Disconnect)
+        ));
+        assert!(matches!(
+            AgentAction::Reassign {
+                assignment: "a1".into(),
+                to: None,
+                cancel: true,
+            }
+            .bridge(),
+            Some(local_agent::LocalAgentAction::Reassign { .. })
+        ));
+        assert!(AgentAction::List {
+            all: false,
+            state: vec![],
+            provider: vec![],
+            kind: vec![],
+            project: vec![],
+            sort: None,
+            limit: None,
+            fields: vec![],
+            placement: None,
+            json: false,
+        }
+        .bridge()
+        .is_none());
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +206,11 @@ pub(crate) enum AgentAction {
         /// Keep only these keys in each row (comma-joined).
         #[arg(long, value_delimiter = ',')]
         fields: Vec<String>,
+        /// Only agents whose process runs there: local (this host),
+        /// cloud (provider-hosted) or queue (a mailbox). Derived from
+        /// `(provider, endpoint_kind)`, never chosen by the caller.
+        #[arg(long, value_enum)]
+        placement: Option<PlacementArg>,
         /// Output is JSON already — accepted for grammar parity.
         #[arg(long)]
         json: bool,
@@ -235,6 +294,30 @@ pub(crate) enum AgentAction {
         #[arg(long)]
         no_resume: bool,
     },
+    /// Replace the agent's standing instructions (operator only). The
+    /// reply's `applies` says when the agent sees them; the agent is not
+    /// restarted.
+    Instructions {
+        alias: String,
+        /// File with the new instructions.
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// List the catalogue roles (id, title, job) a hire can use. Read-only.
+    Roles,
+    /// Propose hiring a catalogue role (the master, on its live turn): the
+    /// operator reviews a card and hires from it. Registers nothing.
+    ProposeHire {
+        /// A catalogue role id (`GET /api/agent-roles`), e.g. `accountant`.
+        #[arg(long)]
+        role: String,
+        /// The name to suggest; omitted, the board picks `<role>-<n>`.
+        #[arg(long)]
+        name: Option<String>,
+        /// A job tailored to the ask; omitted, the role's own job is used.
+        #[arg(long)]
+        job_file: Option<PathBuf>,
+    },
     /// Stop the agent's actor (queued messages are retained).
     Stop { alias: String },
     /// Resume a stopped agent on its saved native thread. Like a
@@ -314,6 +397,10 @@ pub(crate) enum AgentAction {
     /// `agent set <alias> auto_ready=verified` opts a live agent into
     /// daemon-verified readiness.
     ///
+    /// `agent set <alias> gc_keep=true` sets the explicit agent-gc keep:
+    /// every gc path skips it, including a stopped row past the age
+    /// window. `gc_keep=false` (or a bare `gc_keep`) clears it.
+    ///
     /// `agent set <alias> auto_stop=off` opts an agent out of the
     /// daemon's idle auto-stop (default ON: an agent with nothing queued,
     /// running, awaiting a report or unknown for 60 minutes is stopped,
@@ -380,19 +467,158 @@ pub(crate) enum AgentAction {
     /// so no orphan outlives its row. A removed agent can no longer be
     /// resumed.
     ///
-    /// The daemon runs the same sweep on a timer ONLY when pm.yaml sets
-    /// `[host] agent_gc_older_than_secs` (off by default; 7-day floor; at
-    /// most hourly). The timer additionally keeps enabled agents, pty
-    /// agents whose pane is up, and any agent with a queued, running or
-    /// unknown message, and records `agent_gc_removed` per row on the
-    /// daemon event stream. The timer kills nothing: it frees no memory
-    /// and no disk. `cadence daemon status` shows the setting.
+    /// Both this command and the daemon timer use the same eligibility
+    /// rule: enabled agents, agents with `gc_keep`, and agents with a
+    /// queued, running or unknown message are kept. The timer
+    /// additionally skips a pty agent whose pane is still up. The timer
+    /// runs ONLY when pm.yaml sets `[host] agent_gc_older_than_secs`
+    /// (off by default; 7-day floor; at most hourly) and records
+    /// `agent_gc_removed` per row on the daemon event stream. The timer
+    /// kills nothing: it frees no memory and no disk. `cadence daemon
+    /// status` shows the setting.
     Gc {
         /// Only remove agents last updated more than this long ago
-        /// (e.g. 30m, 12h, 7d; bare number = seconds).
+        /// (e.g. 30m, 12h, 7d; bare number = seconds). Below the 7-day
+        /// floor requires --force, like the timer's floor.
         #[arg(long)]
         older_than: Option<String>,
+        /// Sweep rows younger than the 7-day floor (explicit override).
+        #[arg(long)]
+        force: bool,
     },
+    /// Archive a stopped, idle, unkept agent (operator-only). Preview with
+    /// `--plan`, then apply with `--reason` and one `--expect alias=digest`.
+    Archive {
+        /// Explicit aliases (1-50, no duplicates).
+        aliases: Vec<String>,
+        /// Recorded in the agent_archived event; required to apply.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Print the reviewable preview; writes nothing.
+        #[arg(long)]
+        plan: bool,
+        /// alias=digest from the preview; repeat for every alias.
+        #[arg(long = "expect")]
+        expected: Vec<String>,
+    },
+    /// Restore an archived agent (operator-only). Requires one
+    /// `--expect-rev alias=<lifecycle_rev>` per alias.
+    Restore {
+        /// Explicit aliases (1-50, no duplicates).
+        aliases: Vec<String>,
+        /// alias=lifecycle_rev from `agent show`; repeat for every alias.
+        #[arg(long = "expect-rev")]
+        expected: Vec<String>,
+    },
+    /// List a hosted workspace directory page. Presence is observed, not execution capability.
+    Directory {
+        /// Previous page's after_id (lag_<UUID>); null means exhausted.
+        #[arg(long)]
+        after_id: Option<String>,
+    },
+    /// Store an informational FYI; never invokes agent_send or a model.
+    ///
+    /// Use the stable id from `agent directory`. A stored receipt does not mean
+    /// delivered, read or executed. Issue/wiki references are pointers only;
+    /// existing read/start/update authorization remains authoritative.
+    Notify {
+        /// Stable lag_<UUID> in the selected hosted workspace.
+        agent_id: String,
+        /// Literal text, 1..4000 UTF-16 code units.
+        #[arg(long)]
+        text: String,
+        /// Explicit retry key, 1..120 units. Keep workspace/member/agent/content identical on retry.
+        #[arg(long)]
+        operation_id: String,
+        /// Issue id pointer; repeatable, at most 16 references total.
+        #[arg(long = "issue")]
+        issues: Vec<String>,
+        /// Wiki id/path pointer; no content is read or uploaded.
+        #[arg(long = "wiki")]
+        wiki: Vec<String>,
+    },
+    /// Read the native daemon's durable FYI inbox; never claim or execute work.
+    Inbox {
+        /// Clear displayed FYI notices only, not claims or the hosted receipts.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Bind this machine's local actor to the selected hosted org and
+    /// claim queued work. Local execution by definition; `--org` names
+    /// the board, never the placement.
+    Connect {
+        /// Local daemon alias that will read the issue.
+        #[arg(long)]
+        alias: Option<String>,
+        /// Local git checkout. Without it the alias is only saved.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Lane slug. Defaults to `work`.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Keep picking up later assignments until disconnected or interrupted.
+    Watch,
+    /// Show this machine's alias and the assignments the board returned.
+    Assignments,
+    /// Stop local pickup without stopping actors or cancelling claims.
+    Disconnect,
+    /// Move or cancel a live assignment.
+    Reassign {
+        assignment: String,
+        /// Directory user id that should take the work.
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        cancel: bool,
+    },
+}
+
+impl AgentAction {
+    /// The hosted local-binding verbs, mapped onto the existing
+    /// implementation. `None` for every ordinary agent verb, so routing
+    /// stays a single check instead of a second command family.
+    pub(crate) fn bridge(&self) -> Option<local_agent::LocalAgentAction> {
+        use local_agent::LocalAgentAction as L;
+        Some(match self {
+            Self::Connect { alias, repo, name } => L::Connect {
+                alias: alias.clone(),
+                repo: repo.clone(),
+                name: name.clone(),
+                fyi_only: false,
+            },
+            Self::Directory { after_id } => L::Directory {
+                after_id: after_id.clone(),
+            },
+            Self::Notify {
+                agent_id,
+                text,
+                operation_id,
+                issues,
+                wiki,
+            } => L::Notify {
+                agent_id: agent_id.clone(),
+                text: text.clone(),
+                operation_id: operation_id.clone(),
+                issues: issues.clone(),
+                wiki: wiki.clone(),
+            },
+            Self::Inbox { clear } => L::Inbox { clear: *clear },
+            Self::Watch => L::Watch,
+            Self::Assignments => L::Status,
+            Self::Disconnect => L::Disconnect,
+            Self::Reassign {
+                assignment,
+                to,
+                cancel,
+            } => L::Reassign {
+                assignment: assignment.clone(),
+                to: to.clone(),
+                cancel: *cancel,
+            },
+            _ => return None,
+        })
+    }
 }
 
 pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
@@ -481,12 +707,16 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
             sort,
             limit,
             fields,
+            placement,
             json: _,
         } => {
             // Stamp rows with their tracker project when the filter or
             // the sort reads it.
             let stamp = !project.is_empty() || sort.as_deref() == Some("project");
             let mut out = list_agents(&state_dir, &state, &provider, &kind, &project, all, stamp)?;
+            if let Some(want) = placement {
+                retain_by_placement(&mut out, want.placement());
+            }
             shape_rows(
                 &mut out,
                 "agents",
@@ -688,6 +918,45 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
             }
             out
         }
+        AgentAction::Instructions { alias, file } => {
+            let text = crate::cli::read_master_command_file(
+                &state_dir,
+                Some(&file),
+                cadence_agent::store::MAX_INSTRUCTIONS_BYTES as u64,
+            )?;
+            let mut out = client::rpc(
+                &state_dir,
+                "agent_instructions_set",
+                json!({"alias": alias, "instructions": text}),
+            )?;
+            cadence_agent::briefing::deliver_job_update(&state_dir, &alias, &text, &mut out);
+            out
+        }
+        AgentAction::Roles => {
+            let roles: Vec<Value> = cadence_agent::agent_roles::ROLES
+                .iter()
+                .map(|r| json!({"id": r.id, "title": r.title, "job": r.job}))
+                .collect();
+            print_json(&json!({"roles": roles}));
+            return Ok(0);
+        }
+        AgentAction::ProposeHire { role, name, job_file } => {
+            // The job is read through the master's command-file rules, never
+            // a raw read.
+            let job = match job_file {
+                Some(path) => Some(crate::cli::read_master_command_file(
+                    &state_dir,
+                    Some(&path),
+                    cadence_agent::store::MAX_INSTRUCTIONS_BYTES as u64,
+                )?),
+                None => None,
+            };
+            client::rpc(
+                &state_dir,
+                "hire_propose",
+                json!({"role": role, "name": name, "job": job}),
+            )?
+        }
         AgentAction::Remove { alias, force } => client::rpc(
             &state_dir,
             "agent_remove",
@@ -699,11 +968,149 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
                                "message": format!("bootstrap-{alias}")}));
             return Ok(0);
         }
-        AgentAction::Gc { older_than } => {
+        AgentAction::Gc { older_than, force } => {
             let secs = older_than.as_deref().map(parse_duration).transpose()?;
-            client::rpc(&state_dir, "agent_gc", json!({"older_than": secs}))?
+            require_gc_floor(secs, force)?;
+            client::rpc(
+                &state_dir,
+                "agent_gc",
+                json!({"older_than": secs, "force": force}),
+            )?
+        }
+        AgentAction::Archive {
+            aliases,
+            reason,
+            plan,
+            expected,
+        } => {
+            if plan {
+                client::rpc(
+                    &state_dir,
+                    "agent_archive_plan",
+                    json!({"aliases": aliases}),
+                )?
+            } else {
+                let reason = reason.ok_or_else(|| {
+                    Error::usage("agent archive needs --reason (or --plan for a preview)")
+                })?;
+                let pairs = parse_expected(&expected)?;
+                require_same_aliases(&aliases, &pairs)?;
+                let entries: Vec<Value> = pairs
+                    .iter()
+                    .map(|(alias, digest)| json!({"alias": alias, "digest": digest}))
+                    .collect();
+                client::rpc(
+                    &state_dir,
+                    "agent_archive",
+                    json!({"expected": entries, "reason": reason}),
+                )?
+            }
+        }
+        AgentAction::Restore { aliases, expected } => {
+            let pairs = parse_expected_revs(&expected)?;
+            require_same_aliases(&aliases, &pairs)?;
+            let entries: Vec<Value> = pairs
+                .iter()
+                .map(|(alias, rev)| json!({"alias": alias, "lifecycle_rev": rev}))
+                .collect();
+            client::rpc(&state_dir, "agent_restore", json!({"expected": entries}))?
+        }
+        // Routed before this function by the caller; refused here so a
+        // future routing bypass cannot claim locally.
+        AgentAction::Connect { .. }
+        | AgentAction::Directory { .. }
+        | AgentAction::Notify { .. }
+        | AgentAction::Inbox { .. }
+        | AgentAction::Watch
+        | AgentAction::Assignments
+        | AgentAction::Disconnect
+        | AgentAction::Reassign { .. } => {
+            return Err(Error::usage(
+                "agent connect/watch/assignments/disconnect/reassign/directory/notify/inbox require a selected hosted org. Nothing was sent or claimed.",
+            ))
         }
     };
     print_json(&result);
     Ok(0)
+}
+
+fn parse_expected(pairs: &[String]) -> Result<Vec<(String, String)>> {
+    if pairs.is_empty() {
+        return Err(Error::usage(
+            "agent archive needs --expect alias=digest for every alias",
+        ));
+    }
+    pairs
+        .iter()
+        .map(|pair| {
+            pair.split_once('=')
+                .filter(|(alias, digest)| !alias.is_empty() && !digest.is_empty())
+                .map(|(alias, digest)| (alias.to_string(), digest.to_string()))
+                .ok_or_else(|| Error::usage("--expect must be alias=digest"))
+        })
+        .collect()
+}
+
+fn parse_expected_revs(pairs: &[String]) -> Result<Vec<(String, i64)>> {
+    if pairs.is_empty() {
+        return Err(Error::usage(
+            "agent restore needs --expect-rev alias=lifecycle_rev for every alias",
+        ));
+    }
+    pairs
+        .iter()
+        .map(|pair| {
+            let (alias, rev) = pair
+                .split_once('=')
+                .ok_or_else(|| Error::usage("--expect-rev must be alias=lifecycle_rev"))?;
+            let rev = rev
+                .parse::<i64>()
+                .map_err(|_| Error::usage("--expect-rev lifecycle_rev must be an integer"))?;
+            if alias.is_empty() {
+                return Err(Error::usage("--expect-rev needs an alias"));
+            }
+            Ok((alias.to_string(), rev))
+        })
+        .collect()
+}
+
+fn require_same_aliases<T>(aliases: &[String], pairs: &[(String, T)]) -> Result<()> {
+    let positional: std::collections::HashSet<&str> = aliases.iter().map(String::as_str).collect();
+    let expected: std::collections::HashSet<&str> =
+        pairs.iter().map(|(alias, _)| alias.as_str()).collect();
+    if positional != expected {
+        return Err(Error::usage(
+            "positional aliases and --expect/--expect-rev must name the same set",
+        ));
+    }
+    Ok(())
+}
+
+/// CAD-804: the manual sweep honours the same 7-day floor as the timer.
+/// A shorter window is refused unless the caller explicitly overrides it;
+/// a mistyped `--older-than 1h` is otherwise unrecoverable.
+fn require_gc_floor(secs: Option<f64>, force: bool) -> Result<()> {
+    if let Some(secs) = secs {
+        if secs < cadence_agent::daemon::AGENT_GC_FLOOR_SECS as f64 && !force {
+            return Err(Error::rejected(format!(
+                "agent gc --older-than {secs}s is below the 7-day floor ({}s) — \
+                 pass --force to sweep younger rows",
+                cadence_agent::daemon::AGENT_GC_FLOOR_SECS
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod gc_floor_tests {
+    use super::*;
+
+    #[test]
+    fn below_the_floor_requires_force() {
+        assert!(require_gc_floor(Some(3600.0), false).is_err());
+        assert!(require_gc_floor(Some(3600.0), true).is_ok());
+        assert!(require_gc_floor(Some(7.0 * 86_400.0), false).is_ok());
+        assert!(require_gc_floor(None, false).is_ok());
+    }
 }

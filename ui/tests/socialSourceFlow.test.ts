@@ -19,6 +19,19 @@ loader.prototype.require = function(this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const WorkspaceApp = (require("../src/features/workspace-apps/WorkspaceApp") as typeof import("../src/features/workspace-apps/WorkspaceApp")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+// CAD-1560: the workspace takes its scope from an owner (AppShell in
+// production); this harness owns the selection the same way — resolve
+// the remembered/active defaults once and follow emitted picks.
+const { initialContext, rememberedContext, subscribeContext } = require("../src/features/workspace-apps/contextSelection");
+function ScopeOwner({ installId, activeIds, children }: { installId: string; activeIds: string[]; children: (contextId: string) => any }) {
+  const [contextId, setContextId] = React.useState(() => initialContext(rememberedContext(installId), activeIds));
+  React.useEffect(() => subscribeContext((changed: string, next: string | null) => {
+    if (changed === installId) setContextId(next ?? "");
+  }), [installId]);
+  return children(contextId);
+}
+const mountApp = (viewer: any) => React.createElement(LocaleProvider, null, React.createElement(ScopeOwner, { installId: "install-a", activeIds: [], children: (contextId: string) => React.createElement(WorkspaceApp, { installId: "install-a", contextId, viewer }) }));
 const installation = { install_id: "install-a", title: "Social Content", name: "social-content", version: "0.5.0", digest: "bundle-v5", approved: true, storage_kind: "workspace", files: ["workflows/instagram.md", "workflows/facebook.md", "workflows/source-instagram.md", "workflows/image-instagram.md", "workflows/image-manual.md"], workflows: [
   { name: "instagram", inputs: [{ name: "content_prompt", default: "App content prompt" }] },
   { name: "facebook", inputs: [{ name: "content_prompt", default: "App content prompt" }] },
@@ -89,7 +102,7 @@ async function choose(id: string, label: string) {
   await click(option);
 }
 async function main() {
-  await React.act(async () => root.render(React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator: true, readOnly: false } }))); await flush();
+  await React.act(async () => root.render(mountApp({ operator: true, readOnly: false }))); await flush();
   assert(!host.textContent?.includes("no supported board workspace") && button("New post") && button("Sources"), "Installed v0.5 opens the board with post and source actions");
   await click(button("New post"));
   assert(host.querySelector("#wa-content-prompt") && host.querySelector("#wa-image-prompt"), "New post exposes both Cadence-owned per-post prompts");
@@ -176,18 +189,18 @@ async function main() {
   denySource = true; await click(button("Board")); await click(button("Sources"));
   assert(!host.textContent?.includes("Original line one") && !button("Find public posts"), "403 wipes stored source posts and operator controls");
   await React.act(async () => root.unmount()); root = createRoot(host); reads.length = 0;
-  await React.act(async () => root.render(React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator: false, readOnly: false } }))); await flush();
+  await React.act(async () => root.render(mountApp({ operator: false, readOnly: false }))); await flush();
   assert(reads.length === 0, "Unproven viewer never requests private provider receipts");
   await React.act(async () => root.unmount());
   installation.files = installation.files.filter(path => path !== "workflows/image-manual.md");
   root = createRoot(host);
-  await React.act(async () => root.render(React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator: true, readOnly: false } }))); await flush();
+  await React.act(async () => root.render(mountApp({ operator: true, readOnly: false }))); await flush();
   assert(host.textContent?.includes("no supported board workspace") && !button("New post"), "Incomplete v0.5 workflows cannot be mistaken for a supported board contract");
   await React.act(async () => root.unmount());
   installation.version = "constructor";
   installation.files = ["workflows/instagram.md"];
   root = createRoot(host);
-  await React.act(async () => root.render(React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator: true, readOnly: false } }))); await flush();
+  await React.act(async () => root.render(mountApp({ operator: true, readOnly: false }))); await flush();
   assert(host.textContent?.includes("no supported board workspace") && !button("New post"), "An arbitrary installed version matching an object prototype key cannot crash the board");
   await React.act(async () => root.unmount());
   console.log("social source mounted flow passed");

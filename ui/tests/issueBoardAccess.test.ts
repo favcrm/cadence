@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 /** A new issue cannot be offered before the board knows this tab's access. */
 declare function require(name: string): any;
 const { Window } = require("happy-dom");
@@ -9,7 +10,6 @@ for (const name of ["addEventListener", "removeEventListener"])
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
 Object.defineProperty(globalThis, "setInterval", { value: () => 1, configurable: true });
 Object.defineProperty(globalThis, "clearInterval", { value: () => undefined, configurable: true });
-Object.defineProperty(globalThis, "EventSource", { value: class { readyState = 0; addEventListener() {} close() {} }, configurable: true });
 const loader = require("module"), originalRequire = loader.prototype.require;
 loader.prototype.require = function (this: unknown, id: string) {
   if (id.endsWith(".css")) return {};
@@ -21,13 +21,16 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const App = (require("../src/App") as typeof import("../src/App")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const AppComponent = (require("../src/App") as typeof import("../src/App")).default;
+const App = () => React.createElement(LocaleProvider, null, React.createElement(AppComponent));
 const { setSessionKey } = require("../src/lib/sessionKey") as typeof import("../src/lib/sessionKey");
 const json = (data: unknown) => new Response(JSON.stringify(data), { headers: { "Content-Type": "application/json" } });
 let releaseMeta!: (response: Response) => void;
 let failMeta!: (error: Error) => void;
 globalThis.fetch = async (input) => {
   const path = new URL(String(input), "http://localhost").pathname;
+  if (path.endsWith("/stream")) return streamFixture(path);
   if (path === "/api/meta") return new Promise<Response>((resolve, reject) => { releaseMeta = resolve; failMeta = reject; });
   if (path === "/api/health") return json({ daemon: "reachable" });
   if (path === "/api/issues") return json({ issues: [{
@@ -46,11 +49,14 @@ document.body.append(host);
 const root = createRoot(host);
 const flush = async () => { for (let i = 0; i < 3; i++) await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); }); };
 const canCreate = () => Array.from(host.querySelectorAll("button")).some((item) => item.textContent?.trim() === "New issue");
-const writableMeta = (id: string) => ({ read_only: false, signed_in: true, operator: true, actor: "operator", session: { id, user: { name: "Operator", email: "operator@example.test", role: "operator" } } });
+const visible = (element: Element) => {
+  for (let node: Element | null = element; node; node = node.parentElement)
+    if (win.getComputedStyle(node).display === "none") return false;
+  return true;
+};
+const writableMeta = (id: string) => ({ read_only: false, signed_in: true, operator: true, actor: "operator", session: { id, origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test", user: { sub: "operator", handle: "operator", name: "Operator", email: "operator@example.test", role: "operator" } } });
 const refresh = async () => {
-  const control = host.querySelector('[aria-label="Refresh board"]');
-  assert(control, "refresh control exists");
-  await React.act(() => control.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+  await React.act(async () => window.dispatchEvent(new Event("focus")));
   await flush();
 };
 async function run() {
@@ -59,9 +65,8 @@ async function run() {
   await flush();
   assert(releaseMeta, "metadata read started");
   assert(!canCreate(), "creation stays hidden while write access is unknown");
-  const card = host.querySelector("article");
-  assert(card, "board card renders while access is checked");
-  assert(card.getAttribute("title")?.includes("Checking write access"), "pending access explains why dragging is disabled");
+  assert(!host.querySelector("article, aside, form.board-new-issue"), "initial verification mounts no private board or creation form");
+  assert(host.querySelector("[data-auth-state='checking'] h1"), "initial checking is a public auth state, not a private write-access placeholder");
   await React.act(async () => releaseMeta(json(writableMeta("sample"))));
   await flush();
   assert(canCreate(), "creation appears after this tab is proven writable");
@@ -78,13 +83,13 @@ async function run() {
   await React.act(async () => failMeta(new Error("temporary metadata failure")));
   await flush();
   assert(host.querySelector('form.board-new-issue input[name="title"]') === title && title.value === "A draft to keep", "transient metadata failure preserves the open draft");
-  const create = () => Array.from(host.querySelectorAll("button")).find((item) => item.textContent?.trim() === "Create issue");
-  assert(create()?.disabled, "submission is disabled while write access is unknown");
+  assert(host.querySelector("[data-auth-state='unavailable'] h1"), "unknown identity is blocked by the public auth boundary");
+  assert(!visible(title), "preserved issue draft is hidden and cannot be submitted while identity is unknown");
   await refresh();
   await React.act(async () => releaseMeta(json(writableMeta("sample"))));
   await flush();
-  assert(host.querySelector('form.board-new-issue input[name="title"]') === title && !create()?.disabled, "same-session recovery restores the editable draft");
-  setSessionKey("another-session-key");
+  assert(host.querySelector('form.board-new-issue input[name="title"]') === title && visible(title), "same-session recovery restores the editable draft");
+  await React.act(async () => setSessionKey("another-session-key"));
   await refresh();
   assert(!host.querySelector("form.board-new-issue"), "credential change clears the prior draft before the next metadata response");
   await React.act(async () => releaseMeta(json(writableMeta("another-session"))));

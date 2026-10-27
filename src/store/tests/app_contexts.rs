@@ -3,7 +3,7 @@ use super::*;
 
 #[test]
 fn cad690_required_context_content_default_is_nonempty_but_optional_may_be_empty() {
-    let text = include_str!("../../../apps/local-content/workflows/draft.md")
+    let text = include_str!("../../../tests/fixtures/apps/local-content/workflows/draft.md")
         .replace("source: { ask:", "source: { context_default: true, ask:");
     let defaults = std::collections::BTreeMap::from([("source".to_string(), "facts".to_string())]);
     assert!(crate::issue::workflow::check_context_defaults(&text, &defaults).is_ok());
@@ -187,4 +187,23 @@ fn cad690_context_migration_is_atomic_and_preserves_legacy_snapshots_and_authori
         reopened.app_run_show(run["id"].as_str().unwrap()).unwrap(),
         before
     );
+}
+
+/// CAD-1212: the write-counter seam moves on a write and stays put on a
+/// read, so a check can assert a "read-only" callback wrote nothing.
+#[test]
+fn cad1212_total_changes_seam_counts_writes_not_reads() {
+    use crate::store::app_contexts::ContextConfig;
+    let (_dir, s, _legacy) = runtime_fixture();
+    let before = s.total_changes_for_test();
+    s.app_install_known("install-1").unwrap();
+    assert_eq!(
+        s.total_changes_for_test(),
+        before,
+        "a read moved the counter"
+    );
+    let config = ContextConfig::new("Client", std::collections::BTreeMap::new()).unwrap();
+    s.app_context_create("install-1", &config, "context-seam")
+        .unwrap();
+    assert!(s.total_changes_for_test() > before, "a write left it still");
 }

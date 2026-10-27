@@ -64,7 +64,14 @@ fn cad1189_reads_never_mix_installation_states_during_upgrades() {
     let pm = Pm::init(pm_dir.path()).unwrap();
     let v1 = sources.path().join("v1");
     bundle(&v1, "race-app", 1);
-    let out = install(&pm, state.path(), v1.to_str().unwrap(), None).unwrap();
+    let out = install(
+        &pm,
+        state.path(),
+        v1.to_str().unwrap(),
+        None,
+        &CatalogueClaim::Absent,
+    )
+    .unwrap();
     let id = out["install_id"].as_str().unwrap().to_string();
     let first = show(&pm, &id).unwrap()["digest"]
         .as_str()
@@ -103,8 +110,15 @@ fn cad1189_reads_never_mix_installation_states_during_upgrades() {
         let generation = current["catalog_generation"].as_str().unwrap().to_string();
         let source = sources.path().join(format!("v{version}"));
         bundle(&source, "race-app", version);
-        let check =
-            upgrade_check(&pm, &id, source.to_str().unwrap(), &digest, &generation).unwrap();
+        let check = upgrade_check(
+            &pm,
+            &id,
+            source.to_str().unwrap(),
+            &digest,
+            &generation,
+            &CatalogueClaim::Absent,
+        )
+        .unwrap();
         let new_digest = check["digest"].as_str().unwrap().to_string();
         digests.lock().unwrap().insert(version, new_digest.clone());
         upgrade(
@@ -116,8 +130,11 @@ fn cad1189_reads_never_mix_installation_states_during_upgrades() {
                 expected_generation: &generation,
                 expected_new_digest: &new_digest,
                 request_id: &format!("accept-up-{version}"),
+                catalogue: &CatalogueClaim::Absent,
+                directory: CatalogueDirectory::Configured,
             },
-            |_, _| Ok(json!({})),
+            |_, _| Ok((json!({}), Default::default())),
+            |_| Ok(Vec::new()),
         )
         .unwrap();
     }
@@ -164,6 +181,7 @@ fn cad1189_legacy_remove_waits_for_running_admission() {
 
     let inside = Arc::new(Barrier::new(2));
     let admission_done = Arc::new(Mutex::new(None::<Instant>));
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
     let admission = {
         let (pm_dir, id, inside, admission_done) = (
             pm.dir.clone(),
@@ -177,7 +195,9 @@ fn cad1189_legacy_remove_waits_for_running_admission() {
                 inside.wait();
                 // Stands in for the callback's store write (binding,
                 // consent, run) against this installation.
-                std::thread::sleep(Duration::from_millis(1500));
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("remove neither contended nor returned");
                 *admission_done.lock().unwrap() = Some(Instant::now());
                 Ok(())
             })
@@ -185,8 +205,12 @@ fn cad1189_legacy_remove_waits_for_running_admission() {
         })
     };
     inside.wait();
+    crate::issue::pmlock::WAITING
+        .with(|observer| *observer.borrow_mut() = Some(release_tx.clone()));
     let removed = app::remove(&pm, "legacy", "legacy-app", state.path(), "accept");
     let remove_done = Instant::now();
+    crate::issue::pmlock::WAITING.with(|observer| observer.borrow_mut().take());
+    let _ = release_tx.send(());
     admission.join().unwrap();
     let admission_done = admission_done.lock().unwrap().expect("admission finished");
     assert!(
@@ -299,4 +323,64 @@ fn cad1189_legacy_reads_never_tear_during_app_update() {
     done.store(true, Ordering::SeqCst);
     let ok = reader.join().expect("a legacy read tore");
     assert!(ok > 0, "the reader must observe whole versions");
+}
+
+/// (d) CAD-1212: the digest compare in `with_runtime_read` is a real guard.
+/// A bundle file edited between `describe` and the bundle snapshot (the
+/// read seam) must never reach the callback: the read retries, then answers
+/// busy.
+#[test]
+fn cad1212_runtime_read_never_hands_out_a_bundle_edited_mid_read() {
+    let pm_dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let pm = Pm::init(pm_dir.path()).unwrap();
+    let v1 = sources.path().join("v1");
+    bundle(&v1, "seam-app", 1);
+    let out = install(
+        &pm,
+        state.path(),
+        v1.to_str().unwrap(),
+        None,
+        &CatalogueClaim::Absent,
+    )
+    .unwrap();
+    let id = out["install_id"].as_str().unwrap().to_string();
+    let manifest = pm
+        .dir
+        .join(".apps/installations")
+        .join(&id)
+        .join("bundle/app.md");
+    assert!(
+        manifest.is_file(),
+        "fixture bundle at {}",
+        manifest.display()
+    );
+    let edits = Arc::new(Mutex::new(0u32));
+    {
+        let (manifest, edits) = (manifest.clone(), edits.clone());
+        super::read_seam::set_hook(Some(Box::new(move || {
+            let mut n = edits.lock().unwrap();
+            *n += 1;
+            std::fs::write(&manifest, manifest_text_edit(*n)).unwrap();
+        })));
+    }
+    let reached = Arc::new(AtomicBool::new(false));
+    let seen = reached.clone();
+    let read = with_runtime_read(&pm, &id, move |_, _| {
+        seen.store(true, Ordering::SeqCst);
+        Ok(())
+    });
+    super::read_seam::set_hook(None);
+    assert!(
+        !reached.load(Ordering::SeqCst),
+        "the callback received a bundle edited between describe and snapshot"
+    );
+    let err = read.expect_err("an edited bundle must not be admitted");
+    assert_eq!(err.kind(), "busy", "{err}");
+    assert!(*edits.lock().unwrap() >= 1, "the seam never fired");
+}
+
+fn manifest_text_edit(n: u32) -> String {
+    format!("---\napp: seam-app\ntitle: Tampered {n}\nversion: '1'\nneeds:\n  connections: [cms]\n---\n\nEdited mid-read.\n")
 }

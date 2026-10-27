@@ -17,6 +17,7 @@ pub(super) enum Route<'a> {
     Revoke(&'a str),
     Check(&'a str),
     Test(&'a str),
+    Custody(&'a str),
 }
 fn segment(id: &str) -> bool {
     !id.is_empty()
@@ -31,6 +32,12 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
     }
     if path == "/api/connections" {
         return Some(Route::List);
+    }
+    if let Some(verb) = path.strip_prefix("/api/connection-custody/") {
+        return match verb {
+            "initialize" | "unlock" | "lock" | "status" => Some(Route::Custody(verb)),
+            _ => None,
+        };
     }
     let tail = path.strip_prefix("/api/connections/")?;
     if let Some((id, verb)) = tail.split_once('/') {
@@ -49,7 +56,10 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
 }
 impl Route<'_> {
     pub(super) fn is_read(self) -> bool {
-        matches!(self, Self::Providers | Self::List | Self::Show(_))
+        matches!(
+            self,
+            Self::Providers | Self::List | Self::Show(_) | Self::Custody("status")
+        )
     }
 }
 // CAD-785: the create/rotate bodies carry either the opaque token
@@ -59,6 +69,32 @@ impl Route<'_> {
 // is the authority (a token shape with SMTP fields, or an SMTP
 // shape with a token, refuses there). `deny_unknown_fields` still
 // closes the schema here.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Custody {
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    accept_same_uid_risk: Option<bool>,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Revoke {
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    expected_connection_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    expected_revision: Option<u64>,
+}
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Create {
@@ -120,6 +156,18 @@ struct Rotate {
         skip_serializing_if = "Option::is_none"
     )]
     accept_same_uid_risk: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    expected_connection_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    expected_revision: Option<u64>,
 }
 fn present<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
 where
@@ -187,6 +235,28 @@ fn typed<T: serde::de::DeserializeOwned>(request: &mut Request) -> Result<T, Htt
     serde_json::from_slice(&body)
         .map_err(|_| err_response(400, "invalid connection request schema"))
 }
+// Legacy forms may omit expectations. Resolve ONCE for this invocation;
+// explicitly supplied fields are never reread, substituted or retried.
+fn expectations(
+    state: &Path,
+    id: &str,
+    mut params: serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    if params.get("expected_connection_id").is_none() && params.get("expected_revision").is_none() {
+        let shown = client::rpc(state, "connection_show", json!({"connection_id":id}))?;
+        if shown["connection"]["id"].as_str() != Some(id) {
+            return Err(Error::rejected("connection preflight identity mismatch"));
+        }
+        let revision = shown["connection"]["revision"]
+            .as_u64()
+            .filter(|v| *v > 0 && *v <= i64::MAX as u64)
+            .ok_or_else(|| Error::rejected("connection preflight revision unavailable"))?;
+        params["expected_connection_id"] = json!(id);
+        params["expected_revision"] = json!(revision);
+    }
+    Ok(params)
+}
+
 pub(super) fn handle(
     request: &mut Request,
     state: &Path,
@@ -201,6 +271,36 @@ pub(super) fn handle(
         return err_response(400, "connection query parameters are unsupported");
     }
     let (method, params) = match route {
+        Route::Custody(verb) => {
+            let method = match verb {
+                "initialize" => "connection_custody_initialize",
+                "unlock" => "connection_custody_unlock",
+                "lock" => "connection_custody_lock",
+                "status" => "connection_custody_status",
+                _ => return err_response(400, "invalid custody operation"),
+            };
+            if matches!(verb, "initialize" | "unlock") {
+                let body: Custody = match typed(request) {
+                    Ok(body) => body,
+                    Err(response) => return response,
+                };
+                (
+                    method,
+                    serde_json::to_value(body).expect("typed request serializes"),
+                )
+            } else {
+                // GET status normally has no body; any supplied body still
+                // has to satisfy the strict empty schema.
+                let body = match read_body(request, BODY_CAP) {
+                    Ok(body) => body,
+                    Err(response) => return response,
+                };
+                if !body.is_empty() && serde_json::from_slice::<Empty>(&body).is_err() {
+                    return err_response(400, "invalid connection request schema");
+                }
+                (method, json!({}))
+            }
+        }
         Route::Providers => ("connection_providers", json!({})),
         Route::List if !write => ("connection_list", json!({})),
         Route::List => {
@@ -223,18 +323,20 @@ pub(super) fn handle(
             value["connection_id"] = json!(id);
             ("connection_rotate", value)
         }
-        Route::Revoke(id) | Route::Check(id) => {
+        Route::Revoke(id) => {
+            let body: Revoke = match typed(request) {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
+            let mut params = serde_json::to_value(body).expect("typed request serializes");
+            params["connection_id"] = json!(id);
+            ("connection_revoke", params)
+        }
+        Route::Check(id) => {
             if let Err(response) = typed::<Empty>(request) {
                 return response;
             }
-            (
-                if matches!(route, Route::Revoke(_)) {
-                    "connection_revoke"
-                } else {
-                    "connection_check"
-                },
-                json!({"connection_id":id}),
-            )
+            ("connection_check", json!({"connection_id":id}))
         }
         Route::Test(id) => {
             let body: Test = match typed(request) {
@@ -250,6 +352,15 @@ pub(super) fn handle(
                 }),
             )
         }
+    };
+    let params = if matches!(route, Route::Rotate(_) | Route::Revoke(_)) {
+        let id = params["connection_id"].as_str().expect("typed route ID");
+        match expectations(state, id, params.clone()) {
+            Ok(params) => params,
+            Err(_) => return err_response(409, "connection preflight refused or unavailable"),
+        }
+    } else {
+        params
     };
     match client::rpc(state, method, params.clone()) {
         Ok(value) => {
@@ -354,5 +465,42 @@ mod tests {
             r#"{"provider":"fixture","account":"a","shape":"token","token":"x","scopes":"read"}"#
         )
         .is_err());
+    }
+
+    // Independently drafted client3 schema checks; native HTTP authority is
+    // a separate real-peer acceptance obligation, not proved by these.
+    #[test]
+    fn rotate_revoke_typed_expectation_schema() {
+        assert!(serde_json::from_str::<Rotate>(
+            r#"{"token":"t","expected_connection_id":"conn-a","expected_revision":3}"#
+        )
+        .is_ok());
+        assert!(serde_json::from_str::<Revoke>(
+            r#"{"expected_connection_id":"conn-a","expected_revision":3}"#
+        )
+        .is_ok());
+        // Empty revoke body parses — legacy revoke needs no expectation.
+        assert!(serde_json::from_str::<Revoke>(r#"{}"#).is_ok());
+        for bad in [
+            r#"{"token":"t","expected_revision":"3"}"#,
+            r#"{"token":"t","expected_revision":3,"bogus":1}"#,
+            r#"{"expected_revision":3,"expected_revision":4}"#,
+        ] {
+            assert!(serde_json::from_str::<Rotate>(bad).is_err(), "{bad}");
+        }
+        assert!(serde_json::from_str::<Revoke>(r#"{"expected_revision":null}"#).is_err());
+    }
+
+    #[test]
+    fn custody_body_is_acknowledgement_only() {
+        assert!(serde_json::from_str::<Custody>(r#"{"accept_same_uid_risk":true}"#).is_ok());
+        assert!(serde_json::from_str::<Custody>(r#"{}"#).is_ok());
+        for bad in [
+            r#"{"key_file":"/x"}"#,
+            r#"{"secret":"s"}"#,
+            r#"{"accept_same_uid_risk":"yes"}"#,
+        ] {
+            assert!(serde_json::from_str::<Custody>(bad).is_err(), "{bad}");
+        }
     }
 }

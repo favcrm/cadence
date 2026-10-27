@@ -1,5 +1,6 @@
 import { type ResourceState } from "../../lib/cache";
 import Button from "../../ui/Button";
+import { useLocale } from "../../lib/locale";
 
 export function ReadNotice<T>({
   name,
@@ -10,6 +11,9 @@ export function ReadNotice<T>({
   state: ResourceState<T>;
   retry: () => void;
 }) {
+  const { t, locale } = useLocale();
+  // Successful refreshes stay silent: the retained data is the current view.
+  if (state.data !== null && !state.error) return null;
   if (!state.error && !state.inFlight && state.status !== "loading")
     return null;
   const loading = state.inFlight || state.status === "loading";
@@ -23,24 +27,24 @@ export function ReadNotice<T>({
         {state.error ? (
           <>
             <strong>
-              {name[0].toUpperCase() + name.slice(1)} could not be loaded.
+              {t(`${name[0].toUpperCase() + name.slice(1)} could not be loaded.`)}
             </strong>
             <p>
               {state.error}
               {state.data !== null
-                ? " Showing the last known information."
+                ? ` ${t("Showing the last known information.")}`
                 : ""}
             </p>
           </>
         ) : (
           <span>
-            {state.data === null ? "Loading" : "Refreshing"} {name}…
+            {t("Loading")}{locale === "zh-TW" ? "" : " "}{t(name)}…
           </span>
         )}
       </div>
       {state.error && (
         <Button loading={loading} onClick={retry}>
-          Retry {name}
+          {t("Retry")} {t(name)}
         </Button>
       )}
     </div>

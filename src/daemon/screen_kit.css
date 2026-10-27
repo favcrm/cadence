@@ -50,3 +50,8 @@
   border-radius: .75rem .75rem 0 0;
   background: var(--color-ink-875);
 }
+
+/* The frame sits directly on the board's page background (no inset panel):
+ * the document paints nothing of its own; the app's own CSS may still paint
+ * its cards. */
+html, body { background: transparent; }

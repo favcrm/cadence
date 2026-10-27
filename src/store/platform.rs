@@ -23,6 +23,9 @@ use super::{now, Store};
 /// carry fingerprints and handles, never a credential.
 pub const PLATFORM_STREAM: &str = "audit:platforms";
 
+/// The committed credential/grants and exact generic closures retired together.
+pub type EncryptedRevocation = (CredentialRecord, Vec<Grant>, Vec<String>);
+
 /// §5.5 event names.
 pub const PLATFORM_CONNECTED_EVENT: &str = "platform_connected";
 pub const PLATFORM_DISCONNECTED_EVENT: &str = "platform_disconnected";
@@ -657,6 +660,46 @@ impl Store {
         reason: Option<&str>,
         effects_closed: &[String],
     ) -> Result<Option<(CredentialRecord, Vec<Grant>)>> {
+        self.platform_revoke_inner(platform, account, by, reason, effects_closed, None, false)
+            .map(|opt| opt.map(|(record, grants, _)| (record, grants)))
+    }
+
+    /// CAD-1128: the encrypted revoke — same one-transaction authority
+    /// retirement as [`Self::platform_revoke`], plus an in-tx CAS on
+    /// the caller's exact `expected_connection_id`/`expected_revision`
+    /// and closure of only `waiting`/`decided` generic rows
+    /// (`executing`/`reconcile` stay uncertain; the ciphertext is
+    /// retained by the caller separately).
+    pub fn platform_revoke_encrypted(
+        &self,
+        platform: &str,
+        account: &str,
+        by: &str,
+        expected_id: &str,
+        expected_revision: u64,
+    ) -> Result<Option<EncryptedRevocation>> {
+        self.platform_revoke_inner(
+            platform,
+            account,
+            by,
+            None,
+            &[],
+            Some((expected_id, expected_revision)),
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn platform_revoke_inner(
+        &self,
+        platform: &str,
+        account: &str,
+        by: &str,
+        reason: Option<&str>,
+        effects_closed: &[String],
+        expected: Option<(&str, u64)>,
+        close_waiting_decided: bool,
+    ) -> Result<Option<EncryptedRevocation>> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let record: Option<CredentialRecord> = tx.query_opt(
@@ -667,6 +710,14 @@ impl Store {
             let Some(record) = record else {
                 return Ok(None);
             };
+            if let Some((id, revision)) = expected {
+                if record.connection_id != id || record.credential_revision != revision {
+                    return Err(Error::invalid(
+                        "stale_revision",
+                        "connection incarnation or revision changed under claim",
+                    ));
+                }
+            }
             let grants: Vec<Grant> = tx.query_vec(
                 "SELECT * FROM platform_grants WHERE platform=?1 AND account=?2 \
                          ORDER BY agent",
@@ -690,6 +741,37 @@ impl Store {
             // with the record — withdraw each affected installation's approval
             // and close its waiting effects in the same transaction.
             Self::app_binding_approvals_withdraw_for_credential_in(&tx, platform, account)?;
+            let mut closed = effects_closed.to_vec();
+            if close_waiting_decided {
+                // Encrypted only: the generic pending-effect rows bound
+                // to this credential that provably never executed. A
+                // `decided` row is one the press accepted but the
+                // executor never claimed; `executing`/`reconcile` rows
+                // are retained uncertain — the ciphertext cleanup never
+                // cancels a possibly transmitted effect.
+                let rows: Vec<String> = tx.query_vec(
+                    "SELECT effect_id FROM platform_effects WHERE platform=?1 AND account=?2 \
+                     AND state IN ('waiting','decided') AND authorization_kind='agent_grant'",
+                    params![platform, account],
+                    |r| r.get(0),
+                )?;
+                for effect_id in rows {
+                    let changed = tx.execute(
+                        "UPDATE platform_effects SET state='closed', close_reason='credential_revoked',
+                         decision=NULL, outcome=NULL, needs_you=0, updated_at=?2
+                         WHERE effect_id=?1 AND state IN ('waiting','decided')",
+                        params![effect_id, now()],
+                    )?;
+                    if changed != 1 { continue; }
+                    Self::event(
+                        &tx,
+                        PLATFORM_STREAM,
+                        super::EFFECT_CANCELLED_EVENT,
+                        json!({"effect_id": effect_id, "reason": "credential_revoked"}),
+                    )?;
+                    closed.push(effect_id);
+                }
+            }
             for grant in &grants {
                 let mut payload = grant.to_json();
                 payload["reason"] = json!(reason.unwrap_or("credential revoked"));
@@ -709,9 +791,9 @@ impl Store {
                 PLATFORM_DISCONNECTED_EVENT,
                 json!({"platform": platform, "account": account,
                                "fingerprint": record.fingerprint,
-                               "effects_closed": effects_closed, "by": by}),
+                               "effects_closed": closed, "by": by}),
             )?;
-            Ok(Some((record, grants)))
+            Ok(Some((record, grants, closed)))
         })
     }
 
@@ -786,7 +868,10 @@ impl Store {
                 params![platform, account],
                 |r| r.get(0),
             )?;
-            if enrolled.is_none() && !crate::platform::is_builtin(platform, account) {
+            if enrolled.is_none()
+                && !crate::platform::is_builtin(platform, account)
+                && !crate::platform::saved_login_account(platform, account)
+            {
                 return Err(Error::rejected(format!(
                     "platform '{platform}' account '{account}' is not enrolled — \
                              `platform enroll` first"
@@ -937,7 +1022,10 @@ impl Store {
                 params![platform, account],
                 |r| r.get(0),
             )?;
-            if enrolled.is_none() && !crate::platform::is_builtin(platform, account) {
+            if enrolled.is_none()
+                && !crate::platform::is_builtin(platform, account)
+                && !crate::platform::saved_login_account(platform, account)
+            {
                 return Err(Error::rejected(format!(
                     "platform '{platform}' account '{account}' is not enrolled — \
                              `platform enroll` first"
@@ -1178,21 +1266,6 @@ impl Store {
                 })
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.flatten().collect())
-        })
-    }
-
-    /// Revoke every grant an app's approval derived: the `app_grants`
-    /// rows go, and each `(agent, platform, account)`'s `platform_grants`
-    /// scopes shrink by exactly the app's derived set, less whatever
-    /// another approved app still derives — a hand-made grant's other
-    /// scopes survive. Answers the `(agent, platform,
-    /// account)` triples whose platform grant changed, so the caller
-    /// can drain the waiting effects that lost a scope (CAD-506).
-    pub fn app_grants_revoke(&self, app: &str, by: &str) -> Result<Vec<(String, String, String)>> {
-        self.write_tx(|conn| {
-            let tx = &mut *conn;
-            let changed = revoke_derived(&tx, app, by)?;
-            Ok(changed)
         })
     }
 }

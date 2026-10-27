@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadPage",
+  "description": "`thread_read` (daemon RPC; `GET /api/threads/<alias>` relays it).\nA forward read carries `cursor`; a backward one also `more_before`.",
+  "type": "object",
+  "properties": {
+    "alias": {
+      "type": "string"
+    },
+    "cursor": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ThreadEntryRow"
+      }
+    },
+    "more_before": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "reply_seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "thread": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadInfo"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "alias",
+    "entries",
+    "cursor",
+    "reply_seq"
+  ],
+  "$defs": {
+    "ThreadEntryRow": {
+      "description": "One thread entry. For a message entry of the same thread the payload\nalso carries `delivery: {state, started, completed}`.",
+      "type": "object",
+      "properties": {
+        "created": {
+          "type": "number",
+          "format": "double"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": true,
+        "role": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "text": {
+          "type": "string"
+        },
+        "thread": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "seq",
+        "thread",
+        "role",
+        "kind",
+        "text",
+        "created"
+      ]
+    },
+    "ThreadInfo": {
+      "description": "A conversation (thread) row.",
+      "type": "object",
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "archived": {
+          "type": "boolean"
+        },
+        "context_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created": {
+          "type": "number",
+          "format": "double"
+        },
+        "general": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "install_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_general": {
+          "type": "boolean"
+        },
+        "subject": {
+          "description": "`campaign:<id>` for a campaign conversation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "id",
+        "alias",
+        "created",
+        "updated",
+        "general",
+        "is_general",
+        "archived"
+      ]
+    }
+  }
+}

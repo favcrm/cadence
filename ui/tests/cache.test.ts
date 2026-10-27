@@ -204,11 +204,14 @@ async function main() {
     const refused = r.refresh(); s.reject(new Error("forbidden")); await refused;
     equal(r.get().data, null, "refusal purges protected observation");
     equal(r.get().asOf, null, "refusal clears success freshness");
+    equal(r.get().discarded, true, "consumers can distinguish denied private data from transport failure");
     const unavailable = r.revalidate(); s.reject(new Error("unavailable")); await unavailable;
     equal(r.get().data, null, "later availability error cannot resurrect purged observation");
     equal(r.get().status, "failed", "purged observation remains a failed load");
+    equal(r.get().discarded, true, "transport failure cannot erase a prior private-data retirement");
     const admitted = r.revalidate(); s.resolve(2); await admitted;
     equal(r.get().data, 2, "admitted read restores a protected observation");
+    equal(r.get().discarded, false, "fresh admitted read clears the retirement notice");
     const old = r.refresh(); r.write(() => 3); s.reject(new Error("forbidden")); await old;
     equal(r.get().data, 3, "older refusal cannot purge newer authoritative write");
   }
@@ -224,6 +227,7 @@ async function main() {
   equal(invalidatedBy("not json"), [...RESOURCE_NAMES], "bad frame refetches all");
   equal(invalidatedBy(undefined), [...RESOURCE_NAMES], "missing data refetches all");
   equal(invalidatedBy('{"resources":[]}'), [], "explicit empty list refetches nothing");
+  equal(invalidatedBy('{"resources":["threads"]}'), ["threads"], "threads frame is kept");
 
   console.log("resource checks passed");
 }

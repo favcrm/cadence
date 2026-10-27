@@ -725,3 +725,20 @@ mod send_gate {
 
 #[cfg(feature = "test-seam")]
 pub use send_gate::SendRowGate;
+
+/// Fixture-only: whitelist `model` in the store's canonical `[pi]`
+/// policy, so a fixture's registered Pi master passes the launch gate
+/// for that exact explicit model. Crate-internal test helper; no
+/// identity, guard, or refusal path is bypassed, and nothing launches.
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) fn seed_pi_fixture_policy(store: &crate::store::Store, model: &str) -> Result<()> {
+    let mut settings = store.settings()?;
+    settings.doc.pi = Some(serde_json::from_value(serde_json::json!({
+        "models": {
+            "allow": [model],
+            "default": {"master": model}
+        }
+    }))?);
+    store.save_settings(settings.revision, settings.doc, "test-seam-fixture")?;
+    Ok(())
+}

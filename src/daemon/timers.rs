@@ -6,12 +6,86 @@ use super::*;
 /// automatic sweep never reaches an agent idle for less than a week.
 pub const AGENT_GC_FLOOR_SECS: u64 = 7 * 86_400;
 
+/// CAD-804: the daemon-side floor both `agent gc` and `agent_gc_plan`
+/// enforce. The CLI checks it too, but a direct RPC must not bypass it;
+/// `force` is the explicit operator override (and what `session end`
+/// sends for its own 1h cleanup).
+pub(super) fn require_agent_gc_floor(older_than: Option<f64>, force: bool) -> Result<()> {
+    if let Some(secs) = older_than {
+        if secs < AGENT_GC_FLOOR_SECS as f64 && !force {
+            return Err(Error::rejected(format!(
+                "agent gc --older-than {secs}s is below the 7-day floor \
+                 ({AGENT_GC_FLOOR_SECS}s) — pass --force to sweep younger rows"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The timer sweeps at most this often.
 pub(super) const AGENT_GC_EVERY: Duration = Duration::from_secs(3600);
 
 /// How often the timer re-reads `[host]` — enabling, retuning or
 /// disabling it applies without a daemon restart.
 const AGENT_GC_RECHECK: Duration = Duration::from_secs(60);
+
+/// The agent-gc timer's setting: `[host] agent_gc_older_than_secs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentGcSetting {
+    /// The configured age in seconds; `None` (the default) is OFF.
+    pub configured_secs: Option<u64>,
+    /// Why `[host]` could not be read — the timer is then off.
+    pub config_error: Option<String>,
+}
+
+impl AgentGcSetting {
+    /// The timer on, sweeping rows idle longer than `secs`.
+    pub fn older_than(secs: u64) -> Self {
+        Self {
+            configured_secs: Some(secs),
+            config_error: None,
+        }
+    }
+
+    /// `[host]` in `<pm_dir>/pm.yaml`; no file or no key is off, and an
+    /// unusable table is off with its error — the sweep fails closed.
+    pub fn from_pm_dir(pm_dir: Option<&Path>) -> Self {
+        match pm_dir
+            .map(crate::doctor::host::read_host_overrides)
+            .transpose()
+        {
+            Ok(overrides) => Self {
+                configured_secs: overrides.flatten().and_then(|o| o.agent_gc_older_than_secs),
+                config_error: None,
+            },
+            Err(error) => Self {
+                configured_secs: None,
+                config_error: Some(error),
+            },
+        }
+    }
+
+    /// The age a sweep uses: the configured one raised to the floor.
+    /// `None` is off.
+    pub fn effective_secs(&self) -> Option<u64> {
+        self.configured_secs.map(|s| s.max(AGENT_GC_FLOOR_SECS))
+    }
+
+    /// The operator-facing warning, if any: an unreadable `[host]`, or
+    /// an age below the floor that the timer raised.
+    pub fn warning(&self) -> Option<String> {
+        if let Some(error) = &self.config_error {
+            return Some(format!("agent-gc timer off: {error}"));
+        }
+        match self.configured_secs {
+            Some(secs) if secs < AGENT_GC_FLOOR_SECS => Some(format!(
+                "[host] agent_gc_older_than_secs {secs} is below the 7-day floor; \
+                 the timer uses {AGENT_GC_FLOOR_SECS}s"
+            )),
+            _ => None,
+        }
+    }
+}
 
 /// The daemon's agent-gc timer: where its setting comes from and what
 /// it last did — `health` (`cadence daemon status`) reports both.
@@ -157,6 +231,7 @@ impl Shared {
             match self.store.timer_gc_remove(&agent.alias, older_than) {
                 Ok(Some(_)) => {
                     self.open_attach.lock().unwrap().remove(&agent.alias);
+                    self.remove_provider_log(&agent.alias);
                     removed.push(agent.alias);
                 }
                 Ok(None) => {}
@@ -183,6 +258,134 @@ pub const AUTO_STOP_DEFAULT_SECS: u64 = 3600;
 /// typo'd `60` must not stop agents between two turns of one task.
 pub const AUTO_STOP_FLOOR_SECS: u64 = 600;
 
+/// The idle auto-stop setting: `[host] auto_stop_idle_secs` and
+/// `auto_stop_idle_secs_by_provider` in pm.yaml. Per-agent params
+/// (`auto_stop=off`, `auto_stop_idle_secs`) override both.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AutoStopSetting {
+    /// `None` is the built-in [`AUTO_STOP_DEFAULT_SECS`]; `0` is off.
+    pub idle_secs: Option<u64>,
+    /// Provider → bound; `0` turns the timer off for that provider.
+    pub by_provider: std::collections::BTreeMap<String, u64>,
+    /// Why `[host]` could not be read — the timer then stops nothing.
+    pub config_error: Option<String>,
+}
+
+impl AutoStopSetting {
+    /// Off for every provider (per-agent `auto_stop_idle_secs` can still
+    /// turn one agent on). Test daemons pin this.
+    pub fn off() -> Self {
+        Self::idle_after(0)
+    }
+
+    /// On for every provider at `secs` (raised to the floor).
+    pub fn idle_after(secs: u64) -> Self {
+        Self {
+            idle_secs: Some(secs),
+            ..Self::default()
+        }
+    }
+
+    /// `[host]` in `<pm_dir>/pm.yaml`; no file or no key is the default
+    /// (ON, one hour). An unusable table stops nothing, with its error.
+    pub fn from_pm_dir(pm_dir: Option<&Path>) -> Self {
+        match pm_dir
+            .map(crate::doctor::host::read_host_overrides)
+            .transpose()
+        {
+            Ok(overrides) => {
+                let o = overrides.flatten();
+                Self {
+                    idle_secs: o.as_ref().and_then(|o| o.auto_stop_idle_secs),
+                    by_provider: o
+                        .and_then(|o| o.auto_stop_idle_secs_by_provider)
+                        .unwrap_or_default(),
+                    config_error: None,
+                }
+            }
+            Err(error) => Self {
+                config_error: Some(error),
+                ..Self::default()
+            },
+        }
+    }
+
+    fn floored(secs: u64) -> Option<u64> {
+        (secs > 0).then(|| secs.max(AUTO_STOP_FLOOR_SECS))
+    }
+
+    /// The host-wide bound (`None` = off).
+    pub fn default_bound(&self) -> Option<u64> {
+        if self.config_error.is_some() {
+            return None;
+        }
+        match self.idle_secs {
+            Some(secs) => Self::floored(secs),
+            None => Some(AUTO_STOP_DEFAULT_SECS),
+        }
+    }
+
+    /// `agent`'s idle bound and where it came from; `None` is off.
+    /// Precedence: agent `auto_stop=off`, agent `auto_stop_idle_secs`,
+    /// `[host]` by provider, `[host]` default, built-in default.
+    pub fn bound_for(&self, agent: &Agent) -> (Option<u64>, String) {
+        if self.config_error.is_some() {
+            return (None, "pm.yaml [host] unreadable".to_string());
+        }
+        let param = |key: &str| agent.params.as_ref().and_then(|p| p.get(key)).cloned();
+        if param("auto_stop").and_then(|v| v.as_str().map(str::to_string)) == Some("off".into()) {
+            return (None, "agent auto_stop=off".to_string());
+        }
+        let agent_secs = param("auto_stop_idle_secs").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        });
+        if let Some(secs) = agent_secs {
+            return (Self::floored(secs), "agent auto_stop_idle_secs".to_string());
+        }
+        if let Some(&secs) = self.by_provider.get(&agent.provider) {
+            return (
+                Self::floored(secs),
+                format!("[host] auto_stop_idle_secs_by_provider.{}", agent.provider),
+            );
+        }
+        match self.idle_secs {
+            Some(secs) => (
+                Self::floored(secs),
+                "[host] auto_stop_idle_secs".to_string(),
+            ),
+            None => (Some(AUTO_STOP_DEFAULT_SECS), "default".to_string()),
+        }
+    }
+
+    /// The operator-facing warning: an unreadable `[host]`, or a bound
+    /// below the floor that the timer raised.
+    pub fn warning(&self) -> Option<String> {
+        if let Some(error) = &self.config_error {
+            return Some(format!("idle auto-stop off: {error}"));
+        }
+        let mut low: Vec<String> = Vec::new();
+        if let Some(secs) = self
+            .idle_secs
+            .filter(|s| (1..AUTO_STOP_FLOOR_SECS).contains(s))
+        {
+            low.push(format!("auto_stop_idle_secs {secs}"));
+        }
+        for (provider, secs) in &self.by_provider {
+            if (1..AUTO_STOP_FLOOR_SECS).contains(secs) {
+                low.push(format!("auto_stop_idle_secs_by_provider.{provider} {secs}"));
+            }
+        }
+        (!low.is_empty()).then(|| {
+            format!(
+                "[host] {} below the {AUTO_STOP_FLOOR_SECS}s floor; the timer uses \
+                 {AUTO_STOP_FLOOR_SECS}s",
+                low.join(", ")
+            )
+        })
+    }
+}
+
 /// The timer checks at most this often (seconds of its clock).
 const AUTO_STOP_EVERY_SECS: f64 = 60.0;
 
@@ -197,6 +400,7 @@ pub(super) const AUTO_STOP_PASSIVE_KINDS: &[&str] = &[
     AUTO_RESUME_FAILED_EVENT,
     "stop_requested",
     "params_updated",
+    "gc_keep_updated",
     "quota_updated",
     "quota_update_ignored",
     "inbox_unconsumed",
@@ -247,6 +451,99 @@ pub(super) fn auto_stop_view(agent: &Agent, marker: Option<&store::Event>) -> Op
         "label": auto_stop_label(idle),
         "resume": format!("cadence agent resume {}", agent.alias),
     }))
+}
+
+/// CAD-1353: what a non-empty delivery queue is waiting for. The live
+/// idle case is the one the operator cannot see from `state` alone: an
+/// actor with no turn running has no provider event to show and looks
+/// idle while the delivery has not started.
+pub(super) fn delivery_view(agent: &Agent, queued: i64, oldest: Option<f64>) -> Value {
+    if queued <= 0 {
+        return json!({"queued": 0, "state": "clear"});
+    }
+    let age = oldest.map(|at| (crate::store::now() - at).max(0.0).round() as u64);
+    let (state, owner, reason) = if agent.state == "stopped" {
+        (
+            "stopped",
+            "operator",
+            "the agent is stopped — `cadence agent resume <alias>` drains the queue",
+        )
+    } else if !agent.enabled {
+        (
+            "disabled",
+            "operator",
+            "the agent is disabled — enable or resume it to drain the queue",
+        )
+    } else if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+        // The durable mailbox is actorless by design. The cloud sandbox is
+        // also actorless, but it is a real dispatch backend: its queued
+        // kickoff is picked up by `run_cloud_dispatch`, not `cadence inbox`
+        // (which refuses every non-inbox provider/kind).
+        if agent.provider == "inbox" && agent.endpoint_kind == "inbox" {
+            (
+                "inbox",
+                "operator",
+                "the inbox has no actor — drain it with `cadence inbox <alias>`",
+            )
+        } else {
+            (
+                "cloud-dispatch",
+                "daemon",
+                "the queued kickoff is waiting for the cloud sandbox dispatch loop (`run_cloud_dispatch`)",
+            )
+        }
+    } else if matches!(agent.state.as_str(), "starting" | "stopping") {
+        (
+            "lifecycle",
+            "daemon",
+            "the actor is starting or stopping — the queue drains once it is live",
+        )
+    } else if agent.state == "attention" {
+        (
+            "attention",
+            "operator",
+            "the agent needs attention — resolve the fence or approval before the queue can run",
+        )
+    } else if agent.state == "idle" {
+        (
+            "idle-no-turn",
+            "daemon",
+            "the live actor is idle and no turn has started for the queued delivery (daemon delivery loop)",
+        )
+    } else if matches!(agent.state.as_str(), "running" | "busy") {
+        (
+            "turn-in-progress",
+            "agent",
+            "a turn is in progress — the queued delivery waits for it to end",
+        )
+    } else {
+        (
+            "queued",
+            "daemon",
+            "the delivery is queued and the daemon has not started it",
+        )
+    };
+    json!({
+        "queued": queued,
+        "oldest_secs": age,
+        "state": state,
+        "blocker": {"owner": owner, "reason": reason},
+    })
+}
+
+/// Stamp the delivery view and make the queue visible in the row's
+/// label, so a caller reading `state_label` cannot see a plain idle
+/// agent while work waits.
+pub(super) fn apply_delivery_view(j: &mut Value, agent: &Agent, queued: i64, oldest: Option<f64>) {
+    j["delivery"] = delivery_view(agent, queued, oldest);
+    if queued > 0 {
+        let label = j
+            .get("state_label")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| agent.state.clone());
+        j["state_label"] = json!(format!("{label} · {queued} queued"));
+    }
 }
 
 /// CAD-413: the `auto_resume_failed` view of an agent whose newest
@@ -596,6 +893,9 @@ impl Shared {
 
 /// CAD-754: issues classified per reconcile tick.
 const RECONCILE_BATCH: usize = 25;
+/// `gh` starts one hourly reconcile tick may make (CAD-1751 budget); past
+/// it a lookup fails like an unreachable gh and the batch carries on.
+const RECONCILE_GH_CAP: usize = 150;
 
 impl Shared {
     /// CAD-754: one bounded batch of the tracker reconcile — close
@@ -606,7 +906,18 @@ impl Shared {
     /// reclaim pass is the bounded exception: `finish::with_probe_timeout`
     /// caps every probe it makes). A tracker write
     /// failure is logged, never escalated: the next tick retries.
-    pub(super) fn reconcile_tick(&self) {
+    ///
+    /// CAD-1241: `cursor` is the stall-watch-owned continuation — the
+    /// last evidence-bearing candidate the previous tick classified.
+    /// Each tick resumes strictly after it in natural id order and
+    /// wraps once, so a full batch of persistently unresolved older
+    /// issues cannot starve later merged ones. It is in-memory only:
+    /// a daemon restart resets the sweep to the head of the board (no
+    /// persistent schema, no coverage promise under continual
+    /// restart), a deleted cursor id resumes at its natural successor,
+    /// and an error leaves it where it was.
+    pub(super) fn reconcile_tick(&self, cursor: &mut Option<String>) {
+        crate::gh_guard::bind(&self.state_dir);
         let pm = match self.pm() {
             Ok(pm) => pm,
             Err(e) => {
@@ -614,13 +925,27 @@ impl Shared {
                 return;
             }
         };
-        match crate::issue::reconcile::run_daemon(&pm, "daemon", RECONCILE_BATCH) {
+        match crate::gh_guard::with_call_cap(RECONCILE_GH_CAP, || {
+            crate::issue::reconcile::run_daemon(&pm, "daemon", RECONCILE_BATCH, cursor.as_deref())
+        }) {
             Ok(out) => {
+                // A failed history walk is silent in the row counts:
+                // note-derived candidates simply never classify, so a
+                // stuck walk would starve them unseen. Log it so the
+                // condition is diagnosable (CAD-878); the next tick
+                // retries the walk.
+                if let Some(e) = crate::issue::reconcile::history_failure(&out) {
+                    eprintln!(
+                        "issue reconcile: status-line history failed ({e}); \
+                         note-driven candidates parked this tick"
+                    );
+                }
                 let done = out["done"].as_array().map(|d| d.len()).unwrap_or(0);
                 let held = out["held"].as_array().map(|h| h.len()).unwrap_or(0);
                 if done > 0 || held > 0 {
                     eprintln!("issue reconcile: {done} closed, {held} held");
                 }
+                *cursor = out["cursor"].as_str().map(String::from);
             }
             Err(e) => eprintln!("issue reconcile: {e}"),
         }
@@ -709,8 +1034,10 @@ impl Shared {
             .store
             .last_event_of(alias, AUTO_STOP_MARKER_KINDS)
             .is_ok_and(|m| m.is_some_and(|m| m.seq == seen.seq));
-        let still_stopped = self.store.agent(alias).is_ok_and(|a| a.state == "stopped");
-        if !still_seen || !still_stopped {
+        let current = self.store.agent(alias).ok();
+        let still_stopped = current.as_ref().is_some_and(|a| a.state == "stopped");
+        let still_archived = current.as_ref().is_some_and(|a| a.archived_at.is_some());
+        if !still_seen || !still_stopped || still_archived {
             return;
         }
         let recorded = self.store.event_public(
@@ -744,6 +1071,17 @@ impl Shared {
     /// open never reached `ready`. Names the waiting message from the
     /// resume record so the needs-me row can.
     pub(super) fn auto_resume_failed(&self, alias: &str, reason: &str) {
+        // Hold the lifecycle lock across the archived re-check and the
+        // failure event, so an archive cannot commit between them and
+        // leave an event on an archived row.
+        let _lc = self.lifecycle.lock().unwrap();
+        if self
+            .store
+            .agent(alias)
+            .is_ok_and(|a| a.archived_at.is_some())
+        {
+            return;
+        }
         let resumed = self
             .store
             .last_event_of(alias, &[AUTO_RESUME_EVENT])

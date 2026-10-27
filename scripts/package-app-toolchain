@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Package the versioned, platform-neutral app tooling release asset."""
+
+import argparse
+import gzip
+import hashlib
+import json
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+SCHEMA = "cadence-app-toolchain/1"
+PIN_NAMES = ("react", "react-dom", "vite", "@vitejs/plugin-react")
+# The app-side screen receiver, vendored byte-for-byte from ui/app-kit. The
+# archive pins every file so a consumer can prove what it unpacked.
+APP_KIT_FILES = (
+    "README.md",
+    "package.json",
+    "src/index.mjs",
+    "src/receiver.mjs",
+    "src/refusal.mjs",
+    "types/index.d.ts",
+)
+
+
+def fail(message):
+    raise SystemExit(f"package-app-toolchain: {message}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cadence", required=True, type=Path)
+    parser.add_argument("--tag", required=True)
+    parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--out", required=True, type=Path)
+    args = parser.parse_args()
+
+    if not re.fullmatch(r"v[0-9][0-9A-Za-z.+_-]*", args.tag):
+        fail("tag must be a safe v<version>")
+    if not re.fullmatch(r"[0-9a-f]{40}", args.source_sha):
+        fail("source-sha must be a full lowercase 40-hex commit")
+    if args.out.exists() or args.out.is_symlink():
+        fail(f"output must be a new directory: {args.out}")
+
+    expected_version = f"cadence {args.tag[1:]}+{args.source_sha}"
+    version = subprocess.run(
+        [str(args.cadence), "--version"], check=True, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    ).stdout.strip()
+    if version != expected_version:
+        fail(f"built CLI reports {version!r}, expected {expected_version!r}")
+
+    ui_manifest = json.loads((ROOT / "ui/package.json").read_text())
+    manager = ui_manifest.get("packageManager")
+    if not isinstance(manager, str) or not re.fullmatch(r"bun@[0-9]+(?:\.[0-9]+){2}", manager):
+        fail("ui/package.json packageManager must be an exact bun major.minor.patch version")
+    source_pins = {**ui_manifest["dependencies"], **ui_manifest["devDependencies"]}
+    pins = {name: source_pins.get(name) for name in PIN_NAMES}
+    if any(not isinstance(value, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+(?:[-+][0-9A-Za-z.-]+)?", value)
+           for value in pins.values()):
+        fail("required React/Vite pins must be exact versions in ui/package.json")
+
+    args.out.mkdir(parents=True)
+    stage = None
+    try:
+        stage = Path(tempfile.mkdtemp(prefix=".app-toolchain-", dir=args.out))
+        package = {
+            "name": "cadence-app-toolchain",
+            "private": True,
+            "version": args.tag[1:],
+            "type": "module",
+            "packageManager": manager,
+            "scripts": {"dev": "vite", "build": "vite build"},
+            "dependencies": {name: pins[name] for name in PIN_NAMES[:2]},
+            "devDependencies": {name: pins[name] for name in PIN_NAMES[2:]},
+        }
+        (stage / "package.json").write_text(json.dumps(package, indent=2) + "\n")
+        shutil.copyfile(ROOT / "app-toolchain/bun.lock", stage / "bun.lock")
+        shutil.copyfile(ROOT / "app-toolchain/README.md", stage / "README.md")
+        shutil.copyfile(ROOT / "LICENSE", stage / "LICENSE")
+        app_kit = ROOT / "ui/app-kit"
+        unlisted = sorted(
+            str(path.relative_to(app_kit))
+            for base in ("src", "types")
+            for path in (app_kit / base).rglob("*")
+            if path.is_file() and str(path.relative_to(app_kit)) not in APP_KIT_FILES
+        )
+        if unlisted:
+            fail("app-kit source files are not in APP_KIT_FILES: " + ", ".join(unlisted))
+        app_kit_version = json.loads((app_kit / "package.json").read_text())["version"]
+        app_kit_files = {}
+        for relative in APP_KIT_FILES:
+            source = app_kit / relative
+            if not source.is_file():
+                fail(f"app-kit source is missing: {relative}")
+            target = stage / "app-kit" / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            app_kit_files[relative] = hashlib.sha256(source.read_bytes()).hexdigest()
+        (stage / "toolchain.json").write_text(json.dumps({
+            "schema": SCHEMA,
+            "tag": args.tag,
+            "source_sha": args.source_sha,
+            "package_manager": manager,
+            "pins": pins,
+            "app_kit": {"version": app_kit_version, "files": app_kit_files},
+        }, indent=2) + "\n")
+        frame = stage / "frame-kit"
+        subprocess.run(
+            [str(args.cadence), "app", "frame-kit", "--out", str(frame)],
+            check=True,
+        )
+
+        members = [
+            "LICENSE", "README.md", "frame-kit/frame.html", "frame-kit/kit.css",
+            "frame-kit/metadata.json", "package.json", "bun.lock", "toolchain.json",
+            *(f"app-kit/{relative}" for relative in APP_KIT_FILES),
+        ]
+        for member in members:
+            if not (stage / member).is_file():
+                fail(f"required archive member was not generated: {member}")
+        asset = f"cadence-app-toolchain-{args.tag}.tar.gz"
+        archive = args.out / asset
+        with archive.open("wb") as output:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+                with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+                    for member in members:
+                        path = stage / member
+                        info = tarfile.TarInfo(member)
+                        info.size = path.stat().st_size
+                        info.mode = 0o644
+                        info.mtime = 0
+                        info.uid = info.gid = 0
+                        info.uname = info.gname = ""
+                        with path.open("rb") as source:
+                            tar.addfile(info, source)
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        (args.out / f"{asset}.sha256").write_text(f"{digest}  {asset}\n")
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
+        fail(str(error))
+    finally:
+        if stage is not None:
+            shutil.rmtree(stage)
+
+
+if __name__ == "__main__":
+    main()

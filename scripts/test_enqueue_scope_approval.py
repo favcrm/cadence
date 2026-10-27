@@ -32,6 +32,13 @@ BRANCH = "cc13/cad-1106-scope-approval"
 BODY = "## Goal\nApprove once per ticket.\nRisk: human (4, 7)\n"
 OPERATOR = "operator-connection"
 NOTE = "20261003-100000-cad1106-pr5-review-verdict.md"
+CI_SUITE = 106304880676
+CI_URL = "https://github.com/o/r/actions/runs/12345"
+CI_RUN = {"id": 12345, "head_sha": HEAD, "event": "pull_request", "status": "completed",
+          "conclusion": "success", "html_url": CI_URL, "workflow_id": 362543015,
+          "path": ".github/workflows/ci.yml", "check_suite_id": CI_SUITE, "run_attempt": 1, "run_number": 1,
+          "created_at": "2026-10-19T09:35:50Z", "run_started_at": "2026-10-19T09:35:50Z",
+          "updated_at": "2026-10-19T09:43:23Z"}
 
 
 def digest(body):
@@ -51,15 +58,23 @@ class Case:
         self.paths = ["scripts/enqueue-reviewed", ".github/workflows/ci.yml"]
         self.title = f"{ISSUE}: approve once per ticket"
         self.branch = BRANCH
+        self.base_ref = "main"
         self.ticket_body = BODY
         self.refs = [{"kind": "branch", "path": BRANCH}]
         self.status = "doing"
+        self.project = "cadence"
+        self.requirements_override = None
+        self.requirements_calls = 0
+        self.requirements_after_at = None
+        self.requirements_after = None
+        self.scope_calls = 0
         self.store = [scope_rec()]
         self.note_text = (f"# Verdict: {ISSUE} Review (standards+spec) — pass\n> Issue: {ISSUE}\n> From: rev\n\n"
                           f"## Verdict\npass — PR #5, head {HEAD}\n\nRisk: human (4, 7) — scripts\n"
                           f"Scope: in-scope {ISSUE}\n")
         self.per_head = False
         self.scope_rc = 0
+        self.ci_runs = [dict(CI_RUN)]  # the current ci.yml attempt at HEAD; a suite-matched success
         self.scope_override = None  # a raw reply, to model a lying or broken verb
 
     def note(self):
@@ -75,7 +90,7 @@ class Case:
         if argv[:3] == ["gh", "pr", "view"]:
             return 0, json.dumps({
                 "number": 5, "state": "OPEN", "title": self.title, "headRefName": self.branch,
-                "headRefOid": HEAD, "baseRefName": "main", "baseRefOid": BASE,
+                "headRefOid": HEAD, "baseRefName": self.base_ref, "baseRefOid": BASE,
                 "mergeStateStatus": "CLEAN", "autoMergeRequest": None,
                 "author": {"login": "cc"},
                 "statusCheckRollup": [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}]}), ""
@@ -85,16 +100,68 @@ class Case:
             url = argv[-1]
             if "/rules/branches/" in url:
                 return 0, json.dumps([{"type": "required_status_checks", "parameters": {
-                    "required_status_checks": [{"context": "ci"}]}}]), ""
+                    "required_status_checks": [{"context": "ci", "integration_id": 15368}]}}]), ""
+            if "/check-runs" in url:
+                return 0, json.dumps({"total_count": 1, "check_runs": [{
+                    "id": 117992467504, "name": "ci", "head_sha": HEAD, "status": "completed",
+                    "conclusion": "success", "started_at": "2026-10-19T09:43:14Z",
+                    "completed_at": "2026-10-19T09:43:22Z", "details_url": "https://github.com/o/r/actions/runs/12345",
+                    "app": {"id": 15368, "slug": "github-actions"}, "check_suite": {"id": 106304880676}}]}), ""
+            if "actions/workflows/ci.yml/runs" in url or "/actions/runs?head_sha=" in url:
+                return 0, json.dumps({"total_count": len(self.ci_runs), "workflow_runs": self.ci_runs}), ""
+            if "/contents/.github/workflows/ci.yml?ref=" in url:
+                # The trusted base's ci.yml declares the gate job the required context names.
+                return 0, "name: CI\njobs:\n  ci:\n    name: ci\n    runs-on: ubuntu-latest\n", ""
             if url.endswith("/protection"):
                 return 1, "", "Branch not protected"
             for f in (enq.ONE_REVIEW_FILE, enq.RISK_PATHS_FILE):  # the REAL lists
                 if f"/contents/{f}?ref={BASE}" in url:
                     return 0, (ROOT / f).read_text(), ""
         if argv[:3] == ["cadence", "issue", "show"]:
-            return 0, json.dumps({"id": argv[3], "owner": None, "claim": None, "body": self.ticket_body,
-                                  "status": self.status, "refs": self.refs,
-                                  "comments": [{"body": f"{HEAD} {NOTE}"}]}), ""
+            issue = argv[3]
+            matching = [r for r in self.store if r["issue"].lower() == issue.lower()]
+            approval_id = "merge-pr5-aaaa" if self.per_head else (
+                matching[-1]["approval_id"] if matching else "missing")
+            comment = f"{HEAD} {NOTE}\nBase branch: {self.base_ref}\nGreen CI run: {CI_URL}\nOperator approval id: {approval_id}"
+            return 0, json.dumps({"id": issue, "project": self.project, "owner": None, "claim": None,
+                                  "body": self.ticket_body, "status": self.status, "refs": self.refs,
+                                  "comments": [{"body": comment}]}), ""
+        if argv[:3] == ["cadence", "delivery", "requirements"]:
+            issue = argv[argv.index("--issue") + 1]
+            pr_url = argv[argv.index("--pr") + 1]
+            head = argv[argv.index("--head") + 1]
+            pr = int(pr_url.rsplit("/", 1)[-1])
+            # Producer-shaped inactive result for legacy fixtures. This fake
+            # models only the requirements wire shape: derive its fields from
+            # the fixture's current paths/modes and trusted base manifests, but
+            # do not treat that as classifier or native-authority evidence.
+            policy_digest = "sha256:" + "d" * 64
+            changes = [("M", "100644", "100644", path) for path in self.paths]
+            one_text = (ROOT / enq.ONE_REVIEW_FILE).read_text()
+            risk_text = (ROOT / enq.RISK_PATHS_FILE).read_text()
+            reviews = 1 if enq.one_review_qualifies(changes, one_text) else 2
+            review_kind = "combined" if reviews == 1 else "standards_and_spec"
+            verdict_risks = ([v.get("risk") for v in self.verdict_list]
+                             if getattr(self, "verdict_list", None) is not None
+                             else [enq.risk_line(self.note_text or "")])
+            operator_approval = (any(enq.is_human_path(path, enq.risk_globs(risk_text) or ())
+                                     for path in self.paths)
+                                 or any(risk != "auto" for risk in verdict_risks))
+            req = {"class": "strict", "reviews": reviews, "review_kind": review_kind,
+                   "security_capable": False, "browser_qa": any(path.startswith("ui/") for path in self.paths),
+                   "operator_approval": operator_approval,
+                   "full_checks": True, "reasons": ["fixture: legacy project has no approved solo profile"],
+                   "policy_digest": policy_digest, "activation": "no_profile"}
+            response = {"issue": issue, "project": self.project, "repo": "o/r", "pr": pr,
+                        "head": head, "base": BASE, "base_ref": self.base_ref, "merge_base": "c" * 40,
+                        "policy_digest": policy_digest, "requirements": req, "readiness": None}
+            self.requirements_calls += 1
+            if self.requirements_override is not None:
+                response = self.requirements_override
+            if (self.requirements_after_at is not None
+                    and self.requirements_calls > self.requirements_after_at):
+                response = self.requirements_after
+            return 0, json.dumps(response), ""
         if argv[:3] == ["cadence", "audit", "verdicts"]:
             return 0, json.dumps({"verdicts": [self.note()], "skipped": []}), ""
         if argv[:3] == ["cadence", "audit", "approval"]:
@@ -103,6 +170,7 @@ class Case:
                                       "source": "op", "recorded_via": OPERATOR}), ""
             return 1, json.dumps({"state": "missing", "reason": "no merge approval"}), ""
         if argv[:3] == ["cadence", "audit", "scope"]:
+            self.scope_calls += 1
             if self.scope_override is not None:
                 return self.scope_rc, self.scope_override, ""
             issue = argv[argv.index("--issue") + 1]

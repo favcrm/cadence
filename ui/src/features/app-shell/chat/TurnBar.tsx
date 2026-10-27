@@ -1,0 +1,126 @@
+import { useEffect, useState, type ReactNode } from "react";
+import { useTranslate } from "../../../lib/locale";
+import type { TurnBarState } from "./turnBarState";
+
+export interface TurnBarActions {
+  /** Mutating actions are absent when the viewer cannot write. */
+  onStop?: (message: string) => void;
+  onCancel?: (message: string) => void;
+  /** Absent when there is no captured envelope to resend: Retry is hidden. */
+  onRetry?: () => void;
+  onReview: () => void;
+  /** Opens the exact queued predecessor: Home or an installed app's conversation. */
+  onView?: () => void;
+}
+
+/**
+ * One row above the composer for the conversation's current turn
+ * (CAD-1700). Neutral surface; the state is in the dot and the words.
+ * While the stream is down the bar shows the last known state, dimmed and
+ * prefixed "last known", with its actions hidden. A finished turn renders
+ * nothing: the reply itself is the completion signal.
+ */
+export function TurnBar({
+  state,
+  since,
+  actions,
+  reconnecting,
+}: {
+  state: TurnBarState;
+  /** Epoch seconds the running turn started (master_state.turn.since). */
+  since: number | null;
+  actions: TurnBarActions;
+  reconnecting: boolean;
+}) {
+  const t = useTranslate();
+  const live = state.kind === "working" || state.kind === "writing";
+  const elapsed = useElapsed(live ? since : null);
+  if (state.kind === "idle") return null;
+
+  const button = (label: string, onClick: () => void, danger = false, ariaLabel?: string) => (
+    <button type="button" className={danger ? "tb-btn danger" : "tb-btn"} aria-label={ariaLabel} onClick={onClick}>
+      {t(label)}
+    </button>
+  );
+  const { onStop, onCancel } = actions;
+  const stop = (message: string | null) =>
+    message === null || onStop === undefined ? null : button("Stop", () => onStop(message), true, t("Stop this turn"));
+
+  let title: string;
+  let detail = "";
+  let tone: string = state.kind;
+  let controls: ReactNode = null;
+  switch (state.kind) {
+    case "sending":
+      title = t("Sending");
+      break;
+    case "queued":
+      title = t("Queued");
+      detail = state.ahead === "" ? "" : `${t("after")} ${t(state.ahead)}`;
+      controls = (
+        <>
+          {actions.onView ? button("View", actions.onView) : null}
+          {state.cancelMessage !== null && onCancel ? button("Cancel", () => onCancel(state.cancelMessage!)) : null}
+        </>
+      );
+      break;
+    case "working":
+      title = t("Working");
+      detail = [state.step ?? t("planning"), clock(elapsed)].filter(Boolean).join(" · ");
+      controls = stop(state.stopMessage);
+      break;
+    case "writing":
+      title = t("Writing");
+      detail = clock(elapsed);
+      controls = stop(state.stopMessage);
+      break;
+    case "approval":
+      title = t("Needs your approval");
+      detail = t("paused");
+      tone = "needs_approval";
+      controls = button("Review", actions.onReview);
+      break;
+    case "failed":
+      title = t("Failed");
+      detail = state.reason;
+      controls = actions.onRetry ? button("Retry", actions.onRetry) : null;
+      break;
+    case "stopped":
+      title = t("Stopped");
+      detail = t("partial answer kept");
+      break;
+  }
+
+  return (
+    <div className="turnbar" data-state={tone} data-stale={reconnecting || undefined} data-turn-bar role="status" aria-live="polite">
+      <span className="tb-dot" aria-hidden="true" />
+      <span className="tb-text">
+        <span className="tb-title">{title}</span>
+        {(detail || reconnecting) && (
+          <span className="tb-detail">
+            {reconnecting ? `${t("last known")} · ` : ""}
+            {detail}
+          </span>
+        )}
+      </span>
+      {!reconnecting && controls && <span className="tb-actions">{controls}</span>}
+    </div>
+  );
+}
+
+/** Seconds since `since`, ticking once a second while a turn runs (a clock, not a fetch). */
+function useElapsed(since: number | null): number | null {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (since === null) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [since]);
+  return since === null ? null : Math.max(0, Math.floor(now / 1000 - since));
+}
+
+function clock(seconds: number | null): string {
+  if (seconds === null) return "";
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}

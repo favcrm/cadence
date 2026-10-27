@@ -3,9 +3,6 @@
 
 use super::*;
 
-pub(super) fn run(
-    state_dir: PathBuf,
-    action: cadence_agent::sandbox::SandboxAction,
-) -> Result<i32> {
+pub(super) fn run(state_dir: PathBuf, action: cadence_agent::sandbox::DevAction) -> Result<i32> {
     cadence_agent::sandbox::run_cli(&state_dir, &action)
 }

@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A descriptor-bearing (or plain) `apps/blog-post` source tree, a
+/// A descriptor-bearing (or plain) `tests/fixtures/apps/blog-post` source tree, a
 /// private PM dir and one seam-armed in-process daemon serving it.
 struct Workspace {
     _root: tempfile::TempDir,
@@ -52,7 +52,7 @@ impl Workspace {
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
             std::fs::copy(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("apps/blog-post")
+                    .join("tests/fixtures/apps/blog-post")
                     .join(name),
                 destination,
             )
@@ -780,17 +780,25 @@ fn cad864_descriptor_read_stays_operator_only_and_installation_bound() {
     // agent assertion — the existing operator-read gate's proof), and so
     // does an agent with no session at all.
     for held in [true, false] {
-        let stolen = if held {
-            Some((cookie.as_str(), key.as_str()))
-        } else {
-            None
-        };
         for who in ["agent:desc-reader", "unproven"] {
+            // Fresh credentials keep each caller-proof refusal independent
+            // of the preceding agent's session revocation.
+            let held_session = held.then(|| sign_in(&w.state, port));
+            let stolen = held_session
+                .as_ref()
+                .map(|(cookie, key)| (cookie.as_str(), key.as_str()));
             let (code, _, body) = get_as(&w.state, port, Some(who), stolen, &path);
             assert_eq!(
-                code, 403,
+                code,
+                if held { 403 } else { 401 },
                 "agent-peered HTTP descriptor read ({who}, session={held}) reached {path}: {body}"
             );
+            if !held {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&body).unwrap()["code"],
+                    "operator_session_required"
+                );
+            }
         }
     }
     // A cross-install/guessed read — an id that is not a live
@@ -947,4 +955,150 @@ fn cad864_board_files_transports_admit_the_descriptor() {
         w.show(&install_id)["view_descriptor"]["views"][0]["title"],
         json!("Clients")
     );
+}
+
+// CAD-1594: independently authored by aos274-policy-std-4711.
+// Native message c7aa8974deba4accb8b32f5297cb5266,
+// turn 01a15307-6438-72b1-bf85-25c0683d9a07.
+// Append verbatim to tests/cad864_app_views.rs, reusing its real HTTP fixture.
+
+#[test]
+fn cad1594_http_files_checks_preserve_the_canonical_assistant_and_refuse_aliases() {
+    let w = Workspace::new();
+    let descriptor = json!({
+        "contract": "app-assistant/v1",
+        "app": "blog-post",
+        "actions": [{
+            "id": "segments.list",
+            "description": "List segments in this synthetic acceptance fixture.",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            },
+            "effect": "read",
+            "confirmation": "none"
+        }]
+    })
+    .to_string();
+    let assistant = cadence_agent::issue::app_assistant::FILE;
+    assert_eq!(assistant, "app-assistant.json");
+    std::fs::write(w.source().join(assistant), &descriptor).unwrap();
+
+    let lease = test_port();
+    let port = lease.port;
+    let stop = Arc::new(AtomicBool::new(false));
+    let board = board_on(&w.state, &w.pm.dir, port, &stop);
+    struct Cleanup(
+        Arc<AtomicBool>,
+        Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
+    );
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.0.store(true, SeqCst);
+            if let Some(board) = self.1.take() {
+                let _ = board.join();
+            }
+        }
+    }
+    let _cleanup = Cleanup(stop, Some(board));
+    let (cookie, key) = sign_in(&w.state, port);
+    let session = Some((cookie.as_str(), key.as_str()));
+
+    // The unchanged native engine accepts these exact descriptor-bearing bytes.
+    let native =
+        cadence_agent::issue::app_catalog::workspace::check_offline(w.source().to_str().unwrap())
+            .unwrap();
+    assert_eq!(native["ok"], json!(true), "{native}");
+    let mut upload = w.files_body();
+    upload["files"][assistant] = json!(descriptor);
+    upload["expected_digest"] = native["digest"].clone();
+    let empty_head = w.head();
+    let (status, _, body) = post_as(
+        &w.state,
+        port,
+        "operator",
+        session,
+        "/api/app-installations/upload/check",
+        &upload,
+    );
+    assert_eq!(status, 200, "canonical assistant upload check: {body}");
+    let checked: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(checked["committed"], json!(false));
+    assert_eq!(checked["digest"], native["digest"]);
+    assert!(checked["files"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(assistant)));
+    assert_eq!(w.head(), empty_head);
+    assert!(!w.pm.dir.join(".apps").exists());
+
+    // Fixture-only baseline installation enables the real upgrade-check path.
+    // No HTTP Apply, workflow, provider or production operation is exercised.
+    let installed = w.install().unwrap();
+    assert_eq!(installed["digest"], native["digest"]);
+    let id = installed["install_id"].as_str().unwrap();
+    let manifest = w.source().join("app.md");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    assert!(text.contains("version: 0.1.0"));
+    std::fs::write(&manifest, text.replace("version: 0.1.0", "version: 0.2.0")).unwrap();
+    let native_next =
+        cadence_agent::issue::app_catalog::workspace::check_offline(w.source().to_str().unwrap())
+            .unwrap();
+    assert_eq!(native_next["ok"], json!(true), "{native_next}");
+    assert_ne!(native_next["digest"], native["digest"]);
+    let mut upgrade = w.files_body();
+    upgrade["files"][assistant] = json!(descriptor);
+    upgrade["expected_digest"] = installed["digest"].clone();
+    upgrade["expected_generation"] = installed["catalog_generation"].clone();
+    let upgrade_path = format!("/api/app-installations/{id}/upgrade/check");
+    let installed_head = w.head();
+    let before = w.show(id);
+    let (status, _, body) = post_as(&w.state, port, "operator", session, &upgrade_path, &upgrade);
+    assert_eq!(status, 200, "canonical assistant upgrade check: {body}");
+    let checked: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(checked["committed"], json!(false));
+    assert_eq!(checked["install_id"], installed["install_id"]);
+    assert_eq!(checked["digest"], native_next["digest"]);
+    assert_eq!(w.head(), installed_head);
+    assert_eq!(w.show(id), before);
+
+    // Unknown, nested, and traversal filenames must be rejected with HTTP 400.
+    for (route, good) in [
+        ("/api/app-installations/upload/check", &upload),
+        (upgrade_path.as_str(), &upgrade),
+    ] {
+        for bad in [
+            "app-assistant-v2.json",
+            "App-assistant.json",
+            "views/app-assistant.json",
+            "app-assistant.json/child.json",
+            "./app-assistant.json",
+            "../app-assistant.json",
+            "workflows/../app-assistant.json",
+            "/app-assistant.json",
+        ] {
+            let mut rejected = (*good).clone();
+            let files = rejected["files"].as_object_mut().unwrap();
+            let bytes = files.remove(assistant).unwrap();
+            files.insert(bad.to_string(), bytes);
+            let (status, _, body) = post_as(&w.state, port, "operator", session, route, &rejected);
+            assert_eq!(status, 400, "{route} admitted {bad}: {body}");
+            assert_eq!(w.head(), installed_head, "{route}: {bad}");
+            assert_eq!(w.show(id), before, "{route}: {bad}");
+        }
+    }
+
+    // Admitting the root name must still invoke the native descriptor schema.
+    let mut invalid = upgrade.clone();
+    invalid["files"][assistant] =
+        json!(descriptor.replace("app-assistant/v1", "app-assistant/v999"));
+    let (status, _, body) = post_as(&w.state, port, "operator", session, &upgrade_path, &invalid);
+    assert_eq!(
+        status, 400,
+        "invalid native assistant schema admitted: {body}"
+    );
+    assert_eq!(w.head(), installed_head);
+    assert_eq!(w.show(id), before);
 }

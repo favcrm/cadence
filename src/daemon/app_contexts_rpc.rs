@@ -81,6 +81,11 @@ impl Shared {
             "app_context_archive" => {
                 // Archive remains available for historical orphaned installs.
                 // Take release then only SQL, never acquire PM/custody later.
+                #[cfg(all(test, target_os = "linux", feature = "test-seam"))]
+                super::custody_acceptance_fixture::smtp_scope7::at(
+                    self,
+                    super::custody_acceptance_fixture::smtp_scope7::Point::ArchiveBeforeRelease,
+                )?;
                 let _release = self
                     .app_release_lock
                     .lock()

@@ -1,10 +1,51 @@
 import { useWriteBlock } from "../auth/WriteGate";
+import { useTranslate } from "../../lib/locale";
 import { useState } from "react";
-import { api, ApiError } from "../../lib/api";
+import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
 import Button from "../../ui/Button";
+import { plainFailure } from "./needs";
 import { ideaDecisionBody, type IdeaAction } from "./idea";
+
+/**
+ * The idea decision itself (CAD-140): approve, reject with a reason, or
+ * park until a date, bound to the revision shown. The card below and the
+ * review drawer (CAD-1216) both drive it.
+ */
+export function useIdeaDecision(issue: string, onDecided?: (issue: string, action: string) => void) {
+  const state = useQuery(resources.issue(issue));
+  const [busy, setBusy] = useState<IdeaAction | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const detail = state.data?.id === issue ? state.data : null;
+  const decide = (action: IdeaAction, reason: string, parkUntil: string, done?: () => void) => {
+    const decided = ideaDecisionBody(action, reason, parkUntil);
+    if (decided.body === null) {
+      setError(decided.error);
+      return;
+    }
+    const body = decided.body;
+    if (!detail) {
+      setError("Re-read the idea — it is still loading.");
+      return;
+    }
+    setBusy(action);
+    setError(null);
+    // CAD-140: bind the decision to the plan shown — REQUIRED. The
+    // card read this rev; a moved issue refuses with 409 `stale_view`.
+    api
+      .ideaDecide(issue, action, { ...body, expect_rev: detail.rev })
+      .then((out) => {
+        done?.();
+        void resources.issue(issue).invalidate();
+        void resources.overview.invalidate();
+        onDecided?.(issue, String((out as { decision?: { action?: unknown } }).decision?.action ?? action));
+      })
+      .catch((e: unknown) => setError(plainFailure(e)))
+      .finally(() => setBusy(null));
+  };
+  return { state, detail, busy, error, setError, decide };
+}
 
 /**
  * An idea card (CAD-140): a researched idea waiting at the gate, with
@@ -25,62 +66,36 @@ export default function IdeaCard({
   onOpenIssue: (id: string) => void;
   onDecided?: (issue: string, action: string) => void;
 }) {
-  const state = useQuery(resources.issue(issue));
-  const [busy, setBusy] = useState<IdeaAction | null>(null);
   const [mode, setMode] = useState<"reject" | "park" | null>(null);
   const [reason, setReason] = useState("");
   const [parkUntil, setParkUntil] = useState("");
-  const [error, setError] = useState<string | null>(null);
-
+  const { state, detail, busy, error, setError, decide: send } = useIdeaDecision(issue, onDecided);
   const block = useWriteBlock(readOnly);
-  const detail = state.data?.id === issue ? state.data : null;
-
-  const decide = (action: IdeaAction) => {
-    const decided = ideaDecisionBody(action, reason, parkUntil);
-    if (decided.body === null) {
-      setError(decided.error);
-      return;
-    }
-    const body = decided.body;
-    if (!detail) {
-      setError("Re-read the idea — it is still loading.");
-      return;
-    }
-    setBusy(action);
-    setError(null);
-    // CAD-140: bind the decision to the plan shown — REQUIRED. The
-    // card read this rev; a moved issue refuses with 409 `stale_view`.
-    api
-      .ideaDecide(issue, action, { ...body, expect_rev: detail.rev })
-      .then((out) => {
-        setMode(null);
-        setReason("");
-        setParkUntil("");
-        void resources.issue(issue).invalidate();
-        void resources.overview.invalidate();
-        onDecided?.(issue, String((out as { decision?: { action?: unknown } }).decision?.action ?? action));
-      })
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
-      .finally(() => setBusy(null));
-  };
+  const t = useTranslate();
+  const decide = (action: IdeaAction) =>
+    send(action, reason, parkUntil, () => {
+      setMode(null);
+      setReason("");
+      setParkUntil("");
+    });
 
   if (!detail) {
     return (
       <div className="card px-3.5 py-3 text-label text-ink-500" data-idea-card={issue}>
-        {state.status === "failed" ? `Idea ${issue} could not be read — ${state.error}` : `Loading idea ${issue}…`}
+        {state.status === "failed" ? `${t("Idea")} ${issue} ${t("could not be read —")} ${state.error}` : `${t("Loading idea")} ${issue}…`}
       </div>
     );
   }
 
   return (
-    <section className="card overflow-hidden" data-idea-card={issue} aria-label={`idea ${issue}`}>
+    <section className="card overflow-hidden" data-idea-card={issue} aria-label={`${t("idea")} ${issue}`}>
       <header className="px-3.5 pt-3 pb-2 min-w-0">
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="slabel">idea</span>
+          <span className="slabel">{t("idea")}</span>
           <button className="lnk num text-label" onClick={() => onOpenIssue(issue)}>
             {issue}
           </button>
-          <span className="chip bg-warn/10 text-warn">awaiting you</span>
+          <span className="chip bg-warn/10 text-warn">{t("awaiting you")}</span>
         </div>
         <div className="text-cardtitle font-medium text-ink-100 mt-1 break-words">{detail.title}</div>
       </header>
@@ -88,32 +103,32 @@ export default function IdeaCard({
       <div className="px-3.5 py-2.5 border-t border-ink-700 space-y-2">
         {block ? (
           <p className="text-label text-ink-500">
-            {block} Or decide with `cadence idea decide {issue} approve`.
+            {block} {t("Or decide with")} `cadence idea decide {issue} approve`.
           </p>
         ) : (
           <>
             {mode === "reject" && (
               <label className="block">
-                <span className="slabel">reason (required)</span>
+                <span className="slabel">{t("reason (required)")}</span>
                 <textarea
                   value={reason}
                   onChange={(e) => setReason(e.target.value)}
                   rows={2}
                   className="field w-full mt-1 text-secondary"
-                  placeholder="What is wrong with this idea?"
-                  aria-label="rejection reason"
+                  placeholder={t("What is wrong with this idea?")}
+                  aria-label={t("rejection reason")}
                 />
               </label>
             )}
             {mode === "park" && (
               <label className="block">
-                <span className="slabel">re-open after (required)</span>
+                <span className="slabel">{t("re-open after (required)")}</span>
                 <input
                   type="date"
                   value={parkUntil}
                   onChange={(e) => setParkUntil(e.target.value)}
                   className="field w-full mt-1 text-secondary"
-                  aria-label="park until date"
+                  aria-label={t("park until date")}
                 />
               </label>
             )}
@@ -126,7 +141,7 @@ export default function IdeaCard({
                   loading={busy === "approve"}
                   onClick={() => decide("approve")}
                 >
-                  {busy === "approve" ? "Approving…" : "Approve idea"}
+                  {busy === "approve" ? t("Approving…") : t("Approve idea")}
                 </Button>
               )}
               {mode === "reject" ? (
@@ -138,16 +153,16 @@ export default function IdeaCard({
                     loading={busy === "reject"}
                     onClick={() => decide("reject")}
                   >
-                    {busy === "reject" ? "Rejecting…" : "Reject idea"}
+                    {busy === "reject" ? t("Rejecting…") : t("Reject idea")}
                   </Button>
                   <Button size="sm" onClick={() => { setMode(null); setError(null); }}>
-                    Cancel
+                    {t("Cancel")}
                   </Button>
                 </>
               ) : (
                 mode === null && (
                   <Button variant="danger" size="sm" disabled={busy !== null} onClick={() => setMode("reject")}>
-                    Reject…
+                    {t("Reject…")}
                   </Button>
                 )
               )}
@@ -159,16 +174,16 @@ export default function IdeaCard({
                     loading={busy === "park"}
                     onClick={() => decide("park")}
                   >
-                    {busy === "park" ? "Parking…" : "Park idea"}
+                    {busy === "park" ? t("Parking…") : t("Park idea")}
                   </Button>
                   <Button size="sm" onClick={() => { setMode(null); setError(null); }}>
-                    Cancel
+                    {t("Cancel")}
                   </Button>
                 </>
               ) : (
                 mode === null && (
                   <Button size="sm" disabled={busy !== null} onClick={() => setMode("park")}>
-                    Park…
+                    {t("Park…")}
                   </Button>
                 )
               )}

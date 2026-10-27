@@ -49,7 +49,7 @@ class ReducedGateReleaseTest(unittest.TestCase):
         tag = job(ci, "release-gate", "release-build")
         self.assertIn("github.ref == 'refs/heads/main'", artifact)
         self.assertIn("startsWith(github.ref, 'refs/tags/v')", tag)
-        for body, before in ((artifact, "pnpm/action-setup"), (tag, "scripts/ci-rust-toolchain")):
+        for body, before in ((artifact, "oven-sh/setup-bun"), (tag, "scripts/ci-rust-toolchain")):
             self.assertRegex(body, r"scripts/require-full-gates")
             self.assertLess(body.index("scripts/require-full-gates"), body.index(before))
             self.assertRegex(body, r"SOURCE_SHA: \$\{\{ github.sha \}\}")
@@ -63,7 +63,7 @@ class ReducedGateReleaseTest(unittest.TestCase):
         candidate_checkout = stage.index("ref: ${{ steps.candidate.outputs.source_sha }}")
         candidate_guard = stage.index('control/scripts/require-full-gates "$GITHUB_WORKSPACE/candidate-source"')
         self.assertLess(candidate_checkout, candidate_guard)
-        self.assertLess(candidate_guard, stage.index("pnpm/action-setup"))
+        self.assertLess(candidate_guard, stage.index("oven-sh/setup-bun"))
         self.assertIn("SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}", stage)
         promote = staging.split("  promote:\n", 1)[1]
         self.assertIn("scripts/require-full-gates", promote)

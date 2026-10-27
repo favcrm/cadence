@@ -1,18 +1,20 @@
 import type { ResourceState } from "../lib/cache";
+import { useLocale } from "../lib/locale";
 
-function clock(ms: number | null): string {
-  return ms === null ? "never" : new Date(ms).toLocaleTimeString();
+function clock(ms: number | null, locale: string): string {
+  return ms === null ? "never" : new Intl.DateTimeFormat(locale, { timeStyle: "short" }).format(ms);
 }
 
 /** Header chip while a refresh failed over the last good payload. */
 export function StaleChip({ state }: { state: ResourceState<unknown> }) {
+  const { locale, t } = useLocale();
   if (state.status !== "stale") return null;
   return (
     <span
       className="chip bg-warn/10 text-warn"
-      title={`the last refresh failed (${state.error ?? "unknown error"}) — showing data from ${clock(state.asOf)}`}
+      title={`${t("the last refresh failed")} (${state.error ?? t("unknown error")}) — ${t("showing data from")} ${clock(state.asOf, locale)}`}
     >
-      refresh failed — stale
+      {t("refresh failed — stale")}
     </span>
   );
 }
@@ -35,10 +37,11 @@ export function ResourceGate({
   failed: string;
   onRetry?: () => void;
 }) {
+  const { t } = useLocale();
   if (state.status === "loading") {
     return (
       <div className="card mb-4 px-4 py-5 text-secondary text-ink-400" role="status">
-        {loading}
+        {t(loading)}
       </div>
     );
   }
@@ -49,14 +52,14 @@ export function ResourceGate({
         role="alert"
       >
         <span className="min-w-0">
-          {failed} — {state.error ?? "unknown error"}
+          {t(failed)} — {state.error ?? t("unknown error")}
         </span>
         {onRetry && (
           <button
             onClick={onRetry}
             className="chip bg-fail/10 text-fail hover:bg-fail/20 transition-colors ml-auto"
           >
-            retry
+            {t("retry")}
           </button>
         )}
       </div>

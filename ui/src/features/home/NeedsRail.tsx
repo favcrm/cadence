@@ -1,592 +1,275 @@
-import SafeLink from "../../ui/SafeLink";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
-import { useState } from "react";
-import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
-import { resources } from "../../lib/resources";
 import type { Agent, Overview } from "../../lib/types";
-import {
-  ageLabel,
-  homeNeeds,
-  needGroups,
-  UNFENCE_CHOICES,
-  type HomeNeed,
-  type NeedGroupKey,
-  type UnfenceChoice,
-} from "./needs";
-import AnswerForm from "./AnswerForm";
+import { kindSpec, metaLine, todoSplit, updateTitle, type HomeNeed } from "./needs";
 import AgentUpdates from "./AgentUpdates";
 import type { AgentUpdate } from "./agentUpdateModel";
-import MergeForm from "./MergeForm";
-import PermissionCard from "./PermissionCard";
-import PlanCard from "./PlanCard";
-import IdeaCard from "./IdeaCard";
+import { useTranslate } from "../../lib/locale";
+import { READ_ONLY_COPY } from "./AnswerForm";
+import TodoCard from "./TodoCard";
+import { decisionReviewHead, nextDecisionToken, type HomeDecisionOpen } from "../../lib/workItems";
+import { beginTodoVisit, doneTodo, hideTodo, marksFor, useTodoLocal } from "./todoLocal";
 import Link from "../../ui/Link";
 
-/** One row of a rail's inline menu (the `…` overflow and the Unfence
- *  reconcile choice share it). */
-const MENU_ITEM =
-  "needitem w-full text-left px-2.5 py-1.5 text-label text-ink-200 hover:bg-ink-800 rounded disabled:opacity-40 disabled:hover:bg-transparent";
-
-const KIND_CHIP: Record<string, string> = {
-  plan: "bg-warn/10 text-warn",
-  idea_plan: "bg-warn/10 text-warn",
-  question: "bg-info/10 text-info",
-  approval: "bg-warn/10 text-warn",
-  master_permission: "bg-warn/10 text-warn",
-  merge: "bg-ok/15 text-ok",
-};
-
-const SNOOZE_24H = 86_400;
-const SNOOZE_7D = 604_800;
-
-function copy(text: string): Promise<void> {
-  try {
-    return navigator.clipboard.writeText(text);
-  } catch (e) {
-    return Promise.reject(e);
-  }
-}
+export { NeedMenu } from "./NeedMenu";
 
 /**
- * The `…` overflow (CAD-574): Open lands on the row's own link or its
- * issue page; Snooze and Dismiss are the operator's `needs_dismiss`
- * routes; Copy command keeps the row's fallback command one tap away —
- * demoted off the row because Ask master is the action now.
- */
-export function NeedMenu({
-  need,
-  block,
-  busy,
-  onOpenIssue,
-  onDecide,
-  onCopied,
-  onClose,
-}: {
-  need: HomeNeed;
-  block: string | null;
-  busy: boolean;
-  onOpenIssue: (id: string) => void;
-  onDecide: (verb: "snooze" | "dismiss", secs?: number) => void;
-  onCopied: () => void;
-  onClose: () => void;
-}) {
-  const item = MENU_ITEM;
-  return (
-    <>
-      <button
-        type="button"
-        aria-hidden
-        tabIndex={-1}
-        className="fixed inset-0 z-20 cursor-default"
-        onClick={onClose}
-      />
-      <div className="needmenu" role="menu" aria-label={`actions for ${need.title}`}>
-        {need.link && (
-          <SafeLink className={`${item} block`} warnClassName={`${item} block`} href={need.link} role="menuitem">
-            Open
-          </SafeLink>
-        )}
-        {!need.link && need.issue && (
-          <button className={item} role="menuitem" onClick={() => onOpenIssue(need.issue!)}>
-            Open
-          </button>
-        )}
-        <button
-          className={item}
-          role="menuitem"
-          disabled={!!block || busy}
-          title={block ?? undefined}
-          onClick={() => onDecide("snooze", SNOOZE_24H)}
-        >
-          Snooze 24h
-        </button>
-        <button
-          className={item}
-          role="menuitem"
-          disabled={!!block || busy}
-          title={block ?? undefined}
-          onClick={() => onDecide("snooze", SNOOZE_7D)}
-        >
-          Snooze 7d
-        </button>
-        <button
-          className={`${item} text-fail`}
-          role="menuitem"
-          disabled={!!block || busy}
-          title={block ?? undefined}
-          onClick={() => onDecide("dismiss")}
-        >
-          Dismiss
-        </button>
-        <button
-          className={item}
-          role="menuitem"
-          onClick={() => {
-            copy(need.command).then(onCopied, () => undefined);
-            onClose();
-          }}
-        >
-          Copy command
-        </button>
-      </div>
-    </>
-  );
-}
-
-function NeedItem({
-  need,
-  readOnly,
-  onOpenIssue,
-  onAsk,
-  onHide,
-}: {
-  need: HomeNeed;
-  readOnly: boolean;
-  onOpenIssue: (id: string) => void;
-  onAsk: (need: HomeNeed) => void;
-  onHide: (key: string) => void;
-}) {
-  const block = useWriteBlock(readOnly);
-  const [open, setOpen] = useState(need.kind === "master_permission");
-  const [menu, setMenu] = useState(false);
-  const [pick, setPick] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [done, setDone] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const action = need.action;
-
-  const refresh = () => {
-    void resources.overview.invalidate();
-    void resources.agents.invalidate();
-  };
-  const run = (work: () => Promise<unknown>, what: string, hide: boolean) => {
-    setBusy(true);
-    setError(null);
-    work()
-      .then(() => {
-        setDone(what);
-        setMenu(false);
-        if (hide) onHide(need.key);
-        refresh();
-      })
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
-      .finally(() => setBusy(false));
-  };
-  const decide = (verb: "snooze" | "dismiss", secs?: number) => {
-    const id = need.subject ?? { kind: "row", id: need.key };
-    run(
-      () => api.needDecide(verb, id.kind, id.id, secs),
-      verb === "dismiss" ? "dismissed" : secs === SNOOZE_7D ? "snoozed 7d" : "snoozed 24h",
-      true,
-    );
-  };
-  const agentAct = (verb: "resume" | "unfence", status?: UnfenceChoice["status"]) => {
-    if (!need.agent) return;
-    run(() => api.agentAct(need.agent!, verb, status), verb === "resume" ? "resumed" : `unfenced · ${status}`, true);
-  };
-
-  const expandLabel =
-    action.type === "plan"
-      ? "Review plan"
-      : action.type === "idea"
-        ? "Decide"
-        : action.type === "answer"
-          ? "Answer"
-          : action.type === "permission"
-            ? "Decide"
-            : "Review merge";
-  return (
-    <li className="needrow px-3 py-2 min-w-0" data-need={need.kind}>
-      <div className="flex items-center gap-2 min-w-0">
-        <span className={`chip shrink-0 ${KIND_CHIP[need.kind] ?? "bg-ink-800 text-ink-300"}`}>{need.label}</span>
-        <div className="min-w-0 flex-1 text-secondary text-ink-200 break-words" title={need.title}>
-          {need.title}
-        </div>
-        <span className="num shrink-0 text-micro text-ink-500" title={`waiting ${ageLabel(need.age)}`}>
-          {ageLabel(need.age)}
-        </span>
-      </div>
-      <div className="text-micro text-ink-500 mt-0.5 truncate">
-        {need.owner}
-        {need.escalatedBy ? ` · escalated by ${need.escalatedBy}` : ""}
-      </div>
-      {done ? (
-        <p className="text-micro text-ok mt-1" data-need-done>
-          {done}
-        </p>
-      ) : (
-        <div className="mt-1 flex items-center gap-2 flex-wrap min-w-0">
-          <button
-            className="needask shrink-0"
-            disabled={!!block}
-            title={block ?? "Prefill the composer — nothing sends until you press Enter"}
-            onClick={() => onAsk(need)}
-          >
-            Ask master
-          </button>
-          {(action.type === "plan" ||
-            action.type === "idea" ||
-            action.type === "answer" ||
-            action.type === "merge" ||
-            action.type === "permission") && (
-            <button
-              className="lnk text-label shrink-0"
-              aria-expanded={open}
-              onClick={() => setOpen((o) => !o)}
-            >
-              {expandLabel} {open ? "▴" : "▾"}
-            </button>
-          )}
-          {need.kind === "fenced" && need.agent && (
-            <button
-              className="lnk text-label shrink-0"
-              disabled={!!block || busy}
-              aria-expanded={pick}
-              title={block ?? `cadence agent unfence ${need.agent} — say how the fenced turns settled`}
-              onClick={() => {
-                setMenu(false);
-                setPick(true);
-              }}
-            >
-              Unfence
-            </button>
-          )}
-          {need.kind === "stopped" && need.agent && (
-            <button
-              className="lnk text-label shrink-0"
-              disabled={!!block || busy}
-              title={block ?? `cadence agent resume ${need.agent}`}
-              onClick={() => agentAct("resume")}
-            >
-              Resume
-            </button>
-          )}
-          {busy && <span className="text-micro text-ink-500">working…</span>}
-          {note && <span className="text-micro text-ok">{note}</span>}
-          <button
-            className="needmore ml-auto shrink-0"
-            aria-label={`more actions for ${need.title}`}
-            aria-expanded={menu}
-            onClick={() => setMenu((m) => !m)}
-          >
-            ⋯
-          </button>
-        </div>
-      )}
-      {pick && !done && (
-        <>
-          <button
-            type="button"
-            aria-hidden
-            tabIndex={-1}
-            className="fixed inset-0 z-20 cursor-default"
-            onClick={() => setPick(false)}
-          />
-          <div className="needmenu" role="menu" aria-label={`reconcile ${need.agent}'s fenced turns as`}>
-            <p className="px-2.5 pt-1.5 pb-1 text-micro text-ink-500">
-              How did {need.agent}'s fenced turns end? It resumes after.
-            </p>
-            {UNFENCE_CHOICES.map((c) => (
-              <button
-                key={c.status}
-                className={MENU_ITEM}
-                role="menuitem"
-                disabled={busy}
-                onClick={() => {
-                  setPick(false);
-                  agentAct("unfence", c.status);
-                }}
-              >
-                <span className="block">{c.status}</span>
-                <span className="block text-micro text-ink-500">{c.blurb}</span>
-              </button>
-            ))}
-          </div>
-        </>
-      )}
-      {menu && !done && (
-        <NeedMenu
-          need={need}
-          block={block}
-          busy={busy}
-          onOpenIssue={(id) => {
-            setMenu(false);
-            onOpenIssue(id);
-          }}
-          onDecide={decide}
-          onCopied={() => {
-            setNote("copied");
-            setTimeout(() => setNote(null), 1500);
-          }}
-          onClose={() => setMenu(false)}
-        />
-      )}
-      {error && (
-        <p className="text-micro text-fail mt-1 break-words" role="alert">
-          {error}
-        </p>
-      )}
-      {open && action.type === "plan" && (
-        <div className="mt-2">
-          <PlanCard epic={action.epic} readOnly={readOnly} onOpenIssue={onOpenIssue} />
-        </div>
-      )}
-      {open && action.type === "idea" && !done && (
-        <div className="mt-2">
-          <IdeaCard
-            issue={action.issue}
-            readOnly={readOnly}
-            onOpenIssue={onOpenIssue}
-            onDecided={(id, decided) => setDone(`${id} ${decided}`)}
-          />
-        </div>
-      )}
-      {open && action.type === "merge" && !done && (
-        <MergeForm
-          need={need as HomeNeed & { action: { type: "merge" } }}
-          readOnly={readOnly}
-          onDone={(t) => {
-            setDone(t);
-            setOpen(false);
-          }}
-        />
-      )}
-      {open && action.type === "answer" && !done && (
-        <AnswerForm
-          need={need as HomeNeed & { action: { type: "answer" } }}
-          readOnly={readOnly}
-          onDone={(t) => {
-            setDone(`answered: ${t}`);
-            setOpen(false);
-          }}
-        />
-      )}
-      {open && action.type === "permission" && (
-        <PermissionCard
-          card={action}
-          readOnly={readOnly}
-          onDone={(t) => {
-            setDone(t);
-            refresh();
-          }}
-        />
-      )}
-    </li>
-  );
-}
-
-/** One collapsible group of needs — `Decisions` opens by default. */
-function NeedGroup({
-  groupKey,
-  label,
-  needs,
-  open,
-  onToggle,
-  readOnly,
-  onOpenIssue,
-  onAsk,
-  onHide,
-}: {
-  groupKey: NeedGroupKey | "old";
-  label: string;
-  needs: HomeNeed[];
-  open: boolean;
-  onToggle: () => void;
-  readOnly: boolean;
-  onOpenIssue: (id: string) => void;
-  onAsk: (need: HomeNeed) => void;
-  onHide: (key: string) => void;
-}) {
-  return (
-    <section data-need-group={groupKey}>
-      <button
-        type="button"
-        className="needgroup w-full"
-        aria-expanded={open}
-        onClick={onToggle}
-      >
-        <span className="steps-caret num" aria-hidden>
-          ›
-        </span>
-        <span className="flex-1 text-left truncate">{label}</span>
-        <span className="chip bg-ink-800 text-ink-400 shrink-0">{needs.length}</span>
-      </button>
-      {open && (
-        <ul className="divide-y divide-ink-700">
-          {needs.map((n) => (
-            <NeedItem
-              key={n.key}
-              need={n}
-              readOnly={readOnly}
-              onOpenIssue={onOpenIssue}
-              onAsk={onAsk}
-              onHide={onHide}
-            />
-          ))}
-        </ul>
-      )}
-    </section>
-  );
-}
-
-/**
- * "Needs you" (CAD-574): its own column, sticky under the header with
- * its own scroll — the chat beside it never shares the scrollbar. It
- * collapses to a slim rail with a count badge (persisted per viewer),
- * and under ~1100px it is a slide-over drawer opened from the floating
- * button. Items group as Decisions / PRs / Blocked→ready / Inboxes /
- * Other — Decisions open, the rest folded; rows past 14 days fold under
- * `Old (n)`. The action is Ask master (a prefilled composer draft —
- * never auto-sent); Open, Snooze, Dismiss, Copy command live in the `…`
- * menu, Resume/Unfence appear on fenced/stopped agent rows.
+ * The Home rail (CAD-574, CAD-1216): "To do" holds only work for the
+ * operator, one line per card with one control; "Updates" holds the
+ * informational rows and the team's recent work. It collapses to a slim
+ * rail with the count (persisted per viewer) and, under ~1100px, is a
+ * slide-over opened from the floating button. Reading items (plans,
+ * ideas, merge decisions) open inside the one shared work-item detail,
+ * mounted by App (CAD-1811); the rail hands it the reading queue as it
+ * stood when the item opened. The count and the sidebar's Home badge
+ * include pending items only.
  */
 export default function NeedsRail({
   overview,
   readOnly,
   onOpenIssue,
   overviewHref,
+  permissionsHref,
   onAsk,
+  onOpenDecision,
   collapsed,
   onToggleCollapse,
   onAskAgent,
+  onSent,
 }: {
   overview: ResourceState<Overview>;
   readOnly: boolean;
   onOpenIssue: (id: string) => void;
   overviewHref: string;
-  onAsk: (need: HomeNeed) => void;
+  /** Settings → Master permissions, where the standing "Always" rules live. */
+  permissionsHref: string;
+  onAsk: (need: HomeNeed, lead?: string) => void;
+  /** Open a reading item in the shared detail (App owns the one mount). */
+  onOpenDecision: (open: HomeDecisionOpen) => void;
   collapsed: boolean;
   onToggleCollapse: () => void;
   onAskAgent: (agent: Agent, update?: AgentUpdate) => void;
+  /** A "Fix it" reached Master: Home pins the chat to the sent message. */
+  onSent?: () => void;
 }) {
-  const [tab, setTab] = useState<"updates" | "decisions">("updates");
-  const needs = homeNeeds(overview.data?.needs_me);
-  const { groups, old } = needGroups(needs);
-  const [openGroups, setOpenGroups] = useState<ReadonlySet<NeedGroupKey>>(
-    () => new Set<NeedGroupKey>(["decisions"]),
-  );
-  const [oldOpen, setOldOpen] = useState(false);
+  const [tab, setTab] = useState<"todo" | "updates">("todo");
+  const block = useWriteBlock(readOnly);
+  const t = useTranslate();
+  const { todo, updates, decided } = todoSplit(overview.data?.needs_me);
   const [drawer, setDrawer] = useState(false);
-  const [hidden, setHidden] = useState<ReadonlySet<string>>(() => new Set());
-  const count = needs.filter((n) => !hidden.has(n.key)).length;
-
-  const toggleGroup = (key: NeedGroupKey) =>
-    setOpenGroups((s) => {
-      const next = new Set(s);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  const hide = (key: string) => setHidden((s) => new Set(s).add(key));
-  const ask = (need: HomeNeed) => {
+  const local = useTodoLocal();
+  // A new visit to Home: earlier decided and sent marks stop applying.
+  useLayoutEffect(() => beginTodoVisit(), []);
+  // The floating button that owns the slide-over's focus on the way out.
+  const needBtn = useRef<HTMLButtonElement | null>(null);
+  const drawerEl = useRef<HTMLElement | null>(null);
+  const wasOpen = useRef(false);
+  // The <1100px drawer is a dialog: it lands focus on itself, Escape
+  // closes it, and closing hands focus back to the button that opened
+  // it. An Ask hand-off is unaffected — the composer's own focus lands
+  // after this one (child effects run before this parent's).
+  useEffect(() => {
+    if (!drawer) return;
+    drawerEl.current?.focus();
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") setDrawer(false);
+    };
+    addEventListener("keydown", onKey);
+    return () => removeEventListener("keydown", onKey);
+  }, [drawer]);
+  useEffect(() => {
+    if (!drawer && wasOpen.current) needBtn.current?.focus();
+    wasOpen.current = drawer;
+  }, [drawer]);
+  // An issue opened from the slide-over leaves Home — drop the drawer so
+  // a stale overlay never hangs over the navigation.
+  const openIssue = (id: string) => {
     setDrawer(false);
-    onAsk(need);
+    onOpenIssue(id);
   };
+  const [showDecided, setShowDecided] = useState(false);
 
-  const body = (
+  const cards = todo.filter((n) => !marksFor(local, n).hidden);
+  const isDone = (n: HomeNeed) => marksFor(local, n).doneText !== undefined;
+  const count = cards.filter((n) => !isDone(n)).length;
+  const readers = cards.filter((n) => kindSpec(n).place === "drawer");
+  const firstPermission = cards.findIndex((n) => !isDone(n) && n.kind === "master_permission");
+  const ask = (need: HomeNeed, lead?: string) => {
+    setDrawer(false);
+    onAsk(need, lead);
+  };
+  /** One reading item, with the queue as it stood when the detail opened:
+   *  "n of m" does not recount when the overview refreshes mid-run. */
+  const decisionFor = (need: HomeNeed, queue: HomeNeed[]): HomeDecisionOpen => ({
+    need,
+    index: Math.max(queue.findIndex((n) => n.key === need.key), 0) + 1,
+    total: Math.max(queue.length, 1),
+    token: nextDecisionToken(),
+    reviewHead: decisionReviewHead(need),
+    next: (text) => {
+      doneTodo(need, text);
+      const at = queue.findIndex((n) => n.key === need.key);
+      const following = queue.slice(at + 1).find((n) => !isDone(n));
+      return following ? decisionFor(following, queue) : null;
+    },
+    ask: (lead) => ask(need, lead),
+  });
+  const openDecision = (key: string) => {
+    const need = readers.find((n) => n.key === key);
+    if (!need) return;
+    onOpenDecision(decisionFor(need, readers.filter((n) => n.key === key || !isDone(n))));
+  };
+  const todoBody = (
     <>
+      {block && <p className="todo-note">{t(READ_ONLY_COPY)}</p>}
       {!overview.data && overview.status === "failed" && (
-        <p className="px-3 py-2.5 text-label text-fail break-words">Overview unavailable — {overview.error}</p>
+        <p className="px-3 py-2.5 text-label text-fail break-words">{t("The list couldn't be loaded. It will try again.")}</p>
       )}
       {!overview.data && overview.status !== "failed" && (
-        <p className="px-3 py-2.5 text-label text-ink-500">Reading what needs you…</p>
+        <p className="px-3 py-2.5 text-label text-ink-500">{t("Reading what needs you…")}</p>
       )}
-      {overview.data && needs.length === 0 && (
-        <p className="px-3 py-2.5 text-label text-ink-500">Nothing needs a decision. The team is working.</p>
+      {overview.data && cards.length === 0 && (
+        <p className="px-3 py-3 text-label text-ink-400">{t("Nothing needs you. The team is working.")}</p>
       )}
-      {groups.map((g) => (
-        <NeedGroup
-          key={g.key}
-          groupKey={g.key}
-          label={g.label}
-          needs={g.needs.filter((n) => !hidden.has(n.key))}
-          open={openGroups.has(g.key)}
-          onToggle={() => toggleGroup(g.key)}
-          readOnly={readOnly}
-          onOpenIssue={onOpenIssue}
-          onAsk={ask}
-          onHide={hide}
-        />
-      ))}
-      {old.length > 0 && (
-        <NeedGroup
-          groupKey="old"
-          label={`Old (${old.length})`}
-          needs={old.filter((n) => !hidden.has(n.key))}
-          open={oldOpen}
-          onToggle={() => setOldOpen((o) => !o)}
-          readOnly={readOnly}
-          onOpenIssue={onOpenIssue}
-          onAsk={ask}
-          onHide={hide}
-        />
+      <ul className="todo-list">
+        {cards.map((n, i) => (
+          <TodoCard
+            key={n.key}
+            need={n}
+            readOnly={readOnly}
+            defaultOpen={i === firstPermission}
+            doneText={marksFor(local, n).doneText}
+            onReview={openDecision}
+            onOpenIssue={openIssue}
+            onAsk={(need) => ask(need)}
+            onHide={hideTodo}
+            onDone={doneTodo}
+            onSent={() => {
+              setDrawer(false);
+              onSent?.();
+            }}
+          />
+        ))}
+      </ul>
+      {cards.length > 0 && <p className="todo-hint">{t("Tap a card to see more. “Fix it” hands the problem to Master.")}</p>}
+      {decided.length > 0 && (
+        <section className="todo-decided" data-todo-decided>
+          <button type="button" className="todo-decided-h" aria-expanded={showDecided} onClick={() => setShowDecided((s) => !s)}>
+            <span className="steps-caret num" aria-hidden>
+              ›
+            </span>
+            {t("Recently decided")} ({decided.length})
+          </button>
+          {showDecided && (
+            <>
+              <ul>
+                {decided.map((n) => (
+                  <li key={n.key}>
+                    <span className="todo-decided-t">{n.why ?? n.shortTitle ?? kindSpec(n).title(n, { issueTitle: null })}</span>
+                    <span className="chip bg-ink-800 text-ink-300 shrink-0">
+                      {n.action.type === "permission" ? n.action.decisionLabel || n.action.status : "decided"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <Link href={permissionsHref} className="lnk text-label" onClick={() => setDrawer(false)}>
+                {t("Standing rules are in Settings")}
+              </Link>
+            </>
+          )}
+        </section>
       )}
     </>
   );
 
-  const panelBody = <>
-    <div className="activity-tabs" role="group" aria-label="Team activity">
-      <button aria-pressed={tab === "updates"} onClick={() => setTab("updates")}>Updates</button>
-      <button aria-pressed={tab === "decisions"} onClick={() => setTab("decisions")}>Decisions <span className="num">{count}</span></button>
-    </div>
-    <div>
-      {tab === "updates" ? <AgentUpdates onAsk={(agent, update) => { setDrawer(false); onAskAgent(agent, update); }} onOpenIssue={onOpenIssue} /> : body}
-    </div>
-  </>;
-
-  const header = (drawerMode: boolean) => (
-    <header className="px-3 py-2.5 flex items-center gap-2 border-b border-ink-700 shrink-0">
-      <h2 className="text-secondary font-semibold text-ink-100">Agent updates</h2>
-      <Link href={overviewHref} className="lnk text-label ml-auto" onClick={() => setDrawer(false)}>
-        Team overview
-      </Link>
-      {drawerMode ? (
-        <button
-          type="button"
-          className="lnk text-label shrink-0"
-          aria-label="close agent updates"
-          onClick={() => setDrawer(false)}
-        >
-          ✕
-        </button>
-      ) : (
-        <button
-          type="button"
-          className="lnk text-label shrink-0"
-          aria-label={collapsed ? "expand agent updates" : "collapse agent updates"}
-          onClick={onToggleCollapse}
-        >
-          {collapsed ? "»" : "«"}
-        </button>
+  const updatesBody = (
+    <>
+      {updates.length > 0 && (
+        <ul className="todo-fyi" data-todo-updates>
+          {updates.map((n) => (
+            <li key={n.key}>
+              <span>{updateTitle(n)}</span>
+              <span className="text-ink-500">
+                {/* An Updates row stays information; the subject id is a
+                    plain link to the issue it names, never an action. */}
+                {n.issue !== null && (
+                  <button type="button" className="lnk num" onClick={() => openIssue(n.issue!)}>
+                    {n.issue}
+                  </button>
+                )}
+                {n.issue !== null && " · "}
+                {metaLine(n)}
+              </span>
+            </li>
+          ))}
+        </ul>
       )}
-    </header>
+      <AgentUpdates
+        onAsk={(agent, update) => {
+          setDrawer(false);
+          onAskAgent(agent, update);
+        }}
+        onOpenIssue={openIssue}
+      />
+    </>
   );
+
+  const tabs = (drawerMode: boolean) => (
+    <div className="todo-tabs" role="group" aria-label={t("Home rail")}>
+      <button aria-pressed={tab === "todo"} onClick={() => setTab("todo")}>
+        {t("To do")} <span className={`todo-count ${count ? "on" : ""}`}>{overview.data ? count : "…"}</span>
+      </button>
+      <button aria-pressed={tab === "updates"} onClick={() => setTab("updates")}>
+        {t("Updates")}
+      </button>
+      <span className="todo-tools">
+        <Link href={overviewHref} className="lnk text-label" onClick={() => setDrawer(false)}>
+          {t("Team overview")}
+        </Link>
+        {drawerMode ? (
+          <button type="button" className="lnk text-label" aria-label={t("close the rail")} onClick={() => setDrawer(false)}>
+            ✕
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="lnk text-label"
+            aria-label={collapsed ? "expand the rail" : "collapse the rail"}
+            onClick={onToggleCollapse}
+          >
+            {collapsed ? "»" : "«"}
+          </button>
+        )}
+      </span>
+    </div>
+  );
+
+  const panelBody = <div>{tab === "todo" ? todoBody : updatesBody}</div>;
 
   return (
     <>
       {/* ≥1100px: the detached column — sticky in the grid, scrolling on
-          its own; collapsed it is the slim rail with the badge. */}
+          its own; collapsed it is the slim rail with the count. */}
       <div className="hidden rail:block h-full min-h-0">
         {collapsed ? (
           <button
             type="button"
             className="slimrail card"
-            aria-label={`agent updates — ${count} decisions; expand the rail`}
+            aria-label={t("to do — {count} waiting; expand the rail").replace("{count}", String(count))}
             onClick={onToggleCollapse}
           >
             <span className={`chip ${count ? "bg-warn/10 text-warn" : "bg-ok/15 text-ok"}`}>
               {overview.data ? count : "…"}
             </span>
-            <span className="vert text-label text-ink-400">Agent updates</span>
+            <span className="vert text-label text-ink-400">{t("To do")}</span>
             <span className="text-ink-500" aria-hidden>
               «
             </span>
           </button>
         ) : (
-          <section className="card needsrail overflow-hidden" aria-label="agent updates" data-collapsed="false">
-            {header(false)}
+          <section className="card needsrail overflow-hidden" aria-label={t("to do")} data-collapsed="false">
+            {tabs(false)}
             <div className="rail-scroll min-h-0">{panelBody}</div>
           </section>
         )}
@@ -596,10 +279,11 @@ export default function NeedsRail({
       <button
         type="button"
         className="needbtn rail:hidden"
+        ref={needBtn}
         onClick={() => setDrawer(true)}
-        aria-label={`agent updates — ${count} decisions; open the panel`}
+        aria-label={t("to do — {count} waiting; open the list").replace("{count}", String(count))}
       >
-        Agent updates
+        {t("To do")}
         <span className={`chip ${count ? "bg-warn/15 text-warn" : "bg-ok/15 text-ok"}`}>
           {overview.data ? count : "…"}
         </span>
@@ -610,14 +294,17 @@ export default function NeedsRail({
           <section
             className="needsdrawer rail:hidden"
             role="dialog"
-            aria-label="agent updates"
+            aria-label={t("to do")}
             aria-modal="true"
+            tabIndex={-1}
+            ref={drawerEl}
           >
-            {header(true)}
+            {tabs(true)}
             <div className="rail-scroll min-h-0 flex-1">{panelBody}</div>
           </section>
         </>
       )}
+
     </>
   );
 }

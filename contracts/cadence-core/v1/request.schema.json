@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Request",
+  "description": "The request envelope.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "description": "Contract version; only `1` exists.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "oneOf": [
+    {
+      "description": "Split the frontmatter, then check `needs.requires`.",
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/ManifestPreflightInput"
+        },
+        "op": {
+          "type": "string",
+          "const": "app.manifest.preflight"
+        }
+      },
+      "required": [
+        "op",
+        "input"
+      ]
+    },
+    {
+      "description": "Check an issue id, project key, tags, status and priority.",
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/ValidateInput"
+        },
+        "op": {
+          "type": "string",
+          "const": "issue.validate"
+        }
+      },
+      "required": [
+        "op",
+        "input"
+      ]
+    },
+    {
+      "description": "Whether an issue is ready or blocked, given its blockers' statuses.",
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/ReadinessInput"
+        },
+        "op": {
+          "type": "string",
+          "const": "issue.readiness"
+        }
+      },
+      "required": [
+        "op",
+        "input"
+      ]
+    }
+  ],
+  "required": [
+    "v"
+  ],
+  "$defs": {
+    "Blocker": {
+      "description": "A `blocked_by` target and its current status. A target that cannot be\nfound counts as open: pass any status that is not `done` or `dropped`.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "status"
+      ]
+    },
+    "ManifestPreflightInput": {
+      "type": "object",
+      "properties": {
+        "manifest": {
+          "description": "The exact `app.md` text.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "manifest"
+      ]
+    },
+    "ReadinessInput": {
+      "description": "Input of `issue.readiness`. `id` names the issue in the refusal.",
+      "type": "object",
+      "properties": {
+        "blockers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Blocker"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "status",
+        "blockers"
+      ]
+    },
+    "ValidateInput": {
+      "description": "Input of `issue.validate`: every field is optional and checked when set.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "priority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tags": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

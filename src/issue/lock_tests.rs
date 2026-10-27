@@ -11,14 +11,14 @@ use std::time::{Duration, Instant};
 use super::write::{new_issue, project_add};
 use super::*;
 
-fn tracker() -> (tempfile::TempDir, Pm) {
+pub(super) fn tracker() -> (tempfile::TempDir, Pm) {
     let dir = tempfile::tempdir().unwrap();
     let pm = Pm::init(&dir.path().join("pm")).unwrap();
     project_add(&pm, "cadence", "CAD", &[], &[], &[], None).unwrap();
     (dir, pm)
 }
 
-fn mk(pm: &Pm, cwd: &Path, title: &str) -> String {
+pub(super) fn mk(pm: &Pm, cwd: &Path, title: &str) -> String {
     new_issue(
         pm,
         cwd,
@@ -83,11 +83,52 @@ fn lock_helper() {
         .unwrap();
         git(&pm.dir, &["mv", "renamed/victim.txt", "renamed/moved.txt"]).unwrap();
     }
+    if role == "hold_staged_unstaged" {
+        // CAD-1601: the crashed writer staged one version of a tracked
+        // file and then left a DIFFERENT version in the working tree.
+        // The index holds the staged version; the worktree holds the
+        // other one. A recovery that keeps the staged content must
+        // commit the staged blob, never the worktree's.
+        let file = pm.dir.join("tracked.txt");
+        std::fs::write(&file, b"staged\n").unwrap();
+        git(&pm.dir, &["add", "--", "tracked.txt"]).unwrap();
+        std::fs::write(&file, b"working\n").unwrap();
+    }
+    if role == "hold_comment" {
+        // CAD-1600: the live incident. The writer had written and
+        // staged ticket CAD-2's comment, then died before committing.
+        let dir = pm.dir.join("cadence").join("CAD-2").join("comments");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("20261019T100620Z-crashed.md"),
+            "---\nid: CAD-2\nauthor: crashed-writer\n---\n\nhalf a write\n",
+        )
+        .unwrap();
+        git(
+            &pm.dir,
+            &[
+                "add",
+                "--",
+                "cadence/CAD-2/comments/20261019T100620Z-crashed.md",
+            ],
+        )
+        .unwrap();
+    }
+    if role == "hold_issue" {
+        // CAD-1600: the crashed writer was mid-edit on ticket CAD-2's
+        // own issue.md. That path is exactly what a close of CAD-2
+        // would write, so the close must stay refused.
+        let file = pm.dir.join("cadence").join("CAD-2").join("issue.md");
+        let mut text = std::fs::read_to_string(&file).unwrap();
+        text.push_str("\ncrashed half edit\n");
+        std::fs::write(&file, text).unwrap();
+        git(&pm.dir, &["add", "--", "cadence/CAD-2/issue.md"]).unwrap();
+    }
     std::fs::write(std::env::var("CAD852_READY").unwrap(), "ready").unwrap();
     std::thread::sleep(Duration::from_secs(600));
 }
 
-fn spawn_writer(pm: &Pm, role: &str, setsid: bool) -> (Child, PathBuf) {
+pub(super) fn spawn_writer(pm: &Pm, role: &str, setsid: bool) -> (Child, PathBuf) {
     let ready = pm.dir.parent().unwrap().join(format!("ready-{role}"));
     let _ = std::fs::remove_file(&ready);
     let mut cmd = Command::new(std::env::current_exe().unwrap());
@@ -117,7 +158,7 @@ fn spawn_writer(pm: &Pm, role: &str, setsid: bool) -> (Child, PathBuf) {
     (child, ready)
 }
 
-fn sigkill(mut child: Child) {
+pub(super) fn sigkill(mut child: Child) {
     unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
     child.wait().unwrap();
 }
@@ -366,8 +407,14 @@ fn a_tripped_lease_stops_a_writer_waiting_for_the_lock() {
     let held = pm.lock().unwrap();
     let start = Instant::now();
     let e = std::thread::scope(|s| {
-        let w = s.spawn(|| pm.lock().err().map(|e| e.to_string()));
-        std::thread::sleep(Duration::from_millis(300));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let w = s.spawn(|| {
+            pmlock::WAITING.with(|observer| *observer.borrow_mut() = Some(waiting_tx));
+            pm.lock().err().map(|e| e.to_string())
+        });
+        waiting_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer never contended");
         ctl.fence().trip("lease lost while waiting");
         w.join().unwrap()
     });
@@ -417,8 +464,14 @@ fn a_waiting_writer_is_admitted_when_the_holder_dies() {
     let (_tmp, pm) = tracker();
     let (child, _) = spawn_writer(&pm, "hold", false);
     let got = std::thread::scope(|s| {
-        let w = s.spawn(|| pm.lock_for(Duration::from_secs(10)).is_ok());
-        std::thread::sleep(Duration::from_millis(300));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let w = s.spawn(|| {
+            pmlock::WAITING.with(|observer| *observer.borrow_mut() = Some(waiting_tx));
+            pm.lock_for(Duration::from_secs(10)).is_ok()
+        });
+        waiting_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer never contended");
         sigkill(child);
         w.join().unwrap()
     });
@@ -1080,12 +1133,16 @@ fn a_tripped_lease_stops_a_scoped_writer_waiting_for_the_lock() {
     let start = Instant::now();
     let scope = pm.dir.clone();
     let e = std::thread::scope(|s| {
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
         let w = s.spawn(|| {
+            pmlock::WAITING.with(|observer| *observer.borrow_mut() = Some(waiting_tx));
             pm.lock_for_paths(std::slice::from_ref(&scope))
                 .err()
                 .map(|e| e.to_string())
         });
-        std::thread::sleep(Duration::from_millis(300));
+        waiting_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("scoped writer never contended");
         ctl.fence().trip("lease lost while waiting");
         w.join().unwrap()
     });
@@ -1146,21 +1203,54 @@ fn tracker_root_scope_covers_the_whole_tracker() {
     assert!(e.contains("interrupted"), "root wrongly disjoint: {e}");
 }
 
-/// Guard against API misuse: every write.rs function that takes a
+/// Guard against API misuse: every write-module function that takes a
 /// scoped lock must commit only through the scoped wrappers. Plain
 /// commit never checks scope, so an unscoped call beside
 /// `lock_for_paths` would silently write outside the admitted set.
-/// This test reads the source it guards and fails the build on drift.
+/// This test reads the sources it guards and fails the build on drift.
 #[test]
 fn write_rs_pairs_scoped_locks_with_scoped_commits() {
+    for name in [
+        "src/issue/write.rs",
+        "src/issue/write/done.rs",
+        "src/issue/write/edit.rs",
+        "src/issue/write/new.rs",
+        "src/issue/write/plan.rs",
+        "src/issue/write/projects.rs",
+        "src/issue/write/rev.rs",
+        "src/issue/write/stage.rs",
+    ] {
+        let src =
+            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name))
+                .unwrap();
+        scoped_locks_pair_with_scoped_commits(name, &src);
+    }
+}
+
+/// The same guard for the batched edit (CAD-1600): it takes a scoped
+/// lock, so it must commit through the scoped wrapper too.
+#[test]
+fn edit_rs_pairs_scoped_locks_with_scoped_commits() {
     let src = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/issue/write.rs"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/issue/edit.rs"),
     )
     .unwrap();
+    scoped_locks_pair_with_scoped_commits("src/issue/edit.rs", &src);
+}
+
+/// Every function that takes a scoped lock must commit only through
+/// the scoped wrappers. Plain commit never checks scope, so an
+/// unscoped call beside `lock_for_paths` would silently write outside
+/// the admitted set.
+fn scoped_locks_pair_with_scoped_commits(name: &str, src: &str) {
     let lines: Vec<&str> = src.lines().collect();
     let mut bounds = vec![0usize];
     for (i, l) in lines.iter().enumerate() {
-        if l.starts_with("pub fn ") || l.starts_with("pub(crate) fn ") || l.starts_with("fn ") {
+        if l.starts_with("pub fn ")
+            || l.starts_with("pub(crate) fn ")
+            || l.starts_with("pub(super) fn ")
+            || l.starts_with("fn ")
+        {
             bounds.push(i);
         }
     }
@@ -1180,7 +1270,7 @@ fn write_rs_pairs_scoped_locks_with_scoped_commits() {
                     continue;
                 }
                 bad.push(format!(
-                    "{}: unscoped {pat} beside lock_for_paths",
+                    "{name}:{}: unscoped {pat} beside lock_for_paths",
                     lines[w[0]]
                 ));
                 break;
@@ -1252,4 +1342,271 @@ fn pathspec_syntax_is_refused_as_caller_bug() {
         .unwrap()
         .to_string();
     assert!(e.contains("pathspec"), "{e}");
+}
+
+/// CAD-1600: the live incident, end to end. A crashed writer left
+/// ticket CAD-2's comment staged; the targeted post-merge close of the
+/// unrelated, proven-merged CAD-1 is admitted, commits ONLY CAD-1, and
+/// leaves CAD-2's staged bytes, the crash marker and the crash
+/// snapshot exactly as the dead writer left them. A close that would
+/// write the very path the crashed writer staged is still refused, so
+/// the scoped admission did not consume the tripwire.
+#[test]
+fn a_targeted_done_write_is_admitted_beside_an_interrupted_comment() {
+    use super::write::{mark_done_on_merge_waiting_with, RealWait};
+
+    let (_tmp, pm) = tracker();
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    mk(&pm, pm.dir.parent().unwrap(), "second");
+    let (child, _) = spawn_writer(&pm, "hold_comment", false);
+    sigkill(child);
+
+    let staged_before = git(&pm.dir, &["diff", "--cached"]).unwrap();
+    assert!(
+        staged_before.contains("CAD-2/comments/20261019T100620Z-crashed.md"),
+        "the crashed writer's comment is not staged: {staged_before}"
+    );
+    let comment = pm
+        .dir
+        .join("cadence/CAD-2/comments/20261019T100620Z-crashed.md");
+    let comment_bytes = std::fs::read(&comment).unwrap();
+    let marker_before = std::fs::read(pm.dir.join(".write.lock")).unwrap();
+    let snapshot_before = std::fs::read(pm.dir.join(".git").join("cadence-write.dirty.v2")).ok();
+
+    // The scoped close: CAD-1 only.
+    let wrote = mark_done_on_merge_waiting_with(
+        &pm,
+        "CAD-1",
+        "cadence/cad-1-x merged (patch)",
+        "operator (delivery cadence/cad-1-x)",
+        None,
+        Duration::from_secs(2),
+        &RealWait,
+    )
+    .expect("a path-scoped done write must be admitted beside the leftover");
+    assert!(wrote.is_none(), "CAD-1 was left unchanged: {wrote:?}");
+    assert_eq!(
+        super::write::load_front(&pm.dir.join("cadence").join("CAD-1"))
+            .unwrap()
+            .0
+            .status,
+        "done"
+    );
+    let committed = git(&pm.dir, &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+    assert!(
+        committed.contains("cadence/CAD-1/issue.md"),
+        "HEAD does not carry CAD-1: {committed}"
+    );
+    assert!(
+        !committed.contains("CAD-2"),
+        "the close committed CAD-2 too: {committed}"
+    );
+    // The crashed writer's evidence is byte-identical and still staged.
+    assert_eq!(
+        git(&pm.dir, &["diff", "--cached"]).unwrap(),
+        staged_before,
+        "the close changed the crashed writer's staged work"
+    );
+    assert_eq!(std::fs::read(&comment).unwrap(), comment_bytes);
+    assert_eq!(
+        std::fs::read(pm.dir.join(".write.lock")).unwrap(),
+        marker_before,
+        "the close rewrote the crash marker"
+    );
+    assert_eq!(
+        std::fs::read(pm.dir.join(".git").join("cadence-write.dirty.v2")).ok(),
+        snapshot_before,
+        "the close rewrote the crash snapshot"
+    );
+
+    // The tripwire survives the admitted close: the crashed writer's
+    // own path is still refused, and so is every unscoped write.
+    let head_before = git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+    let e = pm
+        .lock_for_paths(std::slice::from_ref(&comment))
+        .expect_err("the crashed writer's own path must stay refused")
+        .to_string();
+    assert!(e.contains("interrupted"), "{e}");
+    assert!(e.contains("CAD-2/comments"), "{e}");
+    let e = pm
+        .try_lock()
+        .expect_err("an unscoped write must stay refused")
+        .to_string();
+    assert!(e.contains("interrupted"), "{e}");
+    assert_eq!(git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(), head_before);
+    assert_eq!(git(&pm.dir, &["diff", "--cached"]).unwrap(), staged_before);
+    assert_eq!(
+        super::write::load_front(&pm.dir.join("cadence").join("CAD-2"))
+            .unwrap()
+            .0
+            .status,
+        "backlog"
+    );
+}
+
+/// CAD-1600: the refusal side of the same contract. The crashed
+/// writer's leftover IS the file the close would write (CAD-2's
+/// issue.md), so the close of CAD-2 is refused without mutating
+/// anything, while the close of the unrelated CAD-1 is still admitted.
+#[test]
+fn a_done_write_over_the_crashed_path_is_refused_without_mutation() {
+    use super::write::{mark_done_on_merge_waiting_with, RealWait};
+
+    let (_tmp, pm) = tracker();
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    mk(&pm, pm.dir.parent().unwrap(), "second");
+    let (child, _) = spawn_writer(&pm, "hold_issue", false);
+    sigkill(child);
+
+    let staged_before = git(&pm.dir, &["diff", "--cached"]).unwrap();
+    assert!(
+        staged_before.contains("CAD-2/issue.md"),
+        "the crashed writer's edit is not staged: {staged_before}"
+    );
+    let head_before = git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+
+    // Refused: the close would write the crashed path.
+    let e = mark_done_on_merge_waiting_with(
+        &pm,
+        "CAD-2",
+        "cadence/cad-2-y merged (patch)",
+        "operator (delivery cadence/cad-2-y)",
+        None,
+        Duration::from_millis(500),
+        &RealWait,
+    )
+    .expect_err("a close over the crashed path must be refused")
+    .error
+    .to_string();
+    assert!(e.contains("interrupted"), "{e}");
+    assert!(e.contains("CAD-2/issue.md"), "{e}");
+    // Nothing moved.
+    assert_eq!(git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(), head_before);
+    assert_eq!(git(&pm.dir, &["diff", "--cached"]).unwrap(), staged_before);
+    assert_eq!(
+        super::write::load_front(&pm.dir.join("cadence").join("CAD-2"))
+            .unwrap()
+            .0
+            .status,
+        "backlog"
+    );
+
+    // The unrelated close is still admitted beside that leftover.
+    mark_done_on_merge_waiting_with(
+        &pm,
+        "CAD-1",
+        "cadence/cad-1-x merged (patch)",
+        "operator (delivery cadence/cad-1-x)",
+        None,
+        Duration::from_secs(2),
+        &RealWait,
+    )
+    .expect("a disjoint close must be admitted");
+    assert_eq!(
+        super::write::load_front(&pm.dir.join("cadence").join("CAD-1"))
+            .unwrap()
+            .0
+            .status,
+        "done"
+    );
+    // The crashed writer's staged edit is still staged, untouched.
+    assert_eq!(git(&pm.dir, &["diff", "--cached"]).unwrap(), staged_before);
+}
+
+/// CAD-1600: the other half of the availability outcome. A crashed
+/// writer left ticket CAD-2's comment staged; a normal new-ticket
+/// allocation still creates an unrelated CAD-3, and it does not absorb
+/// the crashed writer's staged work.
+#[test]
+fn a_new_ticket_is_allocated_beside_an_interrupted_comment() {
+    let (_tmp, pm) = tracker();
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    mk(&pm, pm.dir.parent().unwrap(), "second");
+    let (child, _) = spawn_writer(&pm, "hold_comment", false);
+    sigkill(child);
+    let staged_before = git(&pm.dir, &["diff", "--cached"]).unwrap();
+    assert!(staged_before.contains("CAD-2/comments"));
+
+    let id = mk(&pm, pm.dir.parent().unwrap(), "third");
+    assert_eq!(id, "CAD-3", "the allocation did not take the next id");
+    let created = pm.dir.join("cadence").join("CAD-3").join("issue.md");
+    assert!(created.exists(), "the new ticket was not created");
+    // The commit carries only the new ticket.
+    let committed = git(&pm.dir, &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+    assert!(
+        committed.contains("cadence/CAD-3/issue.md"),
+        "HEAD does not carry the new ticket: {committed}"
+    );
+    assert!(
+        !committed.contains("CAD-2"),
+        "the allocation absorbed the crashed writer's work: {committed}"
+    );
+    // The crashed writer's staged work is untouched and still staged.
+    assert_eq!(
+        git(&pm.dir, &["diff", "--cached"]).unwrap(),
+        staged_before,
+        "the allocation changed the crashed writer's staged work"
+    );
+    // And the tripwire is intact: an unscoped write is still refused.
+    let e = pm
+        .try_lock()
+        .expect_err("an unscoped write must stay refused")
+        .to_string();
+    assert!(e.contains("interrupted"), "{e}");
+}
+
+/// CAD-1600: the batched edit (`issue edit`, CAD-887) writes one
+/// ticket's `issue.md` plus files under its `comments/` and
+/// `artifacts/`. Beside an interrupted write on another ticket it is
+/// admitted and commits only its own ticket; an edit of the crashed
+/// ticket itself is still refused.
+#[test]
+fn a_batched_edit_is_admitted_beside_an_interrupted_comment() {
+    let (_tmp, pm) = tracker();
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    mk(&pm, pm.dir.parent().unwrap(), "second");
+    let (child, _) = spawn_writer(&pm, "hold_comment", false);
+    sigkill(child);
+    let staged_before = git(&pm.dir, &["diff", "--cached"]).unwrap();
+    assert!(staged_before.contains("CAD-2/comments"));
+
+    let spec = crate::issue::edit::EditSpec {
+        set: vec!["status=ready".to_string()],
+        tags: vec![],
+        link: vec![],
+        unlink: vec![],
+        refs: vec![],
+        unrefs: vec![],
+        attach: vec![],
+        acceptance: None,
+        comment: Some("a batched edit beside the leftover".to_string()),
+        author: None,
+        force: None,
+    };
+    let out = crate::issue::edit::edit(&pm, "CAD-1", &spec, "operator", None)
+        .expect("an unrelated batched edit must be admitted");
+    assert_eq!(out["committed"], serde_json::json!(true));
+    let committed = git(&pm.dir, &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+    assert!(
+        committed.contains("cadence/CAD-1/issue.md"),
+        "HEAD does not carry the edit: {committed}"
+    );
+    assert!(
+        !committed.contains("CAD-2"),
+        "the edit committed CAD-2 too: {committed}"
+    );
+    assert_eq!(
+        git(&pm.dir, &["diff", "--cached"]).unwrap(),
+        staged_before,
+        "the edit changed the crashed writer's staged work"
+    );
+
+    // The crashed ticket itself is still refused, and mutates nothing.
+    let head_before = git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+    let e = crate::issue::edit::edit(&pm, "CAD-2", &spec, "operator", None)
+        .expect_err("an edit of the crashed ticket must be refused")
+        .to_string();
+    assert!(e.contains("interrupted"), "{e}");
+    assert_eq!(git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(), head_before);
+    assert_eq!(git(&pm.dir, &["diff", "--cached"]).unwrap(), staged_before);
 }

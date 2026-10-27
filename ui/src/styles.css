@@ -1,126 +1,9 @@
 @import "tailwindcss";
 
-@theme {
-  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+@import "../screen-ui/src/theme.css";
+@import "../screen-ui/src/controls.css";
+@import "../screen-ui/src/base.css";
 
-  --color-ink-950: #070708;
-  --color-ink-900: #0b0b0c;
-  --color-ink-875: #0e0e10;
-  --color-ink-850: #141518;
-  --color-ink-800: #191a1e;
-  --color-ink-700: #222428;
-  --color-ink-600: #2e3136;
-  --color-ink-500: #858c96;
-  --color-ink-400: #9ba1a9;
-  --color-ink-300: #c3c8ce;
-  --color-ink-200: #e7e9ec;
-  --color-ink-100: #f6f7f8;
-
-  --color-accent: #2dd4bf;
-  --color-ok: #4ade80;
-  --color-fail: #f87171;
-  --color-warn: #fbbf24;
-  --color-info: #60a5fa;
-
-  /* Text on an accent fill; form field borders; the overlay behind drawers. */
-  --color-on-accent: #04201c;
-  --color-edge: #3a3d43;
-  --color-edge-hover: #50545c;
-  --color-scrim: rgb(7 7 8 / .7);
-
-  --text-micro: .6875rem;
-  --text-label: .75rem;
-  --text-table: .78125rem;
-  --text-secondary: .8125rem;
-  --text-body: .875rem;
-  --text-cardtitle: .9375rem;
-  --text-section: 1.125rem;
-  --text-drawer: 1.25rem;
-
-  /* CAD-574: the detached Needs-you rail leaves its column and becomes
-     a slide-over drawer below this width (`rail:` variants). */
-  --breakpoint-rail: 1100px;
-}
-
-/*
- * Light and dark themes. The @theme values above are the dark theme; the
- * light theme re-points the same variables, so every utility (bg-ink-900,
- * text-accent, …) and every rule below follows the theme with no second
- * class. The ink scale keeps its meaning — 900 is the page, 100 the
- * strongest text — and flips its values. The system preference decides
- * unless the header toggle stored a choice (`data-theme` on <html>, set by
- * lib/theme.ts). The light block appears twice because a media query
- * cannot share a selector list; keep the two in step.
- */
-:root {
-  color-scheme: dark;
-}
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) {
-    color-scheme: light;
-    --color-ink-950: #e6e8eb;
-    --color-ink-900: #f4f5f6;
-    --color-ink-875: #eceef0;
-    --color-ink-850: #ffffff;
-    --color-ink-800: #e9ebee;
-    --color-ink-700: #dfe2e6;
-    --color-ink-600: #cdd2d8;
-    --color-ink-500: #6b7280;
-    --color-ink-400: #4b5563;
-    --color-ink-300: #374151;
-    --color-ink-200: #1b1d21;
-    --color-ink-100: #0b0b0c;
-    --color-accent: #0f766e;
-    --color-ok: #15803d;
-    --color-fail: #dc2626;
-    --color-warn: #b45309;
-    --color-info: #2563eb;
-    --color-on-accent: #ffffff;
-    --color-edge: #c4c9d0;
-    --color-edge-hover: #9aa1a9;
-    --color-scrim: rgb(17 24 39 / .35);
-  }
-}
-:root[data-theme="light"] {
-  color-scheme: light;
-  --color-ink-950: #e6e8eb;
-  --color-ink-900: #f4f5f6;
-  --color-ink-875: #eceef0;
-  --color-ink-850: #ffffff;
-  --color-ink-800: #e9ebee;
-  --color-ink-700: #dfe2e6;
-  --color-ink-600: #cdd2d8;
-  --color-ink-500: #6b7280;
-  --color-ink-400: #4b5563;
-  --color-ink-300: #374151;
-  --color-ink-200: #1b1d21;
-  --color-ink-100: #0b0b0c;
-  --color-accent: #0f766e;
-  --color-ok: #15803d;
-  --color-fail: #dc2626;
-  --color-warn: #b45309;
-  --color-info: #2563eb;
-  --color-on-accent: #ffffff;
-  --color-edge: #c4c9d0;
-  --color-edge-hover: #9aa1a9;
-  --color-scrim: rgb(17 24 39 / .35);
-}
-
-body {
-  background: var(--color-ink-950);
-  color: var(--color-ink-300);
-  font-family: "IBM Plex Sans", sans-serif;
-  font-size: .875rem;
-  line-height: 1.4;
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-}
-
-.num {
-  font-family: "IBM Plex Mono", monospace;
-  font-variant-numeric: tabular-nums lining-nums;
-}
 .kicker {
   font: 400 .75rem "IBM Plex Mono", monospace;
   color: var(--color-ink-500);
@@ -131,12 +14,6 @@ body {
   letter-spacing: .08em;
   text-transform: uppercase;
   color: var(--color-ink-500);
-}
-.card {
-  border: 1px solid var(--color-ink-700);
-  background: var(--color-ink-850);
-  border-radius: .5rem;
-  transition: border-color .15s ease, background-color .15s ease;
 }
 .tcard {
   cursor: pointer;
@@ -161,6 +38,16 @@ body {
   font-size: 13px;
   transition: background-color .16s ease, color .16s ease;
 }
+.navlink .navbadge {
+  margin-left: auto;
+  min-width: 1.1rem;
+  padding: 0 .375rem;
+  border-radius: 9999px;
+  background: var(--color-warn);
+  color: #1a1200;
+  font: 600 .65rem/1.1rem "IBM Plex Mono", monospace;
+  text-align: center;
+}
 .navlink[data-parent-current] {
   background: none;
   color: var(--color-ink-100);
@@ -173,19 +60,111 @@ body {
   background: color-mix(in srgb, var(--color-accent) 13%, var(--color-ink-875));
   color: var(--color-accent);
 }
-/* The sidebar footer's account trigger: a two-line navlink. */
+/* The sidebar footer's account trigger (CAD-1312): one compact 36px
+   line — avatar, name and role, the up-chevron at the edge. */
 .navlink.account-row {
   width: 100%;
   min-width: 0;
-  min-height: 40px;
+  min-height: 36px;
   gap: 8px;
-  padding: 4px 8px;
+  padding: 4px 6px;
   font-size: inherit;
 }
 .navlink-sub {
   min-height: 28px;
   padding: 0 8px;
   font-size: 12.5px;
+}
+/* CAD-1692: a nav row with a trailing disclosure. The link fills the
+   row and keeps navigating; the chevron button only folds. */
+.navrow {
+  position: relative;
+  display: flex;
+  min-width: 0;
+}
+.navrow > .navlink {
+  flex: 1;
+  min-width: 0;
+  padding-right: 32px;
+}
+.navdisc {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  color: var(--color-ink-500);
+  transform: translateY(-50%);
+  transition: background-color .14s ease, color .14s ease;
+}
+.navdisc:hover {
+  background: var(--color-ink-700);
+  color: var(--color-ink-100);
+}
+.navdisc svg,
+.projhead-toggle svg {
+  transition: transform .18s cubic-bezier(.2, .8, .2, 1);
+}
+.navdisc[aria-expanded="true"] svg,
+.projhead-toggle[aria-expanded="true"] svg {
+  transform: rotate(90deg);
+}
+.navdisc:focus-visible,
+.projhead-toggle:focus-visible,
+.projpin:focus-visible,
+.projmore:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent) 55%, transparent);
+}
+/* A folded region: animates to its content height with no measuring. */
+.navfold {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows .2s cubic-bezier(.2, .8, .2, 1);
+}
+.navfold[data-open] {
+  grid-template-rows: 1fr;
+}
+.navfold-in {
+  min-height: 0;
+  overflow: hidden;
+}
+.navtree {
+  display: grid;
+  gap: 1px;
+  margin: 2px 0 2px 10px;
+  padding-left: 6px;
+  border-left: 1px solid var(--color-ink-700);
+}
+@media (prefers-reduced-motion: reduce) {
+  .navfold,
+  .navdisc svg,
+  .projhead-toggle svg {
+    transition: none;
+  }
+}
+/* Projects heading: the label folds the section. */
+.projhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 18px 4px 5px 4px;
+  padding-right: 7px;
+}
+.projhead-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 7px 0 3px;
+  border-radius: 4px;
+}
+.projhead-toggle:hover {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
 }
 /* The phone menu keeps touch-sized rows. */
 #mobile-navigation .navlink {
@@ -194,13 +173,27 @@ body {
 #mobile-navigation .navlink-sub {
   min-height: 36px;
 }
+#mobile-navigation .navrow > .navlink {
+  padding-right: 44px;
+}
+#mobile-navigation .navdisc,
+#mobile-navigation .projpin {
+  width: 36px;
+  height: 36px;
+}
+#mobile-navigation .projhead {
+  margin: 0 0 4px;
+}
+#mobile-navigation .projhead-toggle {
+  height: 32px;
+}
 #mobile-navigation .proj {
   min-height: 36px;
-  align-items: center;
 }
 .proj {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto 2.4em;
+  align-items: center;
   gap: 8px;
   width: 100%;
   padding: 7px 10px;
@@ -216,305 +209,96 @@ body {
 .proj.on {
   box-shadow: inset 2px 0 var(--color-accent);
 }
-.field {
-  height: 2.25rem;
-  border: 1px solid var(--color-edge);
-  border-radius: .25rem;
-  background: var(--color-ink-900);
-  color: var(--color-ink-100);
-  padding: 0 .85rem;
-  font-size: .8125rem;
+.proj-prefix {
+  font-size: 10px;
+  color: var(--color-ink-500);
 }
-.field:hover {
-  border-color: var(--color-edge-hover);
-}
-.field:focus {
-  outline: none;
-  border-color: var(--color-accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 10%, transparent);
-}
-/* Multi-line fields keep the .field tokens but own their height: the
-   fixed 2.25rem control height would flatten the declared `rows`
-   contract (CRM campaign heading/paragraph editors ask for 2/4). The
-   element's own rows sizing applies, vertical padding keeps the first
-   line off the border, and resize stays vertical-only so a drag can
-   never push the document sideways. */
-textarea.field {
-  height: auto;
-  padding-block: 0.5rem;
-  resize: vertical;
-}
-
-/* Shared Button. Text is centred in the fixed height — a full-width
-   control must not sit on the left, and IBM Plex must not inherit the
-   body's 1.4 line-height into the 2rem box. */
-.btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  height: 2rem;
-  padding: 0 0.8rem;
-  line-height: 1;
-  white-space: nowrap;
-  max-width: 100%;
-  border: 1px solid var(--color-edge);
-  border-radius: 0.25rem;
-  background: var(--color-ink-850);
-  color: var(--color-ink-200);
-  font-size: var(--text-label);
-  text-decoration: none;
-  cursor: pointer;
-  transition: border-color 0.15s ease, background-color 0.15s ease, filter 0.15s ease;
-}
-.btn-label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.btn-icon,
-.btn-spin {
-  flex: none;
-}
-.btn-sm {
-  height: 1.75rem;
-  padding: 0 0.6rem;
+.proj-count {
   font-size: var(--text-micro);
+  color: var(--color-ink-500);
+  text-align: right;
 }
-.btn-full {
-  width: 100%;
+.proj-count.zero {
+  color: var(--color-ink-600);
 }
-.btn:hover:not(:disabled):not([aria-disabled="true"]) {
-  border-color: var(--color-edge-hover);
-  background: var(--color-ink-800);
-}
-.btn:focus-visible,
-.select-trigger:focus-visible,
-.select-search:focus {
-  outline: none;
-  border-color: var(--color-accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 10%, transparent);
-}
-.btn-primary {
-  border-color: transparent;
-  background: var(--color-accent);
-  color: var(--color-on-accent);
-  font-weight: 500;
-}
-.btn-primary:hover:not(:disabled):not([aria-disabled="true"]) {
-  background: var(--color-accent);
-  filter: brightness(1.1);
-}
-.btn-ghost {
-  background: transparent;
-  border-color: transparent;
-  color: var(--color-ink-300);
-}
-.btn-ghost:hover:not(:disabled):not([aria-disabled="true"]) {
-  background: var(--color-ink-800);
-  color: var(--color-ink-100);
-  border-color: transparent;
-}
-.btn-danger {
-  color: var(--color-fail);
-}
-.btn-danger:hover:not(:disabled):not([aria-disabled="true"]) {
-  border-color: var(--color-fail);
-  background: color-mix(in srgb, var(--color-fail) 10%, transparent);
-}
-.btn:disabled,
-.btn[aria-disabled="true"] {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-.btn-spin {
-  width: 0.75rem;
-  height: 0.75rem;
-  box-sizing: border-box;
-  border: 1.5px solid currentColor;
-  border-right-color: transparent;
-  border-radius: 999px;
-  animation: btn-spin 0.6s linear infinite;
-}
-@keyframes btn-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-/* Shared Select. The listbox is portaled so rails and drawers do not clip it. */
-.select {
+/* CAD-1692 pin: shown on hover or focus in the prefix slot; a pinned row
+   keeps it, in the accent. */
+.projrow {
   position: relative;
-  display: inline-flex;
-  max-width: 100%;
-  vertical-align: middle;
 }
-.select-full {
-  display: flex;
-  width: 100%;
-}
-.select-trigger {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  width: 100%;
-  min-width: 8rem;
-  height: 2rem;
-  padding: 0 0.75rem;
-  line-height: 1;
-  white-space: nowrap;
-  border: 1px solid var(--color-edge);
-  border-radius: 0.25rem;
-  background: var(--color-ink-900);
-  color: var(--color-ink-100);
-  font-size: var(--text-label);
-  text-align: left;
-  cursor: pointer;
-  transition: border-color 0.15s ease, background-color 0.15s ease;
-}
-.select-sm .select-trigger {
-  height: 1.75rem;
-}
-.select-trigger:hover:not(:disabled) {
-  border-color: var(--color-edge-hover);
-}
-.select-trigger:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-.select-value {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.select-placeholder {
-  color: var(--color-ink-500);
-}
-.select-caret {
-  flex: none;
-  color: var(--color-ink-500);
-  transition: transform 0.15s ease;
-}
-.select-trigger[aria-expanded="true"] .select-caret {
-  transform: rotate(180deg);
-}
-.select-pop {
-  position: fixed;
-  z-index: 80;
-  display: flex;
-  flex-direction: column;
-  max-height: min(20rem, 70vh);
-  border: 1px solid var(--color-edge);
-  border-radius: 0.25rem;
-  background: var(--color-ink-850);
-  box-shadow: 0 12px 32px rgb(0 0 0 / 0.35);
-  overflow: hidden;
-}
-.select-search {
-  flex: none;
-  height: 2rem;
-  margin: 4px;
-  width: calc(100% - 8px);
-  border: 1px solid var(--color-edge);
-  border-radius: 0.25rem;
-  background: var(--color-ink-900);
-  color: var(--color-ink-100);
-  padding: 0 0.7rem;
-  font-size: var(--text-label);
-  line-height: 1;
-}
-.select-search::placeholder {
-  color: var(--color-ink-500);
-}
-.select-list {
-  list-style: none;
-  margin: 0;
-  padding: 4px;
-  overflow: auto;
-}
-.select-group {
-  padding: 6px 8px 2px;
-  font: 500 var(--text-micro) var(--font-mono);
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--color-ink-500);
-}
-.select-opt {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 2rem;
-  padding: 4px 8px;
-  border-radius: 0.25rem;
-  color: var(--color-ink-200);
-  font-size: var(--text-label);
-  line-height: 1.2;
-  cursor: pointer;
-}
-.select-opt[data-active="true"] {
-  background: var(--color-ink-800);
-}
-.select-opt[aria-selected="true"] {
-  color: var(--color-ink-100);
-}
-.select-opt[aria-disabled="true"] {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-.select-check {
-  flex: none;
-  width: 12px;
-  color: var(--color-accent);
-}
-.select-copy {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.select-label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.select-hint {
-  color: var(--color-ink-500);
-  font-size: var(--text-micro);
-  line-height: 1.3;
-  white-space: normal;
-}
-.select-badge {
-  margin-left: auto;
-  flex: none;
-  border-radius: 0.25rem;
-  padding: 0.05rem 0.4rem;
+.projpin {
+  position: absolute;
+  top: 50%;
+  right: calc(10px + 2.4em + 4px);
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
   background: var(--color-ink-800);
   color: var(--color-ink-400);
-  font: 500 var(--text-micro) var(--font-mono);
+  opacity: 0;
+  transform: translateY(-50%);
+  transition: opacity .12s ease, color .12s ease;
 }
-.select-empty {
-  padding: 8px;
+.projrow:hover .projpin,
+.projrow:focus-within .projpin,
+.projrow[data-pinned] .projpin {
+  opacity: 1;
+}
+.projrow:hover .proj-prefix,
+.projrow:focus-within .proj-prefix,
+.projrow[data-pinned] .proj-prefix {
+  visibility: hidden;
+}
+.projrow[data-pinned] .projpin {
+  background: none;
+  color: var(--color-accent);
+}
+.projpin:hover,
+.projrow[data-pinned] .projpin:hover {
+  background: var(--color-ink-700);
+  color: var(--color-ink-100);
+}
+/* Touch has no hover: the phone menu shows every pin, dimmed until set. */
+@media (hover: none) {
+  #mobile-navigation .projpin {
+    opacity: 1;
+    background: none;
+    color: var(--color-ink-600);
+  }
+  #mobile-navigation .projrow[data-pinned] .projpin {
+    color: var(--color-accent);
+  }
+  #mobile-navigation .proj-prefix {
+    visibility: hidden;
+  }
+}
+.projsep {
+  height: 1px;
+  margin: 4px 10px;
+  background: var(--color-ink-700);
+}
+.projmore {
+  justify-self: start;
+  margin-top: 2px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: var(--text-micro);
   color: var(--color-ink-500);
-  font-size: var(--text-label);
 }
-@media (prefers-reduced-motion: reduce) {
-  .btn,
-  .select-trigger,
-  .select-caret,
-  .select-opt {
-    transition: none;
-  }
-  .btn-spin {
-    animation: none;
-    opacity: 0.7;
-  }
+.projmore:hover {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
 }
 @layer components {
+  /* CAD-1312: one quiet badge language — a hairline border tinted by the
+     chip's own status colour, so labels stay semantic in both themes. */
   .chip {
     display: inline-flex;
     align-items: center;
     gap: .3rem;
+    border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
     border-radius: .25rem;
     padding: .05rem .4rem;
     font: 500 .6875rem "IBM Plex Mono", monospace;
@@ -546,14 +330,48 @@ textarea.field {
   border-color: var(--color-accent);
   color: var(--color-accent);
 }
-a.lnk, button.lnk {
-  color: var(--color-accent);
-}
-a.lnk:hover, button.lnk:hover {
-  text-decoration: underline;
-}
 pre {
   white-space: pre-wrap;
+}
+
+/* CAD-1312: one shared full-pane state — the sign-in and access refusals
+   and a confirmed-empty workspace render as a calm centred state, not a
+   boxed card among sections. The host's pane sizes it (a bounded pane
+   like the Wiki scroller keeps its own height; a document-flow screen
+   gets the main area below the 36px header). */
+.page-state {
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 3rem 1.5rem;
+  text-align: center;
+  min-height: min(30rem, calc(100dvh - 2.25rem - 4rem));
+  justify-content: center;
+}
+.page-state-icon {
+  display: grid;
+  place-items: center;
+  width: 3rem;
+  height: 3rem;
+  border-radius: 0.75rem;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-875);
+  color: var(--color-ink-400);
+}
+.page-state-title {
+  font-size: 1.375rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--color-ink-100);
+}
+.page-state-copy {
+  margin-top: -0.75rem;
+  max-width: 28rem;
+  font-size: var(--text-secondary);
+  line-height: 1.6;
+  color: var(--color-ink-400);
 }
 
 /* ---------- CAD-551: chat turn state, steps, commands, motion ----------
@@ -561,22 +379,34 @@ pre {
  * prefers-reduced-motion the layout is identical, just still.
  */
 
-/* The working row: pulse dot, elapsed clock, live step, Stop. */
+/* The turn status line (CAD-1462: docked above the composer, outside
+   the message rows) — a quiet INLINE line, not a boxed card: truthful
+   queued/submitting/compacting state, the live step, and Stop, with no
+   border/background/radius/full-width box. The working presentation
+   itself is the subtle name-row indicator (`.chat-live`). */
 .workrow {
   position: relative;
-  overflow: hidden;
   display: flex;
   align-items: center;
   gap: .5rem;
   min-width: 0;
-  border: 1px solid var(--color-ink-700);
-  background: var(--color-ink-850);
-  border-radius: .5rem;
-  padding: .4rem .75rem;
+  padding: .15rem .1rem;
   font-size: var(--text-label);
+  color: var(--color-ink-400);
 }
-.workrow[data-turn="working"] {
-  border-color: color-mix(in srgb, var(--color-accent) 30%, var(--color-ink-700));
+/* The name row's right-aligned live state (the mock's `.who .live`):
+   pulse dot + Working + elapsed, accent, mono — beside the row's own
+   name and timestamp, which the bubble keeps rendering. */
+.chat-live {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-accent);
+  font-size: var(--text-micro);
+  white-space: nowrap;
+}
+.chatdock .workrow {
+  margin-bottom: .25rem;
 }
 .workdot {
   flex: none;
@@ -587,6 +417,97 @@ pre {
 }
 .workdot.live {
   background: var(--color-accent);
+}
+/* CAD-1700 turn bar (Home and every app pane, above the composer):
+   neutral surface, the state lives in the dot colour and the words;
+   borderless text actions; dashed while the stream reconnects. */
+.turnbar {
+  --tb: var(--color-ink-500);
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  min-width: 0;
+  margin-bottom: .25rem;
+  padding: .2rem .25rem;
+  border: 0;
+  background: transparent;
+}
+.turnbar[data-state="working"],
+.turnbar[data-state="writing"] { --tb: var(--color-accent); }
+.turnbar[data-state="queued"],
+.turnbar[data-state="needs_approval"] { --tb: var(--color-warn); }
+.turnbar[data-state="failed"] { --tb: var(--color-fail); }
+.turnbar[data-stale] { opacity: .7; }
+.tb-dot {
+  flex: none;
+  width: .5rem;
+  height: .5rem;
+  border-radius: 9999px;
+  background: var(--tb);
+}
+.turnbar[data-state="working"] .tb-dot,
+.turnbar[data-state="writing"] .tb-dot {
+  animation: work-pulse 1.4s ease-in-out infinite;
+}
+.tb-text {
+  display: flex;
+  flex: 1;
+  align-items: baseline;
+  gap: .5rem;
+  min-width: 0;
+}
+.tb-title {
+  flex: none;
+  color: var(--color-ink-100);
+  font-size: var(--text-label);
+  font-weight: 500;
+}
+.tb-detail {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tb-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: .125rem;
+}
+.tb-btn {
+  height: 1.625rem;
+  padding: 0 .5625rem;
+  border: 0;
+  border-radius: .375rem;
+  background: transparent;
+  color: var(--color-ink-300);
+  font: inherit;
+  font-size: var(--text-micro);
+  font-weight: 500;
+  cursor: pointer;
+}
+.tb-btn:hover { background: var(--color-ink-800); color: var(--color-ink-100); }
+.tb-btn.danger { color: var(--color-fail); }
+.tb-btn.danger:hover { background: color-mix(in srgb, var(--color-fail) 12%, transparent); }
+.tb-btn:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+/* CAD-1700: an assistant reply waits unseen — a dot, not a count. */
+.navlink .navdot {
+  flex: none;
+  width: .4375rem;
+  height: .4375rem;
+  margin-left: auto;
+  border-radius: 9999px;
+  background: var(--color-accent);
+}
+.navlink .navbadge + .navdot { margin-left: .375rem; }
+@media (max-width: 1023.98px) {
+  .tb-btn { height: 2.25rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .turnbar[data-state="working"] .tb-dot,
+  .turnbar[data-state="writing"] .tb-dot { animation: none; }
 }
 .stopbtn {
   padding: .12rem .55rem;
@@ -629,19 +550,26 @@ pre {
 .steps[data-open] .steps-caret {
   transform: rotate(90deg);
 }
+/* The trace owns its head; a nested tool disclosure inside it must not
+ * rotate merely because the outer trace opened. */
+.turntrace[data-open] .steps-body .steps-caret {
+  transform: none;
+}
+.turntrace .steps-body .steps[data-open] .steps-caret {
+  transform: rotate(90deg);
+}
 .steps-body {
   display: grid;
   grid-template-rows: 0fr;
   transition: grid-template-rows .28s cubic-bezier(.2, .8, .2, 1);
 }
-.steps[data-open] .steps-body {
+.steps[data-open] > .steps-body {
   grid-template-rows: 1fr;
 }
 .steps-inner {
   overflow: hidden;
   min-height: 0;
-  border-left: 1px solid var(--color-ink-700);
-  padding-left: .625rem;
+  padding-left: .25rem;
   margin-top: .25rem;
   display: flex;
   flex-direction: column;
@@ -663,6 +591,305 @@ pre {
   font: 500 .625rem "IBM Plex Mono", monospace;
   text-transform: uppercase;
   letter-spacing: .04em;
+}
+
+/* ---- Home assistant turns (worker transcript) ----
+   One quiet head per turn, reasoning and worker notes folded into one
+   disclosure, the answer on its own Markdown surface, its artifact cards
+   after it. The flat items stay the data; these rules only say how a run of
+   them paints. No new palette, no new type: inks, accent and the two faces
+   already in use. */
+.turn {
+  min-width: 0;
+}
+.turn-head {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  min-width: 0;
+  max-width: min(100%, 40rem);
+  margin-bottom: .375rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+}
+.turn-name {
+  color: var(--color-ink-200);
+  font-size: var(--text-label);
+  font-weight: 500;
+}
+.turn-time {
+  margin-left: auto;
+  font-family: "IBM Plex Mono", monospace;
+}
+/* The turn's one disclosure: same mechanics as the steps group (the grid
+   rows animation and the caret), a quieter rhythm inside a turn. */
+.turntrace {
+  max-width: min(100%, 40rem);
+  margin: 0 0 .5rem;
+}
+.turntrace-head {
+  color: var(--color-ink-500);
+}
+.turntrace-title {
+  color: var(--color-ink-300);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.turntrace-summary {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-ink-500);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.turntrace-count {
+  margin-left: auto;
+  color: var(--color-ink-500);
+  white-space: nowrap;
+}
+.turntrace .steps-body > .turntrace-wrap {
+  overflow: hidden;
+  min-height: 0;
+}
+.turntrace-list {
+  display: flex;
+  flex-direction: column;
+  gap: .375rem;
+  margin: .125rem 0 0;
+  padding: .5rem .625rem;
+  border-radius: .5rem;
+  background: color-mix(in srgb, var(--color-ink-900) 55%, transparent);
+  list-style: none;
+}
+.turntrace-item {
+  min-width: 0;
+}
+.turntrace-kicker {
+  margin-bottom: .125rem;
+  color: var(--color-ink-500);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: .5625rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+.turntrace-text {
+  margin: 0;
+  color: var(--color-ink-400);
+  font-size: var(--text-secondary);
+  font-style: italic;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* The answer: one surface, the Markdown measure, and only the chrome the
+   turn owns. Tables lose their grid, a blockquote reads as the one staged
+   callout, code and issue links as quiet chips. */
+.answer {
+  display: inline-block;
+  width: fit-content;
+  min-width: 0;
+  max-width: min(100%, 40rem);
+  margin-top: .25rem;
+  padding: 1.125rem 1.375rem;
+  border-radius: .375rem 1.1rem 1.1rem 1.1rem;
+  background: var(--color-ink-850);
+  border: 0;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.answer:has(pre, table) {
+  max-width: min(100%, 48rem);
+}
+.answer-head {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  padding: 0;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+}
+.answer[data-earlier] .answer-head {
+  margin-bottom: .5rem;
+}
+.answer-earlier {
+  color: var(--color-ink-500);
+  font-size: .5625rem;
+}
+.turn-copy {
+  margin-left: .5rem;
+  padding: 0 .1rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+  text-decoration: none;
+  opacity: 0;
+  transition: opacity .14s ease, color .14s ease;
+}
+.turn:hover .turn-copy,
+.turn:focus-within .turn-copy,
+.turn-copy:focus-visible {
+  opacity: 1;
+}
+.turn-copy:hover {
+  color: var(--color-ink-100);
+}
+@media (hover: none) {
+  .turn-copy { opacity: 1; }
+}
+.answer-body {
+  padding: 0;
+  color: var(--color-ink-200);
+}
+.answer .issue-reader > :last-child,
+.chat-bubble.issue-reader > :last-child {
+  margin-block-end: 0;
+}
+.answer-fail {
+  margin: .25rem 0 .5rem;
+}
+.noanswer {
+  margin: .25rem 0 .5rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+}
+.answer .issue-reader table {
+  border-collapse: collapse;
+  display: block;
+  max-inline-size: 100%;
+  overflow-x: auto;
+}
+.answer .issue-reader thead th {
+  border-bottom: 1px solid var(--color-ink-800);
+  color: var(--color-ink-500);
+  font-weight: 500;
+}
+.answer .issue-reader th,
+.answer .issue-reader td {
+  padding-right: .35rem;
+  white-space: nowrap;
+}
+.answer .issue-reader tbody tr + tr td {
+  border-top: 1px solid color-mix(in srgb, var(--color-ink-800) 60%, transparent);
+}
+.answer .issue-reader blockquote {
+  padding: .65rem .85rem;
+  border-inline-start: 0;
+  border-radius: .5rem;
+  background: color-mix(in srgb, var(--color-ink-800) 65%, transparent);
+  color: var(--color-ink-300);
+}
+.answer .issue-reader blockquote p {
+  margin: 0;
+}
+.answer .issue-reader blockquote strong {
+  color: var(--color-ink-100);
+}
+.answer .issue-reader code,
+.chat-bubble.issue-reader code {
+  padding: .12rem .38rem;
+  border: 0;
+  border-radius: .25rem;
+  background: color-mix(in srgb, var(--color-ink-700) 55%, transparent);
+  color: var(--color-ink-100);
+}
+.answer .issue-reader td code {
+  padding: 0;
+  border: 0;
+  background: none;
+}
+.answer .issue-reader button.lnk {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 .3rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .25rem;
+  color: var(--color-ink-300);
+  font-size: .625rem;
+  text-decoration: none;
+}
+.answer .issue-reader button.lnk:hover {
+  border-color: var(--color-ink-500);
+  color: var(--color-ink-100);
+}
+.turn-artifacts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .375rem;
+  margin-top: .5rem;
+}
+/* Streaming: the collapsed trace and three dots — never a skeleton or a
+   made-up answer body. */
+.typing {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 2.25rem;
+  margin-top: .15rem;
+  padding: .6rem .95rem;
+  border-radius: .375rem 1.1rem 1.1rem 1.1rem;
+  background: var(--color-ink-850);
+}
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  height: 1rem;
+}
+.typing-dots i {
+  width: .375rem;
+  height: .375rem;
+  border-radius: 9999px;
+  background: var(--color-accent);
+  animation: typing 1.2s ease-in-out infinite;
+}
+.typing-dots i:nth-child(2) {
+  animation-delay: .16s;
+}
+.typing-dots i:nth-child(3) {
+  animation-delay: .32s;
+}
+@keyframes typing {
+  0%, 60%, 100% { opacity: .35; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-.1rem); }
+}
+/* Reconnecting: one quiet line at the top of the thread, never a stale
+   card border or a re-labelled answer. */
+.streambanner {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  margin: 0 0 .5rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+  line-height: 1.4;
+}
+.streambanner-retry {
+  flex: none;
+  margin-left: auto;
+  padding: .1rem .25rem;
+  font-size: var(--text-micro);
+}
+.banner-spinner {
+  flex: none;
+  width: .75rem;
+  height: .75rem;
+  border: 1.5px solid var(--color-ink-700);
+  border-top-color: var(--color-ink-400);
+  border-radius: 9999px;
+  animation: banner-spin .9s linear infinite;
+}
+@keyframes banner-spin {
+  to { transform: rotate(360deg); }
+}
+.turntrace-head:focus-visible,
+.turn-copy:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: .25rem;
+}
+@media (prefers-reduced-motion: reduce) {
+  .typing-dots i,
+  .banner-spinner {
+    animation: none;
+  }
 }
 
 /* The slash-command menu above the composer. */
@@ -711,6 +938,7 @@ pre {
   transform: translateX(-50%);
   bottom: calc(var(--dock-h, 7rem) + .6rem);
   z-index: 25;
+  white-space: nowrap;
   padding: .35rem .9rem;
   border-radius: 9999px;
   border: 1px solid color-mix(in srgb, var(--color-accent) 45%, var(--color-ink-700));
@@ -769,21 +997,6 @@ pre {
   .workdot.live {
     animation: work-pulse 1.6s ease-in-out infinite;
   }
-  /* The shimmer: a soft accent sweep across the working row. */
-  .workrow[data-turn="working"]::after {
-    content: "";
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-    background: linear-gradient(
-      105deg,
-      transparent 38%,
-      color-mix(in srgb, var(--color-accent) 7%, transparent) 50%,
-      transparent 62%
-    );
-    transform: translateX(-100%);
-    animation: work-shimmer 2.6s ease-in-out infinite;
-  }
   .newpill {
     animation: pill-in .24s cubic-bezier(.2, .8, .2, 1) both;
   }
@@ -840,12 +1053,6 @@ pre {
     box-shadow: 0 0 0 5px transparent;
   }
 }
-@keyframes work-shimmer {
-  55%,
-  100% {
-    transform: translateX(105%);
-  }
-}
 @keyframes pill-in {
   from {
     opacity: 0;
@@ -879,15 +1086,79 @@ pre {
     transition: none;
   }
 }
-::-webkit-scrollbar {
-  height: 10px;
-  width: 10px;
+/* Conversation bubbles: one tone step instead of a border, one readable
+   measure (34rem ≈ 76 characters at the body size), and one radius
+   language — round, with the sender's lower corner clipped to a tail. */
+.chat-bubble {
+  display: inline-block;
+  width: fit-content;
+  min-width: 0;
+  max-width: min(100%, 40rem);
+  padding: 1rem 1.25rem;
+  border-radius: 0.375rem 1.1rem 1.1rem 1.1rem;
+  background: var(--color-ink-850);
+  border: 0;
+  text-align: left;
+  overflow-wrap: anywhere;
 }
-::-webkit-scrollbar-thumb {
-  background: var(--color-ink-700);
-  border-radius: 6px;
+[data-chat-message="user"] .chat-bubble {
+  max-width: min(100%, 34rem);
+  padding: 0.7rem 1rem;
+  border-radius: 1.1rem 1.1rem 0.35rem 1.1rem;
+  background: color-mix(in srgb, var(--color-accent) 11%, var(--color-ink-850));
+  color: var(--color-ink-100);
 }
-
+[data-chat-message] .refsrow {
+  margin-top: 0.5rem;
+  gap: 0.5rem;
+}
+[data-chat-message="user"] .refsrow {
+  justify-content: flex-end;
+}
+.chat-bubble[data-pending="failed"] {
+  background: color-mix(in srgb, var(--color-fail) 9%, var(--color-ink-875));
+}
+.chat-bubble[data-pending="sending"] {
+  opacity: 0.85;
+}
+/* Markdown drops its trailing margin inside the padded surface, so the
+   last line and the bubble edge stay even. */
+.chat-bubble > :last-child {
+  margin-block-end: 0;
+}
+/* Prose keeps the 76-character measure; code and tables get the wider
+   surface they need. Without :has support the bubble simply stays at the
+   prose measure and the block scrolls. */
+.chat-bubble:has(pre, table) {
+  max-width: min(100%, 48rem);
+}
+.chat-bubble:has(pre, table) > :is(p, ul, ol, blockquote, h1, h2, h3, h4):not(:has(> img:only-child)) {
+  max-width: 34rem;
+}
+/* A fenced block: language label and Copy above the code, one surface. */
+.codeblock {
+  margin-block: 0.6rem;
+  overflow: hidden;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.375rem;
+  background: var(--color-ink-900);
+}
+.codeblock-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.25rem 0.5rem;
+  border-bottom: 1px solid var(--color-ink-700);
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+}
+.codeblock-lang {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 /* The issue reader stays shrinkable on phones. */
 .issue-reader {
   min-width: 0;
@@ -907,6 +1178,15 @@ pre {
 .issue-reader h2 { font-size: 1rem; }
 .issue-reader h3,
 .issue-reader h4 { font-size: .9rem; }
+.issue-reader h5,
+.issue-reader h6 {
+  margin: 1.15rem 0 .5rem;
+  color: var(--color-ink-100);
+  font-weight: 600;
+  line-height: 1.25;
+}
+.issue-reader h5 { font-size: .85rem; }
+.issue-reader h6 { font-size: .8rem; }
 .issue-reader > :first-child { margin-top: 0; }
 .issue-reader p,
 .issue-reader ul,
@@ -916,17 +1196,78 @@ pre {
 .issue-reader table {
   margin-block: .6rem;
 }
+.answer .issue-reader,
+.chat-bubble.issue-reader {
+  line-height: 1.7;
+}
+.answer .issue-reader p,
+.chat-bubble.issue-reader p {
+  margin-block: .9rem;
+  text-wrap: pretty;
+}
+.answer .issue-reader ul,
+.answer .issue-reader ol,
+.chat-bubble.issue-reader ul,
+.chat-bubble.issue-reader ol {
+  margin-block: .6rem 1rem;
+  padding-inline-start: 1.25rem;
+}
+.answer .issue-reader ul + p,
+.answer .issue-reader ol + p,
+.chat-bubble.issue-reader ul + p,
+.chat-bubble.issue-reader ol + p {
+  margin-top: 1.25rem;
+}
+.answer .issue-reader > :is(h1, h2, h3, h4, h5, h6):not(:first-child),
+.answer .issue-reader > p:has(> strong:only-child):not(:first-child),
+.chat-bubble.issue-reader > :is(h1, h2, h3, h4, h5, h6):not(:first-child),
+.chat-bubble.issue-reader > p:has(> strong:only-child):not(:first-child) {
+  margin: 1.75rem 0 .75rem;
+  padding-top: 1.35rem;
+  border-top: 1px solid color-mix(in srgb, var(--color-ink-700) 60%, transparent);
+  color: var(--color-ink-100);
+  font-size: .9375rem;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.answer .issue-reader > :is(h1, h2, h3, h4, h5, h6):last-child,
+.answer .issue-reader > p:has(> strong:only-child):last-child,
+.chat-bubble.issue-reader > :is(h1, h2, h3, h4, h5, h6):last-child,
+.chat-bubble.issue-reader > p:has(> strong:only-child):last-child {
+  margin-block-end: 0;
+}
+.answer .issue-reader > :first-child,
+.chat-bubble.issue-reader > :first-child {
+  margin-block-start: 0;
+}
 .issue-reader ul,
 .issue-reader ol {
   padding-inline-start: 1.25rem;
 }
 .issue-reader ul { list-style: disc; }
 .issue-reader ol { list-style: decimal; }
-.issue-reader li + li { margin-top: .25rem; }
+.issue-reader li::marker { color: var(--color-ink-500); }
+.issue-reader li + li { margin-top: .5rem; }
+.issue-reader ul.contains-task-list { padding-inline-start: .25rem; }
+.issue-reader li.task-list-item { list-style: none; }
+.issue-reader li.task-list-item > input[type="checkbox"] {
+  margin: 0 .45rem 0 0;
+  accent-color: var(--color-accent);
+  vertical-align: -0.05em;
+}
+.issue-reader hr {
+  margin: 1rem 0;
+  border: 0;
+  block-size: 1px;
+  background: var(--color-ink-700);
+}
+.issue-reader del { color: var(--color-ink-400); }
 .issue-reader blockquote {
-  border-inline-start: 2px solid var(--color-ink-600);
-  color: var(--color-ink-400);
-  padding-inline-start: .8rem;
+  border-inline-start: 0;
+  border-radius: .5rem;
+  background: color-mix(in srgb, var(--color-ink-800) 65%, transparent);
+  color: var(--color-ink-300);
+  padding: .65rem .85rem;
 }
 .issue-reader code {
   overflow-wrap: anywhere;
@@ -943,7 +1284,31 @@ pre {
   scrollbar-gutter: stable;
   overscroll-behavior: contain;
 }
+/* The code block's own surface owns the frame and padding; the inner
+   pre is only the scroll viewport. */
+.codeblock pre {
+  margin: 0;
+  padding: .75rem;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
 .issue-reader img {
+  max-inline-size: 100%;
+  block-size: auto;
+}
+/* Markdown images in a chat bubble read as content, not as an inline
+   glyph: a block, capped to the bubble, with the one radius. The bubble
+   itself carries `issue-reader`, so target its images directly. */
+.chat-bubble img {
+  display: block;
+  border-radius: 0.5rem;
+}
+.md-image {
+  display: block;
+  max-inline-size: 100%;
+}
+.md-image img {
   max-inline-size: 100%;
   block-size: auto;
 }
@@ -1171,6 +1536,227 @@ pre {
   position: relative;
 }
 
+/* CAD-1216: the To do rail — tabs, one-line cards, the decided history. */
+/* CAD-1312: the rail's tab strip compacts to a 36px row; labels drop
+   to 12px and the tools align vertically with the tabs — the 2px active
+   underline still sits flush on the border. */
+.todo-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: .25rem;
+  min-height: 2.25rem;
+  padding: 0 .75rem;
+  border-bottom: 1px solid var(--color-ink-700);
+}
+.todo-tabs > button {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  min-height: 2.25rem;
+  padding: 0 .5rem;
+  margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+}
+.todo-tabs > button[aria-pressed="true"] {
+  color: var(--color-ink-100);
+  border-color: var(--color-accent);
+  font-weight: 500;
+}
+.todo-tools {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: .5rem;
+}
+.todo-count {
+  min-width: 1rem;
+  padding: 0 .3rem;
+  border-radius: 9999px;
+  background: var(--color-ink-700);
+  color: var(--color-ink-200);
+  font: 600 .625rem/1rem "IBM Plex Mono", monospace;
+  text-align: center;
+}
+.todo-count.on {
+  background: var(--color-warn);
+  color: #1a1200;
+}
+.todo-list {
+  padding: .5rem .625rem 1rem;
+  list-style: none;
+}
+.todo-hint {
+  margin: 0;
+  padding: 0 .875rem 1rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-label);
+}
+.todo-note {
+  margin: .5rem .875rem 0;
+  padding: .45rem .65rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .5rem;
+  background: var(--color-ink-850);
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+}
+.todo-card {
+  display: grid;
+  grid-template-columns: 2.125rem minmax(0, 1fr) auto;
+  gap: .625rem;
+  align-items: center;
+  padding: .625rem;
+  border: 1px solid transparent;
+  border-radius: .625rem;
+}
+.todo + .todo {
+  margin-top: .125rem;
+}
+.todo-card:hover {
+  background: var(--color-ink-800);
+}
+.todo[data-open] .todo-card {
+  align-items: start;
+  background: var(--color-ink-850);
+  border-color: var(--color-ink-700);
+}
+.todo-hit {
+  cursor: default;
+  border-radius: .375rem;
+}
+.todo-hit[role="button"] {
+  cursor: pointer;
+}
+.todo-hit:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 25%, transparent);
+}
+.todo-icon {
+  display: grid;
+  place-items: center;
+  width: 2.125rem;
+  height: 2.125rem;
+  border-radius: .625rem;
+}
+.todo[data-type="ok"] .todo-icon {
+  background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  color: var(--color-accent);
+}
+.todo[data-type="question"] .todo-icon {
+  background: color-mix(in srgb, var(--color-info) 14%, transparent);
+  color: var(--color-info);
+}
+.todo[data-type="stuck"] .todo-icon {
+  background: color-mix(in srgb, var(--color-warn) 14%, transparent);
+  color: var(--color-warn);
+}
+.todo-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  color: var(--color-ink-100);
+  font-size: var(--text-secondary);
+  font-weight: 500;
+  line-height: 1.3;
+}
+.todo-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: .0625rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-label);
+}
+.todo-act {
+  display: flex;
+  align-items: center;
+  gap: .25rem;
+}
+.todo-yn {
+  display: inline-flex;
+  gap: .25rem;
+}
+.todo-yn .btn {
+  max-width: 6rem;
+}
+.todo[data-done] {
+  opacity: .5;
+}
+.todo[data-done] .todo-title {
+  text-decoration: line-through;
+}
+.todo-tech {
+  margin: 0 .625rem .5rem 3.5rem;
+  padding-top: .375rem;
+  border-top: 1px dashed var(--color-ink-700);
+  font: var(--text-micro)/1.6 "IBM Plex Mono", monospace;
+  color: var(--color-ink-500);
+}
+.todo-tech > div {
+  display: flex;
+  gap: .5rem;
+}
+.todo-tech dt {
+  flex: none;
+  min-width: 4rem;
+  color: var(--color-ink-400);
+}
+.todo-tech dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.todo-decided {
+  padding: 0 .875rem 1rem;
+  border-top: 1px solid var(--color-ink-700);
+}
+.todo-decided-h {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  width: 100%;
+  padding: .6rem 0;
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+}
+.todo-decided-h[aria-expanded="true"] .steps-caret {
+  transform: rotate(90deg);
+}
+.todo-decided li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: .5rem;
+  padding: .3rem 0;
+  color: var(--color-ink-300);
+  font-size: var(--text-label);
+}
+.todo-decided-t {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.todo-fyi {
+  list-style: none;
+  padding: .25rem .875rem;
+  border-bottom: 1px solid var(--color-ink-700);
+}
+.todo-fyi li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: .125rem .75rem;
+  padding: .4rem 0;
+  color: var(--color-ink-300);
+  font-size: var(--text-label);
+}
+
 /* The header chips' dropdown (model / effort). */
 .chipmenu {
   position: absolute;
@@ -1261,7 +1847,21 @@ button.refchip:hover {
 
 .chat-scroll {
   overscroll-behavior: contain;
-  padding-bottom: calc(var(--dock-h, 7rem) + .75rem);
+  /* CAD-1533/1799: the tail clearance — 28px, past the 24px fade band
+     below, so the last line separates from the composer card. */
+  padding-bottom: calc(var(--dock-h, 7rem) + 1.75rem);
+  /* The 24px band above the dock fades: a line clipped by the composer
+     reads as continuing instead of colliding with its top edge. */
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    #000 calc(100% - var(--dock-h, 7rem) - 1.5rem),
+    transparent calc(100% - var(--dock-h, 7rem))
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    #000 calc(100% - var(--dock-h, 7rem) - 1.5rem),
+    transparent calc(100% - var(--dock-h, 7rem))
+  );
 }
 
 /* Below the rail breakpoint the Needs-you button is fixed in the band
@@ -1273,7 +1873,7 @@ button.refchip:hover {
     --need-clear: 4rem;
   }
   .chat-scroll {
-    padding-bottom: calc(var(--dock-h, 7rem) + .75rem + var(--need-clear));
+    padding-bottom: calc(var(--dock-h, 7rem) + 1.75rem + var(--need-clear));
   }
   /* The pill was centred in the same band as Needs-you, so the two hit
      targets overlapped. It sits above that band; the thread padding
@@ -1346,7 +1946,6 @@ button.refchip:hover {
 .home-workspace .chat-scroll { scrollbar-gutter: stable; }
 .home-workspace .issue-reader { line-height: 1.7; }
 .home-workspace .issue-reader p { text-wrap: pretty; }
-.home-workspace [data-kind="answer"] { padding-block: .35rem .9rem; }
 .home-workspace .master-heading { padding-block: .25rem .75rem; }
 .home-workspace [data-composer][data-blocked] { background: var(--color-ink-875); border-style: solid; }
 .home-workspace [data-composer][data-blocked] textarea { min-height: 2rem; }
@@ -1377,15 +1976,29 @@ button.refchip:hover {
   min-height: 0;
   overflow-y: auto;
 }
-.app-header { height: 3.25rem; flex-shrink: 0; }
+/* CAD-1312: the board header is a compact 36px status bar — controls
+   sit with a 6px top/bottom inset on desktop. */
+.app-header { height: 2.25rem; flex-shrink: 0; padding-block: 4px; box-sizing: border-box; align-items: center; }
 .header-menu svg { flex-shrink: 0; }
 @media (width >= 1024px) { .app-header .header-menu { display: none; } }
-.header-breadcrumb { display: flex; align-items: center; gap: .65rem; font-size: var(--text-secondary); }
+.header-breadcrumb { display: flex; align-items: center; gap: .5rem; font-size: var(--text-micro); }
+@media (width < 640px) {
+  .app-header { height: auto; min-height: 2.25rem; flex-wrap: wrap; }
+  .header-breadcrumb { order: 1; flex: 0 0 100%; }
+}
+/* CAD-1312: the configured organisation name truncates inside a bounded
+   span so a long configured name never pushes the status controls out. */
+.header-org { flex: 0 1 auto; max-width: 18rem; min-width: 0; }
+@media (width < 640px) { .header-org { max-width: 8rem; } }
 .header-breadcrumb a { color: var(--color-ink-400); }
 .header-breadcrumb a:hover { color: var(--color-ink-100); }
 .header-breadcrumb a:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 3px; border-radius: .15rem; }
-.section-nav { display: flex; flex-shrink: 0; flex-wrap: wrap; align-items: center; gap: .25rem 1rem; border-bottom: 1px solid var(--color-ink-700); min-width: 0; }
-.section-nav-link { display: inline-flex; align-items: center; justify-content: center; min-height: 2.75rem; padding: .5rem .25rem; border-bottom: 2px solid transparent; color: var(--color-ink-400); font-size: var(--text-secondary); white-space: nowrap; }
+/* CAD-1312: section tabs match the compact Home tab row — a 36px strip
+   of 12px labels with the 2px active underline flush on the border.
+   Narrow screens scroll the row sideways rather than wrap it. */
+.section-nav { display: flex; flex-shrink: 0; flex-wrap: wrap; align-items: stretch; gap: .5rem; border-bottom: 1px solid var(--color-ink-700); min-width: 0; min-height: 2.25rem; overflow-x: auto; scrollbar-width: none; }
+.section-nav::-webkit-scrollbar { display: none; }
+.section-nav-link { display: inline-flex; flex-shrink: 0; align-items: center; justify-content: center; min-height: 2.25rem; padding: 0 .5rem; margin-bottom: -1px; border-bottom: 2px solid transparent; color: var(--color-ink-400); font-size: var(--text-label); white-space: nowrap; }
 .section-nav-link:hover { color: var(--color-ink-100); }
 .section-nav-link[aria-current="page"] { color: var(--color-accent); border-bottom-color: var(--color-accent); font-weight: 500; }
 .section-nav-link:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; border-radius: .25rem; }
@@ -1393,22 +2006,54 @@ button.refchip:hover {
 .header-control-wrap.header-update[data-open="true"] .header-tooltip { visibility: hidden; opacity: 0; }
 .header-update-panel { position: absolute; top: calc(100% + .4rem); right: 0; width: min(18rem, calc(100vw - 2rem)); z-index: 50; }
 @media (width < 640px) {
-  .header-update-trigger { width: 2.5rem; justify-content: center; }
-  .header-update-panel { position: fixed; top: 3.65rem; right: 1rem; }
+  .header-update-trigger { width: 2rem; justify-content: center; }
+  .header-update-panel { position: fixed; top: 2.5rem; right: 1rem; }
 }
 .build-update-action { min-height: 2.75rem; padding-inline: .75rem; font-size: var(--text-label); border-radius: .3rem; }
 .build-update-action:hover { background: var(--color-ink-800); }
 .build-update-action:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
-.header-auth-target { min-height: 2rem; }
-@media (width < 640px) { .header-auth-target { min-height: 2.75rem; } }
+.header-auth-target { min-height: 1.5rem; }
+@media (width < 640px) { .header-auth-target { min-height: 1.75rem; } }
 
-/* Header utilities: matching targets, quiet at rest, explicit on focus. */
+/* Header utilities (CAD-1312): a quiet status bar — 14px glyphs in
+   compact hit boxes, borderless at rest and on hover, a subtle surface
+   lift on hover, and an accent outline for keyboard focus only. */
 .header-control-wrap { position: relative; display: inline-flex; }
-.header-icon { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 2.5rem; height: 2.75rem; border-radius: .4rem; transition: background-color .15s, color .15s; }
+.header-icon { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 1.5rem; height: 1.5rem; border-radius: .3rem; border: none; background: transparent; transition: background-color .15s, color .15s; }
+.header-icon svg { width: 14px; height: 14px; }
+@media (width < 640px) { .header-icon { width: 1.75rem; height: 1.75rem; } .header-menu svg { width: 16px; height: 16px; } }
+/* The header's labelled state controls (read-only, update, sign-in)
+   share the same borderless pill — sans micro text, no box outline. */
+.header-state {
+  display: inline-flex;
+  align-items: center;
+  gap: .3rem;
+  height: 1.5rem;
+  padding: 0 .45rem;
+  border: none;
+  border-radius: .3rem;
+  background: transparent;
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color .15s ease, background-color .15s ease;
+}
+.header-state:hover {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+.header-state:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.header-state .header-state-action { color: var(--color-accent); }
+@media (width < 640px) { .header-state { height: 1.75rem; } }
 .header-icon:hover, .header-icon:focus-visible { background: var(--color-ink-800); color: var(--color-ink-100); }
 .header-icon:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
-.connection-dot { position: absolute; right: .35rem; bottom: .35rem; width: .3rem; height: .3rem; border-radius: 50%; background: var(--color-accent); box-shadow: 0 0 0 2px var(--color-ink-900); }
-.header-tooltip { position: absolute; top: calc(100% + .5rem); right: 0; z-index: 70; width: max-content; max-width: min(17rem, calc(100vw - 2rem)); padding: .5rem .65rem; border: 1px solid var(--color-ink-700); border-radius: .4rem; background: var(--color-ink-850); color: var(--color-ink-200); font-size: var(--text-label); line-height: 1.4; box-shadow: 0 4px 12px rgb(0 0 0 / .15); visibility: hidden; opacity: 0; pointer-events: none; }
+.connection-dot { position: absolute; right: .15rem; bottom: .15rem; width: .3rem; height: .3rem; border-radius: 50%; background: var(--color-accent); box-shadow: 0 0 0 2px var(--color-ink-900); }
+.header-tooltip { position: absolute; top: calc(100% + .4rem); right: 0; z-index: 70; width: max-content; max-width: min(17rem, calc(100vw - 2rem)); padding: .5rem .65rem; border: 1px solid var(--color-ink-700); border-radius: .4rem; background: var(--color-ink-850); color: var(--color-ink-200); font-size: var(--text-label); line-height: 1.4; box-shadow: 0 4px 12px rgb(0 0 0 / .15); visibility: hidden; opacity: 0; pointer-events: none; }
 .header-control-wrap:hover .header-tooltip, .header-control-wrap:focus-within .header-tooltip { visibility: visible; opacity: 1; }
 @media (prefers-reduced-motion: reduce) { .header-icon { transition: none; } }
 
@@ -1474,3 +2119,29 @@ button.project-focus-preview:hover { color: var(--color-accent); }
   .checkpoint-detail-grid { grid-template-columns: minmax(0, 1fr); gap: 1.5rem; }
   .checkpoint-links button { flex-wrap: wrap; gap: .35rem .6rem; }
 }
+
+/* Header search (CAD-1396): one dialog for issues and knowledge. */
+.header-search-trigger { align-items: center; gap: .4rem; height: 1.5rem; max-width: 18rem; flex: 0 1 14rem; min-width: 0; padding: 0 .5rem; border: 1px solid var(--color-ink-700); border-radius: .3rem; background: var(--color-ink-875); color: var(--color-ink-400); font-size: var(--text-micro); white-space: nowrap; overflow: hidden; }
+.header-search-trigger span { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.header-search-trigger kbd { margin-left: auto; font-family: inherit; color: var(--color-ink-500); }
+.header-search-trigger:hover, .header-search-trigger:focus-visible { color: var(--color-ink-100); border-color: var(--color-ink-500); }
+.header-search-trigger:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.header-search-icon { flex-shrink: 0; }
+.header-search-wrap { position: fixed; inset: 0; z-index: 80; display: flex; justify-content: center; align-items: flex-start; padding: 4.5rem 1rem 1rem; }
+.header-search-scrim { position: absolute; inset: 0; background: rgb(0 0 0 / .45); }
+.header-search-dialog { position: relative; width: min(32rem, 100%); max-height: calc(100dvh - 6rem); overflow: auto; display: grid; gap: .6rem; padding: .7rem; }
+.header-search-controls { display: grid; gap: .4rem; }
+.header-search-input { width: 100%; min-height: 2.25rem; }
+.header-search-scope { display: flex; flex-wrap: wrap; gap: .35rem; }
+.header-search-chip { display: inline-flex; align-items: center; height: 1.75rem; padding: 0 .65rem; border: 1px solid var(--color-ink-700); border-radius: 9999px; font-size: var(--text-micro); color: var(--color-ink-400); background: transparent; cursor: pointer; }
+.header-search-chip.on { border-color: var(--color-accent); color: var(--color-accent); background: color-mix(in srgb, var(--color-accent) 8%, transparent); }
+.header-search-chip:focus-visible, .header-search-link:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.header-search-results { display: grid; gap: .9rem; }
+.header-search-list { display: grid; gap: .25rem; }
+.header-search-row { border-radius: .3rem; }
+.header-search-row.is-active { background: var(--color-ink-800); }
+.header-search-link { display: grid; gap: .15rem; min-height: 2.75rem; padding: .4rem .55rem; color: var(--color-ink-200); text-decoration: none; min-width: 0; }
+.header-search-title { overflow-wrap: anywhere; font-weight: 500; }
+.header-search-meta, .header-search-snippet { overflow-wrap: anywhere; }
+.header-search-snippet { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+@media (width < 640px) { .header-search-wrap { padding-top: 3.5rem; } }

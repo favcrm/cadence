@@ -1,14 +1,10 @@
 import { useWriteBlock } from "../auth/WriteGate";
 import { issuePath } from "../issues/model";
+import { PRIORITY_CHIP } from "../issues/chips";
 import type { IssueCard } from "../../lib/types";
 import Link from "../../ui/Link";
+import { useLocale } from "../../lib/locale";
 
-const PRIORITY_CHIP: Record<string, string> = {
-  P0: "bg-warn/10 text-warn",
-  P1: "bg-ink-800 text-ink-200",
-  P2: "bg-ink-800 text-ink-400",
-  P3: "bg-ink-800 text-ink-500",
-};
 
 function prLabel(issue: IssueCard): string | null {
   const ref = issue.refs.find((r) => r.kind === "pr");
@@ -28,7 +24,7 @@ interface Props {
 }
 
 /** Why a card is not draggable — surfaced on hover. */
-export function noDragReason(t: IssueCard): string | null {
+export function noDragReason(t: Pick<IssueCard, "container" | "status_source">): string | null {
   if (t.container) return "container — status rolls up from its children";
   if (t.status_source !== "file")
     return `status is derived from ${t.status_source} — set it there`;
@@ -42,6 +38,7 @@ export default function Card({
   canDrag = true,
   onOpen,
 }: Props) {
+  const { t: tr, formatNumber } = useLocale();
   const t = issue;
   const derived = t.status_source !== "file";
   const block = useWriteBlock(!canDrag);
@@ -59,8 +56,8 @@ export default function Card({
   if (pr) meta.push(<span key="pr">{pr}</span>);
   if (t.checks.total > 0) {
     meta.push(
-      <span key="ck" title="checklist">
-        {t.checks.done}/{t.checks.total} done
+      <span key="ck" title={tr("checklist")}>
+        {formatNumber(t.checks.done)}/{formatNumber(t.checks.total)} {tr("done")}
       </span>,
     );
   }
@@ -94,9 +91,9 @@ export default function Card({
         {derived && (
           <span
             className="chip bg-info/10 text-info"
-            title={`status derived from ${t.status_source}, not set by hand`}
+            title={`${tr("status derived from")} ${tr(t.status_source)} ${tr("not set by hand")}`}
           >
-            {t.status_source === "job" ? "job" : "derived"}
+            {tr(t.status_source === "job" ? "job" : "derived")}
           </span>
         )}
         {t.component && (
@@ -107,7 +104,7 @@ export default function Card({
             className="chip bg-warn/10 text-warn ml-auto"
             title={t.blocked_reason ?? undefined}
           >
-            {t.blocked_reason ?? "blocked"}
+            {t.blocked_reason ?? tr("blocked")}
           </span>
         )}
       </div>
@@ -120,7 +117,7 @@ export default function Card({
             <span
               key={`${a.alias}:${a.task}`}
               className="chip bg-ink-800 !py-[.1rem] text-ink-400"
-              title={`${a.alias} · task ${a.task} (${a.task_state})${
+              title={`${a.alias} · ${tr("task")} ${a.task} (${a.task_state})${
                 a.message ? ` · ${a.message}` : ""
               }`}
             >
@@ -153,7 +150,7 @@ export default function Card({
       )}
       {t.parent && (
         <div className="mt-1.5 num text-micro text-ink-500" title={parentTitle}>
-          in {t.parent}
+          {tr("in")} {t.parent}
         </div>
       )}
       {meta.length > 0 && (
@@ -167,10 +164,10 @@ export default function Card({
             t.blocked ? "text-warn/80" : "text-ink-500"
           }`}
         >
-          {t.blocked ? "waits on" : "after"} {t.blocked_by.join(" · ")}
+          {tr(t.blocked ? "waits on" : "after")} {t.blocked_by.join(" · ")}
         </div>
       )}
-      <button type="button" className="board-preview-link mt-3" aria-label={`Preview ${t.id}`} onClick={() => onOpen(t.id)}>Preview</button>
+      <button type="button" className="board-preview-link mt-3" aria-label={`${tr("Preview")} ${t.id}`} onClick={() => onOpen(t.id)}>{tr("Preview")}</button>
     </article>
   );
 }

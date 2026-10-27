@@ -349,6 +349,55 @@ fn generic_api_key_is_warn_only() {
 }
 
 #[test]
+fn author_attribution_is_not_a_credential_argument() {
+    for prefix in ["claude-review-", "pi-"] {
+        let alias = format!("{prefix}{}", noise("author-attribution", 32));
+        for separator in [" ", "="] {
+            let text = format!("cadence issue comment CAD-1 --author{separator}{alias}");
+            let findings = scan(&text, None).unwrap();
+            assert!(
+                !findings.iter().any(|f| f.severity == Severity::Block),
+                "{text}: {findings:?}"
+            );
+            guard_with("author attribution", &text, &Allowlist::default()).unwrap();
+        }
+    }
+}
+
+#[test]
+fn credential_arguments_and_provider_tokens_remain_blocked() {
+    let generated = noise("argv", 24);
+    for text in [
+        format!("tool --auth-token {generated}"),
+        format!("tool --auth-token={generated}"),
+        format!("tool --authorization {generated}"),
+        format!("tool --authorization={generated}"),
+        format!("tool --author-token {generated}"),
+        format!("tool --author-token={generated}"),
+        format!("AUTHOR={generated} tool"),
+    ] {
+        let err =
+            guard_with("author argument acceptance", &text, &Allowlist::default()).unwrap_err();
+        assert_eq!(err.code(), Some("secret_detected"), "{text}: {err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("rule cadence-argv-secret"),
+            "{text}: {message}"
+        );
+    }
+
+    let provider_token = token(&["gh", "p_"].concat(), "doc-ghp", 36);
+    for separator in [" ", "="] {
+        let text = format!("tool --author{separator}{provider_token}");
+        let err =
+            guard_with("author argument acceptance", &text, &Allowlist::default()).unwrap_err();
+        assert_eq!(err.code(), Some("secret_detected"), "{text}: {err}");
+        let message = err.to_string();
+        assert!(message.contains("rule github-pat"), "{text}: {message}");
+    }
+}
+
+#[test]
 fn argv_rule_blocks_secret_named_flags_and_assignments() {
     let value = noise("argv", 24);
     for text in [

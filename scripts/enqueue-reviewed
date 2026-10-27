@@ -22,7 +22,8 @@ unless ALL of these hold for the pinned head:
     list (docs/roles/one-review-paths.toml, CAD-957, read at the PR's base
     commit so a PR cannot widen its own list). A `ui/` change also needs a
     Browser QA pass;
-  * a ticket comment for this head lists those verdict notes;
+  * a ticket comment for this head lists those verdict notes (created after
+    the other gates pass; dry-run only checks an existing comment);
   * for a human-class diff (a path trigger, more than 1500 changed lines, or
     any head-pinned note whose Risk is not exactly `auto`),
     `cadence audit approval` reports an approval in
@@ -41,9 +42,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import unicodedata
+from urllib.parse import quote
 
 ME = "enqueue-reviewed"
 DEFAULT_NOTES_DIR = "/var/www/agent-notes"
@@ -73,7 +76,8 @@ HUMAN_EXACT = {
     "src/rollout.rs", "src/update.rs", "src/upgrade.rs", "src/cli/rollout.rs",
     "src/cli/daemon.rs", "src/cli/update.rs", "src/cli/upgrade.rs",
     # trigger 7: approval and delivery rules (CAD-1104)
-    "src/audit.rs", "src/delegation.rs", "src/issue/delivery_policy.rs",
+    "src/delegation.rs", "src/issue/delivery_policy.rs",
+    "src/issue/delivery_requirements.rs",
     "docs/AUDIT.md", "tests/safety_floor.rs",
 }
 
@@ -93,10 +97,10 @@ REGULAR_MODES = ("100644", "100755")
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
-def run(argv):
+def run(argv, input_text=None):
     """(returncode, stdout, stderr); a missing binary is rc 127."""
     try:
-        r = subprocess.run(argv, capture_output=True, text=True)
+        r = subprocess.run(argv, input=input_text, capture_output=True, text=True)
     except OSError as e:
         return 127, "", str(e)
     return r.returncode, r.stdout, r.stderr
@@ -236,9 +240,20 @@ def is_human_path(path, risk=()):
 # ---- required checks --------------------------------------------------------
 
 def required_contexts(repo, base):
-    """(set of required check names, [reasons]). Fail closed."""
-    names, reasons = set(), []
-    rc, out, err = run(["gh", "api", f"repos/{repo}/rules/branches/{base}"])
+    """({required check name: bound GitHub app id, or None for any app}, [reasons]). Fail closed."""
+    req, reasons = {}, []
+
+    def add(name, app):
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"bad required check name {name!r}")
+        if app is not None and (type(app) is not int or app <= 0):
+            raise ValueError(f"bad app id {app!r} for '{name}'")
+        if app is not None and req.get(name) not in (None, app):
+            raise ValueError(f"'{name}' is bound to two apps ({req[name]}, {app})")
+        req[name] = app if app is not None else req.get(name)
+
+    branch = quote(base, safe="")
+    rc, out, err = run(["gh", "api", f"repos/{repo}/rules/branches/{branch}"])
     if rc != 0:
         reasons.append(f"cannot read the rulesets of {base}: {err.strip() or out.strip()}")
     else:
@@ -246,52 +261,227 @@ def required_contexts(repo, base):
             for rule in json.loads(out):
                 if rule.get("type") == "required_status_checks":
                     for c in rule.get("parameters", {}).get("required_status_checks", []):
-                        names.add(c["context"])
+                        add(c["context"], c.get("integration_id"))
         except (ValueError, TypeError, KeyError) as e:
             reasons.append(f"cannot parse the rulesets of {base}: {e}")
-    rc, out, err = run(["gh", "api", f"repos/{repo}/branches/{base}/protection"])
+    rc, out, err = run(["gh", "api", f"repos/{repo}/branches/{branch}/protection"])
     if rc != 0:
         if "not protected" not in (out + err).lower():
             reasons.append(f"cannot read branch protection of {base}: {err.strip() or out.strip()}")
     else:
         try:
             rsc = json.loads(out).get("required_status_checks") or {}
-            names.update(rsc.get("contexts", []))
-            names.update(c["context"] for c in rsc.get("checks", []))
+            for name in rsc.get("contexts", []):
+                add(name, None)
+            for c in rsc.get("checks", []):
+                add(c["context"], c.get("app_id"))
         except (ValueError, TypeError, KeyError) as e:
             reasons.append(f"cannot parse branch protection of {base}: {e}")
-    if not reasons and not names:
+    if not reasons and not req:
         reasons.append(f"no required checks found for {base}; refusing to read an empty list as 'nothing required'")
-    return names, reasons
+    return req, reasons
 
 
-def check_states(rollup):
-    """{check name: [state, ...]} from statusCheckRollup, state upper-case."""
-    states = {}
+CHECK_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+CI_WORKFLOW = ".github/workflows/ci.yml"
+
+
+def check_runs_at(repo, head, name):
+    """Every check run named `name` at the exact head, shape-checked; fails closed."""
+    doc = gh_json(["api", f"repos/{repo}/commits/{head}/check-runs?check_name={quote(name, safe='')}"
+                   "&filter=all&per_page=100"])
+    runs = doc.get("check_runs") if isinstance(doc, dict) else None
+    total = doc.get("total_count") if isinstance(doc, dict) else None
+    if not isinstance(runs, list) or type(total) is not int or total > len(runs):
+        raise RuntimeError(f"cannot read every check run named '{name}' at head {head[:12]}")
+    for r in runs:
+        app = r.get("app") if isinstance(r, dict) else None
+        suite = r.get("check_suite") if isinstance(r, dict) else None
+        if not (isinstance(r, dict) and type(r.get("id")) is int and r["id"] > 0
+                and r.get("name") == name and r.get("head_sha") == head
+                and isinstance(r.get("status"), str)
+                and (r.get("conclusion") is None or isinstance(r.get("conclusion"), str))
+                and isinstance(r.get("started_at"), str) and CHECK_STAMP.fullmatch(r["started_at"])
+                and isinstance(app, dict) and type(app.get("id")) is int and app["id"] > 0
+                and isinstance(app.get("slug"), str)
+                and isinstance(suite, dict) and type(suite.get("id")) is int and suite["id"] > 0):
+            raise RuntimeError(f"malformed check run named '{name}' at head {head[:12]}")
+    return runs
+
+
+def workflow_runs_at(repo, head):
+    """Every workflow run at the exact head, one entry per run id carrying that
+    run's latest attempt; shape-checked; fails closed.
+
+    The listing spans workflows and events: a check run is bound to the run that
+    produced it, and only a pull_request run is evidence for this PR."""
+    doc = gh_json(["api", f"repos/{repo}/actions/runs?head_sha={head}&per_page=100"])
+    runs = doc.get("workflow_runs") if isinstance(doc, dict) else None
+    total = doc.get("total_count") if isinstance(doc, dict) else None
+    if not isinstance(runs, list) or type(total) is not int or total != len(runs):
+        raise RuntimeError(f"cannot read every workflow run at head {head[:12]}")
+    for r in runs:
+        if not (isinstance(r, dict) and type(r.get("id")) is int and r["id"] > 0
+                and type(r.get("run_number")) is int and r["run_number"] > 0
+                and type(r.get("run_attempt")) is int and r["run_attempt"] > 0
+                and type(r.get("workflow_id")) is int and r["workflow_id"] > 0
+                and isinstance(r.get("path"), str) and r["path"]
+                and type(r.get("check_suite_id")) is int and r["check_suite_id"] > 0
+                and r.get("head_sha") == head and isinstance(r.get("event"), str) and r["event"]
+                and isinstance(r.get("status"), str)
+                and (r.get("conclusion") is None or isinstance(r.get("conclusion"), str))
+                and isinstance(r.get("run_started_at"), str) and CHECK_STAMP.fullmatch(r["run_started_at"])
+                and isinstance(r.get("html_url"), str)):
+            raise RuntimeError(f"malformed workflow run at head {head[:12]}")
+    return runs
+
+
+def current_attempt(runs):
+    """The newest attempt among one workflow's runs, by the attempt's own start.
+
+    `run_number` does not advance when an older run is re-run, so a later
+    attempt of an older run is ordered by when that attempt started. An
+    unorderable tie refuses."""
+    top = max(runs, key=lambda r: (r["run_started_at"], r["run_number"], r["run_attempt"]))
+    if sum(1 for r in runs if r["run_started_at"] == top["run_started_at"]) > 1:
+        raise RuntimeError("workflow attempts have ambiguous ordering")
+    return top
+
+
+JOB_ID = re.compile(r"^  ([A-Za-z0-9_.\-]+):")
+JOB_NAME = re.compile(r"^    name:\s*(.+?)\s*(?:#.*)?$")
+
+
+def job_names(text):
+    """The job names a workflow file declares: each job id and each job's
+    display name. Only the top-level `jobs:` block is read."""
+    names, in_jobs = set(), False
+    for line in text.splitlines():
+        if not in_jobs:
+            if line.startswith("jobs:"):
+                in_jobs = True
+            continue
+        if line and not line[0].isspace():
+            break  # the next top-level key ends the jobs block
+        id_match = JOB_ID.match(line)
+        if id_match:
+            names.add(id_match.group(1))
+            continue
+        name_match = JOB_NAME.match(line)
+        if name_match:
+            value = name_match.group(1).strip().strip("\"'")
+            if value:
+                names.add(value)
+    return names
+
+
+def base_declares(repo, base_oid, path, context):
+    """True when the trusted base's own copy of `path` declares a job named
+    `context`. A workflow the base does not carry, or a job the base does not
+    declare, cannot produce that context."""
+    rc, out, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                      f"repos/{repo}/contents/{path}?ref={base_oid}"])
+    if rc != 0:
+        return False
+    return context in job_names(out)
+
+
+def required_check_reasons(repo, head, base_oid, required, rollup, runs):
+    """(reasons, {required name: proving run url}).
+
+    Every required context is proven by the current attempt of a workflow the
+    TRUSTED BASE declares a job for: the newest check run of that name, from the
+    required app, inside the current pull_request attempt of such a workflow at
+    this head. A workflow the base does not carry, or a context the base does
+    not declare, cannot prove the gate: a same-named check from an unrelated
+    workflow is never a substitute. A superseded attempt never decides; a
+    current failed, pending, missing, mis-bound, untrusted or ambiguous one
+    refuses."""
+    reasons, proofs = [], {}
+    suite_run = {}
+    for r in runs:
+        suite_run.setdefault(r["check_suite_id"], []).append(r)
+    pr_runs = [r for r in runs if r["event"] == "pull_request"]
+    by_workflow = {}
+    for r in pr_runs:
+        by_workflow.setdefault(r["workflow_id"], []).append(r)
+    workflow_path = {}
+    for r in runs:
+        workflow_path.setdefault(r["workflow_id"], r["path"])
+    statuses = {}
     for e in rollup or []:
-        if "context" in e:  # StatusContext
-            name, state = e["context"], (e.get("state") or "").upper()
-        else:  # CheckRun
-            name = e.get("name")
-            status = (e.get("status") or "").upper()
-            state = (e.get("conclusion") or "").upper() if status == "COMPLETED" else (status or "PENDING")
-        if name:
-            states.setdefault(name, []).append(state or "PENDING")
-    return states
-
-
-def check_required(names, rollup, head):
-    reasons = []
-    states = check_states(rollup)
-    for name in sorted(names):
-        got = states.get(name)
-        if not got:
+        if isinstance(e, dict) and "context" in e:
+            statuses.setdefault(e["context"], []).append((e.get("state") or "").upper())
+    for name in sorted(required):
+        app = required[name]
+        try:
+            cruns = check_runs_at(repo, head, name)
+        except RuntimeError as e:
+            reasons.append(str(e))
+            continue
+        if app is not None:
+            cruns = [r for r in cruns if r["app"]["id"] == app]
+        bad = sorted({s for s in statuses.get(name, []) if s != "SUCCESS"})
+        if bad:
+            reasons.append(f"required status '{name}' is not successful ({', '.join(bad)}) at head {head[:12]}")
+            continue
+        if not cruns:
+            if app is None and statuses.get(name):
+                continue  # a successful commit status of an unbound name
             reasons.append(f"required check '{name}' is missing at head {head[:12]}")
-        elif any(s != "SUCCESS" for s in got):
-            bad = sorted({s for s in got if s != "SUCCESS"})
-            kind = "pending" if all(s in ("PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "EXPECTED", "REQUESTED") for s in bad) else "not successful"
-            reasons.append(f"required check '{name}' is {kind} ({', '.join(bad)}) at head {head[:12]}")
-    return reasons
+            continue
+        bound, misbound = [], False
+        for r in cruns:
+            owners = suite_run.get(r["check_suite"]["id"]) or []
+            if len(owners) != 1:
+                reasons.append(f"required check '{name}' is not bound to one run at head {head[:12]}")
+                misbound = True
+                break
+            if owners[0]["event"] == "pull_request":
+                bound.append((r, owners[0]))
+            # A run of another event at this head is not this PR's evidence.
+        if misbound:
+            continue
+        groups = {}
+        for r, run in bound:
+            groups.setdefault(run["workflow_id"], []).append((r, run))
+        for wid, group in groups.items():
+            path = workflow_path.get(wid)
+            if not path or not base_declares(repo, base_oid, path, name):
+                # The trusted base does not declare this context in that workflow:
+                # a same-named check from it proves nothing.
+                reasons.append(f"required check '{name}' is not declared by the trusted base in {path or 'its workflow'}")
+                continue
+            try:
+                current = current_attempt(by_workflow[wid])
+            except RuntimeError as e:
+                reasons.append(str(e))
+                continue
+            mine = [(r, run) for r, run in group if run["id"] == current["id"]]
+            if not mine:
+                reasons.append(f"required check '{name}' is not in the current attempt of its workflow at head {head[:12]}")
+                continue
+            # The current attempt's own report decides: the latest check it
+            # reported for that context. A re-run keeps the suite and adds new
+            # checks, so an earlier attempt's check never overrides a newer one.
+            newest = max(r["started_at"] for r, _ in mine)
+            latest = [(r, run) for r, run in mine if r["started_at"] == newest]
+            if len({r.get("conclusion") for r, _ in latest}) > 1:
+                reasons.append(f"required check '{name}' has ambiguous newest runs at head {head[:12]}")
+                continue
+            check = max(latest, key=lambda pair: pair[0]["id"])[0]
+            if check["status"] != "completed":
+                reasons.append(f"required check '{name}' is pending ({check['status']}) at head {head[:12]}")
+                continue
+            if check.get("conclusion") != "success":
+                reasons.append(f"required check '{name}' is not successful ({check.get('conclusion')}) at head {head[:12]}")
+                continue
+            proofs[name] = current["html_url"]
+        if name not in proofs:
+            # A required context with no trusted pull_request evidence at this head
+            # is unproven: it never counts as satisfied by another context's run.
+            reasons.append(f"required check '{name}' has no trusted pull_request evidence at head {head[:12]}")
+    return reasons, proofs
 
 
 # ---- verdict notes (parsed by `cadence audit verdicts`) --------------------
@@ -375,23 +565,104 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue):
     return reasons, counted
 
 
-def check_comment(comments, head, counted):
+def check_comment(comments, head, counted, base_ref, required=()):
     names = sorted({n["name"] for n in counted})
     for c in comments or []:
         body = c.get("body") or ""
-        if head in body and all(n in body for n in names):
+        if (head in body and all(n in body for n in names)
+                and f"Base branch: {base_ref}" in body.splitlines()
+                and all(v in body for v in required)):
             return []
-    return [f"no ticket comment names head {head} and lists the verdict notes"
+    suffix = (f" and required delivery evidence ({', '.join(required)})" if required else "")
+    return [f"no ticket comment names head {head}, exact base branch {base_ref} and lists the verdict notes{suffix}"
             + (f" ({', '.join(names)})" if names else "")]
 
 
-def check_approval(repo, pr, head, report):
+def requirements_inspection(issue, repo, pr, head):
+    """Read the daemon's trusted, policy-aware requirements decision."""
+    pr_url = f"https://github.com/{repo}/pull/{pr}"
+    rc, out, err = run(["cadence", "delivery", "requirements", "--issue", issue,
+                        "--pr", pr_url, "--head", head, "--json"])
+    try:
+        result = json.loads(out)
+        req = result["requirements"]
+        if rc != 0 or not isinstance(result, dict) or not isinstance(req, dict):
+            raise ValueError("unexpected response shape")
+        if (result.get("issue") != issue or result.get("repo") != repo.lower()
+                or result.get("pr") != pr or result.get("head") != head
+                or not isinstance(result.get("base_ref"), str) or not result["base_ref"]
+                or any(unicodedata.category(char) == "Cc" for char in result["base_ref"])
+                or not FULL_SHA.fullmatch(result.get("base", ""))
+                or not FULL_SHA.fullmatch(result.get("merge_base", ""))
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", result.get("policy_digest", ""))
+                or req.get("policy_digest") != result.get("policy_digest")
+                or req.get("class") not in ("routine", "consequential", "sensitive", "strict")
+                or req.get("activation") not in ("active", "no_profile", "not_approved", "malformed")
+                or type(req.get("reviews")) is not int or req["reviews"] not in (0, 1, 2)
+                or req.get("review_kind") not in ("none", "combined", "standards_and_spec")
+                or type(req.get("security_capable")) is not bool
+                or type(req.get("operator_approval")) is not bool
+                or type(req.get("browser_qa")) is not bool
+                or type(req.get("full_checks")) is not bool
+                or not isinstance(req.get("reasons"), list)
+                or not all(isinstance(v, str) for v in req["reasons"])):
+            raise ValueError("requirements binding or fields are malformed")
+        expected = {
+            "routine": (0, "none", False, False, False),
+            "consequential": (1, "combined", False, False, True),
+        }
+        if req["class"] in expected and req["activation"] == "active":
+            reviews, kind, security, approval, full = expected[req["class"]]
+            if (req["reviews"], req["review_kind"], req["security_capable"],
+                    req["operator_approval"], req["full_checks"]) != (
+                    reviews, kind, security, approval, full):
+                raise ValueError("active class does not match its mandatory requirements")
+        elif req["class"] != "strict" or req["reviews"] not in (1, 2):
+            raise ValueError("inactive or strict result attempts a non-legacy waiver")
+        if req["class"] == "strict":
+            legacy_kind = "combined" if req["reviews"] == 1 else "standards_and_spec"
+            if req["review_kind"] != legacy_kind or not req["full_checks"]:
+                raise ValueError("strict requirements do not preserve the native legacy review/check floor")
+        if req["class"] == "routine" and req["activation"] != "active":
+            raise ValueError("routine classification without an active approved profile")
+        if req["class"] == "routine" and req["browser_qa"]:
+            raise ValueError("routine classification cannot require Browser QA")
+        binding = {key: result[key] for key in
+                   ("issue", "project", "repo", "pr", "head", "base", "base_ref", "merge_base", "policy_digest")}
+        if not isinstance(binding["project"], str) or not binding["project"]:
+            raise ValueError("requirements response has no project binding")
+        readiness = result.get("readiness")
+        if readiness is not None:
+            if not isinstance(readiness, dict):
+                raise ValueError("routine readiness is malformed")
+            if (readiness.get("repo") != repo.lower() or readiness.get("pr") != pr
+                    or readiness.get("head") != head or readiness.get("base") != result["base"]
+                    or readiness.get("base_ref") != result["base_ref"]
+                    or readiness.get("policy_digest") != result["policy_digest"]
+                    or type(readiness.get("ci_run_id")) is not int or readiness["ci_run_id"] <= 0
+                    or readiness.get("ci_run_url") != f"https://github.com/{repo.lower()}/actions/runs/{readiness.get('ci_run_id')}"
+                    or not isinstance(readiness.get("outcome_report"), str)
+                    or not readiness["outcome_report"].startswith(f"{issue}/reports/")
+                    or readiness["outcome_report"].count("/") != 2
+                    or readiness["outcome_report"].split("/")[-1] in ("", ".", "..")
+                    or any(unicodedata.category(char) == "Cc" for char in readiness["outcome_report"])):
+                raise ValueError("routine readiness does not bind to this issue, PR, head, base and policy")
+        return {"binding": binding, "requirements": req, "readiness": readiness}
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        raise RuntimeError(f"cannot use authoritative `cadence delivery requirements` result: {e}; {(err or out).strip()[:200]}")
+
+
+def check_approval(repo, pr, head, report, evidence=None):
     rc, out, err = run(["cadence", "audit", "approval", "--pr", str(pr), "--head", head, "--repo", repo])
     try:
         state = json.loads(out)
     except ValueError:
         return [f"cannot read the operator approval via `cadence audit approval` (rc {rc}): {(err or out).strip()[:200]}"]
-    if rc == 0 and state.get("state") == "in-force":
+    if (rc == 0 and state.get("state") == "in-force"
+            and state.get("recorded_via") == SCOPE_RECORDED_VIA
+            and isinstance(state.get("approval_id"), str) and state["approval_id"]):
+        if evidence is not None:
+            evidence["approval"] = state["approval_id"]
         report.append(f"approval in force: id {state.get('approval_id')}, source {state.get('source')!r}, "
                       f"recorded_via {state.get('recorded_via')} (an operator claim until CAD-280)")
         return []
@@ -592,7 +863,7 @@ def read_note_file(path):
         return None
 
 
-def check_scope(issue, title, branch, ticket, paths, risk_text, one_text, verdicts, counted, report):
+def check_scope(issue, title, branch, ticket, paths, risk_text, one_text, verdicts, counted, report, evidence=None):
     """Reasons ([] = covered). Appends which approval was used to `report`."""
     try:
         rc, out, _ = run(["cadence", "audit", "scope", "--issue", issue or ""])
@@ -603,6 +874,10 @@ def check_scope(issue, title, branch, ticket, paths, risk_text, one_text, verdic
         why = scope_reasons(issue, title, branch, ticket, paths, risk_text, one_text, verdicts, counted, scopes, read_note_file)
         if not why:
             a = pick_scope_approval(scopes, ticket["body"])
+            if not isinstance(a.get("approval_id"), str) or not a["approval_id"]:
+                return ["scope approval has no approval id"]
+            if evidence is not None:
+                evidence["approval"] = a["approval_id"]
             report.append(f"scope approval in force: id {a.get('approval_id')}, ticket {issue}, digest {a['digest'][:12]}, "
                           f"source {a.get('source')!r}, recorded_via {a.get('recorded_via')} (an operator claim until CAD-280)")
         return why
@@ -610,9 +885,12 @@ def check_scope(issue, title, branch, ticket, paths, risk_text, one_text, verdic
         return [f"scope approval check failed: {e}"]
 
 
-def evaluate(args, repo):
-    """(reasons, report lines). Every rule is evaluated; none returns early."""
+def evaluate(args, repo, *, require_comment=True, evidence=None):
+    """(reasons, report lines). Preparing evidence skips only comment presence."""
     reasons, report = [], []
+    if evidence is not None:
+        evidence.clear()
+    approval_evidence = evidence if evidence is not None else {}
     pr, head = args.pr, args.head
     fields = "number,state,title,headRefName,headRefOid,baseRefName,baseRefOid,mergeStateStatus,autoMergeRequest,statusCheckRollup,author"
     view = gh_json(["pr", "view", str(pr), "-R", repo, "--json", fields])
@@ -627,20 +905,38 @@ def evaluate(args, repo):
         reasons.append(f"auto-merge is already enabled on PR #{pr}; disable it, then review the exact head")
     base = view.get("baseRefName") or ""
     base_oid = view.get("baseRefOid") or ""
-    try:
-        default = gh_json(["repo", "view", repo, "--json", "defaultBranchRef"])["defaultBranchRef"]["name"]
-    except (RuntimeError, KeyError, TypeError) as e:
-        default = None
-        reasons.append(f"cannot read the default branch of {repo}: {e}")
-    if default and base != default:
-        reasons.append(f"PR #{pr} targets {base!r}, not the default branch {default!r}")
+    if not FULL_SHA.fullmatch(base_oid):
+        reasons.append("cannot bind evidence to a full base commit SHA")
 
-    # Required checks of the base.
-    names, rs = required_contexts(repo, base or "main")
-    reasons += rs
+    # Read only the actual PR target's checks; absent target data must not use main.
+    if not isinstance(base, str) or not base:
+        required = {}
+        reasons.append("PR has no valid base branch to bind delivery evidence")
+    else:
+        required, rs = required_contexts(repo, base)
+        reasons += rs
+    names = set(required)
+    ci_url = None
+    ci_runs = []
+    proofs = {}
     if names:
-        reasons += check_required(names, view.get("statusCheckRollup"), head)
-        report.append(f"required checks: {', '.join(sorted(names))}")
+        listed = True
+        try:
+            ci_runs = workflow_runs_at(repo, head)
+        except RuntimeError as e:
+            reasons.append(str(e))
+            listed = False
+        if listed:
+            # An empty listing is a read, not a proof: the checks and the canonical
+            # run are judged against it and refuse when it holds nothing.
+            rs, proofs = required_check_reasons(repo, head, base_oid, required,
+                                                view.get("statusCheckRollup"), ci_runs)
+            reasons += rs
+            report.append(f"required checks: {', '.join(sorted(names))}")
+            try:
+                ci_url = green_ci_run(repo, head, ci_runs)
+            except RuntimeError as e:
+                reasons.append(str(e))
 
     # Changed paths (modes included) and size, straight from git.
     try:
@@ -669,7 +965,10 @@ def evaluate(args, repo):
     else:
         rc, out, err = run(["cadence", "issue", "show", issue, "--json"])
         try:
-            ticket = json.loads(out)
+            loaded = json.loads(out)
+            if rc != 0 or not isinstance(loaded, dict) or loaded.get("id") != issue:
+                raise ValueError("ticket reply is not bound to this issue")
+            ticket = loaded
         except ValueError:
             reasons.append(f"cannot read ticket {issue} via `cadence issue show` (rc {rc}): {(err or out).strip()[:200]}")
 
@@ -682,6 +981,40 @@ def evaluate(args, repo):
     if (ticket.get("claim") or {}).get("by"):
         authors.add(str(ticket["claim"]["by"]).lower())
 
+    authority = None
+    required_comment_evidence = []
+    if issue:
+        try:
+            authority = requirements_inspection(issue, repo, pr, head)
+            if (authority["binding"]["base"] != base_oid
+                    or authority["binding"]["base_ref"] != base
+                    or authority["binding"]["repo"] != repo.lower()
+                    or authority["binding"]["project"] != ticket.get("project")):
+                raise RuntimeError("authoritative requirements binding differs from the ticket project, PR base or repository")
+            req = authority["requirements"]
+            need_qa = need_qa or req["browser_qa"]
+            report.append(f"delivery requirements: {req['class']} ({req['activation']}); policy {authority['binding']['policy_digest']}")
+            report.extend(f"delivery reason: {reason}" for reason in req["reasons"])
+            if req["activation"] == "active":
+                required_comment_evidence.extend((f"Delivery class: {req['class']}",
+                                                  f"Policy digest: {authority['binding']['policy_digest']}"))
+            if ci_url:
+                # Every class binds the evidence comment to the CI run this evaluation
+                # actually read: a comment naming another run is not this evidence.
+                required_comment_evidence.append(f"Green CI run: {ci_url}")
+            for name in sorted(proofs):
+                # A required check proven by another workflow's run names that run, so the
+                # comment cannot claim the canonical run proves a gate it never produced.
+                if proofs[name] != ci_url:
+                    required_comment_evidence.append(f"Required check run: {name} = {proofs[name]}")
+            if authority["readiness"]:
+                ready = authority["readiness"]
+                report.append(f"routine outcome: {ready['outcome_report']}; CI run {ready['ci_run_id']} {ready['ci_run_url']}")
+                required_comment_evidence.extend((f"Outcome report: {ready['outcome_report']}",
+                                                  f"Native CI run: {ready['ci_run_id']} {ready['ci_run_url']}"))
+        except RuntimeError as e:
+            reasons.append(str(e))
+
     verdicts, counted = [], []
     if issue:
         try:
@@ -693,10 +1026,30 @@ def evaluate(args, repo):
                     report.append(f"ignored note {v['name']}: its title names no known review kind")
         except RuntimeError as e:
             reasons.append(str(e))
-        rs, counted = check_reviews(verdicts, one, need_qa, authors, issue)
-        reasons += rs
+        active = authority is not None and authority["requirements"]["activation"] == "active"
+        klass = authority["requirements"]["class"] if authority else None
+        counted = []
+        if not active or klass == "strict":
+            native_one = bool(authority and authority["requirements"]["reviews"] == 1)
+            effective_one = one and native_one
+            rs, counted = check_reviews(verdicts, effective_one, need_qa, authors, issue)
+            reasons += rs
+        elif klass == "routine":
+            if authority["readiness"] is None:
+                reasons.append("active routine delivery has no fresh native readiness proof for this exact binding")
+            else:
+                ready = authority["readiness"]
+                if ci_url is not None and ci_url != ready["ci_run_url"]:
+                    reasons.append("native routine readiness CI run is not the actual successful ci.yml run at this head")
+            if need_qa:
+                reasons += check_reviews(verdicts, True, True, authors, issue)[0]
+        elif klass == "consequential":
+            rs, counted = check_reviews(verdicts, True, need_qa, authors, issue)
+            reasons += rs
+            combined = [n for n in counted if n.get("kind") == "combined"]
+            if len({n.get("reviewer") for n in combined}) != 1:
+                reasons.append(f"active {klass} delivery requires exactly one independent combined review")
         report.append("counted verdicts: " + (", ".join(f"{n['reviewer']} {n['kind']} ({n['name']})" for n in counted) or "none"))
-        reasons += check_comment(ticket.get("comments"), head, counted)
 
     # Human class: paths, size, or any head-pinned note whose Risk is not exactly `auto`.
     rc, risk_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
@@ -712,10 +1065,10 @@ def evaluate(args, repo):
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")
     if why:
         report.append("class: human (" + "; ".join(why) + ")")
-        rs = check_approval(repo, pr, head, report)
-        if rs:  # CAD-1106: fall back to a live ticket scope approval
+        rs = check_approval(repo, pr, head, report, approval_evidence)
+        if rs:  # legacy CAD-1106 scope fallback only
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
-                             risk_text, one_text, verdicts, counted, report)
+                             risk_text, one_text, verdicts, counted, report, approval_evidence)
             if sr:
                 report.append("scope approval not used: " + "; ".join(sr))
             else:
@@ -723,7 +1076,97 @@ def evaluate(args, repo):
         reasons += rs
     else:
         report.append("class: auto (every head-pinned note says Risk: auto; no path or size trigger)")
+    authoritative_operator = bool(authority and authority["requirements"]["operator_approval"])
+    if authoritative_operator and not why:
+        rs = check_approval(repo, pr, head, report, approval_evidence)
+        if rs:
+            sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
+                             risk_text, one_text, verdicts, counted, report, approval_evidence)
+            if sr:
+                report.append("scope approval not used: " + "; ".join(sr))
+            else:
+                rs = []
+        reasons += rs
+    if require_comment:
+        if approval_evidence.get("approval"):
+            required_comment_evidence.append("Operator approval id: " + approval_evidence["approval"])
+        reasons += check_comment(ticket.get("comments"), head, counted, base, required_comment_evidence)
+    if evidence is not None and not reasons:
+        evidence.update(issue=issue, repo=repo, pr=pr, head=head, base=base_oid, base_ref=base,
+                        notes=sorted({n["name"] for n in counted}),
+                        checks=sorted(names), comments=ticket.get("comments") or [],
+                        binding=authority["binding"] if authority else None,
+                        requirements=authority["requirements"] if authority else None,
+                        readiness=authority["readiness"] if authority else None)
+        evidence["ci_run"] = ci_url
+        evidence["ci_proofs"] = proofs
     return reasons, report
+
+
+def green_ci_run(repo, head, runs):
+    """The URL of the current ci.yml pull_request attempt at this head.
+
+    The canonical workflow is judged on its own current attempt: an older successful
+    ci.yml run never stands in for a newer failed or pending attempt. Fails closed."""
+    ci = [r for r in runs if r["path"] == CI_WORKFLOW and r["event"] == "pull_request"]
+    if not ci:
+        raise RuntimeError(f"no ci.yml PR run exists at exact head {head}")
+    latest = current_attempt(ci)
+    if (latest["status"] != "completed" or latest.get("conclusion") != "success"
+            or latest["html_url"] != f"https://github.com/{repo}/actions/runs/{latest['id']}"):
+        raise RuntimeError(f"the current ci.yml PR run {latest['id']} at exact head {head} is not a completed success")
+    return latest["html_url"]
+
+
+def evidence_body(evidence):
+    lines = [f"Delivery evidence: {evidence['repo']}#{evidence['pr']}",
+             f"Head: {evidence['head']}", f"Base: {evidence['base']}",
+             f"Base branch: {evidence['base_ref']}",
+             f"Green CI run: {evidence['ci_run']}",
+             "Required checks: " + ", ".join(evidence["checks"])]
+    for name in sorted(evidence.get("ci_proofs") or {}):
+        url = evidence["ci_proofs"][name]
+        if url != evidence["ci_run"]:
+            lines.append(f"Required check run: {name} = {url}")
+    lines.append("Verdict notes: " + (", ".join(evidence["notes"]) or "none required"))
+    binding = evidence.get("binding")
+    if binding:
+        lines.extend((f"Delivery class: {evidence['requirements']['class']}",
+                      f"Policy digest: {binding['policy_digest']}"))
+    readiness = evidence.get("readiness")
+    if readiness:
+        lines.extend((f"Outcome report: {readiness['outcome_report']}",
+                      f"Native CI run: {readiness['ci_run_id']} {readiness['ci_run_url']}"))
+    if evidence.get("approval"):
+        lines.append("Operator approval id: " + evidence["approval"])
+    return "\n".join(lines)
+
+
+def check_evidence_head(args, repo, evidence):
+    view = gh_json(["pr", "view", str(args.pr), "-R", repo, "--json",
+                    "state,headRefOid,baseRefOid,baseRefName,autoMergeRequest"])
+    if (view.get("state") != "OPEN" or view.get("headRefOid") != evidence["head"]
+            or view.get("baseRefOid") != evidence["base"]
+            or view.get("baseRefName") != evidence["base_ref"] or view.get("autoMergeRequest")):
+        return ["PR head/base/state changed during evidence collection; revalidate before enqueue"]
+    return []
+
+
+def post_evidence(args, repo, evidence):
+    """Post once only after preflight; no tracker write during dry-run."""
+    if args.dry_run:
+        return []
+    reasons = check_evidence_head(args, repo, evidence)
+    if reasons:
+        return reasons
+    body = evidence_body(evidence)
+    if any(c.get("body") == body for c in evidence["comments"]):
+        return []
+    rc, out, err = run(["cadence", "issue", "comment", evidence["issue"], "--file", "-"],
+                       input_text=body)
+    if rc != 0:
+        return [f"evidence comment failed (rc {rc}): {(err or out).strip()[:200]}"]
+    return []
 
 
 def queued(repo, pr):
@@ -789,8 +1232,26 @@ def main(argv):
         if not re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", repo):
             print(f"{ME}: bad repo {repo!r}", file=sys.stderr)
             return 2
-        reasons, report = evaluate(args, repo)
-    except (RuntimeError, KeyError) as e:
+        if args.dry_run:
+            reasons, report = evaluate(args, repo)
+        else:
+            evidence = {}
+            reasons, report = evaluate(args, repo, require_comment=False, evidence=evidence)
+            if not reasons:
+                reasons += post_evidence(args, repo, evidence)
+            if not reasons:
+                # Re-read every gate after the write, including approvals and comments.
+                final_evidence = {}
+                reasons, report = evaluate(args, repo, evidence=final_evidence)
+                reasons += check_evidence_head(args, repo, evidence)
+                if (not reasons and (final_evidence.get("binding") != evidence.get("binding")
+                                     or final_evidence.get("requirements") != evidence.get("requirements")
+                                     or final_evidence.get("readiness") != evidence.get("readiness")
+                                     or final_evidence.get("approval") != evidence.get("approval")
+                                     or final_evidence.get("ci_run") != evidence.get("ci_run")
+                                     or final_evidence.get("ci_proofs") != evidence.get("ci_proofs"))):
+                    reasons.append("delivery policy/base/readiness/CI binding changed after evidence collection; revalidate before enqueue")
+    except (RuntimeError, KeyError, TypeError) as e:
         reasons, report = [f"cannot read the PR: {e}"], []
     for line in report:
         print(f"{ME}: {line}")

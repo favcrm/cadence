@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import type { AppDetail as AppDetailRow, AppRun } from "../../lib/types";
 import { IconClose } from "../../ui/icons";
+import { useTranslate } from "../../lib/locale";
 import RunForm from "../projects/RunForm";
 import type { Viewer } from "../projects/work";
 import {
@@ -42,6 +43,7 @@ export default function RunDrawer({
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
+  const t = useTranslate();
   const row = (app.workflows ?? []).find((w) => w.name === wf);
   if (!row) return null;
   const inputs = row.inputs ?? [];
@@ -49,7 +51,7 @@ export default function RunDrawer({
   const slugInput = inputs.some((i) => i.name === "slug") ? "slug" : null;
   // The saved default team wins; the last run fills any role it left
   // unset (CAD-577).
-  const team = { ...teamFromLastRun(row, runs), ...(app.team ?? {}) };
+  const team = { ...teamFromLastRun(row, runs), ...app.team };
   // The run's plain name — the workflow's own `label:` ("New post"),
   // never the engine's "new run" (CAD-571).
   const title = row.label?.trim() || "New run";
@@ -58,17 +60,17 @@ export default function RunDrawer({
       <div className="fixed inset-0 bg-scrim z-20" onClick={onClose} />
       <aside
         className="drawer fixed top-0 right-0 h-full w-full sm:w-[42rem] bg-ink-875 border-l border-ink-700 z-30 flex flex-col"
-        aria-label={`new run of ${row.name}`}
+        aria-label={t("new run of {name}").replace("{name}", () => row.name)}
       >
         <header className="px-5 pt-4 pb-4 border-b border-ink-700 flex items-start gap-3 shrink-0">
           <div className="min-w-0 flex-1">
-            <div className="text-label text-ink-500">in {project} · {title}</div>
+            <div className="text-label text-ink-500">{t("in")} {project} · {title}</div>
             <h2 className="text-drawer font-semibold text-ink-100 leading-tight mt-1">
               {title}
             </h2>
           </div>
           <button
-            aria-label="Close"
+            aria-label={t("Close")}
             onClick={onClose}
             className="closebtn ml-auto shrink-0 w-8 h-8 grid place-items-center rounded border border-ink-600 text-ink-300 bg-ink-850"
           >
@@ -89,7 +91,7 @@ export default function RunDrawer({
               start: startLabel(title),
               // The rules in plain words: the plan waits for the
               // operator, and nothing goes out without them.
-              note: "It waits for your approval before anything runs. Nothing is published without your OK.",
+              note: t("It waits for your approval before anything runs. Nothing is published without your OK."),
               // Live checks: the folder name's shape, and a team that
               // breaks the workflow's kept-apart rule (shown only then).
               validate: (values) =>

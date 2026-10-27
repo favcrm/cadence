@@ -81,7 +81,7 @@ impl Fx {
                 })
                 .unwrap();
         }
-        let source = format!("{}/workspace-apps/crm", env!("CARGO_MANIFEST_DIR"));
+        let source = format!("{}/tests/fixtures/apps/crm", env!("CARGO_MANIFEST_DIR"));
         let mut fx = Self {
             _dir: dir,
             shared,
@@ -304,7 +304,7 @@ fn cad1120_operator_stopped_worker_is_refused_at_create_and_dispatch() {
         error.contains("registered app assignment changed"),
         "{error}"
     );
-    std::thread::sleep(Duration::from_millis(200));
+    fx.shared.advance_app_runs();
     let writer = fx.agent("writer");
     assert_eq!(writer.state, "stopped");
     assert!(!writer.enabled && !fx.owned("writer"));
@@ -380,7 +380,7 @@ fn cad1120_agents_and_forged_fields_cannot_reach_the_wake_path() {
             "{who:?}: {error}"
         );
     }
-    std::thread::sleep(Duration::from_millis(200));
+    fx.shared.advance_app_runs();
     assert_eq!(fx.agent("writer").state, "stopped");
     assert!(!fx.owned("writer"));
     assert_eq!(fx.marker("writer"), AUTO_STOP_EVENT);

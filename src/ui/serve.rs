@@ -2,26 +2,39 @@
 //! accept loop (`serve`), the response/static-file helpers they share, the
 //! embedded SPA build, and the `/api/agents` read model it serves.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
+use cadence_core::board_api::{
+    AgentRow, AgentTask, AgentTotals, AgentsPayload, CardAgent, DaemonReach, MetaDaemon,
+    MetaResponse, RunningMessage,
+};
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+use super::artifacts;
+use super::human_threads;
+use super::member_view::{member_event, member_running_item, redact_agents_payload};
+use super::notify_service;
 use super::setup::{board_boot_agent_uid, setup_get, setup_refusal, WRITE_LOCK};
 use super::stream::stream_events;
 use super::write_path::{
-    artifact_response, header_value, model_defaults_get, request_identity, send, with_agents,
-    write_route, HttpResp,
+    agent_settings_get, artifact_response, coded_response, header_value, model_defaults_get,
+    request_identity, send, with_agents, write_route, HttpResp, BUSY_RETRY_AFTER_SECS,
 };
 use super::{
     app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
-    app_release, app_runs, app_screens, apps, cli_route, connections, crm_send, delivery_sync,
-    home, lane, operator, platform_account, read_model, social_publish, stages, threads, updates,
-    wiki, workflows,
+    app_release, app_runs, app_screens, approvals, apps, assist_route, business_templates,
+    cli_route, connections, crm_send, delivery_sync, endpoints, home, lane, locale, member_assist,
+    my_work, operator, platform_account, read_model, social_publish, stages, threads, topics,
+    updates, wiki, wiki_envelope, work_conversations, workflows,
 };
-use super::{push_device_login_config, ready_file, tailnet_url, ServeOpts, READY_NONCE_ENV};
+use super::{
+    push_device_login_config, ready_file, startup_failed_file, tailnet_url, ServeOpts,
+    READY_NONCE_ENV,
+};
 use crate::adapter::registry;
 use crate::client;
 use crate::doctor::host::redact_argv;
@@ -66,7 +79,7 @@ pub(crate) fn err_response(code: u16, message: &str) -> Response<std::io::Cursor
 /// Defence in depth on an unauthenticated loopback origin that renders
 /// agent-written Markdown. Social source previews use only these reviewed
 /// image CDNs; the client checks the same host families before rendering.
-pub(crate) const CSP: &str = "default-src 'self'; img-src 'self' data: https://cdninstagram.com https://*.cdninstagram.com https://fbcdn.net https://*.fbcdn.net; font-src 'self' data:; style-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'";
+pub(crate) const CSP: &str = "default-src 'self'; img-src 'self' data: https://cdninstagram.com https://*.cdninstagram.com https://fbcdn.net https://*.fbcdn.net; frame-src 'self' blob:; media-src 'self' blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'";
 
 /// Every response gets nosniff + no-referrer; HTML additionally gets
 /// the CSP. Returns whether the response is HTML.
@@ -192,6 +205,9 @@ pub(crate) fn static_file(dist: Option<&Path>, path: &str) -> Option<(String, Ve
             "/favicon.svg" => Some(embedded::FAVICON),
             "/icon.svg" => Some(embedded::ICON),
             "/apple-touch-icon.png" => Some(embedded::APPLE_TOUCH_ICON),
+            // CAD-1423: the push/click service worker, served from the root so
+            // its scope covers the whole board. Push and click only.
+            "/notifications-sw.js" => Some(embedded::NOTIFICATIONS_SW),
             _ => path
                 .strip_prefix("/assets/")
                 .and_then(|name| embedded::ASSETS.get(name).copied()),
@@ -202,15 +218,151 @@ pub(crate) fn static_file(dist: Option<&Path>, path: &str) -> Option<(String, Ve
     None
 }
 
+/// Whether a `q` value carries any positive weight, per the RFC 9110
+/// §12.4.2 grammar: `("0" ["." 0*3DIGIT]) / ("1" ["." 0*3"0"])`. The
+/// `0.` form is positive when a fraction digit is nonzero (`0.` alone
+/// is zero); the `1.` form only when every fraction digit is zero —
+/// including an empty one, `1.` is the full weight. Anything outside
+/// the grammar (non-numeric, NaN/inf, negative, above 1, more than
+/// three fraction digits) is malformed and admits nothing.
+fn qvalue_allowed(raw: &str) -> bool {
+    let (whole, frac) = match raw.split_once('.') {
+        Some((whole, frac)) => (whole, frac),
+        // "1" is the full weight; everything else whole is refused.
+        None => return raw == "1",
+    };
+    if frac.len() > 3 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match whole {
+        "0" => frac.bytes().any(|b| b != b'0'),
+        "1" => frac.bytes().all(|b| b == b'0'),
+        _ => false,
+    }
+}
+
+/// Whether a `;`-separated parameter list's `q` admits the token:
+/// `q=<value>` matches case-insensitively and trims whitespace; a
+/// token with no `q` parameter admits at full weight.
+fn token_allowed(params: &str) -> bool {
+    for param in params.split(';') {
+        let (key, value) = param.split_once('=').unwrap_or((param.trim(), ""));
+        if key.trim().eq_ignore_ascii_case("q") {
+            return qvalue_allowed(value.trim());
+        }
+    }
+    true
+}
+
+/// Whether `Accept-Encoding` allows `want`. An explicit token for `want`
+/// answers with its own q (an explicit `q=0` refuses even when a `*`
+/// offer would count); a positive `*` admits an unlisted coding; no
+/// match at all refuses. `identity` is what the raw file is — a client
+/// can refuse it, and then raw must not be served either.
+pub(crate) fn accepts_encoding(header: Option<&str>, want: &str) -> bool {
+    let Some(header) = header else {
+        return false;
+    };
+    let mut star = false;
+    for part in header.split(',') {
+        let mut it = part.splitn(2, ';');
+        let token = it.next().unwrap_or("").trim();
+        let allowed = it.next().map(token_allowed).unwrap_or(true);
+        if token.eq_ignore_ascii_case(want) {
+            return allowed;
+        }
+        if token == "*" && allowed {
+            star = true;
+        }
+    }
+    star
+}
+
+/// Whether `Accept-Encoding` refuses the raw, identity-coded file. Per
+/// RFC 9110 §12.5.3 a `*;q=0` offer excludes identity too — unless a
+/// more-specific `identity` entry overrides it with its own q (an
+/// explicit `identity;q=0` refuses regardless of `*`, an explicit
+/// positive `identity` allows regardless of `*`; first explicit wins).
+/// A missing header or no matching token allows the raw file. A refused
+/// identity with no acceptable coded answer is a refusal the route
+/// reports (406), never raw bytes against the client's stated rule.
+fn identity_refused(header: Option<&str>) -> bool {
+    let Some(header) = header else {
+        return false;
+    };
+    let mut star_zero = false;
+    for part in header.split(',') {
+        let mut it = part.splitn(2, ';');
+        let token = it.next().unwrap_or("").trim();
+        let allowed = it.next().map(token_allowed).unwrap_or(true);
+        if token.eq_ignore_ascii_case("identity") {
+            return !allowed;
+        }
+        if token == "*" {
+            star_zero = !allowed;
+        }
+    }
+    star_zero
+}
+
+/// The precompressed sibling the build emits (`<file>.br` / `<file>.gz`),
+/// when the client accepts it. Nothing is compressed at request time and
+/// nothing compressed leaves this path: the bytes are the build's own
+/// artifact, and the answer keeps the plain file's name and Content-Type.
+pub(crate) fn encoded_file(
+    dist: Option<&Path>,
+    target: &str,
+    accept_encoding: Option<&str>,
+) -> Option<(String, Vec<u8>, &'static str)> {
+    for (suffix, encoding) in [(".br", "br"), (".gz", "gzip")] {
+        if !accepts_encoding(accept_encoding, encoding) {
+            continue;
+        }
+        if let Some(dist) = dist {
+            // Filesystem mode: the sibling sits beside the file in dist.
+            let compressed = format!("{target}{suffix}");
+            if let Some((_, bytes)) = static_file(Some(dist), &compressed) {
+                return Some((target.to_string(), bytes, encoding));
+            }
+            continue;
+        }
+        #[cfg(feature = "ui")]
+        {
+            // Embedded mode: match the target directly — no path
+            // construction on the request path.
+            let bytes: Option<&[u8]> = match (target, encoding) {
+                ("/assets/index.js", "br") => Some(embedded::JS_BR),
+                ("/assets/index.js", "gzip") => Some(embedded::JS_GZ),
+                ("/assets/index.css", "br") => Some(embedded::CSS_BR),
+                ("/assets/index.css", "gzip") => Some(embedded::CSS_GZ),
+                ("/index.html", "br") => Some(embedded::INDEX_BR),
+                ("/index.html", "gzip") => Some(embedded::INDEX_GZ),
+                _ => None,
+            };
+            if let Some(b) = bytes {
+                return Some((target.to_string(), b.to_vec(), encoding));
+            }
+        }
+        #[allow(unreachable_code)]
+        continue;
+    }
+    None
+}
+
 /// What a non-API GET answers with.
 #[derive(Debug)]
 pub(crate) enum StaticAnswer {
-    /// A file of the build — or the SPA shell (`index.html`) for a client route.
-    File(String, Vec<u8>),
+    /// A file of the build — or the SPA shell (`index.html`) for a client
+    /// route. The `Option<&'static str>` is a `Content-Encoding` name when
+    /// the build's precompressed sibling answers instead of the raw bytes.
+    File(String, Vec<u8>, Option<&'static str>),
     /// A path that names a file the build does not have.
     Missing,
     /// No build to serve at all.
     NoBuild,
+    /// The client refused the only representation the file has
+    /// (`identity;q=0` and no coded sibling it accepts).
+    NotAcceptable,
 }
 
 /// Extensions the build serves as files. A missing one is a 404, never
@@ -237,6 +389,8 @@ pub(crate) fn is_static_ext(ext: &str) -> bool {
             | "map"
             | "json"
             | "webmanifest"
+            | "br"
+            | "gz"
     )
 }
 
@@ -283,24 +437,48 @@ pub(crate) fn prefers_json(accept: Option<&str>) -> bool {
 }
 
 /// A build file when one matches; else the SPA shell for a client route.
-/// `accept` is the request's Accept header. A wiki GET that prefers JSON
-/// stays a 404 so the file API remains `/api/wiki/file`.
+/// `accept` is the request's Accept header and `accept_encoding` its
+/// Accept-Encoding: a precompressed sibling the build emitted answers
+/// only when the client named its coding, else the raw file stands —
+/// unless the client refused identity (`identity;q=0`, or `*;q=0` with
+/// no more-specific identity entry), and then a file with no acceptable
+/// coded answer is a 406, never raw bytes against the client's stated
+/// rule. A wiki GET that prefers JSON stays a 404 so the
+/// file API remains `/api/wiki/file`.
 pub(crate) fn static_answer_for(
     dist: Option<&Path>,
     path: &str,
     accept: Option<&str>,
+    accept_encoding: Option<&str>,
 ) -> StaticAnswer {
     let target = if path == "/" { "/index.html" } else { path };
+    let refuse_raw = identity_refused(accept_encoding);
     if !path.starts_with("/api/") {
+        if let Some((name, bytes, encoding)) = encoded_file(dist, target, accept_encoding) {
+            return StaticAnswer::File(name, bytes, Some(encoding));
+        }
         if let Some((name, bytes)) = static_file(dist, target) {
-            return StaticAnswer::File(name, bytes);
+            return if refuse_raw {
+                StaticAnswer::NotAcceptable
+            } else {
+                StaticAnswer::File(name, bytes, None)
+            };
         }
     }
     if !is_client_route(path) || (is_wiki_path(path) && prefers_json(accept)) {
         return StaticAnswer::Missing;
     }
+    if let Some((name, bytes, encoding)) = encoded_file(dist, "/index.html", accept_encoding) {
+        return StaticAnswer::File(name, bytes, Some(encoding));
+    }
     match static_file(dist, "/index.html") {
-        Some((name, bytes)) => StaticAnswer::File(name, bytes),
+        Some((name, bytes)) => {
+            if refuse_raw {
+                StaticAnswer::NotAcceptable
+            } else {
+                StaticAnswer::File(name, bytes, None)
+            }
+        }
         None => StaticAnswer::NoBuild,
     }
 }
@@ -313,9 +491,17 @@ mod embedded {
     pub const INDEX: &str = include_str!("../../ui/dist/index.html");
     pub const JS: &str = include_str!("../../ui/dist/assets/index.js");
     pub const CSS: &str = include_str!("../../ui/dist/assets/index.css");
+    /// Brotli and gzip siblings the build's precompress step emits beside them.
+    pub const INDEX_BR: &[u8] = include_bytes!("../../ui/dist/index.html.br");
+    pub const INDEX_GZ: &[u8] = include_bytes!("../../ui/dist/index.html.gz");
+    pub const JS_BR: &[u8] = include_bytes!("../../ui/dist/assets/index.js.br");
+    pub const JS_GZ: &[u8] = include_bytes!("../../ui/dist/assets/index.js.gz");
+    pub const CSS_BR: &[u8] = include_bytes!("../../ui/dist/assets/index.css.br");
+    pub const CSS_GZ: &[u8] = include_bytes!("../../ui/dist/assets/index.css.gz");
     pub const FAVICON: &[u8] = include_bytes!("../../ui/dist/favicon.svg");
     pub const ICON: &[u8] = include_bytes!("../../ui/dist/icon.svg");
     pub const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../../ui/dist/apple-touch-icon.png");
+    pub const NOTIFICATIONS_SW: &[u8] = include_bytes!("../../ui/dist/notifications-sw.js");
 
     /// The latin woff2 files the CSS references (woff fallbacks are not
     /// embedded — every supported browser takes woff2 first).
@@ -374,7 +560,7 @@ pub(crate) fn board_job_list(state_dir: &Path) -> Option<Value> {
     client::rpc(
         state_dir,
         "job_list",
-        json!({"all": true, "tasks_detail": true}),
+        json!({"all": true, "tasks_detail": true, "open_tasks_only": true}),
     )
     .ok()
 }
@@ -465,12 +651,13 @@ pub(crate) fn current_message_summary(m: &Value) -> Option<String> {
 /// HTTP caller (CAD-375; the daemon withholds it from the board's own
 /// connection too).
 pub(crate) fn running_json(m: &Value) -> Value {
-    json!({
-        "id": m["id"],
-        "task": m["task_id"],
-        "created": m["created"],
-        "summary": current_message_summary(m),
+    serde_json::to_value(RunningMessage {
+        id: m["id"].clone(),
+        task: m["task_id"].clone(),
+        created: m["created"].clone(),
+        summary: current_message_summary(m),
     })
+    .expect("running message serializes")
 }
 
 pub(crate) fn agent_activity_seconds(value: &Value) -> Option<f64> {
@@ -514,21 +701,30 @@ pub(crate) fn agent_activity_seconds(value: &Value) -> Option<f64> {
     (seconds.is_finite() && seconds > 0.0 && seconds <= 8.64e12).then_some(seconds)
 }
 
-/// The tail of an agent's event log for the drawer — the last `n`
-/// events via the same `events` RPC the CLI long-polls.
-pub(crate) fn agent_events_tail(state_dir: &Path, alias: &str, cursor: i64, n: i64) -> Vec<Value> {
+/// The tail of an agent's event log for the agent page — the last `n`
+/// events via the daemon's `agent_events` RPC (the one the CLI long-polls).
+/// An RPC error is returned, not swallowed: the caller serves `[]` plus an
+/// `events_error` so an empty history is never silently a failed read.
+pub(crate) fn agent_events_tail(
+    state_dir: &Path,
+    alias: &str,
+    cursor: i64,
+    n: i64,
+) -> std::result::Result<Vec<Value>, String> {
     let after = (cursor - n).max(0);
-    client::rpc(state_dir, "events", json!({"alias": alias, "after": after}))
-        .map(|r| {
-            r["events"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|e| e["seq"].as_i64().unwrap_or(0) > cursor - n)
-                .collect()
-        })
+    let reply = client::rpc(
+        state_dir,
+        "agent_events",
+        json!({"alias": alias, "after": after}),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(reply["events"]
+        .as_array()
+        .cloned()
         .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e["seq"].as_i64().unwrap_or(0) > cursor - n)
+        .collect())
 }
 
 /// What the board needs from the daemon — agent rows enriched with the
@@ -538,22 +734,35 @@ pub(crate) fn agent_events_tail(state_dir: &Path, alias: &str, cursor: i64, n: i
 /// the board still renders. Built from an `agent_list` asked with
 /// `board: true` and a [`board_job_list`] — the read model fetches both
 /// once and shares the job list with the cards' job outcomes.
+#[cfg(test)]
 pub(crate) fn agents_payload_from(
     state_dir: &Path,
     list: Option<Value>,
     jobs: Option<&Value>,
 ) -> Value {
+    serde_json::to_value(agents_payload_typed(state_dir, list, jobs)).expect("agents serialize")
+}
+
+pub(crate) fn agents_payload_typed(
+    state_dir: &Path,
+    list: Option<Value>,
+    jobs: Option<&Value>,
+) -> AgentsPayload {
     let Some(list) = list else {
-        return json!({"daemon": "unreachable", "agents": [], "totals": null, "by_issue": {}});
+        return AgentsPayload {
+            daemon: DaemonReach::Unreachable,
+            agents: vec![],
+            totals: None,
+            by_issue: BTreeMap::new(),
+        };
     };
     let task_map = jobs
         .map(|jobs| task_issue_map_from(state_dir, jobs))
         .unwrap_or_default();
     let agents = list["agents"].as_array().cloned().unwrap_or_default();
     let mut out = Vec::new();
-    let mut inboxes = 0i64;
-    let mut by_issue: HashMap<String, Vec<Value>> = HashMap::new();
-    let mut totals = json!({"running": 0, "queued": 0, "fenced": 0, "parked": 0, "inboxes": 0});
+    let mut by_issue: BTreeMap<String, Vec<CardAgent>> = BTreeMap::new();
+    let mut totals = AgentTotals::default();
     for agent in &agents {
         let alias = agent["alias"].as_str().unwrap_or_default();
         let provider = agent["provider"].as_str().unwrap_or_default();
@@ -565,42 +774,55 @@ pub(crate) fn agents_payload_from(
             agent["session_id"].as_str().unwrap_or_default(),
             agent["endpoint"].as_str().unwrap_or_default(),
         );
+        // The fields the daemon reports on every row, mailbox or worker.
+        let base = AgentRow {
+            alias: alias.to_string(),
+            provider: agent["provider"].as_str().map(str::to_string),
+            endpoint_kind: agent["endpoint_kind"].as_str().map(str::to_string),
+            role: agent["role"].clone(),
+            team_role: agent["team_role"].clone(),
+            model_selection: agent["model_selection"].clone(),
+            model_lookup_role: agent["model_lookup_role"].clone(),
+            // Preserve provider evidence so the UI can distinguish a
+            // confirmed effective model from a requested/configured one.
+            model: agent["model"].clone(),
+            model_reported: agent["model_reported"].clone(),
+            model_configured: agent["model_configured"].clone(),
+            model_source: agent["model_source"].clone(),
+            effort: agent["effort"].clone(),
+            effort_reported: agent["effort_reported"].clone(),
+            effort_source: agent["effort_source"].clone(),
+            effort_applicable: agent["effort_applicable"].clone(),
+            // Quota integrations can add this account/pool-scoped view;
+            // absent data stays absent and is rendered unavailable below.
+            quota: agent["quota"].clone(),
+            usage_limit: agent["usage_limit"].clone(),
+            group: agent["params"]["upstream"]
+                .as_str()
+                .unwrap_or(alias)
+                .to_string(),
+            group_root: agent["params"]["upstream"].is_null(),
+            dead: agent["dead"].as_bool(),
+            ..AgentRow::default()
+        };
         // Mailboxes are not workers — they still appear on the Agents
         // screen (as kind "inbox") but never count as busy/fenced.
         let actor = registry::has_actor(provider, kind);
         if !actor {
-            inboxes += 1;
+            totals.inboxes += 1;
             // CAD-480: the mailbox's unread backlog and its oldest
             // unread age are the row's queue evidence — the daemon
             // computes both in `agent.inbox`.
             let unread = agent["inbox"]["queued"].as_i64().unwrap_or(0);
-            let oldest_unread_age_secs = agent["inbox"]["oldest_age_secs"].clone();
-            totals["queued"] = json!(totals["queued"].as_i64().unwrap_or(0) + unread);
-            out.push(json!({
-                "alias": alias, "provider": agent["provider"],
-                "endpoint_kind": agent["endpoint_kind"],
-                "role": agent["role"],
-                "team_role": agent["team_role"],
-                "model_selection": agent["model_selection"],
-                "model_lookup_role": agent["model_lookup_role"],
-                "model": agent["model"],
-                "model_reported": agent["model_reported"],
-                "model_configured": agent["model_configured"],
-                "model_source": agent["model_source"],
-                "effort": agent["effort"],
-                "effort_reported": agent["effort_reported"],
-                "effort_source": agent["effort_source"],
-                "effort_applicable": agent["effort_applicable"],
-                "quota": agent["quota"],
-                "usage_limit": agent["usage_limit"],
-                "state": "inbox", "group": agent["params"]["upstream"].as_str().unwrap_or(alias),
-                "group_root": agent["params"]["upstream"].is_null(),
-                "running": 0, "queued": unread, "unread": unread,
-                "oldest_unread_age_secs": oldest_unread_age_secs,
-                "unknown": 0, "parked": 0,
-                "fenced": false, "on": [], "tasks": [], "message": Value::Null,
-                "dead": agent["dead"], "inbox": true,
-            }));
+            totals.queued += unread;
+            out.push(AgentRow {
+                state: Some("inbox".to_string()),
+                queued: unread,
+                unread: Some(unread),
+                oldest_unread_age_secs: Some(agent["inbox"]["oldest_age_secs"].clone()),
+                inbox: Some(true),
+                ..base
+            });
             continue;
         }
         // A CAD-325 daemon folds the show slice into the row (`board`);
@@ -651,7 +873,7 @@ pub(crate) fn agents_payload_from(
         // Exact binding: the agent's assigned tasks joined through
         // `jobs.issue_id`. A running kickoff's task is the live one.
         let mut on: Vec<String> = Vec::new();
-        let mut bound: Vec<Value> = Vec::new();
+        let mut bound: Vec<AgentTask> = Vec::new();
         for tid in agent["tasks"].as_array().cloned().unwrap_or_default() {
             let Some(tid) = tid.as_str() else { continue };
             let Some(binding) = task_map.get(tid) else {
@@ -665,34 +887,34 @@ pub(crate) fn agents_payload_from(
                 .find(|m| m["task"].as_str() == Some(tid))
                 .cloned()
                 .unwrap_or(Value::Null);
-            bound.push(json!({
-                "task": tid,
-                "task_state": binding.task_state,
-                "title": binding.task_title,
-                "issue": binding.issue,
-                "job": binding.job,
-                "job_title": binding.job_title,
-                "job_state": binding.job_state,
-                "message": message,
-            }));
             by_issue
                 .entry(binding.issue.clone())
                 .or_default()
-                .push(json!({
-                    "alias": alias,
-                    "task": tid,
-                    "task_state": binding.task_state,
-                    "state": agent["state"],
-                    "message": message["id"].clone(),
-                    "resume": resume,
-                }));
+                .push(CardAgent {
+                    alias: alias.to_string(),
+                    task: tid.to_string(),
+                    task_state: binding.task_state.clone(),
+                    state: agent["state"].as_str().map(str::to_string),
+                    message: message["id"].as_str().map(str::to_string),
+                    resume: resume.clone(),
+                });
+            bound.push(AgentTask {
+                task: tid.to_string(),
+                task_state: binding.task_state.clone(),
+                title: binding.task_title.clone(),
+                issue: binding.issue.clone(),
+                job: binding.job.clone(),
+                job_title: binding.job_title.clone(),
+                job_state: binding.job_state.clone(),
+                message,
+            });
         }
         let fenced = unknown > 0 || agent["state"].as_str() == Some("attention");
-        totals["running"] = json!(totals["running"].as_i64().unwrap_or(0) + running);
-        totals["queued"] = json!(totals["queued"].as_i64().unwrap_or(0) + queued);
-        totals["parked"] = json!(totals["parked"].as_i64().unwrap_or(0) + parked);
+        totals.running += running;
+        totals.queued += queued;
+        totals.parked += parked;
         if fenced {
-            totals["fenced"] = json!(totals["fenced"].as_i64().unwrap_or(0) + 1);
+            totals.fenced += 1;
         }
         // The daemon's own fence text already names the recovery path —
         // the board renders it as copyable code, verbatim.
@@ -701,62 +923,73 @@ pub(crate) fn agents_payload_from(
         } else {
             None
         };
-        out.push(json!({
-            "alias": alias,
-            "provider": agent["provider"],
-            "endpoint_kind": agent["endpoint_kind"],
-            "role": agent["role"],
-            "team_role": agent["team_role"],
-            "model_selection": agent["model_selection"],
-            "model_lookup_role": agent["model_lookup_role"],
-            // Preserve provider evidence so the UI can distinguish a
-            // confirmed effective model from a requested/configured one.
-            "model": agent["model"],
-            "model_reported": agent["model_reported"],
-            "model_configured": agent["model_configured"],
-            "model_source": agent["model_source"],
-            "effort": agent["effort"],
-            "effort_reported": agent["effort_reported"],
-            "effort_source": agent["effort_source"],
-            "effort_applicable": agent["effort_applicable"],
-            // Quota integrations can add this account/pool-scoped view;
-            // absent data stays absent and is rendered unavailable below.
-            "quota": agent["quota"],
-            "usage_limit": agent["usage_limit"],
-            "state": agent["state"],
-            "group": agent["params"]["upstream"].as_str().unwrap_or(alias),
-            "group_root": agent["params"]["upstream"].is_null(),
-            "running": running, "queued": queued, "unknown": unknown,
-            "parked": parked, "fenced": fenced,
-            "on": on,
-            "tasks": bound,
-            "message": running_msgs.first().cloned().unwrap_or(Value::Null),
-            "running_messages": running_msgs,
-            "recovery": recovery,
-            "resume": resume,
-            "resume_hint": "after stop",
-            "dead": agent["dead"],
-            "last_activity": last_activity,
-            "silent_secs": agent["silent_secs"],
-            "stalled": agent["stalled"],
+        out.push(AgentRow {
+            // CAD-1752: only the catalogue identity of a hire, never the
+            // whole params object - this list goes to every viewer.
+            catalogue: Some(agent["params"]["catalogue"].clone()),
+            look: Some(agent["params"]["look"].clone()),
+            kind: Some(agent["params"]["kind"].clone()),
+            state: agent["state"].as_str().map(str::to_string),
+            running,
+            queued,
+            unknown,
+            parked,
+            fenced,
+            on,
+            tasks: bound,
+            message: running_msgs.first().cloned().unwrap_or(Value::Null),
+            running_messages: Some(running_msgs),
+            recovery: Some(recovery),
+            resume: Some(resume),
+            resume_hint: Some("after stop".to_string()),
+            last_activity: Some(last_activity),
+            silent_secs: Some(agent["silent_secs"].clone()),
+            stalled: Some(agent["stalled"].clone()),
             // CAD-96: `stopped (auto, idle 72m)` — null unless auto-stopped.
-            "state_label": agent["state_label"],
-            "event_cursor": cursor,
-        }));
+            state_label: Some(agent["state_label"].clone()),
+            event_cursor: Some(cursor),
+            ..base
+        });
     }
-    totals["inboxes"] = json!(inboxes);
-    json!({"daemon": "reachable", "agents": out, "totals": totals, "by_issue": by_issue})
+    AgentsPayload {
+        daemon: DaemonReach::Reachable,
+        agents: out,
+        totals: Some(totals),
+        by_issue,
+    }
 }
 
 /// `/api/agents/<alias>` — the drawer detail: the daemon's own
 /// `agent_show` plus the last 20 events and the recovery/resume
 /// commands the row chips hinted at.
-pub(crate) fn agent_detail(state_dir: &Path, alias: &str) -> std::result::Result<Value, String> {
-    let show =
-        client::rpc(state_dir, "agent_show", json!({"alias": alias})).map_err(|e| e.to_string())?;
+///
+/// CAD-1221: agent-local work only. `active_only` brings the rows the
+/// drawer shows (running ones), never the full message history, and
+/// `task_bindings` brings this alias's tasks with their issues from one
+/// join on this alias's rows. The fleet's `agent_list` and `job_list`
+/// are read only for a daemon that predates `task_bindings`.
+pub(crate) fn agent_detail(
+    state_dir: &Path,
+    alias: &str,
+    operator: bool,
+) -> std::result::Result<Value, String> {
+    // CAD-1752: the saved job text is the operator's to read; a member's
+    // detail never carries `instructions`.
+    let show = client::rpc(
+        state_dir,
+        "agent_show",
+        json!({"alias": alias, "active_only": true,
+               "include_catalogue_instructions": operator, "include_stats": true}),
+    )
+    .map_err(|e| e.to_string())?;
     let agent = &show["agent"];
     let cursor = show["event_cursor"].as_i64().unwrap_or(0);
-    let events = agent_events_tail(state_dir, alias, cursor, 20);
+    let (events, events_error) = match agent_events_tail(state_dir, alias, cursor, 20) {
+        Ok(events) if operator => (events, None),
+        // A non-operator (fail closed) gets only the allowlisted fields.
+        Ok(events) => (events.iter().map(member_event).collect(), None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
     let provider = agent["provider"].as_str().unwrap_or_default();
     let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
     let running: Vec<Value> = show["messages"]
@@ -765,11 +998,66 @@ pub(crate) fn agent_detail(state_dir: &Path, alias: &str) -> std::result::Result
         .unwrap_or_default()
         .iter()
         .filter(|m| m["state"].as_str() == Some("running"))
-        .map(running_json)
+        // The operator keeps the bounded description; anyone else (fail
+        // closed) gets ids, state and timing only.
+        .map(|m| {
+            if operator {
+                running_json(m)
+            } else {
+                member_running_item(m)
+            }
+        })
         .collect();
     let fenced =
         show["unknown"].as_i64().unwrap_or(0) > 0 || agent["state"].as_str() == Some("attention");
-    // `tasks` lives on the agent_list row, not the show payload.
+    let (tasks, issues) = match show["task_bindings"].as_array() {
+        Some(rows) => task_binding_view(rows),
+        None => legacy_task_view(state_dir, alias),
+    };
+    Ok(json!({
+        "agent": agent,
+        "queued": show["queued"],
+        "unknown": show["unknown"],
+        "running": running,
+        "events": events,
+        "events_error": events_error,
+        "fenced": fenced,
+        "recovery": if fenced { agent["error"].clone() } else { Value::Null },
+        "resume": registry::resume_command(
+            provider, kind,
+            agent["thread_id"].as_str().unwrap_or_default(),
+            agent["session_id"].as_str().unwrap_or_default(),
+            agent["endpoint"].as_str().unwrap_or_default(),
+        ),
+        "tasks": tasks,
+        "on": issues,
+        "stats": show["stats"],
+    }))
+}
+
+/// The drawer's `tasks` (the alias's non-terminal task ids, as
+/// `agent_list` lists them) and `on` (distinct issues its tasks bind to,
+/// first-seen order) from an `agent show` `task_bindings` array.
+fn task_binding_view(rows: &[Value]) -> (Value, Vec<String>) {
+    let mut tasks: Vec<Value> = Vec::new();
+    let mut issues: Vec<String> = Vec::new();
+    for row in rows {
+        if let Some(id) = row["id"].as_str() {
+            tasks.push(json!(id));
+        }
+        if let Some(issue) = row["issue"].as_str().filter(|i| !i.is_empty()) {
+            if !issues.iter().any(|known| known == issue) {
+                issues.push(issue.to_string());
+            }
+        }
+    }
+    (Value::Array(tasks), issues)
+}
+
+/// Pre-CAD-1221 daemons answer `agent show` without `task_bindings`: the
+/// alias's ids come from the fleet's `agent_list` row and the issues from
+/// the fleet's `job_list`. Only that daemon pays for the fleet reads.
+fn legacy_task_view(state_dir: &Path, alias: &str) -> (Value, Vec<String>) {
     let tasks = client::rpc(state_dir, "agent_list", json!({}))
         .ok()
         .and_then(|l| {
@@ -782,33 +1070,241 @@ pub(crate) fn agent_detail(state_dir: &Path, alias: &str) -> std::result::Result
         })
         .map(|a| a["tasks"].clone())
         .unwrap_or(json!([]));
-    // Bound issues through the same tasks × jobs.issue_id join.
     let task_map = task_issue_map(state_dir);
-    let mut issues: Vec<&str> = Vec::new();
+    let mut issues: Vec<String> = Vec::new();
     for t in tasks.as_array().cloned().unwrap_or_default() {
         if let Some(binding) = t.as_str().and_then(|tid| task_map.get(tid)) {
-            if !issues.contains(&binding.issue.as_str()) {
-                issues.push(&binding.issue);
+            if !issues.contains(&binding.issue) {
+                issues.push(binding.issue.clone());
             }
         }
     }
-    Ok(json!({
-        "agent": agent,
-        "queued": show["queued"],
-        "unknown": show["unknown"],
-        "running": running,
-        "events": events,
-        "fenced": fenced,
-        "recovery": if fenced { agent["error"].clone() } else { Value::Null },
-        "resume": registry::resume_command(
-            provider, kind,
-            agent["thread_id"].as_str().unwrap_or_default(),
-            agent["session_id"].as_str().unwrap_or_default(),
-            agent["endpoint"].as_str().unwrap_or_default(),
+    (tasks, issues)
+}
+
+/// A board read block's route, by whether it is a read at all.
+///
+/// One impl per module's `Route` enum (`read_route_enums!`), so a block
+/// cannot be copied without the check: [`read_admit`] runs it before any
+/// guard or handler.
+trait ReadRoute {
+    fn is_read_route(&self) -> bool;
+}
+
+macro_rules! read_route_enums {
+    ($($t:ty),* $(,)?) => {$(
+        impl ReadRoute for $t {
+            fn is_read_route(&self) -> bool {
+                <$t>::is_read(*self)
+            }
+        }
+    )*};
+}
+
+read_route_enums!(
+    app_assistant::Route<'_>,
+    app_contexts::Route<'_>,
+    app_audiences::Route<'_>,
+    app_records::Route<'_>,
+    app_content::Route<'_>,
+    connections::Route<'_>,
+    crm_send::Route,
+    app_release::Route<'_>,
+    app_runs::Route<'_>,
+    social_publish::Route<'_>,
+);
+
+/// [`operator::admit_screen_read`] as the unit refusal [`read_admit`] takes
+/// — the screen blocks discard the admitted caller, as they always did.
+fn screen_read_only(
+    request: &Request,
+    state_dir: &Path,
+    opts: &ServeOpts,
+) -> std::result::Result<(), HttpResp> {
+    operator::admit_screen_read(request, state_dir, opts).map(|_| ())
+}
+
+/// The one admit sequence for a board read block: a route that matched a
+/// write surface is `405`, the guard runs before the handler, and only an
+/// admitted caller reaches it. `None` means no route matched and the
+/// caller's chain continues; `Some` is the response to send.
+fn read_admit<R: ReadRoute>(
+    request: &mut Request,
+    state_dir: &Path,
+    opts: &ServeOpts,
+    matched: Option<R>,
+    admit: fn(&Request, &Path, &ServeOpts) -> std::result::Result<(), HttpResp>,
+    handle: impl FnOnce(&mut Request, R) -> HttpResp,
+) -> Option<HttpResp> {
+    let route = matched?;
+    if !route.is_read_route() {
+        return Some(err_response(405, "method not allowed"));
+    }
+    if let Err(response) = admit(request, state_dir, opts) {
+        return Some(response);
+    }
+    Some(handle(request, route))
+}
+
+/// A table read row's admission, chosen by its class (CAD-1696).
+///
+/// The read and write guards differ beyond the class name: a read never runs
+/// the browser write guard, and `ScreenRead` admits a member where
+/// `OperatorOnly` refuses one. A class with no read rule is refused rather
+/// than admitted, so a read row cannot be declared with a write-only class.
+fn table_read_guard(
+    class: operator::RouteClass,
+    request: &Request,
+    state_dir: &Path,
+    opts: &ServeOpts,
+) -> std::result::Result<(), HttpResp> {
+    match class {
+        operator::RouteClass::OperatorOnly => {
+            operator::admit_operator_read(request, state_dir, opts)
+        }
+        operator::RouteClass::ScreenRead => {
+            operator::admit_screen_read(request, state_dir, opts).map(|_| ())
+        }
+        operator::RouteClass::AgentAllowed => {
+            operator::admit_read(request, state_dir, opts).map(|_| ())
+        }
+        // `CallerScoped` means "the generic read gate is the whole guard": it
+        // already admitted this request, and a second `admit_read` would only
+        // repeat it. `endpoints::tests::only_the_agent_detail_row_is_gate_only`
+        // pins that meaning to the one read row that relies on it.
+        operator::RouteClass::CallerScoped => Ok(()),
+        operator::RouteClass::Session
+        | operator::RouteClass::RecipientToken
+        | operator::RouteClass::Refused => Err(err_response(
+            500,
+            "this endpoint table row cannot be served as a read",
+        )),
+    }
+}
+
+/// Run one table read row: guard by class, then the row's handler
+/// (CAD-1696). `None` means no read row matched and the chain continues.
+fn read_dispatch(
+    request: &mut Request,
+    state_dir: &Path,
+    opts: &ServeOpts,
+    bound: endpoints::Bound<'_>,
+) -> HttpResp {
+    let row = bound.endpoint;
+    if let Err(response) = table_read_guard(row.class, request, state_dir, opts) {
+        return response;
+    }
+    // A bound value that fails its validator answers the row's own refusal,
+    // exactly as the write dispatcher does — never the handler.
+    if let Some(response) = bound.invalid() {
+        return response;
+    }
+    match row.id {
+        endpoints::RouteId::WorkspaceList => {
+            apps::workspace(request, state_dir, "app_workspace_list", None)
+        }
+        endpoints::RouteId::WorkspaceShow => {
+            apps::workspace(request, state_dir, "app_workspace_show", bound.get("id"))
+        }
+        endpoints::RouteId::AgentDetail => {
+            let alias = bound.get("alias").unwrap_or_default();
+            // The viewer verdict the OperatorOnly reads use: only the
+            // operator's session (with peer proof) gets the saved job text.
+            let operator = operator::admit_operator_read(request, state_dir, opts).is_ok();
+            match agent_detail(state_dir, alias, operator) {
+                Ok(detail) => json_response(detail),
+                Err(error) => err_response(404, &error),
+            }
+        }
+        endpoints::RouteId::AgentRoles => match client::rpc(state_dir, "agent_roles", json!({})) {
+            Ok(roles) => json_response(roles),
+            Err(error) => home::rpc_err(&error, "agent_roles"),
+        },
+        endpoints::RouteId::ArtifactRead => artifacts::read(
+            request,
+            state_dir,
+            bound.get("artifact").unwrap_or_default(),
+            bound.get("version").unwrap_or_default(),
         ),
-        "tasks": tasks,
-        "on": issues,
-    }))
+        endpoints::RouteId::ArtifactVersions => artifacts::versions(
+            request,
+            state_dir,
+            bound.get("artifact").unwrap_or_default(),
+        ),
+        endpoints::RouteId::ConversationsRead => {
+            let install = bound.get("id").unwrap_or_default();
+            threads::conversations(state_dir, crate::master::ALIAS, &|key: &str| {
+                (key == "install").then(|| install.to_string())
+            })
+        }
+        _ => err_response(500, "a write row reached the read dispatcher"),
+    }
+}
+
+/// A board write waits this long for the one writer before answering
+/// `resource_busy`: long enough for an ordinary write queued behind
+/// another, short enough that a stuck request never queues the board.
+const WRITE_LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// [`WRITE_LOCK`] with a deadline. `None` means another write still holds
+/// it after `within`, so the caller answers a retryable refusal instead of
+/// blocking its thread for the holder's whole daemon call. A poisoned lock
+/// is recovered exactly as the blocking `lock()` did.
+fn acquire_write_lock(within: Duration) -> Option<MutexGuard<'static, ()>> {
+    let deadline = Instant::now() + within;
+    loop {
+        match WRITE_LOCK.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) if Instant::now() >= deadline => return None,
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// Whether this request takes the board's one writer. Every method
+/// `handle` treats as a write is serialized — `PUT` included, because the
+/// wiki serves PUT writes — except the device sign-in exchange (CAD-777:
+/// its handlers call the issuer, and its own state is separately locked).
+fn serialized_write(method: &Method, url: &str) -> bool {
+    matches!(
+        method,
+        Method::Post | Method::Patch | Method::Delete | Method::Put
+    ) && !matches!(
+        url.split('?').next().unwrap_or(""),
+        "/api/session/device/code" | "/api/session/device/poll"
+    )
+}
+
+/// Run one write under [`WRITE_LOCK`]. The guard is dropped only after
+/// `handle` returns, so no write can dispatch without it. `Some(request)`
+/// means the writer stayed busy for `within`: the request is unanswered
+/// and the caller refuses it (CAD-1658).
+fn run_serialized_write(
+    request: Request,
+    state_dir: &Path,
+    pm_dir: &Path,
+    opts: &ServeOpts,
+    within: Duration,
+) -> Option<Request> {
+    let Some(_guard) = acquire_write_lock(within) else {
+        return Some(request);
+    };
+    handle(request, state_dir, pm_dir, opts);
+    None
+}
+
+/// The board's writer is still busy: transient, like a daemon `busy`
+/// refusal (`busy_response`), so the client retries instead of failing.
+fn board_busy_response() -> HttpResp {
+    let mut resp = coded_response(
+        503,
+        "resource_busy",
+        "the board is finishing another write — retry shortly",
+        None,
+    );
+    resp.add_header(Header::from_bytes("Retry-After", BUSY_RETRY_AFTER_SECS.to_string()).unwrap());
+    resp
 }
 
 fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
@@ -935,6 +1431,29 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         }
         return;
     }
+    // Closed screen services use the SAME admitted HTTP peer proof as the
+    // ordinary write dispatcher, on local and public surfaces. CAD-1537:
+    // `call` is `ScreenRead` — a member or `--read-only` board caller is
+    // held to the read allowlist; the SLOT routes stay OperatorOnly.
+    if let Some(rpc) = app_screens::service_route(&path) {
+        if method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let caller = match operator::admit(&request, method.as_str(), &path, state_dir, opts) {
+            Ok(caller) => caller,
+            Err(response) => {
+                send(request, response);
+                return;
+            }
+        };
+        let read_only = opts.read_only
+            || matches!(&caller, Some(operator::Caller::Named(named)) if !named.operator);
+        let response = app_screens::service(&mut request, state_dir, opts, rpc, read_only);
+        read_model::get(state_dir, pm_dir).invalidate();
+        send(request, response);
+        return;
+    }
     if public_host {
         if path.starts_with("/__platform/") {
             let resp = match (method.as_str(), path.as_str()) {
@@ -961,6 +1480,74 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             send(request, resp);
             return;
         }
+        // CAD-1401: a `wikienv_` bearer on `/api/wiki/<tail>` is the wiki
+        // envelope credential (the proxy's translated routes). Only that
+        // bearer diverts here, ahead of the session and write gates; a
+        // browser request has no such bearer and takes the unchanged path.
+        if let Some(tail) = path.strip_prefix("/api/wiki/") {
+            if wiki_envelope::is_envelope_request(&request) {
+                let resp = wiki_envelope::handle(
+                    &mut request,
+                    &method,
+                    tail,
+                    &query,
+                    state_dir,
+                    pm_dir,
+                    opts,
+                );
+                send(request, resp);
+                return;
+            }
+        }
+        // CAD-1380/AOS-216: `POST /api/assist/<verb>` — the container end of
+        // the member-assistant surface (`/__platform/assistant/call`
+        // forwards here). Same diversion point as `/api/cli/`: the
+        // `wikienv_` assistant-envelope bearer is the only credential, and
+        // it satisfies no other route. Verified + jti-consumed inside
+        // `assist_route::post` before any handler.
+        if let Some(tail) = path.strip_prefix("/api/assist/") {
+            let resp = assist_route::post(&mut request, &method, tail, state_dir, pm_dir, opts);
+            send(request, resp);
+            return;
+        }
+        // CAD-1423: the platform delivery service. Diverted ahead of the cookie
+        // gates; the daemon RPC verifies the platform proof before any business
+        // check. A browser session never satisfies it.
+        if let Some(tail) = path.strip_prefix("/api/internal/notifications/") {
+            let resp = notify_service::post(&mut request, &method, tail, state_dir, opts);
+            send(request, resp);
+            return;
+        }
+        // CAD-1485: `/api/member-assistant/<verb>` — the member's own
+        // browser chat. Cookie-facing twin of `/api/assist`: the public
+        // session cookie is the credential, and the route mints a fresh
+        // assistant envelope server-side (the AOS `board-authorize`
+        // issuer) before running the same member dispatch. Diverted ahead
+        // of the cookie gates alongside the assist family; the route's
+        // own write_guard + verified-session check run inside.
+        if let Some(tail) = path.strip_prefix("/api/member-assistant/") {
+            let resp = member_assist::post(&mut request, &method, tail, state_dir, pm_dir, opts);
+            send(request, resp);
+            return;
+        }
+        // CAD-1412: the human-rooms family owns its own guards. It runs
+        // before the generic write route so POST/DELETE reach its CSRF
+        // header check and member-role rules, and it does not widen the
+        // generic write gate for any other path.
+        if let Some(rest) = path.strip_prefix("/api/human-threads") {
+            if rest.is_empty() || rest.starts_with('/') {
+                let resp = human_threads::dispatch(
+                    &mut request,
+                    &method,
+                    &path,
+                    raw_query,
+                    state_dir,
+                    opts,
+                );
+                send(request, resp);
+                return;
+            }
+        }
         if is_write {
             let send_write = |req: Request, resp: HttpResp| {
                 read_model::get(state_dir, pm_dir).invalidate();
@@ -978,25 +1565,6 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             );
             return;
         }
-        // A read on the public host needs a live board session —
-        // `/api/health` and `/api/version` stay open so a probe can see
-        // the board is up, and a signed-out tab can still learn the
-        // serving build, without holding a credential.
-        if path != "/api/health" && path != "/api/version" {
-            match operator::public_session(&request, state_dir, opts) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    let resp = operator::session_bounce(&request, &path, opts);
-                    send(request, resp);
-                    return;
-                }
-                Err(resp) => {
-                    send(request, resp);
-                    return;
-                }
-            }
-        }
-        // Signed-in reads fall through to the shared dispatch below.
     }
 
     if is_write {
@@ -1019,7 +1587,80 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         return;
     }
 
+    // Every private API read is admitted before dispatch, including future
+    // routes and streams. Local bootstrap/static files are public. The
+    // screen document instead owns a one-use, live-session-bound capability.
+    let private_api = path.starts_with("/api/")
+        && !matches!(path.as_str(), "/api/meta" | "/api/health" | "/api/version")
+        && app_screens::frame_route(&path).is_none();
+    let public_read = public_host && !matches!(path.as_str(), "/api/health" | "/api/version");
+    let read_admission = if private_api || public_read {
+        match operator::admit_read(&request, state_dir, opts) {
+            Ok(admission) => Some(admission),
+            Err(resp) => {
+                let resp = if public_host && resp.status_code().0 == 401 {
+                    operator::session_bounce(&request, &path, opts)
+                } else {
+                    resp
+                };
+                send(request, resp);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    // A multi-segment tail under `/api/agents/` was the old arm's invalid
+    // alias (`a/b` carries `/`) and answered 400 before any handler. The
+    // table's single-segment row cannot bind it, so the answer is kept here.
+    if let Some(tail) = path.strip_prefix("/api/agents/") {
+        if tail.contains('/') {
+            send(request, err_response(400, "bad agent alias"));
+            return;
+        }
+    }
+
+    // CAD-1696: a table read row answers from its own declaration, so the
+    // board's reads and writes share one route authority. It runs after the
+    // generic read gate above — the same place the arms it replaces ran — so
+    // an unsigned caller still sees that gate's 401 (and, on the public host,
+    // its session bounce) before any per-row role guard. A path the table does
+    // not own falls through to the chain below, unchanged.
+    if let Some(bound) = endpoints::resolve(method.as_str(), &path) {
+        let response = read_dispatch(&mut request, state_dir, opts, bound);
+        send(request, response);
+        return;
+    }
+
+    // The catalogue proxy is a signed-in read: the container no longer serves
+    // an anonymous directory. The browser must not be sent at the catalog
+    // origin; loopback is this board's machine, which a tunneled viewer
+    // cannot reach.
+    if super::public_directory::is_public_catalog_route(&path) {
+        if !matches!(method, Method::Get | Method::Head) {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = super::public_directory::proxy_public_catalog(&path, raw_query);
+        send(request, resp);
+        return;
+    }
+
     match path.as_str() {
+        "/api/my-work" => {
+            let response = my_work::get(&request, state_dir, pm_dir, opts, raw_query);
+            send(request, response);
+        }
+        p if p.starts_with("/api/my-work/issues/") => {
+            let id = &p["/api/my-work/issues/".len()..];
+            let response = my_work::get_issue(&request, state_dir, pm_dir, opts, id, raw_query);
+            send(request, response);
+        }
+        "/api/locale" => {
+            let response = locale::get(&request, state_dir, opts);
+            send(request, response);
+        }
         // What the SPA needs to render itself correctly for this
         // client: read-only mode, the actor this request would write
         // as, and the tailnet URL when sharing is armed. Build identity
@@ -1027,55 +1668,92 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         // reachable (`daemon_info` carries the running build, which is
         // the one deploy drift measures).
         "/api/meta" => {
-            let daemon = client::rpc(state_dir, "daemon_info", json!({})).ok();
+            // CAD-1193: one shared read budget for every daemon fact
+            // this courtesy answer needs (target 5 s end to end). A
+            // dependency that cannot answer in it produces `null` —
+            // unknown — never a granted role or a manufactured
+            // sign-out. Writes are untouched: their guards keep the
+            // full RPC bound.
+            let budget = client::MetaBudget::fresh(client::MetaBudget::LIMIT);
+            let session = operator::meta(&request, state_dir, opts, &budget);
+            let signed_in = session.signed_in == Some(true);
+            let daemon = budget
+                .read(state_dir, "daemon_info", json!({}))
+                .ok()
+                .map(|info| MetaDaemon {
+                    build_commit: info["build_commit"].clone(),
+                    build_time: info["build_time"].clone(),
+                    started_at: info["started_at"].clone(),
+                });
             let (actor, tailnet_proof) = request_identity(&request, opts);
+            let actor = if signed_in {
+                actor
+            } else {
+                super::UI_ACTOR.to_string()
+            };
             // CAD-432: may this client make the operator's board
             // decisions — the same proof those writes run. It walks
             // /proc, so it is computed only when asked (`?operator=1`,
             // once per page load), never on the 30 s poll.
-            let operator = matches!(query("operator").as_deref(), Some("1" | "true"))
-                .then(|| home::operator_viewer(&request, state_dir, opts));
-            let session = operator::meta(&request, state_dir, opts);
+            // `Some(true|false)` is the proven answer; `None` — a
+            // dependency could not answer in budget — serializes as
+            // `operator: null`, which the UI shows as unavailable,
+            // never as a resolved non-operator.
+            let operator = (signed_in
+                && matches!(query("operator").as_deref(), Some("1" | "true")))
+            .then(|| home::operator_viewer(&request, state_dir, opts, &budget))
+            .flatten();
             // Display the same verified identity that attributes public
             // board writes, never a name supplied by request fields.
             // Public-origin sessions carry a verified user; every other
             // session is the operator's, matching `held_of`'s
             // attribution exactly.
-            let actor = if session["session"]["origin"].as_str() == Some("public") {
+            let actor = if session.session["origin"].as_str() == Some("public") {
                 serde_json::from_value::<crate::operator_auth::BoardUser>(
-                    session["session"]["user"].clone(),
+                    session.session["user"].clone(),
                 )
                 .map(|user| user.actor())
                 .unwrap_or(actor)
             } else {
                 actor
             };
+            let anonymous_reads_allowed =
+                operator::anonymous_reads_on(opts, operator::request_origin_kind(&request, opts));
             send(
                 request,
-                json_response(json!({
-                    "read_only": opts.read_only,
-                    "signed_in": session["signed_in"],
-                    "hosted": session["hosted"],
-                    "session": session["session"],
-                    "login_hint": session["login_hint"],
-                    "device_login": session["device_login"],
-                    "tab_signed_out": session["tab_signed_out"],
-                    "actor": actor,
-                    "tailnet_proof": tailnet_proof,
-                    "operator": operator,
-                    "platform_account_configured": opts.public.as_ref().is_some_and(|board| board.issuer == "http://api.internal"),
-                    "tailnet_url": opts
-                        .tailnet
-                        .as_ref()
-                        .map(|(dns, port)| tailnet_url(dns, *port)),
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "build_commit": crate::overview::BUILD_COMMIT,
-                    "build_time": crate::overview::BUILD_TIME,
-                    "daemon": daemon,
-                    // CAD-446: the `gh` this board's sync runs, fixed at
-                    // start; `null` when the board runs no sync.
-                    "delivery_sync": opts.delivery_sync.as_ref().map(|s| s.meta()),
-                })),
+                json_response(
+                    serde_json::to_value(MetaResponse {
+                        read_only: opts.read_only,
+                        anonymous_reads: anonymous_reads_allowed,
+                        signed_in: session.signed_in,
+                        hosted: session.hosted,
+                        session: session.session,
+                        login_hint: session.login_hint.to_string(),
+                        device_login: session.device_login,
+                        tab_signed_out: session.tab_signed_out,
+                        actor,
+                        tailnet_proof,
+                        operator,
+                        platform_account_configured: opts
+                            .public
+                            .as_ref()
+                            .is_some_and(|board| board.issuer == "http://api.internal"),
+                        tailnet_url: opts
+                            .tailnet
+                            .as_ref()
+                            .map(|(dns, port)| tailnet_url(dns, *port)),
+                        version: env!("CARGO_PKG_VERSION").to_string(),
+                        build_commit: crate::overview::BUILD_COMMIT.to_string(),
+                        build_time: crate::overview::BUILD_TIME.to_string(),
+                        daemon,
+                        // CAD-446: the `gh` this board's sync runs, fixed at
+                        // start; `null` when the board runs no sync.
+                        delivery_sync: signed_in
+                            .then(|| opts.delivery_sync.as_ref().map(|s| s.meta()))
+                            .flatten(),
+                    })
+                    .expect("meta serializes"),
+                ),
             );
         }
         // CAD-561: the Update card's view and the draining banner.
@@ -1084,11 +1762,49 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         "/api/settings/model-defaults" => {
             send(request, model_defaults_get(state_dir, opts.read_only));
         }
+        "/api/settings/agents" => match operator::admit_operator_read(&request, state_dir, opts) {
+            Ok(()) => send(request, agent_settings_get(state_dir, opts.read_only)),
+            Err(resp) => send(request, resp),
+        },
         "/api/platform-account" => send(request, platform_account::get(opts)),
+        // CAD-1393: operator-only reads of company templates and drafts.
+        "/api/templates/show"
+        | "/api/documents/show"
+        | "/api/documents/export"
+        | "/api/templates/sample" => {
+            let route = business_templates::route(&path).expect("route listed above");
+            match operator::admit_operator_read(&request, state_dir, opts) {
+                Ok(()) => send(
+                    request,
+                    business_templates::handle_read(state_dir, route, raw_query),
+                ),
+                Err(resp) => send(request, resp),
+            }
+        }
+        // CAD-1218: whether the shown head has an approval (drawer state).
+        "/api/approvals/state" => {
+            let resp = approvals::state(&request, state_dir, opts, raw_query);
+            send(request, resp);
+        }
         // CAD-615: the operator's master permission rules and pending
         // requests. The board relays over its own daemon connection, so
         // the HTTP peer is admitted here — the same operator proof as
         // the decision writes.
+        // CAD-1374: the owner activity trail. The operator proof gates the
+        // local path; a public-host request also carries its server-held
+        // session, which the daemon re-checks as the owner role.
+        "/api/activity" | "/api/activity/export" => {
+            let method = if path == "/api/activity" {
+                "activity_query"
+            } else {
+                "activity_export"
+            };
+            let resp = match activity_get(&request, state_dir, opts, raw_query, method) {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            };
+            send(request, resp);
+        }
         "/api/master/permissions" => {
             if let Err(resp) = operator::admit_operator_read(&request, state_dir, opts) {
                 send(request, resp);
@@ -1110,35 +1826,46 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             );
         }
         "/api/health" => {
-            let pm = Pm::at(pm_dir).ok();
-            let (projects, issues) = match &pm {
-                Some(pm) => {
-                    let p = project::list(&pm.dir).map(|l| l.len()).unwrap_or(0);
-                    let i = board::load_all(&pm.dir, None).map(|l| l.len()).unwrap_or(0);
-                    (p, i)
+            // Health probes are public, but the workspace projection is
+            // not. Keep authenticated status chips truthful without
+            // leaking tracker paths/counts to an unsigned probe.
+            let admitted = match operator::admit_read(&request, state_dir, opts) {
+                Ok(_) => true,
+                Err(resp) if resp.status_code().0 == 401 => false,
+                Err(resp) => {
+                    send(request, resp);
+                    return;
                 }
-                None => (0, 0),
             };
-            let daemon = if client::rpc(state_dir, "health", json!({})).is_ok() {
-                "reachable"
-            } else {
-                "unreachable"
-            };
-            send(
-                request,
-                json_response(json!({
-                    "ok": true,
-                    "pm_dir": pm.as_ref().map(|p| p.dir.clone()),
-                    "pm_present": pm.is_some(),
-                    "projects": projects, "issues": issues,
-                    "daemon": daemon,
-                    "embedded": cfg!(feature = "ui"),
-                    // CAD-561: which build is answering, so
-                    // `cadence update`'s health check can require the
-                    // board to come back on the new release.
-                    "build": crate::overview::BUILD_COMMIT,
-                })),
-            );
+            let mut health = json!({
+                "ok": true,
+                "embedded": cfg!(feature = "ui"),
+                "build": crate::overview::BUILD_COMMIT,
+            });
+            if admitted {
+                let pm = Pm::at(pm_dir).ok();
+                let (projects, issues) = match &pm {
+                    Some(pm) => (
+                        project::list(&pm.dir).map(|list| list.len()).unwrap_or(0),
+                        board::load_all(&pm.dir, None)
+                            .map(|list| list.len())
+                            .unwrap_or(0),
+                    ),
+                    None => (0, 0),
+                };
+                let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+                let daemon = if budget.read(state_dir, "health", json!({})).is_ok() {
+                    "reachable"
+                } else {
+                    "unreachable"
+                };
+                health["pm_dir"] = json!(pm.as_ref().map(|pm| &pm.dir));
+                health["pm_present"] = json!(pm.is_some());
+                health["projects"] = json!(projects);
+                health["issues"] = json!(issues);
+                health["daemon"] = json!(daemon);
+            }
+            send(request, json_response(health));
         }
         "/api/setup" => {
             // Refused before anything runs: no probe for a viewer.
@@ -1179,14 +1906,57 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     }
                 }
             }
-            send(request, json_response(overview))
+            let actor = match read_admission
+                .as_ref()
+                .map(|a| operator::read_actor(a, &request, state_dir, opts))
+            {
+                Some(Ok(actor)) => actor,
+                Some(Err(resp)) => {
+                    send(request, resp);
+                    return;
+                }
+                None => {
+                    send(request, err_response(503, "read admission is missing"));
+                    return;
+                }
+            };
+            match Pm::at(pm_dir) {
+                Ok(pm) => {
+                    let readable = super::project_policy::readable(&pm, &actor);
+                    super::project_policy::retain_overview(&mut overview, &readable);
+                    send(request, json_response(overview));
+                }
+                Err(e) => send(request, err_response(503, &e.to_string())),
+            }
         }
         "/api/projects" => match Pm::at(pm_dir) {
             Ok(pm) => {
-                send(
-                    request,
-                    json_response(read_model::get(state_dir, pm_dir).projects(&pm)),
-                );
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(resp)) => {
+                        send(request, resp);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                // AOS-274: a project this caller may not read contributes
+                // no row, and no issue count, to the listing.
+                let readable = super::project_policy::readable(&pm, &actor);
+                let mut payload = read_model::get(state_dir, pm_dir).projects(&pm);
+                if let Some(rows) = payload.get_mut("projects").and_then(|v| v.as_array_mut()) {
+                    rows.retain(|row| {
+                        row.get("key")
+                            .and_then(|k| k.as_str())
+                            .is_some_and(|key| readable.contains(key))
+                    });
+                }
+                send(request, json_response(payload));
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
         },
@@ -1222,16 +1992,35 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 // CAD-405: each card carries its `work` block.
                 let by_id = read.by_id();
                 let ctx = read.ctx(&by_id);
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(resp)) => {
+                        send(request, resp);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                // AOS-274: filter before the slice and the card, so a
+                // restricted project contributes no row or count.
+                let readable = super::project_policy::readable(&pm, &actor);
+                let body = cadence_core::board_api::IssuesResponse {
+                    issues: read
+                        .views
+                        .iter()
+                        .filter(|v| slice.matches(v) && readable.contains(&v.issue.project))
+                        .map(|v| read.card_item(&ctx, v))
+                        .collect(),
+                    freshness: read.freshness.clone(),
+                };
                 send(
                     request,
-                    json_response(json!({
-                        "issues": read
-                            .views
-                            .iter()
-                            .filter(|v| slice.matches(v))
-                            .map(|v| read.card(&ctx, v))
-                            .collect::<Vec<_>>(),
-                    })),
+                    json_response(serde_json::to_value(body).expect("issues serialize")),
                 );
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
@@ -1245,14 +2034,37 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, err_response(400, "bad project key"));
                     return;
                 }
-                // Every project loads so cross-project children count.
+                // Every project loads so cross-project children count, so
+                // the caller's readable set is applied to the view slice
+                // first: a restricted project contributes no epic, child
+                // or count.
                 let read = read_model::get(state_dir, pm_dir).board(&pm, None);
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(resp)) => {
+                        send(request, resp);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                let readable = super::project_policy::readable(&pm, &actor);
+                let visible: Vec<&crate::issue::board::View> = read
+                    .views
+                    .iter()
+                    .filter(|v| readable.contains(&v.issue.project))
+                    .collect();
                 send(
                     request,
                     json_response(json!({
                         "epics": crate::issue::work::epics_json(
                             &pm.dir,
-                            &read.views,
+                            &visible,
                             filter.as_deref(),
                             crate::issue::time::now_epoch(),
                             &read.approvals,
@@ -1266,10 +2078,16 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             request,
             stages::milestones(state_dir, pm_dir, query("project").as_deref()),
         ),
-        "/api/agents" => send(
-            request,
-            json_response(read_model::get(state_dir, pm_dir).agents()),
-        ),
+        "/api/agents" => {
+            // CAD-1767: running-message text is the operator's; anyone else
+            // (fail closed) gets the allowlisted rows.
+            let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
+            let mut payload = read_model::get(state_dir, pm_dir).agents();
+            if !operator {
+                redact_agents_payload(&mut payload);
+            }
+            send(request, json_response(payload))
+        }
         // CAD-546: the `local` platform's outbox — an operator-only
         // read, the same proof the board's operator write routes take.
         "/api/outbox" => {
@@ -1328,7 +2146,34 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             if head_only {
                 send(request, err_response(405, "stream is GET only"));
             } else {
-                stream_events(request, state_dir, pm_dir);
+                let admission = read_admission.expect("private stream admission");
+                // AOS-274: the stream is one shared, unfiltered frame
+                // source. A caller who cannot read every project is
+                // refused live updates rather than served rows and
+                // counts from projects it may not see.
+                let complete = match Pm::at(pm_dir) {
+                    Ok(pm) => match operator::read_actor(&admission, &request, state_dir, opts) {
+                        Ok(actor) => super::project_policy::reads_every_project(&pm, &actor),
+                        Err(resp) => {
+                            send(request, resp);
+                            return;
+                        }
+                    },
+                    // Fail closed when the tracker cannot be read.
+                    Err(_) => false,
+                };
+                if !complete {
+                    send(
+                        request,
+                        err_response(
+                            403,
+                            "live updates are unavailable for a project-restricted workspace",
+                        ),
+                    );
+                    return;
+                }
+                let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
+                stream_events(request, state_dir, pm_dir, admission, operator);
             }
         }
         _ => {
@@ -1363,15 +2208,40 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     match Pm::at(pm_dir) {
                         Ok(pm) => match project::list(&pm.dir) {
                             Ok(projects) => match projects.iter().find(|p| p.key == key) {
-                                Some(selected) => send(
-                                    request,
-                                    json_response(context::bundle(
-                                        &pm,
-                                        selected,
-                                        role.as_deref(),
-                                        expected_revision.as_deref(),
-                                    )),
-                                ),
+                                Some(selected) => {
+                                    let actor = match read_admission
+                                        .as_ref()
+                                        .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                                    {
+                                        Some(Ok(actor)) => actor,
+                                        Some(Err(resp)) => {
+                                            send(request, resp);
+                                            return;
+                                        }
+                                        None => {
+                                            send(
+                                                request,
+                                                err_response(503, "read admission is missing"),
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    // AOS-274: a restricted project answers
+                                    // like an absent one, with no bundle.
+                                    if super::project_policy::refused(&pm, &selected.key, &actor) {
+                                        send(request, err_response(404, "unknown project"));
+                                        return;
+                                    }
+                                    send(
+                                        request,
+                                        json_response(context::bundle(
+                                            &pm,
+                                            selected,
+                                            role.as_deref(),
+                                            expected_revision.as_deref(),
+                                        )),
+                                    )
+                                }
                                 None => send(request, err_response(404, "unknown project")),
                             },
                             Err(error) => send(request, err_response(503, &error.to_string())),
@@ -1412,8 +2282,21 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 send(request, app_chat::handle(state_dir, install));
                 return;
             }
-            if let Some(route) = app_assistant::route(&path) {
-                if !route.is_read() {
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                app_assistant::route(&path),
+                operator::admit_operator_read,
+                |req, route| app_assistant::handle(req, state_dir, route, raw_query),
+            ) {
+                send(request, response);
+                return;
+            }
+            // CAD-1177: operator read of retained standalone tool receipts
+            // for one installation — same operator-read gate as app reads.
+            if app_screens::tool_results_route(&path) {
+                if method != Method::Get {
                     send(request, err_response(405, "method not allowed"));
                     return;
                 }
@@ -1421,161 +2304,126 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, response);
                     return;
                 }
-                let response = app_assistant::handle(&mut request, state_dir, route, raw_query);
+                let response = app_screens::tool_results(&request, state_dir);
                 send(request, response);
                 return;
             }
-            if let Some(route) = app_contexts::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = app_contexts::handle(&mut request, state_dir, route, false);
+            // CAD-1537: a member's screen needs the context receipt.
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                app_contexts::route(&path),
+                screen_read_only,
+                |req, route| app_contexts::handle(req, state_dir, route, false),
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = app_audiences::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = app_audiences::handle(&mut request, state_dir, route, false);
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                app_audiences::route(&path),
+                operator::admit_operator_read,
+                |req, route| app_audiences::handle(req, state_dir, route, false),
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = app_records::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = app_records::handle(&mut request, state_dir, route, false);
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                app_records::route(&path),
+                operator::admit_operator_read,
+                |req, route| {
+                    app_records::handle(
+                        req,
+                        state_dir,
+                        route,
+                        false,
+                        operator::PublicRelay::NotPublic,
+                    )
+                },
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = app_content::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = app_content::handle(&mut request, state_dir, route, false);
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                app_content::route(&path),
+                operator::admit_operator_read,
+                |req, route| {
+                    app_content::handle(
+                        req,
+                        state_dir,
+                        route,
+                        false,
+                        operator::PublicRelay::NotPublic,
+                    )
+                },
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = connections::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = connections::handle(&mut request, state_dir, route, false);
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                connections::route(&path),
+                operator::admit_operator_read,
+                |req, route| connections::handle(req, state_dir, route, false),
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = crm_send::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = crm_send::handle_read(state_dir, route, &query);
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                crm_send::route(&path),
+                operator::admit_operator_read,
+                |_, route| crm_send::handle_read(state_dir, route, &query),
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = app_release::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = app_release::handle(&mut request, state_dir, route, false);
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                app_release::route(&path),
+                operator::admit_operator_read,
+                |req, route| {
+                    let relay = operator::public_relay(req, opts);
+                    app_release::handle_with_relay(req, state_dir, route, false, relay, opts)
+                },
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = app_runs::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = app_runs::handle(&mut request, state_dir, route, false);
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                app_runs::route(&path),
+                operator::admit_operator_read,
+                |req, route| app_runs::handle(req, state_dir, route, false, opts),
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = social_publish::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = social_publish::handle(&mut request, state_dir, route, false);
-                send(request, response);
-                return;
-            }
-            // CAD-1098: `/api/app-installations/<id>/conversations` — the
-            // master's conversations for that installation.
-            if let Some(install) = path
-                .strip_prefix("/api/app-installations/")
-                .and_then(|tail| tail.strip_suffix("/conversations"))
-                .filter(|id| !id.is_empty() && !id.contains('/'))
-            {
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response =
-                    threads::conversations(state_dir, crate::master::ALIAS, &|key: &str| {
-                        (key == "install").then(|| install.to_string())
-                    });
-                send(request, response);
-                return;
-            }
-            if path == "/api/app-installations"
-                || path
-                    .strip_prefix("/api/app-installations/")
-                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
-            {
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let id = path.strip_prefix("/api/app-installations/");
-                let method = if id.is_some() {
-                    "app_workspace_show"
-                } else {
-                    "app_workspace_list"
-                };
-                let response = apps::workspace(&mut request, state_dir, method, id);
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                social_publish::route(&path),
+                operator::admit_operator_read,
+                |req, route| social_publish::handle(req, state_dir, route, false),
+            ) {
                 send(request, response);
                 return;
             }
@@ -1645,35 +2493,55 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             }
             // `/api/master/state` — the header chips + turn state (CAD-551).
             if path == "/api/master/state" {
-                send(request, home::master_state(state_dir));
+                // CAD-1767: only a proven operator reads the turn's text.
+                let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
+                send(request, home::master_state(state_dir, operator));
                 return;
+            }
+            // CAD-819: the cross-agent work conversation view (read-only).
+            if let Some(id) = work_conversations::route(&path) {
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
+                if id.is_empty() {
+                    send(request, work_conversations::list(state_dir, &query));
+                } else {
+                    send(request, work_conversations::read(state_dir, id, &query));
+                }
+                return;
+            }
+            // CAD-810: a topic's transcript and per-subscriber receipts (read-only).
+            if let Some((id, None)) = topics::route(&path) {
+                if !id.is_empty() {
+                    if let Err(response) = operator::admit_operator_read(&request, state_dir, opts)
+                    {
+                        send(request, response);
+                        return;
+                    }
+                    send(request, topics::read(state_dir, id, &query));
+                    return;
+                }
             }
             // `/api/threads/<alias>[/stream]` — an agent's chat (CAD-319).
             if let Some((alias, sub)) = threads::route(&path) {
+                // CAD-1767: only a proven operator reads a thread whole; every
+                // other reader gets the member view (fail closed).
+                let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
                 match sub {
-                    None => send(request, threads::read(state_dir, alias, &query)),
+                    None => send(request, threads::read(state_dir, alias, &query, operator)),
                     Some("stream") if head_only => {
                         send(request, err_response(405, "stream is GET only"))
                     }
-                    Some("stream") => threads::stream(request, state_dir, alias, &query),
+                    Some("stream") => threads::stream(
+                        request,
+                        state_dir,
+                        alias,
+                        &query,
+                        read_admission.expect("private stream admission"),
+                        operator,
+                    ),
                     Some(_) => send(request, err_response(404, "no such thread route")),
-                }
-                return;
-            }
-            // `/api/agents/<alias>` — the drawer detail endpoint.
-            if let Some(alias) = path.strip_prefix("/api/agents/") {
-                if alias.is_empty()
-                    || alias.len() > 80
-                    || !alias
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-                {
-                    send(request, err_response(400, "bad agent alias"));
-                    return;
-                }
-                match agent_detail(state_dir, alias) {
-                    Ok(detail) => send(request, json_response(detail)),
-                    Err(e) => send(request, err_response(404, &e)),
                 }
                 return;
             }
@@ -1706,6 +2574,26 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                             send(request, err_response(404, "unknown issue"));
                             return;
                         };
+                        // AOS-274: a restricted project answers like an
+                        // absent issue, without naming the project.
+                        let actor = match read_admission
+                            .as_ref()
+                            .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                        {
+                            Some(Ok(actor)) => actor,
+                            Some(Err(resp)) => {
+                                send(request, resp);
+                                return;
+                            }
+                            None => {
+                                send(request, err_response(503, "read admission is missing"));
+                                return;
+                            }
+                        };
+                        if super::project_policy::refused(&pm, &view.issue.project, &actor) {
+                            send(request, err_response(404, "unknown issue"));
+                            return;
+                        }
                         match sub {
                             Some("kickoff") => {
                                 let resp = home::kickoff_options(&request, state_dir, opts, &id);
@@ -1714,11 +2602,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                             None => send(
                                 request,
                                 json_response(with_agents(
-                                    crate::issue::work::detail_json(
-                                        &pm.dir,
-                                        &read.ctx(&by_id),
-                                        view,
-                                    ),
+                                    crate::issue::work::detail(&pm.dir, &read.ctx(&by_id), view),
                                     &read.by_issue,
                                     &id,
                                 )),
@@ -1790,16 +2674,26 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 opts.dist.as_deref(),
                 &path,
                 header_value(&request, "Accept").as_deref(),
+                header_value(&request, "Accept-Encoding").as_deref(),
             ) {
-                StaticAnswer::File(name, bytes) => {
+                StaticAnswer::File(name, bytes, encoding) => {
                     let mut resp = Response::from_data(bytes);
                     resp.add_header(
                         Header::from_bytes("Content-Type", content_type(&name)).unwrap(),
                     );
                     resp.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
+                    // Raw and compressed answers differ on this header,
+                    // so it varies every file answer, not only the coded one.
+                    resp.add_header(Header::from_bytes("Vary", "Accept-Encoding").unwrap());
+                    if let Some(encoding) = encoding {
+                        resp.add_header(Header::from_bytes("Content-Encoding", encoding).unwrap());
+                    }
                     send(request, resp);
                 }
                 StaticAnswer::Missing => send(request, err_response(404, "no such file")),
+                StaticAnswer::NotAcceptable => {
+                    send(request, err_response(406, "no acceptable content encoding"))
+                }
                 StaticAnswer::NoBuild => send(
                     request,
                     err_response(
@@ -1850,12 +2744,59 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     } else {
         Default::default()
     };
+    // CAD-1283 test seam: pause before the actual bind so a driver can
+    // hold this start's port and reproduce a native AddrInUse collision.
+    // Delays only `Server::http` below — nonce, identity, pid and
+    // readiness proofs are unchanged, and no failure is fabricated.
+    // Compiled only under the `test-seam` feature, which release builds
+    // refuse (CAD-482). Valid range 1..=1000 ms.
+    #[cfg(feature = "test-seam")]
+    if let Ok(ms) = std::env::var("CADENCE_TEST_UI_BIND_DELAY_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            if (1..=1000).contains(&ms) {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+        }
+    }
     let server = Server::http(format!("{}:{}", opts.host, opts.port)).map_err(|e| {
+        let kind = e
+            .downcast_ref::<std::io::Error>()
+            .map_or(std::io::ErrorKind::Other, std::io::Error::kind);
         if let Some(startup) = opts.startup.take() {
-            let kind = e
-                .downcast_ref::<std::io::Error>()
-                .map_or(std::io::ErrorKind::Other, std::io::Error::kind);
             let _ = startup.send(Err(kind));
+        }
+        // CAD-1283: an actual AddrInUse with this start's nonce writes
+        // `ui.startup-failed-{pid}` — the only writer — so `ui start`
+        // can classify its dead child's failure as typed evidence
+        // rather than a log substring. The path is scoped to this
+        // process's own pid: `create_new` refuses any existing path
+        // (stale record under a reused pid, foreign file, symlink,
+        // FIFO, dir) and leaves it untouched — no temp, no rename, no
+        // overwrite, no unlink; O_NOFOLLOW refuses a planted symlink.
+        // A partial or malformed frame reads as false to the consumer,
+        // which only ever reads after its own child exited. Absent or
+        // unwritable nonce/dir records nothing (a `ui run` with no
+        // starter proves nothing to anyone).
+        if kind == std::io::ErrorKind::AddrInUse {
+            if let Some(nonce) = opts.ready_nonce.as_ref() {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let frame = json!({
+                    "pid": std::process::id(),
+                    "nonce": nonce,
+                    "kind": "addr_in_use",
+                });
+                let path = startup_failed_file(state_dir, std::process::id());
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(path)
+                {
+                    let _ = f.write_all(frame.to_string().as_bytes());
+                }
+            }
         }
         Error::internal(format!("ui bind {}:{}: {e}", opts.host, opts.port))
     })?;
@@ -1906,7 +2847,23 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     // that spawned this board. A bind failure above never writes it, so
     // the waiting start sees the dead child plus its ui.log, not a
     // foreign board's health answer (CAD-817).
-    if let Some(nonce) = &opts.ready_nonce {
+    // CAD-1207 test seam: a board that binds but never proves readiness,
+    // so `ui start`'s timeout path can be exercised. Compiled only under
+    // the `test-seam` feature, which release builds refuse (CAD-482).
+    #[cfg(feature = "test-seam")]
+    let withhold_ready = std::env::var_os("CADENCE_TEST_UI_WITHHOLD_READY").is_some();
+    #[cfg(not(feature = "test-seam"))]
+    let withhold_ready = false;
+    // CAD-1251 test seam: a board whose readiness report comes late (a
+    // loaded host's slow cold start), in milliseconds.
+    #[cfg(feature = "test-seam")]
+    if let Some(ms) = std::env::var("CADENCE_TEST_UI_READY_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+    if let Some(nonce) = opts.ready_nonce.as_ref().filter(|_| !withhold_ready) {
         let marker = json!({"pid": std::process::id(), "nonce": nonce});
         // A `ui.json` save owns `ui.tmp`; keep the marker's sidecar apart.
         let tmp = ready_file(state_dir).with_extension("ready.tmp");
@@ -1943,20 +2900,363 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
             // unrelated board write. Safe: their only shared state is
             // the pending map under its own mutex, and the daemon
             // serializes the mint itself.
-            let is_write = matches!(
-                request.method(),
-                Method::Post | Method::Patch | Method::Delete
-            ) && !matches!(
-                request.url().split('?').next().unwrap_or(""),
-                "/api/session/device/code" | "/api/session/device/poll"
-            );
-            if is_write {
-                let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                handle(request, &state_dir, &pm_dir, &opts);
+            if serialized_write(request.method(), request.url()) {
+                if let Some(busy) =
+                    run_serialized_write(request, &state_dir, &pm_dir, &opts, WRITE_LOCK_WAIT)
+                {
+                    // A writer that never returns must not queue the board
+                    // behind it: answer the retryable refusal the client
+                    // already renders as busy (CAD-1653).
+                    let _ = busy.respond(board_busy_response());
+                }
             } else {
                 handle(request, &state_dir, &pm_dir, &opts);
             }
         });
     }
     Ok(())
+}
+
+/// CAD-1374: the owner activity GET. Refuses before any RPC unless the
+/// caller is the local operator or a live board owner. The params come only
+/// from the allowlisted query fields; the public session is server-held.
+fn activity_get(
+    request: &Request,
+    state_dir: &Path,
+    opts: &ServeOpts,
+    raw_query: &str,
+    method: &str,
+) -> std::result::Result<HttpResp, HttpResp> {
+    // A live named session (owner or member) reaches the daemon, which
+    // checks the owner role and records a member refusal. Missing, invalid
+    // or stolen proofs still fail closed in `board_caller`.
+    let what = format!(
+        "GET {}",
+        request.url().split('?').next().unwrap_or_default()
+    );
+    let caller = operator::board_caller(request, state_dir, opts, false, None)?;
+    match &caller {
+        operator::Caller::Agent(alias) => {
+            return Err(super::write_path::guard_fail(
+                "operator_only",
+                &format!(
+                    "{what} is the operator's decision — this request comes from agent '{alias}'"
+                ),
+            ))
+        }
+        operator::Caller::Operator(_) => {
+            super::home::prove_operator_peer(request, state_dir, opts, &what, None)?
+        }
+        operator::Caller::Named(_) => {}
+    }
+    let mut params = activity_params(raw_query).map_err(|e| err_response(400, e))?;
+    let relay = operator::public_relay(request, opts);
+    operator::relay_owner_proof(&mut params, relay)?;
+    match client::rpc(state_dir, method, params) {
+        Ok(out) => Ok(json_response(out)),
+        Err(e) => Err(home::rpc_err(&e, method)),
+    }
+}
+
+/// The allowlisted activity query fields, decoded from the request query.
+/// Unknown keys refuse, so nothing a browser names reaches the daemon.
+fn activity_params(raw_query: &str) -> std::result::Result<Value, &'static str> {
+    let mut out = serde_json::Map::new();
+    for raw_pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
+        let (raw_key, raw_value) = raw_pair
+            .split_once('=')
+            .ok_or("activity query values must use key=value")?;
+        let key = pct_decode(raw_key).ok_or("malformed activity query")?;
+        let value = pct_decode(raw_value).ok_or("malformed activity query")?;
+        if out.contains_key(&key) {
+            return Err("duplicate activity query field");
+        }
+        match key.as_str() {
+            "sub" | "action" | "target" | "outcome" | "cursor" => {
+                out.insert(key, Value::String(value));
+            }
+            "from" | "until" => {
+                let n: f64 = value
+                    .parse()
+                    .map_err(|_| "activity time must be a UTC epoch")?;
+                if !n.is_finite() {
+                    return Err("activity time must be a UTC epoch");
+                }
+                out.insert(key, json!(n));
+            }
+            "limit" => {
+                let n: u64 = value
+                    .parse()
+                    .map_err(|_| "activity limit must be an integer")?;
+                out.insert(key, json!(n));
+            }
+            _ => return Err("unknown activity query field"),
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+#[cfg(test)]
+mod read_admit_tests {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Probe {
+        Read,
+        Write,
+    }
+
+    impl ReadRoute for Probe {
+        fn is_read_route(&self) -> bool {
+            *self == Probe::Read
+        }
+    }
+
+    fn admit(_: &Request, _: &Path, _: &ServeOpts) -> std::result::Result<(), HttpResp> {
+        Ok(())
+    }
+
+    fn refuse(_: &Request, _: &Path, _: &ServeOpts) -> std::result::Result<(), HttpResp> {
+        Err(err_response(403, "refused"))
+    }
+
+    fn request() -> Request {
+        tiny_http::TestRequest::new().with_path("/api/probe").into()
+    }
+
+    #[test]
+    fn no_matched_route_continues_the_chain() {
+        let mut request = request();
+        let response = read_admit::<Probe>(
+            &mut request,
+            Path::new("/nonexistent"),
+            &ServeOpts::default(),
+            None,
+            admit,
+            |_, _| panic!("handler must not run without a route"),
+        );
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn a_write_route_is_405_before_any_guard_or_handler() {
+        fn must_not_admit(
+            _: &Request,
+            _: &Path,
+            _: &ServeOpts,
+        ) -> std::result::Result<(), HttpResp> {
+            panic!("admission ran before the 405")
+        }
+
+        let mut request = request();
+        let response = read_admit(
+            &mut request,
+            Path::new("/nonexistent"),
+            &ServeOpts::default(),
+            Some(Probe::Write),
+            must_not_admit,
+            |_, _| panic!("handler must not run for a write route"),
+        )
+        .expect("a matched route answers");
+        assert_eq!(response.status_code(), StatusCode(405));
+    }
+
+    #[test]
+    fn a_refused_read_never_reaches_the_handler() {
+        let mut request = request();
+        let response = read_admit(
+            &mut request,
+            Path::new("/nonexistent"),
+            &ServeOpts::default(),
+            Some(Probe::Read),
+            refuse,
+            |_, _| panic!("handler must not run for a refused caller"),
+        )
+        .expect("a matched route answers");
+        assert_eq!(response.status_code(), StatusCode(403));
+    }
+
+    #[test]
+    fn the_real_operator_read_guard_refuses_an_anonymous_caller() {
+        let state = tempfile::tempdir().expect("temporary state directory");
+        let mut request = request();
+        let response = read_admit(
+            &mut request,
+            state.path(),
+            &ServeOpts::default(),
+            Some(Probe::Read),
+            operator::admit_operator_read,
+            |_, _| panic!("handler must not run for an anonymous caller"),
+        )
+        .expect("a matched route answers");
+        assert_ne!(response.status_code(), StatusCode(200));
+        assert_ne!(response.status_code(), StatusCode(405));
+    }
+
+    #[test]
+    fn an_admitted_read_reaches_its_handler_once() {
+        let mut request = request();
+        let mut calls = 0;
+        let response = read_admit(
+            &mut request,
+            Path::new("/nonexistent"),
+            &ServeOpts::default(),
+            Some(Probe::Read),
+            admit,
+            |_, route| {
+                calls += 1;
+                assert_eq!(route, Probe::Read);
+                json_response(json!({"ok": true}))
+            },
+        )
+        .expect("a matched route answers");
+        assert_eq!(calls, 1);
+        assert_eq!(response.status_code(), StatusCode(200));
+    }
+}
+
+#[cfg(test)]
+mod write_lock_tests {
+    use super::*;
+
+    #[test]
+    fn a_held_writer_answers_after_its_budget() {
+        let held = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let started = Instant::now();
+        assert!(acquire_write_lock(Duration::from_millis(50)).is_none());
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        drop(held);
+        assert!(acquire_write_lock(Duration::from_millis(50)).is_some());
+    }
+
+    #[test]
+    fn a_busy_board_answers_a_retryable_refusal() {
+        let response = board_busy_response();
+        assert_eq!(response.status_code(), StatusCode(503));
+        assert!(
+            response
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("Retry-After")),
+            "a busy board must tell the client when to retry"
+        );
+    }
+
+    #[test]
+    fn every_write_method_is_serialized_including_put() {
+        for method in [Method::Post, Method::Patch, Method::Delete, Method::Put] {
+            assert!(
+                serialized_write(&method, "/api/wiki/items/x/files/y"),
+                "{method:?} writes and must take the one writer"
+            );
+        }
+        for method in [Method::Get, Method::Head] {
+            assert!(
+                !serialized_write(&method, "/api/health"),
+                "{method:?} is a read"
+            );
+        }
+        for path in ["/api/session/device/code", "/api/session/device/poll"] {
+            assert!(
+                !serialized_write(&Method::Post, path),
+                "{path} stays exempt"
+            );
+            assert!(
+                !serialized_write(&Method::Post, &format!("{path}?retry=1")),
+                "a query string does not bypass the exemption"
+            );
+        }
+        assert!(serialized_write(&Method::Post, "/api/session"));
+    }
+
+    #[test]
+    fn a_busy_writer_returns_the_request_without_dispatching() {
+        let state = tempfile::tempdir().expect("state dir");
+        let pm = tempfile::tempdir().expect("pm dir");
+        let request = || -> Request {
+            tiny_http::TestRequest::new()
+                .with_method(Method::Post)
+                .with_path("/api/locale")
+                .into()
+        };
+
+        let held = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let refused = run_serialized_write(
+            request(),
+            state.path(),
+            pm.path(),
+            &ServeOpts::default(),
+            Duration::from_millis(50),
+        );
+        assert!(refused.is_some(), "a held writer must not dispatch");
+        drop(held);
+
+        assert!(
+            run_serialized_write(
+                request(),
+                state.path(),
+                pm.path(),
+                &ServeOpts::default(),
+                Duration::from_millis(50),
+            )
+            .is_none(),
+            "a free writer dispatches and consumes the request"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_lock_is_still_acquired() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            panic!("poison the board's write lock");
+        });
+        assert!(poisoned.join().is_err());
+        let guard = acquire_write_lock(Duration::from_millis(50));
+        assert!(guard.is_some(), "a poisoned lock is recovered, as before");
+    }
+}
+
+#[cfg(test)]
+mod read_dispatch_tests {
+    use super::*;
+
+    /// The table's own tests call `bound.invalid()` directly, which is how
+    /// CAD-1696's validators stayed declared-but-unenforced until CAD-1718.
+    /// This drives the dispatcher, so removing the call there fails here
+    /// (mutation-checked: without it the response is 404 from `agent_detail`).
+    #[test]
+    fn a_failing_validator_answers_before_the_handler() {
+        let state = tempfile::tempdir().expect("state dir");
+        let mut request: Request = tiny_http::TestRequest::new()
+            .with_path("/api/agents/")
+            .into();
+        let bound =
+            endpoints::resolve("GET", "/api/agents/").expect("the row binds an empty alias");
+        assert!(
+            bound.invalid().is_some(),
+            "precondition: the empty alias fails its validator"
+        );
+
+        let response = read_dispatch(&mut request, state.path(), &ServeOpts::default(), bound);
+
+        // The row's own pair, not a generic status, and never `agent_detail`.
+        assert_eq!(response.status_code(), StatusCode(400));
+    }
+
+    /// The fail-closed arm of the class mapping: a read row declared with a
+    /// write-only class is refused, never admitted with no guard.
+    #[test]
+    fn a_read_row_with_a_write_only_class_is_refused() {
+        let state = tempfile::tempdir().expect("state dir");
+        let request: Request = tiny_http::TestRequest::new().with_path("/x").into();
+        for class in [
+            operator::RouteClass::Session,
+            operator::RouteClass::RecipientToken,
+            operator::RouteClass::Refused,
+        ] {
+            let response = table_read_guard(class, &request, state.path(), &ServeOpts::default())
+                .expect_err("a write-only class cannot guard a read");
+            assert_eq!(response.status_code(), StatusCode(500), "{class:?}");
+        }
+    }
 }

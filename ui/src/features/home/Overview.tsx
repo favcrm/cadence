@@ -1,5 +1,6 @@
 import SafeLink from "../../ui/SafeLink";
 import { useWriteBlock } from "../auth/WriteGate";
+import { useTranslate } from "../../lib/locale";
 import { exclusionLabel, issueCounts, statusBreakdown } from "../../lib/counts";
 import type { ResourceState } from "../../lib/cache";
 import type {
@@ -69,6 +70,7 @@ function isGlobalProject(value: string | null | undefined): boolean {
 /** Sections come from the server-resolved `audience` (CAD-253); with
  *  `decision`, "Needs your decision" always shows, empty or not. */
 export function NeedRows({ rows, decision }: { rows: Overview["needs_me"]; decision: boolean }) {
+  const t = useTranslate();
   const grouped = needSections(rows, decision);
   return (
     <div className="space-y-3">
@@ -120,11 +122,11 @@ export function NeedRows({ rows, decision }: { rows: Overview["needs_me"]; decis
                 </span>
                 <details className="basis-full sm:basis-auto sm:ml-auto min-w-0">
                   <summary className="cursor-pointer text-micro text-accent list-none hover:underline">
-                    details
+                    {t("details")}
                   </summary>
                   <div className="mt-1.5 rounded border border-ink-700 bg-ink-900 px-2.5 py-2 text-micro text-ink-400">
-                    <div className="text-ink-300">kind {n.kind} · observed {age(n.age)} ago · source {n.project || "global host"}</div>
-                    {n.audience_reason && <div className="text-ink-300">for {n.audience} · {n.audience_reason}</div>}
+                    <div className="text-ink-300">{t("kind")} {n.kind} · {t("observed")} {age(n.age)} {t("ago")} · {t("source")} {n.project || t("global host")}</div>
+                    {n.audience_reason && <div className="text-ink-300">{t("for")} {n.audience} · {n.audience_reason}</div>}
                     <code className="num block mt-1 whitespace-pre-wrap break-words">{n.command}</code>
                   </div>
                 </details>
@@ -148,35 +150,36 @@ function MonitoringView({
   readOnly: boolean;
   onAck: (monitor: string, seq: number) => void;
 }) {
+  const t = useTranslate();
   const monitors = data.monitors.filter((monitor) => projectMatches(monitor.project, project));
   const globalMonitors = data.monitors.filter((monitor) => isGlobalProject(monitor.project));
   const alerts = data.alerts.filter((alert) => projectMatches(alert.project, project));
   const globalAlerts = data.alerts.filter((alert) => isGlobalProject(alert.project));
   return (
     <section>
-      <div className="slabel mb-2">coordinator</div>
+      <div className="slabel mb-2">{t("coordinator")}</div>
       <div className="card px-4 py-3.5 space-y-3">
         <div className="flex flex-wrap items-center gap-2">
           <span
             className={`chip ${MONITOR_STATE_CHIP[data.state] ?? "bg-ink-800 text-ink-400"}`}
           >
-            monitor {data.state}
+            {t("monitor")} {data.state}
           </span>
           <span className="text-label text-ink-400">
-            last successful scan: {when(data.last_success_at)}
+            {t("last successful scan:")} {when(data.last_success_at)}
           </span>
           <span className="text-micro text-ink-500">
-            next reconciliation: {when(data.next_check_at)}
+            {t("next reconciliation:")} {when(data.next_check_at)}
           </span>
         </div>
 
         <div className="text-micro text-ink-500">
-          local UI visibility only — external push delivery is unconfigured
+          {t("local UI visibility only — external push delivery is unconfigured")}
         </div>
 
         {!data.available && (
           <div className="text-label text-warn">
-            monitor RPC unavailable; persistent monitor health cannot be confirmed
+            {t("monitor RPC unavailable; persistent monitor health cannot be confirmed")}
           </div>
         )}
         {data.errors.map((e, i) => (
@@ -198,15 +201,15 @@ function MonitoringView({
                   {monitor.monitoring}
                 </span>
                 <span className="num text-ink-300">{monitor.id}</span>
-                <span className="text-ink-500">owner {monitor.owner}</span>
+                <span className="text-ink-500">{t("owner")} {monitor.owner}</span>
                 <span className="text-ink-600">
-                  dispatch {monitor.auto_dispatch_enabled ? "automatic opt-in" : monitor.dispatch_enabled ? "manual" : "off"}
+                  {t("dispatch")} {monitor.auto_dispatch_enabled ? t("automatic opt-in") : monitor.dispatch_enabled ? t("manual") : t("off")}
                 </span>
                 <span className="text-ink-500">
-                  scan {when(monitor.last_success_at)} · last check {when(monitor.last_check_at)}
+                  {t("scan")} {when(monitor.last_success_at)} · {t("last check")} {when(monitor.last_check_at)}
                 </span>
                 <span className="text-ink-600">
-                  heartbeat {when(monitor.heartbeat_at)} · coverage {monitor.coverage.join(", ") || "none"}
+                  {t("heartbeat")} {when(monitor.heartbeat_at)} · {t("coverage")} {monitor.coverage.join(", ") || t("none")}
                 </span>
                 {monitor.error && <span className="text-fail">{monitor.error}</span>}
               </div>
@@ -217,17 +220,17 @@ function MonitoringView({
         {monitors.length === 0 && data.available && (
           <div className="text-label text-ink-500">
             {project === "all"
-              ? "no monitor registration is active; autonomous reconciliation is stopped"
-              : `no monitor registration is attached to ${project}`}
+              ? t("no monitor registration is active; autonomous reconciliation is stopped")
+              : `${t("no monitor registration is attached to")} ${project}`}
           </div>
         )}
 
         {alerts.length > 0 && (
           <div className="space-y-2 border-t border-ink-700/60 pt-3">
             <div className="flex items-center justify-between">
-              <span className="slabel">actionable alerts</span>
+              <span className="slabel">{t("actionable alerts")}</span>
               <span className="num text-micro text-ink-500">
-                {alerts.filter((alert) => alert.state === "open").length} open · {alerts.length} recorded
+                {alerts.filter((alert) => alert.state === "open").length} {t("open")} · {alerts.length} {t("recorded")}
               </span>
             </div>
             {alerts.map((alert) => (
@@ -244,7 +247,7 @@ function MonitoringView({
         {project !== "all" && globalAlerts.length > 0 && (
           <details className="border-t border-ink-700/60 pt-3">
             <summary className="cursor-pointer text-micro text-ink-400 hover:text-ink-200">
-              Global or unassigned alerts · {globalAlerts.length}
+              {t("Global or unassigned alerts")} · {globalAlerts.length}
             </summary>
             <div className="mt-2 space-y-2">
               {globalAlerts.map((alert) => (
@@ -256,15 +259,15 @@ function MonitoringView({
         {project !== "all" && globalMonitors.length > 0 && (
           <details className="border-t border-ink-700/60 pt-3">
             <summary className="cursor-pointer text-micro text-ink-400 hover:text-ink-200">
-              Global or unassigned monitors · {globalMonitors.length}
+              {t("Global or unassigned monitors")} · {globalMonitors.length}
             </summary>
             <div className="mt-2 space-y-1 text-micro text-ink-500">
               {globalMonitors.map((monitor) => (
                 <div key={monitor.id} className="flex flex-wrap gap-2">
                   <span className="num text-ink-300">{monitor.id}</span>
                   <span>{monitor.monitoring}</span>
-                  <span>owner {monitor.owner}</span>
-                  <span>coverage {monitor.coverage.join(", ") || "none"}</span>
+                  <span>{t("owner")} {monitor.owner}</span>
+                  <span>{t("coverage")} {monitor.coverage.join(", ") || t("none")}</span>
                 </div>
               ))}
             </div>
@@ -286,35 +289,36 @@ function MonitorAlertView({
 }) {
   const open = alert.state === "open";
   const block = useWriteBlock(readOnly);
+  const t = useTranslate();
   const stateLabel = alert.state === "resolved" ? "resolved" : open ? "open" : "acknowledged";
   return (
     <div className="rounded border border-ink-700/70 bg-ink-875 px-3 py-2.5 space-y-1.5">
       <div className="flex flex-wrap items-center gap-2">
         <span className={`chip !py-[.15rem] ${open ? "bg-warn/10 text-warn" : "bg-ink-800 text-ink-500"}`}>
-          {stateLabel}
+          {t(stateLabel)}
         </span>
         <span className="chip !py-[.15rem] bg-ink-800 text-ink-300">{alert.kind}</span>
         <span className="num text-micro text-ink-500">{age(alert.age_secs)}</span>
         <span className="num text-micro text-ink-500">
-          {alert.project} · {alert.monitor} · {alert.task ?? "task unknown"}
+          {alert.project} · {alert.monitor} · {alert.task ?? t("task unknown")}
         </span>
         {open && (
           <button
             className="chip ml-auto bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-50"
             disabled={readOnly}
-            title={block ?? "acknowledge this durable monitor alert"}
+            title={block ?? t("acknowledge this durable monitor alert")}
             onClick={() => onAck(alert.monitor, alert.seq)}
           >
-            ack
+            {t("ack")}
           </button>
         )}
       </div>
       <div className="text-label text-ink-200">{alert.next_action}</div>
       <div className="text-micro text-ink-500">
-        next owner <span className="text-ink-300">{alert.next_owner}</span> · {alert.authority}
+        {t("next owner")} <span className="text-ink-300">{alert.next_owner}</span> · {alert.authority}
       </div>
       <div className="text-micro text-ink-600">
-        evidence event {alert.event_seq} · {alert.fingerprint}
+        {t("evidence event")} {alert.event_seq} · {alert.fingerprint}
       </div>
     </div>
   );
@@ -331,6 +335,7 @@ export default function OverviewView({
   readOnly,
   onAck,
   onOpenContext,
+  hosted = false,
 }: {
   state: ResourceState<Overview>;
   /** The cards — project summary counts come from counts.ts, like the sidebar. */
@@ -343,7 +348,9 @@ export default function OverviewView({
   readOnly: boolean;
   onAck: (monitor: string, seq: number) => void;
   onOpenContext: () => void;
+  hosted?: boolean;
 }) {
+  const t = useTranslate();
   const data = state.data;
   if (!data) {
     return (
@@ -354,19 +361,19 @@ export default function OverviewView({
         {state.status === "failed" ? (
           <div className="text-label text-fail flex flex-wrap items-center gap-3" role="alert">
             <span>
-              overview unavailable — the board server could not build the view
+              {t("overview unavailable — the board server could not build the view")}
               {state.error ? ` (${state.error})` : ""}
             </span>
             <button
               onClick={onRetry}
               className="chip bg-fail/10 text-fail hover:bg-fail/20 transition-colors"
             >
-              retry
+              {t("retry")}
             </button>
           </div>
         ) : (
           <div className="text-label text-ink-500" role="status">
-            building the overview — daemon and GitHub probes can take several seconds
+            {t("building the overview — daemon and GitHub probes can take several seconds")}
           </div>
         )}
         {project !== "all" && (
@@ -376,6 +383,7 @@ export default function OverviewView({
             context={context}
             contextLoading={contextLoading}
             onOpenContext={onOpenContext}
+            hosted={hosted}
           />
         )}
       </div>
@@ -392,13 +400,13 @@ export default function OverviewView({
     <div className="px-4 lg:px-8 pt-4 pb-10 space-y-5 max-w-[68rem]">
       <header className="flex flex-wrap items-end gap-3">
         <div>
-          <div className="slabel">workspace</div>
+          <div className="slabel">{t("workspace")}</div>
           <h1 className="text-section font-semibold text-ink-100 mt-1">
-            {project === "all" ? "All projects" : project}
+            {project === "all" ? t("All projects") : project}
           </h1>
         </div>
         <span className="kicker">
-          exact project ownership · unresolved work stays visible
+          {t("exact project ownership · unresolved work stays visible")}
         </span>
         <StaleChip state={state} />
       </header>
@@ -407,10 +415,10 @@ export default function OverviewView({
         (data.degraded ?? []).length > 0) && (
         <div className="card border-warn/40 px-4 py-3 text-secondary text-warn">
           {data.github.state === "unavailable" && (
-            <div>github unavailable — PR and CI rows are missing</div>
+            <div>{t("github unavailable — PR and CI rows are missing")}</div>
           )}
           {!data.daemon.reachable && (
-            <div>daemon unreachable — agent, approval and drift rows are missing</div>
+            <div>{t("daemon unreachable — agent, approval and drift rows are missing")}</div>
           )}
           {(data.degraded ?? []).map((d, i) => (
             <div key={i}>
@@ -428,6 +436,7 @@ export default function OverviewView({
           context={context}
           contextLoading={contextLoading}
           onOpenContext={onOpenContext}
+          hosted={hosted}
         />
       )}
 
@@ -441,12 +450,12 @@ export default function OverviewView({
       )}
 
       <section>
-        <div className="slabel mb-2">needs me · {project === "all" ? "all projects" : project}</div>
+        <div className="slabel mb-2">{t("needs me")} · {project === "all" ? t("all projects") : project}</div>
         <NeedRows rows={scopedNeeds} decision />
         {project !== "all" && globalNeeds.length > 0 && (
           <details className="mt-4">
             <summary className="cursor-pointer text-micro text-ink-400 hover:text-ink-200">
-              Global or unassigned observations · {globalNeeds.length}
+              {t("Global or unassigned observations")} · {globalNeeds.length}
             </summary>
             <div className="mt-2"><NeedRows rows={globalNeeds} decision={false} /></div>
           </details>
@@ -454,13 +463,12 @@ export default function OverviewView({
       </section>
 
       <section>
-        <div className="slabel mb-2">deploy drift</div>
+        <div className="slabel mb-2">{t("deploy drift")}</div>
         <div className="card px-4 py-3.5">
           {scopedDrift && drift.known ? (
             drift.count === 0 ? (
               <div className="text-label text-ink-300">
-                <span className="text-ok">up to date</span> — {drift.project} is
-                running the latest on {drift.ref}
+                <span className="text-ok">{t("up to date")}</span> — {drift.project} {t("is running the latest on")} {drift.ref}
               </div>
             ) : (
               <div>
@@ -468,7 +476,7 @@ export default function OverviewView({
                   <span className="text-warn font-semibold">
                     {drift.count} commit{drift.count === 1 ? "" : "s"}
                   </span>{" "}
-                  merged on {drift.ref} past build{" "}
+                  {t("merged on")} {drift.ref} {t("past build")}{" "}
                   <code className="num text-ink-400">
                     {drift.build_commit?.slice(0, 10)}
                   </code>{" "}
@@ -492,7 +500,7 @@ export default function OverviewView({
             </div>
           ) : (
             <div className="text-label text-ink-500">
-              deployment snapshot belongs to <span className="text-ink-200">{drift.project ?? "global host"}</span>; no drift is attributed to {project}
+              {t("deployment snapshot belongs to")} <span className="text-ink-200">{drift.project ?? t("global host")}</span>; {t("no drift is attributed to")} {project}
             </div>
           )}
         </div>
@@ -502,7 +510,7 @@ export default function OverviewView({
 
       {scopedProjects.length > 0 && (
         <section>
-          <div className="slabel mb-2">project summary</div>
+          <div className="slabel mb-2">{t("project summary")}</div>
           <div className="card divide-y divide-ink-700/60">
             {scopedProjects.map((p) => {
               // The same derivation as the sidebar and board header
@@ -519,16 +527,16 @@ export default function OverviewView({
                   <span className="num text-label text-ink-400 min-w-0 flex-1">
                     {c === null
                       ? issues.status === "failed"
-                        ? "issue counts unavailable"
-                        : "counting…"
-                      : `${c.open} open${c.open ? ` — ${statusBreakdown(c)}` : ""}`}
+                        ? t("issue counts unavailable")
+                        : t("counting…")
+                      : `${c.open} ${t("open")}${c.open ? ` — ${statusBreakdown(c)}` : ""}`}
                     {excluded && (
                       <span className="text-micro text-ink-500"> · {excluded}</span>
                     )}
                   </span>
                   {p.oldest_review_age != null && (
                     <span className="num text-micro text-warn shrink-0">
-                      oldest review {age(p.oldest_review_age)}
+                      {t("oldest review")} {age(p.oldest_review_age)}
                     </span>
                   )}
                 </div>
@@ -540,7 +548,7 @@ export default function OverviewView({
                         <span className="text-ink-200">{cl.issue}</span> {cl.status} ·{" "}
                         {cl.by ?? "?"}
                         {cl.owner && cl.owner !== cl.by ? ` (owner ${cl.owner})` : ""} ·{" "}
-                        {cl.age_secs != null ? `claimed ${age(cl.age_secs)} ago` : "claim age unknown"}
+                        {cl.age_secs != null ? `${t("claimed")} ${age(cl.age_secs)} ${t("ago")}` : t("claim age unknown")}
                       </li>
                     ))}
                   </ul>
@@ -548,16 +556,16 @@ export default function OverviewView({
                 {/* CAD-378: open lanes, their code areas and overlaps. */}
                 {p.areas_error && (
                   <p className="mt-1 sm:ml-[7.75rem] text-micro text-warn break-words">
-                    areas config: {p.areas_error}
+                    {t("areas config:")} {p.areas_error}
                   </p>
                 )}
                 {(p.lanes ?? []).length > 0 && (
                   <details className="mt-1 sm:ml-[7.75rem] min-w-0" data-testid="open-lanes">
                     <summary className="cursor-pointer list-none text-micro text-accent hover:underline">
-                      {(p.lanes ?? []).length} open lanes
+                      {(p.lanes ?? []).length} {t("open lanes")}
                       {(() => {
                         const n = (p.lanes ?? []).filter((l) => l.overlaps.length > 0).length;
-                        return n > 0 ? ` · ${n} overlapping` : "";
+                        return n > 0 ? ` · ${n} ${t("overlapping")}` : "";
                       })()}
                     </summary>
                     <ul className="mt-1 space-y-0.5">
@@ -578,7 +586,7 @@ export default function OverviewView({
           </div>
           {otherProjectCount > 0 && (
             <p className="text-micro text-ink-500 mt-2">
-              {otherProjectCount} other project summaries remain in All projects.
+              {otherProjectCount} {t("other project summaries remain in All projects.")}
             </p>
           )}
         </section>

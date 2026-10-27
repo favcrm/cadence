@@ -24,7 +24,7 @@ try {
   vite = await import(pathToFileURL(require.resolve("vite")).href);
 } catch {
   throw new Error(
-    "Install the existing UI tools first: pnpm -C ui install --frozen-lockfile",
+    "Install the existing UI tools first: bun install --cwd ui --frozen-lockfile",
   );
 }
 const react = (
@@ -85,7 +85,9 @@ const server = await vite.createServer({
     host: options.host,
     port: options.port,
     strictPort: true,
-    allowedHosts: options.allowedHosts,
+    allowedHosts: options.container
+      ? ["localhost", "127.0.0.1"]
+      : options.allowedHosts,
     fs: {
       strict: true,
       allow: [root, resolve(repo, "ui/node_modules"), resolve(repo, "design")],

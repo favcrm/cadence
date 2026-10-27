@@ -17,7 +17,7 @@
 //! same route with `member_as` absent.
 
 use serde_json::{json, Value};
-use tiny_http::{Method, Request};
+use tiny_http::Request;
 
 use super::{err_response, json_response, operator, read_body, HttpResp, ServeOpts};
 use crate::client;
@@ -52,12 +52,29 @@ fn relay(state_dir: &Path, method: &str, mut params: Value, member: Option<&str>
     }
 }
 
+/// `relay` for a body-less attributed write: the server-held proof rides
+/// alongside the path-derived params; no body is read.
+fn relay_session(
+    state_dir: &Path,
+    method: &str,
+    mut params: Value,
+    proof: Option<&str>,
+) -> HttpResp {
+    if let Some(proof) = proof {
+        params["public_session"] = json!(proof);
+    }
+    match client::rpc(state_dir, method, params) {
+        Ok(v) => json_response(v),
+        Err(e) => super::home::rpc_err(&e, method),
+    }
+}
+
 fn board_caller(
     request: &Request,
     state_dir: &Path,
     opts: &ServeOpts,
 ) -> Result<operator::Caller, HttpResp> {
-    operator::board_caller(request, state_dir, opts, false)
+    operator::board_caller(request, state_dir, opts, false, None)
 }
 
 /// GET reads: `/api/app-catalog`, `/api/app-catalog/<id>`,
@@ -109,128 +126,178 @@ pub(super) fn read(
     err_response(404, "no such app explorer route")
 }
 
-/// POST writes admitted by `RouteClass`. `caller` is the admitted
-/// board caller (only `AgentAllowed` routes reach member verbs).
+/// One explorer write, chosen by the endpoint table's row id (CAD-1682):
+/// the path is parsed once, by `endpoints::resolve`, so this handler never
+/// re-derives its action from the URL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WriteAction {
+    CatalogInstall,
+    CatalogGitCheck,
+    CatalogRequest,
+    FavoriteSet,
+    FavoriteDefault,
+    FavoriteOpened,
+    RequestDismiss,
+    UpdateCheck,
+    RemovePreview,
+    Remove,
+    Restore,
+}
+
+/// POST writes admitted by `RouteClass`. `caller` is the admitted board
+/// caller (only `AgentAllowed` routes reach member verbs); `install` is the
+/// row's bound `{id}` for the per-installation verbs.
 pub(super) fn write(
     request: &mut Request,
-    method: &Method,
-    path: &str,
+    action: WriteAction,
+    install: Option<&str>,
     caller: Option<&operator::Caller>,
+    proof_relay: operator::PublicRelay,
     state_dir: &Path,
 ) -> HttpResp {
-    if *method != Method::Post {
-        return err_response(405, "method not allowed");
-    }
-    // No admitted caller, or an agent, never reaches a relay: the
-    // member verbs below would otherwise run as the operator.
+    // No admitted caller, or an agent, never reaches a relay: the member
+    // verbs below would otherwise run as the operator.
     let member = match caller.map(principal) {
         Some(Ok(m)) => m,
         Some(Err(resp)) => return resp,
         None => return err_response(401, "an operator or member session is required"),
     };
-    match path {
-        // The operator-only writes relay over the board's own connection.
-        "/api/app-catalog/install" => body_rpc(
-            request,
-            state_dir,
-            "app_workspace_install_entry",
-            &["catalog_id", "expected_digest"],
-            None,
-        ),
-        "/api/app-catalog/git-check" => body_rpc(
+    let install = install.unwrap_or_default();
+    match action {
+        WriteAction::CatalogInstall => match public_proof(proof_relay) {
+            Ok(proof) => relay_body(
+                request,
+                state_dir,
+                "app_workspace_install_entry",
+                json!({}),
+                &["catalog_id", "expected_digest"],
+                None,
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
+        WriteAction::CatalogGitCheck => body_rpc(
             request,
             state_dir,
             "app_catalog_git_check",
             &["url", "git_ref", "dir"],
             None,
         ),
-        p if p.starts_with("/api/app-installations/") => {
-            let tail = &p["/api/app-installations/".len()..];
-            let mut segs = tail.split('/');
-            let (id, verb) = (
-                segs.next().unwrap_or_default(),
-                segs.next().unwrap_or_default(),
-            );
-            if id.is_empty() {
-                return err_response(400, "missing installation id");
-            }
-            match verb {
-                "update-check" => relay(
-                    state_dir,
-                    "app_workspace_update_check",
-                    json!({"install_id": id}),
-                    None,
-                ),
-                "remove-preview" => relay(
-                    state_dir,
-                    "app_workspace_remove_preview",
-                    json!({"install_id": id}),
-                    None,
-                ),
-                "remove" => body_rpc_install(
-                    request,
-                    state_dir,
-                    "app_workspace_remove",
-                    id,
-                    &["expected_generation", "expected_digest", "request_id"],
-                ),
-                "restore" => relay(
-                    state_dir,
-                    "app_workspace_restore",
-                    json!({"install_id": id}),
-                    None,
-                ),
-                _ => err_response(404, "no such app-installation route"),
-            }
-        }
-        // Member verbs: favorites + requests (AgentAllowed).
-        "/api/app-favorites" => body_rpc(
-            request,
+        WriteAction::UpdateCheck => relay(
             state_dir,
-            "app_favorites_put",
-            &["install_ids"],
-            member.as_deref(),
-        ),
-        "/api/app-favorites/default" => body_rpc(
-            request,
-            state_dir,
-            "app_favorites_put_default",
-            &["install_ids"],
+            "app_workspace_update_check",
+            json!({"install_id": install}),
             None,
         ),
-        "/api/app-favorites/opened" => body_rpc(
+        WriteAction::RemovePreview => relay(
+            state_dir,
+            "app_workspace_remove_preview",
+            json!({"install_id": install}),
+            None,
+        ),
+        WriteAction::Remove => match public_proof(proof_relay) {
+            Ok(proof) => body_rpc_install(
+                request,
+                state_dir,
+                "app_workspace_remove",
+                install,
+                &["expected_generation", "expected_digest", "request_id"],
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
+        WriteAction::Restore => match public_proof(proof_relay) {
+            Ok(proof) => relay_session(
+                state_dir,
+                "app_workspace_restore",
+                json!({"install_id": install}),
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
+        WriteAction::FavoriteSet => match public_proof(proof_relay) {
+            Ok(proof) => relay_body(
+                request,
+                state_dir,
+                "app_favorites_put",
+                json!({}),
+                &["install_ids"],
+                member.as_deref(),
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
+        WriteAction::FavoriteDefault => match public_proof(proof_relay) {
+            Ok(proof) => relay_body(
+                request,
+                state_dir,
+                "app_favorites_put_default",
+                json!({}),
+                &["install_ids"],
+                None,
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
+        WriteAction::FavoriteOpened => body_rpc(
             request,
             state_dir,
             "app_favorites_opened",
             &["install_id"],
             member.as_deref(),
         ),
-        "/api/app-catalog/request" => body_rpc(
-            request,
-            state_dir,
-            "app_install_request",
-            &["catalog_id"],
-            member.as_deref(),
-        ),
-        "/api/app-requests/dismiss" => body_rpc(
-            request,
-            state_dir,
-            "app_install_request_dismiss",
-            &["id"],
-            None,
-        ),
-        _ => err_response(404, "no such app explorer write"),
+        WriteAction::CatalogRequest => match public_proof(proof_relay) {
+            Ok(proof) => relay_body(
+                request,
+                state_dir,
+                "app_install_request",
+                json!({}),
+                &["catalog_id"],
+                member.as_deref(),
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
+        WriteAction::RequestDismiss => match public_proof(proof_relay) {
+            Ok(proof) => relay_body(
+                request,
+                state_dir,
+                "app_install_request_dismiss",
+                json!({}),
+                &["id"],
+                None,
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
     }
 }
 
-/// Read a bounded JSON body, forward the allow-listed fields plus the
-/// caller's `member_as` (when the route admits a member).
-fn body_rpc(
+/// CAD-1374: the public session proof an attributed verb relays. A
+/// public-host write with no bearer is refused before any RPC; a local
+/// write carries none and the daemon names no human for it.
+fn public_proof(relay: operator::PublicRelay) -> Result<Option<String>, HttpResp> {
+    match relay {
+        operator::PublicRelay::NotPublic => Ok(None),
+        operator::PublicRelay::Proven(proof) => Ok(Some(proof.token().to_string())),
+        operator::PublicRelay::Missing => {
+            Err(err_response(401, "board session required for this write"))
+        }
+    }
+}
+
+/// Read a bounded JSON body, forward its allow-listed fields onto `base`
+/// (a path-derived id, or empty), plus the caller's `member_as` when the
+/// route admits a member and the attributed verb's `public_session` proof.
+/// Unknown body fields are dropped.
+fn relay_body(
     request: &mut Request,
     state_dir: &Path,
     method: &str,
+    base: Value,
     fields: &[&str],
     member: Option<&str>,
+    proof: Option<&str>,
 ) -> HttpResp {
     let bytes = match read_body(request, BODY_CAP) {
         Ok(b) => b,
@@ -240,7 +307,7 @@ fn body_rpc(
         Ok(v) => v,
         Err(_) => return err_response(400, "body must be a JSON object"),
     };
-    let mut params = json!({});
+    let mut params = base;
     if let Some(obj) = value.as_object() {
         for f in fields {
             if let Some(v) = obj.get(*f) {
@@ -251,10 +318,23 @@ fn body_rpc(
     if let Some(member) = member {
         params["member_as"] = json!(member);
     }
+    if let Some(proof) = proof {
+        params["public_session"] = json!(proof);
+    }
     match client::rpc(state_dir, method, params) {
         Ok(v) => json_response(v),
         Err(e) => super::home::rpc_err(&e, method),
     }
+}
+
+fn body_rpc(
+    request: &mut Request,
+    state_dir: &Path,
+    method: &str,
+    fields: &[&str],
+    member: Option<&str>,
+) -> HttpResp {
+    relay_body(request, state_dir, method, json!({}), fields, member, None)
 }
 
 /// Like `body_rpc`, but `install_id` comes from the path, not the
@@ -265,27 +345,17 @@ fn body_rpc_install(
     method: &str,
     install_id: &str,
     fields: &[&str],
+    proof: Option<&str>,
 ) -> HttpResp {
-    let bytes = match read_body(request, BODY_CAP) {
-        Ok(b) => b,
-        Err(resp) => return resp,
-    };
-    let value: Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(_) => return err_response(400, "body must be a JSON object"),
-    };
-    let mut params = json!({"install_id": install_id});
-    if let Some(obj) = value.as_object() {
-        for f in fields {
-            if let Some(v) = obj.get(*f) {
-                params[*f] = v.clone();
-            }
-        }
-    }
-    match client::rpc(state_dir, method, params) {
-        Ok(v) => json_response(v),
-        Err(e) => super::home::rpc_err(&e, method),
-    }
+    relay_body(
+        request,
+        state_dir,
+        method,
+        json!({"install_id": install_id}),
+        fields,
+        None,
+        proof,
+    )
 }
 
 #[cfg(test)]
@@ -298,6 +368,7 @@ mod principal_acceptance {
         Caller::Named(Named {
             actor: "A <a@x> (board)".into(),
             author: "alice".into(),
+            sub: "sub_alice".into(),
             operator,
         })
     }

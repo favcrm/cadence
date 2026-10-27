@@ -70,6 +70,16 @@ pub enum RouteClass {
     /// the path is the only credential — no session, no Origin
     /// check; the handler owns the gate.
     RecipientToken,
+    /// A signed-in user preference write. The route still runs the full
+    /// browser/session guard; its handler narrows the verified identity
+    /// and action (for example, self-only vs organization operator).
+    CallerScoped,
+    /// CAD-1537: an installed app's own screen — the mount and its read
+    /// service calls. The guards run as for a write, and also on a
+    /// `--read-only` board; an operator session (with peer proof) or a
+    /// named member is admitted, never an agent. The daemon decides per
+    /// operation: a member's or read-only board's mount is read-only.
+    ScreenRead,
 }
 
 /// One write route: method, path pattern (`*` is one non-empty
@@ -95,6 +105,16 @@ const fn route(method: &'static str, pattern: &'static str, class: RouteClass) -
 /// that matches no entry is [`RouteClass::OperatorOnly`]
 /// ([`route_class`]) — a new route fails closed until it is listed.
 pub const WRITE_ROUTES: &[WriteRoute] = &[
+    route("POST", "/api/approvals/approve", RouteClass::OperatorOnly),
+    // CAD-1393: company document templates and drafts — the approval is
+    // the operator's alone; drafting is listed operator-only on the board
+    // (agents use the daemon RPC or CLI, which share the same rules).
+    route("POST", "/api/templates/create", RouteClass::OperatorOnly),
+    route("POST", "/api/templates/revise", RouteClass::OperatorOnly),
+    route("POST", "/api/templates/approve", RouteClass::OperatorOnly),
+    route("POST", "/api/documents/create", RouteClass::OperatorOnly),
+    route("POST", "/api/templates/intake", RouteClass::OperatorOnly),
+    route("POST", "/api/approvals/*/revoke", RouteClass::OperatorOnly),
     route(
         "POST",
         "/api/app-effects/*/resolve",
@@ -134,6 +154,16 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route(
         "POST",
         "/api/app-installations/*/assistant/permissions/block",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-effects/*/publish-now",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-effects/*/confirm-publish",
         RouteClass::OperatorOnly,
     ),
     route(
@@ -231,96 +261,110 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-installations/*/revoke",
         RouteClass::OperatorOnly,
     ),
-    route("POST", "/api/app-installations", RouteClass::OperatorOnly),
     // CAD-1194: the install-check — read-only, but it fetches and
     // validates a source on the host, so it is the operator's like install.
-    route(
-        "POST",
-        "/api/app-installations/check",
-        RouteClass::OperatorOnly,
-    ),
     // CAD-1129: the apps Explorer. The catalog install/git-check and
     // the per-install update-check/remove/restore are the operator's,
     // like every install write; favorites, the workspace default and
     // an install request are the member verbs (`AgentAllowed` admits a
     // named member's session, which the daemon re-proves).
-    route("POST", "/api/app-catalog/install", RouteClass::OperatorOnly),
-    route(
-        "POST",
-        "/api/app-catalog/git-check",
-        RouteClass::OperatorOnly,
-    ),
-    route("POST", "/api/app-catalog/request", RouteClass::AgentAllowed),
-    route("POST", "/api/app-favorites", RouteClass::AgentAllowed),
-    route(
-        "POST",
-        "/api/app-favorites/default",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/app-favorites/opened",
-        RouteClass::AgentAllowed,
-    ),
-    route(
-        "POST",
-        "/api/app-requests/dismiss",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/app-installations/*/update-check",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/app-installations/*/remove-preview",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/app-installations/*/remove",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/app-installations/*/restore",
-        RouteClass::OperatorOnly,
-    ),
     // CAD-996: bounded manual `{files}` bundle upload — operator-only like the
     // sibling install route it stages into.
+    // CAD-1006: the screen mint. Authority is the proven session
+    // credential relayed to the daemon, never a caller field; the minted
+    // nonce is the frame GET's one-use cap. CAD-1537: a member or a
+    // `--read-only` board mounts read-only (`ScreenRead`); the SLOT and
+    // tool routes below stay the operator's.
     route(
         "POST",
-        "/api/app-installations/upload",
-        RouteClass::OperatorOnly,
-    ),
-    // CAD-1006: the screen mint — operator-only like the install routes.
-    // Authority is the proven session credential relayed to the daemon,
-    // never a caller field; the minted nonce is the frame GET's one-use cap.
-    route(
-        "POST",
-        "/api/app-installations/*/screens/*/mount",
-        RouteClass::OperatorOnly,
+        "/api/app-screen-services/call",
+        RouteClass::ScreenRead,
     ),
     route(
         "POST",
-        "/api/app-installations/migrate",
+        "/api/app-screen-services/slot-prepare",
         RouteClass::OperatorOnly,
     ),
     route(
         "POST",
-        "/api/app-installations/*/recover",
+        "/api/app-screen-services/slot-confirm",
+        RouteClass::OperatorOnly,
+    ),
+    // CAD-1177: the standalone tool invoke — operator-only write; the
+    // daemon re-proves the session + mount action context it relays.
+    route(
+        "POST",
+        "/api/app-screen-tools/invoke",
+        RouteClass::OperatorOnly,
+    ),
+    // CAD-1177: the mount-teardown revoke — operator-only write; the
+    // daemon only retires a context the proven session owns.
+    route(
+        "POST",
+        "/api/app-screen-tools/revoke",
         RouteClass::OperatorOnly,
     ),
     route(
         "POST",
-        "/api/app-installations/migrations/*/recover",
+        "/api/app-social-drafts/create",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/list",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/show",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/update",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/discard",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/asset",
+        RouteClass::OperatorOnly,
+    ),
+    // SOC-32: the composer's own-image upload — operator-only like the
+    // draft writes; the daemon re-proves the mount/context/slot and the
+    // route bounds/normalises the image.
+    route(
+        "POST",
+        "/api/app-social-drafts/image",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/uploaded",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/sources/show",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/sources/save",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/effect-stage",
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/issues", RouteClass::AgentAllowed),
     // CAD-140: filing a report or idea is creating a tracker issue —
     // the same class as `POST /api/issues`, through `report::file`.
-    route("POST", "/api/reports", RouteClass::AgentAllowed),
     route("PATCH", "/api/issues/*", RouteClass::AgentAllowed),
     route("POST", "/api/issues/*/links", RouteClass::AgentAllowed),
     route("DELETE", "/api/issues/*/links", RouteClass::AgentAllowed),
@@ -340,12 +384,21 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/plans/*/reject", RouteClass::OperatorOnly),
     route("POST", "/api/delivery/*/merge", RouteClass::OperatorOnly),
     route("POST", "/api/delivery/*/decline", RouteClass::OperatorOnly),
+    route("POST", "/api/threads/*/messages", RouteClass::OperatorOnly),
+    // CAD-810 / CAD-821: every topic write is the operator's. Listed so the
+    // classification is reviewed, and unlisted writes fail closed to the same class.
+    route("POST", "/api/topics", RouteClass::OperatorOnly),
     route(
         "POST",
-        "/api/settings/model-defaults",
+        "/api/topics/*/subscribers",
         RouteClass::OperatorOnly,
     ),
-    route("POST", "/api/threads/*/messages", RouteClass::OperatorOnly),
+    route("POST", "/api/topics/*/posts", RouteClass::OperatorOnly),
+    route("POST", "/api/topics/*/requests", RouteClass::OperatorOnly),
+    // CAD-1168: the chat attachment upload — the operator's alone, like
+    // the messages POST. Multipart body (the second non-JSON carve-out
+    // after `/api/wiki/upload`); the daemon re-proves the caller.
+    route("POST", "/api/chat/upload", RouteClass::OperatorOnly),
     // CAD-1098: making a conversation is the operator's chat, like the
     // message POST — the daemon proves the connection again.
     route(
@@ -353,14 +406,12 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/threads/*/conversations",
         RouteClass::OperatorOnly,
     ),
-    route(
-        "POST",
-        "/api/app-installations/*/conversations",
-        RouteClass::OperatorOnly,
-    ),
     // CAD-551: the composer's slash commands and Stop — the daemon's
     // `master_command` is operator-only, so the relay is too.
     route("POST", "/api/master/command", RouteClass::OperatorOnly),
+    // CAD-1817: the workspace coordinator's bounded identity write. The
+    // daemon's `master_identity_set` proves the operator connection again.
+    route("POST", "/api/master/identity", RouteClass::OperatorOnly),
     // CAD-574: the rail's needs-row snooze/dismiss and agent
     // resume/unfence — the relays cross the daemon's operator gate, so
     // the board routes are the operator's alone (unlisted writes would
@@ -388,8 +439,16 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/master/permissions/rules/*/revoke",
         RouteClass::OperatorOnly,
     ),
+    // Setup: create one agent row through the daemon's `agent_register`
+    // (`rpc_register`). Operator-only; the daemon's own gate still applies.
+    route("POST", "/api/agents", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/resume", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/unfence", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/agents/*/instructions",
+        RouteClass::OperatorOnly,
+    ),
     // CAD-608: the issue page's lane. Unlisted writes would fail closed
     // the same way; listed so a reader sees they are the operator's.
     route("POST", "/api/issues/*/lane/ask", RouteClass::OperatorOnly),
@@ -417,8 +476,6 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/epics/*/stage", RouteClass::OperatorOnly),
     // CAD-561: the board's Update button and its check — operator-only,
     // like every other action that replaces the running build.
-    route("POST", "/api/update", RouteClass::OperatorOnly),
-    route("POST", "/api/update/check", RouteClass::OperatorOnly),
     // CAD-496: the board relays `plan_propose` over its own daemon
     // connection, so the daemon attributes the run to whoever that
     // connection proves — operator-only, like `plan_approve`.
@@ -444,6 +501,14 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // attributed agent) writes, and the daemon's per-prefix allowlist
     // decides where. The board relays; it never widens a caller.
     route("PUT", "/api/wiki/file", RouteClass::AgentAllowed),
+    route("PUT", "/api/wiki/collection", RouteClass::AgentAllowed),
+    route("POST", "/api/wiki/corrections", RouteClass::AgentAllowed),
+    route(
+        "POST",
+        "/api/wiki/corrections/review",
+        RouteClass::AgentAllowed,
+    ),
+    route("PUT", "/api/wiki/transfer", RouteClass::AgentAllowed),
     route("POST", "/api/wiki/upload", RouteClass::AgentAllowed),
     route("POST", "/api/wiki/mkdir", RouteClass::AgentAllowed),
     route("POST", "/api/wiki/mv", RouteClass::AgentAllowed),
@@ -460,13 +525,12 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/apps/*/*/worker", RouteClass::OperatorOnly),
     route("POST", "/api/memories/*/*/accept", RouteClass::Refused),
     route("POST", "/api/memories/*/*/reject", RouteClass::Refused),
-    route("POST", "/api/session", RouteClass::Session),
-    route("POST", "/api/session/logout", RouteClass::Session),
+    // The session paths are declared in `endpoints::ENDPOINTS`; their
+    // class is answered there, so no row is repeated here.
     // CAD-777: the device-grant sign-in exchange — the pending id (code)
     // or the issuer-approved grant (poll) is the credential, never a
     // session. Agent peers are refused without side effects.
-    route("POST", "/api/session/device/code", RouteClass::Session),
-    route("POST", "/api/session/device/poll", RouteClass::Session),
+
     // CAD-786: the unsubscribe origin write is operator-only like
     // every other /api/crm-send write (the class default).
     route("POST", "/api/crm-send/origin", RouteClass::OperatorOnly),
@@ -490,6 +554,11 @@ fn matches(pattern: &str, path: &str) -> bool {
 
 /// The class of a write — [`RouteClass::OperatorOnly`] when unlisted.
 pub fn route_class(method: &str, path: &str) -> RouteClass {
+    // The endpoint table answers first: a migrated path is declared in
+    // exactly one place (CAD-1670).
+    if let Some(class) = super::endpoints::class_of(method, path) {
+        return class;
+    }
     WRITE_ROUTES
         .iter()
         .find(|r| r.method == method && matches(r.pattern, path))
@@ -521,6 +590,12 @@ pub(super) fn admit(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> Result<Option<Caller>, HttpResp> {
+    // Transfer status/export is a bounded authenticated read carried by POST.
+    // Keep the browser origin guard, without requiring write capability.
+    if method == "POST" && path == "/api/wiki/job_status" {
+        write_guard(request, "application/json", opts)?;
+        return board_caller(request, state_dir, opts, false, None).map(Some);
+    }
     let class = route_class(method, path);
     if matches!(
         class,
@@ -528,7 +603,7 @@ pub(super) fn admit(
     ) {
         return Ok(None);
     }
-    if opts.read_only {
+    if opts.read_only && class != RouteClass::ScreenRead {
         return Err(guard_fail(
             "read_only",
             "board is read-only — writes are disabled",
@@ -536,7 +611,10 @@ pub(super) fn admit(
     }
     let ct = if path.ends_with("/artifacts") {
         "application/octet-stream"
-    } else if path == "/api/wiki/upload" {
+    } else if path == "/api/wiki/upload"
+        || path == "/api/chat/upload"
+        || path == "/api/app-social-drafts/image"
+    {
         // Multipart is the one non-exact rule — `write_guard` checks
         // the bounded `multipart/form-data; boundary=` prefix; the
         // header/origin/fetch-site guards still run exact.
@@ -545,7 +623,11 @@ pub(super) fn admit(
         "application/json"
     };
     write_guard(request, ct, opts)?;
-    let caller = board_caller(request, state_dir, opts, true)?;
+    let caller = board_caller(request, state_dir, opts, true, None)?;
+    if class == RouteClass::ScreenRead {
+        let what = format!("{method} {path}");
+        return admit_screen_caller(request, state_dir, opts, caller, &what).map(Some);
+    }
     if class == RouteClass::OperatorOnly {
         match &caller {
             Caller::Agent(alias) => {
@@ -579,6 +661,7 @@ pub(super) fn admit(
                 state_dir,
                 opts,
                 &format!("{method} {path}"),
+                None,
             )?,
         }
     }
@@ -595,7 +678,18 @@ pub(super) fn admit_operator_read(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> Result<(), HttpResp> {
-    let caller = board_caller(request, state_dir, opts, false)?;
+    admit_operator_read_caller(request, state_dir, opts).map(|_| ())
+}
+
+/// [`admit_operator_read`], answering the admitted caller so a handler can
+/// narrow it further (CAD-1218: the approval state read is for
+/// `Caller::Operator` only).
+pub(super) fn admit_operator_read_caller(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<Caller, HttpResp> {
+    let caller = board_caller(request, state_dir, opts, false, None)?;
     let what = format!(
         "GET {}",
         request.url().split('?').next().unwrap_or_default()
@@ -616,8 +710,53 @@ pub(super) fn admit_operator_read(
                 named.actor
             ),
         )),
-        Caller::Named(_) => Ok(()),
-        Caller::Operator(_) => super::home::prove_operator_peer(request, state_dir, opts, &what),
+        Caller::Named(_) => Ok(caller),
+        Caller::Operator(_) => {
+            super::home::prove_operator_peer(request, state_dir, opts, &what, None)?;
+            Ok(caller)
+        }
+    }
+}
+
+/// CAD-1537: a read of an installed app's own screen — its installation
+/// receipt and contexts. Admits the operator (with peer proof, as
+/// [`admit_operator_read`]) or a named member; never an agent.
+pub(super) fn admit_screen_read(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<Caller, HttpResp> {
+    let caller = board_caller(request, state_dir, opts, false, None)?;
+    let what = format!(
+        "GET {}",
+        request.url().split('?').next().unwrap_or_default()
+    );
+    admit_screen_caller(request, state_dir, opts, caller, &what)
+}
+
+/// The [`RouteClass::ScreenRead`] caller rule: an agent is refused, a
+/// named user of either role is admitted (the daemon re-proves the role),
+/// and the operator still needs positive process proof on the peer.
+fn admit_screen_caller(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    caller: Caller,
+    what: &str,
+) -> Result<Caller, HttpResp> {
+    match &caller {
+        Caller::Agent(alias) => Err(guard_fail(
+            "operator_only",
+            &format!(
+                "{what} is a board viewer's read — this request comes from agent \
+                 '{alias}'; open it from a browser"
+            ),
+        )),
+        Caller::Named(_) => Ok(caller),
+        Caller::Operator(_) => {
+            super::home::prove_operator_peer(request, state_dir, opts, what, None)?;
+            Ok(caller)
+        }
     }
 }
 
@@ -629,8 +768,75 @@ pub(super) struct Named {
     pub actor: String,
     /// The `[A-Za-z0-9_-]` comment-author / ack handle.
     pub author: String,
+    /// The assertion's `sub` — the platform's stable person id, the
+    /// only spelling `Activity-Receipt` self-assignment proofs compare.
+    pub sub: String,
     /// `owner`-mapped sessions pass operator-only routes.
     pub operator: bool,
+}
+
+/// CAD-1374: the public session bearer a named board write relays to the
+/// daemon so the daemon re-checks it. A transient credential: no derived
+/// `Debug`, no `Display`, no serialization — it can only be read as the
+/// request's opaque `public_session` value.
+pub(super) struct PublicProof(String);
+
+impl PublicProof {
+    pub(super) fn token(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PublicProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PublicProof(<redacted>)")
+    }
+}
+
+/// How a board write's public origin relates to its session proof.
+pub(super) enum PublicRelay {
+    /// Not the public host: a local/tailnet operator write, unchanged.
+    NotPublic,
+    /// A public-host write carrying its session bearer.
+    Proven(PublicProof),
+    /// A public-host write with no session bearer. Never relayed: the
+    /// board refuses it rather than fall back to an anonymous operator.
+    Missing,
+}
+
+/// CAD-1374: attach the public session bearer to a daemon params object
+/// for an owner write that persists human attribution. A public-host write
+/// with no bearer is refused before any RPC; a local/tailnet write is left
+/// unchanged, and so is any write that does not persist attribution.
+pub(super) fn relay_owner_proof(
+    params: &mut Value,
+    relay: PublicRelay,
+) -> Result<(), super::HttpResp> {
+    match relay {
+        PublicRelay::NotPublic => Ok(()),
+        PublicRelay::Proven(proof) => {
+            params["public_session"] = Value::String(proof.token().to_string());
+            Ok(())
+        }
+        PublicRelay::Missing => Err(super::err_response(
+            401,
+            "board session required for this write",
+        )),
+    }
+}
+
+/// The origin of a board write and, on the public host, its session
+/// bearer re-read from the cookie. The board decides origin from the
+/// Host it was reached on (`request_origin`), never from a request
+/// field. The daemon re-checks the bearer against its own row.
+pub(super) fn public_relay(request: &Request, opts: &ServeOpts) -> PublicRelay {
+    match request_origin(request, opts) {
+        ReqOrigin::Known(Origin::Public) => match session_cookie(request, opts, Origin::Public) {
+            Some(token) => PublicRelay::Proven(PublicProof(token)),
+            None => PublicRelay::Missing,
+        },
+        _ => PublicRelay::NotPublic,
+    }
 }
 
 /// A board write's caller, once [`board_caller`] has decided.
@@ -756,12 +962,25 @@ pub(super) fn request_origin_kind(request: &Request, opts: &ServeOpts) -> Option
 /// native `check`/`check_public`, so the *daemon* proves the session and
 /// binds the frame capability to the resolved id. Never logged, never
 /// sent to the frame. `None` when the request carries no such cookie.
-pub(super) fn session_token_for(
+pub(crate) fn session_token_for(
     request: &Request,
     opts: &ServeOpts,
     origin: Origin,
 ) -> Option<String> {
     session_cookie(request, opts, origin)
+}
+
+/// The live request's internal session proof for a native relay. The proof
+/// is never accepted from multipart fields and is rechecked by the daemon.
+pub(super) fn chat_upload_session_proof(request: &Request, opts: &ServeOpts) -> Option<Value> {
+    let origin = request_origin_kind(request, opts)?;
+    let token = session_token_for(request, opts, origin)?;
+    let key = if origin == Origin::Public {
+        String::new()
+    } else {
+        session_key(request)
+    };
+    Some(json!({ "token": token, "key": key, "origin": origin.as_str() }))
 }
 
 /// The session token the request presents for `origin`, if any.
@@ -836,10 +1055,11 @@ fn require_own_origin(request: &Request, origin: Origin) -> Result<(), HttpResp>
 
 /// Ask the daemon whether `token` is a live session on `origin`.
 /// The header carrying a session's second credential (review round 2,
-/// PR #249). The page holds it in `sessionStorage` — scoped to its exact
-/// origin, port included — so a listener on another port that receives
-/// the cookie (cookies ignore ports) never has it, and a cross-site page
-/// cannot set a custom header without a preflight this board refuses.
+/// PR #249). The page keeps it in this browser's `localStorage` — scoped
+/// to its exact origin, port included — so a listener on another port
+/// that receives the cookie (cookies ignore ports) never has it, and a
+/// cross-site page cannot set a custom header without a preflight this
+/// board refuses.
 /// Public sessions (CAD-526) have no page key: the `__Host-` cookie is
 /// the whole credential on an origin no other port can share.
 pub(super) const SESSION_HEADER: &str = "X-Cadence-Session";
@@ -854,12 +1074,16 @@ fn session_key(request: &Request) -> String {
 /// Ask the daemon whether the cookie's `token` and the page's `key`
 /// together are a live session on `origin`. A `public` request is
 /// answered by `board_session_check` — the cookie alone — and can only
-/// ever name a `public` session row.
+/// ever name a `public` session row. `budget` bounds the daemon's
+/// answer for courtesy metadata (CAD-1193): a transport failure inside
+/// it is `daemon_unavailable`, which `/api/meta` reports as
+/// `signed_in: null` — never a manufactured `false`.
 fn check_session(
     state_dir: &std::path::Path,
     token: &str,
     key: &str,
     origin: Origin,
+    budget: Option<&client::MetaBudget>,
 ) -> Result<Option<Value>, HttpResp> {
     let (method, params) = if origin == Origin::Public {
         ("board_session_check", json!({"token": token}))
@@ -869,9 +1093,19 @@ fn check_session(
             json!({"token": token, "key": key, "origin": origin.as_str()}),
         )
     };
-    match client::rpc(state_dir, method, params) {
-        Ok(v) if v["valid"] == true => Ok(Some(v["session"].clone())),
-        Ok(_) => Ok(None),
+    let answered = match budget {
+        Some(b) => b.read(state_dir, method, params),
+        None => client::rpc(state_dir, method, params),
+    };
+    match answered {
+        Ok(v) if v["valid"] == true && v["session"].is_object() => Ok(Some(v["session"].clone())),
+        Ok(v) if v["valid"] == false => Ok(None),
+        Ok(_) => Err(coded_response(
+            503,
+            "session_unavailable",
+            "the daemon did not answer whether this session is valid",
+            None,
+        )),
         Err(e) if e.to_string().contains("Unknown method") => Err(coded_response(
             501,
             "unsupported_daemon",
@@ -898,11 +1132,147 @@ pub(super) fn public_session(
 ) -> Result<Option<Value>, HttpResp> {
     match request_origin(request, opts) {
         ReqOrigin::Known(Origin::Public) => match session_cookie(request, opts, Origin::Public) {
-            Some(token) => check_session(state_dir, &token, "", Origin::Public),
+            Some(token) => {
+                let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+                check_session(state_dir, &token, "", Origin::Public, Some(&budget))
+            }
             None => Ok(None),
         },
         _ => Ok(None),
     }
+}
+
+/// Read authority is deliberately weaker than write/operator authority:
+/// the daemon's live cookie + tab key (public sessions use only their
+/// cookie), with no inferred privilege from the peer's process.
+/// Credentials stay in this request/stream and are never serialized.
+pub(super) struct ReadAdmission {
+    proof: Option<(String, String, Origin)>,
+    checked_at: std::time::Instant,
+}
+
+impl ReadAdmission {
+    /// True when `admit_read` admitted the request without a session — the
+    /// local bootstrap case, where the caller is the operator.
+    pub(super) fn is_anonymous(&self) -> bool {
+        self.proof.is_none()
+    }
+}
+
+/// The caller spelling for a read `admit_read` already admitted.
+///
+/// `operator` for an anonymous local read; otherwise the public session's
+/// `users/<handle>` via [`board_caller`]. A failure to resolve refuses —
+/// a project-scoped read is never served unfiltered.
+pub(super) fn read_actor(
+    admission: &ReadAdmission,
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<String, HttpResp> {
+    if admission.is_anonymous() {
+        return Ok("operator".to_string());
+    }
+    // `Caller::actor()` is display text (it can read "<name> via board"),
+    // so the policy spelling is built from the variant: the public
+    // session's attribution handle is the platform subject, which is what
+    // `users/<handle>` keys on everywhere else.
+    board_caller(request, state_dir, opts, false, None).map(|caller| caller_spelling(&caller))
+}
+
+/// The project-policy spelling for a resolved board caller.
+pub(super) fn caller_spelling(caller: &Caller) -> String {
+    match caller {
+        Caller::Operator(_) => "operator".to_string(),
+        Caller::Named(named) => format!("users/{}", named.author),
+        Caller::Agent(alias) => format!("agents/{alias}"),
+    }
+}
+
+impl ReadAdmission {
+    pub(super) const RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub(super) fn wait_timeout(&self) -> std::time::Duration {
+        if self.proof.is_none() {
+            Self::RECHECK
+        } else {
+            Self::RECHECK.saturating_sub(self.checked_at.elapsed())
+        }
+    }
+
+    /// Revalidate before new frames once the five-second window ends.
+    /// Idle board streams wait only until that deadline; thread streams
+    /// can additionally spend at most two seconds in their bounded poll.
+    /// Validation itself has a two-second absolute deadline. Unknown or
+    /// invalid closes the stream without revoking or clearing credentials.
+    /// Bytes already handed to the blocking HTTP writer are not retractable.
+    pub(super) fn still_live(&mut self, state_dir: &std::path::Path) -> bool {
+        let Some((token, key, origin)) = &self.proof else {
+            return true;
+        };
+        if self.checked_at.elapsed() < Self::RECHECK {
+            return true;
+        }
+        let checked_at = std::time::Instant::now();
+        let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+        match check_session(state_dir, token, key, *origin, Some(&budget)) {
+            Ok(Some(_)) => {
+                self.checked_at = checked_at;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// `--allow-anonymous-reads` is a local bootstrap policy: only the
+/// loopback origin. `admit_read` and `/api/meta` share this predicate so a
+/// tailnet client is never told unsigned reads are available while its
+/// private reads are refused.
+pub(super) fn anonymous_reads_on(opts: &ServeOpts, origin: Option<Origin>) -> bool {
+    opts.allow_anonymous_reads
+        && !opts.board_public_only
+        && opts.public.is_none()
+        && origin == Some(Origin::Loopback)
+}
+
+pub(super) fn admit_read(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<ReadAdmission, HttpResp> {
+    let checked_at = std::time::Instant::now();
+    let admission = |proof| ReadAdmission { proof, checked_at };
+    let origin = match request_origin(request, opts) {
+        ReqOrigin::Known(origin) => Some(origin),
+        ReqOrigin::NoSession(_) => None,
+    };
+    // Only the loopback origin can use the local bootstrap allowance; a
+    // tailnet proxy or any other Host still needs a session.
+    if anonymous_reads_on(opts, origin) {
+        return Ok(admission(None));
+    }
+    if let Some(origin) = origin {
+        if let Some(token) = session_cookie(request, opts, origin) {
+            let key = session_key(request);
+            let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+            if check_session(state_dir, &token, &key, origin, Some(&budget))?.is_some() {
+                return Ok(admission(Some((token, key, origin))));
+            }
+        }
+    }
+    let (code, message) = if origin == Some(Origin::Public) {
+        (
+            "board_session_required",
+            "a board session is required — sign in through your company's workspace",
+        )
+    } else {
+        (
+            "operator_session_required",
+            "a local board session is required — sign in with cadence ui login",
+        )
+    };
+    Err(coded_response(401, code, message, None))
 }
 
 /// How the board's peer attribution came out.
@@ -925,6 +1295,10 @@ pub(super) enum Attribution {
     /// this uid's with no visible owner (a sender that closed its end
     /// early to escape attribution).
     Unknown(String),
+    /// CAD-1193: a required identity read could not answer inside the
+    /// metadata budget — distinct from `Unknown`, which is evidence
+    /// against the caller. Only ever produced on a bounded read.
+    Unavailable(String),
     /// The proven `tailscale serve` proxy, with its login (or why none).
     Proxy(Result<String, String>),
 }
@@ -1019,6 +1393,12 @@ pub(super) fn decide(
                  it is tied to; the operator writes with a session (`cadence ui login`)."
             ),
         ),
+        // A bounded metadata read whose identity dependency did not
+        // answer: not a caller's fault, not a grant — unknown.
+        (_, Attribution::Unavailable(why)) => Verdict::Refuse(
+            "identity_unavailable",
+            format!("caller identity could not be read: {why}"),
+        ),
     }
 }
 
@@ -1086,22 +1466,36 @@ fn attribute(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
     origin: &ReqOrigin,
+    budget: Option<&client::MetaBudget>,
 ) -> Attribution {
+    // CAD-1193: a bounded metadata read reports a failed dependency or
+    // board fact as `Unavailable` (unknown); the same failures keep
+    // `Unknown` — the caller-side refusal — for every guarded route.
+    let bounded = budget.is_some();
+    let dep_fail = |why: String| {
+        if bounded {
+            Attribution::Unavailable(why)
+        } else {
+            Attribution::Unknown(why)
+        }
+    };
     let configured = match crate::agent_uid::config::configured_uid(state_dir) {
         Ok(uid) => uid,
-        Err(error) => return Attribution::Unknown(format!("agent UID config refused: {error}")),
+        Err(error) => {
+            return dep_fail(format!("agent UID config refused: {error}"));
+        }
     };
     // `serve` captured the daemon's UID once before opening the port.
     // Keep comparing the private record on every request so removal or
     // replacement cannot downgrade a board with an active agent UID.
     let agent_uid = match pinned_agent_uid(configured, opts.agent_uid) {
         Ok(uid) => uid,
-        Err(error) => return Attribution::Unknown(error),
+        Err(error) => return dep_fail(error),
     };
     if agent_uid.is_some() {
         let server = match concrete_board_server(opts) {
             Ok(server) => server,
-            Err(error) => return Attribution::Unknown(error),
+            Err(error) => return dep_fail(error),
         };
         let socket_uid = request
             .remote_addr()
@@ -1112,8 +1506,11 @@ fn attribute(
             })
             .map(|(_, uid)| uid);
         let classified = agent_uid_attribution(socket_uid, agent_uid, Attribution::NoAgent);
-        if matches!(classified, Attribution::AgentUid | Attribution::Unknown(_)) {
+        if matches!(classified, Attribution::AgentUid) {
             return classified;
+        }
+        if let Attribution::Unknown(why) = classified {
+            return dep_fail(why);
         }
     }
     if let Some(asserted) = crate::test_seam::asserted() {
@@ -1130,7 +1527,26 @@ fn attribute(
             header_value(request, "Tailscale-User-Login").as_deref(),
         ));
     }
-    let found = agent_roots(state_dir).and_then(|roots| {
+    // CAD-1193: under a metadata budget the required `agent_list` read
+    // is itself a dependency — its failure is `Unavailable` (unknown),
+    // distinct from a caller the board could attribute-fail on its own
+    // evidence (a vanished socket is still the caller's `Unknown`).
+    // Unbounded callers keep the exact `Unknown` they had.
+    let roots = match agent_roots(state_dir, budget.copied()) {
+        Ok(roots) => roots,
+        Err(why) if budget.is_some() => return Attribution::Unavailable(why),
+        Err(why) => {
+            let why = match origin {
+                ReqOrigin::NoSession(p) => format!("{why}. {p}"),
+                ReqOrigin::Known(_) => why,
+            };
+            return match foreign_socket(request, opts) {
+                Some(uid) => Attribution::Foreign(format!("{why} (its socket is uid {uid}'s)")),
+                None => Attribution::Unknown(why),
+            };
+        }
+    };
+    let found = Ok::<crate::peer::AgentRoots, String>(roots).and_then(|roots| {
         let peer = request
             .remote_addr()
             .ok_or_else(|| "the request has no peer address".to_string())?;
@@ -1154,25 +1570,29 @@ fn attribute(
         Ok(Some(alias)) => Attribution::Agent(alias),
         Ok(None) => Attribution::NoAgent,
         Err(why) => {
-            // Only a live client socket of another uid excuses it.
-            // SAFETY: geteuid has no preconditions and cannot fail.
-            let euid = unsafe { libc::geteuid() };
-            let foreign = request
-                .remote_addr()
-                .and_then(|peer| crate::peer::client_socket(opts.port, *peer).ok().flatten())
-                .filter(|(_, uid)| *uid != euid);
             let why = match origin {
                 ReqOrigin::NoSession(p) => format!("{why}. {p}"),
                 ReqOrigin::Known(_) => why,
             };
-            match foreign {
-                Some((_, uid)) => {
-                    Attribution::Foreign(format!("{why} (its socket is uid {uid}'s)"))
-                }
+            // Only a live client socket of another uid excuses it.
+            match foreign_socket(request, opts) {
+                Some(uid) => Attribution::Foreign(format!("{why} (its socket is uid {uid}'s)")),
                 None => Attribution::Unknown(why),
             }
         }
     }
+}
+
+/// The uid owning the peer's still-open client socket when it is not
+/// this process's — a privilege-separated proxy (tailscaled, sshd).
+fn foreign_socket(request: &Request, opts: &ServeOpts) -> Option<u32> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    request
+        .remote_addr()
+        .and_then(|peer| crate::peer::client_socket(opts.port, *peer).ok().flatten())
+        .map(|(_, uid)| uid)
+        .filter(|uid| *uid != euid)
 }
 
 /// What a live session row means for [`decide`]: the operator's on
@@ -1188,6 +1608,7 @@ fn held_of(origin: Origin, session: &Value) -> Option<Held> {
                     Held::Named(Named {
                         actor: user.actor(),
                         author: user.handle.clone(),
+                        sub: user.sub.clone(),
                         operator: user.is_operator(),
                     })
                 })
@@ -1199,12 +1620,16 @@ fn held_of(origin: Origin, session: &Value) -> Option<Held> {
 /// The caller of a board request (module doc). `write` requires a
 /// cookie-bearing request to carry its own `Origin` (browsers send none
 /// on a same-origin GET, so `/api/meta` passes `false`). `Err` is the
-/// refusal to send.
+/// refusal to send. `budget` bounds the dependent reads of a courtesy
+/// metadata answer (CAD-1193); `None` — every guarded route — keeps the
+/// full RPC bound. A dependency that cannot answer fails closed either
+/// way; the bounded caller turns the refusal into `unknown`.
 pub(super) fn board_caller(
     request: &Request,
     state_dir: &std::path::Path,
     opts: &ServeOpts,
     write: bool,
+    budget: Option<&client::MetaBudget>,
 ) -> Result<Caller, HttpResp> {
     let origin = request_origin(request, opts);
     let (held, token) = match &origin {
@@ -1213,7 +1638,7 @@ pub(super) fn board_caller(
                 if write {
                     require_own_origin(request, *o)?;
                 }
-                match check_session(state_dir, &token, &session_key(request), *o)? {
+                match check_session(state_dir, &token, &session_key(request), *o, budget)? {
                     Some(session) => (held_of(*o, &session), Some(token)),
                     None => (None, None),
                 }
@@ -1226,7 +1651,7 @@ pub(super) fn board_caller(
         ReqOrigin::Known(Origin::Public) => ("board_session_required", BOARD_SESSION_REQUIRED),
         _ => ("operator_session_required", SESSION_REQUIRED),
     };
-    let attribution = attribute(request, state_dir, opts, &origin);
+    let attribution = attribute(request, state_dir, opts, &origin, budget);
     match decide(held, attribution, required) {
         Verdict::Operator(actor) => Ok(Caller::Operator(actor)),
         Verdict::Named(named) => Ok(Caller::Named(named)),
@@ -1246,6 +1671,13 @@ pub(super) fn board_caller(
                 ),
             ))
         }
+        // CAD-1193: a bounded read's unavailable dependency answers
+        // 503 — `operator_viewer` reports it as `unknown`, never as a
+        // resolved non-operator; every unbounded caller still gets the
+        // plain 403 refusal.
+        Verdict::Refuse("identity_unavailable", msg) => {
+            Err(coded_response(503, "identity_unavailable", &msg, None))
+        }
         Verdict::Refuse(check, msg) => Err(guard_fail(check, &msg)),
     }
 }
@@ -1256,18 +1688,44 @@ pub(super) fn board_caller(
 /// `None` → the flow is off (or the daemon is unreachable — the mint
 /// would refuse anyway), and the routes answer the same `device_off`
 /// as before.
-fn device_config(state_dir: &std::path::Path) -> Option<crate::device_login::DeviceConfig> {
-    let out = client::rpc(state_dir, "device_login_config", json!({})).ok()?;
+fn device_config(
+    state_dir: &std::path::Path,
+    budget: Option<&client::MetaBudget>,
+) -> Option<crate::device_login::DeviceConfig> {
+    let out = match budget {
+        Some(b) => b.read(state_dir, "device_login_config", json!({})).ok()?,
+        None => client::rpc(state_dir, "device_login_config", json!({})).ok()?,
+    };
     if out["configured"].as_bool() != Some(true) {
         return None;
     }
     crate::device_login::DeviceConfig::new(out["issuer"].as_str()?, out["org"].as_str()?).ok()
 }
 
-/// `/api/meta`'s session fields: `operator` (this request holds a live
-/// session), `session` (its display id and expiries, never the token)
-/// and `login_hint` (the command that signs this origin in).
-pub(super) fn meta(request: &Request, state_dir: &std::path::Path, opts: &ServeOpts) -> Value {
+/// The session half of `/api/meta`.
+pub(super) struct MetaSession {
+    pub signed_in: Option<bool>,
+    pub hosted: bool,
+    pub session: Value,
+    pub login_hint: &'static str,
+    pub device_login: bool,
+    pub tab_signed_out: bool,
+}
+
+/// `/api/meta`'s session fields under `budget` (CAD-1193):
+/// `signed_in` is `true` for a live session, `false` when the daemon
+/// positively answered that the presented credentials are not one, and
+/// `null` when the session check itself could not answer in budget —
+/// an unknown, never a manufactured sign-out. `tab_signed_out` is
+/// reported only for the proven case (cookie present, daemon answered
+/// not-valid): an unanswered check can never claim this tab is signed
+/// out, and no answer here ever clears the request's credentials.
+pub(super) fn meta(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    budget: &client::MetaBudget,
+) -> MetaSession {
     let hosted = matches!(
         request_origin(request, opts),
         ReqOrigin::Known(Origin::Public)
@@ -1280,10 +1738,11 @@ pub(super) fn meta(request: &Request, state_dir: &std::path::Path, opts: &ServeO
                 Origin::Public => "sign in through your company's AgenticOS workspace",
             };
             let token = session_cookie(request, opts, o);
+            // Three answers: `Some(Some)` live session, `Some(None)`
+            // proven not valid, `None` unanswerable in budget — an
+            // error is NOT a proven invalid.
             let session = token.as_deref().and_then(|token| {
-                check_session(state_dir, token, &session_key(request), o)
-                    .ok()
-                    .flatten()
+                check_session(state_dir, token, &session_key(request), o, Some(budget)).ok()
             });
             (hint, token.is_some(), session)
         }
@@ -1291,22 +1750,34 @@ pub(super) fn meta(request: &Request, state_dir: &std::path::Path, opts: &ServeO
     };
     // CAD-777/CAD-841: device sign-in is advertised on the operator
     // surface only — never to the public host or an unattributable
-    // request — and only while the daemon's store says configured.
+    // request — and only while the daemon's store says configured. On
+    // an unanswerable check it stays silent rather than mislead.
     let device_login = matches!(
         request_origin(request, opts),
         ReqOrigin::Known(Origin::Loopback | Origin::Tailnet)
-    ) && device_config(state_dir).is_some();
-    json!({
-        "signed_in": session.is_some(),
-        "hosted": hosted,
-        "session": session,
-        "login_hint": hint,
-        "device_login": device_login,
-        // A cookie but no live session for this page: typically a new
-        // tab — the key lives in the signing-in tab's `sessionStorage`.
-        // Public sessions have no page key, so the cookie alone answers.
-        "tab_signed_out": cookie && session.is_none(),
-    })
+    ) && device_config(state_dir, Some(budget)).is_some();
+    // `None` with a cookie (a check that could not answer) reports
+    // `signed_in: null`; `Some(None)` (proven not valid) and a request
+    // carrying no session credential at all report `false`;
+    // `Some(Some)` reports `true`.
+    let proven_signed_out = session == Some(None);
+    let signed_in = match &session {
+        Some(s) => Some(s.is_some()),
+        None if !cookie => Some(false),
+        None => None,
+    };
+    MetaSession {
+        signed_in,
+        hosted,
+        session: json!(session.flatten()),
+        login_hint: hint,
+        device_login,
+        // A cookie but no live session for this browser: typically its
+        // key storage was cleared. Public sessions have no page key, so
+        // the cookie alone answers. An unanswerable check is NOT this
+        // state.
+        tab_signed_out: cookie && proven_signed_out,
+    }
 }
 
 #[derive(Deserialize)]
@@ -1343,7 +1814,7 @@ fn cookie_attrs(origin: Origin, max_age: i64) -> String {
 
 /// `POST /api/session {"nonce"}` — exchange a login link for a session:
 /// the cookie (`Set-Cookie`) plus `{"session_key"}` for the page, both
-/// required on every later write. The write guards apply, the Host must be this board's own
+/// required on later private reads and writes. The write guards apply, and the Host must be this board's own
 /// name (or the proven tailnet), and `Origin` must be this request's
 /// own; the link must have been minted for this origin. The peer is
 /// attributed BEFORE the exchange, under the same rule as a
@@ -1355,9 +1826,6 @@ pub(super) fn open(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> HttpResp {
-    if opts.read_only {
-        return guard_fail("read_only", "board is read-only — sign-in is disabled");
-    }
     if let Err(resp) = write_guard(request, "application/json", opts) {
         return resp;
     }
@@ -1389,7 +1857,8 @@ pub(super) fn open(
         Err(resp) => return resp,
     };
     let user_agent = header_value(request, "User-Agent").unwrap_or_default();
-    let refusal = match attribute(request, state_dir, opts, &ReqOrigin::Known(origin)) {
+    let refusal =
+        match attribute(request, state_dir, opts, &ReqOrigin::Known(origin), None) {
         Attribution::Agent(alias) => Some((
             "session_from_agent",
             alias.clone(),
@@ -1401,7 +1870,10 @@ pub(super) fn open(
             "sign-in refused: this request comes from the agent UID — the link is spent"
                 .to_string(),
         )),
-        Attribution::Unknown(why) => Some((
+        // `Unavailable` cannot occur here — this caller passes no
+        // budget; it maps to the same refusal as `Unknown` if ever
+        // reached so the exchange stays fail-closed.
+        Attribution::Unknown(why) | Attribution::Unavailable(why) => Some((
             "caller_identity",
             "unattributable".to_string(),
             format!("sign-in refused: the board cannot attribute this caller — {why}; the link is spent"),
@@ -1446,8 +1918,8 @@ pub(super) fn open(
     }
     let now = crate::issue::time::now_epoch();
     let expires = opened["session"]["expires_at"].as_i64().unwrap_or(now);
-    // The key goes to this page only, once: it keeps it in
-    // `sessionStorage` and sends it as `X-Cadence-Session`.
+    // The key goes to this browser only, once: it keeps it in
+    // `localStorage` and sends it as `X-Cadence-Session`.
     let key = opened["key"].as_str().unwrap_or_default();
     let body = serde_json::to_vec(&json!({ "session_key": key })).unwrap_or_default();
     let mut resp = Response::from_data(body).with_status_code(StatusCode(200));
@@ -1556,7 +2028,7 @@ fn device_attribution(
     opts: &ServeOpts,
     origin: Origin,
 ) -> Option<HttpResp> {
-    match attribute(request, state_dir, opts, &ReqOrigin::Known(origin)) {
+    match attribute(request, state_dir, opts, &ReqOrigin::Known(origin), None) {
         Attribution::Agent(alias) => Some(guard_fail(
             "session_from_agent",
             &format!(
@@ -1569,7 +2041,9 @@ fn device_attribution(
             "sign-in refused: this request comes from the agent UID — \
              device sign-in is never minted for a pane",
         )),
-        Attribution::Unknown(why) => Some(guard_fail(
+        // `Unavailable` is unreachable on this unbounded path; it
+        // refuses exactly like `Unknown` so the route stays fail-closed.
+        Attribution::Unknown(why) | Attribution::Unavailable(why) => Some(guard_fail(
             "caller_identity",
             &format!("sign-in refused: the board cannot attribute this caller — {why}"),
         )),
@@ -1589,12 +2063,9 @@ pub(super) fn device_code(
     let login = &opts.device_login;
     // CAD-841: the daemon's store decides whether the route serves at
     // all — `clear` on a running board closes it on this very request.
-    let Some(config) = device_config(state_dir) else {
+    let Some(config) = device_config(state_dir, None) else {
         return device_off();
     };
-    if opts.read_only {
-        return guard_fail("read_only", "board is read-only — sign-in is disabled");
-    }
     if let Err(resp) = write_guard(request, "application/json", opts) {
         return resp;
     }
@@ -1683,12 +2154,9 @@ pub(super) fn device_poll(
     opts: &ServeOpts,
 ) -> HttpResp {
     let login = &opts.device_login;
-    let Some(config) = device_config(state_dir) else {
+    let Some(config) = device_config(state_dir, None) else {
         return device_off();
     };
-    if opts.read_only {
-        return guard_fail("read_only", "board is read-only — sign-in is disabled");
-    }
     if let Err(resp) = write_guard(request, "application/json", opts) {
         return resp;
     }
@@ -2030,14 +2498,33 @@ pub(super) fn platform_session(
         return platform_fail(400, "assertion_invalid", "request body is not valid JSON");
     }
     let user_agent = header_value(request, "User-Agent").unwrap_or_default();
+    // Only relay a prior session the browser actually presented. The daemon
+    // verifies this opaque proof before allowing it to affect consent state.
+    let prior_session = session_cookie(request, opts, Origin::Public);
     match client::rpc(
         state_dir,
         "board_session_open",
-        json!({"assertion": req.assertion, "user_agent": user_agent}),
+        json!({
+            "assertion": req.assertion,
+            "user_agent": user_agent,
+            "prior_session": prior_session,
+        }),
     ) {
         Ok(opened) => {
             let token = opened["token"].as_str().unwrap_or_default();
-            let body = serde_json::to_vec(&json!({"ok": true})).unwrap_or_default();
+            // The server's own session expiry rides the success body so
+            // the AgenticOS edge binds its custody digest to the ACTUAL
+            // session lifetime — never an approximation. The value comes
+            // only from the daemon's opened row; a missing or malformed
+            // expiry is an internal fault, not a sign-in with a guessed
+            // or extended lifetime.
+            let expires_at = opened["session"]["expires_at"].as_i64();
+            let body = match expires_at {
+                Some(at) if at > 0 => {
+                    serde_json::to_vec(&json!({"ok": true, "expires_at": at})).unwrap_or_default()
+                }
+                _ => return platform_fail(500, "internal", "session expiry unavailable"),
+            };
             let mut resp = Response::from_data(body).with_status_code(StatusCode(200));
             resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
             set_cookie(
@@ -2068,6 +2555,27 @@ pub(super) fn platform_session(
 
 #[cfg(test)]
 mod tests {
+    /// A board session's display actor is not the policy key: the named
+    /// handle is. Using `Caller::actor()` here made every project
+    /// unreadable for a real board session (cad1452).
+    #[test]
+    fn a_board_session_maps_to_the_user_spelling_not_the_display_actor() {
+        let named = Caller::Named(Named {
+            actor: "Fable Chen <fable@example.com> (board)".into(),
+            author: "usr_fable".into(),
+            sub: "sub_fable".into(),
+            operator: false,
+        });
+        assert_eq!(caller_spelling(&named), "users/usr_fable");
+        assert_eq!(
+            caller_spelling(&Caller::Operator("operator (ui)".into())),
+            "operator"
+        );
+        assert_eq!(
+            caller_spelling(&Caller::Agent("pane-3".into())),
+            "agents/pane-3"
+        );
+    }
     use super::*;
 
     #[test]
@@ -2198,10 +2706,25 @@ mod tests {
             route_class("POST", "/api/plans/CAD-1/approve"),
             RouteClass::OperatorOnly
         );
+        // CAD-810 / CAD-821: every topic write is the operator's.
+        for path in [
+            "/api/topics",
+            "/api/topics/topic-abc/subscribers",
+            "/api/topics/topic-abc/posts",
+            "/api/topics/topic-abc/requests",
+        ] {
+            assert_eq!(
+                route_class("POST", path),
+                RouteClass::OperatorOnly,
+                "{path}"
+            );
+        }
         assert_eq!(
             route_class("POST", "/api/ideas/CAD-1/decide"),
             RouteClass::OperatorOnly
         );
+        // Setup: creating an agent is the operator's, never an agent's.
+        assert_eq!(route_class("POST", "/api/agents"), RouteClass::OperatorOnly);
         assert_eq!(
             route_class("POST", "/api/issues/CAD-1/answers"),
             RouteClass::OperatorOnly
@@ -2259,10 +2782,14 @@ mod tests {
                 RouteClass::OperatorOnly,
                 "{path}"
             );
+            // Listed in one of the two declarations: the endpoint table for
+            // migrated paths (CAD-1682), otherwise `WRITE_ROUTES`.
             assert!(
                 WRITE_ROUTES.iter().any(|r| r.method == "POST"
                     && r.class == RouteClass::OperatorOnly
-                    && matches(r.pattern, path)),
+                    && matches(r.pattern, path))
+                    || crate::ui::endpoints::class_of("POST", path)
+                        == Some(RouteClass::OperatorOnly),
                 "{path} must be listed, not left to the fail-closed default"
             );
         }
@@ -2322,6 +2849,7 @@ mod tests {
             Some(Held::Named(Named {
                 actor: "Fable <f@e.co> (board)".into(),
                 author: "fable".into(),
+                sub: "sub_fable".into(),
                 operator: false,
             }))
         };
@@ -2359,6 +2887,7 @@ mod tests {
             Verdict::Named(Named {
                 actor: "Fable <f@e.co> (board)".into(),
                 author: "fable".into(),
+                sub: "sub_fable".into(),
                 operator: false,
             })
         );

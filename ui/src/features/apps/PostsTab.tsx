@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { fmtTime } from "../../lib/fmt";
+import { useTranslate } from "../../lib/locale";
 import { useQuery } from "../../lib/useResource";
 import type { AppPendingSend, AppRun, AppRunOutput } from "../../lib/types";
 import Link from "../../ui/Link";
@@ -38,6 +39,7 @@ export default function PostsTab({
   onOpenIssue: (id: string) => void;
   onRetry: () => void;
 }) {
+  const t = useTranslate();
   const [filter, setFilter] = useState<RunFilter>("in_progress");
   const counts = filterCounts(runs, needs, items, pending);
   const shown = runs.filter((run) => {
@@ -49,9 +51,9 @@ export default function PostsTab({
       {runs.length > 0 && <div className="flex flex-wrap items-center gap-1.5">
         {(
           [
-            ["in_progress", "In progress"],
-            ["needs_you", "Needs you"],
-            ["published", "Published"],
+            ["in_progress", t("In progress")],
+            ["needs_you", t("Needs you")],
+            ["published", t("Published")],
           ] as [RunFilter, string][]
         ).map(([id, label]) => (
           <button
@@ -69,35 +71,44 @@ export default function PostsTab({
         ))}
         <span className="text-micro text-ink-500 ml-auto">
           {[
-            counts.in_progress > 0 ? `${counts.in_progress} in progress` : null,
-            counts.needs_you > 0 ? `${counts.needs_you} need${counts.needs_you === 1 ? "s" : ""} you` : null,
-            counts.published > 0 ? `${counts.published} published` : null,
+            counts.in_progress > 0 ? t("{count} in progress").replace("{count}", String(counts.in_progress)) : null,
+            counts.needs_you > 0 ? t(counts.needs_you === 1 ? "{count} needs you" : "{count} need you").replace("{count}", String(counts.needs_you)) : null,
+            counts.published > 0 ? t("{count} published").replace("{count}", String(counts.published)) : null,
           ]
             .filter(Boolean)
-            .join(" · ") || "Nothing yet"}
+            .join(" · ") || t("Nothing yet")}
         </span>
       </div>}
       <ResourceGate
         state={runsState}
-        loading="loading posts…"
-        failed="could not load posts"
+        loading={t("loading posts…")}
+        failed={t("could not load posts")}
         onRetry={onRetry}
       />
       {runsState.data && runs.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400">
-          <h2 className="text-cardtitle font-medium text-ink-100">No posts yet</h2>
+          <h2 className="text-cardtitle font-medium text-ink-100">{t("No posts yet")}</h2>
           <p className="mt-1">{!ready
-            ? "Complete setup in Settings before starting a post."
+            ? t("Complete setup in Settings before starting a post.")
             : viewer.readOnly && viewer.operator
-              ? "New posts cannot be started on this read-only board."
+              ? t("New posts cannot be started on this read-only board.")
+            : viewer.operator === null && viewer.access === "unavailable"
+              ? t("Access could not be confirmed — the board's access check did not answer.")
+            : viewer.operator === null
+              ? t("Checking whether this session may start a post…")
             : !viewer.operator
-              ? "Sign in as the operator to start a post."
-              : "Start a post when you’re ready. You’ll review the plan before any work runs."}</p>
+              ? t("Sign in as the operator to start a post.")
+              : t("Start a post when you’re ready. You’ll review the plan before any work runs.")}{" "}
+            {viewer.operator === null && viewer.access === "unavailable" && viewer.onRetryAccess && (
+              <button type="button" className="lnk" onClick={viewer.onRetryAccess}>
+                {t("Retry access check")}
+              </button>
+            )}</p>
         </div>
       )}
       {runsState.data && runs.length > 0 && shown.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400">
-          {filter === "needs_you" ? "No posts need your attention." : filter === "published" ? "No published posts yet." : "No posts in progress."}
+          {filter === "needs_you" ? t("No posts need your attention.") : filter === "published" ? t("No published posts yet.") : t("No posts in progress.")}
         </div>
       )}
       <ul className="space-y-2.5">

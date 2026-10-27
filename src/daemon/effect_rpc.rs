@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{optional_str, required_str, AgentCaller, Shared};
+use super::{optional_str, reject_identity_fields, required_str, AgentCaller, Shared};
 use crate::contract_fixture::{classify_call, Effect};
 use crate::error::{Error, Result};
 use crate::platform::{self, PlatformAdapter};
@@ -68,22 +68,26 @@ impl Shared {
     /// defaults like `platform_check`'s: the caller's project default
     /// for the platform.
     pub(super) fn rpc_platform_call(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        let agent = self.request_caller(params, peer_pid, "platform call")?;
-        self.store
-            .app_effect_guard(&agent, optional_str(params, "task"))?;
-        // The caller is the connection — `agent`/`alias` are request
-        // fields only where they name a target; a platform call has no
-        // such field, so any present is refused, even one naming the
-        // caller itself (§5.4: the record's agent is never a field).
-        for field in ["agent", "alias"] {
-            if params.get(field).is_some() {
-                return Err(Error::rejected(format!(
-                    "platform call: caller identity is connection-bound; request \
-                     field '{field}' is not accepted"
-                )));
+        reject_identity_fields(params, "platform call")?;
+        // An agent caller is connection-derived. A proven operator may run
+        // read/draft tools from an attached shell; a send still needs an
+        // agent, because only an agent's effect can be released.
+        let agent = match self.request_caller(params, peer_pid, "platform call") {
+            Ok(agent) => Some(agent),
+            Err(error) => {
+                if self.proven_operator("platform call", peer_pid).is_err() {
+                    return Err(error);
+                }
+                None
             }
+        };
+        if let Some(agent) = agent.as_deref() {
+            self.store
+                .app_effect_guard(agent, optional_str(params, "task"))?;
+            self.store.agent(agent)?;
+        } else if params.get("task").is_some() {
+            return Err(Error::rejected("platform call: 'task' is an agent field"));
         }
-        self.store.agent(&agent)?;
         let platform = identifier(required_str(params, "platform")?, "Platform")?;
         let tool = required_str(params, "tool")?;
         let input = match params.get("input") {
@@ -99,7 +103,14 @@ impl Shared {
         }
         let account = match optional_str(params, "account") {
             Some(a) => identifier(a, "Account")?,
-            None => self.default_account(&agent, &platform, params)?,
+            None => match agent.as_deref() {
+                Some(agent) => self.default_account(agent, &platform, params)?,
+                None => {
+                    return Err(Error::rejected(
+                        "platform call: a proven operator passes 'account'",
+                    ))
+                }
+            },
         };
         let task = optional_str(params, "task")
             .map(|t| identifier(t, "Task"))
@@ -108,47 +119,125 @@ impl Shared {
         if adapter.app_artifact_tool(tool) {
             return Err(Error::rejected("this reviewed tool requires an exact accepted app artifact and explicit app release"));
         }
-        // The §5.3 grant check gates even staging — a caller holding no
-        // grant on the account learns that before a row exists.
-        self.check_grant(&agent, &platform, &account, &adapter, tool)?;
-        // The §5.4 cancel scan runs on every touchpoint: a source edit
-        // since the row staged cancels it before this call proceeds.
-        self.scan_effect_sources(Some(&agent));
+        if let Some(agent) = agent.as_deref() {
+            self.check_grant(agent, &platform, &account, &adapter, tool)?;
+        }
+        {
+            let _admission = self.custody_operation()?;
+            self.refuse_encrypted_target(&platform, &account)?;
+        }
+        if let Some(agent) = agent.as_deref() {
+            self.scan_effect_sources(Some(agent));
+        }
 
         let reported = adapter.reported_manifest_version();
         let table = adapter.table();
         match classify_call(table, reported.as_deref(), tool) {
             Effect::Read | Effect::Draft => {
                 let draft = table.effect_of(tool) == Effect::Draft;
-                self.execute_immediate(&agent, &platform, &account, tool, &input, draft, &adapter)
+                // The actor label is the event/draft-log identity only; a
+                // send never reaches here without an agent.
+                let actor = agent.as_deref().unwrap_or("operator");
+                self.execute_immediate(actor, &platform, &account, tool, &input, draft, &adapter)
             }
-            Effect::Send => self.stage_send(
-                &agent, &platform, &account, tool, &input, task, params, &adapter,
-            ),
+            Effect::Send => match agent.as_deref() {
+                Some(agent) => self.stage_send(
+                    agent, &platform, &account, tool, &input, task, params, &adapter,
+                ),
+                None => Err(Error::rejected(
+                    "platform call: a send effect needs an agent; the operator releases it \
+                     with the effect decision",
+                )),
+            },
         }
     }
 
-    /// The caller's project default account for `platform` (the same
-    /// resolution `platform_check` documents): `params.project`, else
-    /// the caller agent's cwd's project. A platform with a built-in
-    /// account (the `local` outbox, CAD-577) falls back to it when the
-    /// project names no default — so a slot bound to `local` needs no
-    /// setup.
+    /// `platform_tools {project?}` — every registered adapter's reviewed
+    /// table. Read-only: no credential, no grant check, no network. A tool
+    /// whose only execution path is a frozen app-run capability carries
+    /// `direct: false`, so a listing never promises a call the gate refuses.
+    pub(super) fn rpc_platform_tools(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let Some(fields) = params.as_object() else {
+            return Err(Error::rejected(
+                "platform tools: params must be a JSON object",
+            ));
+        };
+        if let Some(field) = fields.keys().find(|key| key.as_str() != "project") {
+            return Err(Error::rejected(format!(
+                "platform tools: unknown field '{field}'"
+            )));
+        }
+        let project = match fields.get("project") {
+            None | Some(Value::Null) => self.caller_project(peer_pid),
+            Some(Value::String(project)) if !project.trim().is_empty() => {
+                Some(identifier(project, "Project")?.to_string())
+            }
+            Some(_) => {
+                return Err(Error::rejected(
+                    "platform tools: 'project' must be a non-empty string",
+                ))
+            }
+        };
+        let mut platforms: Vec<(&String, &Arc<dyn PlatformAdapter>)> =
+            self.platforms.iter().collect();
+        platforms.sort_by(|left, right| left.0.cmp(right.0));
+        let mut out = Vec::new();
+        for (platform, adapter) in platforms {
+            let table = adapter.table();
+            let mut tools: Vec<Value> = table
+                .tools
+                .iter()
+                .map(|decl| {
+                    json!({
+                        "tool": decl.tool.clone(),
+                        "effect": decl.effect.clone(),
+                        "scopes": decl.scopes.clone(),
+                        "label": decl.label.clone(),
+                        "direct": adapter.direct_call(&decl.tool),
+                    })
+                })
+                .collect();
+            tools.sort_by(|left, right| left["tool"].as_str().cmp(&right["tool"].as_str()));
+            let default_account = match project.as_deref() {
+                Some(project) => self
+                    .store
+                    .platform_default(project, platform)?
+                    .map(|default| default.account),
+                None => None,
+            };
+            out.push(json!({
+                "platform": platform,
+                "manifest_version": table.manifest_version.clone(),
+                "default_account": default_account,
+                "tools": tools,
+            }));
+        }
+        Ok(json!({"platforms": out}))
+    }
+
+    /// The caller's project, from the same turn rule `default_account` uses.
+    /// An operator has no agent identity, so no implicit project.
+    fn caller_project(&self, peer_pid: u32) -> Option<String> {
+        let super::identity::Caller::Agent(verified) = self.caller_identity(peer_pid).ok()? else {
+            return None;
+        };
+        let agent = self.store.agent(&verified.agent.alias).ok()?;
+        self.turn_project(&agent).map(|turn| turn.key)
+    }
+
     fn default_account(&self, agent: &str, platform: &str, params: &Value) -> Result<String> {
         let project = match optional_str(params, "project") {
             Some(p) => identifier(p, "Project")?,
             None => {
                 let agent_row = self.store.agent(agent)?;
-                crate::issue::project::key_for_cwd(
-                    &self.pm_dir()?,
-                    std::path::Path::new(&agent_row.cwd),
-                )
-                .ok_or_else(|| {
-                    Error::rejected(format!(
-                        "'{agent}'s cwd resolves to no project — pass 'account' \
-                         or 'project'"
-                    ))
-                })?
+                self.turn_project(&agent_row)
+                    .map(|turn| turn.key)
+                    .ok_or_else(|| {
+                        Error::rejected(format!(
+                            "'{agent}' has no project: no running task and its cwd is \
+                             in no project — pass 'account' or 'project'"
+                        ))
+                    })?
             }
         };
         match self.store.platform_default(&project, platform)? {
@@ -237,11 +326,14 @@ impl Shared {
         draft: bool,
         adapter: &Arc<dyn PlatformAdapter>,
     ) -> Result<Value> {
-        let bytes =
-            platform::load_credential(&self.store, &self.platform_custody, platform_name, account)?;
+        let bytes = if adapter.credentialless() {
+            Vec::new()
+        } else {
+            platform::load_credential(&self.store, &self.platform_custody, platform_name, account)?
+        };
         let key = format!("call-{}", uuid::Uuid::new_v4().simple());
         let result = adapter
-            .execute(&bytes, tool, input, &key, None)
+            .execute_for_account(account, &bytes, tool, input, &key, None)
             .map_err(Error::internal)?;
         platform::refuse_leak("platform result", &result.to_string(), &bytes)?;
         let label = adapter.table().declared(tool).and_then(|d| d.label.clone());
@@ -469,9 +561,7 @@ impl Shared {
             Some(r) => EffectKey::Request(identifier(r, "Request handle")?),
             None => EffectKey::Id(identifier(required_str(params, "effect_id")?, "Effect id")?),
         };
-        let reason = optional_str(params, "reason")
-            .unwrap_or("cancelled")
-            .to_string();
+        let reason = optional_str(params, "reason").map(str::to_owned);
         // Which row the caller may reach: the operator any closeable
         // row; an agent only its own `waiting` ones — a `reconcile` row
         // is exactly the ambiguity only the operator resolves.
@@ -510,27 +600,24 @@ impl Shared {
                 .unwrap_or_else(|| row.clone());
             return Ok(json!({"state": "acknowledged", "record": row.to_record()}));
         }
-        // Caller-authored free text lands durably — screen it against
-        // the row's enrolled credential and bound it like every other
-        // stored string (N2). A custody miss just skips the screen.
-        let mut reason = reason;
-        if let Ok(bytes) = platform::load_credential(
-            &self.store,
-            &self.platform_custody,
-            &row.platform,
-            &row.account,
-        ) {
-            platform::refuse_leak("close reason", &reason, &bytes)?;
-        }
-        if reason.len() > REASON_CAP {
-            cap_str(&mut reason, REASON_CAP);
-        }
+        // Classification, screen and durable write share C; release before notifications.
+        let custody_guard = self.custody_operation()?;
+        let reason = self
+            .screen_reason_or_refuse(&row.platform, &row.account, reason, "close reason")?
+            .unwrap_or_else(|| {
+                if row.state == "reconcile" {
+                    "operator_reconciled_outcome_unknown".to_string()
+                } else {
+                    "cancelled".to_string()
+                }
+            });
         let Some(row) = self.store.effect_close(key, &reason)? else {
             return Err(Error::rejected(format!(
                 "effect {} is no longer closeable (already decided or terminal)",
                 row.effect_id
             )));
         };
+        drop(custody_guard);
         self.emit_request_closed(&row.agent, &row.request, &reason);
         self.wake();
         Ok(json!({"state": "closed", "record": row.to_record()}))
@@ -583,26 +670,12 @@ impl Shared {
                  press accept is operator-only in v1 (ADR 0006 §5.4 step 4, C6)"
             )));
         }
-        // The presser's free-text reason lands on the durable row —
-        // screen it against the row's enrolled credential and bound it
-        // like every other stored string (N2). A custody miss just
-        // skips the screen.
-        let reason = reason
-            .map(|mut r| {
-                if let Ok(bytes) = platform::load_credential(
-                    &self.store,
-                    &self.platform_custody,
-                    &row.platform,
-                    &row.account,
-                ) {
-                    platform::refuse_leak("decision reason", &r, &bytes)?;
-                }
-                if r.len() > REASON_CAP {
-                    cap_str(&mut r, REASON_CAP);
-                }
-                Ok::<String, Error>(r)
-            })
-            .transpose()?;
+        let custody_guard = self.custody_operation()?;
+        if accept {
+            self.refuse_encrypted_target(&row.platform, &row.account)?;
+        }
+        let reason =
+            self.screen_reason_or_refuse(&row.platform, &row.account, reason, "decision reason")?;
         // `by` is {member, role, rule}: who pressed, the role they
         // hold, the rule that authorised the press — {member, role}
         // comes from the proven caller and the agent row, never a
@@ -640,6 +713,7 @@ impl Shared {
                  decided, declined or closed",
             ));
         };
+        drop(custody_guard);
         if !accept {
             self.deliver_effect_outcome(&row, "declined");
             self.emit_request_closed(&row.agent, &row.request, "declined");
@@ -662,15 +736,63 @@ impl Shared {
         }
     }
 
+    pub(super) fn refuse_encrypted_target(&self, provider: &str, account: &str) -> Result<()> {
+        if self
+            .store
+            .platform_credential(provider, account)?
+            .is_some_and(|r| {
+                r.custody
+                    .starts_with(platform::encrypted_sqlite::TAG_PREFIX)
+            })
+        {
+            return Err(Error::invalid(
+                "unsupported_custody_use",
+                "encrypted credentials are unsupported on this path",
+            ));
+        }
+        Ok(())
+    }
+
+    // Adapted from cad1128-confidentiality-swe's independently drafted R3 helper.
+    // Caller holds C through its subsequent guarded state write.
+    fn screen_reason_or_refuse(
+        &self,
+        provider: &str,
+        account: &str,
+        reason: Option<String>,
+        what: &'static str,
+    ) -> Result<Option<String>> {
+        let Some(mut reason) = reason else {
+            return Ok(None);
+        };
+        self.refuse_encrypted_target(provider, account)
+            .map_err(|_| {
+                Error::invalid(
+                    "reason_unscreenable",
+                    "omit reason for a fixed-cause outcome",
+                )
+            })?;
+        let bytes =
+            platform::load_credential(&self.store, &self.platform_custody, provider, account)
+                .map_err(|_| {
+                    Error::invalid("reason_unscreenable", "credential unavailable; omit reason")
+                })?;
+        platform::refuse_leak(what, &reason, &bytes)?;
+        cap_str(&mut reason, REASON_CAP);
+        Ok(Some(reason))
+    }
+
     /// Execute the accepted send — §5.4 steps 3–6. The durable
     /// `decided` row exists already; this runs: source re-verify →
     /// grant re-check → custody load → `executing` → the platform call
     /// under the `effect_id` idempotency key and expected hash →
     /// adapter read-back → the recorded outcome → the delivered
-    /// message. A source change, a lost grant or a credential that no
-    /// longer loads closes the row instead of firing; a platform error
-    /// lands `failed`, never `closed`.
+    /// message. A source change, a lost grant or a missing enrollment
+    /// closes the row instead of firing. A custody fingerprint mismatch
+    /// stays that error and does not borrow another workspace. A
+    /// platform error lands `failed`, never `closed`.
     fn execute_effect(&self, row: &EffectRow) -> Result<EffectRow> {
+        self.refuse_encrypted_target(&row.platform, &row.account)?;
         if self.store.app_effect_is_child(&row.effect_id)? {
             return Err(Error::rejected(
                 "app artifact effects require an exact app execution claim",
@@ -726,8 +848,8 @@ impl Shared {
             &row.platform,
             &row.account,
         ) {
-            Ok(b) => b,
-            Err(_) => {
+            Ok(bytes) => bytes,
+            Err(err) if platform::credential_enrollment_missing(&err) => {
                 let row = self
                     .store
                     .effect_close_decided(&row.effect_id, "credential_revoked")?
@@ -737,8 +859,9 @@ impl Shared {
                 self.wake();
                 return Ok(row);
             }
+            Err(err) => return Err(err),
         };
-        self.store.effect_executing(&row.effect_id)?;
+        let row = self.store.effect_executing(&row.effect_id, row)?;
         let outcome = adapter.execute(
             &bytes,
             &row.tool,
@@ -787,7 +910,7 @@ impl Shared {
     /// lands `failed` with `verified:"unknown"`: the run could not even
     /// be attempted, which is a Needs-you-grade ambiguity.
     fn fail_effect(&self, row: &EffectRow, error: &str) -> Result<EffectRow> {
-        self.store.effect_executing(&row.effect_id)?;
+        let row = self.store.effect_executing(&row.effect_id, row)?;
         let outcome = json!({"error": error, "verified": "unknown"});
         let row = self
             .store
@@ -999,3 +1122,20 @@ pub(crate) type PlatformMap = HashMap<String, Arc<dyn PlatformAdapter>>;
 /// The test-only crash seam between the durable `decided` write and
 /// execution (`ServeOptions::effect_execute_gate`).
 pub(crate) type EffectExecuteGate = Arc<dyn Fn(&EffectRow) -> bool + Send + Sync>;
+
+#[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "effect_rpc/platform_call_floor_tests.rs"]
+mod platform_call_floor_tests;
+
+#[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "effect_rpc/claims_revoke.rs"]
+mod claims_revoke;
+
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod boundary_floor_tests;
+
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod cad1128_execute_claim_tests;
+
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod cad1128_reason_claim_tests;

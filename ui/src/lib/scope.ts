@@ -1,3 +1,4 @@
+import { agentOn } from "./agentOn";
 import type { Agent, IssueCard } from "./types";
 
 /**
@@ -36,7 +37,7 @@ export function issueIndex(issues: IssueCard[]): IssueIndex {
  * the same rule as the CLI ISSUES column.
  */
 export function agentIssueIds(agent: Agent, index: IssueIndex): string[] {
-  const ids = new Set<string>(agent.on);
+  const ids = new Set<string>(agentOn(agent));
   for (const task of agent.tasks ?? []) {
     if (task.issue) ids.add(task.issue);
   }

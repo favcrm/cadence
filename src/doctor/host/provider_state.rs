@@ -150,3 +150,66 @@ fn eval_provider_state(stores: &[StoreMeasure], t: &Thresholds) -> Check {
         .collect::<Vec<_>>();
     check(name, level, json!(value), threshold, detail, remedy)
 }
+
+// ---------- provider command resolution ----------
+
+/// CAD-1247: the pi adapter execs `CADENCE_PI_COMMAND` or bare `pi`
+/// via `execvp` — a daemon started under a minimal service PATH that
+/// lacks pi fences every pi agent with only a provider log saying why.
+/// The daemon records its own resolution at start
+/// (`provider-commands.json` in the state dir); this check reports
+/// that startup result, because doctor usually runs from a shell whose
+/// PATH is not the daemon's. Missing, malformed or stale records warn;
+/// a shell-only probe cannot establish daemon command resolution.
+pub(super) fn check_provider_commands(scan: &Scan) -> Check {
+    const REMEDY: &str =
+        "set CADENCE_PI_COMMAND to pi's absolute path, or add its directory to the daemon's PATH";
+    let name = "provider-pi-command";
+    let recorded = scan.state_dir.join(crate::doctor::PROVIDER_COMMANDS_FILE);
+    if let Ok(text) = std::fs::read_to_string(&recorded) {
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            let pid = v["pid"].as_u64().and_then(|p| u32::try_from(p).ok());
+            let recorded_start = v["starttime"].as_u64();
+            let current_start = pid.and_then(crate::peer::proc_starttime);
+            let pi = &v["pi"];
+            if recorded_start.is_some()
+                && recorded_start == current_start
+                && (pi["resolved"].as_str().is_some_and(|p| !p.is_empty())
+                    || (pi["resolved"].is_null() && pi["reason"].as_str().is_some()))
+            {
+                return match pi["resolved"].as_str() {
+                Some(resolved) => check(
+                    name,
+                    Level::Ok,
+                    json!({"provider": "pi", "resolved": resolved, "source": "daemon"}),
+                    Value::Null,
+                    format!("pi resolved to {resolved} at daemon startup (not a launch or authentication check)"),
+                    String::new(),
+                ),
+                None => {
+                    let reason = pi["reason"].as_str().unwrap_or("unresolved");
+                    let daemon_path = pi["path"].as_str().unwrap_or_default();
+                    check(
+                        name,
+                        Level::Fail,
+                        json!({"provider": "pi", "resolved": null,
+                               "reason": reason, "source": "daemon",
+                               "daemon_path": daemon_path}),
+                        Value::Null,
+                        format!("pi: {reason} (daemon's PATH)"),
+                        REMEDY.to_string(),
+                    )
+                }
+            };
+            }
+        }
+    }
+    check(
+        name,
+        Level::Warn,
+        json!({"provider": "pi", "resolved": null, "source": "unavailable"}),
+        Value::Null,
+        "pi: daemon startup resolution is unavailable, malformed or stale; shell PATH is not evidence".to_string(),
+        "Inspect the daemon's startup diagnostics and configured provider command".to_string(),
+    )
+}

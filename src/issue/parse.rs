@@ -3,44 +3,7 @@
 use crate::error::{Error, Result};
 use crate::issue::model::{CommentFront, Front};
 
-/// Split `---\n<yaml>\n---\n<body>`; the opening fence must be the very
-/// first line. Returns the frontmatter text and the body.
-pub fn split_front(text: &str) -> Result<(&str, &str)> {
-    let text = text.strip_prefix("\u{feff}").unwrap_or(text);
-    if !text.starts_with("---\n") && !text.starts_with("---\r\n") {
-        return Err(Error::rejected(
-            "Issue file must start with a '---' frontmatter fence",
-        ));
-    }
-    let after_open = if text.starts_with("---\r\n") { 5 } else { 4 };
-    let rest = &text[after_open..];
-    for (idx, _) in rest.match_indices("---") {
-        // The closing fence must sit on its own line.
-        let before_ok = idx == 0 || rest.as_bytes()[idx - 1] == b'\n';
-        let after = &rest[idx + 3..];
-        let after_ok = after.is_empty()
-            || after.starts_with('\n')
-            || after.starts_with("\r\n")
-            || after.starts_with(' ');
-        if before_ok && after_ok {
-            let yaml = &rest[..idx];
-            // The fence's own line ending, then one blank separator
-            // line — a body that wants to start blank writes two.
-            let body = after
-                .strip_prefix("\r\n")
-                .or_else(|| after.strip_prefix('\n'))
-                .unwrap_or(after);
-            let body = body
-                .strip_prefix("\r\n")
-                .or_else(|| body.strip_prefix('\n'))
-                .unwrap_or(body);
-            return Ok((yaml, body));
-        }
-    }
-    Err(Error::rejected(
-        "Issue file is missing the closing '---' frontmatter fence",
-    ))
-}
+pub use cadence_core::split_front;
 
 pub fn parse_issue(text: &str) -> Result<(Front, String)> {
     let (yaml, body) = split_front(text)?;
@@ -68,11 +31,15 @@ impl AcceptanceItem {
     /// `dispatch` all report: `done` mirrors `checked` for readers
     /// that speak in completion rather than checkbox terms.
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "text": self.text,
-            "checked": self.checked,
-            "done": self.checked,
-        })
+        serde_json::to_value(self.row()).expect("acceptance item serializes")
+    }
+
+    pub fn row(&self) -> cadence_core::board_api::AcceptanceRow {
+        cadence_core::board_api::AcceptanceRow {
+            text: self.text.clone(),
+            checked: self.checked,
+            done: self.checked,
+        }
     }
 }
 
@@ -273,39 +240,70 @@ fn checkbox_item(line: &str) -> Option<AcceptanceItem> {
     })
 }
 
+/// The canonical checklist rows and their original byte ranges. Both the
+/// acceptance reader and task-request projection use this one Markdown rule.
+fn acceptance_lines(body: &str) -> impl Iterator<Item = (LineRange, AcceptanceItem)> + '_ {
+    let sections = acceptance_sections(body);
+    let section = (sections.len() == 1).then(|| sections[0]);
+    section.into_iter().flat_map(move |section| {
+        let section_body = &body[section.heading_end..section.end];
+        let mut fences = Fences::default();
+        line_ranges(section_body)
+            .into_iter()
+            .filter_map(move |line| {
+                let text = &section_body[line.start..line.content_end];
+                if fences.is_code(text) {
+                    return None;
+                }
+                checkbox_item(text).map(|item| {
+                    (
+                        LineRange {
+                            start: section.heading_end + line.start,
+                            content_end: section.heading_end + line.content_end,
+                            end: section.heading_end + line.end,
+                        },
+                        item,
+                    )
+                })
+            })
+    })
+}
+
 /// Read acceptance items from the unique level-two `Acceptance` section.
 /// A duplicate heading is treated as malformed and produces no items on the
 /// read side; mutation uses `replace_acceptance` to report the error.
 pub fn acceptance_items(body: &str) -> Vec<AcceptanceItem> {
-    let sections = acceptance_sections(body);
-    if sections.len() != 1 {
-        return Vec::new();
-    }
-    let section = sections[0];
-    let section_body = &body[section.heading_end..section.end];
+    acceptance_lines(body).map(|(_, item)| item).collect()
+}
+
+/// Split a canonical task body into its prose and complete criteria without
+/// duplicating the criteria in the provider payload. Keep every other line,
+/// including Acceptance preambles, continuations and fenced examples.
+pub(crate) fn task_request(mut body: String) -> (String, Vec<AcceptanceItem>) {
+    let mut removed = Vec::new();
     let mut items = Vec::new();
-    let mut in_fence: Option<(u8, usize)> = None;
-    for line in line_ranges(section_body) {
-        let text = &section_body[line.start..line.content_end];
-        if let Some((marker, count)) = fence(text) {
-            match in_fence {
-                Some((open_marker, open_count))
-                    if open_marker == marker && is_closing_fence(text, marker, open_count) =>
-                {
-                    in_fence = None;
-                }
-                None => in_fence = Some((marker, count)),
-                _ => {}
-            }
-            continue;
-        }
-        if in_fence.is_none() {
-            if let Some(item) = checkbox_item(text) {
-                items.push(item);
-            }
-        }
+    for (line, item) in acceptance_lines(&body) {
+        removed.push(line);
+        items.push(item);
     }
-    items
+    if !removed.is_empty() {
+        // Compact the already-owned UTF-8 body in place. Ranges name complete
+        // original lines; this cursor counts original bytes even for removed
+        // characters, so Unicode and CRLF cannot shift later ranges.
+        let mut removed = removed.into_iter().peekable();
+        let mut offset = 0usize;
+        body.retain(|character| {
+            let at = offset;
+            offset += character.len_utf8();
+            while removed.peek().is_some_and(|line| line.end <= at) {
+                removed.next();
+            }
+            !removed
+                .peek()
+                .is_some_and(|line| line.start <= at && at < line.end)
+        });
+    }
+    (body, items)
 }
 
 /// Validate the existing body before replacing its acceptance section.
@@ -373,8 +371,47 @@ fn rendered_acceptance(items: &[AcceptanceItem], newline: &str) -> Result<String
     Ok(out)
 }
 
-/// Replace the unique acceptance section, or append one when it is absent.
-/// The surrounding body and its line-ending style are preserved.
+/// Split a section body at its first checklist line: the byte offset of that
+/// line, and the text after it with every checklist line removed. `None` means
+/// the section has no checklist. Fenced code never counts as a checklist — the
+/// same rule `acceptance_items` reads by.
+fn split_checklist(text: &str) -> Option<(usize, String)> {
+    let mut first: Option<usize> = None;
+    let mut rest = String::new();
+    let mut in_fence: Option<(u8, usize)> = None;
+    for line in line_ranges(text) {
+        let content = &text[line.start..line.content_end];
+        if let Some((marker, count)) = fence(content) {
+            match in_fence {
+                Some((open_marker, open_count))
+                    if open_marker == marker && is_closing_fence(content, marker, open_count) =>
+                {
+                    in_fence = None;
+                }
+                None => in_fence = Some((marker, count)),
+                _ => {}
+            }
+            if first.is_some() {
+                rest.push_str(&text[line.start..line.end]);
+            }
+            continue;
+        }
+        if in_fence.is_none() && checkbox_item(content).is_some() {
+            first.get_or_insert(line.start);
+            continue;
+        }
+        if first.is_some() {
+            rest.push_str(&text[line.start..line.end]);
+        }
+    }
+    first.map(|start| (start, rest))
+}
+
+/// Replace the unique acceptance section's checklist, or append a section when
+/// it is absent. Only checklist lines are replaced: every other line inside the
+/// section stays in place, so a declaration such as `Risk: human (4)` — read by
+/// the scope-approval check — is never dropped silently (CAD-1516). The
+/// surrounding body and its line-ending style are preserved too.
 pub fn replace_acceptance(body: &str, items: &[AcceptanceItem]) -> Result<String> {
     let sections = acceptance_sections(body);
     if sections.len() > 1 {
@@ -385,11 +422,26 @@ pub fn replace_acceptance(body: &str, items: &[AcceptanceItem]) -> Result<String
     let newline = preferred_newline(body);
     let checklist = rendered_acceptance(items, newline)?;
     if let Some(section) = sections.first() {
+        let section_body = &body[section.heading_end..section.end];
         let mut out = String::with_capacity(body.len() + checklist.len());
         out.push_str(&body[..section.heading_end]);
-        out.push_str(newline);
-        out.push_str(&checklist);
-        out.push_str(newline);
+        match split_checklist(section_body) {
+            Some((start, rest)) => {
+                // The checklist takes the first item's place: text before it
+                // stays put, and every later non-checklist line keeps its order.
+                out.push_str(&section_body[..start]);
+                out.push_str(&checklist);
+                out.push_str(&rest);
+            }
+            None => {
+                // No checklist yet: write one after the heading, then the
+                // section's own text (its leading blank lines are not doubled).
+                out.push_str(newline);
+                out.push_str(&checklist);
+                out.push_str(newline);
+                out.push_str(section_body.trim_start_matches(['\r', '\n']));
+            }
+        }
         out.push_str(&body[section.end..]);
         return Ok(out);
     }
@@ -638,5 +690,38 @@ mod tests {
         )
         .unwrap();
         assert!(inserted.ends_with("## Acceptance\n\n- [ ] criterion\n"));
+    }
+
+    #[test]
+    fn acceptance_replacement_keeps_non_checklist_lines_in_the_section() {
+        // CAD-1516: `--acceptance` replaces the checklist, not the whole
+        // section. A declaration inside the section — `Risk: human (4)` is what
+        // the scope-approval check reads — must survive the replacement, or the
+        // tracker loses it without a word.
+        let body = concat!(
+            "Intro\n\n",
+            "## Acceptance\n",
+            "- [ ] old criterion\n",
+            "\n",
+            "Risk: human (4)\n",
+            "\n",
+            "## Notes\n",
+            "Keep this\n",
+        );
+        let changed = replace_acceptance(
+            body,
+            &[AcceptanceItem {
+                text: "new criterion".into(),
+                checked: false,
+            }],
+        )
+        .unwrap();
+        assert!(changed.contains("- [ ] new criterion\n"), "{changed}");
+        assert!(!changed.contains("old criterion"), "{changed}");
+        assert!(
+            changed.contains("Risk: human (4)\n"),
+            "a non-checklist line inside the section must survive: {changed}"
+        );
+        assert!(changed.contains("## Notes\nKeep this\n"), "{changed}");
     }
 }

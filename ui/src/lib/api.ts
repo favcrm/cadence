@@ -1,8 +1,21 @@
 import type { LanePayload } from "../features/issues/lane";
 import { ConditionalGet } from "./conditionalGet";
+import { ApiError, errorMessage } from "./apiError";
 import { sessionKey, sessionHeaders } from "./sessionKey";
+import {
+  bindPrivateAbort,
+  notifyPrivateSessionRequired,
+  privateFetch,
+  privateReadsAllowed,
+  privateSessionGeneration,
+  usingPrivateOperation,
+  type PrivateOperation,
+} from "./privateSession";
 import type {
   AgentDetail,
+  AgentRegisterBody,
+  AgentRolesPayload,
+  InstructionsResult,
   AgentsPayload,
   AppDetail,
   AppOutputsPayload,
@@ -17,14 +30,18 @@ import type {
   IssueDetail,
   IssueHistoryEntry,
   MasterCommandResult,
+  MasterIdentity,
   MasterModels,
   MasterState,
   MemoryCard,
   MemoryDetail,
   Meta,
   MilestoneRow,
-  ModelDefaultsConfig,
-  ModelDefaultsSnapshot,
+  AgentCatalog,
+  AgentPreviewResult,
+  AgentSettingsConfig,
+  AgentSettingsSnapshot,
+  AgentSyncResult,
   OutboxDetail,
   UpdateBanner,
   UpdateCheck,
@@ -37,7 +54,65 @@ import type {
   ThreadRef,
   WorkflowPreview,
   WorkflowsPayload,
+  AvatarLook,
 } from "./types";
+
+/** The daemon-minted retained-file row `POST /api/chat/upload` answers
+ *  (CAD-1168): the id is the only handle; metadata is server-derived. */
+export interface ChatFileRow {
+  id: string;
+  sha256: string;
+  size: number;
+  mime: string;
+  name: string;
+  scope: string;
+  context_id: string;
+  uploader: string;
+  user_id: string;
+  thread_id: string;
+  location_version: 1;
+  created: number;
+}
+
+/** Validate the daemon's ChatFile::to_json receipt before a row can become
+ *  ready. This checks the wire shape only; native scope proofs remain the
+ *  authority for upload and later reads. */
+function decodeChatFileRow(value: unknown): ChatFileRow {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("upload returned an invalid attachment receipt — retry or remove the file");
+  }
+  const row = value as Record<string, unknown>;
+  if (
+    typeof row.id !== "string" || !/^chf-[0-9a-f]{32}$/.test(row.id) ||
+    typeof row.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(row.sha256) ||
+    typeof row.size !== "number" || !Number.isSafeInteger(row.size) || row.size <= 0 ||
+    typeof row.mime !== "string" || row.mime.length === 0 ||
+    typeof row.name !== "string" || row.name.trim().length === 0 ||
+    typeof row.scope !== "string" || row.scope.length === 0 ||
+    typeof row.context_id !== "string" ||
+    typeof row.uploader !== "string" || row.uploader.length === 0 ||
+    typeof row.user_id !== "string" || !/^acu-[0-9a-f]{32}$/.test(row.user_id) ||
+    typeof row.thread_id !== "string" || row.thread_id.length === 0 ||
+    row.location_version !== 1 ||
+    typeof row.created !== "number" || !Number.isFinite(row.created)
+  ) {
+    throw new Error("upload returned an invalid attachment receipt — retry or remove the file");
+  }
+  return row as unknown as ChatFileRow;
+}
+
+/** Immutable native selector for a retained file. Home may carry its
+ *  real conversation id without an app binding; app destinations also
+ *  carry the install and optional context. */
+export type ChatFileDestination =
+  | { install_id: string; conversation: string; context_id?: string }
+  | { conversation: string };
+
+/** Native-served capability state; a hint only, never upload authority. */
+export interface AppFileUploadProjection {
+  declared: boolean;
+  available: boolean;
+}
 
 /** `GET /api/threads/<alias>` — `thread` is null until the first message. */
 export interface ThreadPage {
@@ -47,49 +122,134 @@ export interface ThreadPage {
   cursor?: number;
   /** Backward reads (`tail`/`before`): older entries remain. */
   more_before?: boolean;
+  /** CAD-1700: the complete thread's newest visible assistant reply seq
+   *  (0 when none), independent of the page cursor. */
+  reply_seq?: number;
 }
 
-export class ApiError extends Error {
-  status: number;
-  conflict?: string;
-  check?: string;
-  code?: string;
-  revision?: number | null;
-  card?: IssueCard;
-  constructor(
-    message: string,
-    status: number,
-    opts?: {
-      conflict?: string;
-      check?: string;
-      code?: string;
-      revision?: number | null;
-      card?: IssueCard;
-    },
-  ) {
-    super(message);
-    this.status = status;
-    this.conflict = opts?.conflict;
-    this.check = opts?.check;
-    this.code = opts?.code;
-    this.revision = opts?.revision;
-    this.card = opts?.card;
+/** CAD-1485: `POST /api/member-assistant/state` — the member's assistant
+ *  binding (daemon-owned `to_json`) plus the bound conversation id. */
+export interface MemberAssistState {
+  assistant: {
+    org: string;
+    sub: string;
+    assistant_id: string;
+    alias: string;
+    conversation_id: string | null;
+    state: string;
+    bootstrap_state?: string | null;
+    authority_rev?: number;
+    created?: number;
+    updated?: number;
+    /** CAD-1817: the binding's committed identity. `name`/`tone` null
+     *  mean unset; `look` is always a canonical catalog slug; `revision`
+     *  is the binding's integer bootstrap revision. An unreadable
+     *  identity fails the read rather than silently reporting unset. */
+    identity: MemberAssistantIdentity;
+  };
+  conversation_id: string | null;
+}
+
+/** The private assistant's committed identity projection. User address
+ *  and preferences are deliberately absent — they stay private and are
+ *  not part of the displayed identity. */
+export interface MemberAssistantIdentity {
+  name: string | null;
+  tone: string | null;
+  look: AvatarLook;
+  revision: number;
+}
+
+/** `POST /api/master/identity` (CAD-1817): the proven operator's
+ *  workspace-identity edit. Only the supplied fields change; an empty
+ *  string clears `name`/`tone`. */
+export interface MasterIdentityUpdate {
+  expected_revision: string;
+  name?: string;
+  tone?: string;
+  look?: AvatarLook;
+}
+
+/** The committed result and when it takes effect for the coordinator. */
+export interface MasterIdentityUpdateResult {
+  identity: MasterIdentity;
+  applies: "next_turn";
+}
+
+/** `POST /api/member-assistant/history` — the member's bound conversation
+ *  page. `entries` carry the stored `role`/`kind`/`seq`; `cursor` is the
+ *  forward resume watermark. A member names no thread — the binding's
+ *  own conversation is always the read. */
+export interface MemberAssistHistory {
+  conversation: { id: string; alias: string; created?: string; updated?: string } | null;
+  entries: unknown[];
+  cursor?: number;
+  more_before?: boolean;
+}
+
+/** `POST /api/member-assistant/send` receipt: the accepted message id and
+ *  queue state. `queued`/`attention` tell the truth when the assistant's
+ *  endpoint could not start — the row stays queued, never a fabricated
+ *  reply. */
+export interface MemberAssistSend {
+  message: string;
+  state: string;
+  duplicate?: boolean;
+  queued?: boolean;
+  attention?: string;
+}
+
+export { ApiError } from "./apiError";
+
+const conditional = new ConditionalGet(
+  (input, init) => fetch(input, init),
+  () => `${sessionKey() ?? ""}:${privateSessionGeneration()}`,
+);
+
+async function readConditional<T>(path: string, signal: AbortSignal | undefined, operation: PrivateOperation | null): Promise<T> {
+  const protectedRead = !path.startsWith("/api/meta");
+  const generation = operation?.generation ?? privateSessionGeneration();
+  if (protectedRead) operation?.assertCurrent();
+  const controller = new AbortController();
+  const stopCaller = signal ? bindPrivateAbort(controller, signal) : () => {};
+  const stopOperation = operation ? bindPrivateAbort(controller, operation.signal) : () => {};
+  const stop = () => {
+    stopCaller();
+    stopOperation();
+  };
+  try {
+    if (controller.signal.aborted) throw new DOMException("The private session changed", "AbortError");
+    const { response: resp, value } = await conditional.get<T>(path, sessionHeaders(), controller.signal);
+    if (operation) operation.assertCurrent();
+    else if (generation !== privateSessionGeneration() || (protectedRead && !privateReadsAllowed())) {
+      throw new Error("Session changed during request");
+    }
+    if (!resp.ok && !(resp.status === 304 && value !== undefined)) {
+      const body = await resp.json().catch(() => null);
+      if (operation) operation.assertCurrent();
+      else if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
+      const code = body?.code ?? body?.error?.code;
+      if (protectedRead && resp.status === 401 && (code === "board_session_required" || code === "operator_session_required") && typeof window !== "undefined") {
+        window.dispatchEvent(new Event("cadence:session-required"));
+      }
+      throw new ApiError(
+        errorMessage(body, `${resp.status} ${resp.statusText}`),
+        resp.status,
+        body ? { ...body, code } : undefined,
+      );
+    }
+    if (operation) operation.assertCurrent();
+    return value as T;
+  } finally {
+    stop();
   }
 }
 
-const conditional = new ConditionalGet((input, init) => fetch(input, init), sessionKey);
-
-async function get<T>(path: string): Promise<T> {
-  const { response: resp, value } = await conditional.get<T>(path, sessionHeaders());
-  if (!resp.ok && !(resp.status === 304 && value !== undefined)) {
-    const body = await resp.json().catch(() => null);
-    throw new ApiError(
-      body?.error ?? `${resp.status} ${resp.statusText}`,
-      resp.status,
-      body ?? undefined,
-    );
-  }
-  return value as T;
+async function get<T>(path: string, signal?: AbortSignal, operation?: PrivateOperation): Promise<T> {
+  const protectedRead = !path.startsWith("/api/meta");
+  if (!protectedRead) return readConditional<T>(path, signal, null);
+  if (!operation && !privateReadsAllowed()) throw new Error("Session verification required");
+  return usingPrivateOperation(operation, (op) => readConditional<T>(path, signal, op), signal);
 }
 
 export interface WriteResp {
@@ -118,47 +278,54 @@ async function write<T extends object | undefined>(
   method: "POST" | "PATCH" | "DELETE",
   path: string,
   body?: T,
+  operation?: PrivateOperation,
 ): Promise<WriteResp> {
-  const resp = await fetch(path, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }, op);
+    const parsed = await resp.json().catch(() => null);
+    op.assertCurrent();
+    if (!resp.ok) {
+      throw new ApiError(
+        errorMessage(parsed, `${resp.status} ${resp.statusText}`),
+        resp.status,
+        parsed ?? undefined,
+      );
+    }
+    return parsed as WriteResp;
   });
-  const parsed = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    throw new ApiError(
-      parsed?.error ?? `${resp.status} ${resp.statusText}`,
-      resp.status,
-      parsed ?? undefined,
-    );
-  }
-  return parsed as WriteResp;
 }
 
 /** A board write that answers its own JSON (not an issue `WriteResp`). */
-async function post<T>(path: string, body: object): Promise<T> {
-  const resp = await fetch(path, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: JSON.stringify(body),
+async function post<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: JSON.stringify(body),
+    }, op);
+    const parsed = await resp.json().catch(() => null);
+    op.assertCurrent();
+    if (!resp.ok) {
+      throw new ApiError(
+        errorMessage(parsed, `${resp.status} ${resp.statusText}`),
+        resp.status,
+        parsed ?? undefined,
+      );
+    }
+    return parsed as T;
   });
-  const parsed = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    throw new ApiError(
-      parsed?.error ?? `${resp.status} ${resp.statusText}`,
-      resp.status,
-      parsed ?? undefined,
-    );
-  }
-  return parsed as T;
 }
 
 /** A plan decision's request: approve takes nothing, reject a reason. */
@@ -197,11 +364,84 @@ export interface MasterPermissionRule {
   at: number;
 }
 
+function textField(record: object, key: string): string | undefined {
+  if (!Object.prototype.hasOwnProperty.call(record, key)) return undefined;
+  const value: unknown = Reflect.get(record, key);
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/** Local `{error, code}` and hosted `{error:{code,message}}` upload refusals. */
+function refusedUpload(body: unknown, status: number, statusText: string): { message: string; code?: string } {
+  const fallback = `${status} ${statusText}`.trim();
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return { message: fallback };
+  const topCode = textField(body, "code");
+  const error: unknown = Reflect.get(body, "error");
+  if (typeof error === "string" && error.length > 0) return { message: error, code: topCode };
+  if (error !== null && typeof error === "object" && !Array.isArray(error)) {
+    return {
+      message: textField(error, "message") ?? fallback,
+      code: topCode ?? textField(error, "code"),
+    };
+  }
+  return { message: fallback, code: topCode };
+}
+
+/** Recorded owner handoff for the current personal assignment, never a Git-author guess. */
+export interface AssignmentContext {
+  kind: "assigned" | "initial_owner";
+  actor: string;
+  at: string;
+  self_assigned: boolean;
+}
+
+/** One My work queue row (CAD-1703): what a card renders, not the full board card. */
+export interface MyWorkIssue {
+  id: string;
+  project: string;
+  title: string;
+  status: string;
+  priority: string;
+  blocked: boolean;
+  blocked_reason: string | null;
+  container: boolean;
+  checks: { done: number; total: number };
+  counts: { comments: number };
+  created: string;
+  /** Last recorded activity (status/owner change, comment or creation). */
+  updated: string | null;
+}
+
+/** One page of `GET /api/my-work`. `counts` cover every filter except the tab. */
+export interface MyWorkPayload {
+  owner: string;
+  issues: MyWorkIssue[];
+  total: number;
+  next_cursor: string | null;
+  counts: { active: number; done: number; dropped: number; all: number };
+  status_counts: Record<string, number>;
+  /** Projects the caller has any issue in — the project filter's options. */
+  projects: string[];
+}
+
+/** `GET /api/my-work/issues/<ID>` — whether the issue is still the caller's. */
+export interface MyWorkMembership {
+  owner: string;
+  id: string;
+  assigned: boolean;
+  assignment: AssignmentContext | null;
+}
+
+
 export const api = {
   health: () => get<Health>("/api/health"),
-  /** `withOperator` asks the server to run the operator proof (CAD-432) — once per page load. */
-  meta: (withOperator = false) => get<Meta>(withOperator ? "/api/meta?operator=1" : "/api/meta"),
+  /** `withOperator` asks the server to run the operator proof (CAD-432) — once per page load.
+   *  `signal` bounds the wait (CAD-1193): an aborted read is a failed
+   *  probe — unknown — never a sign-out or a resolved negative. */
+  meta: (withOperator = false, signal?: AbortSignal) =>
+    get<Meta>(withOperator ? "/api/meta?operator=1" : "/api/meta", signal),
   overview: () => get<Overview>("/api/overview"),
+  myWork: (query: string, signal?: AbortSignal) => get<MyWorkPayload>(`/api/my-work?${query}`, signal),
+  myWorkIssue: (id: string) => get<MyWorkMembership>(`/api/my-work/issues/${encodeURIComponent(id)}`),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
   projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {
     const query = new URLSearchParams({ role });
@@ -219,37 +459,20 @@ export const api = {
     get<{ id: string; history: IssueHistoryEntry[] }>(
       `/api/issues/${id}/history?limit=${limit}`,
     ),
-  file: async (id: string) => {
-    const resp = await fetch(`/api/issues/${id}/file`);
-    if (!resp.ok) throw new ApiError(`${resp.status} ${resp.statusText}`, resp.status);
-    return resp.text();
+  file: async (id: string, operation?: PrivateOperation) => {
+    return usingPrivateOperation(operation, async (op) => {
+      const resp = await privateFetch(`/api/issues/${id}/file`, { headers: sessionHeaders() }, op);
+      if (!resp.ok) throw new ApiError(`${resp.status} ${resp.statusText}`, resp.status);
+      const text = await resp.text();
+      op.assertCurrent();
+      return text;
+    });
   },
   agents: () => get<AgentsPayload>("/api/agents"),
   agent: (alias: string) =>
     get<AgentDetail>(`/api/agents/${encodeURIComponent(alias)}`),
   monitorAck: (monitor: string, alert: number) =>
-    fetch(
-      `/api/monitors/${encodeURIComponent(monitor)}/alerts/${alert}/ack`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-        },
-        body: "{}",
-      },
-    ).then(async (resp) => {
-      const parsed = await resp.json().catch(() => null);
-      if (!resp.ok) {
-        throw new ApiError(
-          parsed?.error ?? `${resp.status} ${resp.statusText}`,
-          resp.status,
-          parsed ?? undefined,
-        );
-      }
-      return parsed as { ok: boolean; alert: unknown };
-    }),
+    post<{ ok: boolean; alert: unknown }>(`/api/monitors/${encodeURIComponent(monitor)}/alerts/${alert}/ack`, {}),
   memories: (opts: { project?: string; status?: string; type?: string } = {}) => {
     const q = new URLSearchParams();
     if (opts.project) q.set("project", opts.project);
@@ -325,28 +548,32 @@ export const api = {
     },
   ) => write("POST", `/api/issues/${encodeURIComponent(id)}/kickoff`, body),
 
-  attach: async (id: string, name: string, data: Blob): Promise<WriteResp> => {
-    const resp = await fetch(
-      `/api/issues/${id}/artifacts?name=${encodeURIComponent(name)}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/octet-stream",
-          "X-Cadence-Board": "1",
-      ...sessionHeaders(),
+  attach: async (id: string, name: string, data: Blob, operation?: PrivateOperation): Promise<WriteResp> => {
+    return usingPrivateOperation(operation, async (op) => {
+      const resp = await privateFetch(
+        `/api/issues/${id}/artifacts?name=${encodeURIComponent(name)}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "X-Cadence-Board": "1",
+            ...sessionHeaders(),
+          },
+          body: data,
         },
-        body: data,
-      },
-    );
-    const parsed = await resp.json().catch(() => null);
-    if (!resp.ok) {
-      throw new ApiError(
-        parsed?.error ?? `${resp.status} ${resp.statusText}`,
-        resp.status,
-        parsed ?? undefined,
+        op,
       );
-    }
-    return parsed as WriteResp;
+      const parsed = await resp.json().catch(() => null);
+      op.assertCurrent();
+      if (!resp.ok) {
+        throw new ApiError(
+          errorMessage(parsed, `${resp.status} ${resp.statusText}`),
+          resp.status,
+          parsed ?? undefined,
+        );
+      }
+      return parsed as WriteResp;
+    });
   },
 
   artifactUrl: (id: string, name: string) =>
@@ -365,12 +592,20 @@ export const api = {
     else q.set("after", String(at.after ?? 0));
     return get<ThreadPage>(`/api/threads/${encodeURIComponent(alias)}?${q.toString()}`);
   },
+  /** `POST /api/threads/master/conversations {kind:"recruit"}` (CAD-1772):
+   *  find-or-create the master's single Recruit conversation. */
+  recruitConversation: () =>
+    post<{ conversation: { id: string } }>("/api/threads/master/conversations", { kind: "recruit" }),
   /** `POST /api/threads/<alias>/messages` — `message` makes a retry idempotent.
    *  `refs` are the needs-me subjects the message cites (CAD-574 "Ask
    *  master"): they land on the entry's payload, never in the text.
    *  `app` is the shell chat's current installation/context (CAD-802):
    *  never authority — the daemon proves both against its store and
-   *  stamps the verified binding on the entry, refusing anything else. */
+   *  stamps the verified binding on the entry, refusing anything else.
+   *  `expectedRecipientUid` (CAD-1591) is an identity constraint, not
+   *  authority: the contextual Threads reply pins the recorded sender it
+   *  is answering, and the daemon refuses before any side effect when
+   *  the alias now names a different uid. Ordinary sends omit it. */
   threadSend: (
     alias: string,
     text: string,
@@ -378,6 +613,10 @@ export const api = {
     refs?: ThreadRef[],
     app?: { install_id: string; context_id?: string },
     conversation?: string,
+    attachments?: { id: string }[],
+    operation?: PrivateOperation,
+    mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
+    expectedRecipientUid?: string,
   ) =>
     post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
@@ -388,13 +627,121 @@ export const api = {
         ...(app ? { app } : {}),
         // CAD-1098: only a selector; the daemon resolves scope, subject and install.
         ...(conversation ? { conversation } : {}),
+        // CAD-1168: `chf-…` ids of retained uploads — the daemon checks
+        // grammar and existence, never the client's metadata.
+        ...(attachments && attachments.length > 0 ? { attachments } : {}),
+        ...(mediaRefs && mediaRefs.length > 0 ? { media_refs: mediaRefs } : {}),
+        ...(expectedRecipientUid ? { expected_recipient_uid: expectedRecipientUid } : {}),
       },
+      operation,
     ),
+  /** `POST /api/chat/upload` — one retained chat attachment (CAD-1168).
+   *  Operator-only multipart; returns the daemon-minted row. `signal`
+   *  aborts only this upload's transport (a canceled row's late answer
+   *  is ignored by its caller); it never deletes a retained blob. */
+  chatFileUpload: (
+    file: File,
+    signal?: AbortSignal,
+    destination?: ChatFileDestination,
+  ): Promise<ChatFileRow> => {
+    if (signal?.aborted) return Promise.reject(new DOMException("upload canceled", "AbortError"));
+    return usingPrivateOperation(undefined, (operation) => new Promise((resolve, reject) => {
+      if (operation.signal.aborted) {
+        reject(new DOMException("upload canceled", "AbortError"));
+        return;
+      }
+      const form = new FormData();
+      form.append("name", file.name);
+      if (destination !== undefined) {
+        form.append("conversation", destination.conversation);
+        if ("install_id" in destination) {
+          form.append("install_id", destination.install_id);
+          if (destination.context_id !== undefined) form.append("context_id", destination.context_id);
+        }
+      }
+      form.append("file", file, file.name);
+      const xhr = new XMLHttpRequest();
+      let settled = false;
+      const onAbort = () => xhr.abort();
+      operation.signal.addEventListener("abort", onAbort, { once: true });
+      const detach = () => {
+        operation.signal.removeEventListener("abort", onAbort);
+        xhr.onload = null;
+        xhr.onerror = null;
+        xhr.onabort = null;
+      };
+      const settle = (done: () => void) => {
+        if (settled) return;
+        settled = true;
+        detach();
+        done();
+      };
+      xhr.open("POST", "/api/chat/upload");
+      xhr.setRequestHeader("X-Cadence-Board", "1");
+      for (const [key, value] of Object.entries(sessionHeaders())) xhr.setRequestHeader(key, value);
+      xhr.onload = () => {
+        const status = xhr.status;
+        const statusText = xhr.statusText;
+        const responseText = xhr.responseText;
+        const stillCurrent = !operation.signal.aborted;
+        let body: unknown = null;
+        try {
+          body = JSON.parse(responseText);
+        } catch {
+          body = null;
+        }
+        settle(() => {
+          if (!stillCurrent) {
+            reject(new DOMException("upload canceled", "AbortError"));
+            return;
+          }
+          if (status >= 200 && status < 300) {
+            try {
+              resolve(decodeChatFileRow(body));
+            } catch (error) {
+              reject(error);
+            }
+            return;
+          }
+          if (status === 401) notifyPrivateSessionRequired(status, body, operation);
+          const refusal = refusedUpload(body, status, statusText);
+          reject(new ApiError(refusal.message, status, refusal.code === undefined ? undefined : { code: refusal.code }));
+        });
+      };
+      xhr.onerror = () => {
+        settle(() => reject(new ApiError("upload failed — connection lost", 0)));
+      };
+      xhr.onabort = () => {
+        settle(() => reject(new DOMException("upload canceled", "AbortError")));
+      };
+      xhr.send(form);
+    }), signal);
+  },
+  /** CAD-1485: `POST /api/member-assistant/state` — the signed-in member's
+   *  own assistant surface state (binding + bound conversation id). The
+   *  public session cookie is the only credential; the board mints the
+   *  assistant envelope server-side. Body is `{}`. */
+  memberAssistState: () =>
+    post<MemberAssistState>(`/api/member-assistant/state`, {}),
+  /** `POST /api/member-assistant/history` — a page of the member's bound
+   *  conversation. `after`/`before`/`tail`/`limit` match the daemon's own
+   *  fields; a member never names a thread (the binding owns it). */
+  memberAssistHistory: (page: {
+    after?: number;
+    before?: number;
+    tail?: boolean;
+    limit?: number;
+  }) => post<MemberAssistHistory>(`/api/member-assistant/history`, { ...page }),
+  /** `POST /api/member-assistant/send` — send `text` to the member's own
+   *  assistant. `message` is the client-chosen idempotent id a retry
+   *  reuses (one message, not two). */
+  memberAssistSend: (text: string, message: string) =>
+    post<MemberAssistSend>(`/api/member-assistant/send`, { text, message }),
   /** `GET /api/app-installations/<id>/chat-descriptor` (CAD-1110): the installed
    *  package's `app-chat.json`, pinned to the digest its install consented to. A
    *  404 means no descriptor (plain shared chat). */
   appChatDescriptor: (installId: string) =>
-    get<{ descriptor: unknown; digest: unknown; app: unknown }>(
+    get<{ descriptor: unknown; digest: unknown; app: unknown; file_upload?: AppFileUploadProjection }>(
       `/api/app-installations/${encodeURIComponent(installId)}/chat-descriptor`,
     ),
   /** Generic app-assistant/v1 discovery, durable operations and scoped permissions. */
@@ -437,7 +784,7 @@ export const api = {
    * conversation is made under (the daemon proves install, context and
    * campaign); `subject` (`campaign:<id>`) is idempotent, none always makes a new one.
    */
-  conversationCreate: (installId: string, contextId: string, subject?: string) =>
+  conversationCreate: (installId: string, contextId: string, subject?: string, operation?: PrivateOperation) =>
     post<Record<string, unknown>>(
       `/api/app-installations/${encodeURIComponent(installId)}/conversations`,
       {
@@ -445,6 +792,7 @@ export const api = {
         ...(contextId !== "" ? { context_id: contextId } : {}),
         ...(subject ? { subject } : {}),
       },
+      operation,
     ),
   /**
    * `POST /api/needs/<verb>` — the rail's snooze/dismiss (CAD-574);
@@ -481,6 +829,20 @@ export const api = {
       `/api/agents/${encodeURIComponent(alias)}/${verb}`,
       verb === "unfence" ? { status } : {},
     ),
+  /**
+   * `POST /api/agents` - create one agent row through the daemon's
+   * `agent_register` (the CLI's registration path). Operator-only. Cloud
+   * agents send `location: "cloud"` and the daemon pins provider and
+   * endpoint kind to `sandbox`.
+   */
+  registerAgent: (body: AgentRegisterBody) => post<Record<string, unknown>>("/api/agents", body),
+  /** `GET /api/agent-roles` (CAD-1752) — the role catalogue, the install's
+   *  runtime and the model each role would launch on. Any signed-in viewer. */
+  agentRoles: () => get<AgentRolesPayload>("/api/agent-roles"),
+  /** `POST /api/agents/<alias>/instructions` (CAD-1752) — replace the
+   *  agent's standing instructions. Operator only. */
+  setAgentInstructions: (alias: string, instructions: string) =>
+    post<InstructionsResult>(`/api/agents/${encodeURIComponent(alias)}/instructions`, { instructions }),
   /** `POST /api/plans/<epic>/approve|reject` — operator-only (CAD-328). */
   decidePlan: (epic: string, verb: "approve" | "reject", reason?: string) => {
     let req: ReturnType<typeof planDecision>;
@@ -603,6 +965,18 @@ export const api = {
    * operator, so a viewer without the read never sees a 403.
    */
   connectionProviders: () => get<ConnectionProvidersPayload>("/api/connection-providers"),
+  /**
+   * `POST /api/connection-providers/<provider>/connect` (CAD-1839) —
+   * start a hosted provider's sign-in. The tenant worker owns the
+   * credential and the OAuth state; this board sends an empty body and
+   * receives only `{ok, hosted, url}`. Operator-only, same board
+   * headers/credentials as every other connection write.
+   */
+  connectionProviderConnect: (provider: string) =>
+    post<{ ok: boolean; hosted: boolean; url?: string }>(
+      `/api/connection-providers/${encodeURIComponent(provider)}/connect`,
+      {},
+    ),
   /** `GET /api/connections` — every exact provider account (operator-only). */
   connections: () => get<ConnectionsPayload>("/api/connections"),
   /** `GET /api/connections/<id>` — one connection's metadata (operator-only). */
@@ -727,24 +1101,56 @@ export const api = {
    *  reason (CAD-140); the worker loop stands down. */
   declineDelivery: (issue: string, reason: string) =>
     post<Record<string, unknown>>(`/api/delivery/${encodeURIComponent(issue)}/decline`, { reason }),
+  /** `POST /api/approvals/approve` (CAD-1218) — records the operator's
+   *  merge approval for the exact head the drawer showed. A moved head
+   *  refuses with 409 `head_moved`; a head with an earlier record refuses. */
+  approveHead: (repo: string, pr: number, head: string) =>
+    post<{ approval_id: string }>("/api/approvals/approve", { repo, pr, head }),
+  /** `GET /api/approvals/state` (CAD-1218) — whether this head has an
+   *  approval in force, revoked, or none. */
+  approvalState: (repo: string, pr: number, head: string) =>
+    get<{ state: "in-force" | "revoked" | "missing"; approval_id?: string; board_revocable?: boolean }>(
+      `/api/approvals/state?repo=${encodeURIComponent(repo)}&pr=${pr}&head=${encodeURIComponent(head)}`,
+    ),
+  /** `POST /api/approvals/<id>/revoke` (CAD-1218) — withdraw that approval. */
+  revokeApproval: (id: string, reason: string) =>
+    post<Record<string, unknown>>(`/api/approvals/${encodeURIComponent(id)}/revoke`, { reason }),
   /** `GET /api/master/summary?since=` — 501 on a daemon without it. */
   masterSummary: (since: number) =>
     get<Record<string, unknown>>(`/api/master/summary?since=${Math.floor(since)}`),
   /** `GET /api/master/state` — session chips + in-flight turn (CAD-551);
    *  501 on a daemon that predates it. */
-  masterState: () => get<MasterState>("/api/master/state"),
+  masterState: (conversation?: string) =>
+    get<MasterState>(conversation === undefined ? "/api/master/state" : `/api/master/state?conversation=${encodeURIComponent(conversation)}`),
+  /** `POST /api/master/identity` (CAD-1817) — the proven operator edits
+   *  the workspace coordinator's name/personality/avatar. The response is
+   *  the committed identity plus when it applies; the UI never assumes a
+   *  save from the request alone. */
+  masterIdentityUpdate: (body: MasterIdentityUpdate) =>
+    post<MasterIdentityUpdateResult>("/api/master/identity", body),
   /** `POST /api/master/command` — an allowlisted session verb (CAD-551);
    *  operator-only, 400 `unknown_command` outside the board's set. */
-  masterCommand: (command: string, arg?: string, wait?: number) =>
-    post<MasterCommandResult>(
-      "/api/master/command",
-      wait !== undefined ? { command, arg, wait } : arg ? { command, arg } : { command },
-    ),
+  masterCommand: (command: string, arg?: string, wait?: number, message?: string) =>
+    post<MasterCommandResult>("/api/master/command", {
+      command,
+      ...(arg ? { arg } : {}),
+      ...(wait !== undefined ? { wait } : {}),
+      ...(message !== undefined ? { message } : {}),
+    }),
   /** `GET /api/master/models` — the dropdowns' list (CAD-575's route,
    *  operator-gated; the chip shows the refusal until it lands). */
   masterModels: () => get<MasterModels>("/api/master/models"),
 
-  modelDefaults: () => get<ModelDefaultsSnapshot>("/api/settings/model-defaults"),
+  /** CAD-1548 — harnesses, profiles, providers and models. */
+  agentSettings: () => get<AgentSettingsSnapshot>("/api/settings/agents"),
+  saveAgentSettings: (body: { expected_revision: string; config: AgentSettingsConfig }) =>
+    post<AgentSettingsSnapshot>("/api/settings/agents", body),
+  refreshAgentCatalog: (provider: string) =>
+    post<AgentCatalog>("/api/settings/agents/catalog", { provider }),
+  syncAgentProfiles: (body: { expected_revision: string; profile: string | null }) =>
+    post<AgentSyncResult>("/api/settings/agents/sync", body),
+  previewAgentLaunch: (body: { expected_revision: string; profile: string; harness: string }) =>
+    post<AgentPreviewResult>("/api/settings/agents/preview", body),
   /** CAD-561: the Settings Update card — current version, the last
    *  check, the running update's progress and the drain state. */
   updateStatus: () => get<UpdateStatus>("/api/update"),
@@ -754,9 +1160,6 @@ export const api = {
   updateCheck: () => post<UpdateCheck>("/api/update/check", {}),
   /** Start the update: the same pipeline as `cadence update`. */
   startUpdate: () => post<{ started: boolean }>("/api/update", {}),
-  saveModelDefaults: (body: { expected_revision: number; config: ModelDefaultsConfig }) =>
-    writeSettings(body),
-
   /** `GET /api/issues/<id>/lane` — the card's live agent, or `lane: null`. */
   lane: (id: string) => get<LanePayload>(`/api/issues/${encodeURIComponent(id)}/lane`),
   /** Ask for status. Optional extra is appended to the `status?` template server-side. */
@@ -777,27 +1180,3 @@ export const api = {
   laneReassign: (id: string, body: { provider: string; model?: string; effort?: string; note?: string }) =>
     post<Record<string, unknown>>(`/api/issues/${encodeURIComponent(id)}/lane/reassign`, body),
 };
-
-async function writeSettings(body: {
-  expected_revision: number;
-  config: ModelDefaultsConfig;
-}): Promise<ModelDefaultsSnapshot> {
-  const resp = await fetch("/api/settings/model-defaults", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: JSON.stringify(body),
-  });
-  const parsed = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    throw new ApiError(
-      parsed?.error ?? `${resp.status} ${resp.statusText}`,
-      resp.status,
-      parsed ?? undefined,
-    );
-  }
-  return parsed as ModelDefaultsSnapshot;
-}

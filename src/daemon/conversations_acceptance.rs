@@ -40,7 +40,7 @@ fn pid() -> u32 {
 }
 
 fn install(shared: &Arc<Shared>, app: &str) -> String {
-    let source = format!("{}/workspace-apps/{app}", env!("CARGO_MANIFEST_DIR"));
+    let source = format!("{}/tests/fixtures/apps/{app}", env!("CARGO_MANIFEST_DIR"));
     let out = scoped(Asserted::Operator, || {
         shared.dispatch("app_workspace_install", &json!({"source": source}), pid())
     })
@@ -56,12 +56,27 @@ fn gx() -> Gx {
 /// `social_context: false` leaves Social Content installed but with no
 /// context at all (an app before its first brand).
 fn gx_with(social_context: bool) -> Gx {
+    gx_deployed(social_context, None)
+}
+
+/// `gx_with` under trusted image metadata (`provider_deployments`), so a
+/// hosted admission is selected exactly as the daemon selects it.
+fn gx_deployed(
+    social_context: bool,
+    deployments: Option<crate::platform::deployments::DeploymentMetadata>,
+) -> Gx {
     let dir = tempfile::Builder::new().prefix("c98a").tempdir().unwrap();
     let pm = dir.path().join("pm");
     crate::issue::Pm::init(&pm).unwrap();
-    let opts = ServeOptions::default();
+    let opts = ServeOptions {
+        provider_env: crate::adapter::ProviderEnv::refusing_providers(),
+        provider_deployments: deployments,
+        ..Default::default()
+    };
     opts.provider_env
         .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+    opts.provider_env
+        .set("CADENCE_HOME", dir.path().to_str().unwrap());
     let shared = Shared::new(dir.path(), &opts).unwrap();
     let cwd = dir.path().to_str().unwrap().to_string();
     for (alias, provider, kind) in [("master", "pi", "managed"), ("w1", "fake", "fake")] {
@@ -75,12 +90,13 @@ fn gx_with(social_context: bool) -> Gx {
                 cwd: &cwd,
                 sandbox: "read-only",
                 instructions: None,
-                params: None,
+                params: (alias == "master").then_some(r#"{"model":"fixture/model"}"#),
                 team_role: None,
                 model_policy: None,
             })
             .unwrap();
     }
+    crate::test_seam::seed_pi_fixture_policy(&shared.store, "fixture/model").unwrap();
     // The master's live endpoint generation, so a minted turn token is
     // current under the endpoint's own scheme.
     shared
@@ -222,6 +238,206 @@ impl Gx {
         params["token"] = json!(token);
         self.call(Asserted::Agent("master".into()), method, params)
     }
+}
+
+#[test]
+fn conversation_reply_watermark_ignores_non_reply_writes() {
+    let fx = gx();
+    let list = || {
+        fx.operator(
+            "conversation_list",
+            json!({"alias": "master", "install_id": fx.crm}),
+        )
+        .unwrap()
+    };
+    let first = list();
+    let id = first["general"].as_str().unwrap();
+    let reply = |page: &Value| {
+        page["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap()["reply_seq"]
+            .as_i64()
+            .expect("a conversation exposes its reply watermark")
+    };
+    assert_eq!(reply(&first), 0, "empty General has no assistant reply");
+    let append = |thread: &str, role: &str, kind: &str, text: &str| {
+        fx.shared
+            .store
+            .thread_append_to(
+                thread,
+                store::NewEntry {
+                    role,
+                    kind,
+                    text,
+                    payload: None,
+                    message_id: None,
+                },
+            )
+            .unwrap()
+            .unwrap()
+    };
+    append(id, "operator", "message", "Please review this");
+    append(id, "agent", "tool_call", "customers.search");
+    append(
+        id,
+        "system",
+        "turn_result",
+        "A system notice is not a reply",
+    );
+    for blank in ["", " \t\r\n", "\u{00a0}\u{2003}\u{feff}"] {
+        append(id, "agent", "turn_result", blank);
+        assert_eq!(
+            reply(&list()),
+            0,
+            "blank/non-reply writes never light a reply dot"
+        );
+    }
+    let answer = append(id, "agent", "assistant_text", "The audience is ready");
+    assert_eq!(reply(&list()), answer);
+    append(id, "operator", "message", "One more question");
+    append(id, "agent", "tool_result", "Found 12 customers");
+    let foreign = fx.conversation(&fx.social, &fx.social_ctx, json!({}));
+    append(
+        &foreign,
+        "agent",
+        "turn_result",
+        "Another installation's answer",
+    );
+    assert_eq!(
+        reply(&list()),
+        answer,
+        "later writes preserve this reply's watermark"
+    );
+    let completed = append(id, "agent", "turn_result", "Review complete");
+    assert_eq!(reply(&list()), completed);
+}
+
+#[test]
+fn conversation_stream_snapshot_precedes_resume_and_master_changes_are_pushed() {
+    use std::io::{BufRead, BufReader};
+
+    fn next_event(reader: &mut impl BufRead) -> (String, Value, Option<i64>) {
+        let mut event = String::new();
+        let mut data = String::new();
+        let mut id = None;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(
+                reader.read_line(&mut line).unwrap() > 0,
+                "stream closed before an event"
+            );
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() && !data.is_empty() {
+                return (event, serde_json::from_str(&data).unwrap(), id);
+            }
+            if let Some(value) = line.strip_prefix("event: ") {
+                event = value.to_string();
+            } else if let Some(value) = line.strip_prefix("data: ") {
+                data.push_str(value);
+            } else if let Some(value) = line.strip_prefix("id: ") {
+                id = Some(value.parse().unwrap());
+            }
+        }
+    }
+
+    let fx = gx();
+    let conversation = fx.conversation(&fx.crm, &fx.crm_a, json!({}));
+    let append = |store: &store::Store, text: &str| {
+        store
+            .thread_append_to(
+                &conversation,
+                store::NewEntry {
+                    role: "agent",
+                    kind: "assistant_text",
+                    text,
+                    payload: None,
+                    message_id: None,
+                },
+            )
+            .unwrap()
+            .unwrap()
+    };
+    let seen = append(&fx.shared.store, "already seen");
+    let missed = append(&fx.shared.store, "missed reply");
+    let (board, state, _rest) = http::start(fx);
+    let store = store::Store::open(&crate::rollout::db_file(&state)).unwrap();
+    {
+        let url = format!(
+            "{}/api/threads/master/stream?conversation={conversation}&after={seen}",
+            board.base
+        );
+        let mut response = board
+            .decorate("operator", board.agent.get(&url))
+            .call()
+            .unwrap();
+        let mut reader = BufReader::new(response.body_mut().as_reader());
+        let (kind, snapshot, id) = next_event(&mut reader);
+        assert_eq!(
+            kind, "master",
+            "current turn state is the first event, before entry replay"
+        );
+        assert_eq!(
+            snapshot["alias"], "master",
+            "the first event is state, not an invalidation hint"
+        );
+        assert_eq!(
+            id, None,
+            "a state snapshot must not advance the transcript cursor"
+        );
+        let (kind, entry, id) = next_event(&mut reader);
+        assert_eq!(kind, "entry");
+        assert_eq!(id, Some(missed));
+        assert_eq!(entry["text"], "missed reply");
+    }
+    let after_disconnect = append(&store, "after disconnect");
+    {
+        let url = format!(
+            "{}/api/threads/master/stream?conversation={conversation}&after=0",
+            board.base
+        );
+        let mut response = board
+            .decorate("operator", board.agent.get(&url))
+            .header("Last-Event-ID", missed.to_string())
+            .call()
+            .unwrap();
+        let mut reader = BufReader::new(response.body_mut().as_reader());
+        assert_eq!(
+            next_event(&mut reader).0,
+            "master",
+            "every reconnect starts with current state"
+        );
+        let (kind, entry, id) = next_event(&mut reader);
+        assert_eq!(kind, "entry");
+        assert_eq!(
+            id,
+            Some(after_disconnect),
+            "Last-Event-ID wins over the older query cursor"
+        );
+        assert_eq!(entry["text"], "after disconnect");
+    }
+    let url = format!("{}/api/stream", board.base);
+    let mut response = board
+        .decorate("operator", board.agent.get(&url))
+        .call()
+        .unwrap();
+    let mut reader = BufReader::new(response.body_mut().as_reader());
+    assert_eq!(next_event(&mut reader).0, "hello");
+    append(&store, "pushed reply");
+    loop {
+        let (kind, data, _) = next_event(&mut reader);
+        if kind == "master" {
+            assert_eq!(data["resources"], json!(["master"]));
+            break;
+        }
+    }
+    drop(reader);
+    drop(response);
+    drop(store);
+    drop(board);
 }
 
 fn err_text(r: Result<Value>) -> String {
@@ -440,9 +656,8 @@ fn unknown_install_and_unproven_subject_create_nothing() {
 /// no verified app binding and any client-named scope field are refused,
 /// and no message is queued.
 ///
-/// Guards: `verify_conversation_selector` (conversations_rpc.rs), the
-/// `conversation needs a verified app binding` arm and the field
-/// allowlist in `rpc_thread_send`.
+/// Guards: `verify_conversation_selector` (conversations_rpc.rs), Home
+/// conversation resolution and the field allowlist in `rpc_thread_send`.
 #[test]
 fn thread_send_refuses_forged_and_other_install_conversations() {
     let gx = gx();
@@ -478,7 +693,7 @@ fn thread_send_refuses_forged_and_other_install_conversations() {
         "thread_send",
         json!({"alias": "master", "text": "x", "message": "m-f", "conversation": campaign}),
     ));
-    assert!(err.contains("needs a verified app binding"), "{err}");
+    assert!(err.contains("Unknown Home conversation"), "{err}");
     for field in [
         "scope",
         "subject",
@@ -673,8 +888,12 @@ fn gate1_live_actor_home_app_home_opens_each_session_with_its_profile() {
     // What each profile is: the app one holds only scoped `cadence app`
     // verbs, the home one the full master set.
     let app = master::allowed_tools(App);
+    // CAD-1168: `attachment read` rides both profiles.
     assert!(
-        !app.is_empty() && app.iter().all(|t| t.starts_with("Bash(cadence app ")),
+        !app.is_empty()
+            && app.iter().all(|t| t.starts_with("Bash(cadence app ")
+                || *t == "Bash(cadence attachment read *)"
+                || *t == "Bash(cadence artifact put *)"),
         "{app:?}"
     );
     assert_eq!(master::allowed_tools(Home), master::CLAUDE_ALLOWED_TOOLS);
@@ -709,40 +928,9 @@ fn i11_master_tmp_is_emptied_on_a_conversation_switch() {
     assert!(left.is_empty(), "the next conversation sees {left:?}");
 }
 
-/// Every method name in `Shared::dispatch_method`'s match, parsed from
-/// the source so a method added later is in the table.
-fn dispatch_methods() -> Vec<String> {
-    let src = include_str!("../daemon.rs");
-    let start = src
-        .find("    fn dispatch_method(\n")
-        .expect("dispatch_method");
-    let body = &src[start..];
-    let body = &body[body.find("match method {").expect("match")..];
-    let body = &body[..body
-        .find("other => Err(Error::rejected(format!(\"Unknown method")
-        .expect("end")];
-    let mut out = Vec::new();
-    for line in body.lines() {
-        let t = line.trim_start();
-        if line.len() - t.len() != 12 || !t.starts_with('"') {
-            continue;
-        }
-        let Some((arms, _)) = t.split_once("=>") else {
-            continue;
-        };
-        for arm in arms.split('|') {
-            let name = arm.trim().trim_matches('"');
-            if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
-                out.push(name.to_string());
-            }
-        }
-    }
-    out
-}
-
 /// The ONLY daemon methods a master turn in an app conversation may call,
 /// written out from the ticket's answer 1 (scoped app verbs plus
-/// read-only status for its own turn): the twelve scoped verbs,
+/// read-only status for its own turn): the scoped app verbs,
 /// `message_report` and `thread_read` of its own conversation.
 const APP_TURN_MAY_CALL: &[&str] = &[
     "app_assistant_actions",
@@ -757,6 +945,11 @@ const APP_TURN_MAY_CALL: &[&str] = &[
     "app_segment_assistant_preview",
     "app_segment_assistant_save",
     "app_segment_assistant_show",
+    // CAD-1168: the turn reads the retained file its message carried.
+    "chat_file_read",
+    // CAD-1726: the turn puts a canvas artifact; the handler takes the
+    // conversation and scope from the live turn, never the request.
+    "artifact_put",
     "message_report",
     "thread_read",
 ];
@@ -781,7 +974,7 @@ impl Gx {
 
 /// Gate 2: while the master's running message is in an APP conversation,
 /// `master_policy` is an allowlist over EVERY dispatch method: exactly the
-/// fourteen in `APP_TURN_MAY_CALL` pass, so the admin RPCs, the permission
+/// methods in `APP_TURN_MAY_CALL` pass, so the admin RPCs, the permission
 /// verbs (`master_ask_permission`, `master_peek_grant`,
 /// `master_permission_use`), `wiki_write`, `agent_*`, `job_*` and
 /// `monitor_*` are refused. A running message that cannot be resolved
@@ -793,8 +986,10 @@ impl Gx {
 #[test]
 fn gate2_app_conversation_turn_is_an_allowlist_over_every_method() {
     let gx = gx();
-    let table = dispatch_methods();
-    assert!(table.len() > 100, "method table parse: {}", table.len());
+    let table = super::caller_rule::dispatch_methods();
+    // The weak (pre-consolidation) parser saw 417 of 450 methods; keep
+    // the floor above that result and below the real count.
+    assert!(table.len() > 440, "method table parse: {}", table.len());
     for family in ["agent_", "job_", "monitor_", "wiki_", "master_permission_"] {
         assert!(
             table.iter().any(|m| m.starts_with(family)),
@@ -1016,8 +1211,8 @@ mod http {
     }
 
     pub(super) struct Board {
-        agent: ureq::Agent,
-        base: String,
+        pub(super) agent: ureq::Agent,
+        pub(super) base: String,
         host: String,
         token: String,
         cookie: String,
@@ -1029,7 +1224,11 @@ mod http {
     pub(super) type Reply = (u16, Value);
 
     impl Board {
-        fn decorate<B>(&self, who: &str, b: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        pub(super) fn decorate<B>(
+            &self,
+            who: &str,
+            b: ureq::RequestBuilder<B>,
+        ) -> ureq::RequestBuilder<B> {
             let b = b.header("Host", &self.host).header("X-Cadence-Board", "1");
             let b = b.header("Origin", format!("http://{}", self.host));
             let b = b.header(crate::test_seam::AS_HEADER, who);
@@ -1238,12 +1437,13 @@ fn i1_board_http_refuses_agents_on_every_conversation_route_like_the_rpc() {
     ];
     for (method, path, body) in &routes {
         let (status, reply) = board.call(agent, method, path, body.clone());
-        assert_eq!(status, 403, "{method} {path}: {reply}");
-        assert_eq!(
-            reply["check"],
-            json!("operator_only"),
-            "{method} {path}: {reply}"
-        );
+        if *method == "GET" {
+            assert_eq!(status, 401, "{method} {path}: {reply}");
+            assert_eq!(reply["code"], "operator_session_required", "{reply}");
+        } else {
+            assert_eq!(status, 403, "{method} {path}: {reply}");
+            assert_eq!(reply["check"], "operator_only", "{reply}");
+        }
     }
     assert_eq!(
         (
@@ -1287,12 +1487,13 @@ fn i1_board_http_refuses_agents_on_every_conversation_route_like_the_rpc() {
             &format!("/api/threads/master/conversations?install={crm}"),
             None,
         );
-        assert_eq!(status, 404, "{who}: {reply}");
-        assert_eq!(
-            reply["error"],
-            json!("no such thread route"),
-            "{who}: {reply}"
-        );
+        if who == agent {
+            assert_eq!(status, 401, "{who}: {reply}");
+            assert_eq!(reply["code"], "operator_session_required", "{reply}");
+        } else {
+            assert_eq!(status, 404, "{who}: {reply}");
+            assert_eq!(reply["error"], "no such thread route", "{reply}");
+        }
     }
 }
 
@@ -1632,8 +1833,11 @@ fn chat_descriptor_board_route_refuses_agents_and_404s_every_missing_case() {
     let forged = "/api/app-installations/no-such-install/chat-descriptor";
     for path in [crm_path.as_str(), forged] {
         let (status, reply) = board.call("agent:w1", "GET", path, None);
-        assert_eq!(status, 403, "{path}: {reply}");
-        assert_eq!(reply["check"], json!("operator_only"), "{path}: {reply}");
+        assert_eq!(status, 401, "{path}: {reply}");
+        assert_eq!(
+            reply["code"], "operator_session_required",
+            "{path}: {reply}"
+        );
     }
     let (status, reply) = board.call("operator", "GET", &crm_path, None);
     assert_eq!(status, 200, "{reply}");
@@ -1693,7 +1897,7 @@ fn install_refuses_a_package_with_an_invalid_chat_descriptor() {
         })
     };
     let root = tempfile::Builder::new().prefix("c1110").tempdir().unwrap();
-    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workspace-apps/crm");
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/apps/crm");
     let good: Value =
         serde_json::from_str(&std::fs::read_to_string(source.join("app-chat.json")).unwrap())
             .unwrap();
@@ -1840,4 +2044,1574 @@ fn cad1123_board_capability_asset_route_is_an_operator_read() {
         status == 400 && error.contains("capability asset"),
         "operator did not reach app_run_capability_asset: {status} {reply}"
     );
+}
+
+// ---------- CAD-1168 slice 2: retained chat attachments ----------
+
+/// Establish the fixture's native local-admin upload account through the
+/// production secret-gated link-mint method, using only this fixture's state.
+fn establish_upload_account(gx: &Gx) {
+    crate::operator_auth::ensure_secret(gx.dir.path()).unwrap();
+    let secret = crate::operator_auth::read_secret(gx.dir.path()).unwrap();
+    gx.operator(
+        "operator_link_mint",
+        json!({"secret": secret, "origin": "loopback"}),
+    )
+    .unwrap();
+}
+
+/// Verify a receipt is bound to its server-issued account and conversation,
+/// and that exact bytes live under the nested user tree.
+fn assert_owned_upload(gx: &Gx, row: &Value, name: &str, bytes: &[u8]) {
+    let user_id = row["user_id"].as_str().expect("account owner");
+    let thread_id = row["thread_id"].as_str().expect("native conversation");
+    assert!(
+        gx.shared
+            .store
+            .chat_upload_account_registered(user_id)
+            .unwrap(),
+        "upload owner is not registered: {row}"
+    );
+    assert_ne!(
+        user_id, "operator",
+        "owner must be a server-issued account id"
+    );
+    assert_eq!(row["uploader"], json!(user_id), "{row}");
+    let thread = gx
+        .shared
+        .store
+        .thread_by_id(thread_id)
+        .unwrap()
+        .expect("upload must name a stored native conversation");
+    assert_eq!(thread.alias, "master", "{row}");
+    assert!(!thread.archived, "upload conversation is archived: {row}");
+    assert_eq!(row["location_version"], json!(1), "{row}");
+    let stored = gx
+        .shared
+        .upload_workspace_dir
+        .join("users")
+        .join(user_id)
+        .join("threads")
+        .join(thread_id)
+        .join("uploads")
+        .join(row["id"].as_str().unwrap())
+        .join(name);
+    assert_eq!(
+        std::fs::read(stored).unwrap(),
+        bytes,
+        "nested custody bytes"
+    );
+}
+
+/// Upload a real staged file as the operator; returns the minted row.
+fn chat_upload(gx: &Gx, name: &str, bytes: &[u8]) -> Value {
+    let dir = gx.dir.path().join(crate::wiki::UPLOAD_DIR);
+    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = dir.join(format!("upload-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&tmp, bytes).unwrap();
+    gx.operator(
+        "chat_file_upload",
+        json!({"name": name, "tmp": tmp.to_string_lossy()}),
+    )
+    .unwrap()
+}
+
+/// CAD-1168: `chat_file_upload` is the operator's alone — an agent caller
+/// is refused by `operator_chat` before the file is even named (the same
+/// proof `thread_send` runs), and so is an underivable one; a caller-
+/// supplied `scope`, `sha256` or path field is refused whole. A good
+/// staged text file then lands as the control.
+///
+/// Guards: `rpc_chat_file_upload`'s `operator_chat` proof and the
+/// `reject_chat_file_fields` allowlist (daemon/chat_files_rpc.rs).
+#[test]
+fn chat_file_upload_is_operator_only_and_field_strict() {
+    let gx = gx();
+    establish_upload_account(&gx);
+    let staged = |bytes: &[u8]| {
+        let dir = gx.dir.path().join(crate::wiki::UPLOAD_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join(format!("upload-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&tmp, bytes).unwrap();
+        tmp.to_string_lossy().into_owned()
+    };
+    // An agent caller is refused — the refusal names it.
+    let err = err_text(gx.call(
+        Asserted::Agent("w1".into()),
+        "chat_file_upload",
+        json!({"name": "n.txt", "tmp": staged(b"hi")}),
+    ));
+    assert!(
+        err.contains("operator's chat") && err.contains("agent 'w1'"),
+        "{err}"
+    );
+    // An underivable caller is refused too.
+    let err = err_text(gx.call(
+        Asserted::Unproven,
+        "chat_file_upload",
+        json!({"name": "n.txt", "tmp": staged(b"hi")}),
+    ));
+    assert!(err.contains("operator"), "{err}");
+    // Identity/authority-shaped fields are refused, never silently dropped.
+    for field in ["scope", "sha256", "path", "wiki_as", "uploader", "by"] {
+        let mut params = json!({"name": "n.txt", "tmp": staged(b"hi")});
+        params[field] = json!("x");
+        let err = err_text(gx.operator("chat_file_upload", params));
+        assert!(
+            err.contains(&format!("field '{field}' is not accepted")) || err.contains("identity"),
+            "{field}: {err}"
+        );
+    }
+    // Control: the operator's own upload lands and names the stored row.
+    let row = chat_upload(&gx, "notes.txt", b"hello");
+    assert!(row["id"].as_str().unwrap().starts_with("chf-"), "{row}");
+    assert_eq!(row["mime"], json!("text/plain"));
+    assert_eq!(row["scope"], json!("home"));
+    assert_owned_upload(&gx, &row, "notes.txt", b"hello");
+    // An agent cannot read it either — a worker caller is refused.
+    let id = row["id"].as_str().unwrap();
+    let err = err_text(gx.call(
+        Asserted::Agent("w1".into()),
+        "chat_file_read",
+        json!({"id": id, "message": "m-x", "token": "t"}),
+    ));
+    assert!(err.contains("only the master"), "{err}");
+    // And the operator reads the bounded text back.
+    let read = gx.operator("chat_file_read", json!({"id": id})).unwrap();
+    assert_eq!(read["text"], json!("hello"));
+    assert_eq!(read["extractable"], json!(true));
+}
+
+/// CAD-1168: the board's `POST /api/chat/upload` is OperatorOnly like
+/// the messages POST — an agent-attributed caller and a sessionless
+/// request are refused at the board (`check: operator_only`), while an
+/// oversized multipart body is refused before any daemon call.
+///
+/// Guards: `WRITE_ROUTES` + `operator::admit` (ui/operator.rs) and the
+/// route's `read_body` cap (ui/threads.rs).
+#[test]
+fn board_chat_upload_is_operator_only_and_capped() {
+    let (board, state, _rest) = http::start(gx_with(false));
+    let db = || rusqlite::Connection::open(crate::rollout::db_file(&state)).unwrap();
+    let rows = || -> i64 {
+        db().query_row("SELECT count(*) FROM chat_files", [], |r| r.get(0))
+            .unwrap_or(0)
+    };
+    let before = rows();
+    // Agent-attributed and sessionless requests are refused alike.
+    let boundary = "----t";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"n.txt\"\r\n\r\nhi\r\n--{boundary}--\r\n"
+    );
+    for (who, check) in [
+        ("agent:w1", "operator_only"),
+        ("unproven", "caller_identity"),
+    ] {
+        let url = format!("{}/api/chat/upload", board.base);
+        let resp = board
+            .decorate(who, board.agent.post(&url))
+            .header(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )
+            .send(body.clone().into_bytes())
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "{who}: {:?}", resp.status());
+        let v: Value = resp.into_body().read_json().unwrap_or(Value::Null);
+        assert_eq!(v["check"], json!(check), "{who}: {v}");
+    }
+    // An oversized body (cap 10 MiB + envelope) is refused at the
+    // board's own read — the daemon is never called.
+    let big = vec![b'x'; (10 * 1024 * 1024 + 200 * 1024) as usize];
+    let mut oversized = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big.txt\"\r\n\r\n"
+    )
+    .into_bytes();
+    oversized.extend_from_slice(&big);
+    oversized.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let url = format!("{}/api/chat/upload", board.base);
+    let resp = board
+        .decorate("operator", board.agent.post(&url))
+        .header(
+            "Content-Type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
+        .send(oversized)
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 413, "oversize was not refused");
+    assert_eq!(rows(), before, "a refused upload wrote a row");
+
+    // Control: a real operator upload lands and the row is minted.
+    let url = format!("{}/api/chat/upload", board.base);
+    let resp = board
+        .decorate("operator", board.agent.post(&url))
+        .header(
+            "Content-Type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
+        .send(body.into_bytes())
+        .unwrap();
+    let status = resp.status().as_u16();
+    let v: Value = resp.into_body().read_json().unwrap();
+    assert_eq!(status, 200, "{v}");
+    assert!(v["id"].as_str().unwrap().starts_with("chf-"), "{v}");
+    assert_eq!(rows(), before + 1);
+}
+/// CAD-1168: a refused or forged attachment never reaches a queued
+/// message — an off-allowlist or mismatched upload is refused, an
+/// unknown or grammar-bad id refuses the send, and a retry naming
+/// different attachments is the conflict it always was. A good
+/// attachment then lands on the entry's payload and rides the
+/// delivery envelope — control for the whole path.
+///
+/// Guards: `chat_file_put`'s kind/cap checks (store/chat_files.rs),
+/// `thread_attachments` (daemon.rs) and `entry_attachments_in`'s
+/// retry comparison (store/threads.rs).
+#[test]
+fn thread_send_attachments_resolve_refuse_and_ride() {
+    let gx = gx();
+    establish_upload_account(&gx);
+    // A .pdf is refused by the current explicit unsupported-type
+    // check before any kind sniff — the interim allowlist is text
+    // only, and a magic prefix is not processing.
+    let dir = gx.dir.path().join(crate::wiki::UPLOAD_DIR);
+    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = dir.join("upload-fakepdf");
+    std::fs::write(&tmp, b"plain text").unwrap();
+    let err = err_text(gx.operator(
+        "chat_file_upload",
+        json!({"name": "fake.pdf", "tmp": tmp.to_string_lossy()}),
+    ));
+    assert!(err.contains("not available yet"), "{err}");
+    // Off-allowlist extension refuses before sniffing.
+    let tmp2 = dir.join("upload-exe");
+    std::fs::write(&tmp2, b"MZ").unwrap();
+    let err = err_text(gx.operator(
+        "chat_file_upload",
+        json!({"name": "a.exe", "tmp": tmp2.to_string_lossy()}),
+    ));
+    assert!(err.contains("not an attachable type"), "{err}");
+
+    // A real upload, referenced on a send.
+    let file = chat_upload(&gx, "brief.csv", b"name,email\nA,a@b.c");
+    assert_owned_upload(&gx, &file, "brief.csv", b"name,email\nA,a@b.c");
+    let id = file["id"].as_str().unwrap().to_string();
+    let sent = gx
+        .operator(
+            "thread_send",
+            json!({"alias": "master", "text": "review this", "message": "m-att",
+                   "attachments": [{"id": id}]}),
+        )
+        .unwrap();
+    assert_eq!(sent["state"], json!("queued"), "{sent}");
+    let entry_payload = |gx: &Gx, id: &str| -> Value {
+        let conn = gx.db();
+        conn.query_row(
+            "SELECT payload FROM thread_entries WHERE message_id=?",
+            [id],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|p| serde_json::from_str(&p).unwrap())
+        .unwrap()
+    };
+    let payload = entry_payload(&gx, "m-att");
+    assert_eq!(
+        payload["attachments"][0]["id"],
+        json!(id),
+        "the stored entry carries the resolved row: {payload}"
+    );
+    assert_eq!(payload["attachments"][0]["name"], json!("brief.csv"));
+    assert_eq!(payload["attachments"][0]["mime"], json!("text/csv"));
+
+    // The same message id with different attachments is the conflict
+    // it always was — a retry cannot quietly re-scope a message.
+    let other = chat_upload(&gx, "other.txt", b"second");
+    let err = err_text(gx.operator(
+        "thread_send",
+        json!({"alias": "master", "text": "review this", "message": "m-att",
+               "attachments": [{"id": other["id"]}]}),
+    ));
+    assert!(err.contains("already used with different content"), "{err}");
+
+    // Forged/unknown ids refuse; the grammar refuses a non-chf id too.
+    for bad in ["chf-0000000000000000000000000000dead", "not-an-id", ""] {
+        let err = err_text(gx.operator(
+            "thread_send",
+            json!({"alias": "master", "text": "x", "message": "m-bad",
+                   "attachments": [{"id": bad}]}),
+        ));
+        assert!(
+            err.contains("attachment") || err.contains("unknown"),
+            "{bad}: {err}"
+        );
+    }
+    // A non-id field inside an attachment refuses whole.
+    let err = err_text(gx.operator(
+        "thread_send",
+        json!({"alias": "master", "text": "x", "message": "m-bad2",
+               "attachments": [{"id": id, "path": "/etc/passwd"}]}),
+    ));
+    assert!(err.contains("takes id only"), "{err}");
+
+    // The delivery envelope names the file and its read verb — the
+    // stored text is untouched.
+    let message = gx.message("m-att");
+    let body = gx.shared.delivery_body("master", "managed", &message, None);
+    assert!(body.contains("brief.csv"), "{body}");
+    assert!(body.contains("text/csv"), "{body}");
+    assert!(
+        body.contains(&format!("cadence attachment read {id}")),
+        "{body}"
+    );
+    assert!(body.ends_with("review this"), "{body}");
+}
+
+// ---------- CAD-1168 independent acceptance check (reviewer-authored) ----------
+
+/// CAD-1168 acceptance item 9, written by the Spec/security reviewer
+/// (cc-rev-spec) from the ticket, not by the implementer — the
+/// implementer must not edit or weaken it.
+///
+/// Control: a same-scope ready CSV uploaded into a CRM conversation is
+/// referenced by a real app-bound `thread_send`, and the master's live
+/// turn reads its bounded text back. Refused, each by its own reason
+/// and without bytes or an effect (no new message, no new row):
+/// cross-installation, cross-company (context) and cross-conversation
+/// references; a home row on an app send and an app row on a home
+/// send; an unknown id; a forged row that claims ready text without
+/// custody bytes; a forged PDF row over real text bytes; a client
+/// `ready`/`sha256` field; a master read of an id not on its turn's
+/// envelope, under a finished turn, from a worker or an underivable
+/// caller; and an agent (the master itself, a worker, a detached child)
+/// trying the operator's upload or attach authority. The same cases are
+/// then run on the board's HTTP peer.
+///
+/// Guards: `rpc_chat_file_upload` / `rpc_chat_file_read`
+/// (daemon/chat_files_rpc.rs), `thread_attachments` (daemon.rs),
+/// `ChatFile::scope_matches` / `home_scope` / readiness checks
+/// (store/chat_files.rs), `WRITE_ROUTES` + `post_upload` /
+/// `post_message` (ui/operator.rs, ui/threads.rs).
+#[test]
+fn cad1168_independent_attachment_scope_refusals() {
+    const SECRETLESS: &str = "name,email\nZed Sentinel,zed@example.test\n";
+    let gx = gx();
+    establish_upload_account(&gx);
+    let staged = |gx: &Gx, bytes: &[u8]| {
+        let dir = gx.dir.path().join(crate::wiki::UPLOAD_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join(format!("upload-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&tmp, bytes).unwrap();
+        tmp.to_string_lossy().into_owned()
+    };
+    let upload = |gx: &Gx, name: &str, bytes: &[u8], scope: Option<(&str, &str, &str)>| {
+        let mut params = json!({"name": name, "tmp": staged(gx, bytes)});
+        if let Some((install, context, conversation)) = scope {
+            params["app"] = json!({"install_id": install, "context_id": context});
+            params["conversation"] = json!(conversation);
+        }
+        let row = gx.operator("chat_file_upload", params).unwrap();
+        assert_owned_upload(gx, &row, name, bytes);
+        row["id"].as_str().unwrap().to_string()
+    };
+    let send = |gx: &Gx, msg: &str, scope: Option<(&str, &str, &str)>, ids: Value| {
+        let mut params = json!({"alias": "master", "text": format!("read {msg}"),
+                                "message": msg, "attachments": ids});
+        if let Some((install, context, conversation)) = scope {
+            params["app"] = json!({"install_id": install, "context_id": context});
+            params["conversation"] = json!(conversation);
+        }
+        gx.operator("thread_send", params)
+    };
+    let (crm, social) = (gx.crm.clone(), gx.social.clone());
+    let (crm_a, crm_b, social_ctx) = (gx.crm_a.clone(), gx.crm_b.clone(), gx.social_ctx.clone());
+    let conv_a = gx.conversation(&crm, &crm_a, json!({"general": true}));
+    let conv_a2 = gx.conversation(&crm, &crm_a, json!({}));
+    let conv_b = gx.conversation(&crm, &crm_b, json!({"general": true}));
+    let conv_s = gx.general_of(&social, &social_ctx);
+    let scope_a = Some((crm.as_str(), crm_a.as_str(), conv_a.as_str()));
+
+    // ---- Control: same-scope ready file, real send, guarded read. ----
+    let file_a = upload(&gx, "leads.csv", SECRETLESS.as_bytes(), scope_a);
+    let sent = send(&gx, "m-ctl", scope_a, json!([{"id": file_a}])).unwrap();
+    assert_eq!(sent["state"], json!("queued"), "{sent}");
+    let token = gx.run("m-ctl");
+    let read = gx
+        .verb("chat_file_read", json!({"id": file_a}), "m-ctl", &token)
+        .unwrap();
+    assert_eq!(read["text"], json!(SECRETLESS), "control read: {read}");
+    assert_eq!(read["extractable"], json!(true), "{read}");
+
+    // Fixture rows in other scopes — same bytes, so only scope differs.
+    let file_a2 = upload(&gx, "other.txt", b"second file in A", scope_a);
+    let file_b = upload(
+        &gx,
+        "leads.csv",
+        SECRETLESS.as_bytes(),
+        Some((&crm, &crm_b, &conv_b)),
+    );
+    let file_s = upload(
+        &gx,
+        "leads.csv",
+        SECRETLESS.as_bytes(),
+        Some((&social, &social_ctx, &conv_s)),
+    );
+    let file_conv2 = upload(
+        &gx,
+        "leads.csv",
+        SECRETLESS.as_bytes(),
+        Some((&crm, &crm_a, &conv_a2)),
+    );
+    let file_home = upload(&gx, "leads.csv", SECRETLESS.as_bytes(), None);
+    for id in [&file_b, &file_s, &file_conv2, &file_home] {
+        assert_ne!(id, &file_a, "a different scope must mint a different row");
+    }
+
+    let rows = || gx.count("SELECT count(*) FROM chat_files");
+    let messages = || gx.count("SELECT count(*) FROM messages");
+    let no_bytes = |what: &str, err: &str| {
+        assert!(
+            !err.contains("Zed Sentinel") && !err.contains("second file"),
+            "{what}: a refusal exposed bytes: {err}"
+        );
+    };
+
+    // ---- Forged rows: ready claimed without bytes; PDF over text. ----
+    let forged_ready = "chf-00000000000000000000000000000f0e";
+    let forged_pdf = "chf-00000000000000000000000000000f0f";
+    let sha_a: String = gx
+        .db()
+        .query_row("SELECT sha256 FROM chat_files WHERE id=?", [&file_a], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    // Real custody bytes that no scope-A row names yet (uploaded under
+    // Home), so a forged scope-A PDF row can point at a present blob.
+    let file_carrier = upload(&gx, "carrier.txt", b"carrier bytes", None);
+    let sha_carrier: String = gx
+        .db()
+        .query_row(
+            "SELECT sha256 FROM chat_files WHERE id=?",
+            [&file_carrier],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let scope_label = format!("app:{crm}@{conv_a}");
+    for (id, sha, mime) in [
+        (forged_ready, "ab".repeat(32), "text/csv"),
+        (forged_pdf, sha_carrier, "application/pdf"),
+    ] {
+        gx.db()
+            .execute(
+                "INSERT INTO chat_files(id,sha256,size,mime,name,scope,context_id,uploader,created)
+                 VALUES(?,?,?,?,?,?,?,'operator',1.0)",
+                rusqlite::params![
+                    id,
+                    sha,
+                    if mime == "application/pdf" {
+                        13
+                    } else {
+                        SECRETLESS.len() as i64
+                    },
+                    mime,
+                    "forged.csv",
+                    scope_label,
+                    crm_a
+                ],
+            )
+            .unwrap();
+    }
+
+    let (rows0, messages0) = (rows(), messages());
+
+    // ---- Daemon: refused references at send. ----
+    let not_scoped = "is not scoped to this installation, context and conversation";
+    /// (what, app scope or Home, attachments, refusal reason)
+    type Scope<'a> = Option<(&'a str, &'a str, &'a str)>;
+    let cases: Vec<(&str, Scope, Value, &str)> = vec![
+        // cross-installation: a Social row on a CRM conversation
+        (
+            "cross-install",
+            scope_a,
+            json!([{"id": file_s}]),
+            not_scoped,
+        ),
+        // cross-company: company A's row on company B's conversation
+        (
+            "cross-company",
+            Some((&crm, &crm_b, &conv_b)),
+            json!([{"id": file_a}]),
+            not_scoped,
+        ),
+        // another conversation of the same installation and company
+        (
+            "cross-conversation",
+            Some((&crm, &crm_a, &conv_a2)),
+            json!([{"id": file_a}]),
+            not_scoped,
+        ),
+        // a home row cannot ride an app conversation
+        (
+            "home-on-app",
+            scope_a,
+            json!([{"id": file_home}]),
+            not_scoped,
+        ),
+        // an app row cannot ride the home thread
+        (
+            "app-on-home",
+            None,
+            json!([{"id": file_a}]),
+            "is not a home-scope file",
+        ),
+        // never minted
+        (
+            "unknown",
+            scope_a,
+            json!([{"id": "chf-0123456789abcdef0123456789abcdef"}]),
+            "unknown attachment",
+        ),
+        // a row claiming ready text with no custody bytes
+        (
+            "forged-ready-row",
+            scope_a,
+            json!([{"id": forged_ready}]),
+            "blob is missing",
+        ),
+        // a non-text row over genuine bytes is never ready text
+        (
+            "forged-pdf-row",
+            scope_a,
+            json!([{"id": forged_pdf}]),
+            "is not a ready text source",
+        ),
+        // client-forged readiness or digest fields refuse whole
+        (
+            "client-ready-field",
+            scope_a,
+            json!([{"id": file_a, "ready": true}]),
+            "takes id only",
+        ),
+        (
+            "client-sha-field",
+            scope_a,
+            json!([{"id": file_a, "sha256": sha_a}]),
+            "takes id only",
+        ),
+    ];
+    for (i, (what, scope, ids, reason)) in cases.into_iter().enumerate() {
+        let err = err_text(send(&gx, &format!("m-bad-{i}"), scope, ids));
+        assert!(err.contains(reason), "{what}: {err}");
+        no_bytes(what, &err);
+        assert_eq!(messages(), messages0, "{what}: a refused send queued");
+    }
+    // A forged ready state on upload refuses whole too.
+    for field in ["ready", "state", "scope", "context_id"] {
+        let mut params = json!({"name": "x.csv", "tmp": staged(&gx, b"a,b\n1,2\n")});
+        params[field] = json!("ready");
+        let err = err_text(gx.operator("chat_file_upload", params));
+        assert!(
+            err.contains(&format!("field '{field}' is not accepted")),
+            "{field}: {err}"
+        );
+    }
+
+    // ---- Daemon: refused reads. ----
+    // An id not on THIS turn's envelope — even one in the same scope,
+    // and even the forged rows — is refused under a live token.
+    for id in [&file_a2, &file_b, &file_s, &file_home, &file_conv2] {
+        let err = err_text(gx.verb("chat_file_read", json!({"id": id}), "m-ctl", &token));
+        assert!(err.contains("not on your turn's envelope"), "{id}: {err}");
+        no_bytes("off-envelope read", &err);
+    }
+    // A worker, an underivable caller and a forged token are refused.
+    let err = err_text(gx.call(
+        Asserted::Agent("w1".into()),
+        "chat_file_read",
+        json!({"id": file_a, "message": "m-ctl", "token": token}),
+    ));
+    assert!(err.contains("only the master"), "{err}");
+    no_bytes("worker read", &err);
+    let err = err_text(gx.call(Asserted::Unproven, "chat_file_read", json!({"id": file_a})));
+    assert!(err.contains("not provably the operator"), "{err}");
+    let err = err_text(gx.verb(
+        "chat_file_read",
+        json!({"id": file_a}),
+        "m-ctl",
+        "forged-token",
+    ));
+    assert!(err.contains("active assigned turn"), "{err}");
+    no_bytes("forged-token read", &err);
+    // Once the turn finishes, the same token no longer reads.
+    gx.finish("m-ctl", 5.0);
+    let err = err_text(gx.verb("chat_file_read", json!({"id": file_a}), "m-ctl", &token));
+    assert!(err.contains("active assigned turn"), "{err}");
+    no_bytes("finished-turn read", &err);
+
+    // ---- Daemon: no agent acquires operator upload/attach authority. ----
+    for who in [
+        Asserted::Agent("master".into()),
+        Asserted::Agent("w1".into()),
+        Asserted::Unproven,
+    ] {
+        let label = format!("{who:?}");
+        let err = err_text(gx.call(
+            who.clone(),
+            "chat_file_upload",
+            json!({"name": "x.csv", "tmp": staged(&gx, b"a,b\n1,2\n")}),
+        ));
+        // The master is stopped earlier, by its own call policy (an app
+        // turn may call only the scoped verbs) — still a refusal naming
+        // the verb; workers and detached children by the operator proof.
+        let refused = |err: &str, verb: &str| {
+            err.contains("operator's chat")
+                || err.contains("not provably the operator")
+                || err.contains(&format!("not {verb}"))
+        };
+        assert!(refused(&err, "chat_file_upload"), "{label} upload: {err}");
+        let err = err_text(gx.call(
+            who,
+            "thread_send",
+            json!({"alias": "master", "text": "x", "message": "m-agent",
+                   "attachments": [{"id": file_home}]}),
+        ));
+        assert!(refused(&err, "thread_send"), "{label} attach: {err}");
+    }
+    // A worker's plain `agent_send` cannot carry attachments either.
+    let err = err_text(gx.call(
+        Asserted::Agent("w1".into()),
+        "agent_send",
+        json!({"alias": "master", "text": "x", "attachments": [{"id": file_home}]}),
+    ));
+    assert!(
+        err.contains("attachments") || err.contains("not accepted"),
+        "agent_send: {err}"
+    );
+    assert_eq!(rows(), rows0, "a refused call minted a chat_files row");
+    assert_eq!(messages(), messages0, "a refused call queued a message");
+    drop(gx);
+
+    // ---- The board's HTTP peer: the same control and refusals. ----
+    let (board, state, rest) = http::start(gx_with(true));
+    let db = || rusqlite::Connection::open(crate::rollout::db_file(&state)).unwrap();
+    let count = |sql: &str| -> i64 { db().query_row(sql, [], |r| r.get(0)).unwrap() };
+    let crm = rest.crm.clone();
+    let make_conv = |context: &str| -> String {
+        let (status, reply) = board.call(
+            "operator",
+            "POST",
+            &format!("/api/app-installations/{crm}/conversations"),
+            Some(json!({"context_id": context, "general": true})),
+        );
+        assert_eq!(status, 200, "{reply}");
+        reply["conversation"]["id"].as_str().unwrap().to_string()
+    };
+    let conv_a = make_conv(&rest.crm_a);
+    let conv_b = make_conv(&rest._crm_b);
+    let boundary = "----cad1168rev";
+    let multipart = |fields: &[(&str, &str)], filename: &str, bytes: &[u8]| -> Vec<u8> {
+        let mut body = Vec::new();
+        for (k, v) in fields {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    };
+    let post_upload = |who: &str, body: Vec<u8>| -> (u16, Value) {
+        let url = format!("{}/api/chat/upload", board.base);
+        let resp = board
+            .decorate(who, board.agent.post(&url))
+            .header(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )
+            .send(body)
+            .unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.into_body().read_json().unwrap_or(Value::Null))
+    };
+    let scoped_fields = |context: &str, conversation: &str| -> Vec<(String, String)> {
+        vec![
+            ("install_id".into(), crm.clone()),
+            ("context_id".into(), context.to_string()),
+            ("conversation".into(), conversation.to_string()),
+        ]
+    };
+    fn as_refs(v: &[(String, String)]) -> Vec<(&str, &str)> {
+        v.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect()
+    }
+    let fields_a = scoped_fields(&rest.crm_a, &conv_a);
+    // Control upload through the board, scoped to company A's conversation.
+    let (status, row) = post_upload(
+        "operator",
+        multipart(&as_refs(&fields_a), "leads.csv", SECRETLESS.as_bytes()),
+    );
+    assert_eq!(status, 200, "{row}");
+    let http_a = row["id"].as_str().unwrap().to_string();
+    assert_eq!(row["scope"], json!(format!("app:{crm}@{conv_a}")), "{row}");
+    let (rows0, messages0) = (
+        count("SELECT count(*) FROM chat_files"),
+        count("SELECT count(*) FROM messages"),
+    );
+    // Agents and a sessionless caller cannot upload through the board.
+    for (who, check) in [
+        ("agent:master", "operator_only"),
+        ("agent:w1", "operator_only"),
+        ("unproven", "caller_identity"),
+    ] {
+        let (status, reply) =
+            post_upload(who, multipart(&as_refs(&fields_a), "x.csv", b"a,b\n1,2\n"));
+        assert_eq!(status, 403, "{who}: {reply}");
+        assert_eq!(reply["check"], json!(check), "{who}: {reply}");
+    }
+    // A forged readiness / scope field on the upload refuses whole.
+    for field in ["ready", "scope", "sha256"] {
+        let mut fields = as_refs(&fields_a);
+        fields.push((field, "1"));
+        let (status, reply) = post_upload("operator", multipart(&fields, "x.csv", b"a,b\n1,2\n"));
+        assert_eq!(status, 400, "{field}: {reply}");
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!("field '{field}' is not accepted")),
+            "{field}: {reply}"
+        );
+    }
+    let post_msg = |who: &str, msg: &str, context: &str, conversation: &str, ids: Value| {
+        board.call(
+            who,
+            "POST",
+            "/api/threads/master/messages",
+            Some(json!({"text": "read it", "message": msg,
+                        "app": {"install_id": crm, "context_id": context},
+                        "conversation": conversation, "attachments": ids})),
+        )
+    };
+    // Agents cannot attach through the board.
+    for who in ["agent:master", "agent:w1"] {
+        let (status, reply) = post_msg(
+            who,
+            "h-agent",
+            &rest.crm_a,
+            &conv_a,
+            json!([{"id": http_a}]),
+        );
+        assert_eq!(status, 403, "{who}: {reply}");
+        assert_eq!(reply["check"], json!("operator_only"), "{who}: {reply}");
+    }
+    // Forged cross-company, unknown and client-ready references refuse.
+    let http_cases: Vec<(&str, &str, &str, Value, &str)> = vec![
+        (
+            "cross-company",
+            &rest._crm_b,
+            &conv_b,
+            json!([{"id": http_a}]),
+            not_scoped,
+        ),
+        (
+            "unknown",
+            &rest.crm_a,
+            &conv_a,
+            json!([{"id": "chf-0123456789abcdef0123456789abcdef"}]),
+            "unknown attachment",
+        ),
+        (
+            "client-ready-field",
+            &rest.crm_a,
+            &conv_a,
+            json!([{"id": http_a, "ready": true}]),
+            "unknown field",
+        ),
+    ];
+    for (i, (what, context, conversation, ids, reason)) in http_cases.into_iter().enumerate() {
+        let (status, reply) = post_msg(
+            "operator",
+            &format!("h-bad-{i}"),
+            context,
+            conversation,
+            ids,
+        );
+        assert_eq!(status, 400, "{what}: {reply}");
+        let err = reply["error"].as_str().unwrap_or_default().to_string();
+        assert!(err.contains(reason), "{what}: {reply}");
+        no_bytes(what, &err);
+    }
+    assert_eq!(
+        count("SELECT count(*) FROM chat_files"),
+        rows0,
+        "HTTP refusal minted a row"
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM messages"),
+        messages0,
+        "HTTP refusal queued"
+    );
+    // Control: the same-scope reference is accepted through the board.
+    let (status, reply) = post_msg(
+        "operator",
+        "h-ok",
+        &rest.crm_a,
+        &conv_a,
+        json!([{"id": http_a}]),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["state"], json!("queued"), "{reply}");
+    assert_eq!(count("SELECT count(*) FROM messages"), messages0 + 1);
+}
+
+/// CAD-1168: the master reads an attachment with the id alone, on its own
+/// live turn, in an APP conversation too — the CLI no longer calls
+/// `agent_show` (which Gate 2 refuses under an app turn), so the daemon
+/// resolves the running turn from the proven caller. An id on the turn's
+/// envelope reads; an id of the same conversation that was never sent
+/// with this turn is refused with the envelope reason, a Home turn
+/// still reads its own file, and a master with no running turn reads
+/// nothing.
+///
+/// Guards: `rpc_chat_file_read`'s agent arm (the live-turn resolution and
+/// the envelope-membership check, daemon/chat_files_rpc.rs).
+#[test]
+fn master_reads_attachments_on_its_live_turn_by_id_alone() {
+    let gx = gx();
+    establish_upload_account(&gx);
+    let staged = |bytes: &[u8]| {
+        let dir = gx.dir.path().join(crate::wiki::UPLOAD_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join(format!("upload-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&tmp, bytes).unwrap();
+        tmp.to_string_lossy().into_owned()
+    };
+    let app = json!({"install_id": gx.crm, "context_id": gx.crm_a});
+    let conv = gx.conversation(&gx.crm, &gx.crm_a, json!({"general": true}));
+    let app_upload = |name: &str, bytes: &[u8]| -> String {
+        let row = gx
+            .operator(
+                "chat_file_upload",
+                json!({"name": name, "tmp": staged(bytes), "app": app, "conversation": conv}),
+            )
+            .unwrap();
+        assert_owned_upload(&gx, &row, name, bytes);
+        row["id"].as_str().unwrap().to_string()
+    };
+    let sent = app_upload("sent.csv", b"name\nAnn");
+    let unsent = app_upload("unsent.txt", b"never sent");
+    let read = |id: &str| {
+        gx.call(
+            Asserted::Agent("master".into()),
+            "chat_file_read",
+            json!({"id": id}),
+        )
+    };
+
+    // No running turn: nothing is readable.
+    let err = err_text(read(&sent));
+    assert!(err.contains("none is running"), "{err}");
+
+    // An app turn: the id on its envelope reads (Gate 2 admits the verb
+    // and no `agent_show` is involved) ...
+    gx.operator(
+        "thread_send",
+        json!({"alias": "master", "text": "see file", "message": "m-app",
+               "app": app, "conversation": conv, "attachments": [{"id": sent}]}),
+    )
+    .unwrap();
+    gx.run("m-app");
+    gx.policy("chat_file_read", &json!({"id": sent})).unwrap();
+    assert!(gx
+        .policy("agent_show", &json!({"alias": "master"}))
+        .is_err());
+    assert_eq!(read(&sent).unwrap()["text"], json!("name\nAnn"));
+    // ... an id of the same conversation that this turn did not carry is
+    // refused, and so is an id that does not exist.
+    let err = err_text(read(&unsent));
+    assert!(err.contains("not on your turn's envelope"), "{err}");
+    let err = err_text(read("chf-0000000000000000000000000000dead"));
+    assert!(err.contains("not on your turn's envelope"), "{err}");
+
+    // A Home turn still reads its own file, and not the app one.
+    gx.finish("m-app", 2.0);
+    let home = chat_upload(&gx, "home.txt", b"home text");
+    let home_id = home["id"].as_str().unwrap().to_string();
+    gx.operator(
+        "thread_send",
+        json!({"alias": "master", "text": "home file", "message": "m-home",
+               "attachments": [{"id": home_id}]}),
+    )
+    .unwrap();
+    gx.run("m-home");
+    assert_eq!(read(&home_id).unwrap()["text"], json!("home text"));
+    let err = err_text(read(&sent));
+    assert!(err.contains("not on your turn's envelope"), "{err}");
+}
+
+/// CAD-1168 (Home links open the originating app conversation): the
+/// master turn Home shows names its app conversation from the message's
+/// persisted provenance — with a context, and without one (an
+/// installation-only chat). A Home turn, a foreign conversation and an
+/// archived one yield no link.
+///
+/// Guard: `master_turn_app_origin`.
+#[test]
+fn cad1168_home_turn_origin_is_the_persisted_app_conversation() {
+    let gx = gx();
+    let origin =
+        |gx: &Gx| gx.operator("master_state", json!({})).unwrap()["turn"]["app_origin"].clone();
+    let mut at = 1.0;
+    let mut done = |gx: &Gx, id: &str| {
+        at += 1.0;
+        gx.finish(id, at);
+    };
+
+    // With a context: the exact installation, context and conversation.
+    let conv = gx.general_of(&gx.crm, &gx.crm_a);
+    gx.send("o-ctx", &gx.crm, &gx.crm_a, Some(&conv));
+    gx.run("o-ctx");
+    assert_eq!(
+        origin(&gx),
+        json!({"install_id": gx.crm, "context_id": gx.crm_a, "conversation_id": conv})
+    );
+    done(&gx, "o-ctx");
+
+    // Without a context: a valid destination with an empty context.
+    let social = gx.general_of(&gx.social, &gx.social_ctx);
+    gx.operator(
+        "thread_send",
+        json!({"alias": "master", "text": "hi", "message": "o-bare",
+               "app": {"install_id": gx.social}, "conversation": social}),
+    )
+    .unwrap();
+    gx.run("o-bare");
+    assert_eq!(
+        origin(&gx),
+        json!({"install_id": gx.social, "context_id": "", "conversation_id": social})
+    );
+    done(&gx, "o-bare");
+
+    // A Home turn has no app conversation.
+    gx.send_home("o-home");
+    gx.run("o-home");
+    assert_eq!(origin(&gx), Value::Null);
+    done(&gx, "o-home");
+
+    // Foreign: a CRM-stamped turn whose conversation is Social's.
+    gx.send("o-foreign", &gx.crm, &gx.crm_a, None);
+    gx.repoint("o-foreign", &social);
+    gx.run("o-foreign");
+    assert_eq!(origin(&gx), Value::Null);
+    done(&gx, "o-foreign");
+
+    // Archived: the conversation is no longer a destination.
+    let other = gx.conversation(&gx.crm, &gx.crm_a, json!({}));
+    gx.send("o-arch", &gx.crm, &gx.crm_a, Some(&other));
+    gx.run("o-arch");
+    assert_ne!(origin(&gx), Value::Null);
+    gx.db()
+        .execute("UPDATE threads SET archived=1 WHERE id=?", [&other])
+        .unwrap();
+    assert_eq!(origin(&gx), Value::Null);
+}
+
+/// CAD-1726 control (not a refusal check): the master's live Home turn
+/// puts an artifact, the card lands in that turn's conversation, and the
+/// operator reads the same bytes back for exactly that conversation.
+#[test]
+fn cad1726_artifact_put_read_control() {
+    use base64::Engine;
+    let gx = gx();
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    gx.send_home("m-art");
+    let token = gx.run("m-art");
+    let put = gx.verb(
+        "artifact_put",
+        json!({"kind": "html", "title": "Weekly", "content": b64(b"<h1>v1</h1>")}),
+        "m-art",
+        &token,
+    );
+    // The explicit message/token form is not an artifact_put field.
+    assert!(put.is_err(), "{put:?}");
+    let put = gx
+        .call(
+            Asserted::Agent("master".into()),
+            "artifact_put",
+            json!({"kind": "html", "title": "Weekly", "content": b64(b"<h1>v1</h1>")}),
+        )
+        .unwrap();
+    let id = put["id"].as_str().unwrap().to_string();
+    assert_eq!(put["version"], json!(1));
+    let put2 = gx
+        .call(
+            Asserted::Agent("master".into()),
+            "artifact_put",
+            json!({"kind": "html", "title": "Weekly", "id": id, "content": b64(b"<h1>v2</h1>")}),
+        )
+        .unwrap();
+    assert_eq!(put2["version"], json!(2));
+    let home = gx.shared.store.ensure_thread("master").unwrap().id;
+    let cards: Vec<_> = gx
+        .shared
+        .store
+        .thread_entries_of(&home, 0, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "artifact")
+        .collect();
+    assert_eq!(cards.len(), 2);
+    assert_eq!(cards[1].payload.as_ref().unwrap()["version"], json!(2));
+    let read = gx
+        .operator(
+            "artifact_read",
+            json!({"id": id, "version": 2, "conversation": home}),
+        )
+        .unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(read["content"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(bytes, b"<h1>v2</h1>");
+    assert_eq!(read["mime"], json!("text/html; charset=utf-8"));
+    let list = gx
+        .operator("artifact_versions", json!({"id": id, "conversation": home}))
+        .unwrap();
+    assert_eq!(list["versions"].as_array().unwrap().len(), 2);
+}
+
+// ============================================================================
+// CAD-1726 refusal acceptance checks — written from the ticket by the
+// reviewer, not the implementer (AGENTS.md "Gates and security work").
+// Each refusal is asserted by its reason, and each test holds a positive
+// control on the same fixture so a harness that refuses everything fails.
+// ============================================================================
+
+/// A sentinel inside every artifact body: a refusal that leaks bytes
+/// would carry it.
+const CANVAS_SENTINEL: &str = "Zed Canvas Sentinel";
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn unb64(v: &Value) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(v.as_str().expect("base64 content"))
+        .unwrap()
+}
+
+impl Gx {
+    /// `artifact_put` on the master's own connection (the turn is the
+    /// daemon's to resolve; the request never names it).
+    fn master_put(&self, params: Value) -> Result<Value> {
+        self.call(Asserted::Agent("master".into()), "artifact_put", params)
+    }
+
+    /// `(artifact rows, artifact card entries, custody blobs)` — the
+    /// "nothing was stored" probe. A missing custody dir is zero blobs;
+    /// any other read failure fails the test.
+    fn artifact_state(&self) -> (i64, i64, usize) {
+        let dir = self.dir.path().join("artifacts");
+        let blobs = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries.count(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => panic!("read {}: {e}", dir.display()),
+        };
+        (
+            self.count("SELECT count(*) FROM artifacts"),
+            self.count("SELECT count(*) FROM thread_entries WHERE kind='artifact'"),
+            blobs,
+        )
+    }
+
+    fn artifact_cards(&self, thread: &str) -> Vec<Value> {
+        self.shared
+            .store
+            .thread_entries_of(thread, 0, 500)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "artifact")
+            .map(|e| e.payload.unwrap())
+            .collect()
+    }
+}
+
+fn no_canvas_bytes(what: &str, err: &str) {
+    assert!(
+        !err.contains(CANVAS_SENTINEL),
+        "{what}: a refusal exposed artifact bytes: {err}"
+    );
+}
+
+/// CAD-1726 acceptance: "The read route refuses an artifact from another
+/// conversation or workspace, and an agent caller." An artifact put on a
+/// Home turn and one put on a CRM app-conversation turn are each read by
+/// the operator in their own conversation (control), then refused when
+/// viewed from every other conversation: Home <-> app, another
+/// conversation of the same company, another company, another
+/// installation; a forged row whose stored scope names a different
+/// conversation than its thread is refused by the scope re-proof; and
+/// every non-operator caller is refused on both `artifact_read` and
+/// `artifact_versions`.
+///
+/// Guards: `rpc_artifact_read` / `rpc_artifact_versions` ->
+/// `artifact_operator` + `artifact_in_view` + `prove_artifact_scope`
+/// (daemon/artifacts_rpc.rs).
+#[test]
+fn cad1726_artifact_read_refuses_other_conversation_workspace_and_agents() {
+    let gx = gx();
+    let (crm, social) = (gx.crm.clone(), gx.social.clone());
+    let (crm_a, crm_b, social_ctx) = (gx.crm_a.clone(), gx.crm_b.clone(), gx.social_ctx.clone());
+    let home = gx.shared.store.ensure_thread("master").unwrap().id;
+
+    // A Home turn puts one artifact.
+    gx.send_home("m-home");
+    gx.run("m-home");
+    let home_art = gx
+        .master_put(json!({"kind": "html", "title": "Home report",
+            "content": b64(format!("<p>{CANVAS_SENTINEL} home</p>").as_bytes())}))
+        .unwrap();
+    gx.finish("m-home", 2.0);
+    // A CRM app-conversation turn puts another.
+    let conv_a = gx.conversation(&crm, &crm_a, json!({"general": true}));
+    gx.send("m-app", &crm, &crm_a, Some(&conv_a));
+    gx.run("m-app");
+    let app_art = gx
+        .master_put(json!({"kind": "md", "title": "App report",
+            "content": b64(format!("# {CANVAS_SENTINEL} app").as_bytes())}))
+        .unwrap();
+    gx.finish("m-app", 3.0);
+    let (home_id, app_id) = (
+        home_art["id"].as_str().unwrap().to_string(),
+        app_art["id"].as_str().unwrap().to_string(),
+    );
+    // Each card landed in its own turn's conversation, nowhere else.
+    let ids = |thread: &str| -> Vec<String> {
+        gx.artifact_cards(thread)
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(ids(&home), vec![home_id.clone()]);
+    assert_eq!(ids(&conv_a), vec![app_id.clone()]);
+
+    let conv_a2 = gx.conversation(&crm, &crm_a, json!({}));
+    let conv_b = gx.conversation(&crm, &crm_b, json!({}));
+    let conv_s = gx.general_of(&social, &social_ctx);
+    let distinct: std::collections::BTreeSet<&String> =
+        [&home, &conv_a, &conv_a2, &conv_b, &conv_s]
+            .into_iter()
+            .collect();
+    assert_eq!(distinct.len(), 5, "the fixture conversations must differ");
+
+    let read = |who: Asserted, id: &str, version: i64, conv: &str| {
+        gx.call(
+            who,
+            "artifact_read",
+            json!({"id": id, "version": version, "conversation": conv}),
+        )
+    };
+    let versions = |who: Asserted, id: &str, conv: &str| {
+        gx.call(
+            who,
+            "artifact_versions",
+            json!({"id": id, "conversation": conv}),
+        )
+    };
+
+    // ---- Control: the operator reads each in its own conversation. ----
+    for (id, conv) in [(&home_id, &home), (&app_id, &conv_a)] {
+        let got = read(Asserted::Operator, id, 1, conv).unwrap();
+        let text = String::from_utf8(unb64(&got["content"])).unwrap();
+        assert!(text.contains(CANVAS_SENTINEL), "control {id}: {text}");
+        let list = versions(Asserted::Operator, id, conv).unwrap();
+        assert_eq!(list["versions"].as_array().unwrap().len(), 1, "{list}");
+    }
+
+    // ---- Another conversation or workspace: refused. ----
+    let not_in_view = "artifact does not belong to the conversation in view";
+    let cases = [
+        (
+            "home artifact viewed from an app conversation",
+            &home_id,
+            &conv_a,
+        ),
+        ("app artifact viewed from Home", &app_id, &home),
+        (
+            "another conversation of the same company",
+            &app_id,
+            &conv_a2,
+        ),
+        ("another company of the installation", &app_id, &conv_b),
+        ("another installation", &app_id, &conv_s),
+    ];
+    for (what, id, conv) in cases {
+        let got = read(Asserted::Operator, id, 1, conv);
+        assert!(got.is_err(), "{what}: served {id} in {conv}: {got:?}");
+        let err = err_text(got);
+        assert!(err.contains(not_in_view), "{what} read: {err}");
+        no_canvas_bytes(what, &err);
+        let err = err_text(versions(Asserted::Operator, id, conv));
+        assert!(err.contains(not_in_view), "{what} versions: {err}");
+    }
+
+    // ---- A forged row: its thread is company B's conversation, its
+    // stored scope still names company A's. The scope re-proof refuses
+    // it even though thread and conversation agree. ----
+    let forged = gx
+        .db()
+        .execute(
+            "INSERT INTO artifacts(id,version,kind,title,bytes,digest,scope,context_id,
+                                   thread_id,created_by,created)
+             SELECT id,7,kind,title,bytes,digest,scope,context_id,?,created_by,created
+             FROM artifacts WHERE id=? AND version=1",
+            rusqlite::params![conv_b, app_id],
+        )
+        .unwrap();
+    assert_eq!(forged, 1);
+    let err = err_text(read(Asserted::Operator, &app_id, 7, &conv_b));
+    assert!(
+        err.contains("artifact scope does not match its conversation"),
+        "forged scope row: {err}"
+    );
+    no_canvas_bytes("forged scope row", &err);
+
+    // ---- No agent and no unproven caller reads, even in view. The
+    // master is stopped by its own call policy (an app turn's allowlist
+    // has no read verb), a worker by the handler's operator proof. ----
+    let agent_refused = |err: &str, verb: &str| {
+        err.contains("an agent may not read artifacts") || err.contains(&format!("not {verb};"))
+    };
+    for who in [
+        Asserted::Agent("master".into()),
+        Asserted::Agent("w1".into()),
+    ] {
+        let label = format!("{who:?}");
+        let err = err_text(read(who.clone(), &home_id, 1, &home));
+        assert!(agent_refused(&err, "artifact_read"), "{label} read: {err}");
+        no_canvas_bytes(&label, &err);
+        let err = err_text(versions(who, &home_id, &home));
+        assert!(
+            agent_refused(&err, "artifact_versions"),
+            "{label} versions: {err}"
+        );
+    }
+    let err = err_text(read(Asserted::Agent("w1".into()), &home_id, 1, &home));
+    assert!(
+        err.contains("an agent may not read artifacts"),
+        "w1 reaches the handler's proof: {err}"
+    );
+    let err = err_text(read(Asserted::Unproven, &home_id, 1, &home));
+    assert!(
+        err.contains("not provably the operator"),
+        "unproven read: {err}"
+    );
+    no_canvas_bytes("unproven", &err);
+    let err = err_text(versions(Asserted::Unproven, &home_id, &home));
+    assert!(
+        err.contains("not provably the operator"),
+        "unproven versions: {err}"
+    );
+}
+
+/// CAD-1726 acceptance, the board's HTTP peer of the read RPC (a board
+/// path is at least as strict as the RPC it relays): the operator's
+/// session reads the bytes in view, `nosniff` and a `sandbox` CSP on the
+/// HTML (control); an agent or unproven caller is refused on both rows;
+/// the operator naming another conversation, or none, is refused.
+///
+/// Guards: the `OperatorOnly` rows `ArtifactRead` / `ArtifactVersions`
+/// (ui/endpoints.rs) + the relayed `artifact_read` / `artifact_versions`
+/// proofs (ui/artifacts.rs -> daemon/artifacts_rpc.rs).
+#[test]
+fn cad1726_board_artifact_route_is_operator_only_and_conversation_bound() {
+    let gx = gx_with(true);
+    let home = gx.shared.store.ensure_thread("master").unwrap().id;
+    gx.send_home("m-home");
+    gx.run("m-home");
+    let html = format!("<p>{CANVAS_SENTINEL}</p><script>fetch('/api/session')</script>");
+    let art = gx
+        .master_put(json!({"kind": "html", "title": "Report", "content": b64(html.as_bytes())}))
+        .unwrap();
+    gx.finish("m-home", 2.0);
+    let id = art["id"].as_str().unwrap().to_string();
+    let conv_a = gx.conversation(&gx.crm.clone(), &gx.crm_a.clone(), json!({"general": true}));
+    let (board, _state, _rest) = http::start(gx);
+
+    struct Got {
+        status: u16,
+        nosniff: Option<String>,
+        csp: Option<String>,
+        body: Vec<u8>,
+    }
+    let get = |who: &str, path: &str| -> Got {
+        let url = format!("{}{path}", board.base);
+        let mut resp = board.decorate(who, board.agent.get(&url)).call().unwrap();
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let (nosniff, csp) = (
+            header("x-content-type-options"),
+            header("content-security-policy"),
+        );
+        Got {
+            status: resp.status().as_u16(),
+            nosniff,
+            csp,
+            body: resp.body_mut().read_to_vec().unwrap(),
+        }
+    };
+    let bytes_path = |conv: &str| format!("/api/artifacts/{id}/1?conversation={conv}");
+    let list_path = |conv: &str| format!("/api/artifacts/{id}?conversation={conv}");
+
+    // ---- Control: the operator's session, in view. ----
+    let got = get("operator", &bytes_path(&home));
+    assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+    assert_eq!(got.body, html.as_bytes());
+    assert_eq!(got.nosniff.as_deref(), Some("nosniff"));
+    assert!(
+        got.csp.as_deref().is_some_and(|c| c.starts_with("sandbox")),
+        "{:?}",
+        got.csp
+    );
+    let got = get("operator", &list_path(&home));
+    assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+    let list: Value = serde_json::from_slice(&got.body).unwrap();
+    assert_eq!(list["versions"].as_array().unwrap().len(), 1, "{list}");
+
+    // ---- Agents and an unproven caller: refused on both rows. ----
+    for who in ["agent:master", "agent:w1", "unproven"] {
+        for path in [bytes_path(&home), list_path(&home)] {
+            let got = get(who, &path);
+            let body = String::from_utf8_lossy(&got.body).into_owned();
+            assert!(
+                [401, 403].contains(&got.status),
+                "{who} {path}: {} {body}",
+                got.status
+            );
+            no_canvas_bytes(who, &body);
+        }
+    }
+
+    // ---- The operator, but another conversation or none: refused. ----
+    for path in [bytes_path(&conv_a), list_path(&conv_a)] {
+        let got = get("operator", &path);
+        let body = String::from_utf8_lossy(&got.body).into_owned();
+        assert_ne!(got.status, 200, "{path}: {body}");
+        assert!(
+            body.contains("artifact does not belong to the conversation in view"),
+            "{path}: {} {body}",
+            got.status
+        );
+        no_canvas_bytes(&path, &body);
+    }
+    for path in [
+        format!("/api/artifacts/{id}/1"),
+        format!("/api/artifacts/{id}"),
+    ] {
+        let got = get("operator", &path);
+        let body = String::from_utf8_lossy(&got.body).into_owned();
+        assert_eq!(got.status, 400, "{path}: {body}");
+        assert!(body.contains("conversation is required"), "{path}: {body}");
+    }
+}
+
+/// CAD-1726 acceptance for `artifact_put`: scope comes from the master's
+/// live turn, never the request. Under a LIVE app-conversation turn a
+/// request naming a conversation, thread, scope, context, installation,
+/// message, token or author is refused whole; an existing id from
+/// another conversation (the only request handle that names stored
+/// custody) is refused; the operator and a worker are refused. Then the
+/// same live turn puts in its own conversation (control). A put after the
+/// endpoint's generation rotated (a stale token) or after the turn
+/// finished is refused. No refusal stores a row, a card or a blob.
+///
+/// Guards: `reject_artifact_fields` + `artifact_turn`
+/// (daemon/artifacts_rpc.rs); the cross-conversation version check in
+/// `LocalArtifacts::put` (store/artifacts.rs).
+#[test]
+fn cad1726_artifact_put_refuses_forged_fields_foreign_ids_and_stale_turns() {
+    let gx = gx();
+    let (crm, social) = (gx.crm.clone(), gx.social.clone());
+    let (crm_a, crm_b) = (gx.crm_a.clone(), gx.crm_b.clone());
+    let home = gx.shared.store.ensure_thread("master").unwrap().id;
+    gx.send_home("m-home");
+    gx.run("m-home");
+    let home_art = gx
+        .master_put(json!({"kind": "md", "title": "Home", "content": b64(b"# home")}))
+        .unwrap();
+    let home_id = home_art["id"].as_str().unwrap().to_string();
+    gx.finish("m-home", 2.0);
+
+    let conv_a = gx.conversation(&crm, &crm_a, json!({"general": true}));
+    gx.send("m-app", &crm, &crm_a, Some(&conv_a));
+    let token = gx.run("m-app");
+    let body = |extra: Value| {
+        let mut p = json!({"kind": "md", "title": "Forged",
+                           "content": b64(b"# forged bytes")});
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        p
+    };
+    let before = gx.artifact_state();
+
+    // ---- Forged custody fields under a live turn: refused whole. ----
+    let forged: Vec<(&str, Value)> = vec![
+        ("conversation", json!(home)),
+        ("thread_id", json!(home)),
+        ("scope", json!("home")),
+        ("context_id", json!(crm_b)),
+        ("install_id", json!(social)),
+        ("app", json!({"install_id": social, "context_id": crm_b})),
+        ("message", json!("m-home")),
+        ("token", json!(token)),
+        ("created_by", json!("operator")),
+        ("by", json!("operator")),
+    ];
+    for (field, value) in forged {
+        let err = err_text(gx.master_put(body(json!({ field: value }))));
+        assert!(
+            err.contains(&format!("'{field}' is not accepted")),
+            "{field}: {err}"
+        );
+        assert_eq!(gx.artifact_state(), before, "{field}: a refused put stored");
+    }
+
+    // ---- An id of another conversation: refused, nothing kept (the
+    // blob of new bytes is written first, then pruned). ----
+    let err = err_text(gx.master_put(body(json!({"id": home_id}))));
+    assert!(
+        err.contains("artifact belongs to another conversation"),
+        "foreign id: {err}"
+    );
+    assert_eq!(
+        gx.artifact_state(),
+        before,
+        "foreign id: a refused put stored"
+    );
+
+    // ---- Not the master's turn: the operator and a worker. ----
+    let err = err_text(gx.call(Asserted::Operator, "artifact_put", body(json!({}))));
+    assert!(
+        err.contains("artifact put is the agent's"),
+        "operator: {err}"
+    );
+    let err = err_text(gx.call(
+        Asserted::Agent("w1".into()),
+        "artifact_put",
+        body(json!({})),
+    ));
+    assert!(err.contains("only the master puts artifacts"), "w1: {err}");
+    assert_eq!(gx.artifact_state(), before, "a refused caller stored");
+
+    // ---- Control: the same live turn puts into its own conversation. ----
+    let ok = gx.master_put(body(json!({}))).unwrap();
+    let cards = gx.artifact_cards(&conv_a);
+    assert_eq!(cards.len(), 1, "{cards:?}");
+    assert_eq!(cards[0]["id"], ok["id"]);
+    assert_eq!(gx.artifact_cards(&home).len(), 1, "Home gained a card");
+    let before = gx.artifact_state();
+
+    // ---- A stale token: the endpoint generation moved on under the
+    // still-running turn (forged in the row, so the daemon's own
+    // re-open fence does not end the turn first), and its minted token
+    // is no longer current. ----
+    let moved = gx
+        .db()
+        .execute(
+            "UPDATE agents SET generation='fedcba9876543210fedcba9876543210' WHERE alias='master'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(moved, 1);
+    let err = err_text(gx.master_put(body(json!({"title": "Stale"}))));
+    assert!(
+        err.contains("turn token is no longer current"),
+        "stale: {err}"
+    );
+    // ---- A finished turn: nothing is running any more. ----
+    gx.finish("m-app", 4.0);
+    let err = err_text(gx.master_put(body(json!({"title": "Late"}))));
+    assert!(err.contains("active assigned turn"), "finished: {err}");
+    assert_eq!(gx.artifact_state(), before, "a stale/finished put stored");
+}
+
+/// CAD-1726 acceptance, hosted half: "Storage follows the workspace ...
+/// hosted -> AgenticOS (AOS-346)". With the image-owned hosted admission
+/// selected (the business-documents tuple; no lease), a put on the
+/// master's genuine live turn and the operator's reads refuse with the
+/// AOS-346 reason, and nothing lands in the state dir's custody, the
+/// table or the thread. The turn proof still runs first (a worker is
+/// refused as a worker), and the same flow on a local fixture stores
+/// (control). Not covered here: the `hosted.lease` selector.
+///
+/// Guards: `Shared::with_artifact_store` (daemon/artifacts_rpc.rs) ->
+/// `HostedArtifacts` (store/artifacts.rs).
+#[test]
+fn cad1726_hosted_artifacts_refuse_aos346_and_write_nothing() {
+    let tuple = json!({"schema": 1, "providers": [{
+        "provider": "business_documents",
+        "origin": "http://api.internal",
+        "manifest_pin": "business-documents@1",
+        "transport": "hosted-business-documents@1"
+    }]});
+    let metadata =
+        crate::platform::deployments::DeploymentMetadata::parse(tuple.to_string().as_bytes())
+            .unwrap();
+    let gx = gx_deployed(false, Some(metadata));
+    assert!(gx.shared.hosted_business_documents.is_some());
+    assert!(gx.shared.lease.is_none());
+    let home = gx.shared.store.ensure_thread("master").unwrap().id;
+    gx.send_home("m-hosted");
+    gx.run("m-hosted");
+    let aos = "hosted artifact store unavailable (AOS-346)";
+    let put = json!({"kind": "md", "title": "Hosted",
+                     "content": b64(format!("# {CANVAS_SENTINEL}").as_bytes())});
+    let err = err_text(gx.master_put(put.clone()));
+    assert!(err.contains(aos), "hosted put: {err}");
+    let mut again = put.clone();
+    again["id"] = json!("art-0123456789abcdef");
+    let err = err_text(gx.master_put(again));
+    assert!(err.contains(aos), "hosted put with id: {err}");
+    let err = err_text(gx.operator(
+        "artifact_read",
+        json!({"id": "art-0123456789abcdef", "version": 1, "conversation": home}),
+    ));
+    assert!(err.contains(aos), "hosted read: {err}");
+    let err = err_text(gx.operator(
+        "artifact_versions",
+        json!({"id": "art-0123456789abcdef", "conversation": home}),
+    ));
+    assert!(err.contains(aos), "hosted versions: {err}");
+    // The caller proof still runs before the store is chosen.
+    let err = err_text(gx.call(Asserted::Agent("w1".into()), "artifact_put", put.clone()));
+    assert!(
+        err.contains("only the master puts artifacts"),
+        "hosted w1: {err}"
+    );
+    assert!(
+        !gx.dir.path().join("artifacts").exists(),
+        "hosted put created workspace custody"
+    );
+    assert_eq!(gx.artifact_state(), (0, 0, 0));
+
+    // Control: the identical flow on a local fixture stores.
+    let local = gx_with(false);
+    local.send_home("m-local");
+    local.run("m-local");
+    local.master_put(put).unwrap();
+    assert_eq!(local.artifact_state(), (1, 1, 1));
 }

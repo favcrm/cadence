@@ -1,0 +1,63 @@
+.auth-public { min-height: 100dvh; background: var(--color-ink-900); }
+.auth-public-header { height: 80px; max-width: 1344px; margin: auto; padding: 0 40px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.auth-wordmark { display: inline-flex; align-items: center; gap: 9px; color: var(--color-ink-100); font-size: 17px; font-weight: 600; letter-spacing: -.6px; white-space: nowrap; }
+.auth-wordmark small { margin-left: 5px; color: var(--color-ink-500); font-size: 13px; font-weight: 400; letter-spacing: 0; }
+.auth-header-tools { display: flex; align-items: center; gap: 12px; }
+.auth-header-tools .header-icon { width: 2rem; height: 2rem; }
+.auth-header-tools select { min-height: 2rem; }
+.auth-private-label { display: flex; align-items: center; gap: 7px; color: var(--color-ink-500); font-size: 12px; }
+.auth-private-label svg { width: 13px; height: 13px; }
+.auth-stage { min-height: calc(100dvh - 128px); display: grid; place-items: center; padding: 40px 24px 80px; }
+.auth-card { width: min(100%, 400px); min-width: 0; min-height: 390px; display: flex; flex-direction: column; align-items: flex-start; }
+.auth-state-icon { height: 52px; width: 52px; display: grid; place-items: center; border: 1px solid var(--color-ink-700); border-radius: 14px; background: var(--color-ink-875); margin-bottom: 28px; color: var(--color-accent); }
+.auth-state-icon svg { width: 23px; height: 23px; }
+.auth-state-icon.auth-warn { color: var(--color-warn); }
+.auth-eyebrow { font-size: 11px; letter-spacing: .07em; text-transform: uppercase; color: var(--color-ink-500); margin-bottom: 10px; }
+.auth-card h1 { font-size: 29px; line-height: 1.2; letter-spacing: -.9px; font-weight: 500; color: var(--color-ink-100); max-width: 390px; }
+/* Focus is moved here for the status announcement. Show the indicator only
+   when the browser would show one for keyboard focus, so the gate does not
+   open with a ring boxed around its title. */
+.auth-card h1:focus { outline: none; }
+.auth-card h1:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 4px; border-radius: 3px; }
+.auth-intro { font-size: 14px; line-height: 1.75; color: var(--color-ink-400); margin-top: 15px; max-width: 365px; overflow-wrap: anywhere; }
+.auth-actions { width: 100%; margin-top: 28px; display: flex; flex-direction: column; gap: 10px; }
+.auth-actions .btn { min-height: 42px; border-radius: 8px; font-size: 13px; gap: 9px; white-space: normal; text-align: center; }
+.auth-quiet { font-size: 12px; color: var(--color-ink-500); line-height: 1.65; }
+.auth-centered { text-align: center; }
+.auth-assurance { margin-top: 24px; display: flex; gap: 8px; font-size: 12px; line-height: 1.6; color: var(--color-ink-500); }
+.auth-assurance svg { width: 14px; height: 14px; flex-shrink: 0; margin-top: 3px; }
+.auth-loader { width: 23px; height: 23px; border: 2px solid var(--color-ink-600); border-top-color: var(--color-accent); border-radius: 50%; animation: auth-turn 1s linear infinite; }
+@keyframes auth-turn { to { transform: rotate(360deg); } }
+.auth-session-line { margin-top: 31px; font-size: 12px; color: var(--color-ink-400); }
+.auth-login-command { width: 100%; padding: 13px 15px; border: 1px solid var(--color-edge); border-radius: 8px; background: var(--color-ink-875); display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--color-ink-200); font-size: 13px; }
+.auth-login-command code { font-family: var(--font-mono); overflow-wrap: anywhere; }
+.auth-login-command > span { color: var(--color-ink-500); }
+.auth-back-link { display: inline-flex; justify-content: center; align-items: center; min-height: 40px; padding: 0 6px; color: var(--color-ink-400); font-size: 12px; }
+.auth-back-link:hover { color: var(--color-ink-100); }
+.auth-public-footer { min-height: 48px; padding: 12px 24px; display: flex; justify-content: center; align-items: center; gap: 8px; color: var(--color-ink-500); font-size: 11px; }
+.auth-public-footer svg { width: 12px; height: 12px; }
+.auth-public button:focus-visible, .auth-public a:focus-visible, .auth-public select:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 4px; }
+@media (max-width: 760px) {
+  .auth-public-header { height: 72px; padding: 0 22px; gap: 10px; }
+  .auth-header-tools { gap: 8px; }
+  .auth-private-label { font-size: 11px; }
+  .auth-stage { min-height: calc(100dvh - 120px); padding: 32px 24px 64px; }
+  .auth-card { min-height: 365px; }
+  .auth-card h1 { font-size: 27px; }
+}
+@media (max-width: 640px) {
+  .auth-header-tools .header-icon { width: 2.5rem; height: 2.5rem; }
+  .auth-header-tools select { min-height: 2.5rem; }
+}
+@media (max-width: 440px) {
+  .auth-private-label { display: none; }
+  .auth-public-header { padding: 0 18px; }
+  .auth-header-tools { gap: 4px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .auth-public *, .auth-public *::before, .auth-public *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}
+.auth-new-signin { width: 100%; }
+.auth-new-signin summary { width: 100%; cursor: pointer; }
+.auth-new-signin[open] { display: grid; gap: 12px; }
+.auth-public summary:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 4px; }

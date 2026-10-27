@@ -239,4 +239,216 @@ mod tests {
             1
         );
     }
+
+    // CAD-1257: the checkup sweeps decide on lock-free snapshots.
+
+    fn sweep_issue(pm: &Pm, dir: &Path, title: &str) -> String {
+        new_issue(
+            pm,
+            dir,
+            Some("cadence"),
+            title,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "t",
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn edit_front(pm: &Pm, id: &str, f: impl FnOnce(&mut crate::issue::model::Front)) {
+        use crate::issue::write;
+        let (_p, dir) = write::issue_dir(pm, id).unwrap();
+        let (mut front, body) = write::load_front(&dir).unwrap();
+        f(&mut front);
+        write::save_front(&dir, &front, &body).unwrap();
+    }
+
+    /// A pass with nothing eligible never asks for the PM lock: it
+    /// returns at once although another writer holds it.
+    #[test]
+    fn sweeps_with_nothing_eligible_take_no_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&tmp.path().join("pm")).unwrap();
+        project_add(&pm, "cadence", "CAD", &[], &[], &[], None).unwrap();
+        sweep_issue(&pm, tmp.path(), "fresh, unblocked");
+        let _held = pm.lock().unwrap();
+        let started = std::time::Instant::now();
+        let g = crate::issue::groom::groom(
+            &pm,
+            None,
+            crate::issue::groom::GROOM_GRACE_SECS,
+            false,
+            "t",
+        )
+        .unwrap();
+        let b = crate::issue::blocked::sweep(
+            &pm,
+            crate::issue::blocked::PARK_GRACE_SECS,
+            false,
+            None,
+            "t",
+        )
+        .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(g["flagged"].as_array().unwrap().is_empty(), "{g}");
+        assert!(b["parked"].as_array().unwrap().is_empty(), "{b}");
+    }
+
+    /// Groom loads the status clock and runs the product-repo `git log`
+    /// with the PM lock free, then writes under the lock.
+    #[test]
+    fn groom_reads_history_without_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = tmp.path().join("code");
+        std::fs::create_dir(&code).unwrap();
+        sh(&code, &["init", "-b", "main"]);
+        let pm = Pm::init(&tmp.path().join("pm")).unwrap();
+        project_add(
+            &pm,
+            "cadence",
+            "CAD",
+            &[code.to_string_lossy().into_owned()],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        let id = sweep_issue(&pm, tmp.path(), "old");
+        edit_front(&pm, &id, |f| {
+            f.paths = vec!["src.rs".into()];
+            f.created = crate::issue::time::iso(crate::issue::time::now_epoch() - 30 * 86_400);
+        });
+        let seen = assert_lock_free_at(&pm);
+        let out = crate::issue::groom::groom(
+            &pm,
+            None,
+            crate::issue::groom::GROOM_GRACE_SECS,
+            false,
+            "t",
+        )
+        .unwrap();
+        set_hook(None);
+        assert_eq!(out["verdicts"][0]["id"], id, "{out}");
+        assert_eq!(*seen.borrow(), ["groom-line-times", "groom-git-log"]);
+        let log = git(&pm.dir, &["log", "--format=%s", "-1"]).unwrap();
+        assert!(log.contains("groom"), "{log}");
+    }
+
+    /// The unblocked notice RPC goes out after the commit, with the PM
+    /// lock free. CAD-1341: the sweep still rides the real client wire
+    /// path (`rpc_relay_timeout` → `rpc_frame_relay`), but against a
+    /// fake daemon on `cadence.sock` instead of a missing socket — a
+    /// missing socket burns the full 60s connect-retry budget.
+    #[test]
+    fn blocked_notice_is_sent_after_commit_outside_the_lock() {
+        use crate::issue::model::Claim;
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let tmp = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&tmp.path().join("pm")).unwrap();
+        project_add(&pm, "cadence", "CAD", &[], &[], &[], None).unwrap();
+        let a = sweep_issue(&pm, tmp.path(), "a");
+        let b = sweep_issue(&pm, tmp.path(), "b");
+        let a_id = a.clone();
+        edit_front(&pm, &a, |f| {
+            f.status = "backlog".into();
+            f.blocked_by = vec![b.clone()];
+            f.tags = vec![crate::issue::blocked::PARK_TAG.into()];
+            f.claim = Some(Claim {
+                by: "w1".into(),
+                at: crate::issue::time::iso(crate::issue::time::now_epoch() - 96 * 3600),
+                session: None,
+                last_seen: None,
+                note: None,
+                stale: None,
+            });
+        });
+        edit_front(&pm, &b, |f| f.status = "done".into());
+        let state = tmp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        // Bound before spawn so the first connect cannot race the bind;
+        // nonblocking accept + socket timeouts keep the fake bounded.
+        let listener = UnixListener::bind(crate::client::socket_path(&state)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut requests = Vec::new();
+            // job_list (job-outcome probe) + one agent_send per notice.
+            while requests.len() < 2 && std::time::Instant::now() < deadline {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+                requests.push(req.clone());
+                let reply = match req["method"].as_str() {
+                    Some("job_list") => serde_json::json!({"ok": true, "result": {"jobs": []}}),
+                    Some("agent_send") => serde_json::json!({
+                        "ok": true,
+                        "result": {"message": req["params"]["message"].clone(),
+                                    "state": "pending", "duplicate": false},
+                    }),
+                    other => serde_json::json!({
+                        "ok": false,
+                        "error": {"kind": "rejected",
+                                  "message": format!("unexpected method {other:?}")},
+                    }),
+                };
+                writeln!(&stream, "{reply}").unwrap();
+            }
+            requests
+        });
+        let seen = assert_lock_free_at(&pm);
+        let out = crate::issue::blocked::sweep(
+            &pm,
+            crate::issue::blocked::PARK_GRACE_SECS,
+            false,
+            Some(&state),
+            "t",
+        )
+        .unwrap();
+        set_hook(None);
+        assert_eq!(out["unblocked"][0]["id"], a_id, "{out}");
+        assert_eq!(
+            out["unblocked"][0]["sent"][0]["to"].as_str().unwrap(),
+            "w1",
+            "{out}"
+        );
+        assert_eq!(
+            out["unblocked"][0]["sent"][0]["sent"].as_bool(),
+            Some(true),
+            "{out}"
+        );
+        assert_eq!(*seen.borrow(), ["blocked-notice"]);
+        let log = git(&pm.dir, &["log", "--format=%s", "-1"]).unwrap();
+        assert!(log.contains("unblocked"), "{log}");
+        // The notice went over the real frame: agent_send to the claim
+        // holder, resume text naming the issue.
+        let requests = daemon.join().unwrap();
+        let send = requests
+            .iter()
+            .find(|r| r["method"] == "agent_send")
+            .expect("notice must ride agent_send");
+        assert_eq!(send["params"]["alias"].as_str().unwrap(), "w1");
+        let text = send["params"]["text"].as_str().unwrap();
+        assert!(text.contains(&a_id) && text.contains("unblocked"), "{text}");
+    }
 }

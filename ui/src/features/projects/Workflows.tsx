@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { resources } from "../../lib/resources";
 import type { WorkflowRow } from "../../lib/types";
 import { useQuery } from "../../lib/useResource";
+import { useTranslate } from "../../lib/locale";
 import { useHref } from "../../lib/useLocation";
 import Link from "../../ui/Link";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
@@ -37,6 +38,7 @@ export default function Workflows({
   onOpenIssue: (id: string) => void;
   onHome: () => void;
 }) {
+  const t = useTranslate();
   const state = useQuery(resources.workflows(project));
   const [open, setOpen] = useState<string | null>(null);
   const rows = state.data ?? [];
@@ -53,18 +55,18 @@ export default function Workflows({
   return (
     <main className="px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="workflows">
       <div className="flex flex-wrap items-center gap-2 mb-3">
-        <h1 className="text-section font-semibold text-ink-100">Workflows</h1>
+        <h1 className="text-section font-semibold text-ink-100">{t("Workflows")}</h1>
         <StaleChip state={state} />
 
       </div>
-      <p className="text-label text-ink-500 mb-5">Start repeatable work from a workflow. Review its plan before agents begin.</p>
+      <p className="text-label text-ink-500 mb-5">{t("Start repeatable work from a workflow. Review its plan before agents begin.")}</p>
       <ResourceGate state={state} loading="loading workflows…" failed="could not load workflows" onRetry={() => void resources.workflows(project).invalidate()} />
       {state.data && rows.length === 0 && (
         <div className="card project-card-padding text-secondary text-ink-400">
-          <h2 className="text-section text-ink-100 font-semibold">No workflows yet</h2>
-          <p className="mt-2 max-w-xl">Workflows turn recurring work into a repeatable plan. Installed apps can also provide workflows.</p>
-          <Link href="/apps" className="lnk inline-block mt-4">Explore apps ↗</Link>
-          <details className="mt-4 text-label"><summary className="cursor-pointer text-ink-500">Add a project workflow</summary><p className="mt-2">Use <code className="num">cadence workflow add</code> to store a workflow for {project}.</p></details>
+          <h2 className="text-section text-ink-100 font-semibold">{t("No workflows yet")}</h2>
+          <p className="mt-2 max-w-xl">{t("Workflows turn recurring work into a repeatable plan. Installed apps can also provide workflows.")}</p>
+          <Link href="/apps" className="lnk inline-block mt-4">{t("Explore apps")} ↗</Link>
+          <details className="mt-4 text-label"><summary className="cursor-pointer text-ink-500">{t("Add a project workflow")}</summary><p className="mt-2">{t("Use")} <code className="num">cadence workflow add</code> {t("to store a workflow for")} {project}.</p></details>
         </div>
       )}
       <ul className="space-y-2.5">
@@ -99,6 +101,7 @@ function WorkflowCard({
   onOpenIssue: (id: string) => void;
   onHome: () => void;
 }) {
+  const t = useTranslate();
   const approval = approvalChip(row);
   const blocked = gateBlock(row);
   const app = row.app ?? null;
@@ -130,8 +133,8 @@ function WorkflowCard({
           </button>
         )}
         <div className="flex flex-wrap items-center gap-1.5 mt-2">
-          <span className={`chip ${approval.cls}`}>{approval.text}</span>
-          {app && <span className="chip bg-accent/10 text-accent">provided by {app}</span>}
+          <span className={`chip ${approval.cls}`}>{t(approval.text)}</span>
+          {app && <span className="chip bg-accent/10 text-accent">{t("provided by")} {app}</span>}
           {typeof row.tickets === "number" && (
             <span className="chip bg-ink-800 text-ink-300">
               {row.tickets} ticket{row.tickets === 1 ? "" : "s"}
@@ -144,9 +147,9 @@ function WorkflowCard({
             <Link
               href={appHref(row.project, app)}
               className="chip bg-accent/15 text-accent hover:bg-accent/25 transition-colors"
-              title={`open ${app} — its workflows run from the app page`}
+              title={`${t("open")} ${app} — ${t("its workflows run from the app page")}`}
             >
-              open app →
+              {t("open app")} →
             </Link>
           )}
         </div>

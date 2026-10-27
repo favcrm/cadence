@@ -17,12 +17,9 @@
 //! - the credential needs the `publish.send` scope; it is loaded from a
 //!   `0600` file at registration, never logged, never tested with real
 //!   material;
-//! - registration is explicit config and default-off: without both
-//!   `CADENCE_PUBLISH_SEND_URL` and
-//!   `CADENCE_PUBLISH_SEND_CREDENTIAL_FILE` no sender is registered and
-//!   dispatch stays `processing` exactly as before. One-sided or
-//!   malformed config refuses daemon startup loudly rather than
-//!   silently running without a sender;
+//! - registration is the explicit credential file plus its door URL.
+//!   With neither env set, no sender is registered. A door URL without
+//!   that file is config-required. A cached lane is not selected;
 //! - exact-binding preflight precedes the first POST: a definitive
 //!   staging refusal (or an unknown decision — AOS-94 permits only
 //!   `approved`) means zero sends. Ambiguous preflight is retried
@@ -68,9 +65,18 @@ use crate::error::{Error, Result};
 /// Wire version every v1 door document carries.
 pub const DEVICE_PUBLISH_VERSION: &str = "1";
 
-const PREFLIGHT_PATH: &str = "/v1/runtime/connectors/publish/preflight";
-const EXEC_PATH: &str = "/v1/runtime/connectors/publish";
-const STATUS_PATH: &str = "/v1/runtime/connectors/publish";
+// Route tails, joined to the credential's door prefix (see `route`).
+const PREFLIGHT_PATH: &str = "/publish/preflight";
+const EXEC_PATH: &str = "/publish";
+const STATUS_PATH: &str = "/publish";
+const GRANTS_PATH: &str = "/publish/grants";
+const DEVICE_PREFIX: &str = "/v1/runtime/connectors";
+/// CAD-1267 (AOS-181): the lease door serves the same bodies and envelope
+/// under this prefix, with no Authorization header.
+const HOSTED_PREFIX: &str = "/v1/runtime/connectors/hosted-publish";
+/// The one origin the hosted lease credential may reach: the same fixed
+/// `api.internal` the hosted media admission already pins.
+const HOSTED_ORIGIN: &str = "http://api.internal";
 const RESPONSE_CAP: u64 = 1024 * 1024;
 
 /// Explicit-config surface. Both must be set; neither alone registers.
@@ -113,18 +119,54 @@ pub type MaterialResolver =
 /// Device credential with redacted debug: the bearer secret never
 /// appears in logs, panic messages or test output.
 #[derive(Clone)]
-pub struct DeviceCredential(String);
+pub struct DeviceCredential(Option<String>);
 
 impl DeviceCredential {
     pub fn new(secret: String) -> Self {
-        Self(secret)
+        Self(Some(secret))
+    }
+
+    /// CAD-1267: the hosted lease door authenticates by network position
+    /// (`api.internal`), so there is no bearer to send. Constructible only
+    /// from a [`HostedMediaAdmission`](crate::platform::deployments::HostedMediaAdmission).
+    pub(crate) fn hosted_lease(
+        _admission: &crate::platform::deployments::HostedMediaAdmission,
+    ) -> Self {
+        Self(None)
+    }
+
+    /// The origin check shared by the door clients. A bearer credential
+    /// keeps the existing rule (https, or loopback http). The bearerless
+    /// lease credential is admitted only for the fixed image-owned
+    /// `api.internal` origin and nothing else.
+    pub(crate) fn door_base(&self, base: &str) -> Result<String> {
+        if self.0.is_none() {
+            if base.trim_end_matches('/') == HOSTED_ORIGIN {
+                return Ok(HOSTED_ORIGIN.to_owned());
+            }
+            return Err(Error::rejected(
+                "hosted publish lease is bound to the fixed api.internal origin",
+            ));
+        }
+        super::valid_base(base)
+    }
+
+    /// Full door path for a route tail: the device door, or the hosted
+    /// lease door prefix for the bearerless credential.
+    pub(crate) fn route(&self, tail: &str) -> String {
+        let prefix = if self.0.is_none() {
+            HOSTED_PREFIX
+        } else {
+            DEVICE_PREFIX
+        };
+        format!("{prefix}{tail}")
     }
 
     /// Bearer header value; `pub(crate)` so the sibling media-import
     /// client authenticates the same way. Never logged or returned to a
     /// caller — the secret only ever reaches this one header.
-    pub(crate) fn authorization(&self) -> String {
-        format!("Bearer {}", self.0)
+    pub(crate) fn authorization(&self) -> Option<String> {
+        self.0.as_ref().map(|secret| format!("Bearer {secret}"))
     }
 }
 
@@ -161,7 +203,7 @@ impl HttpPublishSender {
         material: MaterialResolver,
         timeout: Duration,
     ) -> Result<Self> {
-        let base = super::valid_base(base)?;
+        let base = credential.door_base(base)?;
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
             .http_status_as_error(false)
@@ -201,7 +243,7 @@ impl HttpPublishSender {
         binding.validate().map_err(Fault::Refused)?;
         check_material(binding, material).map_err(Fault::Refused)?;
         let body = send_body(binding, material);
-        self.post(PREFLIGHT_PATH, &body)
+        self.post(&self.credential.route(PREFLIGHT_PATH), &body)
             .and_then(|data| preflight_of(binding, &data).map_err(Fault::Refused))
     }
 
@@ -241,7 +283,7 @@ impl HttpPublishSender {
             }
         }
         let body = send_body(binding, material);
-        match self.post(EXEC_PATH, &body) {
+        match self.post(&self.credential.route(EXEC_PATH), &body) {
             Ok(data) => match execution_of(binding, &data) {
                 Ok(mut outcome) => {
                     if outcome.state == PublishState::Posted {
@@ -281,18 +323,21 @@ impl HttpPublishSender {
         if !super::publish::valid_idempotency_key(key) {
             return Err(Refusal::new("bad_key", "status key shape is invalid"));
         }
-        let url = format!("{}{STATUS_PATH}/{key}/status", self.base);
-        let envelope = self
-            .http
-            .get(&url)
-            .header("authorization", &self.credential.authorization())
-            .call()
-            .map_err(|_| {
-                Refusal::new(
-                    "refused",
-                    "publish status is uncertain; the intent stays processing",
-                )
-            })?;
+        let url = format!(
+            "{}{}/{key}/status",
+            self.base,
+            self.credential.route(STATUS_PATH)
+        );
+        let mut request = self.http.get(&url);
+        if let Some(authorization) = self.credential.authorization() {
+            request = request.header("authorization", &authorization);
+        }
+        let envelope = request.call().map_err(|_| {
+            Refusal::new(
+                "refused",
+                "publish status is uncertain; the intent stays processing",
+            )
+        })?;
         match read_envelope(envelope, true) {
             Ok(data) => status_of(key, &data),
             Err(Fault::Refused(refusal)) => Err(refusal),
@@ -305,10 +350,11 @@ impl HttpPublishSender {
 
     fn post(&self, path: &str, body: &Value) -> std::result::Result<Value, Fault> {
         assert_no_workspace(body);
-        let envelope = self
-            .http
-            .post(format!("{}{path}", self.base))
-            .header("authorization", &self.credential.authorization())
+        let mut request = self.http.post(format!("{}{path}", self.base));
+        if let Some(authorization) = self.credential.authorization() {
+            request = request.header("authorization", &authorization);
+        }
+        let envelope = request
             .send_json(body.clone())
             .map_err(|_| Fault::Ambiguous)?;
         read_envelope(envelope, false)
@@ -323,6 +369,57 @@ impl super::publish::PublishSender for HttpPublishSender {
 
     fn status(&self, key: &str) -> std::result::Result<LedgerOutcome, Refusal> {
         self.status_request(key)
+    }
+
+    /// CAD-1291: read-only lookup of the owner's standing grants for one
+    /// destination. The door scopes it to this company; Cadence selects the
+    /// live one for the approved account and AgenticOS re-checks company,
+    /// destination, revocation and the daily cap at preflight and send.
+    fn find_grant(
+        &self,
+        destination_id: &str,
+    ) -> std::result::Result<Vec<super::publish::FoundGrant>, Refusal> {
+        let uncertain = || {
+            Refusal::new(
+                "refused",
+                "grant lookup is uncertain; nothing was sent, try again",
+            )
+        };
+        if destination_id.is_empty()
+            || destination_id.len() > 120
+            || !destination_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        {
+            return Err(Refusal::new(
+                "bad_destination",
+                "destination id shape is invalid",
+            ));
+        }
+        let url = format!(
+            "{}{}?destinationId={destination_id}",
+            self.base,
+            self.credential.route(GRANTS_PATH)
+        );
+        let mut request = self.http.get(&url);
+        if let Some(authorization) = self.credential.authorization() {
+            request = request.header("authorization", &authorization);
+        }
+        let response = request.call().map_err(|_| uncertain())?;
+        let data = match read_envelope(response, false) {
+            Ok(data) => data,
+            Err(Fault::Refused(refusal)) => return Err(refusal),
+            Err(Fault::Ambiguous) => return Err(uncertain()),
+        };
+        data.get("grants")
+            .and_then(Value::as_array)
+            .and_then(|grants| {
+                grants
+                    .iter()
+                    .map(super::publish::FoundGrant::from_wire)
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or_else(uncertain)
     }
 
     /// CAD-1041: pre-claim staging for an explicit send-now. Resolves
@@ -438,7 +535,6 @@ fn send_body(binding: &SendBinding, material: &SendMaterial) -> Value {
         "key": binding.key,
         "connectionId": binding.connection_id,
         "caption": material.caption,
-        "cadenceRunId": binding.cadence_run_id,
         "cadenceEffectId": binding.cadence_effect_id,
         "grant": {
             "id": binding.grant_id,
@@ -448,6 +544,13 @@ fn send_body(binding: &SendBinding, material: &SendMaterial) -> Value {
             "imageDigest": binding.image_digest,
         },
     });
+    match &binding.source {
+        super::publish::PublicationSource::Run { run_id } => body["cadenceRunId"] = json!(run_id),
+        super::publish::PublicationSource::SocialDraft { draft_id, revision } => {
+            body["cadenceDraftId"] = json!(draft_id);
+            body["draftRevision"] = json!(revision);
+        }
+    }
     if let Some(media_key) = &material.media_key {
         body["mediaKey"] = Value::String(media_key.clone());
     }
@@ -732,17 +835,83 @@ pub fn attach_publish_sender(
     if opts.social_publish_sender.is_some() {
         return Ok(());
     }
+    let metadata = match &opts.provider_deployments {
+        Some(value) => Some(value.clone()),
+        None => crate::platform::deployments::load()?,
+    };
+    attach_publish_sender_with(state_dir, opts, metadata.as_ref())
+}
+
+/// CAD-1267: image metadata carrying the hosted-media lease assertion (AOS-181
+/// serves publish, import and destinations on the same `api.internal` door,
+/// under `hosted-publish`) is the only thing that registers the bearerless sender, importer and
+/// resolver over `api.internal`. No declaration leaves the device-credential
+/// env path exactly as it was; a hosted declaration plus device env config
+/// is a conflict and refuses startup (the lease is never silently replaced).
+fn attach_publish_sender_with(
+    state_dir: &Path,
+    opts: &mut crate::daemon::ServeOptions,
+    metadata: Option<&crate::platform::deployments::DeploymentMetadata>,
+) -> Result<()> {
+    if let Some(admission) = metadata.and_then(|value| value.hosted_media()) {
+        let device_env = [
+            PUBLISH_SEND_URL_ENV,
+            PUBLISH_SEND_CREDENTIAL_FILE_ENV,
+            PUBLISH_READ_URL_ENV,
+            PUBLISH_READ_CREDENTIAL_FILE_ENV,
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+        if device_env {
+            return Err(Error::rejected(
+                "hosted publish lease conflicts with device publish credential config",
+            ));
+        }
+        let base = HOSTED_ORIGIN;
+        let credential = DeviceCredential::hosted_lease(&admission);
+        opts.social_publish_sender = Some(Arc::new(HttpPublishSender::new(
+            base,
+            credential.clone(),
+            production_resolver(state_dir),
+        )?));
+        if opts.social_media_importer.is_none() {
+            opts.social_media_importer = Some(Arc::new(
+                crate::platform::agenticos_external::media_import::MediaImporter::new(
+                    base,
+                    credential.clone(),
+                )?,
+            ));
+        }
+        if opts.social_media_resolver.is_none() {
+            opts.social_media_resolver = Some(Arc::new(
+                crate::platform::agenticos_external::media_import::MediaResolver::new(
+                    base, credential,
+                )?,
+            ));
+        }
+        return Ok(());
+    }
     let url = std::env::var(PUBLISH_SEND_URL_ENV).unwrap_or_default();
     let credential_file = std::env::var(PUBLISH_SEND_CREDENTIAL_FILE_ENV).unwrap_or_default();
+    // Neither knob and no request to publish: stay default-off. A lane
+    // file alone does not register a sender, spend, or send.
     if url.is_empty() && credential_file.is_empty() {
         return Ok(());
     }
-    if url.is_empty() || credential_file.is_empty() {
+    if url.is_empty() {
         return Err(Error::rejected(format!(
             "{PUBLISH_SEND_URL_ENV} and {PUBLISH_SEND_CREDENTIAL_FILE_ENV} must be set together"
         )));
     }
-    let credential = read_credential_file(Path::new(&credential_file))?;
+    // Explicit file plus door URL. Startup has no frozen billing workspace,
+    // so a cached lane is not a sender credential.
+    let credential = if credential_file.is_empty() {
+        return Err(Error::rejected(format!(
+            "{PUBLISH_SEND_URL_ENV} and {PUBLISH_SEND_CREDENTIAL_FILE_ENV} must be set together"
+        )));
+    } else {
+        read_credential_file(Path::new(&credential_file))?
+    };
     let resolver = production_resolver(state_dir);
     opts.social_publish_sender = Some(Arc::new(HttpPublishSender::new(
         url.trim_end_matches('/'),
@@ -829,7 +998,23 @@ fn store_material(
     state_dir: &Path,
     binding: &SendBinding,
 ) -> std::result::Result<SendMaterial, Refusal> {
-    let db_path = state_dir.join("cadence.sqlite3");
+    // A social draft effect lives in its install's record store, not the
+    // main store; the install is encoded in the `sfx_` effect id.
+    let db_path = match &binding.source {
+        super::publish::PublicationSource::SocialDraft { .. } => {
+            crate::daemon::app_effects_rpc::social_effect_install(&binding.cadence_effect_id)
+                .and_then(|install| {
+                    crate::store::app_records::record_db_path(state_dir, &install).ok()
+                })
+                .ok_or_else(|| {
+                    Refusal::new(
+                        "unknown_key",
+                        "no approved social draft effect holds this key",
+                    )
+                })?
+        }
+        _ => state_dir.join("cadence.sqlite3"),
+    };
     // Transient store failures (open / busy) are `store_unavailable` —
     // the send-now preflight maps them to Uncertain (row stays queued,
     // the operator retries), never Refused: a SQLITE_BUSY blip must not
@@ -841,6 +1026,49 @@ fn store_material(
             })?;
     conn.busy_timeout(crate::store::BUSY_TIMEOUT)
         .map_err(|_| Refusal::new("store_unavailable", "publish material store is unavailable"))?;
+    if let super::publish::PublicationSource::SocialDraft { draft_id, revision } = &binding.source {
+        let row: (String,String,String,Option<String>) = conn.query_row(
+            "SELECT frozen_json,state,digest,media_key FROM app_social_effects WHERE effect_id=?",
+            rusqlite::params![binding.cadence_effect_id],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).map_err(|_|Refusal::new("unknown_key","no approved social draft effect holds this key"))?;
+        let frozen: Value = serde_json::from_str(&row.0)
+            .map_err(|_| Refusal::new("bad_effect", "frozen social draft effect is corrupt"))?;
+        if !matches!(row.1.as_str(), "approved" | "sending")
+            || crate::store::app_runs::material_digest(&frozen) != row.2
+            || frozen["idempotency_key"].as_str() != Some(binding.key.as_str())
+            || frozen["effect_id"].as_str() != Some(binding.cadence_effect_id.as_str())
+            || frozen["source"]["kind"].as_str() != Some("social_draft")
+            || frozen["source"]["draft_id"].as_str() != Some(draft_id.as_str())
+            || frozen["source"]["revision"].as_i64() != Some(*revision)
+            || frozen["aos_connection_id"].as_str() != Some(binding.connection_id.as_str())
+            || frozen["destination_id"].as_str() != Some(binding.destination_id.as_str())
+            || frozen["caption_digest"].as_str() != Some(binding.caption_digest.as_str())
+            || frozen["image_digest"]
+                .as_str()
+                .map(super::publish::bare_digest)
+                != binding.image_digest.as_deref()
+        {
+            return Err(Refusal::new(
+                "grant_binding_mismatch",
+                "social draft effect differs from its approved binding",
+            ));
+        }
+        let caption = frozen["caption"]
+            .as_str()
+            .ok_or_else(|| Refusal::new("bad_effect", "approved caption is missing"))?
+            .to_owned();
+        if super::publish::caption_digest_of(&caption) != binding.caption_digest {
+            return Err(Refusal::new(
+                "grant_binding_mismatch",
+                "approved caption digest changed",
+            ));
+        }
+        return Ok(SendMaterial {
+            caption,
+            media_key: row.3,
+        });
+    }
     let frozen_text: String = conn
         .query_row(
             "SELECT frozen FROM social_publish_intents WHERE request=?1",
@@ -979,7 +1207,9 @@ mod tests {
             toolkit: Toolkit::Facebook,
             caption_digest: caption_digest_of("Harbour at dusk."),
             image_digest: None,
-            cadence_run_id: "cad_run_test_01".into(),
+            source: super::super::publish::PublicationSource::Run {
+                run_id: "cad_run_test_01".into(),
+            },
             cadence_effect_id: "cad_fx_test_01".into(),
             grant_id: "dpq_test_grant_01".into(),
         }
@@ -1012,11 +1242,154 @@ mod tests {
         );
     }
 
+    // ---- CAD-1267: hosted publish lease registration ----
+
+    /// The baked hosted-media entry is the one declaration that admits the
+    /// lease door; there is no separate publish transport.
+    const HOSTED_PUBLISH: &str = r#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#;
+
+    /// Env is process-global: every test that reads or writes the device
+    /// publish knobs holds this lock and restores a clean environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const DEVICE_ENVS: [&str; 4] = [
+        PUBLISH_SEND_URL_ENV,
+        PUBLISH_SEND_CREDENTIAL_FILE_ENV,
+        PUBLISH_READ_URL_ENV,
+        PUBLISH_READ_CREDENTIAL_FILE_ENV,
+    ];
+
+    fn clean_env() {
+        for name in DEVICE_ENVS {
+            std::env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn unknown_publish_transport_is_refused_not_registered() {
+        for transport in ["hosted-publish-lease@1", "hosted-media-lease@2", "publish"] {
+            let raw = HOSTED_PUBLISH.replace("hosted-media-lease@1", transport);
+            assert!(
+                crate::platform::deployments::DeploymentMetadata::parse(raw.as_bytes()).is_err(),
+                "{transport}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_declaration_with_device_env_is_a_conflict() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clean_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var(PUBLISH_SEND_URL_ENV, "https://publish.example");
+        let mut opts = crate::daemon::ServeOptions::default();
+        let metadata =
+            crate::platform::deployments::DeploymentMetadata::parse(HOSTED_PUBLISH.as_bytes())
+                .unwrap();
+        assert!(attach_publish_sender_with(dir.path(), &mut opts, Some(&metadata)).is_err());
+        clean_env();
+    }
+
+    #[test]
+    fn lease_credential_sends_no_bearer_and_only_reaches_api_internal() {
+        let metadata =
+            crate::platform::deployments::DeploymentMetadata::parse(HOSTED_PUBLISH.as_bytes())
+                .unwrap();
+        let admission = metadata.hosted_media().unwrap();
+        let lease = DeviceCredential::hosted_lease(&admission);
+        assert!(lease.authorization().is_none());
+        assert_eq!(
+            lease.route("/publish/preflight"),
+            "/v1/runtime/connectors/hosted-publish/publish/preflight"
+        );
+        assert_eq!(
+            DeviceCredential::new("x".into()).route("/media/import"),
+            "/v1/runtime/connectors/media/import"
+        );
+        assert!(lease.door_base("http://api.internal").is_ok());
+        for other in [
+            "https://publish.example",
+            "http://127.0.0.1:3110",
+            "http://api.internal:8080",
+            "http://evil.internal",
+        ] {
+            assert!(lease.door_base(other).is_err(), "{other}");
+        }
+        // A bearer credential keeps the old origin rule: plain http to
+        // api.internal is refused for it.
+        let bearer = DeviceCredential::new("x".into());
+        assert!(bearer.door_base("http://api.internal").is_err());
+        assert!(bearer.door_base("https://publish.example").is_ok());
+    }
+
+    /// CAD-1267: a social draft effect is read from its install's record
+    /// store (install decoded from the `sfx_` id), never the main store.
+    #[test]
+    fn social_draft_material_reads_the_install_record_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = "install-one";
+        let hex: String = install.bytes().map(|b| format!("{b:02x}")).collect();
+        let effect_id = format!("sfx_{hex}_{:032x}", 7);
+        let caption = "Hosted caption";
+        let key = format!("social_{:032x}", 7);
+        let bound = SendBinding {
+            key: key.clone(),
+            connection_id: "con_hosted".into(),
+            destination_id: "275491372109884".into(),
+            toolkit: Toolkit::Facebook,
+            caption_digest: caption_digest_of(caption),
+            image_digest: None,
+            source: super::super::publish::PublicationSource::SocialDraft {
+                draft_id: "draft-1".into(),
+                revision: 1,
+            },
+            cadence_effect_id: effect_id.clone(),
+            grant_id: "dpq_test_grant_01".into(),
+        };
+        let frozen = json!({
+            "idempotency_key": key, "effect_id": effect_id,
+            "source": {"kind": "social_draft", "draft_id": "draft-1", "revision": 1},
+            "aos_connection_id": "con_hosted", "destination_id": "275491372109884",
+            "caption_digest": caption_digest_of(caption), "image_digest": null,
+            "grant_id": "dpq_test_grant_01", "caption": caption,
+        });
+        let path = crate::store::app_records::record_db_path(dir.path(), install).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE app_social_effects(effect_id TEXT, frozen_json TEXT, state TEXT, digest TEXT, media_key TEXT)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO app_social_effects VALUES(?,?,?,?,NULL)",
+            rusqlite::params![
+                effect_id,
+                frozen.to_string(),
+                "approved",
+                crate::store::app_runs::material_digest(&frozen)
+            ],
+        )
+        .unwrap();
+        let material = super::store_material(dir.path(), &bound).unwrap();
+        assert_eq!(material.caption, caption);
+        // An effect id that names no install is refused, never read from
+        // the main store.
+        let mut forged = bound.clone();
+        forged.cadence_effect_id = "sfx_zz_bad".into();
+        assert_eq!(
+            super::store_material(dir.path(), &forged).unwrap_err().code,
+            "unknown_key"
+        );
+    }
+
     #[test]
     fn credential_debug_redacts() {
         let credential = DeviceCredential::new("secret-material".into());
         assert_eq!(format!("{credential:?}"), "DeviceCredential(redacted)");
-        assert!(credential.authorization().contains("secret-material"));
+        assert!(credential
+            .authorization()
+            .unwrap()
+            .contains("secret-material"));
     }
 
     #[test]
@@ -1130,5 +1503,113 @@ mod tests {
         assert!(preflight_of(&binding, &verdict("granted", true)).is_err());
         assert!(preflight_of(&binding, &verdict("declined", false)).is_err());
         assert!(preflight_of(&binding, &verdict("pending", false)).is_err());
+    }
+    /// CAD-1291: the lookup is a read-only GET on the door's grants route,
+    /// scoped by destination; a malformed record fails closed.
+    #[test]
+    fn find_grant_reads_the_door_and_refuses_malformed_records() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies = [
+            r#"{"ok":true,"data":{"grants":[{"id":"dpq_ownergrant_001","kind":"standing","connectionId":"c","destinationId":"d","toolkit":"instagram","remainingToday":3,"revokedAt":null}]}}"#,
+            r#"{"ok":true,"data":{"grants":[{"id":"nope"}]}}"#,
+        ];
+        let server = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            for body in bodies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                lines.push(
+                    String::from_utf8_lossy(&buf[..n])
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .to_owned(),
+                );
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+            lines
+        });
+        let sender = HttpPublishSender::new(
+            &format!("http://127.0.0.1:{port}"),
+            DeviceCredential::new("x".repeat(8)),
+            test_resolver("c", None),
+        )
+        .unwrap();
+        use super::super::publish::PublishSender;
+        let found = sender.find_grant("1784").unwrap();
+        assert_eq!(found[0].id, "dpq_ownergrant_001");
+        assert_eq!(sender.find_grant("1784").unwrap_err().code, "refused");
+        assert_eq!(
+            sender.find_grant("a b/../x").unwrap_err().code,
+            "bad_destination"
+        );
+        let lines = server.join().unwrap();
+        assert!(
+            lines[0].starts_with("GET /v1/runtime/connectors/publish/grants?destinationId=1784 "),
+            "{}",
+            lines[0]
+        );
+    }
+    /// CAD-1291: a social draft effect freezes no grant id (the owner's
+    /// standing grant is found at send time), so the stored-material check
+    /// must not demand one; every other frozen field still has to match.
+    #[test]
+    fn social_draft_material_needs_no_frozen_grant_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = "install-1";
+        let effect_id = format!(
+            "sfx_{}_{}",
+            install
+                .bytes()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            "0".repeat(32)
+        );
+        let mut b = binding();
+        b.source = super::super::publish::PublicationSource::SocialDraft {
+            draft_id: "d1".into(),
+            revision: 2,
+        };
+        b.cadence_effect_id = effect_id.clone();
+        let frozen = json!({"idempotency_key": b.key, "effect_id": effect_id,
+            "source":{"kind":"social_draft","draft_id":"d1","revision":2},
+            "aos_connection_id": b.connection_id, "destination_id": b.destination_id,
+            "caption_digest": b.caption_digest, "caption":"Harbour at dusk."});
+        let path = crate::store::app_records::record_db_path(dir.path(), install).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE app_social_effects (effect_id TEXT, frozen_json TEXT, state TEXT, digest TEXT, media_key TEXT)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO app_social_effects VALUES (?,?,?,?,NULL)",
+            rusqlite::params![
+                effect_id,
+                frozen.to_string(),
+                "approved",
+                crate::store::app_runs::material_digest(&frozen)
+            ],
+        )
+        .unwrap();
+        let material = super::store_material(dir.path(), &b).unwrap();
+        assert_eq!(material.caption, "Harbour at dusk.");
+        // A drifted caption digest is still refused.
+        let mut drifted = b.clone();
+        drifted.caption_digest = "0".repeat(64);
+        assert_eq!(
+            super::store_material(dir.path(), &drifted)
+                .unwrap_err()
+                .code,
+            "grant_binding_mismatch"
+        );
     }
 }

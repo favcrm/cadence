@@ -21,15 +21,19 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::unattended::DispatchAuthority;
 use super::{
     optional_str, optional_strs, reject_identity_fields, required_str, Caller, Shared, DAEMON_ALIAS,
 };
+
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::{self, task_report};
 use crate::master::{self, ALIAS};
 use crate::peer::AgentCaller;
 use crate::store;
+// Readers and protected writers share the file/digest/params publication boundary.
+pub(super) static MASTER_IDENTITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The daemon methods a master connection may call — everything else is
 /// refused (review round 1, C2). Reads, proposing a plan, registering a
@@ -86,6 +90,9 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "master_ask_permission",
     "master_peek_grant",
     "master_permission_use",
+    // CAD-1586: petitions and exact operator-approved settings operations.
+    // The handler owns grants; app turns keep their separate allowlist.
+    "agent_settings_command",
     // CAD-1014(b): the master's scoped-chat redeem verbs — a bounded CSV
     // import and a segment save, each redeeming the operator's own
     // stamped scoped chat message on the live assigned turn. Narrow
@@ -111,6 +118,17 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "app_assistant_actions",
     "app_assistant_invoke",
     "app_assistant_operation_show",
+    // CAD-1168: read a retained chat attachment — the daemon still
+    // checks the turn is the master's live one inside the handler.
+    "chat_file_read",
+    // CAD-1726: put a canvas artifact on the master's own live turn; the
+    // handler binds scope to that turn and refuses every other caller.
+    "artifact_put",
+    // CAD-1752: propose hiring a catalogue role on the master's own live
+    // turn; the handler binds to that turn and writes one inert entry.
+    "hire_propose",
+    // Retained Library image bytes, still exact-turn and source/receiver scoped.
+    "app_media_inspect",
 ];
 
 /// Most reports one router pass queues to the master; the rest wait for
@@ -133,7 +151,7 @@ fn now_epoch() -> i64 {
 /// `preferred` / `fallbacks` of AGENT.md's frontmatter: the provider,
 /// model and effort the master launches with unless the operator names
 /// them. Unreadable frontmatter just yields nothing.
-fn preferred(agent_md: &str) -> Vec<(String, Option<String>, Option<String>)> {
+pub(super) fn preferred(agent_md: &str) -> Vec<(String, Option<String>, Option<String>)> {
     let Ok((yaml, _)) = crate::issue::parse::split_front(agent_md) else {
         return vec![];
     };
@@ -159,7 +177,7 @@ fn preferred(agent_md: &str) -> Vec<(String, Option<String>, Option<String>)> {
 /// `fallbacks` entry, taking the first the daemon accepts
 /// ([`master::PROVIDERS`]); none usable → the first accepted provider
 /// (CAD-322 round 2, I2).
-fn resolve_provider(
+pub(super) fn resolve_provider(
     requested: Option<&str>,
     prefs: &[(String, Option<String>, Option<String>)],
 ) -> String {
@@ -214,6 +232,8 @@ pub(crate) fn master_may_call(method: &str) -> bool {
 /// CAD-1098 Gate 2: the daemon methods a master turn whose running
 /// message is in an APP conversation (or whose running message cannot be
 /// resolved — fail closed) may call: the twelve scoped assistant verbs,
+/// `chat_file_read` for the retained file the turn was sent (CAD-1168 —
+/// the handler binds the call to the live assigned turn),
 /// `message_report` (own running message only — it finishes the turn) and
 /// `thread_read` (only the running message's own conversation). Nothing
 /// else: no `health` (fleet metadata), no permission verbs (so
@@ -234,6 +254,13 @@ pub const MASTER_APP_ALLOWED: &[&str] = &[
     "app_content_assistant_draft",
     "app_content_assistant_proposals",
     "app_content_assistant_proposal_show",
+    // CAD-1168: the attachment an app conversation's turn was sent is
+    // readable by it — the handler still binds the call to the live
+    // assigned turn (message + current token), and an id is only ever
+    // learned from that turn's own envelope.
+    "chat_file_read",
+    "artifact_put",
+    "app_media_inspect",
     "message_report",
     "thread_read",
 ];
@@ -343,6 +370,23 @@ impl Shared {
         // narrowed to `MASTER_APP_ALLOWED`.
         let scope = self.master_turn_scope();
         if scope != MasterScope::Home {
+            // CAD-1767: say what is actually missing for a hire proposal -
+            // a live Home turn - instead of the app-conversation rule.
+            if method == "hire_propose" {
+                return Err(Error::invalid(
+                    "master_refused",
+                    match scope {
+                        MasterScope::App(_) => {
+                            "hire propose is made in the master's Home conversation, \
+                             not in an app conversation"
+                        }
+                        _ => {
+                            "hire propose needs the master's live assigned turn in its \
+                             Home conversation - none is running"
+                        }
+                    },
+                ));
+            }
             if !master_app_may_call(method) {
                 return Err(Error::invalid(
                     "master_refused",
@@ -401,7 +445,7 @@ impl Shared {
             _ => return MasterScope::Unresolved,
         };
         match self.store.message_conversation(ALIAS, &running) {
-            Ok(Some(t)) if !t.is_home() => MasterScope::App(t.id),
+            Ok(Some(t)) if !t.runs_as_home() => MasterScope::App(t.id),
             Ok(_) => MasterScope::Home,
             Err(_) => MasterScope::Unresolved,
         }
@@ -431,6 +475,10 @@ impl Shared {
         // dispatch runs under, so a concurrent second call sees `doing`
         // and is refused having written nothing. The dispatch's own
         // daemon calls (agent_show, dispatch_send) never take this lock.
+        let _grant = self
+            .unattended_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let _serial = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
         // CAD-431: a dispatch the review loop cannot record does not
         // happen — an unreadable delivery.json refuses before anything.
@@ -444,6 +492,9 @@ impl Shared {
         let ticket = issue::board::find_issue(&pm.dir, id)?;
         let front = &ticket.front;
         crate::issue::plan::gate_master(&pm.dir, front, &ticket.body)?;
+        let repo = self
+            .unattended_dispatch_authority(id)?
+            .map(|authority| authority.checkout);
         if front.status != "ready" {
             return Err(Error::invalid(
                 "master_dispatch_state",
@@ -502,7 +553,7 @@ impl Shared {
             note: None,
             name: None,
             base: None,
-            repo: None,
+            repo: repo.map(Into::into),
             reply_to: Some(ALIAS.to_string()),
             summary: None,
             job_spec: None,
@@ -519,7 +570,15 @@ impl Shared {
         // proves in production, rather than leaning on the daemon's own
         // ambient ancestry (which a test pane marks as an agent's).
         let out = crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
-            issue::dispatch::run(&pm, id, &args, ALIAS, &self.state_dir, Some(ALIAS))
+            issue::dispatch::run(
+                &pm,
+                id,
+                &args,
+                ALIAS,
+                &self.state_dir,
+                Some(ALIAS),
+                issue::dispatch::DispatchOrigin::Automatic,
+            )
         })?;
         // Only a real send is the master's dispatch: a duplicate answers
         // with the live kickoff someone else sent (`dispatched: false`),
@@ -538,6 +597,68 @@ impl Shared {
             );
         }
         Ok(out)
+    }
+
+    /// Pin an unattended kickoff to the grant's registered checkout, never
+    /// the controller cwd's default repository in a multi-repository project.
+    /// Carry the live expiry into enqueue for its in-transaction deadline check.
+    pub(super) fn unattended_dispatch_authority(
+        &self,
+        id: &str,
+    ) -> Result<Option<DispatchAuthority>> {
+        let Some(run) = self.unattended_authorization_for_issue(id)? else {
+            return Ok(None);
+        };
+        let pm = self.pm()?;
+        let mut file = pm.dir.join(&run.project);
+        file.push("project.yaml");
+        let project = issue::project::load(&file)?;
+        let remote = format!("github.com/{}", run.repo);
+        let mut selected = None;
+        for repo in &project.repos {
+            if !repo.remote.as_deref().is_some_and(|value| {
+                issue::project::normalize_remote(value).eq_ignore_ascii_case(&remote)
+            }) {
+                continue;
+            }
+            let path = repo.path.as_deref().ok_or_else(|| {
+                Error::rejected("the authorized repository has no registered local checkout")
+            })?;
+            let (root, origin) = issue::project::repo_identity(&issue::project::expand_home(path))
+                .ok_or_else(|| {
+                    Error::rejected("the authorized checkout has no proven Git identity")
+                })?;
+            if !origin
+                .as_deref()
+                .is_some_and(|origin| origin.eq_ignore_ascii_case(&remote))
+            {
+                return Err(Error::rejected(
+                    "the authorized checkout's actual Git origin differs from the registered repository",
+                ));
+            }
+            if selected.as_ref().is_some_and(|previous| previous != &root) {
+                return Err(Error::rejected(
+                    "the authorized repository has multiple local roots; operator must resolve the ambiguity",
+                ));
+            }
+            selected = Some(root);
+        }
+        if crate::issue::time::now_epoch() as f64 >= run.expires_at {
+            return Err(Error::rejected(
+                "the workflow grant expired before dispatch",
+            ));
+        }
+        let root = selected.ok_or_else(|| {
+            Error::rejected("the workflow grant's repository is no longer registered")
+        })?;
+        let root = root
+            .into_os_string()
+            .into_string()
+            .map_err(|_| Error::rejected("the authorized checkout path is not valid UTF-8"))?;
+        Ok(Some(DispatchAuthority {
+            checkout: root,
+            expires_at: run.expires_at,
+        }))
     }
 
     /// `question_escalate` — hand an open question the master cannot
@@ -605,18 +726,172 @@ impl Shared {
         let slug = required_str(params, "agent")?;
         let name = required_str(params, "file")?;
         let text = required_str(params, "text")?;
+        // Master SOUL.md, AGENT.md, and permissions stay on this writer
+        // and its digest record. Only a migrated non-master profile
+        // definition has moved into the settings row.
+        if name == "AGENT.md"
+            && slug != crate::master::ALIAS
+            && self.store.settings()?.legacy_imported
+        {
+            return Err(Error::rejected(
+                "legacy_authority_retired: AGENT.md is a settings export; edit profiles through agent_settings_set",
+            ));
+        }
         let pm = self.pm()?;
+        let protected_master_file = slug == ALIAS;
+        let _identity_guard = if protected_master_file {
+            Some(
+                MASTER_IDENTITY_LOCK
+                    .lock()
+                    .map_err(|_| Error::internal("master identity lock poisoned"))?,
+            )
+        } else {
+            None
+        };
         let out = master::write_file(&pm, slug, name, text, "operator")?;
         master::record(&self.state_dir, slug, name, &master::digest(text))?;
+        if protected_master_file {
+            self.bump_master_rev();
+        }
         Ok(out)
+    }
+
+    /// `master_identity_set` (CAD-1817) — the workspace coordinator's bounded
+    /// identity write, for a proven operator only (an agent, the master
+    /// included, is refused by the connection gate before any effect).
+    ///
+    /// Closed request: `expected_revision` plus at least one of `name`,
+    /// `tone`, `look`. `name`/`tone` go to the protected IDENTITY.md/SOUL.md
+    /// managed sections through the same writer/digest path as
+    /// `agent_file_write`; `look` is the master's ordinary `params.look` and
+    /// requires a registered master. Every write is fenced on the identity
+    /// revision, so a stale editor never overwrites a newer identity. The
+    /// response reports `next_turn`: the actor briefs each new turn from the
+    /// committed name/tone, including after a provider session reset.
+    pub(super) fn rpc_master_identity_set(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("master identity", params, peer_pid)?;
+        const FIELDS: [&str; 4] = ["expected_revision", "name", "tone", "look"];
+        if let Some(field) = params
+            .as_object()
+            .and_then(|object| object.keys().find(|key| !FIELDS.contains(&key.as_str())))
+        {
+            return Err(Error::rejected(format!(
+                "master identity takes {} only; field '{field}' is not accepted",
+                FIELDS.join(", ")
+            )));
+        }
+        let expected_revision = required_str(params, "expected_revision")?;
+        if expected_revision.is_empty() {
+            return Err(Error::rejected(
+                "master identity needs a non-empty expected_revision",
+            ));
+        }
+        let scalar = |key: &str, max: usize| -> Result<Option<String>> {
+            match params.get(key) {
+                None => Ok(None),
+                Some(Value::String(text)) => {
+                    let value = crate::managed_section::clean(text);
+                    if value.chars().count() > max {
+                        return Err(Error::rejected(format!(
+                            "master identity {key} is longer than {max} characters"
+                        )));
+                    }
+                    Ok(Some(value))
+                }
+                Some(_) => Err(Error::rejected(format!(
+                    "master identity {key} must be a string"
+                ))),
+            }
+        };
+        let name = scalar("name", 80)?;
+        let tone = scalar("tone", 240)?;
+        let look = match params.get("look") {
+            None => None,
+            Some(Value::String(text)) => Some(
+                crate::agent_roles::canonical_look(text.trim()).ok_or_else(|| {
+                    Error::rejected(format!(
+                        "master identity look '{text}' is not one of: {}",
+                        crate::agent_roles::LOOKS.join(", ")
+                    ))
+                })?,
+            ),
+            Some(_) => return Err(Error::rejected("master identity look must be a string")),
+        };
+        if name.is_none() && tone.is_none() && look.is_none() {
+            return Err(Error::rejected(
+                "master identity needs at least one of name, tone, look",
+            ));
+        }
+        let pm = self.pm()?;
+        let identity_guard = MASTER_IDENTITY_LOCK
+            .lock()
+            .map_err(|_| Error::internal("master identity lock poisoned"))?;
+        let current = self.master_identity_locked(&identity_guard)?;
+        if current.revision != expected_revision {
+            return Err(Error::rejected(format!(
+                "master identity revision is stale (current {}); reload the \
+                 identity and retry",
+                current.revision
+            )));
+        }
+        if look.is_some() && self.store.agent_opt(ALIAS)?.is_none() {
+            return Err(Error::rejected(
+                "the master is not started — `cadence master start` registers it \
+                 before its avatar can change",
+            ));
+        }
+        let files_changed = name.is_some() || tone.is_some();
+        if files_changed {
+            master::write_identity(
+                &pm,
+                expected_revision,
+                current.look.as_str(),
+                name.as_deref(),
+                tone.as_deref(),
+                "operator",
+            )?;
+            master::record_identity(&self.state_dir, &pm.dir, name.is_some(), tone.is_some())?;
+            // Keep the launch briefing and stored instructions current too;
+            // per-turn identity context is the live provider's refresh path.
+            let files = master::read_files(&pm.dir, ALIAS, false)?;
+            master::verify(&self.state_dir, ALIAS, &files)?;
+            let briefing = master::compose(&files);
+            let file = client::briefing_path(&self.state_dir, &Value::Null, ALIAS);
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&file, &briefing)?;
+            if self.store.agent_opt(ALIAS)?.is_some() {
+                self.store.set_instructions_by(
+                    ALIAS,
+                    &briefing,
+                    &super::caller_audit(&AgentCaller::Operator),
+                )?;
+            }
+        }
+        if let Some(look) = look {
+            self.store.set_params_by(
+                ALIAS,
+                &json!({ "look": look }),
+                &super::caller_audit(&AgentCaller::Operator),
+            )?;
+        }
+        let identity = self.master_identity_locked(&identity_guard)?;
+        // The board's master push frame keys on this revision, so an open
+        // header refetches the identity it just missed.
+        self.bump_master_rev();
+        Ok(json!({
+            "identity": identity,
+            "applies": "next_turn",
+        }))
     }
 
     /// `master_start` — operator only. Installs any missing default agent
     /// file, refuses files changed around the writer, then registers the
     /// one `master` agent — managed Claude, in an empty working dir under
     /// the state dir — and queues its bootstrap: the briefing built from
-    /// SOUL.md + AGENT.md. Its thread starts here, so reports routed to
-    /// it land in the chat.
+    /// IDENTITY.md + SOUL.md + AGENT.md. Its thread starts here, so reports
+    /// routed to it land in the chat.
     pub(super) fn rpc_master_start(
         self: &Arc<Self>,
         params: &Value,
@@ -636,11 +911,16 @@ impl Shared {
         let pm = self.pm()?;
         // Files edited around the writer refuse BEFORE anything is
         // installed or registered — a refusal writes nothing.
-        master::verify(
-            &self.state_dir,
-            ALIAS,
-            &master::read_files(&pm.dir, ALIAS, false)?,
-        )?;
+        {
+            let _guard = MASTER_IDENTITY_LOCK
+                .lock()
+                .map_err(|_| Error::internal("master identity lock poisoned"))?;
+            master::verify(
+                &self.state_dir,
+                ALIAS,
+                &master::read_files(&pm.dir, ALIAS, false)?,
+            )?;
+        }
         // `claude` and `pi` (CAD-322) — a Codex master still waits for a
         // read-only sandbox with its writes through daemon verbs.
         let requested = optional_str(params, "provider");
@@ -697,9 +977,15 @@ impl Shared {
                 ))
             }
         }
-        let installed = master::install_defaults(&pm, "operator")?;
-        let files = master::read_files(&pm.dir, ALIAS, true)?;
-        master::verify(&self.state_dir, ALIAS, &files)?;
+        let (installed, files) = {
+            let _guard = MASTER_IDENTITY_LOCK
+                .lock()
+                .map_err(|_| Error::internal("master identity lock poisoned"))?;
+            let installed = master::install_defaults(&pm, "operator")?;
+            let files = master::read_files(&pm.dir, ALIAS, true)?;
+            master::verify(&self.state_dir, ALIAS, &files)?;
+            (installed, files)
+        };
         let agent_md = files
             .iter()
             .find(|(n, _)| n == "AGENT.md")
@@ -721,8 +1007,8 @@ impl Shared {
         // `[pi].models.default.master`, else refuse; Pi's own fallback
         // is never used. Whatever wins must be on `[pi].models.allow`.
         let mut pi_selection = None;
-        let model = if provider == "pi" {
-            let policy = crate::pi_policy::read(&pm.dir)?;
+        let model = if crate::adapter::registry::pi_family_provider(&provider) {
+            let policy = self.stored_pi_policy()?;
             let chosen = model.as_deref();
             let (resolved, fallback) =
                 crate::pi_policy::resolve_model_with_source(policy.as_ref(), "master", chosen)?;
@@ -824,7 +1110,7 @@ impl Shared {
             format!(
                 "Cadence bootstrap: you are 'master', the operator's company assistant. \
                  Your briefing is on disk at {} and too long to inline; ask the operator \
-                 to shorten SOUL.md/AGENT.md. Reply to the operator in this thread.",
+                 to shorten IDENTITY.md/SOUL.md/AGENT.md. Reply to the operator in this thread.",
                 file.display()
             )
         };
@@ -1136,6 +1422,9 @@ impl Shared {
 
     fn audit_perm(&self, kind: &str, payload: Value) {
         let _ = self.store.event_public(PERM_AUDIT_STREAM, kind, payload);
+        // CAD-1700: every audited permission change (ask, decide, revoke)
+        // moves the master push stamp; the store write it follows is done.
+        self.bump_master_rev();
     }
 
     fn tell_master(&self, key: &str, text: &str) {
@@ -1748,33 +2037,22 @@ mod tests {
         assert_eq!(clip("short", 10), "short");
     }
 
-    /// Every method name in `Shared::dispatch_method`'s match — parsed from the
-    /// source so the test sees methods added later.
-    pub(crate) fn dispatch_methods() -> Vec<String> {
-        let src = include_str!("../daemon.rs");
-        let start = src
-            .find("    fn dispatch_method(\n")
-            .expect("dispatch_method fn");
-        let body = &src[start..];
-        let body = &body[body.find("match method {").expect("match")..];
-        let body = &body[..body
-            .find("other => Err(Error::rejected(format!(\"Unknown method")
-            .expect("end")];
+    /// Framed byte streams served in `serve.rs` before `dispatch_method`.
+    /// They are real methods, so an allowlist entry may name one, but they
+    /// never appear in the JSON dispatch match.
+    fn framed_stream_methods() -> Vec<String> {
+        let src = include_str!("serve.rs");
+        let marker = "framed_method.as_deref() == Some(\"";
         let mut out = Vec::new();
-        for line in body.lines() {
-            let t = line.trim_start();
-            if line.len() - t.len() != 12 || !t.starts_with('"') {
-                continue;
-            }
-            let Some((arms, _)) = t.split_once("=>") else {
+        for line in src.lines() {
+            let Some(start) = line.find(marker) else {
                 continue;
             };
-            for arm in arms.split('|') {
-                let name = arm.trim().trim_matches('"');
-                if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
-                    out.push(name.to_string());
-                }
-            }
+            let rest = &line[start + marker.len()..];
+            let Some(end) = rest.find('"') else {
+                continue;
+            };
+            out.push(rest[..end].to_string());
         }
         out
     }
@@ -1788,18 +2066,28 @@ mod tests {
     /// master's own answer names, CAD-447).
     #[test]
     fn master_policy_allowlists_the_method_table() {
-        let table = dispatch_methods();
-        assert!(table.len() > 50, "method table parse: {table:?}");
+        let table = super::super::caller_rule::dispatch_methods();
+        let streams = framed_stream_methods();
+        // A parser that misses rustfmt-wrapped `| "next"` arms saw 417
+        // of 450 methods, so a low floor let the completeness checks
+        // below pass while skipping 33 methods. Keep the floor above that
+        // result and below the real count.
+        assert!(table.len() > 440, "method table parse: {}", table.len());
+        assert!(
+            streams.contains(&"app_media_inspect".to_string()),
+            "retained image inspect must stay a framed stream"
+        );
         for allowed in MASTER_ALLOWED {
             assert!(
-                table.contains(&allowed.to_string()),
+                table.contains(&allowed.to_string()) || streams.contains(&allowed.to_string()),
                 "{allowed} not a method"
             );
         }
-        for m in &table {
-            let open = master_may_call(m);
-            assert_eq!(open, MASTER_ALLOWED.contains(&m.as_str()), "{m}");
-        }
+        // `master_may_call` is exactly `MASTER_ALLOWED.contains`, so
+        // comparing the two is a tautology that can never fail. What can
+        // go wrong is the list naming something the daemon no longer
+        // dispatches (checked above) or a reviewed refusal silently
+        // becoming reachable (checked below).
         for never in [
             "shutdown",
             "agent_send",
@@ -1818,6 +2106,9 @@ mod tests {
             "agent_set",
             "agent_respond",
             "approval_record",
+            "approval_record_shown",
+            "approval_state",
+            "approval_revoke_shown",
             "task_accept",
             "agent_file_write",
             "master_start",
@@ -1887,6 +2178,7 @@ mod tests {
                 "app_content_assistant_draft",
                 "app_content_assistant_proposal_show",
                 "app_content_assistant_proposals",
+                "app_media_inspect",
                 "app_record_csv_assistant_import",
                 "app_record_csv_assistant_preview",
                 "app_segment_assistant_list",

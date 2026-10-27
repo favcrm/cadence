@@ -1,4 +1,5 @@
 /target/
+/.devin/
 /.worktrees/
 .state/
 /ui/node_modules
@@ -12,45 +13,94 @@ __pycache__/
 claudedocs/
 /tests/e2e/node_modules
 
-# docs/ is local working material — only the context manifest and the
-# documents it indexes stay tracked (`cadence issue context` serves them,
-# and one test embeds the manifest).
+# Local tool state and scratch output.
+/.commandcode/
+/.firecrawl/
+/.pi/
+/.playwright-mcp/
+/.wrangler/
+.claude/settings.local.json*
+
+# docs/ is local working material — only the documents listed below stay
+# tracked (`cadence issue context` serves them, and one test embeds the
+# manifest). Every tracked document needs its own negation here: a tracked
+# file keeps working, but a delete-and-readd silently drops it otherwise.
 docs/*
-!docs/guides/
-docs/guides/*
-!docs/guides/provider-deployment-metadata.md
-!docs/cadence/
-!docs/design/
-!docs/roles/
-!docs/guides/
-docs/guides/*
-!docs/guides/app-contexts.md
 !docs/ARCHITECTURE.md
 !docs/AUDIT.md
 !docs/BOARD.md
 !docs/CHARTER.md
+!docs/CI-DELIVERY.md
+!docs/CI-WORKFLOW-INVENTORY.md
+!docs/CLEAN-INSTALL.md
 !docs/CLI.md
+!docs/DEV-CYCLE.md
 !docs/EXTERNAL-TEST-RECIPE.md
-!docs/START-HERE.md
+!docs/HOSTED-LEASE.md
 !docs/INSTALL-AGENT.md
 !docs/NATIVE_MESSAGING.md
 !docs/RELEASING.md
+!docs/REMOTE-AUTH.md
 !docs/REMOTE-RESULT-OUTBOX.md
+!docs/REVIEW-EVIDENCE.md
+!docs/REVIEW-FLAKES.md
+!docs/SPLIT-MANIFESTS.md
+!docs/START-HERE.md
+!docs/TRUSTED-TEAM-ACTIVITY.md
+!docs/WORKTREE-LIFECYCLE.md
+!docs/publish-web.md
+!docs/cadence/
+docs/cadence/*
+!docs/cadence/project-context.yaml
+!docs/design/
 docs/design/*
-docs/roles/*
-!docs/design/DEVELOPMENT-TEAM.md
-!docs/design/hosted-migration.md
+!docs/design/CAD-1109-app-chat-v1.md
 !docs/design/CONTRACT-TEMPLATE.md
+!docs/design/DEVELOPMENT-TEAM.md
+!docs/design/app-catalog-foundation.md
+!docs/design/app-ownership.md
+!docs/design/auto-update-policy.md
+!docs/design/board-endpoint-table.md
+!docs/design/cad1184-assistant-guard-checks.md
+!docs/design/fixtures/
+docs/design/fixtures/*
+!docs/design/fixtures/hosted-cadence-local-assignment.v1.json
+!docs/design/hosted-migration.md
+!docs/design/installer-client-transport.md
+!docs/design/member-assistant-bootstrap-delivery.md
+!docs/design/method-aware-resolution.md
+!docs/design/platform-account.md
 !docs/design/remote-cli.md
-!docs/roles/risk-classes.md
+!docs/design/retired-agent-archive.md
+!docs/design/staging-delegation.md
+!docs/design/team-knowledge.md
+!docs/roles/
+docs/roles/*
 !docs/roles/one-review-paths.toml
+!docs/roles/risk-classes.md
 !docs/roles/risk-paths.toml
-
-# Operator connection guide is a maintained public CLI contract.
 !docs/guides/
 docs/guides/*
-!docs/guides/connections.md
+!docs/guides/agenticos-pi-workers.md
 !docs/guides/app-artifact-release.md
-!docs/guides/wiki-knowledge.md
-!docs/guides/external-agents-social.md
+!docs/guides/app-catalog.md
+!docs/guides/app-contexts.md
+!docs/guides/app-development.md
+!docs/guides/app-runs.md
+!docs/guides/app-toolchain.md
+!docs/guides/app-works.md
+!docs/guides/chat-attachments.md
+!docs/guides/ci-performance.md
+!docs/guides/connections.md
 !docs/guides/crm-package-setup.md
+!docs/guides/external-agents-social.md
+!docs/guides/hosted-image-media.md
+!docs/guides/hosted-workspace.md
+!docs/guides/provider-deployment-metadata.md
+!docs/guides/rollout-checklist.md
+!docs/guides/wiki-knowledge.md
+!docs/guides/workspace-app-upgrade.md
+!docs/ui/
+docs/ui/*
+!docs/ui/milestone-roadmap.md
+!docs/ui/projects-review.md

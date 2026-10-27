@@ -109,6 +109,16 @@ fn rpc_error(error: Error) -> HttpResp {
         }
     }
     let text = error.to_string();
+    // Two permanent, non-secret states of an installation the operator
+    // already holds: it declares no assistant actions (nothing to show), or
+    // its descriptor is not yet consented. Both stay refusals — only the
+    // fixed, typed message differs, so the board can render them calmly.
+    if text.contains("installation has no assistant actions") {
+        return err_response(404, "no assistant actions declared");
+    }
+    if text.contains("app assistant descriptor is not consented") {
+        return err_response(409, "app assistant is not consented");
+    }
     let status = if text.contains("operator") || text.contains("caller") || text.contains("session")
     {
         403
@@ -160,6 +170,25 @@ pub(super) fn handle(
     route: Route<'_>,
     query: &str,
 ) -> HttpResp {
+    handle_with_relay(
+        request,
+        state,
+        route,
+        query,
+        super::operator::PublicRelay::NotPublic,
+    )
+}
+
+/// CAD-1374: decisions on the public host relay the request's own session
+/// bearer. Local operator connections stay credential-less. The frame body
+/// cannot name a human.
+pub(super) fn handle_with_relay(
+    request: &mut Request,
+    state: &Path,
+    route: Route<'_>,
+    query: &str,
+    relay: super::operator::PublicRelay,
+) -> HttpResp {
     match route {
         Route::Actions(install) | Route::Operations(install) | Route::Permissions(install) => {
             if request.method().as_str() != "GET" {
@@ -200,13 +229,13 @@ pub(super) fn handle(
                 Err(response) => return response,
             };
             match stored_context(state, install, true, id) {
-                Ok(context) => call(
-                    state,
-                    install,
-                    &context,
-                    "app_assistant_decision",
-                    json!({"operation_id":id,"decision":value.decision,"expected_revision":value.expected_revision}),
-                ),
+                Ok(context) => {
+                    let mut params = json!({"operation_id":id,"decision":value.decision,"expected_revision":value.expected_revision});
+                    if let Err(response) = super::operator::relay_owner_proof(&mut params, relay) {
+                        return response;
+                    }
+                    call(state, install, &context, "app_assistant_decision", params)
+                }
                 Err(response) => response,
             }
         }
@@ -255,4 +284,31 @@ pub(super) fn handle(
 #[cfg(test)]
 pub(super) fn busy_status_for_test(e: &Error) -> u16 {
     rpc_error(Error::busy(e.to_string())).status_code().0
+}
+
+#[cfg(test)]
+mod permanent_state_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_or_unconsented_descriptor_is_a_typed_refusal_and_real_failures_stay_errors() {
+        let status = |e: Error| rpc_error(e).status_code().0;
+        assert_eq!(
+            status(Error::rejected("installation has no assistant actions")),
+            404
+        );
+        assert_eq!(
+            status(Error::rejected("app assistant descriptor is not consented")),
+            409
+        );
+        // Anything else keeps its previous mapping.
+        assert_eq!(status(Error::rejected("caller is not the operator")), 403);
+        assert_eq!(
+            status(Error::rejected(
+                "assistant RPC payload has unsupported fields"
+            )),
+            409
+        );
+        assert_eq!(status(Error::internal("disk")), 503);
+    }
 }

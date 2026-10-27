@@ -54,7 +54,11 @@ for line in sys.stdin:
         continue
     text = req.get("message", "")
     marker = next((m for m in MARKERS if m in text), None)
-    journal({"rpc": "prompt", "marker": marker, "session": session})
+    # The synthetic journal retains the ACTUAL prompt string received over
+    # the Pi RPC line, so a test can prove per-turn actor context (name/tone)
+    # survives a refused-session retry. Test fixture only; never production
+    # provider logging.
+    journal({"rpc": "prompt", "marker": marker, "session": session, "text": text})
     emit(reply)
     if marker == "TOOL-REFUSED":
         emit({"type": "tool_execution_start", "toolCallId": "t1",

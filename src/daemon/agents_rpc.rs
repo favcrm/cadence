@@ -5,15 +5,53 @@ use super::*;
 impl Shared {
     pub(super) fn rpc_register(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = required_str(params, "alias")?;
-        let provider = required_str(params, "provider")?;
-        let endpoint =
-            optional_str(params, "endpoint_kind").unwrap_or(registry::DEFAULT_ENDPOINT_KIND);
+        // CAD-1752: a hire from the role catalogue. The install, not the
+        // caller, picks the runtime: Pi on its launch-default endpoint.
+        // The role is resolved here so the flag cannot be set by naming
+        // an id the daemon does not know.
+        let hired = match optional_str(params, "catalogue") {
+            Some(id) => {
+                // A hire is the operator's act, whatever group the caller
+                // sits in: no agent may recruit, and nothing is written
+                // (no row, no home dir) before that is proven.
+                self.operator_connection_on_agent("catalogue hire", params, peer_pid)
+                    .map_err(|e| {
+                        Error::rejected(format!(
+                            "agent register refused: a catalogue hire is the operator's act ({e})"
+                        ))
+                    })?;
+                if self.store.agent_opt(alias)?.is_some() {
+                    return Err(Error::rejected(format!(
+                        "Agent '{alias}' already exists - pick another alias"
+                    )));
+                }
+                Some(catalogue_hire(params, id)?)
+            }
+            None => None,
+        };
+        if hired.is_none() && !matches!(params.get("look"), None | Some(Value::Null)) {
+            return Err(Error::rejected(
+                "'look' only applies to a catalogue hire - send 'catalogue' with it",
+            ));
+        }
+        let provider = match &hired {
+            Some(_) => "pi",
+            None => required_str(params, "provider")?,
+        };
+        let endpoint = match &hired {
+            Some(_) => registry::default_kind("pi")?,
+            None => {
+                optional_str(params, "endpoint_kind").unwrap_or(registry::DEFAULT_ENDPOINT_KIND)
+            }
+        };
         let role = optional_str(params, "role").unwrap_or("worker");
-        let team_role = optional_text(params, "team_role")?;
+        let caller_team_role = optional_text(params, "team_role")?
+            .or_else(|| hired.as_ref().map(|hire| hire.role.team_role));
         let model_policy = optional_text(params, "model_policy")?;
         let cwd = optional_str(params, "cwd");
         let sandbox = optional_str(params, "sandbox").unwrap_or("read-only");
-        let instructions = optional_str(params, "instructions");
+        let caller_instructions = optional_str(params, "instructions")
+            .or_else(|| hired.as_ref().map(|hire| hire.instructions.as_str()));
         let agent_params = optional_str(params, "params");
         if registry::is_inbox_kind(endpoint) != registry::is_inbox_provider(provider) {
             return Err(Error::rejected(
@@ -30,10 +68,17 @@ impl Shared {
         }
         // A mailbox never runs a process — its cwd is bookkeeping only,
         // so direct socket callers may omit it (the CLI defaults cwd).
-        let cwd = match (cwd, endpoint) {
+        // A catalogue hire without a cwd gets a home dir under state,
+        // created below once every refusal has passed.
+        let mut needs_home = false;
+        let mut cwd = match (cwd, endpoint) {
             (Some(cwd), _) => std::fs::canonicalize(cwd)
                 .map_err(|_| Error::rejected("Working directory must exist"))?,
             (None, e) if !registry::has_actor(provider, e) => self.state_dir.clone(),
+            (None, _) if hired.is_some() => {
+                needs_home = true;
+                std::path::PathBuf::new()
+            }
             (None, _) => return Err(Error::rejected("Missing 'cwd'")),
         };
         // Enumerated launch params are validated at the door — a bad
@@ -48,14 +93,140 @@ impl Shared {
             }
             None => Value::Null,
         };
+        // The launch workdir (and so a confined agent's grant) is the
+        // daemon's to set when it relaunches for a ticket, never a caller's.
+        if parsed.get("launch_workdir").is_some() {
+            return Err(Error::rejected(
+                "params 'launch_workdir' is set by the daemon, not the caller",
+            ));
+        }
+        let mut defaulted = false;
+        if let Some(hire) = &hired {
+            let mut obj = match parsed {
+                Value::Object(obj) => obj,
+                Value::Null => serde_json::Map::new(),
+                _ => return Err(Error::rejected("'params' must be a JSON object")),
+            };
+            for key in ["catalogue", "look", "kind"] {
+                if obj.contains_key(key) {
+                    return Err(Error::rejected(format!(
+                        "params '{key}' is set from the catalogue role, not the caller"
+                    )));
+                }
+            }
+            obj.insert("catalogue".to_string(), json!(hire.role.id));
+            obj.insert("look".to_string(), json!(hire.look));
+            obj.insert("kind".to_string(), json!(hire.role.kind));
+            parsed = Value::Object(obj);
+            defaulted = true;
+            // A hire that Pi would refuse at launch is refused here, with
+            // the reason `GET /api/agent-roles` shows, before any home dir or
+            // row exists. An explicit model in params takes the ordinary
+            // path below, which applies the allowlist itself.
+            if parsed.get("model").is_none() {
+                self.role_model(endpoint, caller_team_role.unwrap_or(hire.role.team_role))?;
+            }
+        }
         // CAD-556: `pm.yaml [host] confine_pi_workers` is the pm-level
         // default a bare `join … pi` picks up — an explicit `confine`
         // param (`--confine`/`--no-confine`, or a caller's own params)
         // always wins. A [host] table that cannot be parsed refuses
         // the register rather than silently landing unconfined.
-        let mut defaulted = false;
+        let requested_profile = optional_str(params, "profile");
+        if requested_profile.is_none()
+            && ["profile", "profile_digest", "profile_revision"]
+                .iter()
+                .any(|key| parsed.get(*key).is_some())
+        {
+            return Err(Error::rejected(
+                "profile provenance is assigned from the settings row, not the caller",
+            ));
+        }
+        if requested_profile.is_some() && caller_instructions.is_some() {
+            return Err(Error::rejected(
+                "profile and instructions are mutually exclusive",
+            ));
+        }
+        let mut profile_job: Option<String> = None;
+        let mut profile_team: Option<String> = None;
+        for key in ["profile", "profile_revision", "profile_digest"] {
+            if parsed.get(key).is_some() {
+                return Err(Error::rejected(
+                    "profile provenance is taken from the settings row, not caller params",
+                ));
+            }
+        }
+        if let Some(profile_id) = requested_profile {
+            // Join sends the profile id and, when briefing, FilesAndMessage.
+            // It does not put a bootstrap flag in params. Only an instructions
+            // file or an explicit skip conflicts with the saved profile body.
+            if parsed.get("instructions_file").is_some()
+                || parsed.get("instructions").is_some()
+                || parsed.get("no_bootstrap").and_then(Value::as_bool) == Some(true)
+            {
+                return Err(Error::rejected(
+                    "a profile launch cannot combine an instructions file or skip bootstrap",
+                ));
+            }
+            let requested_model = parsed
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|model| !model.is_empty());
+            let provider_default = model_policy == Some("provider_default");
+            let explicit_model = requested_model.is_some() || provider_default;
+            let launched = crate::agent_settings::launch_profile(
+                &self.store,
+                profile_id,
+                provider,
+                endpoint,
+                requested_model,
+                provider_default,
+            )?;
+            let mut obj = match parsed {
+                Value::Object(obj) => obj,
+                _ => serde_json::Map::new(),
+            };
+            obj.insert("profile".to_string(), json!(launched.id));
+            obj.insert("profile_revision".to_string(), json!(launched.revision));
+            obj.insert("profile_digest".to_string(), json!(launched.digest));
+            obj.remove("instructions");
+            if !explicit_model
+                && launched.model != "inherit"
+                && registry::supports_model(provider, endpoint)
+            {
+                obj.insert("model".to_string(), json!(launched.model));
+            }
+            parsed = Value::Object(obj);
+            profile_job = Some(launched.job);
+            profile_team = Some(launched.role);
+        }
+        let team_role = if let Some(profile_role) = profile_team.as_deref() {
+            if !crate::model_defaults::canonical_team_role(profile_role) {
+                return Err(Error::rejected(
+                    "profile role is a team-role lookup, not runtime authority, and it is not a team role",
+                ));
+            }
+            if let Some(caller) = caller_team_role {
+                let normalized = crate::model_defaults::normalize_team_role(caller)?;
+                if normalized != profile_role {
+                    return Err(Error::rejected(
+                        "profile role is the team-role lookup and does not match the requested team role",
+                    ));
+                }
+            }
+            Some(profile_role)
+        } else {
+            caller_team_role
+        };
+        let instructions = profile_job.as_deref().or(caller_instructions);
+        defaulted |= requested_profile.is_some();
         let pm_dir = self.pm_dir().ok().filter(|d| d.is_dir());
-        if provider == "pi" && endpoint == "managed" && parsed.get("confine").is_none() {
+        // The host default `confine_pi_workers` is the Pi adapter's policy, so
+        // every managed Pi-family worker (pi, omp) obeys it — a family
+        // registration must never launch unconfined by name mismatch.
+        if crate::adapter::registry::pi_family_managed(provider, endpoint)
+            && parsed.get("confine").is_none()
+        {
             if let Some(pm_dir) = &pm_dir {
                 let overrides =
                     crate::doctor::host::read_host_overrides(pm_dir).map_err(Error::rejected)?;
@@ -87,7 +258,7 @@ impl Shared {
         // survives into the stored row.
         let mut pi_params: Option<String> = None;
         let mut pi_selection: Option<Value> = None;
-        let parsed = if provider == "pi" {
+        let parsed = if crate::adapter::registry::pi_family_managed(provider, endpoint) {
             // `provider_default` means "whatever the provider picks" —
             // the exact silent fallback this gate removes, so pi
             // refuses it outright rather than collide downstream.
@@ -96,7 +267,7 @@ impl Shared {
             {
                 return Err(Error::rejected(
                     "pi has no provider default — pass --model <provider/id> or \
-                     set pi.models.default.* in pm.yaml (CAD-559)",
+                     set the Pi role default in Settings > Agents (CAD-559)",
                 ));
             }
             let defaults = self.store.model_defaults()?;
@@ -123,10 +294,7 @@ impl Shared {
             } else {
                 // No tracker dir means no policy — an absent `[pi]`
                 // allows nothing either way.
-                let policy = match &pm_dir {
-                    Some(dir) => crate::pi_policy::read(dir)?,
-                    None => None,
-                };
+                let policy = self.stored_pi_policy()?;
                 // CAD-575: the allowlist the gate checks is the role's
                 // own when pm.yaml carries one (master_allow /
                 // worker_allow), else `allow`.
@@ -187,7 +355,15 @@ impl Shared {
             parsed
         };
         self.authorize_register(alias, &parsed, peer_pid)?;
-        self.store.register_agent(&crate::store::NewAgent {
+        // The alias was checked free above; should the insert still fail
+        // (a racing register, a params cap), the empty home is removed.
+        let mut new_home = None;
+        if needs_home {
+            let home = crate::adapter::pi::pi_agent_home(&self.state_dir, alias)?;
+            cwd = std::fs::canonicalize(&home)?;
+            new_home = Some(home);
+        }
+        let registered = self.store.register_agent(&crate::store::NewAgent {
             alias,
             provider,
             endpoint_kind: endpoint,
@@ -198,7 +374,15 @@ impl Shared {
             params: pi_params.as_deref().or(agent_params),
             team_role,
             model_policy,
-        })?;
+        });
+        if let Err(err) = registered {
+            if let Some(home) = new_home {
+                if !matches!(self.store.agent_opt(alias), Ok(Some(_))) {
+                    let _ = std::fs::remove_dir(home);
+                }
+            }
+            return Err(err);
+        }
         // CAD-559: when `[pi].models.default` filled the launch model,
         // `register_agent` labeled it `explicit` — restamp the real
         // provenance before the row can be read or launched.
@@ -217,14 +401,169 @@ impl Shared {
         Ok(json!({"alias": alias, "state": "starting", "provider": provider}))
     }
 
-    pub(super) fn rpc_events(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    /// CAD-1752: `cadence agent instructions` — replace an agent's
+    /// standing instructions. Operator only, by the connection: an agent
+    /// (the target itself and its PM included) is refused, so this is
+    /// stricter than `agent set`'s `authorize_agent_mutation`.
+    pub(super) fn rpc_instructions_set(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection_on_agent("agent instructions", params, peer_pid)?;
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let text = required_str(params, "instructions")?;
+        if crate::master::is_master(&alias) {
+            return Err(Error::rejected(
+                "the master's instructions are its SOUL and AGENT files, not this verb",
+            ));
+        }
+        let agent = self.store.agent(&alias)?;
+        if agent
+            .params
+            .as_ref()
+            .is_some_and(|p| p.get("profile").is_some())
+        {
+            return Err(Error::rejected(
+                "a profile agent's job comes from its settings profile, not from instructions",
+            ));
+        }
+        let audit = json!({"by": "operator", "by_kind": "operator", "caller_pid": peer_pid});
+        let (old, new) = self.store.set_instructions_by(&alias, text, &audit)?;
+        // `applies` here is what the DAEMON alone does: only codex and Devin
+        // cloud read the stored row, and only when a session opens
+        // (`next_launch`); every other provider is `not_delivered` by this RPC.
+        // The CLI verb and the board route then rewrite the agent's briefing and
+        // queue a re-read notice (`briefing::deliver_job_update`) and, on
+        // success, report `next_turn` instead - the two-step split is
+        // deliberate, so the raw RPC never promises what only a wrapper does.
+        // Nothing here restarts the agent.
+        let applies = match (agent.provider.as_str(), agent.endpoint_kind.as_str()) {
+            ("codex", _) | ("devin", "cloud") => "next_launch",
+            _ => "not_delivered",
+        };
+        Ok(json!({
+            "alias": alias, "state": "updated", "applies": applies,
+            "old_sha256": old, "new_sha256": new,
+        }))
+    }
+
+    /// CAD-1752: the role catalogue plus what a hire registers on this
+    /// install and the model each role would launch on. A read: the
+    /// catalogue is static and the model rows come from the same settings
+    /// `model_defaults_get` already serves to any viewer.
+    pub(super) fn rpc_agent_roles(self: &Arc<Self>) -> Result<Value> {
+        let provider = "pi";
+        let endpoint = registry::default_kind(provider)?;
+        let roles: Vec<Value> = crate::agent_roles::ROLES
+            .iter()
+            .map(|role| {
+                let mut row = role.to_json();
+                row["model"] = match self.role_model(endpoint, role.team_role) {
+                    Ok((id, source)) => json!({"id": id, "source": source}),
+                    Err(err) => json!({"error": err.to_string()}),
+                };
+                row
+            })
+            .collect();
+        Ok(json!({
+            "categories": crate::agent_roles::CATEGORIES
+                .iter()
+                .map(|(id, label)| json!({"id": id, "label": label}))
+                .collect::<Vec<_>>(),
+            "roles": roles,
+            "install": {
+                "hosted": crate::issue::cloud::hosted_company(|key| std::env::var(key).ok()).is_ok(),
+                "provider": provider,
+                "endpoint_kind": endpoint,
+            },
+        }))
+    }
+
+    /// The model a worker of `team_role` launches on: the same two steps
+    /// `rpc_register` takes for pi — the defaults layer, else `[pi]` policy.
+    fn role_model(&self, endpoint: &str, team_role: &str) -> Result<(String, String)> {
+        let defaults = self.store.model_defaults()?;
+        let resolved = crate::model_defaults::resolve(crate::model_defaults::ResolveRequest {
+            provider: "pi",
+            endpoint_kind: endpoint,
+            runtime_role: "worker",
+            team_role: Some(team_role),
+            model_policy: None,
+            params: None,
+            config: &defaults.config,
+            revision: defaults.revision,
+        })?;
+        let policy = self.stored_pi_policy()?;
+        let selection = resolved.model_selection.as_ref();
+        let picked = selection
+            .and_then(|sel| sel.get("model"))
+            .and_then(Value::as_str);
+        let (model, source) = match picked {
+            Some(model) => {
+                let source = selection
+                    .and_then(|sel| sel.get("source"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider_default");
+                (model.to_string(), source.to_string())
+            }
+            None => {
+                let (model, platform) =
+                    crate::pi_policy::resolve_model_with_source(policy.as_ref(), "worker", None)?;
+                let source = if platform {
+                    "platform_default"
+                } else {
+                    "pi_policy_default"
+                };
+                (model, source.to_string())
+            }
+        };
+        // The launch admits a worker only on the operator's allowlist - the
+        // platform fallback is exempt at register but not when Pi opens -
+        // and refuses Devin models for a confined worker. Apply both here
+        // so a role that would register and then fence shows its reason.
+        crate::pi_policy::require_allowed(policy.as_ref(), "worker", &model)?;
+        let confined = self
+            .pm_dir()
+            .ok()
+            .filter(|dir| dir.is_dir())
+            .map(|dir| crate::doctor::host::read_host_overrides(&dir))
+            .transpose()
+            .map_err(Error::rejected)?
+            .flatten()
+            .and_then(|overrides| overrides.confine_pi_workers)
+            == Some(true);
+        crate::adapter::pi::refuse_confined_devin("a catalogue hire", confined, &model)?;
+        Ok((model, source))
+    }
+
+    pub(super) fn rpc_events(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let raw = required_str(params, "alias")?;
         // The daemon stream has no agents row — read-only, so a plain
         // match suffices; every other RPC keeps resolving to an agent.
-        let alias = if raw == DAEMON_ALIAS {
+        let daemon = raw == DAEMON_ALIAS;
+        let alias = if daemon {
             raw.to_string()
         } else {
             self.resolve_alias(raw)?
+        };
+        // CAD-1380: daemon `assist_intent` rows are member-private routing. Only
+        // the operator reads them from the shared stream; every other caller gets
+        // the same page with those rows removed, cursors unchanged.
+        let hide_intents = daemon
+            && !matches!(
+                self.connection_caller(peer_pid)?,
+                caller_rule::Who::Operator
+            );
+        let visible = |events: Vec<crate::store::Event>| -> Vec<crate::store::Event> {
+            if hide_intents {
+                events
+                    .into_iter()
+                    .filter(|e| e.kind != "assist_intent")
+                    .collect()
+            } else {
+                events
+            }
         };
         let after = optional_i64(params, "after").unwrap_or(0);
         if after < 0 {
@@ -242,9 +581,10 @@ impl Shared {
             if has_older {
                 events.remove(0);
             }
+            let cursor = events.last().map(|e| e.seq).unwrap_or(0);
             return Ok(json!({
-                "events": events.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
-                "cursor": events.last().map(|e| e.seq).unwrap_or(0),
+                "events": visible(events).iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+                "cursor": cursor,
                 "has_older": has_older,
             }));
         }
@@ -254,7 +594,7 @@ impl Shared {
             if !events.is_empty() || self.closing.load(Ordering::SeqCst) {
                 let cursor = events.last().map(|e| e.seq).unwrap_or(after);
                 return Ok(json!({
-                    "events": events.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+                    "events": visible(events).iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
                     "cursor": cursor,
                 }));
             }
@@ -336,7 +676,7 @@ impl Shared {
     /// caller and each key's old and new value.
     pub(super) fn rpc_set(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
-        let patch = params
+        let mut patch = params
             .get("patch")
             .filter(|p| p.is_object())
             .cloned()
@@ -345,6 +685,11 @@ impl Shared {
         // like `upstream` or `session` would silently rewire routing and
         // session binding, so they are rejected rather than merged.
         let agent = self.store.agent(&alias)?;
+        if agent.archived_at.is_some() {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is archived — restore it before changing it"
+            )));
+        }
         // `next_launch`: launch params (model, effort) stored for the
         // next open only — the live process is left exactly as it is.
         let next_launch = params
@@ -366,8 +711,42 @@ impl Shared {
         };
         let caller =
             self.authorize_agent_mutation(params, peer_pid, "agent set", &agent, mutation)?;
+        // CAD-804: `gc_keep` is a registry keep, not an endpoint param.
+        // Take it out before the endpoint-param allowlist runs; every
+        // other key still validates and merges exactly as before.
+        let gc_keep = match patch.as_object_mut().unwrap().remove("gc_keep") {
+            None => None,
+            Some(Value::Bool(keep)) => Some(keep),
+            Some(Value::String(s)) if s.eq_ignore_ascii_case("true") => Some(true),
+            Some(Value::String(s)) if s.eq_ignore_ascii_case("false") => Some(false),
+            Some(Value::Null) => Some(false),
+            Some(_) => {
+                return Err(Error::invalid(
+                    "invalid_gc_keep",
+                    "gc_keep must be true or false",
+                ))
+            }
+        };
+        if next_launch && gc_keep.is_some() {
+            return Err(Error::rejected(
+                "gc_keep is not a launch param; set it without --next-launch",
+            ));
+        }
         for (key, value) in patch.as_object().unwrap() {
+            if key == "launch_workdir" {
+                return Err(Error::rejected(
+                    "params 'launch_workdir' is set by the daemon, not the caller",
+                ));
+            }
             proto::param_key(key)?;
+            if matches!(
+                key.as_str(),
+                "profile" | "profile_revision" | "profile_digest"
+            ) {
+                return Err(Error::rejected(
+                    "saved profile provenance is immutable; launch a new session",
+                ));
+            }
             if next_launch {
                 registry::validate_next_launch_param(
                     &agent.provider,
@@ -383,8 +762,10 @@ impl Shared {
         // it is refused — and it can never be cleared, because a pi
         // launch without `--model` would silently fall back. CAD-575:
         // the role's own list applies when pm.yaml carries one.
-        if agent.provider == "pi" && patch.as_object().unwrap().contains_key("model") {
-            let policy = crate::pi_policy::read(&self.pm_dir()?)?;
+        if crate::adapter::registry::pi_family_provider(&agent.provider)
+            && patch.as_object().unwrap().contains_key("model")
+        {
+            let policy = self.stored_pi_policy()?;
             let role = if crate::master::is_master(&agent.alias) {
                 "master"
             } else {
@@ -401,7 +782,7 @@ impl Shared {
                 }
             }
         }
-        if agent.provider == "pi" && agent.endpoint_kind == "managed" {
+        if crate::adapter::registry::pi_family_provider(&agent.provider) {
             let mut effective = agent.params.clone().unwrap_or_else(|| json!({}));
             if let (Some(current), Some(changes)) = (effective.as_object_mut(), patch.as_object()) {
                 current.extend(changes.clone());
@@ -419,6 +800,16 @@ impl Shared {
         let mut audit = caller_audit(&caller);
         audit["caller_pid"] = json!(peer_pid);
         audit["next_launch"] = json!(next_launch);
+        if let Some(keep) = gc_keep {
+            self.store.set_gc_keep_by(&alias, keep, &audit)?;
+        }
+        if patch.as_object().unwrap().is_empty() {
+            if gc_keep.is_none() {
+                return Err(Error::rejected("agent set needs at least one key"));
+            }
+            self.wake();
+            return Ok(json!({"alias": alias, "state": "updated", "gc_keep": gc_keep}));
+        }
         self.store.set_params_by(&alias, &patch, &audit)?;
         if next_launch {
             self.wake();
@@ -638,6 +1029,63 @@ impl Shared {
         self.start_actor_locked(&mut lc, alias, true)
     }
 
+    /// Whether an operator paused `alias`: disabled, and its newest stop
+    /// marker is not the idle timer's. A fresh registration is enabled, a
+    /// timer stop stays eligible for work-driven resume, and an explicit
+    /// resume re-enables the row, so a historical manual marker never blocks it.
+    pub(super) fn assistant_stopped_by_operator(&self, alias: &str) -> Result<bool> {
+        if self.store.agent(alias)?.enabled {
+            return Ok(false);
+        }
+        let marker = self
+            .store
+            .last_event_of(alias, crate::store::AUTO_STOP_MARKER_KINDS)?;
+        Ok(!marker.is_some_and(|m| m.kind == crate::store::AUTO_STOP_EVENT))
+    }
+
+    /// The member assistant's resume (CAD-1380): the inbox, fence and start
+    /// path of `try_resume`, with the operator-stop check and the start claim
+    /// under one lifecycle lock, so a stop cannot land between them. Operator
+    /// resume and unfence keep `try_resume`. An owned alias is a live actor
+    /// that drains the queue; a stop in flight refuses.
+    pub(super) fn try_resume_assistant(self: &Arc<Self>, alias: &str) -> Result<()> {
+        let agent = self.store.agent(alias)?;
+        if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is an inbox — nothing to resume"
+            )));
+        }
+        let mut lc = self.lifecycle.lock().unwrap();
+        if lc.stopping.contains(alias) {
+            return Err(Error::rejected(format!(
+                "assistant '{alias}' is stopping — the message stays queued"
+            )));
+        }
+        if lc.agents.contains_key(alias) {
+            // CAD-1380: the owned no-op resume still gates on the cwd invariant.
+            self.assistant_start_guard(alias)?;
+            return Ok(());
+        }
+        if self.store.has_unknown(alias)? {
+            return Err(Error::rejected(format!(
+                "assistant '{alias}' is fenced by an unreconciled unknown message — \
+                 the operator reconciles before it runs again"
+            )));
+        }
+        if self.assistant_stopped_by_operator(alias)? {
+            return Err(Error::rejected(format!(
+                "assistant '{alias}' was stopped by an operator and stays stopped — \
+                 the operator resumes it; the message stays queued"
+            )));
+        }
+        if !self.start_actor_locked(&mut lc, alias, true)? {
+            return Err(Error::rejected(format!(
+                "assistant '{alias}' is fenced by an unreconciled unknown message"
+            )));
+        }
+        Ok(())
+    }
+
     /// Bounded wait for a just-started actor's `open`: live when an
     /// endpoint is published or a live state lands, over when the
     /// actor gives up (`attention`/`stopped`/`offline`). Same 30s
@@ -725,6 +1173,11 @@ impl Shared {
         // Resolve the agent before any reconcile so a bad alias fails
         // without side effects.
         let agent = self.store.agent(&alias)?;
+        if agent.archived_at.is_some() {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is archived — restore it before unfencing it"
+            )));
+        }
         let ids = self.store.unknown_messages(&alias)?;
         if ids.is_empty() {
             return Err(Error::rejected(format!(
@@ -814,6 +1267,60 @@ impl Shared {
             )));
         }
         let agent = self.store.agent(&alias)?;
+        if agent.archived_at.is_some() {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is archived — restore it before stopping it"
+            )));
+        }
+        // A sandbox runner has no host actor, so the inbox refusal below
+        // does not apply. A running kickoff is stopped by the poller on a
+        // durable request; a queued one is settled before any create.
+        if agent.provider == "sandbox" && agent.endpoint_kind == "sandbox" {
+            let mut running = 0;
+            let mut queued = 0;
+            for message in self.store.messages(&alias)? {
+                if message.source != "job_dispatch" {
+                    continue;
+                }
+                match message.state.as_str() {
+                    "running" => {
+                        self.store.request_cloud_stop(&message.id)?;
+                        running += 1;
+                    }
+                    "queued" => {
+                        self.store.request_cloud_stop(&message.id)?;
+                        queued += 1;
+                    }
+                    "unknown" => {
+                        self.store.request_cloud_stop(&message.id)?;
+                        running += 1;
+                        if let Some(task_id) = message.task_id.clone() {
+                            let shared = Arc::clone(self);
+                            let message_id = message.id.clone();
+                            std::thread::spawn(move || {
+                                let _ = shared.run_cloud_dispatch(&task_id, &message_id);
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if running == 0 && queued == 0 {
+                return Err(Error::rejected(format!(
+                    "Agent '{alias}' has no active cloud dispatch to stop"
+                )));
+            }
+            // A cloud stop is per-job. The actorless agent stays enabled:
+            // there is no actor/resume path to re-enable it, and a stopped
+            // job must not permanently block later dispatch.
+            let _ = self.store.event_public(
+                &alias,
+                "stop_requested",
+                json!({"cloud_jobs": running, "queued_stop_requested": queued}),
+            );
+            return Ok(json!({"alias": alias, "state": "stopping",
+                             "cloud_jobs": running, "queued_stop_requested": queued}));
+        }
         if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
             return Err(Error::rejected(format!(
                 "Agent '{alias}' is an inbox — no actor to stop; \
@@ -837,6 +1344,13 @@ impl Shared {
             lifecycle: &self.lifecycle,
             alias: &alias,
         };
+        // The archive holds the same lifecycle lock. Re-read after the
+        // reservation so an archive that won the lock first refuses here.
+        if self.store.agent(&alias)?.archived_at.is_some() {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is archived — restore it before stopping it"
+            )));
+        }
         self.store.set_enabled(&alias, false)?;
         let _ = self.store.event_public(&alias, "stop_requested", json!({}));
         // A fenced agent keeps its attention state and reason; the stop
@@ -1176,4 +1690,40 @@ impl Shared {
                 .event_public(&agent.alias, "inbox_unconsumed", health);
         }
     }
+}
+
+/// CAD-1752: one validated hire from the role catalogue.
+struct CatalogueHire {
+    role: &'static crate::agent_roles::Role,
+    look: &'static str,
+    instructions: String,
+}
+
+/// Resolve a `catalogue` register request. The install picks the runtime,
+/// so a caller naming provider or endpoint kind is refused, and `profile`
+/// (mutually exclusive with instructions) never rides along.
+fn catalogue_hire(params: &Value, id: &str) -> Result<CatalogueHire> {
+    for field in ["provider", "endpoint_kind", "profile"] {
+        if !matches!(params.get(field), None | Some(Value::Null)) {
+            return Err(Error::rejected(format!(
+                "a catalogue hire takes '{field}' from the install, not the caller"
+            )));
+        }
+    }
+    let role = crate::agent_roles::find(id).ok_or_else(|| {
+        Error::rejected(format!(
+            "Unknown catalogue role '{id}' - one of: {}",
+            crate::agent_roles::ids()
+        ))
+    })?;
+    let look = match optional_text(params, "look")? {
+        None => role.look,
+        Some(look) => crate::agent_roles::canonical_look(look)
+            .ok_or_else(|| Error::rejected(format!("Unknown look '{look}'")))?,
+    };
+    Ok(CatalogueHire {
+        role,
+        look,
+        instructions: role.instructions(),
+    })
 }

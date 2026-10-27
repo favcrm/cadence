@@ -1,4 +1,4 @@
-import { parseChild, parseInit, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
+import { parseChild, parseDraftImageRef, parseInit, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
 import { parseMount, ScreenChannel } from "../src/features/workspace-apps/screen/screenLifecycle";
 
 function check(value: unknown, label: string): void { if (!value) throw new Error(label); }
@@ -15,6 +15,9 @@ check(!parseInit({ ...init, operator: true }), "forged init field refused");
 check(!parseChild({ v: 1, op: "ready", actor: "operator" }), "forged port field refused");
 check(!parseChild({ v: 1, op: "state", data: "界".repeat(12000) }), "UTF8 state bound");
 check(parseChild({ v: 1, op: "state", data: "x".repeat(32768) }), "exact byte bound accepted");
+check(parseChild({v:2,op:"tool",id:"t1",alias:"text.generate",input:{messages:[]},request_id:"request-a",generation_scope:{operation:"caption",draft_id:"draft-a",revision:2}}),"draft-revision generation intent parses");
+check(!parseChild({v:2,op:"tool",id:"t1",alias:"text.generate",input:{messages:[]},request_id:"request-a",generation_scope:{operation:"caption",draft_id:"draft-a"}}),"generation intent without revision is refused");
+check(!parseChild({v:2,op:"tool",id:"t1",alias:"text.generate",input:{messages:[]},request_id:"request-a",generation_scope:{operation:"caption",draft_id:"draft-a",revision:2,request_id:"other"}}),"generation intent cannot override its key");
 
 class Port {
   onmessage: ((event: { data: unknown }) => void) | null = null;
@@ -101,4 +104,53 @@ const badLink = mount(); badLink.channel.update({ ...extended, outbox: [{ ...ext
 badLink.channel.receive(badLink.event); badLink.port.receive({ v: 1, op: "ready", accepts: ["publish-intents.v1"] });
 check(badLink.port.closed && badLink.port.sent.length === 0 && badLink.counts().failed === 1 && badLink.counts().ready === 0,
   "out-of-range linkage closes an opted-in mount with nothing sent and no ready");
+
+// CAD-1177: a declared tool alias is advertised in `actions`; an undeclared
+// one is not; advertising needs a minted action context and a tool host.
+const tokenA = "c".repeat(64);
+const toolReceipt = { ...receipt, action_token: tokenA, tools: ["instagram.read"] };
+check(parseMount(toolReceipt, "main"), "a mount receipt may name declared tool aliases");
+check(!parseMount({ ...toolReceipt, tools: ["Bad Alias"] }, "main"), "a malformed tool alias refuses the receipt");
+check(!parseMount({ ...toolReceipt, tools: ["a.b", "a.b"] }, "main"), "duplicate tool aliases refuse the receipt");
+check(!parseMount({ ...toolReceipt, extra: 1 }, "main"), "an unknown receipt field still refuses");
+const actingPush: ScreenPush = { ...push, defaults: { context_id: "c", revision: 0, values: {} }, readiness: { ok: true, blockers: [] }, publish_intents: { status: "ok", withheld: 0, rows: [] }, actions: ["read.run"] };
+const toolHost = { call: async () => ({ ok: true }), planner: () => null, onSlot: () => {}, onLink: () => {},
+  invoke: async () => ({ ok: true }) } as unknown as ConstructorParameters<typeof ScreenChannel>[7];
+function actingMount(r: typeof toolReceipt | typeof receipt, host: typeof toolHost) {
+  const source = {} as Window; const port = new Port();
+  const channel = new ScreenChannel(source, r, actingPush, () => {}, () => {}, () => {}, undefined, host);
+  channel.receive({ source, origin: "null", data: init, ports: [port as unknown as MessagePort] });
+  port.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-actions.v1"] });
+  return port;
+}
+const advertised = (actingMount(toolReceipt, toolHost).sent[0] as ScreenPush).actions!;
+check(advertised.includes("instagram.read") && !advertised.includes("facebook.read") && advertised.includes("read.run"),
+  "a declared alias appears in actions and an undeclared one does not");
+check(!(actingMount({ ...toolReceipt, action_token: null } as never, toolHost).sent[0] as ScreenPush).actions!.includes("instagram.read"),
+  "no minted action context: nothing is advertised");
+check(!(actingMount(toolReceipt, { ...toolHost, invoke: undefined } as never).sent[0] as ScreenPush).actions!.includes("instagram.read"),
+  "no tool host: nothing is advertised");
+
+// Gates that must each be the reason nothing is advertised or accepted.
+const noActionsPush: ScreenPush = { ...actingPush, actions: [] };
+function actingMountWith(r: typeof toolReceipt, pushed: ScreenPush, accepts: string[]) {
+  const source = {} as Window; const port = new Port();
+  const channel = new ScreenChannel(source, r, pushed, () => {}, () => {}, () => {}, undefined, toolHost);
+  channel.receive({ source, origin: "null", data: init, ports: [port as unknown as MessagePort] });
+  port.receive({ v: 1, op: "ready", accepts });
+  return port;
+}
+check(!(actingMountWith(toolReceipt, actingPush, ["screen.v2"]).sent[0] as ScreenPush).actions!.includes("instagram.read"),
+  "a v2 child that did not opt into screen-actions.v1 is advertised no tool alias");
+check((actingMountWith(toolReceipt, noActionsPush, ["screen.v2", "screen-actions.v1"]).sent[0] as ScreenPush).actions!.length === 0,
+  "a non-operator projection (empty actions) is never given a tool alias");
+check(!parseMount({ ...receipt, action_token: "not-a-token" }, "main"), "any string action_token is not accepted");
+check(!parseMount({ ...receipt, action_token: 7 }, "main"), "a non-string action_token is refused");
+check(!parseMount({ ...receipt, action_token: "b".repeat(64) }, "main"), "an action token equal to the frame capability is refused");
+check(parseMount({ ...receipt, action_token: "d".repeat(64) }, "main"), "a distinct 64-hex action token is accepted");
+// A dotted tool alias in a host-held draft image ref parses (a literal dot, not a backslash escape).
+check(JSON.stringify(parseDraftImageRef("draft-image:d1:instagram.read")) === JSON.stringify({ draftId: "d1", alias: "instagram.read" }),
+  "a dotted-alias draft image ref parses");
+check(parseDraftImageRef("draft-image:d1:instagram..read") === null && parseDraftImageRef("draft-image:d1:Bad.Alias") === null &&
+  parseDraftImageRef("image:d1") === null, "a malformed draft image ref does not parse");
 console.log("screen lifecycle adversarial checks pass");

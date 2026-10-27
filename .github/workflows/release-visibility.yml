@@ -1,0 +1,93 @@
+name: release-visibility
+
+# CAD-1475: the explicit operator-owned private->public lifecycle step for
+# an already-published cadence/operator-host catalogue record. Runs only
+# from a manual dispatch on main and only after GitHub `production`
+# environment approval. It changes exactly one field on exactly one
+# existing record — visibility private -> public — through an
+# ETag-conditional write (`put-object --if-match`), never a blind put.
+# It never writes artifacts, never deletes, never withdraws and never
+# takes a private/revoke direction; the publisher's immutable conditional
+# writes stay untouched.
+#
+# Triggering this does not install, deploy or restart anything — the
+# public data plane reads the record after the flip.
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-hex source commit whose operator-host catalogue record goes public
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # The dedicated release store this operation is bound to — literals the
+  # configured vars must equal before any mutation, and the helper asserts
+  # the same literals a second time.
+  RELEASES_ENDPOINT: https://87b59a40e130c425e35474687ad98a4f.r2.cloudflarestorage.com
+  RELEASES_BUCKET: agenticos-v2-release-artifacts
+
+jobs:
+  make-public:
+    # The catalogue visibility flip is an operator lifecycle decision on the
+    # production release store; it sits behind the same `production`
+    # environment approval as a native-host promotion.
+    # CAD-1506: this job's release-store credentials come from the
+    # `production` environment; the publishing jobs read the `release-store`
+    # environment instead (branch policy main + v* tags, no reviewers, so no
+    # approval click is added). The key is held in both environments —
+    # rotate both. `production` stays here: dropping it would drop the
+    # operator approval that gates this outward flip.
+    environment: production
+    # Only a manual dispatch from a main ref may reach the mutation step.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Validate the requested source and the configured store
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CONFIGURED_ENDPOINT: ${{ vars.RELEASES_R2_ENDPOINT }}
+          CONFIGURED_BUCKET: ${{ vars.RELEASES_R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          # Closed input: a full lowercase 40-hex commit, passed through the
+          # environment — never interpolated into a command line.
+          test "${#SOURCE_SHA}" -eq 40 || { echo "source_sha is not 40 chars" >&2; exit 1; }
+          case "$SOURCE_SHA" in
+            *[!0-9a-f]*) echo "source_sha is not lowercase hex" >&2; exit 1 ;;
+          esac
+          # The configured store must be exactly the dedicated literals —
+          # a configured endpoint/bucket that differs refuses rather than
+          # steering the mutation at another store.
+          test "$CONFIGURED_ENDPOINT" = "$RELEASES_ENDPOINT" || {
+            echo "RELEASES_R2_ENDPOINT is not the dedicated release store" >&2; exit 1; }
+          test "$CONFIGURED_BUCKET" = "$RELEASES_BUCKET" || {
+            echo "RELEASES_R2_BUCKET is not the dedicated release store" >&2; exit 1; }
+
+      - name: Make the operator-host record public (conditional ETag write)
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          # Secrets stay in the environment, never in argv or output; the
+          # helper fails closed without them. The endpoint/bucket passed to
+          # the helper are the validated literals, not re-read unchecked vars.
+          AWS_ACCESS_KEY_ID: ${{ secrets.RELEASES_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RELEASES_R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$AWS_ACCESS_KEY_ID" && test -n "$AWS_SECRET_ACCESS_KEY"
+          python3 scripts/make-release-public.py \
+            --endpoint "$RELEASES_ENDPOINT" \
+            --bucket "$RELEASES_BUCKET" \
+            --source-sha "$SOURCE_SHA"

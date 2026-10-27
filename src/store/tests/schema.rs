@@ -303,18 +303,25 @@
         let facts = s.pty_endpoint_facts().unwrap();
         s.shutdown_backoff_ms = 5_000;
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        crate::store::wait_probe::WAITING.with(|observer| *observer.borrow_mut() = Some(waiting_tx));
+        crate::store::wait_probe::RELEASED.with(|release| *release.borrow_mut() = Some(released_rx));
+        crate::store::wait_probe::configure(&s.conn()).unwrap();
         let path = dir.path().join("t.sqlite3");
         let writer = std::thread::spawn(move || {
             let conn = Connection::open(path).unwrap();
             conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
             conn.execute_batch("BEGIN IMMEDIATE").unwrap();
             locked_tx.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(400));
+            waiting_rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("drain never contended on the native write lock");
             conn.execute_batch(
                 "INSERT INTO events(alias,kind,payload,at) VALUES('ok','probe','{}',0);
                  COMMIT",
             )
             .unwrap();
+            released_tx.send(()).unwrap();
         });
         locked_rx.recv().unwrap();
         let started = std::time::Instant::now();
@@ -483,6 +490,7 @@
                 &steer_as_pm(Priority::Urgent, none),
                 None,
                 None,
+                None,
             )
             .unwrap();
             let order: Vec<String> = (0..3)
@@ -550,6 +558,7 @@
                 Some("/lane/d-1"),
                 &Sender::Unattributed,
                 &Steer::NONE,
+                None,
                 None,
                 None,
             )
@@ -688,11 +697,6 @@
             // The migrated store keeps its pre-v18 rows.
             assert!(s.agent("a1").unwrap().alias == "a1");
         }
-        assert_eq!(
-            crate::rollout::SCHEMA_VERSION,
-            33,
-            "bump? pin the new version and add its migration test"
-        );
         // Half-applied: one table present, version rolled back — the
         // reopen converges.
         Connection::open(&db)
@@ -706,6 +710,134 @@
             let _ = Store::open_for_schema_tests(&db).unwrap();
         }
         assert!(has(&db, "platform_drafts"));
+    }
+
+    #[test]
+    fn migration_v48_to_v49_keeps_assistant_binding_and_bootstrap() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        let before = {
+            let store = Store::open(&db).unwrap();
+            store.assistant_bind("org1", "sub1", "assistant-1", "alias-1", Some("rev-1")).unwrap();
+            store.assistant_set_conversation("org1", "sub1", "conversation-1").unwrap();
+            store.assistant_binding("org1", "sub1").unwrap().unwrap()
+        };
+        Connection::open(&db).unwrap().execute_batch(
+            "DROP TABLE wiki_transfer_entries;
+             DROP TABLE wiki_transfer_jobs;
+             UPDATE schema_version SET version=48;"
+        ).unwrap();
+        for _ in 0..2 {
+            let store = Store::open_for_schema_tests(&db).unwrap();
+            let after = store.assistant_binding("org1", "sub1").unwrap().unwrap();
+            assert_eq!(after.assistant_id, before.assistant_id);
+            assert_eq!(after.alias, before.alias);
+            assert_eq!(after.authority_rev, before.authority_rev);
+            assert_eq!(after.conversation_id, before.conversation_id);
+            assert_eq!(after.bootstrap_state, before.bootstrap_state);
+            assert_eq!(after.bootstrap_template_version, before.bootstrap_template_version);
+            assert_eq!(after.bootstrap_revision, before.bootstrap_revision);
+            assert_eq!(after.created, before.created);
+            let actual: i64 = store.conn().query_row(
+                "SELECT version FROM schema_version", [], |r| r.get(0)
+            ).unwrap();
+            assert_eq!(actual, crate::rollout::SCHEMA_VERSION);
+        }
+    }
+
+    /// CAD-1420: v48 adds the bootstrap lifecycle columns to the
+    /// `assistants` binding row. A genuine main-47 preimage — media, the
+    /// v46 upload/account layout and the CAD-1423 notification tables all
+    /// present, only the three tail bootstrap columns absent — migrates in
+    /// place with the defaults, keeps its member binding, notification and
+    /// media rows, and a reopen is a no-op. `assistants` is created at v41
+    /// and no migration through v47 alters it, so dropping the three tail
+    /// ALTER-added columns reproduces the real main47 physical column
+    /// order.
+    #[test]
+    fn migration_v47_to_v48_adds_bootstrap_columns_and_keeps_binding() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        let bound = {
+            let s = Store::open(&db).unwrap();
+            let b = s
+                .assistant_bind("org1", "sub1", "asst-1", "alias-1", Some("rev-1"))
+                .unwrap();
+            s.assistant_set_conversation("org1", "sub1", "conv-1")
+                .unwrap();
+            b
+        };
+        // A genuine main46 row in the media catalog the migration must not
+        // touch: valid v45 metadata, no locator/bytes columns.
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO app_media_assets(
+                    id,install_id,title,kind,lifecycle,revision,creator,created,updated)
+                 VALUES('med-0123456789abcdef0123456789abcdef','inst-1',
+                        'kept','image','draft',1,'test',1.0,1.0)",
+                [],
+            )
+            .unwrap();
+        // A genuine main47: one notification preference row the migration
+        // must not touch, then the binding row drops its three bootstrap
+        // columns and the store is stamped 47. The v45 media tables, the
+        // v46 upload/account layout and the v47 notification tables remain.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO human_principals(id,org,issuer,subject,name,seen)
+                 VALUES('hum-1','org1','iss','subj','Test Human',1.0);
+                 INSERT INTO human_notification_prefs(human,dm,mention,sound,preview,quiet,zone,updated)
+                 VALUES('hum-1',1,1,0,0,'off','UTC',1.0);
+                 ALTER TABLE assistants DROP COLUMN bootstrap_state;
+                 ALTER TABLE assistants DROP COLUMN bootstrap_template_version;
+                 ALTER TABLE assistants DROP COLUMN bootstrap_revision;
+                 UPDATE schema_version SET version=47;",
+            )
+            .unwrap();
+        let media_before: i64 = Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM app_media_assets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(media_before, 1, "preimage must carry the media row");
+        for _ in 0..2 {
+            // The first pass migrates; the second reopen must be a no-op.
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            let after = s.assistant_binding("org1", "sub1").unwrap().unwrap();
+            assert_eq!(after.bootstrap_state, "pending");
+            assert_eq!(after.bootstrap_template_version, 1);
+            assert_eq!(after.bootstrap_revision, 0);
+            assert_eq!(after.assistant_id, bound.assistant_id);
+            assert_eq!(after.alias, bound.alias);
+            assert_eq!(after.authority_rev, bound.authority_rev);
+            assert_eq!(after.conversation_id.as_deref(), Some("conv-1"));
+            assert_eq!(after.created, bound.created);
+            // The main47 media and notification rows survive untouched.
+            let raw = Connection::open(&db).unwrap();
+            let media_after: i64 = raw
+                .query_row("SELECT COUNT(*) FROM app_media_assets", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(media_after, 1, "migration must keep the media row");
+            let notification_after: i64 = raw
+                .query_row(
+                    "SELECT COUNT(*) FROM human_notification_prefs",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                notification_after, 1,
+                "migration must keep the notification preference row"
+            );
+        }
+        assert_eq!(
+            Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT version FROM schema_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            crate::rollout::SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -1380,4 +1512,379 @@
         for t in ["app_favorites", "app_install_requests", "app_update_checks"] {
             assert!(has(t), "{t} missing after half-applied converge");
         }
+    }
+
+    #[test]
+    fn migration_v33_to_v34_adds_events_alias_kind_and_is_idempotent() {
+        // v34 adds one index, `events_alias_kind` on
+        // `events(alias, kind, seq)` — the per-alias `WHERE alias=? AND
+        // kind=?` lookups that full-scanned `events` now seek it. A v33
+        // store migrates in place; a half-applied v34 (index present,
+        // version rolled back) converges on reopen; pre-v34 rows are
+        // untouched.
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        // A genuine v33: everything but the new index.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX events_alias_kind;
+                 UPDATE schema_version SET version=33;",
+            )
+            .unwrap();
+        let has_index = || -> bool {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='events_alias_kind'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        let version = || -> i64 {
+            Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(!has_index(), "events_alias_kind unexpectedly present at v33");
+        {
+            let _s = Store::open_for_schema_tests(&db).unwrap();
+            assert!(has_index(), "events_alias_kind missing after migrate");
+            assert_eq!(version(), crate::rollout::SCHEMA_VERSION);
+        }
+        // Half-applied: index present, version rolled back — reopen is a
+        // no-op converge, not an error or a second build.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("UPDATE schema_version SET version=33;")
+            .unwrap();
+        {
+            let _s = Store::open_for_schema_tests(&db).unwrap();
+            assert!(has_index(), "events_alias_kind missing after converge");
+            assert_eq!(version(), crate::rollout::SCHEMA_VERSION);
+        }
+    }
+
+    /// CAD-1280: `msg_state` and `tasks_assignee` are plain indexes added
+    /// WITHOUT a schema bump, so an older binary (which refuses a store
+    /// recorded at a newer version) still opens the store. A fresh store
+    /// has both; a store that lost them (a restore from a copy taken
+    /// before) gets them back on open at the same version; the queries
+    /// they exist for are planned through them.
+    #[test]
+    fn read_indexes_are_unversioned_and_used_by_their_queries() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        drop(Store::open(&db).unwrap());
+        let indexes = || -> Vec<String> {
+            let conn = Connection::open(&db).unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='index'
+                     AND name IN ('msg_state','tasks_assignee') ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let version = || -> i64 {
+            Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(indexes(), ["msg_state", "tasks_assignee"]);
+        // The schema version is the last migration's: these indexes do not
+        // move it (an older binary compares it, and refuses a higher one).
+        assert_eq!(version(), crate::rollout::SCHEMA_VERSION);
+
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("DROP INDEX msg_state; DROP INDEX tasks_assignee;")
+            .unwrap();
+        assert!(indexes().is_empty());
+        drop(Store::open(&db).unwrap());
+        assert_eq!(indexes(), ["msg_state", "tasks_assignee"]);
+        assert_eq!(version(), crate::rollout::SCHEMA_VERSION);
+
+        let plan = |sql: &str| -> String {
+            let conn = Connection::open(&db).unwrap();
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows.join(" | ")
+        };
+        let inflight = plan(
+            "SELECT alias, id, state, COALESCE(started, created) FROM messages
+             WHERE state IN ('running','submitted')",
+        );
+        assert!(inflight.contains("USING INDEX msg_state"), "{inflight}");
+        assert!(!inflight.contains("SCAN messages"), "{inflight}");
+        let per_agent = plan(
+            "SELECT * FROM tasks WHERE assignee='w1'
+             AND state NOT IN ('verified','done','cancelled','failed') ORDER BY updated",
+        );
+        assert!(per_agent.contains("USING INDEX tasks_assignee"), "{per_agent}");
+        assert!(!per_agent.contains("SCAN tasks"), "{per_agent}");
+    }
+
+    /// v35 adds the CAD-1177 standalone tool receipt tables:
+    /// `app_tool_claims` (claim-before-I/O, one intent per `request_id`
+    /// UNIQUE) and `app_tool_results` (the retained receipt, one per
+    /// `request_id` UNIQUE). `IF NOT EXISTS`, so a genuine v34 store (with
+    /// CAD-1246's index) migrates in place and a half-applied v35
+    /// converges; pre-v35 rows and the v34 index are preserved.
+    #[test]
+    fn migration_v34_to_v35_adds_app_tool_tables() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        // A genuine v34: everything but the tool tables, index kept.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE app_tool_claims;
+                 DROP TABLE app_tool_results;
+                 UPDATE schema_version SET version=34;",
+            )
+            .unwrap();
+        let has = |kind: &str, name: &str| -> bool {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2",
+                    [kind, name],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(has("index", "events_alias_kind"), "v34 index present before");
+        assert!(!has("table", "app_tool_claims"));
+        assert!(!has("table", "app_tool_results"));
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            for table in ["app_tool_claims", "app_tool_results"] {
+                assert!(has("table", table), "{table} missing after migrate");
+            }
+            assert!(has("index", "events_alias_kind"), "main's v34 index must survive");
+            assert_eq!(
+                Connection::open(&db)
+                    .unwrap()
+                    .query_row("SELECT version FROM schema_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                crate::rollout::SCHEMA_VERSION
+            );
+            // The migrated store keeps its pre-v35 rows.
+            assert!(s.agent("a1").unwrap().alias == "a1");
+        }
+        // Half-applied: results table dropped, version rolled back — the
+        // reopen converges.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE app_tool_results;
+                 UPDATE schema_version SET version=34;",
+            )
+            .unwrap();
+        {
+            let _ = Store::open_for_schema_tests(&db).unwrap();
+        }
+        assert!(has("table", "app_tool_results"));
+        assert!(has("index", "events_alias_kind"));
+    }
+
+    /// CAD-1282: a store already at v35 (the Essential Foods hot-swap) lacks
+    /// `app_run_failures`; v36 creates it idempotently and keeps every other
+    /// table and row.
+    #[test]
+    fn migration_v35_to_v36_adds_app_run_failures_to_a_store_already_at_v35() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        // A genuine v35 that never got the retrofitted table.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE app_run_failures;
+                 UPDATE schema_version SET version=35;",
+            )
+            .unwrap();
+        let has = |name: &str| -> bool {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [name],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(!has("app_run_failures"), "v35 store lacks the table");
+        assert!(has("app_tool_claims"), "v35 tool tables are present");
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert!(has("app_run_failures"), "v36 creates app_run_failures");
+            assert!(has("app_tool_claims") && has("app_tool_results"));
+            assert_eq!(
+                Connection::open(&db)
+                    .unwrap()
+                    .query_row("SELECT version FROM schema_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                crate::rollout::SCHEMA_VERSION
+            );
+            assert!(s.agent("a1").unwrap().alias == "a1");
+        }
+        // Reopening at v36 is a no-op converge.
+        let _ = Store::open_for_schema_tests(&db).unwrap();
+        assert!(has("app_run_failures"));
+    }
+
+    /// v37 adds the CAD-1168 retained-attachment table only:
+    /// `chat_files` — metadata rows keyed `chf-<hex>` with the
+    /// `(sha256, scope, context_id)` uniqueness index; bytes live
+    /// content-addressed under `<workspace>/.cadence/chat-files/`, never
+    /// in the table. `IF NOT EXISTS`, so a v36 store migrates in place and a
+    /// half-applied v37 converges; pre-v37 rows are preserved.
+    /// CAD-1365 acceptance: a genuine physical v44 store (the three media
+    /// tables absent) migrates to v45 with the exact media table columns,
+    /// keeps its pre-v45 rows, and reopens idempotently.
+    #[test]
+    fn cad1365_migration_v44_to_v45_adds_media_tables() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE app_media_lineage;
+                 DROP TABLE app_media_asset_origins;
+                 DROP TABLE app_media_publish_requests;
+                 DROP TABLE app_media_assets;
+                 UPDATE schema_version SET version=44;",
+            )
+            .unwrap();
+        let columns = |table: &str| -> Vec<String> {
+            Connection::open(&db)
+                .unwrap()
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let version = || -> i64 {
+            Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(columns("app_media_assets").is_empty());
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert_eq!(version(), crate::rollout::SCHEMA_VERSION);
+            assert_eq!(
+                columns("app_media_assets"),
+                ["id", "install_id", "title", "kind", "lifecycle", "revision", "creator", "created", "updated"]
+            );
+            assert_eq!(
+                columns("app_media_publish_requests"),
+                ["request_id", "asset_id", "expected_revision", "result", "created"]
+            );
+            assert_eq!(columns("app_media_asset_origins"), ["asset_id", "receipt_id"]);
+            // Pre-v45 rows survive the migration.
+            assert_eq!(s.agent("a1").unwrap().alias, "a1");
+        }
+        {
+            Store::open_for_schema_tests(&db).unwrap();
+        }
+        assert_eq!(version(), crate::rollout::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_v36_to_v37_adds_chat_files() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        // A genuine v36: everything but the chat_files table.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE chat_files;
+                 UPDATE schema_version SET version=36;",
+            )
+            .unwrap();
+        let has = |table: &str| -> bool {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(!has("chat_files"));
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert!(has("chat_files"));
+            assert_eq!(
+                Connection::open(&db)
+                    .unwrap()
+                    .query_row("SELECT version FROM schema_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                crate::rollout::SCHEMA_VERSION
+            );
+            // Pre-v37 rows survive.
+            assert_eq!(s.agent("a1").unwrap().alias, "a1");
+        }
+        // Half-applied: table dropped, version rolled back — the
+        // reopen converges.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE chat_files;
+                 UPDATE schema_version SET version=36;",
+            )
+            .unwrap();
+        {
+            let _ = Store::open_for_schema_tests(&db).unwrap();
+        }
+        assert!(has("chat_files"));
     }

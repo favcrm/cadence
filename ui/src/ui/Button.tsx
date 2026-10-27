@@ -1,6 +1,5 @@
 import type { MouseEvent, ReactNode } from "react";
-import { navigate } from "../lib/useLocation";
-import { activateButtonHref } from "./buttonActivate";
+import { activateNavigation, useNavigation } from "../../screen-ui/src/navigation";
 
 export type ButtonVariant = "primary" | "secondary" | "ghost" | "danger";
 export type ButtonSize = "sm" | "md";
@@ -31,6 +30,7 @@ export type ButtonProps = {
   children?: ReactNode;
   onClick?: (event: MouseEvent<HTMLButtonElement | HTMLAnchorElement>) => void;
   "aria-label"?: string;
+  "aria-pressed"?: boolean | "mixed";
 };
 
 function buttonClass(props: ButtonProps): string {
@@ -68,6 +68,7 @@ function ButtonBody({ icon, loading, children }: Pick<ButtonProps, "icon" | "loa
  * in `.btn`) so a full-width control does not sit on the left of its box.
  */
 export function Button(props: ButtonProps) {
+  const navigation = useNavigation();
   const {
     disabled,
     loading,
@@ -89,7 +90,7 @@ export function Button(props: ButtonProps) {
     return (
       <a
         id={id}
-        href={inactive ? undefined : href}
+        href={inactive ? undefined : navigation?.href(href)}
         className={className}
         title={tip}
         aria-label={ariaLabel}
@@ -99,7 +100,7 @@ export function Button(props: ButtonProps) {
         onClick={(event) => {
           onClick?.(event);
           if (inactive) event.preventDefault();
-          activateButtonHref(href, event, navigate, replace ? { replace: true } : undefined);
+          activateNavigation(navigation, href, event, replace ? { replace: true } : undefined);
         }}
       >
         <ButtonBody icon={icon} loading={loading}>
@@ -116,6 +117,7 @@ export function Button(props: ButtonProps) {
       className={className}
       title={tip}
       aria-label={ariaLabel}
+      aria-pressed={props["aria-pressed"]}
       aria-busy={loading || undefined}
       disabled={inactive || undefined}
       onClick={onClick}

@@ -26,11 +26,28 @@ pub enum WikiAction {
     },
     /// Print a page. A blob page streams its bytes; `--meta` prints
     /// its JSON metadata (including the text page's revision) instead.
+    /// `--offset` / `--bytes` / `--rev` read one bounded range as a
+    /// single JSON line under the native tool line bound. Text ranges
+    /// carry `text`; blob ranges carry `data_base64` of the original
+    /// bytes plus the pointer metadata.
     Cat {
         path: String,
         /// Show the blob pointer (sha256/size/mime) rather than bytes.
         #[arg(long)]
         meta: bool,
+        /// Byte offset into the original. Text offsets must fall on a
+        /// UTF-8 boundary. With `--bytes` or `--rev`, the reply is the
+        /// bounded range, not the raw page.
+        #[arg(long)]
+        offset: Option<u64>,
+        /// Maximum original bytes to return. For text, the end is
+        /// exclusive and must fall on a UTF-8 character boundary.
+        #[arg(long)]
+        bytes: Option<u64>,
+        /// Original revision (`fnv1a:…` from a prior read). A different
+        /// revision is refused and no body is returned.
+        #[arg(long)]
+        rev: Option<String>,
     },
     /// Write a page: text from `-m`/`--file`/stdin, or a binary blob
     /// with `--blob --file`.
@@ -49,6 +66,18 @@ pub enum WikiAction {
         /// requires the page to not exist yet.
         #[arg(long)]
         if_rev: Option<String>,
+    },
+    /// CAD-913: upload a local file as a wiki blob (remote org only). The
+    /// file is read and size-checked locally before any request; a symlink
+    /// is refused. Without `--overwrite` an existing name is refused.
+    Upload {
+        /// The local file (a regular file, not a symlink).
+        file: PathBuf,
+        /// The logical wiki path to write, e.g. `sources/report.pdf`.
+        path: String,
+        /// Replace an existing file at `path`.
+        #[arg(long)]
+        overwrite: bool,
     },
     /// Create a directory.
     Mkdir { path: String },
@@ -81,6 +110,24 @@ pub enum WikiAction {
         #[command(subcommand)]
         action: IndexAction,
     },
+    /// Copy between a local path and `wiki:<path>` (CAD-914).
+    /// Exactly one operand uses the `wiki:` prefix. A directory source
+    /// needs `--recursive`. `--update` pins current revisions and may
+    /// replace bytes; the default is create-only. `--resume` continues
+    /// one import job. `--wait-index` polls that job until the command
+    /// deadline.
+    Cp {
+        source: String,
+        dest: String,
+        #[arg(long)]
+        recursive: bool,
+        #[arg(long)]
+        update: bool,
+        #[arg(long)]
+        resume: Option<String>,
+        #[arg(long)]
+        wait_index: bool,
+    },
 }
 
 /// `cadence wiki index …` — the operator's index health and repair.
@@ -97,7 +144,7 @@ fn rpc(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
     client::rpc(state_dir, method, params)
 }
 
-fn entries(out: &Value) {
+pub fn entries(out: &Value) {
     let path = out["path"].as_str().unwrap_or("");
     println!("{path}:");
     for e in out["entries"].as_array().cloned().unwrap_or_default() {
@@ -127,7 +174,37 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
             entries(&out);
             Ok(0)
         }
-        WikiAction::Cat { path, meta } => {
+        WikiAction::Cat {
+            path,
+            meta,
+            offset,
+            bytes,
+            rev,
+        } => {
+            if offset.is_some() || bytes.is_some() || rev.is_some() {
+                let mut params = json!({"path": path});
+                if let Some(offset) = offset {
+                    params["offset"] = json!(offset);
+                }
+                if let Some(bytes) = bytes {
+                    params["bytes"] = json!(bytes);
+                }
+                if let Some(rev) = rev {
+                    params["rev"] = json!(rev);
+                }
+                let out = rpc(state_dir, "wiki_read", params)?;
+                let line = serde_json::to_string(&out)
+                    .map_err(|e| Error::rejected(format!("wiki cat '{path}' range: {e}")))?;
+                if line.len() + 1 >= super::NATIVE_TOOL_LINE_BOUND {
+                    return Err(Error::rejected(format!(
+                        "wiki cat '{path}' refused: the range exceeds the \
+                         {}-byte native tool line bound",
+                        super::NATIVE_TOOL_LINE_BOUND
+                    )));
+                }
+                println!("{line}");
+                return Ok(0);
+            }
             let out = rpc(state_dir, "wiki_read", json!({"path": path}))?;
             match out["kind"].as_str() {
                 Some("text") if *meta => {
@@ -243,6 +320,10 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
             crate::issue::cli::print_json(&out);
             Ok(0)
         }
+        WikiAction::Upload { .. } => Err(Error::rejected(
+            "`wiki upload` sends a file to a remote org; select one with `--org <slug>` \
+             (the local daemon uses `wiki put --blob --file`)",
+        )),
         WikiAction::Mkdir { path } => {
             let out = rpc(state_dir, "wiki_mkdir", json!({"path": path}))?;
             crate::issue::cli::print_json(&out);
@@ -307,5 +388,23 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
             crate::issue::cli::print_json(&out);
             Ok(0)
         }
+        WikiAction::Cp {
+            source,
+            dest,
+            recursive,
+            update,
+            resume,
+            wait_index,
+        } => super::transfer_client::copy_local(
+            state_dir,
+            &super::transfer_client::CopyRequest {
+                source,
+                dest,
+                recursive: *recursive,
+                update: *update,
+                resume: resume.as_deref(),
+                wait_index: *wait_index,
+            },
+        ),
     }
 }

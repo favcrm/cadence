@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 export {};
 /** The actual App must prove the current session before mounting protected rules. */
 declare function require(name: string): any;
@@ -8,14 +9,9 @@ for (const name of ["window", "document", "Node", "Element", "HTMLElement", "SVG
 for (const name of ["addEventListener", "removeEventListener"])
   Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
-// Keep the real app's poll and stream inert; refreshes below use its header control.
+// Keep background timers and streams inert; explicit focus drives verification.
 Object.defineProperty(globalThis, "setInterval", { value: () => 1, configurable: true });
 Object.defineProperty(globalThis, "clearInterval", { value: () => undefined, configurable: true });
-Object.defineProperty(globalThis, "EventSource", { value: class {
-  readyState = 0;
-  addEventListener() {}
-  close() {}
-}, configurable: true });
 const loader = require("module"), originalRequire = loader.prototype.require;
 loader.prototype.require = function (this: unknown, id: string) {
   if (id.endsWith(".css")) return {};
@@ -27,18 +23,21 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const App = (require("../src/App") as typeof import("../src/App")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const AppComponent = (require("../src/App") as typeof import("../src/App")).default;
+const App = () => React.createElement(LocaleProvider, null, React.createElement(AppComponent));
 const { setSessionKey } = require("../src/lib/sessionKey") as typeof import("../src/lib/sessionKey");
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
 const identity = (id: string, operator: boolean | null) => ({
   signed_in: true, read_only: false, operator, actor: id,
-  session: { id, user: { name: id, email: `${id}@example.test`, role: id === "a" ? "operator" : "member" } },
+  session: { id, origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test", user: { sub: id, handle: id, name: id, email: `${id}@example.test`, role: id === "a" ? "operator" : "member" } },
 });
 let current = "a", permissionReads = 0, holdMeta = false;
 const metaRequests: { proof: boolean; id: string }[] = [];
 const pending: { resolve: (response: Response) => void; proof: boolean; id: string }[] = [];
 globalThis.fetch = async (input) => {
   const url = new URL(String(input), "http://localhost");
+  if (url.pathname.endsWith("/stream")) return streamFixture(url.href);
   if (url.pathname === "/api/meta") {
     const proof = url.searchParams.get("operator") === "1", id = current;
     metaRequests.push({ proof, id });
@@ -63,9 +62,7 @@ const root = createRoot(host);
 const flush = async () => { for (let i = 0; i < 3; i++) await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); }); };
 const text = () => host.textContent ?? "";
 const refresh = async () => {
-  const control = host.querySelector('[aria-label="Refresh board"]');
-  assert(control, "Actual app refresh control exists");
-  await React.act(async () => control.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+  await React.act(async () => window.dispatchEvent(new Event("focus")));
   await flush();
 };
 const resolve = async (index: number, id: string, operator: boolean | null) => {
@@ -78,14 +75,14 @@ async function run() {
   await flush();
   assert(permissionReads === 1 && text().includes("/private/session-a"), "Proven session A reads its rules");
   await refresh();
-  assert(metaRequests.at(-1)?.proof === false, "Ordinary polls reuse the same session's proof");
+  assert(metaRequests.at(-1)?.proof === true, "Each verification proves current operator capability");
 
   // Keep the credential unchanged to isolate metadata session identity, as when a
   // server reports a new session while both responses still say signed_in=true.
   current = "b";
   await refresh();
   assert(Number(permissionReads) === 1, "Session B must never inherit A's operator proof and request protected rules");
-  assert(metaRequests.at(-1)?.proof === true, "Same-signed-in identity change re-proves operator capability");
+  assert(metaRequests.at(-1)?.proof === true, "Identity change never reuses another session's operator capability");
   assert(!text().includes("/private/session-a"), "Member session hides A's saved rules");
 
   current = "a";
@@ -95,8 +92,8 @@ async function run() {
   // A real second sign-in replaces the tab key. Hide A's data immediately,
   // before the new session's slow metadata response can arrive.
   current = "b";
-  setSessionKey("key-b");
   holdMeta = true;
+  await React.act(async () => setSessionKey("key-b"));
   await refresh();
   const switched = pending.length - 1;
   assert(pending[switched].proof, "New credential always requests operator proof");
@@ -104,21 +101,32 @@ async function run() {
   await resolve(switched, "b", false);
   assert(Number(permissionReads) === 2, "Proven member session makes no protected request");
 
-  // Two refreshes may overlap under one credential. A late old operator
-  // response must not replace the newer member response or mount protected UI.
+  // Repeated focus while one proof is pending shares that check.
+  await refresh();
+  const shared = pending.length - 1;
+  await refresh();
+  assert(pending.length - 1 === shared, "Concurrent verification coalesces for one credential");
+  await resolve(shared, "b", false);
+
+  // A late old operator proof must never admit its private rules after a
+  // newer credential has already been verified as a member.
+  current = "a";
   await refresh();
   const old = pending.length - 1;
+  current = "b";
+  await React.act(async () => setSessionKey("key-b-2"));
   await refresh();
   const latest = pending.length - 1;
-  await resolve(latest, "b", null);
+  assert(latest > old, "Credential switch creates a distinct verification lifetime");
+  await resolve(latest, "b", false);
   await resolve(old, "a", true);
-  assert(Number(permissionReads) === 2 && !text().includes("/private/session-a"), "Late metadata cannot overwrite the newest session/proof");
+  assert(Number(permissionReads) === 2 && !text().includes("/private/session-a"), "Late old operator metadata cannot mount protected rules for a member");
 
   // Nor may an in-flight proof from B survive a subsequent credential switch.
   await refresh();
   const formerKey = pending.length - 1;
   current = "a";
-  setSessionKey("key-a-2");
+  await React.act(async () => setSessionKey("key-a-2"));
   await refresh();
   const newKey = pending.length - 1;
   await resolve(newKey, "a", true);

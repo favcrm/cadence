@@ -1,0 +1,82 @@
+/* CAD-1319: the Connections page family — index rows and the dedicated
+   Add/detail pages. Reuses the existing tokens and shared classes; no
+   new palette, no global theme change. */
+
+.conn-form {
+  max-width: 40rem;
+  /* Left-aligned by default — never centred. */
+}
+
+.conn-row {
+  display: block;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: var(--radius, 0.375rem);
+  background: var(--color-ink-850);
+  min-width: 0;
+  text-decoration: none;
+  color: inherit;
+}
+
+.conn-row:hover {
+  border-color: var(--color-edge-hover, var(--color-ink-600));
+}
+
+.conn-row-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.conn-row-sub {
+  display: block;
+  margin-top: 0.125rem;
+}
+
+/* Pinned setup header: the page title with the choose-a-different-service
+   action in its trailing area; wraps under the title on narrow screens. */
+.conn-add-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.25rem 0.75rem;
+}
+
+/* Required storage-consent panel (CAD-1319): compact warning card —
+   small icon + title, short risk description, native-checkbox acceptance
+   row, smaller hint. Same warn border/tint tokens as before. */
+.conn-risk {
+  font-size: var(--text-label);
+}
+
+.conn-risk-title {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  color: var(--color-warn);
+  margin-bottom: 0.25rem;
+}
+
+.conn-risk-title strong {
+  color: var(--color-ink-200);
+}
+
+.conn-risk-desc {
+  margin: 0 0 0.375rem 0;
+}
+
+.conn-risk-hint {
+  margin: 0.25rem 0 0 0;
+  font-size: var(--text-micro);
+  color: var(--color-ink-500);
+}
+
+/* Action row: a clear local boundary above Save/Cancel — it stays in the
+   normal flow at the end of the form, never sticky over the fields. */
+.conn-actions {
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--color-edge);
+}

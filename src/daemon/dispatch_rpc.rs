@@ -68,6 +68,32 @@ impl Shared {
             )));
         }
         let caller = self.agent_caller(peer_pid, VERB)?;
+        // Only a proven daemon self-peer can mark an automatic send.
+        // The marker requests stricter validation; it never grants authority.
+        let automatic = match params.get("unattended") {
+            None => false,
+            Some(Value::Bool(true))
+                if peer_pid == std::process::id() && matches!(&caller, AgentCaller::Operator) =>
+            {
+                true
+            }
+            Some(_) => {
+                return Err(Error::rejected(format!(
+                    "{VERB}: `unattended` marks the daemon's own automatic \
+                     dispatch — it is not a caller field"
+                )));
+            }
+        };
+        // Automatic callers retain their outer read guard across self-RPC;
+        // do not reacquire it here while a grant writer may be waiting.
+        let _grant = match &caller {
+            AgentCaller::Agent(_) => Some(
+                self.unattended_lock
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner()),
+            ),
+            AgentCaller::Operator => None,
+        };
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let id = issue::model::check_id(required_str(params, "issue")?)?;
         let text = required_str(params, "text")?;
@@ -99,7 +125,8 @@ impl Shared {
         .map_err(Error::rejected)?;
         let pm = self.pm()?;
         let (project, dir) = issue::write::issue_dir(&pm, &id)?;
-        let (front, _) = issue::write::load_front(&dir)?;
+        let issue_source = std::fs::read_to_string(dir.join("issue.md"))?;
+        let (front, issue_body) = issue::parse::parse_issue(&issue_source)?;
         // The dispatch-side claim check `dispatch::run` runs before
         // `issue start`, repeated here against the connection-bound
         // caller (never `reply_to`, which is a request field): an issue
@@ -131,8 +158,117 @@ impl Shared {
             }
         }
         let sender = self.thread_sender(&alias, peer_pid)?;
-        let (duplicate, state) = self.store.enqueue_steered(
+        // CAD-1822: an already-accepted id is decided by the Store's exact
+        // envelope comparison. A lost-ACK retry must see the known accepted
+        // outcome, so it never re-captures project context or adds metadata;
+        // only an existing pinned selection keeps its conversation real.
+        let already_accepted = self.store.message_exists(&mid)?;
+        // Keep an accepted pinned selection's native conversation real; a
+        // legacy accepted mid gains no new metadata.
+        if already_accepted && self.store.context_pin(&alias, &mid)?.is_some() {
+            self.store.ensure_thread(&alias)?;
+        }
+        // CAD-1846: the sender's `--no-lessons` is daemon-side selection
+        // policy, so it must reach the shared guard rather than being
+        // re-derived here.
+        let no_lessons = match params.get("no_lessons") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(Error::rejected(format!(
+                    "{VERB} takes `no_lessons` as a boolean"
+                )))
+            }
+        };
+        // Derive the context selection for a genuinely new dispatch and pass
+        // it into the store's admission transaction. The selection commits
+        // only with an accepted NEW row: a rejected or duplicate envelope
+        // writes nothing, so a colliding same-id request cannot retarget a
+        // queued turn's context. The guard pins first: when the project is not
+        // opted in it returns without this closure, so no source is read.
+        let selection = if already_accepted {
+            None
+        } else {
+            let context_target = issue::dispatch::ContextTarget {
+                team_role: target.team_role.as_deref(),
+                provider: &target.provider,
+                endpoint_kind: &target.endpoint_kind,
+            };
+            let make = || {
+                let (request, items) = issue::parse::task_request(issue_body);
+                let contract = crate::context_pack::TaskContract::new(
+                    &front.id,
+                    &front.title,
+                    issue_source.as_bytes(),
+                    &items,
+                    request,
+                );
+                Ok((contract, std::borrow::Cow::Borrowed(text)))
+            };
+            match issue::dispatch::context_guard(
+                &pm,
+                &project,
+                &front,
+                context_target,
+                no_lessons,
+                make,
+            )? {
+                Some(prepared) => {
+                    // Opted-in delivery shares the alias's native home
+                    // conversation from the first send onward: the enqueue
+                    // note, provider compaction notes and later receipts must
+                    // name one real thread id.
+                    self.store.ensure_thread(&alias)?;
+                    Some(store::IssueSelection::Pin(
+                        prepared.manifest.pin_payload(&mid),
+                    ))
+                }
+                None => Some(store::IssueSelection::Disabled {
+                    task: id.clone(),
+                    reason: "the assigned project is not opted in to agent delivery".to_string(),
+                }),
+            }
+        };
+        // CAD-1586: a dispatch is a master-target send too — the same
+        // configuration-unlaunchable refusal, before the enqueue.
+        // A retry of an ID that already names a row is decided by the
+        // store's exact-envelope comparison; the refusal is for new sends.
+        if crate::master::is_master(&alias) && !already_accepted {
+            self.master_send_preflight(&alias)?;
+        }
+        let gated = (matches!(&caller, AgentCaller::Agent(_)) || automatic)
+            && self.unattended_issue_bound(&id)?;
+        // Grant→tracker order; keep canonical semantics and owner stable
+        // through enqueue. Resolve blocking reads/Git before the live helper,
+        // whose final expiry check must follow all dispatch setup waits.
+        let _tracker = gated.then(|| pm.lock()).transpose()?;
+        let mut authorized_until = None;
+        if gated {
+            let (live_front, _) = issue::write::load_front(&dir)?;
+            let actual = issue::project::repo_identity(&worktree);
+            let authority = self.unattended_dispatch_authority(&id)?.ok_or_else(|| {
+                Error::rejected(
+                    "the unattended run's live authority vanished during dispatch — refused",
+                )
+            })?;
+            if live_front.owner.as_deref() != Some(alias.as_str()) {
+                return Err(Error::rejected(
+                    "an unattended kickoff must target the workflow's authorized worker",
+                ));
+            }
+            let actual = actual.ok_or_else(|| {
+                Error::rejected("the unattended worktree has no proven repository identity")
+            })?;
+            if actual.0.as_path() != Path::new(&authority.checkout) {
+                return Err(Error::rejected(
+                    "the unattended worktree is outside the workflow's authorized repository",
+                ));
+            }
+            authorized_until = Some(authority.expires_at);
+        }
+        let (duplicate, state) = self.store.enqueue_steered_for_with_conversation(
             &alias,
+            None,
             text,
             Some(reply_to),
             &mid,
@@ -144,6 +280,12 @@ impl Shared {
             &store::Steer::NONE,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            authorized_until,
+            selection,
         )?;
         self.notify_agent(&alias);
         self.wake();
@@ -160,7 +302,7 @@ impl Shared {
     /// repo's worktrees dir. Exactly one must resolve — none means
     /// `issue start` never ran (or its lane is gone), several means the
     /// tracker names competing lanes and a pick would be a guess.
-    fn dispatch_lane(
+    pub(super) fn dispatch_lane(
         &self,
         verb: &str,
         project: &issue::project::Project,
@@ -287,11 +429,8 @@ impl Shared {
                 )));
             }
             crate::model_defaults::validate_model_id(model)?;
-            if provider == "pi" {
-                let policy = match self.pm_dir() {
-                    Ok(dir) => crate::pi_policy::read(&dir)?,
-                    Err(_) => None,
-                };
+            if crate::adapter::registry::pi_family_managed(provider, kind) {
+                let policy = self.stored_pi_policy()?;
                 crate::pi_policy::require_allowed(policy.as_ref(), "worker", model)?;
             }
         }
@@ -302,9 +441,11 @@ impl Shared {
                 )));
             }
             match provider {
-                "pi" => crate::adapter::registry::pi_effort(effort)?,
                 "claude" => crate::adapter::registry::claude_effort(effort)?,
                 "codex" => crate::adapter::registry::codex_effort(effort)?,
+                _ if crate::adapter::registry::pi_family_managed(provider, kind) => {
+                    crate::adapter::registry::pi_effort(effort)?
+                }
                 other => {
                     return Err(Error::rejected(format!(
                         "issue kickoff: provider '{other}' has no effort vocabulary"
@@ -346,6 +487,38 @@ impl Shared {
         })
     }
 
+    /// `issue_kickoff` target decision. `true` registers the alias;
+    /// `false` dispatches to the existing seat unchanged. The seat keeps
+    /// its provider, model and effort — the request only names it.
+    fn kickoff_register(
+        existing: Option<(&str, &str)>,
+        provider: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<bool> {
+        let Some((seat_provider, seat_state)) = existing else {
+            return Ok(true);
+        };
+        if seat_provider != provider {
+            return Err(Error::rejected(format!(
+                "issue kickoff: the seat runs {seat_provider}, not {provider} — \
+                 a seat keeps its provider; change it on the seat"
+            )));
+        }
+        if model.is_some() || effort.is_some() {
+            return Err(Error::rejected(
+                "issue kickoff: an existing seat keeps its model and effort; \
+                 change them on the seat",
+            ));
+        }
+        if seat_state == "attention" {
+            return Err(Error::rejected(
+                "issue kickoff: the seat is fenced — reconcile it before dispatching",
+            ));
+        }
+        Ok(false)
+    }
+
     /// `issue_kickoff` — `{issue, group, provider, model?, effort?, alias?, note?}`.
     pub(super) fn rpc_issue_kickoff(
         self: &Arc<Self>,
@@ -385,15 +558,10 @@ impl Shared {
         // One kickoff at a time, so two callers share one lane.
         let _serial = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
         let pm = self.pm()?;
-        let (project, dir) = issue::write::issue_dir(&pm, &id)?;
-        let (front, body) = issue::write::load_front(&dir)?;
-        if issue::parse::acceptance_items(&body).is_empty() {
-            return Err(Error::rejected(format!(
-                "{id} has no acceptance criteria — add them with \
-                 `cadence issue acceptance {id} --from <file>` before kickoff"
-            )));
-        }
-        issue::plan::gate(&pm.dir, &front, &body)?;
+        // One shared pre-dispatch gate (CLI dispatch uses the same
+        // function); the board is the caller that requires acceptance.
+        let gate = issue::dispatch::gate_issue(&pm, &id, true)?;
+        let (project, front) = (gate.project, gate.front);
         if let Some(path) = self.kickoff_existing_lane(&project, &front)? {
             return Ok(self.kickoff_lane_receipt(&front, &path));
         }
@@ -418,19 +586,28 @@ impl Shared {
                 picked
             }
         };
-        if self.store.agent_opt(&alias)?.is_some() {
-            return Err(Error::rejected(format!(
-                "issue kickoff: '{alias}' is already registered"
-            )));
+        // One target decision: an existing row is a seat and is
+        // dispatched to as-is; a free alias is registered.
+        let existing = self.store.agent_opt(&alias)?;
+        let register = Self::kickoff_register(
+            existing
+                .as_ref()
+                .map(|a| (a.provider.as_str(), a.state.as_str())),
+            provider,
+            model,
+            effort,
+        )?;
+        if register {
+            // A minted alias is checked here too — still before `issue
+            // start`, so a reserved name never opens a worktree.
+            crate::master::refuse_reserved_alias(&alias)?;
         }
-        // A minted alias is checked here too — still before `issue start`,
-        // so a reserved name never opens a worktree.
-        crate::master::refuse_reserved_alias(&alias)?;
 
         // `issue start` creates a lane before `rpc_register` runs. Apply
         // the same effective-model gate here so a refused configuration
-        // leaves no worktree or issue side effect behind.
-        if provider == "pi" && kind == "managed" {
+        // leaves no worktree or issue side effect behind. A seat is
+        // already registered and keeps its model.
+        if register && crate::adapter::registry::pi_family_managed(provider, kind) {
             let pm_dir = self.pm_dir()?;
             let confined = crate::doctor::host::read_host_overrides(&pm_dir)
                 .map_err(Error::rejected)?
@@ -459,12 +636,17 @@ impl Shared {
                 let effective = match effective {
                     Some(m) => m,
                     None => {
-                        let policy = crate::pi_policy::read(&pm_dir)?;
+                        let policy = self.stored_pi_policy()?;
                         crate::pi_policy::resolve_model(policy.as_ref(), "worker", None)?
                     }
                 };
                 crate::adapter::pi::refuse_confined_devin(&alias, true, &effective)?;
             }
+        }
+        // A seat is checked before `issue start`, so a bad pane or a
+        // confined worker refuses with no lane or claim left behind.
+        if !register {
+            issue::dispatch::check_seat(&project, &alias, false, &self.state_dir)?;
         }
         let start_args = issue::start::StartArgs {
             repo: None,
@@ -490,17 +672,19 @@ impl Shared {
             launch.insert("effort".to_string(), json!(effort));
         }
         let launch_text = Value::Object(launch).to_string();
-        self.rpc_register(
-            &json!({
-                "alias": alias,
-                "provider": provider,
-                "endpoint_kind": kind,
-                "role": "worker",
-                "cwd": worktree,
-                "params": launch_text,
-            }),
-            peer_pid,
-        )?;
+        if register {
+            self.rpc_register(
+                &json!({
+                    "alias": alias,
+                    "provider": provider,
+                    "endpoint_kind": kind,
+                    "role": "worker",
+                    "cwd": worktree,
+                    "params": launch_text,
+                }),
+                peer_pid,
+            )?;
+        }
         let args = issue::dispatch::DispatchArgs {
             to: alias.clone(),
             note: None,
@@ -515,7 +699,15 @@ impl Shared {
             take_over: None,
         };
         let mut out = crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
-            issue::dispatch::run(&pm, &id, &args, "operator", &self.state_dir, Some(group))
+            issue::dispatch::run(
+                &pm,
+                &id,
+                &args,
+                "operator",
+                &self.state_dir,
+                Some(group),
+                issue::dispatch::DispatchOrigin::Explicit,
+            )
         })?;
         if let Some(note) = &note {
             // A comment on the ticket — never the file the kickoff
@@ -556,10 +748,7 @@ impl Shared {
         let (front, body) = issue::write::load_front(&dir)?;
         let items = issue::parse::acceptance_items(&body);
         let lane = self.kickoff_existing_lane(&project, &front)?;
-        let policy = match self.pm_dir() {
-            Ok(dir) => crate::pi_policy::read(&dir)?,
-            Err(_) => None,
-        };
+        let policy = self.stored_pi_policy()?;
         let mut providers = Vec::new();
         let mut seen: Vec<&str> = Vec::new();
         for spec in crate::adapter::registry::SPECS {
@@ -569,21 +758,24 @@ impl Shared {
             seen.push(spec.provider);
             let takes_model = spec.launch_params.contains(&"model");
             let takes_effort = spec.launch_params.contains(&"effort");
-            let models = if spec.provider == "pi" {
-                json!(policy
-                    .as_ref()
-                    .map(|p| p.models.allow_for("worker"))
-                    .unwrap_or(&[]))
-            } else if takes_model {
-                Value::Null
-            } else {
-                json!([])
-            };
+            let models =
+                if crate::adapter::registry::pi_family_managed(spec.provider, spec.endpoint_kind) {
+                    json!(policy
+                        .as_ref()
+                        .map(|p| p.models.allow_for("worker"))
+                        .unwrap_or(&[]))
+                } else if takes_model {
+                    Value::Null
+                } else {
+                    json!([])
+                };
             let efforts: &[&str] = if !takes_effort {
                 &[]
+            } else if crate::adapter::registry::pi_family_managed(spec.provider, spec.endpoint_kind)
+            {
+                crate::adapter::registry::PI_EFFORTS
             } else {
                 match spec.provider {
-                    "pi" => crate::adapter::registry::PI_EFFORTS,
                     "claude" => crate::adapter::registry::CLAUDE_EFFORTS,
                     "codex" => crate::adapter::registry::CODEX_EFFORTS,
                     _ => &[],
@@ -623,5 +815,24 @@ impl Shared {
                 "effort": Value::Null,
             },
         }))
+    }
+}
+
+#[cfg(test)]
+mod kickoff_target_tests {
+    use super::*;
+
+    #[test]
+    fn free_alias_registers_and_seat_dispatches() {
+        assert!(Shared::kickoff_register(None, "pi", None, None).unwrap());
+        assert!(!Shared::kickoff_register(Some(("pi", "idle")), "pi", None, None).unwrap());
+    }
+
+    #[test]
+    fn seat_keeps_provider_model_effort_and_is_refused_when_fenced() {
+        assert!(Shared::kickoff_register(Some(("devin", "idle")), "pi", None, None).is_err());
+        assert!(Shared::kickoff_register(Some(("pi", "idle")), "pi", Some("m"), None).is_err());
+        assert!(Shared::kickoff_register(Some(("pi", "idle")), "pi", None, Some("high")).is_err());
+        assert!(Shared::kickoff_register(Some(("pi", "attention")), "pi", None, None).is_err());
     }
 }

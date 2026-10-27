@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReportReq",
+  "description": "CAD-140: `POST /api/reports` — file a question, feedback, idea or\nbug through the canonical intake path. `project` is the board the\noperator files from: ideas land there, while questions, feedback\nand bugs route to the `cadence` project like `cadence report` (the\nserver decides — the UI never routes). Unknown fields are refused\nso a forged `by`/`actor` never reaches the write.",
+  "type": "object",
+  "properties": {
+    "body": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kind": {
+      "type": "string"
+    },
+    "priority": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "project": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "project",
+    "title"
+  ]
+}

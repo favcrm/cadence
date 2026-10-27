@@ -1,0 +1,14 @@
+{
+ "input": {
+  "v": 1,
+  "op": "app.manifest.preflight",
+  "input": {
+   "manifest": "---\nname: a\nname: b\n---\n"
+  }
+ },
+ "expected": {
+  "ok": false,
+  "code": "invalid_manifest",
+  "message": "duplicate entry with key \"name\""
+ }
+}

@@ -479,6 +479,14 @@ const CADENCE_RULES: &[CadenceRule] = &[
 ];
 
 fn argv_confirm(caps: &Captures) -> bool {
+    // Author attribution is not authentication. Exclude only this exact flag
+    // from the argv heuristic; provider-token rules still inspect its value.
+    if caps
+        .get(1)
+        .is_some_and(|flag| flag.as_bytes() == b"--author")
+    {
+        return false;
+    }
     let text = |i: usize| caps.get(i).map(|m| String::from_utf8_lossy(m.as_bytes()));
     let Some(value) = text(3) else {
         return false;
@@ -607,6 +615,19 @@ fn redact(secret: &str) -> String {
 pub fn fingerprint(secret: &[u8]) -> String {
     let digest = Sha256::digest(secret);
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// CAD-1128: the vault row's key-confirmation id — SHA-256(key)[..16].
+/// Stored so a wrong key file is refused before any ciphertext decrypt.
+pub fn fingerprint_key_id(key: &[u8]) -> [u8; 16] {
+    let digest = Sha256::digest(key);
+    digest[..16].try_into().expect("SHA-256 is 32 bytes")
+}
+
+/// CAD-1128: SHA-256 over raw bytes as a `[u8; 32]` — the tamper-evident
+/// row-content digest the vault's public metadata carries.
+pub fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }
 
 /// The full line(s) covering `start..end`.

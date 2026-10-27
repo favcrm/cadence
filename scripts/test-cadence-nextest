@@ -6,13 +6,16 @@ set -eu
 
 # The checks set the suite lock env themselves; an inherited one (a lane
 # shell, pre-push) must not change what they prove.
-unset CADENCE_SUITE_LOCK CADENCE_REVIEW_SUITE_LOCK_HELD
+unset CADENCE_SUITE_LOCK CADENCE_SUITE_LOCK_WAIT_SECS CADENCE_REVIEW_SUITE_LOCK_HELD
 # CI forces colour on; the help-text checks below match plain text.
 NO_COLOR=1 CARGO_TERM_COLOR=never
 export NO_COLOR CARGO_TERM_COLOR
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RUNNER="$ROOT/scripts/cadence-nextest"
+# Independent fake-executable/real-flock acceptance always runs, even when
+# the real pinned binary below is unavailable. It does not compile Rust.
+python3 "$ROOT/scripts/acceptance/test-cad-1383-suite-lock-contract.py"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/cadence-nextest-contract.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
@@ -34,7 +37,7 @@ contains() {
 # A binary that only prints the pinned version must still be rejected.
 cat >"$TMP/cargo-nextest" <<'EOF'
 #!/bin/sh
-printf '%s\n' 'cargo-nextest 0.9.145'
+printf '%s\n' 'cargo-nextest 0.9.150'
 EOF
 chmod +x "$TMP/cargo-nextest"
 if CADENCE_NEXTTEST_BIN="$TMP/cargo-nextest" "$RUNNER" --help \
@@ -55,13 +58,13 @@ contains "refusing install outside the tools dir" "$TMP/err"
 
 # The durable tools dir is the default install (CAD-273); /tmp is the
 # legacy task-local location.
-TOOLS_BIN="${XDG_DATA_HOME:-$HOME/.local/share}/cadence/tools/cadence-nextest-0.9.145/cargo-nextest"
+TOOLS_BIN="${XDG_DATA_HOME:-$HOME/.local/share}/cadence/tools/cadence-nextest-0.9.150/cargo-nextest"
 if [ -n "${CADENCE_NEXTTEST_TEST_BIN:-}" ]; then
     PINNED_BIN=$CADENCE_NEXTTEST_TEST_BIN
 elif [ -x "$TOOLS_BIN" ]; then
     PINNED_BIN=$TOOLS_BIN
 else
-    PINNED_BIN=/tmp/cadence-nextest-0.9.145/cargo-nextest
+    PINNED_BIN=/tmp/cadence-nextest-0.9.150/cargo-nextest
 fi
 if [ ! -x "$PINNED_BIN" ]; then
     # CAD-968: CI sets this so a missing binary can never turn the
@@ -81,7 +84,7 @@ contains "requires CADENCE_SUITE_LOCK" "$TMP/err"
 # CAD-273: with CADENCE_NEXTTEST_BIN unset and nothing on PATH, the wrapper
 # finds the durable tools-dir install (a copy still passes the checksum
 # because the manifest keys the executable by name).
-tools="$TMP/data/cadence/tools/cadence-nextest-0.9.145"
+tools="$TMP/data/cadence/tools/cadence-nextest-0.9.150"
 mkdir -p "$tools"
 cp "$PINNED_BIN" "$tools/cargo-nextest"
 if env -u CADENCE_NEXTTEST_BIN XDG_DATA_HOME="$TMP/data" PATH=/usr/bin:/bin \
@@ -92,9 +95,9 @@ contains "requires CADENCE_SUITE_LOCK" "$TMP/err"
 
 # CAD-273: a successful install leaves no .nextest-extract.* dir behind.
 # Reuses a cached, checksum-verified archive so no network is needed.
-archive=$(dirname "$PINNED_BIN")/cargo-nextest-0.9.145-x86_64-unknown-linux-gnu.tar.gz
+archive=$(dirname "$PINNED_BIN")/cargo-nextest-0.9.150-x86_64-unknown-linux-gnu.tar.gz
 if [ -f "$archive" ]; then
-    fresh="$TMP/fresh/cadence/tools/cadence-nextest-0.9.145"
+    fresh="$TMP/fresh/cadence/tools/cadence-nextest-0.9.150"
     mkdir -p "$fresh"
     cp "$archive" "$fresh/"
     XDG_DATA_HOME="$TMP/fresh" TMPDIR="$TMP/task" "$INSTALLER" >"$TMP/out" 2>"$TMP/err" ||
@@ -148,6 +151,7 @@ contains "Usage: cargo nextest run" "$TMP/review-help.out"
 FX="$TMP/fxroot"
 mkdir -p "$FX/scripts" "$FX/.config"
 cp "$RUNNER" "$FX/scripts/cadence-nextest"
+cp "$ROOT/scripts/suite-lock-config" "$FX/scripts/suite-lock-config"
 cp "$ROOT/.config/cargo-nextest.sha256" "$FX/.config/cargo-nextest.sha256"
 printf '%s\n' '[profile.cadence]' 'retries = 0' 'fail-fast = false' >"$FX/.config/nextest.toml"
 FXRUNNER="$FX/scripts/cadence-nextest"
@@ -173,7 +177,7 @@ mod tests {
 
     #[test]
     fn fail_once_without_retry() {
-        let path = std::env::var("CADENCE_RETRY_COUNT").unwrap();
+        let path = std::env::var("FIXTURE_RETRY_COUNT").unwrap();
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -184,7 +188,7 @@ mod tests {
     }
 }
 EOF
-if NEXTEST_RETRIES=3 CADENCE_RETRY_COUNT="$TMP/retry.count" \
+if NEXTEST_RETRIES=3 FIXTURE_RETRY_COUNT="$TMP/retry.count" \
     CARGO_BUILD_JOBS=4 CADENCE_NEXTTEST_BIN="$PINNED_BIN" \
     CADENCE_SUITE_LOCK="$TMP/retry.lock" "$FXRUNNER" \
     --manifest-path "$TMP/retry-workspace/Cargo.toml" --no-fail-fast \
@@ -200,6 +204,40 @@ attempts=$(wc -l <"$TMP/retry.count" | tr -d ' ')
     cat "$TMP/retry.out" "$TMP/retry.err" >&2
     die "NEXTEST_RETRIES override was not neutralized (attempts=$attempts)"
 }
+
+# CAD-1227: the wrapper drops caller CADENCE_PM_DIR/CADENCE_STATE_DIR (and
+# any other CADENCE_* routing) before the tests run, so a pane's production
+# routing never reaches a test binary. The fixture test fails if any is
+# visible. Fake values only; nothing here names a real path.
+mkdir -p "$TMP/scrub-workspace/src"
+cat >"$TMP/scrub-workspace/Cargo.toml" <<'EOF'
+[package]
+name = "cadence-nextest-scrub-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+EOF
+cat >"$TMP/scrub-workspace/src/lib.rs" <<'EOF'
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn routing_vars_are_absent() {
+        for k in ["CADENCE_PM_DIR", "CADENCE_STATE_DIR", "CADENCE_HOME"] {
+            assert!(std::env::var_os(k).is_none(), "{k} reached the test");
+        }
+    }
+}
+EOF
+if ! CADENCE_PM_DIR="$TMP/fake-pm" CADENCE_STATE_DIR="$TMP/fake-state" \
+    CADENCE_HOME="$TMP/fake-home" CARGO_BUILD_JOBS=4 \
+    CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$TMP/scrub.lock" \
+    "$FXRUNNER" --manifest-path "$TMP/scrub-workspace/Cargo.toml" \
+    >"$TMP/scrub.out" 2>"$TMP/scrub.err"; then
+    cat "$TMP/scrub.out" "$TMP/scrub.err" >&2
+    die "cadence-nextest forwarded CADENCE_PM_DIR/CADENCE_STATE_DIR/CADENCE_HOME to the tests"
+fi
 
 # The outer flock must be held before the nextest child starts. A temporary
 # two-second test gives a separate non-blocking probe time to observe that
@@ -264,7 +302,7 @@ cat >"$TMP/leak-workspace/src/lib.rs" <<'EOF'
 #[cfg(test)]
 mod tests {
     fn leak() {
-        let mark = std::env::var("CADENCE_LEAK_MARK").unwrap();
+        let mark = std::env::var("FIXTURE_LEAK_MARK").unwrap();
         std::process::Command::new("setsid")
             .args(["bash", "-c", "exec -a \"$0\" sleep 120", &mark])
             .stdin(std::process::Stdio::null())
@@ -299,7 +337,7 @@ count_marked() {
     echo "$n"
 }
 trap 'count_marked kill >/dev/null; rm -rf "$TMP"' EXIT HUP INT TERM
-CADENCE_LEAK_MARK="$leak_mark" CARGO_BUILD_JOBS=4 \
+FIXTURE_LEAK_MARK="$leak_mark" CARGO_BUILD_JOBS=4 \
     CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$leak_lock" \
     "$FXRUNNER" --manifest-path "$TMP/leak-workspace/Cargo.toml" --no-fail-fast \
     >"$TMP/leak.out" 2>"$TMP/leak.err" || :

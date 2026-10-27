@@ -3,21 +3,6 @@
 
 use super::*;
 
-/// Run a git subcommand in `dir`, returning stdout or a rejected error
-/// carrying stderr.
-pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = cadence_agent::reaper::output(Command::new("git").arg("-C").arg(dir).args(args))
-        .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))?;
-    if !out.status.success() {
-        return Err(Error::rejected(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
 /// `git worktree add <root>/.cadence/wt/<name> -b cadence/<name>` — the
 /// new checkout becomes the agent's cwd. Shared with `issue start`
 /// through `cadence_agent::worktree`.

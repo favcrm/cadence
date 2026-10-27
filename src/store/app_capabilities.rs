@@ -319,6 +319,19 @@ impl Store {
             result,
             asset,
         } = record;
+        let record = AppCapabilityRecord {
+            id,
+            run,
+            step,
+            message,
+            turn,
+            slot,
+            request,
+            binding_digest,
+            input_digest,
+            result,
+            asset,
+        };
         let serialized = serde_json::to_vec(result)?;
         if serialized.len() > RESULT_BYTES {
             return Err(Error::rejected("app capability result exceeds 256 KiB"));
@@ -420,6 +433,11 @@ impl Store {
                             now()
                         ],
                     )?;
+                    // CAD-1365: an eligible media.generated.image
+                    // receipt atomically catalogs its one draft asset
+                    // plus the private origin link, inside THIS tx —
+                    // a provenance refusal rolls the receipt back too.
+                    Self::app_media_record_origin_in(tx, &record)?;
                     Self::event(
                         &tx,
                         Self::DAEMON_STREAM,

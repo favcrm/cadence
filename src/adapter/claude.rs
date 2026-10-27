@@ -292,6 +292,7 @@ fn launch_command(
         mcp_config,
         crate::master::Profile::Home,
     )
+    .expect("unbound adapter test launch has no workspace isolation context")
 }
 
 fn launch_command_for(
@@ -302,14 +303,23 @@ fn launch_command_for(
     resume: bool,
     mcp_config: Option<&Path>,
     profile: crate::master::Profile,
-) -> (Vec<String>, Option<crate::confine::Policy>) {
+) -> Result<(Vec<String>, Option<crate::confine::Policy>)> {
     let command = build_command_for(env, agent, session_id, resume, mcp_config, profile);
     if !master_confined(env, agent) {
-        return (command, None);
+        if crate::master::is_master(&agent.alias)
+            && env.workspace().is_some()
+            && !env.company_master()
+        {
+            return Err(Error::rejected(
+                "cannot isolate operational upload workspace without effective Master confinement",
+            ));
+        }
+        return Ok((command, None));
     }
     let (confine, policy) = master_confinement(env, state_dir);
+    let policy = crate::home::validate_policy_for_env(policy, env)?;
     let argv = crate::master::confine_argv(&confine, &policy, &command);
-    (argv, Some(policy))
+    Ok((argv, Some(policy)))
 }
 
 /// The master, confined whenever this host can confine it — the stored
@@ -495,10 +505,7 @@ impl ClaudeAdapter {
         if let Some(dir) = self.log_path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)?;
+        let mut log = super::open_provider_log(&self.log_path)?;
         std::io::Write::write_all(
             &mut log,
             format!(
@@ -838,7 +845,7 @@ impl ProviderAdapter for ClaudeAdapter {
             resume,
             mcp_config.as_deref(),
             profile,
-        );
+        )?;
         if let Some(policy) = &confinement {
             self.log_confinement(policy)?;
         }
@@ -1148,6 +1155,260 @@ impl ProviderAdapter for ClaudeAdapter {
     }
 }
 
+#[cfg(all(test, debug_assertions, unix))]
+mod cad1553_company_authority_acceptance {
+    use super::*;
+    use crate::platform::deployments::DeploymentMetadata;
+    use serde_json::json;
+
+    const EXACT: &str = r#"{"schema":1,"master_trust_boundary":"company-container@1","providers":[{"provider":"agenticos","origin":"http://api.internal","manifest_pin":"agenticos-manifest@1/publish_post@2"}]}"#;
+    const ORDINARY: &str = r#"{"schema":1,"providers":[{"provider":"agenticos","origin":"http://api.internal","manifest_pin":"agenticos-manifest@1/publish_post@2"}]}"#;
+
+    fn master(params: Value, state: &Path) -> Agent {
+        Agent {
+            alias: "master".into(),
+            uid: "agt-cad1553".into(),
+            provider: "claude".into(),
+            endpoint_kind: "managed".into(),
+            role: "worker".into(),
+            team_role: None,
+            cwd: state.to_string_lossy().into_owned(),
+            sandbox: "read-only".into(),
+            instructions: None,
+            thread_id: None,
+            session_id: None,
+            model: None,
+            effort: None,
+            pid: None,
+            pid_start: None,
+            endpoint: None,
+            params: Some(params),
+            model_selection: None,
+            quota: None,
+            generation: None,
+            state: "starting".into(),
+            enabled: true,
+            gc_keep: false,
+            archived_at: None,
+            archived_by: None,
+            archive_reason: None,
+            lifecycle_rev: 0,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        }
+    }
+
+    fn plan(
+        env: &ProviderEnv,
+        state: &Path,
+        agent: &Agent,
+    ) -> Result<(Vec<String>, Option<crate::confine::Policy>)> {
+        launch_command_for(
+            env,
+            state,
+            agent,
+            "cad1553-session",
+            false,
+            None,
+            crate::master::Profile::Home,
+        )
+    }
+
+    fn inner(env: &ProviderEnv, state: &Path, agent: &Agent) -> Vec<String> {
+        let _ = state;
+        build_command_for(
+            env,
+            agent,
+            "cad1553-session",
+            false,
+            None,
+            crate::master::Profile::Home,
+        )
+    }
+
+    fn refused(env: &ProviderEnv, state: &Path, agent: &Agent, case: &str) {
+        let error = plan(env, state, agent)
+            .expect_err(&format!("{case} manufactured company file authority"));
+        assert!(
+            error.to_string().contains(
+                "cannot isolate operational upload workspace without effective Master confinement"
+            ),
+            "{case} refused for an unrelated reason: {error}"
+        );
+    }
+
+    #[test]
+    fn mutable_values_cannot_grant_company_authority_but_exact_image_proof_can() {
+        let root = tempfile::Builder::new()
+            .prefix("c1553-claude-")
+            .tempdir()
+            .unwrap();
+        let state = root.path().join("s");
+        let tracker = root.path().join("t");
+        let home = root.path().join("h");
+        let private = root.path().join("p");
+        let workspace = private.join("workspace");
+        for path in [&state, &home, &workspace] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        crate::issue::Pm::init(&tracker).unwrap();
+        let mutable = ProviderEnv::refusing_providers();
+        mutable.set("HOME", home.to_str().unwrap());
+        mutable.set("CADENCE_HOME", private.to_str().unwrap());
+        mutable.set("CADENCE_PM_DIR", tracker.to_str().unwrap());
+        mutable.set("CADENCE_CONFINE_COMMAND", "/bin/false");
+        mutable.set("CADENCE_PI_COMMAND", "/bin/false");
+        mutable.set("CADENCE_CLAUDE_COMMAND", "/bin/false");
+        mutable.set(crate::master::CONFINE_EXTRA_READ_ENV, "");
+        mutable.set(crate::master::CONFINE_EXTRA_WRITE_ENV, "");
+        // A real, fixture-owned absolute extension path avoids relying on the
+        // test runner having no installed image extension in its ambient env.
+        let extension = root.path().join("image-read-extension.js");
+        std::fs::write(&extension, "// command-planning fixture only\n").unwrap();
+        mutable.set(
+            "CADENCE_PI_AGENTICOS_READ_EXTENSION",
+            extension.to_str().unwrap(),
+        );
+        mutable.set(crate::master::TEST_NO_LANDLOCK, "1");
+        assert!(
+            crate::master::confinement_available(&mutable).is_err(),
+            "the real per-daemon no-Landlock seam must be effective"
+        );
+        let bound = mutable.with_workspace(workspace.clone());
+        let loose = master(json!({"unconfined":true,"model":"fixture/model"}), &state);
+        refused(&bound, &state, &loose, "absent authority");
+        let ordinary = DeploymentMetadata::parse(ORDINARY.as_bytes()).unwrap();
+        refused(
+            &bound
+                .clone()
+                .with_company_master(ordinary.hosted_company_master()),
+            &state,
+            &loose,
+            "ordinary provider metadata",
+        );
+
+        // These are hostile values, deliberately supplied below the registry
+        // validator: even an in-memory Agent with forged fields cannot grant
+        // the adapter authority. This is not a test-only granting boolean.
+        let forged = master(
+            json!({
+                "unconfined":true,"model":"fixture/model",
+                "master_trust_boundary":"company-container@1",
+                "company_master":true,"hosted_company_master":true,
+                "provider_deployments":serde_json::from_str::<Value>(EXACT).unwrap()
+            }),
+            &state,
+        );
+        refused(&bound, &state, &forged, "forged agent params alone");
+        let claims = [
+            ("master_trust_boundary", "company-container@1"),
+            ("CADENCE_MASTER_TRUST_BOUNDARY", "company-container@1"),
+            ("CADENCE_COMPANY_MASTER", "true"),
+            ("CADENCE_HOSTED_COMPANY_MASTER", "true"),
+            ("CADENCE_PROVIDER_DEPLOYMENTS", EXACT),
+        ];
+        for (key, value) in claims {
+            mutable.set(key, value);
+        }
+        refused(&bound, &state, &loose, "forged mutable env alone");
+        refused(
+            &bound.clone(),
+            &state,
+            &forged,
+            "forged mutable env plus params",
+        );
+
+        let image = DeploymentMetadata::parse(EXACT.as_bytes()).unwrap();
+        let trusted = bound
+            .clone()
+            .with_company_master(image.hosted_company_master());
+        for (case, env) in [
+            ("exact image", trusted.clone()),
+            (
+                "proof survives clone and checked workspace binding",
+                trusted.clone().with_workspace(workspace.clone()),
+            ),
+        ] {
+            let (argv, policy) = plan(&env, &state, &loose).unwrap_or_else(|error| {
+                panic!("{case} refused existing unconfined Master: {error}")
+            });
+            assert!(
+                policy.is_none(),
+                "{case} falsely emitted a confinement policy"
+            );
+            assert!(
+                !master_confined(&env, &loose),
+                "{case} falsely labeled an unconfined Master confined"
+            );
+            assert_eq!(
+                argv,
+                inner(&env, &state, &loose),
+                "{case} changed provider command instead of lifting only workspace refusal"
+            );
+        }
+
+        // vars() is the actual environment handoff. Re-importing every value
+        // must lose the proof rather than serializing company authority.
+        let replayed = ProviderEnv::default().with_workspace(workspace.clone());
+        for (key, value) in trusted.vars() {
+            replayed.set(&key, value);
+        }
+        refused(&replayed, &state, &loose, "serialized env replay");
+        for (key, _) in claims {
+            mutable.remove(key);
+        }
+        assert!(
+            !bound.company_master(),
+            "mutable-map clone acquired the trusted sibling proof"
+        );
+        assert!(
+            trusted.company_master(),
+            "mutable-map changes erased image-owned proof"
+        );
+        let (argv, policy) = plan(&trusted, &state, &loose).unwrap();
+        assert!(policy.is_none());
+        assert_eq!(argv, inner(&trusted, &state, &loose));
+        refused(&bound, &state, &loose, "env claims removed again");
+
+        // Image authority is not an implicit unconfined opt-in. With the
+        // existing opt-in absent, the launch still uses cadence confine;
+        // on this simulated host that wrapper will fail closed at execution.
+        let not_opted_in = master(json!({"model":"fixture/model"}), &state);
+        let (argv, policy) = plan(&trusted, &state, &not_opted_in).unwrap();
+        assert!(
+            policy.is_some(),
+            "image assertion silently opted Master out of confinement"
+        );
+        assert_eq!(
+            &argv[..2],
+            &["/bin/false".to_string(), "confine".to_string()]
+        );
+
+        // Removing only the unavailable-host seam restores actual host
+        // availability. Where effective confinement exists it must win even
+        // with both valid image proof and the saved unconfined opt-in.
+        mutable.remove(crate::master::TEST_NO_LANDLOCK);
+        let available = crate::master::confinement_available(&trusted).is_ok();
+        let (argv, policy) = plan(&trusted, &state, &loose).unwrap();
+        assert_eq!(
+            policy.is_some(),
+            available,
+            "company trust overrode effective confinement or falsely claimed it"
+        );
+        assert_eq!(master_confined(&trusted, &loose), available);
+        if let Some(policy) = policy {
+            let expected = crate::master::confine_argv(
+                "/bin/false",
+                &policy,
+                &inner(&trusted, &state, &loose),
+            );
+            assert_eq!(argv, expected);
+        } else {
+            assert_eq!(argv, inner(&trusted, &state, &loose));
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1155,6 +1416,7 @@ mod tests {
     fn agent(alias: &str, params: Value) -> Agent {
         Agent {
             alias: alias.into(),
+            uid: format!("agt-{alias}"),
             provider: "claude".into(),
             endpoint_kind: "managed".into(),
             role: "worker".into(),
@@ -1175,6 +1437,11 @@ mod tests {
             generation: None,
             state: "starting".into(),
             enabled: true,
+            gc_keep: false,
+            archived_at: None,
+            archived_by: None,
+            archive_reason: None,
+            lifecycle_rev: 0,
             error: None,
             created: 0.0,
             updated: 0.0,
@@ -1377,8 +1644,12 @@ mod tests {
             "an app session must still hold the scoped verbs"
         );
         assert!(
-            app.iter()
-                .all(|t| t.starts_with("Bash(cadence app ") && home.contains(t)),
+            // CAD-1168: `attachment read` is in both profiles — an app
+            // turn reads the file its own message carried.
+            app.iter().all(|t| (t.starts_with("Bash(cadence app ")
+                || *t == "Bash(cadence attachment read *)"
+                || *t == "Bash(cadence artifact put *)")
+                && home.contains(t)),
             "{app:?}"
         );
         // A worker's launch ignores the profile.

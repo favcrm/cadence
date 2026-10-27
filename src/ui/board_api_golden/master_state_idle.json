@@ -1,0 +1,21 @@
+{
+  "alias": "master",
+  "commands": [],
+  "context": null,
+  "effort": "high",
+  "endpoint_kind": "managed",
+  "identity": {
+    "look": "robot",
+    "name": null,
+    "revision": "b40c80878cd6912c06e80a3da722e0babdf1720f8c14d33c3f98da53d1a5d169",
+    "tone": null
+  },
+  "live": false,
+  "model": "fixture/model",
+  "model_label": null,
+  "provider": "pi",
+  "queue": [],
+  "queued": 0,
+  "session": null,
+  "turn": null
+}

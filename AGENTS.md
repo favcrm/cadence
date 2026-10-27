@@ -3,171 +3,144 @@
 
 This repo may be worked on by cadence-managed agents. If
 `CADENCE_ALIAS` is set in your environment: run `cadence self` for
-your identity and running turn token, read your briefing at
-`.cadence/<group>/BRIEFING-<alias>.md`, report with
+your identity and running turn token, read your briefing at the
+path `cadence agent show` prints, report with
 `cadence message result <msg-id> --token <turn_id> --text ...`,
 and discover peers with `cadence agent list`.
 <!-- cadence:end -->
 
-## Delivery workflow
+## Where the rules live
 
-Main moves every few minutes and many sessions work in parallel. The
-merge, approval and production-safety steps below are exact; follow them
-as written.
+This file holds the principles and the commands, not the policy. Where
+prose and an authoritative source disagree, the source wins.
+
+- **When a rule is enforced mechanically, name the enforcement, not the
+  rule.** A copied rule is a rule that drifts.
+- **What a PR needs is computed, not described.** The shared evaluator
+  `src/issue/delivery_requirements.rs` turns the resolved delivery policy
+  and the PR's diff into the requirements; read them with
+  `cadence delivery requirements --issue <ID> --pr <url> --head <sha>`.
+  The evaluator reads the path lists at the PR's base, so a PR can never
+  classify itself under rules it edited.
+- The merge gate is mechanical: `scripts/enqueue-reviewed <pr> --head <sha>`
+  (`--dry-run` enqueues nothing) refuses with one reason per line for
+  everything still missing. Trust it over any prose, this file included.
+- Risk classes, triggers, who approves what: `docs/roles/risk-classes.md`.
+- Path lists: `docs/roles/one-review-paths.toml` (review count),
+  `docs/roles/risk-paths.toml` (triggers; the daemon compiles it in).
+- The delivery policy: the default lean policy needs no activation, and an
+  absent `delivery:` section is that default — unless a custom section was
+  approved before, in which case that policy stays in force and the
+  delivery counts as unapproved. A project declares its own in
+  `<pm>/<key>/PROJECT.md` and the operator approves it with
+  `cadence issue project approve-work <key>` (`docs/BOARD.md`). A policy
+  that is not the default is not lean: a malformed section, a custom
+  section that is not operator-approved, or a custom section removed after
+  approval falls back to `strict`.
+- Elsewhere: audit evidence `docs/AUDIT.md`, charter and non-goals
+  `docs/CHARTER.md`, dev cycle and the clean-slate transition
+  `docs/DEV-CYCLE.md`, Pi provider mechanics `docs/BOARD.md`, rollout order
+  and rollback `docs/guides/rollout-checklist.md`.
+
+## Principles
 
 ### Scope: essentials first
+
 Deliver the ticket's acceptance items end to end with the simplest change
 that meets them, then stop. Refactors, new abstractions, adjacent fixes and
-nice-to-haves you notice go into a follow-up ticket, not this PR. Polish
-progressively: get the essential path working and reviewed first, improve
-it in later PRs. When two approaches both meet the ticket, pick the smaller
-one and say why in the PR. Plan the same way: one ticket per feature, its
-acceptance covering the feature end to end. Split into more tickets only for
+nice-to-haves go into a follow-up ticket, not this PR. One ticket per
+feature, its acceptance covering the feature end to end; split only for
 another repository or an outcome the operator can use on its own, never a
-ticket per step. Before asking for review, simplify your own diff: drop dead
+ticket per step. When two approaches both meet the ticket, pick the smaller
+one and say why in the PR. Before review, simplify your own diff: drop dead
 code, duplication and abstractions the change does not need, in the lines
-you changed only, with no behaviour change and no refactor outside the
-ticket. Doing it before review costs no extra head.
+you changed only. If expansion is necessary to meet acceptance, explain why
+and ask first; otherwise defer it. Stop once acceptance and required
+verification are complete. Scope never waives a check, a review, an
+approval or a production-safety rule.
 
-### Before you start, and before every push
-- Run `git fetch origin`. Then run
-  `gh pr list -R favcrm/cadence --state all --search "<ISSUE-ID>"` as a
-  separate command and read its output. If another PR covers the issue,
-  stop and report it. Search by topic as well, because duplicates often
-  carry a different id.
-- Work in the lane worktree that `cadence issue start <ID>` creates,
-  never on main.
-- One PR per feature (CAD-1099, CAD-1107), behind a flag if it must land
-  incomplete, not a chain of small slices: each extra PR repeats CI, review,
-  approval and queue. Size a PR by what it delivers (the ticket's acceptance
-  end to end), never by a line cap. Sub-tickets of one feature ship in that
-  one PR under the parent ticket's id in the title; the body lists them.
-  Split only per repository, or to keep a small trigger 1/3 part on the
-  two-review path so the rest needs one. Unfinished parts go into the open
-  PR before review; REVISE fixes go into the same PR; notes on a PASS go to
-  a follow-up PR (see "Notes never block"). Don't stack a PR on an unmerged
-  branch: squash merges break the stack. Before asking for review,
-  `git fetch origin && git rebase origin/main` so the reviewed head is
-  current; after approval, rebase only if the PR conflicts.
+### Evidence: behaviour first, not test counts
 
-### Design note in the PR (CAD-957, revised by CAD-1099)
-When a change touches a daemon-enforced rule (gate, lease, lock, fence,
-operator-only action, exactly-once) or a `docs/roles/risk-classes.md`
-trigger 1-3, or trigger 7 when it changes a gate or who approves what, the PR
-description carries a short design note: the approach, the rules it enforces
-and the cases it refuses. There is no separate pre-code contract review
-round; the code review checks the note and the code together. The operator
-may still ask for a design to be agreed on the ticket before code.
+Done means the ticket's expected result works. Read the acceptance items
+from the ticket and build to them; do not derive the expected result from
+the code you just wrote.
 
-### Review: what a merge needs (interim, CAD-815)
-Until the delivery loop enforces a per-project policy (CAD-814), every
-PR needs each of the following as a PASS on the exact head you enqueue:
-- **One independent review by default (CAD-1099, CAD-1104).** A PR needs ONE
-  independent review covering standards and spec, filed as
-  `# Verdict: <ID> Review (standards+spec) — pass|revise`, when every
-  changed path qualifies under `docs/roles/one-review-paths.toml`. That list
-  covers code, docs, CI/workflows, scripts, rules, dependencies and rollout.
-  It EXCLUDES only trust-boundary/identity and secrets (risk-classes
-  triggers 1 and 3: the auth/identity modules, the identity-heavy source
-  trees listed in that file, and UI, since the board runs with the
-  operator's session). A PR touching an excluded path needs **Standards**
-  and **Spec/security** reviews by two different independent reviewers.
-  For a `human`-class PR (see below) the operator's approval is the second
-  check, so one reviewer plus the operator is enough outside triggers 1
-  and 3. No reviewer may be the author. Prefer a reviewer whose model
-  vendor differs from the author's.
-- **Notes never block (CAD-1104).** REVISE only for a correctness,
-  security or ticket-requirement gap. Everything else (wording, docs,
-  comments, style, extra tests) is a note: the reviewer PASSes with notes,
-  and the author fixes them in a follow-up PR, not in the reviewed PR,
-  because a new head voids every verdict. After a PASS with notes, the
-  author files one follow-up ticket listing them, or says on the ticket why
-  they are dropped. Complexity that hides a bug or makes the change
-  unverifiable is a correctness gap (REVISE); plain style stays a note. A
-  gate or daemon-enforced rule change without its acceptance check ("Gates
-  and security work") is a REVISE, not a note.
-- **The path list is a floor.** A single reviewer who sees auth, identity,
-  credential, signature, secret or confinement logic (triggers 1 and 3) in
-  a one-review PR returns REVISE asking for a second (Spec/security)
-  reviewer, and states the trigger in `Risk:`. When unsure, two. Gate,
-  CI and rules logic stays one review: the operator's approval (enforced
-  from `docs/roles/risk-paths.toml` by `scripts/enqueue-reviewed`) is its
-  second check. The PR
-  then follows the two-review path: the same reviewer refiles as the
-  Standards review on the head, and a different reviewer files Spec/security. A single
-  reviewer of a PR that changes or deletes a check states that no gate check
-  and no isolation or fail-closed default was weakened, naming what was
-  checked.
-  - **Reviewer-count scaling (CAD-814):** for a two-review PR, the default is two distinct
-    reviewers. When the project runs a solo-operator lane — the author is
-    the only registered reviewer-capable identity on the project — a
-    single independent registered-identity reviewer (not the author) may
-    satisfy both axes only if the operator approves that head through the
-    operator-connection-bound `cadence audit approve --pr <n> --head <full
-    sha> --action merge` event on `audit:approvals` (the same channel every
-    human-class approval uses). A ticket comment or note is not approval
-    evidence. The operator approval substitutes for the second reviewer,
-    not for independence: the single reviewer still must not be the author.
-    Solo-operator scaling is declared per project in the `delivery:`
-    policy, not per PR; it does not apply to any `human` trigger other
-    than reviewer count, and it never lowers the Browser QA,
-    qa-verdict-status, or risk-class gates.
-  - **The list is mechanical (CAD-957/1099):** `docs/roles/one-review-paths.toml`
-    (match rules in its header; exclude wins) is the only list, and
-    `scripts/enqueue-reviewed` reads it at the PR's base. It needs no
-    operator approval for the count. `human` triggers are unchanged: a
-    one-review PR that hits a `human` trigger still needs the operator.
-- **Browser QA** at desktop and narrow widths when the PR changes
-  `ui/**`.
-- **Operator approval** when any `human` trigger in
-  `docs/roles/risk-classes.md` applies. That includes, but is not
-  limited to, every change to `.github/**`, `scripts/**` (except the
-  allowlist in `docs/roles/risk-classes.md`), `Cargo.toml`,
-  `Cargo.lock`, `ui/package.json`, `cadence-review.toml`,
-  `src/review.rs`, `docs/roles/**`, `docs/CHARTER.md`
-  and this file. Most gates on a PR run from the PR's
-  own workflow files, so review is the only control on a change to them.
-  The operator decides. An agent the operator designates may prepare
-  the decision and relay it, but never records it, and the PR's author
-  does neither. Before enqueue, the operator records the decision from
-  an operator connection (not an agent pane or endpoint):
-  `cadence audit approve --pr <n> --head <full-sha> --source "<who decided, where>"`.
-  A note or ticket comment is not approval evidence (`docs/AUDIT.md`).
-  **Approve once per ticket (CAD-1106):** instead of a per-head approval the
-  operator may run `cadence audit approve --issue <ID> --action scope` once;
-  `scripts/enqueue-reviewed` then accepts it for every in-scope PR of that
-  ticket when: the PR title names the ticket, its branch is an open lane
-  branch recorded on it, the approval is operator-connection, unrevoked and
-  its digest equals the sha256 of the ticket body as it reads now, every
-  head-pinned verdict's `Risk:` line is `auto` or `human (<numbers>)` without
-  trigger 1 or 3, and each counted verdict carries `Scope: in-scope <ID>`.
-  The ticket body declares its triggers (`Risk: human (4, 7)`; missing or
-  unparseable means no scope approval) and the approval covers only those:
-  the triggers of the changed paths (risk-paths `[schema]`/`[trigger4]`/
-  `[trigger6]`/`[trigger7]`) and of every verdict must be declared, and a
-  human-class path in no trigger list needs the per-head approval. A diff
-  touching a risk-paths trigger 1/3 path or a two-review path always needs
-  the per-head approval, and so does a ticket not in ready, doing or review (backlog, done, dropped). A
-  verdict with more than one `Risk:` line, or a ticket body with more than
-  one line containing `Risk:` (Markdown markers stripped; fenced code and
-  HTML comments count), gives no scope approval. Editing the ticket body voids the scope
-  approval (the digest changes); `cadence audit revoke <id>` withdraws it.
-- **Delegated approval** (CAD-918) when the reviewers class the PR
-  `delegated` (`docs/roles/risk-classes.md`): the agent designated for
-  the project runs, from its own pane,
-  `cadence audit approve --pr <n> --head <full-sha> --delegated --source "<notes>"`.
-  The daemon records it as `delegated:<alias>` only when every safeguard
-  holds, including an allowlist of the paths a PR may touch
-  (`docs/roles/risk-paths.toml`). Triggers 1, 3, 4, 6 and 7 are never delegated. Until the running daemon
-  is built with CAD-918, delegated-class PRs still need the operator.
+- The evidence is what the computed class requires. `routine` needs the
+  required base CI on the exact head and genuine ticket-outcome evidence
+  — no mandatory review, and no fabricated PASS to stand in for one.
+  `consequential` and `strict` add one or two independent reviews of
+  the code against the ticket, as the class states. Do not add routine
+  unit tests, snapshot or fixture tests, stress runs, sandbox demos or
+  evidence ledgers unless the ticket asks for one. For a bug fix, show
+  the failing case once, then fixed.
+- A self-written test proves the author's own assumptions. When a change
+  talks to another repo's API, check the request and response against that
+  repo's current schema.
+- Never claim a check passed that you did not run. Keep implemented,
+  reviewed, merged, installed and operationally verified distinct, and do
+  not touch production to obtain acceptance evidence.
+- Do not port, restore or rebuild deleted or legacy tests. Add a check only
+  when the ticket's outcome cannot be shown without one, or under "Gates
+  and security work" below. Removing an existing check that guards merged
+  code needs the operator's explicit decision, recorded on the ticket.
+- Only an explicit operator-approved ticket opens an emergency clean-slate
+  transition.
 
-Record the evidence so that every merge can be audited:
-- The PR title carries the issue id (`CAD-123: …`). A PR without a
-  ticket does not merge.
-- Each review files one verdict note in the notes dir (`notes_dir` in
-  `pm.yaml`, default `/var/www/agent-notes`). Name it
-  `YYYYMMDD-HHMMSS-<slug>-verdict.md` (UTC), and use this shape so
-  `cadence audit` and the ticket view both read it:
+### Review: what a merge needs
+
+- **Two axes, and they are independent.** The *delivery class* says what
+  evidence a PR needs; the *risk class* says who signs it off. The class
+  comes from the diff, so one repo can be `routine` on one PR and `strict`
+  on another. The evaluator returns three classes:
+  - `routine` — required base CI plus genuine ticket-outcome evidence;
+    zero mandatory reviews; no fabricated PASS.
+  - `consequential` — one independent combined review and the full check
+    floor; no operator approval.
+  - `strict` — the floor the evaluator falls back to: any activation other
+    than the default lean policy — a malformed section, a custom section
+    that is not operator-approved or was removed after approval, or a
+    policy that is not the default once its solo-operator and
+    integration-branch fields are cleared — path lists that cannot be
+    read, incomplete or unsafe diff evidence, a delete, rename, type or
+    mode change, a path or change shape outside the known one-review
+    include list, and the risk-trigger, human-class, one-review-excluded
+    and oversize-diff conditions. It keeps today's legacy floor and never
+    fewer: one combined review on the one-review list, else two (Standards
+    and Spec/security), and the operator floor on human-class paths and
+    over 1500 changed lines.
+- One independent review by default, covering standards and spec, when
+  every changed path qualifies under `docs/roles/one-review-paths.toml`. A
+  path that does not (trust boundary, identity, secrets, `ui/**`) needs
+  two reviews — Standards and Spec/security — from different reviewers. No
+  reviewer may be the author; prefer a different model vendor.
+- A reviewer who sees auth, identity, credential, signature, secret or
+  confinement logic in a one-review PR returns REVISE, names the trigger in
+  `Risk:`, and asks for the second reviewer. When unsure, two.
+- Notes never block. REVISE only for a correctness, security or
+  ticket-requirement gap. Everything else — wording, docs, comments, style,
+  extra tests — is a note: PASS with notes, and the author files one
+  follow-up ticket listing them. Those fixes land in a follow-up PR, never
+  in the reviewed PR, because a new head voids every verdict. A gate or
+  daemon-enforced rule change without its acceptance check is a REVISE.
+- A reviewer of a PR that changes or deletes a check states that no gate
+  check and no isolation or fail-closed default was weakened, naming what
+  was checked.
+- A `human` trigger needs the operator as the second check. One reviewer
+  plus the operator is enough only outside triggers 1 and 3; inside them
+  two independent reviewers are required and the operator's approval does
+  not stand in for the second reviewer. On a project whose `delivery:`
+  policy declares a solo-operator lane, one independent registered-identity
+  reviewer (never the author) may cover both axes when the operator
+  approves that head. The operator's approval substitutes for the second
+  reviewer, never for independence, and never lowers Browser QA, the
+  `qa-verdict` status or the risk class itself. Browser QA at desktop and
+  narrow widths when the PR changes `ui/**`.
+- Bot reviews (Devin Review, CodeRabbit and similar) are advisory: before a
+  PASS, the reviewer blocks on or refutes each severe bug and each critical
+  security finding. Never make a bot's check a required check, and never
+  let a bot push to a PR branch.
+- Each review files one verdict note in `notes_dir` (`pm.yaml`, default
+  `/var/www/agent-notes`), named `YYYYMMDD-HHMMSS-<slug>-verdict.md` (UTC):
 
   ```markdown
   # Verdict: CAD-123 Standards review — pass
@@ -186,253 +159,301 @@ Record the evidence so that every merge can be audited:
   - <blocking / should-fix / nits>
   ```
 
-  For a `human`-class PR, write `Risk: human (<trigger numbers>) — <reason>`;
-  for a `delegated` one, `Risk: delegated (<triggers>)`.
-  The `>` header lines must follow the title directly. A bare `Issue:`
-  line does not link the note to the ticket. The ticket view takes the
-  result from the title, and the audit takes it from the first line
-  under `## Verdict`. The two must say the same thing: a note titled
-  `— pass` whose section says `revise` shows as passed on the ticket.
-  Link the note from the ticket.
-- Before you enqueue, post one ticket comment for the head you enqueue.
-  It lists every required verdict note, the green CI run and, for a
-  `human`-class PR, the approval id.
-- A new head voids every verdict on the old head.
-
-Bot reviews (Devin Review, CodeRabbit and similar) are advisory:
-- Before a PASS, the reviewer reads the bot's findings on that head. In
-  the verdict, the reviewer either blocks on or refutes each severe bug
-  and each critical security finding.
-- Never make a bot's check a required check. Never let a bot push to a
-  PR branch (auto-fix, or applying edits from a bot's chat).
-
-### Merging: use the merge queue, never `--admin`
-- A PR merges only after every review that the section above requires
-  has passed, pinned to the same head SHA.
-- To enqueue, run `scripts/enqueue-reviewed <n> --head <full-reviewed-sha>`
-  (add `--dry-run` to check without enqueueing). It refuses unless the PR
-  is open at that head with auto-merge off, every required check is
-  present and green, the required verdict notes are pinned to the head, a
-  ticket comment lists them and, for a `human` diff, an operator approval
-  is recorded for the head. It never records an approval. The step it
-  wraps is
-  `gh pr merge <n> -R favcrm/cadence --auto --squash --match-head-commit <reviewed-sha>`.
-  The queue re-tests the PR on the newest main plus every entry ahead of
-  it, so you don't need to rebase first. If the head moved after the
-  review, the enqueue is refused.
-- If the queue ejects a PR (`failed_checks`), read the failed run. The
-  cause is often a semantic clash with a PR that just landed, for example
-  a new test that uses a name this PR reserves. Fix it on the branch,
-  show a `git range-diff` against the reviewed head (only the rebase plus
-  the fix), and enqueue it again.
-- Auto-merge survives a force-push. `--match-head-commit` is checked only
-  when auto-merge is enabled, so a later push goes into the queue
-  unreviewed. Before sending a PR with auto-merge on back for changes (a
-  rebase, a fix, another review round), run
-  `gh pr merge <n> -R favcrm/cadence --disable-auto`. Re-enable it, pinned
-  to the new head, only after that head passes review.
-- Use `--admin` only in a declared emergency, never as routine.
-
-### Behavior-first verification and delivery outcomes (CAD-1071)
-
-Done means the ticket's expected result works, not a test count. A green
-suite is regression evidence, not product acceptance.
-
-- Read the acceptance items from the ticket and build to them. Don't derive
-  the expected result from the code you just wrote.
-- The evidence is required CI green plus the independent review of the code
-  against the ticket. Do not add routine unit tests, snapshot or fixture
-  tests, stress runs, sandbox demos or evidence ledgers unless the ticket asks
-  for one. For a bug fix, show the failing case once, then fixed.
-- Self-written tests confirm the author's own assumptions: a fake that mirrors
-  the client proves nothing about the real server. When a change talks to
-  another repo's API, check the request and response against that repo's
-  current schema.
-- Never claim a check passed that you did not run. Keep implemented, reviewed,
-  merged, installed and operationally verified distinct; do not touch
-  production to obtain acceptance evidence.
-
-#### Legacy tests
-
-Do not port, restore or rebuild deleted or legacy tests. Add a check only when
-the ticket's outcome cannot be shown without one, or under "Gates and security
-work" below. Removing an existing check that guards merged code needs the
-operator's explicit decision, recorded on the ticket.
-
-#### Emergency clean-slate transition
-Only an explicit operator-approved ticket can open one; the rules are in
-`docs/DEV-CYCLE.md` ("Emergency clean-slate transition").
-
-### Checks: trust exit codes, not filtered text
-- A shell hook routes commands through `rtk`, which can print "clean" or
-  nothing at all when a check really failed. It has hidden a
-  `cargo fmt` failure and non-empty git diffs. Run checks as
-  `rtk proxy <cmd>` and judge them by exit code:
-  `rtk proxy cargo fmt --all -- --check`,
-  `rtk proxy cargo clippy --all-targets -- -D warnings`,
-  `rtk proxy gh pr checks <n>`, `rtk proxy git diff …`.
-- Never skip, ignore or weaken a test or check to get green.
-
-### Local builds and tests
-- Before every push run `scripts/pre-push` (fmt, live doctor split check,
-  clippy, UI typecheck and active script contracts for what you changed).
-  Use `scripts/pre-push --tests` before requesting review of Rust changes:
-  it always runs the safety floor, even when its source is
-  unchanged. It is the regression floor, not proof of the ticket's outcome (see "Behavior-first verification").
-  Integration split manifests are retired; do not run `split-map-sync`
-  until a reviewed inventory restoration establishes its inputs.
-- sccache is the host-wide rustc wrapper (set in `~/.cargo/config.toml`).
-  Don't override `RUSTC_WRAPPER`. If a build fails in a strange way, rerun
-  it once with `RUSTC_WRAPPER=` to rule sccache out.
-- Many lanes share this host. Use `CARGO_BUILD_JOBS=4` and
-  `--test-threads 2`, and run only filtered test groups; CI runs the full
-  suite.
-- Tests isolate HOME, XDG and TMPDIR under a short `/tmp/<lane>` root,
-  because unix socket paths are limited to 107 bytes. They set
-  `CADENCE_SUITE_LOCK` and pass `RUSTUP_HOME` and `CARGO_HOME` through so
-  the toolchain resolves.
-- If a test fails with a timeout or "daemon not reachable" while the host
-  is loaded, rerun that test alone before treating the failure as real.
-
-### Pi agents and models (CAD-559)
-- Workers and reviewers run on `pi` with **Devin** (`devin/*`) or the
-  configured **OpenCode Go subscription** (`opencode-go/*`) — never
-  OpenRouter. Honor an explicitly requested provider and model; do not
-  silently substitute another provider. If the requested model or its
-  authentication is unavailable, stop and report it. This provider choice
-  does not waive independent review, head-pinned verdicts, Browser QA,
-  operator approval or production-safety rules.
-- **OpenCode Go subscription:** the current Muse 1.3 id is
-  `opencode-go/muse-spark-1.3-contributor`; for example:
-  `cadence join <pm> pi --model opencode-go/muse-spark-1.3-contributor --effort xhigh`.
-  Confirm the exact id with `pi --list-models opencode-go`, then verify it
-  is permitted by the operator-owned `[pi].models` role allowlist and
-  available in the provider configuration the worker launcher loads.
-  Catalog visibility is not proof of authentication or a successful launch.
-  Report launch failures without substituting another provider. Use the
-  existing subscription; never read, print or copy its credentials into a
-  prompt, note or command. Subscription limits and usage apply; do not
-  describe OpenCode Go as free.
-- **Cursor through Pi remains blocked (CAD-603):** `cursor/*` model ids
-  may appear in Pi's catalog, but `src/pi_policy.rs::require_safe_transport`
-  rejects their unsafe argv prompt transport (process-argument exposure
-  and E2BIG). A subscription, model allowlist entry or this documentation
-  does not override that refusal. Do not remove or bypass the guard to
-  dispatch. Enabling Pi + Cursor requires a separately reviewed safe
-  transport implementation and its independent refusal acceptance check.
-  The native `cursor` adapter is a different route, not a silent substitute
-  for a Pi request; use it only when the operator explicitly requests it.
-- **Devin default when no provider is requested:** cost tiers per
-  `devin models list` (the source of truth for Devin):
-  `swe-2-{high,medium,max}` are **Free**; `deepseek-v4-1-flash-*` is
-  low cost ($0.22/1M in, $0.66/1M out), not free. The default worker
-  model is `devin/swe-2-high` with `--effort max` (the SWE-2 Max
-  variant):
-  `cadence join <pm> pi --model devin/swe-2-high --effort max`.
-  `devin/deepseek-v4-1-flash-high` + `--effort max` is the low-cost
-  alternative. Switch a live agent:
-  `cadence agent set <alias> --next-launch model=<m> effort=max`
-  then `agent stop` + `agent resume`.
-- `openrouter/*` models are **paid** — never route a worker or reviewer
-  through openrouter. (The production master's pinned
-  `openrouter/z-ai/glm-5.3-flash` is the one accepted exception; the
-  operator owns that pin in `pm.yaml`.)
-- The devin provider comes from the pinned `pi-devin@<version>` package
-  in `pm.yaml` `[pi].providers`, loaded with `-e` (CAD-559). A daemon
-  built before CAD-559 cannot launch devin models: its worker argv is
-  `--no-extensions` with no `-e`, so pi exits with
-  `Model "devin/…" not found` and the agent fences with
-  "Pi process disconnected". Check the running build before dispatching:
-  `readlink ~/.local/bin/cadence`.
-- Verify by hand as the operator:
-  `pi --list-models -e ~/.pi/agent/npm/node_modules/pi-devin/extensions/index.ts | grep devin`
-  and
-  `pi -p "Reply with exactly: ok" --no-extensions -e <that path> --model devin/deepseek-v4-1-flash-high`.
-- If deepseek answers `Your Windsurf version is out of date` while
-  `devin/swe-2-high` works and the Devin CLI itself runs deepseek fine,
-  the backend is gating the extension's `ide` field, not its version:
-  `pi-devin` ≤ 0.2.1 sends `ide="devin-desktop"` for every request, and
-  Cognition version-gates that ide for non-Local models. The local fix
-  (applied on this host, 2026-09-26) patches
-  `~/.pi/agent/npm/node_modules/pi-devin/src/stream.ts` so the chat
-  metadata sends `ide="windsurf"` unless the model uid starts with
-  `gpt-5-6-` (Devin Local-only models still need `devin-desktop`).
-  A reinstall of the pinned package reverts it — re-apply or fix
-  upstream.
-
-### Production safety
-- A production daemon runs on this host. Never touch
-  `~/.local/state/cadence`, `~/pm` (apart from `cadence issue …`
-  commands), port 3010, the installed `~/.local/bin/cadence`, or the
-  tailnet.
-- Never restart the daemon. The rollout has a single owner; see
-  `cadence rollout status` and CAD-236.
-- Boards and daemons you start use a temp state dir and a port in
-  3110–3199.
-- Never signal or kill a process you did not start.
-
-### Explicitly delegated development staging
-
-The production safety rules above protect production. The operator may explicitly
-assign an agent to manage a named, isolated development or demo instance without
-requiring a new permission request for every refresh. Record the delegation in
-the issue before acting: state and PM directories, board port, any exact tailnet
-mapping, process owner, permitted operations and rollback artifact.
-
-- State and PM directories must be isolated from production; local ports stay
-  in 3110–3199. A shared staging instance has one refresh owner at a time.
-- Within that recorded scope, agents may build, update app bundles, and start,
-  stop or refresh the staging board and daemon through supported commands.
-  Operator-created staging processes require explicit ownership handoff first;
-  permission to inspect staging alone does not authorize stopping them.
-- Reuse the recorded tailnet mapping. Creating, removing or changing a staging
-  mapping requires explicit delegation for that exact port and target; never
-  alter unrelated mappings, the tailnet configuration or operator-user settings.
-- Before a refresh, verify instance identity, process and port ownership,
-  artifact hashes and current mappings. Retain data backups and a pinned rollback
-  build; validate actual served build and application behavior afterward.
-- This exception changes operational scope, not caller identity. Honor native
-  authorization and rollout guards. If a supported command requires an operator
-  connection, implement and independently review a bounded staging delegation
-  path, or use an actual operator connection. Never impersonate an operator,
-  clear identity variables, bypass a guard, or record operator approval as an agent.
-- Production paths, port3010, the installed binary, live customer runtimes and
-  production rollout remain outside this exception. Standard source reviews,
-  tests and audit requirements still apply unless the operator explicitly grants
-  a separate emergency delivery exception.
-
-### Shared scratch space
-- The session scratchpad is shared between agents. Write only inside your
-  own `<scratchpad>/<lane>/` subdirectory, and delete only your own files,
-  by name. Never run `rm <scratchpad>/*`.
+  `Risk:` is `auto`, `human (<triggers>)` or `delegated (<triggers>)`. The
+  `>` header lines follow the title directly; a bare `Issue:` line does not
+  link the note to the ticket. The title and the section must say the same
+  thing. Link the note from the ticket.
+- Before enqueueing, post one ticket comment for that head: every required
+  verdict note, the green CI run and, for a `human` PR, the approval id. A
+  new head voids every verdict on the old head.
 
 ### Gates and security work
+
 - A rule the daemon or an HTTP route enforces (auth, operator-only,
   exactly-once, a gate), whether new or changed, or a change that deletes
-  data, ships with ONE acceptance check proving the bad case is refused (for
-  example an agent caller, a forged field or a replay). It is written from
-  the ticket by someone other than the implementer (the reviewer or the
-  ticket author), and the implementer may not edit or weaken it. The
-  reviewer confirms it exercises the real guard. No other ceremony.
+  data, ships with ONE acceptance check proving the bad case is refused (an
+  agent caller, a forged field, a replay). It is written from the ticket by
+  someone other than the implementer (the reviewer or the ticket author),
+  and the implementer may not edit or weaken it. The reviewer confirms it
+  exercises the real guard.
 - A board or HTTP path must be at least as strict as the daemon RPC it
   relays, so run the same operator proof on the HTTP peer.
 - Restrict actors with allowlists, not denylists.
 
+## Working in this repo
+
+### Before you start, and before every push
+
+- `git fetch origin`, then `gh pr list -R favcrm/cadence --state all
+  --search "<ISSUE-ID>"` as a separate command and read it. If another PR
+  covers the issue, stop and report it. Search by topic too, because
+  duplicates often carry a different id.
+- Work in the lane worktree `cadence issue start <ID>` creates, never on
+  main.
+- One PR per feature, behind a flag if it must land incomplete, not a chain
+  of small slices. Sub-tickets of one feature ship in that PR under the
+  parent ticket's id; the body lists them. Don't stack a PR on an unmerged
+  branch: squash merges break the stack. Before review, `git fetch origin &&
+  git rebase origin/main`; after approval, rebase only if the PR conflicts.
+- The PR title carries the issue id (`CAD-123: …`). A PR without a ticket
+  does not merge.
+- A change that touches a daemon-enforced rule (gate, lease, lock, fence,
+  operator-only action, exactly-once) or a risk-class trigger 1-3 — or
+  trigger 7 when it changes a gate or who approves what — carries a short
+  design note in the PR description: the approach, the rules it enforces
+  and the cases it refuses. The code review checks the note and the code
+  together; there is no separate pre-code round.
+
+### Approvals
+
+- The operator records a `human` approval from an operator connection (not
+  an agent pane or endpoint): `cadence audit approve --pr <n> --head
+  <full-sha> --source "<who decided, where>"`. A note or ticket comment is
+  not approval evidence (`docs/AUDIT.md`).
+- Approve once per ticket: the operator may run `cadence audit approve
+  --issue <ID> --action scope` once, and `scripts/enqueue-reviewed` then
+  accepts it for every in-scope PR of that ticket. Traps: the ticket body
+  must declare its triggers (`Risk: human (4, 7)`); editing the body voids
+  the approval (the digest changes); a ticket outside ready, doing or review
+  gets no scope approval; a diff touching a trigger 1/3 path always needs
+  the per-head approval; and every counted verdict must carry
+  `Scope: in-scope <ID>`. `cadence audit revoke <id>` withdraws it.
+- A `delegated` PR is approved by the designated agent from its own pane:
+  `cadence audit approve --pr <n> --head <full-sha> --delegated --source
+  "<notes>"`. Triggers 1, 3, 4, 6 and 7 are never delegated, and the
+  running daemon must support `--delegated` (`cadence audit approve
+  --help`); where it does not, the operator approves.
+
+### Merging
+
+- Enqueue with `scripts/enqueue-reviewed <n> --head <full-reviewed-sha>`. It
+  refuses unless the PR is open at that head, every required check is
+  present and green, the required verdicts are pinned to the head, a ticket
+  comment lists them and, for a `human` diff, an operator approval is
+  recorded. It never records an approval. The queue re-tests on the newest
+  main, so you do not have to rebase first.
+- If the queue ejects the PR (`failed_checks`), read the failed run: the
+  cause is often a semantic clash with a PR that just landed. Fix it on the
+  branch, show a `git range-diff` against the reviewed head, enqueue again.
+- Auto-merge survives a force-push, so a later push would enter the queue
+  unreviewed. Before sending a PR back for changes, run `gh pr merge <n> -R
+  favcrm/cadence --disable-auto`; re-enable it, pinned to the new head, only
+  after that head passes review.
+- `--admin` only in a declared emergency, never as routine.
+
+### Checks: trust exit codes, not filtered text
+
+- A shell hook routes commands through `rtk`, which can print "clean" or
+  nothing at all when a check really failed. Run checks as `rtk proxy <cmd>`
+  and judge them by exit code: `rtk proxy cargo fmt --all -- --check`,
+  `rtk proxy cargo clippy --all-targets -- -D warnings`, `rtk proxy gh pr
+  checks <n>`, `rtk proxy git diff …`.
+- Never skip, ignore or weaken a test or check to get green.
+
+### Local builds and tests
+
+- Before every push run `scripts/pre-push` (fmt, the live doctor split
+  check, clippy on both feature sets, the release seam, the UI typecheck and
+  the active script contracts for what you changed). `scripts/pre-push
+  --tests` is a focused local diagnostic, not a prerequisite before review;
+  required CI and the merge-group regression floor are unchanged. Neither a
+  local run nor a green suite proves the ticket's outcome. The split
+  manifests are retired; do not run `split-map-sync` until a reviewed
+  inventory restoration establishes its inputs.
+- Prefer `cargo check` over `cargo build` for compile verification:
+  `cargo check` stops at the type check, `cargo build` adds codegen and
+  linking for this crate's five binary targets, and that extra work is the
+  expensive part on a shared host (measured here, same tree, warm sccache:
+  1m41s check against 7m11s build). Build only when you need to run the
+  binary — a board smoke run, `cargo run`, a release artifact — and take the
+  build slot first (`cadence build-slot run build -- cargo build`).
+  `scripts/pre-push` is check-level already, so a plain `cargo build`
+  before every push buys nothing.
+- sccache is the host-wide rustc wrapper (`~/.cargo/config.toml`). Do not
+  override `RUSTC_WRAPPER`; if a build fails oddly, rerun it once with
+  `RUSTC_WRAPPER=` to rule sccache out. Force `SCCACHE_DIR` (and
+  `SCCACHE_CACHE_SIZE`) in that cargo config so a lane's rewritten
+  `HOME`/`XDG_CACHE_HOME` cannot start the shared `:4226` server against a
+  tmp cache. The durable dir is `~/.cache/sccache`.
+
+- Many lanes share this host. Use `CARGO_BUILD_JOBS=4` and
+  `--test-threads 2`, and run only filtered test groups; CI runs the full
+  suite.
+- Tests isolate HOME, XDG and TMPDIR under a short `/tmp/<lane>` root (unix
+  socket paths are limited to 107 bytes), set `CADENCE_SUITE_LOCK` and pass
+  `RUSTUP_HOME` and `CARGO_HOME` through. If a test fails with a timeout or
+  "daemon not reachable" while the host is loaded, rerun that test alone
+  before treating the failure as real.
+
+### Pi agents and models (CAD-559, CAD-855)
+
+Cadence's setting is the source of truth; this file names no model.
+
+- Read the vocabulary from the settings: `cadence settings agents show` is
+  the authoritative document (`config.models`, `config.scope`,
+  `config.roleDefaults`, `config.providers`, `config.pins`); `cadence
+  settings agents model list` and `role list` show the same rows in list
+  form. `pm.yaml`'s `[pi]` block is the retired legacy source that mirrors
+  that authority. A launch uses the id and the scope the settings carry at
+  that moment.
+- Honor an explicitly requested provider and model; do not silently
+  substitute another. If the requested model is not in `config.models`, or
+  its scope does not cover the role that would run it, or its
+  authentication is unavailable, stop and report it. This never waives
+  independent review, head-pinned verdicts, Browser QA, operator approval or
+  production-safety rules.
+- Scope is the rule: a `master`-scoped model is master-only, a
+  `worker`-scoped model serves workers and reviewers. Never route a worker
+  or reviewer through a master-scoped model or a paid provider's metered
+  route. The operator owns the master pin.
+- No model named: use the role default the settings carry (`cadence settings
+  agents role list`) and let the launch resolve it (`cadence join <pm> pi
+  --team-role <role>`). Cost tiers come from the provider's own catalogue
+  (`devin models list`) — read the tier, never quote it from memory. Switch
+  a live agent with `cadence agent set <alias> --next-launch model=<m>
+  effort=<e>`, then `agent stop` + `agent resume`.
+- A subscription provider is used through its subscription, never a metered
+  route. Catalog visibility is not proof of authentication or a successful
+  launch; report launch failures without substituting another provider, and
+  never read, print or copy its credentials into a prompt, note or command.
+  Do not describe a subscription as free.
+- An effort override documents preferences only within the applicable
+  runtime allowlist: `high` means high, not max. Agents must not change
+  runtime pins, credentials or installed packages to authorize their own
+  launch. After an authorized launch, `cadence agent show <alias>` must show
+  `model_effective` and `effort_effective` matching the request; configured
+  values or catalog presence alone are not launch proof. A draft cannot
+  authorize its own review.
+- Cursor through Pi stays blocked (CAD-603): `src/pi_policy.rs::
+  require_safe_transport` rejects the unsafe argv prompt transport, and no
+  allowlist entry or doc overrides that refusal. Do not remove or bypass the
+  guard. Cursor models live on the native cursor provider in Settings >
+  Agents; that adapter is a different route, not a silent substitute for a
+  Pi request.
+- Provider mechanics — the pinned extension, the content digest, the local
+  `ide` patch on a patched install — are in `docs/BOARD.md`. A launch that
+  dies with `Model "devin/…" not found` or "Pi process disconnected" has
+  several causes, one of them a running daemon older than the pin support:
+  check `readlink ~/.local/bin/cadence` before blaming the model.
+
+### Production safety
+
+- A production daemon runs on this host. Never touch
+  `~/.local/state/cadence`, `~/pm` (apart from `cadence issue …` commands),
+  port 3010, the installed `~/.local/bin/cadence` or the tailnet. Never
+  restart the daemon. Never signal or kill a process you did not start.
+- A production deploy needs exactly these two lines to the operator, and
+  nothing else:
+
+  ```
+  cadence update --check --as operator:<name>
+  cadence update --as operator:<name>
+  ```
+
+  If `--check` shows `available` older than `current`, or a `blocked:` line
+  naming an older build or unproven ancestry, report it and stop: the
+  approved candidate is stale (CAD-1235). Use `--to <full main sha>` on
+  both lines only when the operator asks to pin a commit. Never relay
+  `rollout claim|backup|handoff|grant` or `upgrade` recipes; those are
+  recovery internals (`docs/CLI.md`). If `--check` refuses, report the
+  refusal text and stop.
+- Boards and daemons you start use a temp state dir and a port in
+  3110-3199.
+
+### Explicitly delegated development staging
+
+The operator may assign an agent to manage a named, isolated development
+or demo instance, without a permission request per refresh. Record the
+delegation in the issue before acting: state and PM directories, board
+port, any tailnet mapping, process owner, permitted operations, rollback
+artifact.
+
+- State and PM directories are isolated from production; local ports stay
+  in 3110-3199. A shared staging instance has one refresh owner at a time.
+- Within that scope, agents may build, update app bundles and start, stop
+  or refresh the staging board and daemon through supported commands.
+  Operator-created staging processes need an explicit ownership handoff
+  first; permission to inspect is not permission to stop.
+- Reuse the recorded tailnet mapping; creating, removing or changing one
+  needs an explicit delegation for that exact port and target. Never alter
+  unrelated mappings, the tailnet configuration or operator-user settings.
+- Before a refresh, verify instance identity, process and port ownership,
+  artifact hashes and current mappings; retain data backups and a pinned
+  rollback build, then validate the served build and behaviour afterwards.
+- The exception changes operational scope, not caller identity. Honour
+  native authorization and rollout guards; never impersonate an operator,
+  clear identity variables, bypass a guard, or record operator approval as
+  an agent. If a command needs an operator connection, use an actual
+  operator connection or a separately reviewed bounded delegation path.
+- Production paths, port 3010, the installed binary, live customer
+  runtimes and production rollout stay outside this exception. Standard
+  source reviews, tests and audit requirements still apply unless the
+  operator grants a separate emergency delivery exception.
+
+### Shared scratch space
+
+The session scratchpad is shared. Write only inside your own
+`<scratchpad>/<lane>/` subdirectory and delete only your own files, by
+name. Never run `rm <scratchpad>/*`.
+
+### The tracker write lock and an interrupted write
+- The tracker has ONE writer lock: a kernel `flock` on
+  `.git/cadence-write.flock` inside the PM dir. `.write.lock` is the legacy
+  fence and `cadence-write.dirty.v2` is the snapshot of what was already
+  dirty when a writer took it. The kernel lock is what proves liveness; the
+  other two are evidence.
+- A crashed writer leaves its staged work behind. The kernel lock is then
+  FREE and the tracker still refuses every write that touches the leftovers.
+  That refusal is a transaction fence, not contention: "the tracker has an
+  interrupted write" is NOT fixed by waiting, by retrying the same command
+  or by deleting a lock. The leftovers' outcome is uncertain, and only the
+  tracker owner may settle it.
+- A write whose paths are DISJOINT from the leftovers is admitted:
+  `Pm::lock_for_paths` plus `Pm::commit_scoped` (`src/issue/pmlock.rs`,
+  `src/issue/mod.rs`). A whole-tracker lock is disjoint from nothing, so a
+  caller that writes one file must scope its lock to that file — take the
+  scoped lock AND commit through the scoped wrapper. `src/issue/lock_tests.rs`
+  has a guard test that fails the build when a function pairs a scoped lock
+  with the unscoped commit; extend it when you add a caller.
+- While a crashed writer's marker stands, a global Git hazard
+  (`index.lock`, a merge/rebase/cherry-pick state) refuses EVERY write,
+  scoped or not: a path-local recovery cannot settle Git-global state.
+  WITHOUT that marker the hazard is not a refusal at all — the tracker
+  admits the write and hands it to Git, and Git's own answer varies: an
+  `index.lock` makes the commit fail, while a merge or a rebase in
+  progress can accept the commit. Never rely on the tracker to refuse a
+  write because of a Git-global state. A legacy or foreign `.write.lock`
+  is not this build's crash to clear: never delete it as routine, and
+  never treat a file's age as authority.
+- The operator-facing recovery flow for an interrupted write is
+  `cadence issue recover review|decide|execute|status` (CAD-1601, merged).
+  Running it is a separate operator decision, not something an agent
+  performs: `review` is read-only, and `decide`/`execute` require an
+  operator connection. An agent may explain the evidence the review shows,
+  never choose the outcome or perform that mutation.
+- `~/pm` is written only through the `cadence issue …` commands. Never edit
+  the PM dir, the marker, the snapshot or the index by hand, and never
+  impersonate an operator to get around a refusal.
+
 ### Finish: clean up as soon as the PR merges
 - Run `cadence issue reconcile --project <key>`. It marks the ticket done
-  from the merge evidence; if it reports the tracker write lock, run it
-  again. If it holds the ticket (an open PR, a claim newer than the merge),
-  say why on the ticket so the PM can close it.
+  from the merge evidence. If it reports the tracker write lock, do NOT run
+  it again until the PREREQUISITE changed — a refusal that names an
+  interrupted write is a transaction fence, and a retry cannot settle it
+  (see "The tracker write lock and an interrupted write"). Re-run it once
+  the leftovers are resolved and the lock is free. If it holds the ticket
+  (an open PR, a claim newer than the merge), say why on the ticket so the
+  PM can close it.
 - Leave the worktree to the sweep. GitHub deletes the merged branch, and a
   later `issue reconcile` (also run by `issue sync`) removes the worktree
   and local branch once no turn, shell or process stands in it. Never
   `--force` `issue finish`.
 - Delete your own scratch files by name and stop the servers and processes
-  you started.
-- A PR you abandon or replace: close it with a link to what replaces it and
-  say so on the ticket. Don't leave a conflicted PR idle.
+  you started. A PR you abandon or replace: close it with a link to what
+  replaces it and say so on the ticket; do not leave a conflicted PR idle.
 
 ### Reporting
+
 - Every lane ends with a six-field reflection (expected, evidence, cause,
   correction, lesson, next) posted to the ticket.
 - Copy SHAs from `git` or `gh` output; never type them by hand.

@@ -6,13 +6,16 @@ use super::*;
 /// slot plan's own ceiling plus headroom — the farm is *meant* to run
 /// `(build_slots + suite_slots) × jobs_per_lane` deep, so warn above
 /// 1.25× that plan (never below plain saturation). The daemon's
-/// resolved config rides `scan.slots`; unreachable, the built-in
-/// defaults stand in.
+/// resolved config rides `scan.slots`; unreachable,
+/// [`crate::slots::SlotConfig::default`] stands in so the stand-in
+/// never drifts from the daemon's real defaults.
 fn planned_load_warn_ratio(scan: &Scan, cpus: f64) -> f64 {
+    let defaults = crate::slots::SlotConfig::default();
     let cfg = scan.slots.as_ref().map(|s| &s["config"]);
     let key = |k: &str, d: f64| cfg.and_then(|c| c[k].as_f64()).unwrap_or(d);
-    let planned_jobs =
-        (key("build_slots", 3.0) + key("suite_slots", 1.0)) * key("jobs_per_lane", 4.0);
+    let planned_jobs = (key("build_slots", defaults.build_slots as f64)
+        + key("suite_slots", defaults.suite_slots as f64))
+        * key("jobs_per_lane", defaults.jobs_per_lane as f64);
     (planned_jobs * 1.25 / cpus).max(1.0)
 }
 
@@ -126,4 +129,25 @@ pub(super) fn check_load(scan: &Scan) -> Check {
             "cadence build-slot status  # who holds the build slots".to_string()
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CAD-1268 review: a daemon-unreachable scan falls back to
+    /// `SlotConfig::default()` — (3+1) pools × 2 jobs on 4 cpus warns
+    /// above 2.5×; a config the daemon resolved still wins outright.
+    /// `Scan::host` on a socket-less temp state dir returns
+    /// `slots: None` instantly — no daemon probe, no host cpus.
+    #[test]
+    fn planned_load_warn_ratio_defaults_and_status_override() {
+        let root = tempfile::TempDir::new().unwrap();
+        let mut scan = Scan::host(root.path());
+        assert!(scan.slots.is_none());
+        assert_eq!(planned_load_warn_ratio(&scan, 4.0), 2.5);
+        // The daemon's resolved `jobs_per_lane` overrides the default.
+        scan.slots = Some(json!({"config": {"jobs_per_lane": 4}}));
+        assert_eq!(planned_load_warn_ratio(&scan, 4.0), 5.0);
+    }
 }

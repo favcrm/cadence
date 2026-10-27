@@ -3,7 +3,11 @@
 //! External tokens stay in custody; the upstream door derives their company.
 //! Trusted hosted media and source reads (CAD-868, CAD-1060) instead use the
 //! fixed lease-owned door with no bearer; the Worker derives the company.
-mod image;
+#[cfg(test)]
+mod cad1365_original_artifact_acceptance;
+#[cfg(test)]
+mod cad1446_image_max_acceptance;
+pub(crate) mod image;
 pub mod media_import;
 pub mod publish;
 pub mod publish_sender;
@@ -24,17 +28,27 @@ use crate::platform::connections::{
 use crate::platform::{
     AppCapabilityAsset, AppCapabilityError, AppCapabilityOutput, AppCapabilityQuote,
 };
-use image::{image_mime, image_prompt, ASSET_LIMIT};
+use crate::platform::{ImageFailure, ImageReason};
+use image::{fit_to_custody, image_checked, image_prompt, ImageFault, ASSET_LIMIT, FETCH_LIMIT};
 
 pub const PLATFORM: &str = "agenticos_external";
 pub const MANIFEST_PIN: &str = "agenticos-external-provider-tools@3";
+pub(crate) const TEXT_MANIFEST_PIN: &str = "agenticos-external-provider-tools@4";
 /// CAD-1096: the generic workspace-visible source tool (AOS-140). The raw
 /// provider slug stays hidden from workspaces (AOS-103).
 const POSTS_TOOL: &str = "read_instagram_posts";
+/// Matches the contract default and the Library page; the contract maximum is 24.
+const POSTS_COUNT: u32 = 12;
 const IMAGE_TOOL: &str = "generate_image";
+const TEXT_TOOL: &str = "generate_text";
 /// The only model the image slot may run; the price read and every job must
 /// echo it back.
 const IMAGE_MODEL: &str = "openai/gpt-image-2.5";
+/// The reviewed image model a native price card may name. It is the same
+/// constant the price read and every submit must echo.
+pub(crate) fn reviewed_image_model() -> &'static str {
+    IMAGE_MODEL
+}
 const CALL_PATH: &str = "/v1/runtime/tools/call";
 const MEDIA_PRICE_PATH: &str = "/v1/runtime/media/price/image";
 const MEDIA_SUBMIT_PATH: &str = "/v1/runtime/media/image";
@@ -48,8 +62,23 @@ const MEDIA_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// Bounded well inside the 700s worker→daemon RPC frame timeout
 /// (`client::rpc`), so a stuck job answers the caller instead of hanging it.
 const MEDIA_POLL_DEADLINE: Duration = Duration::from_secs(120);
-const MEDIA_UNCERTAIN_SUBMIT: &str =
-    "AgenticOS image submit outcome is uncertain; no automatic retry was made";
+/// The artifact download may be up to 10 MiB; the JSON calls keep 15 s.
+const ARTIFACT_TIMEOUT: Duration = Duration::from_secs(60);
+const MEDIA_UNCERTAIN_SUBMIT: &str = "AgenticOS image submit outcome is uncertain";
+
+/// The exact prompt an image job submits; frozen on the job at admission.
+pub(crate) fn frozen_image_prompt(
+    authority: &Value,
+    input: &Value,
+) -> std::result::Result<String, String> {
+    match authority["binding"]["config"]["provider"].as_str() {
+        Some(PLATFORM) => image_prompt(authority, input),
+        Some(super::account_media::PLATFORM) => {
+            image::image_prompt_for(authority, input, super::account_media::PLATFORM)
+        }
+        _ => Err("frozen image binding names an unreviewed provider".into()),
+    }
+}
 
 pub(crate) fn image_plan_preflight(
     inputs: &BTreeMap<String, String>,
@@ -66,16 +95,27 @@ const TABLE_JSON: &str = r#"{
         {"tool":"generate_image","effect":"draft","scopes":["provider.draft"],"label":"Generate an image draft"}
     ]
 }"#;
+const TABLE_JSON_V4: &str = r#"{
+    "platform":"agenticos_external",
+    "manifest_version":"agenticos-external-provider-tools@4",
+    "tools":[
+        {"tool":"read_instagram_posts","effect":"read","scopes":["provider.read"],"label":"Read public Instagram profile posts"},
+        {"tool":"generate_image","effect":"draft","scopes":["provider.draft"],"label":"Generate an image draft"},
+        {"tool":"generate_text","effect":"draft","scopes":["provider.draft"],"label":"Generate a text draft"}
+    ]
+}"#;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Transport {
     ExternalBearer,
     HostedMediaLease,
+    AccountImage,
 }
 
 pub struct AgenticosExternalAdapter {
     table: ToolTable,
     transport: Transport,
+    account_identity: Option<crate::remote_cli::AccountImageIdentity>,
     base: String,
     deployment_pin: Option<String>,
     http: ureq::Agent,
@@ -93,11 +133,11 @@ impl AgenticosExternalAdapter {
     }
 
     pub(crate) fn hosted_media(
-        _admission: super::deployments::HostedMediaAdmission,
+        admission: super::deployments::HostedMediaAdmission,
     ) -> Result<Self> {
         Self::new(
             "http://api.internal".into(),
-            Some(MANIFEST_PIN),
+            Some(admission.pin()),
             Transport::HostedMediaLease,
         )
     }
@@ -108,11 +148,17 @@ impl AgenticosExternalAdapter {
             .http_status_as_error(false)
             .max_redirects(0)
             .build();
-        let table = ToolTable::from_json(&serde_json::from_str(TABLE_JSON).expect("table JSON"))
+        let table_json = if deployment_pin == Some(TEXT_MANIFEST_PIN) {
+            TABLE_JSON_V4
+        } else {
+            TABLE_JSON
+        };
+        let table = ToolTable::from_json(&serde_json::from_str(table_json).expect("table JSON"))
             .expect("reviewed tool table");
         let adapter = Self {
             table,
             transport,
+            account_identity: None,
             base,
             deployment_pin: deployment_pin.map(str::to_owned),
             http: ureq::Agent::new_with_config(config),
@@ -128,9 +174,97 @@ impl AgenticosExternalAdapter {
         Ok(adapter)
     }
 
+    /// The normal-login adapter reuses only the reviewed image protocol.
+    pub(crate) fn account_image(identity: crate::remote_cli::AccountImageIdentity) -> Result<Self> {
+        let mut adapter = Self::new(identity.audience.clone(), None, Transport::ExternalBearer)?;
+        adapter.transport = Transport::AccountImage;
+        adapter.account_identity = Some(identity);
+        Ok(adapter)
+    }
+
+    fn image_provider(&self) -> &str {
+        if self.transport == Transport::AccountImage {
+            super::account_media::PLATFORM
+        } else {
+            PLATFORM
+        }
+    }
+
+    fn image_approved(&self) -> bool {
+        self.transport == Transport::AccountImage
+            || matches!(
+                self.deployment_pin.as_deref(),
+                Some(MANIFEST_PIN | TEXT_MANIFEST_PIN)
+            )
+    }
+
+    fn image_json(
+        &self,
+        token: Option<&str>,
+        operation: crate::remote_cli::AccountImageOperation,
+    ) -> std::result::Result<(u16, Value), String> {
+        use crate::remote_cli::AccountImageOperation as Op;
+        if let Some(identity) = &self.account_identity {
+            let response = crate::remote_cli::account_image_request(identity, operation, 20)
+                .map_err(|_| {
+                    "saved account image operation refused or could not be confirmed".to_owned()
+                })?;
+            return Ok((
+                response.status,
+                response.body.ok_or("account image response was not JSON")?,
+            ));
+        }
+        match operation {
+            Op::Quote => self.get_media(
+                &format!("{}{MEDIA_PRICE_PATH}", self.base),
+                token,
+                MEDIA_BODY_CAP,
+                "AgenticOS media price read could not reach the service",
+            ),
+            Op::QuoteReference => self.get_media(
+                &format!("{}{MEDIA_PRICE_PATH}?variant=image-to-image", self.base),
+                token,
+                MEDIA_BODY_CAP,
+                "AgenticOS media price read could not reach the service",
+            ),
+            Op::Job { job_id } => self.get_media(
+                &format!("{}{MEDIA_JOBS_PATH}{job_id}", self.base),
+                token,
+                MEDIA_BODY_CAP,
+                "AgenticOS image job read failed",
+            ),
+            Op::Submit {
+                input,
+                idempotency_key,
+            } => {
+                let mut response = authorized(
+                    self.http.post(format!("{}{MEDIA_SUBMIT_PATH}", self.base)),
+                    token,
+                )
+                .header("idempotency-key", &idempotency_key)
+                .send_json(input)
+                .map_err(|_| MEDIA_UNCERTAIN_SUBMIT.to_owned())?;
+                let status = response.status().as_u16();
+                let bytes = response
+                    .body_mut()
+                    .with_config()
+                    .limit(RESPONSE_CAP)
+                    .read_to_vec()
+                    .map_err(|_| MEDIA_UNCERTAIN_SUBMIT.to_owned())?;
+                let envelope = serde_json::from_slice(&bytes)
+                    .map_err(|_| MEDIA_UNCERTAIN_SUBMIT.to_owned())?;
+                Ok((status, envelope))
+            }
+            _ => Err("not a JSON image operation".into()),
+        }
+    }
+
     fn poll_interval(&self) -> Duration {
         #[cfg(feature = "test-seam")]
-        if let Some(interval) = self.test_poll_interval {
+        if let Some(interval) = self
+            .test_poll_interval
+            .or_else(|| test_env_ms("CADENCE_TEST_MEDIA_POLL_MS"))
+        {
             return interval;
         }
         MEDIA_POLL_INTERVAL
@@ -138,7 +272,10 @@ impl AgenticosExternalAdapter {
 
     fn poll_deadline(&self) -> Duration {
         #[cfg(feature = "test-seam")]
-        if let Some(deadline) = self.test_poll_deadline {
+        if let Some(deadline) = self
+            .test_poll_deadline
+            .or_else(|| test_env_ms("CADENCE_TEST_MEDIA_DEADLINE_MS"))
+        {
             return deadline;
         }
         MEDIA_POLL_DEADLINE
@@ -154,6 +291,23 @@ impl AgenticosExternalAdapter {
     ) -> std::result::Result<Option<&'a str>, String> {
         match self.transport {
             Transport::ExternalBearer => bearer_token(credential).map(Some),
+            Transport::AccountImage => {
+                let identity = self
+                    .account_identity
+                    .as_ref()
+                    .ok_or("account image identity unavailable")?;
+                if !credential.is_empty()
+                    || config["provider"] != super::account_media::PLATFORM
+                    || config["connection_kind"] != "builtin"
+                    || config["account"] != super::account_media::account_handle(identity)
+                {
+                    return Err(
+                        "account image requires its exact credentialless saved-login identity"
+                            .into(),
+                    );
+                }
+                Ok(None)
+            }
             Transport::HostedMediaLease => {
                 if !credential.is_empty()
                     || config["account"] != "hosted"
@@ -215,6 +369,13 @@ impl AgenticosExternalAdapter {
             (Some("social.read"), Some(1), Some("list_posts"), Some("read"), Some(POSTS_TOOL)) => {
                 POSTS_TOOL
             }
+            (
+                Some("text.generate"),
+                Some(1),
+                Some("generate_text"),
+                Some("draft"),
+                Some(TEXT_TOOL),
+            ) if self.deployment_pin.as_deref() == Some(TEXT_MANIFEST_PIN) => TEXT_TOOL,
             _ => return Err("provider quote names an unreviewed action".into()),
         };
         let token = self.lease_token(credential, config)?;
@@ -278,7 +439,7 @@ impl AgenticosExternalAdapter {
             .header("idempotency-key", idempotency_key)
             .send_json(json!({
                 "slug": POSTS_TOOL,
-                "query": {"handle": handle},
+                "query": {"handle": handle, "count": POSTS_COUNT},
                 "max_charge_minor": ceiling,
             }))
             .map_err(|_| {
@@ -373,17 +534,35 @@ impl AgenticosExternalAdapter {
     /// provider-tool catalog. The quote carries the current rate; the
     /// daemon re-quotes at execution and refuses a changed rate, so a price
     /// move can never silently bill under an old approval.
-    fn quote_image(
+    pub(crate) fn quote_image(
         &self,
         credential: &[u8],
         binding: &Value,
     ) -> std::result::Result<AppCapabilityQuote, String> {
-        if self.deployment_pin.as_deref() != Some(MANIFEST_PIN) {
+        self.quote_image_kind(credential, binding, false)
+    }
+
+    /// Reference-edit rate. Text-to-image quoting stays on [`Self::quote_image`].
+    pub(crate) fn quote_reference_image(
+        &self,
+        credential: &[u8],
+        binding: &Value,
+    ) -> std::result::Result<AppCapabilityQuote, String> {
+        self.quote_image_kind(credential, binding, true)
+    }
+
+    fn quote_image_kind(
+        &self,
+        credential: &[u8],
+        binding: &Value,
+        reference_edit: bool,
+    ) -> std::result::Result<AppCapabilityQuote, String> {
+        if !self.image_approved() {
             return Err("image generation has not been approved by this deployment".into());
         }
         let config = &binding["config"];
         let mapping = &config["mapping"];
-        if config["provider"] != PLATFORM
+        if config["provider"] != self.image_provider()
             || config["account"].as_str().is_none_or(str::is_empty)
             || config["connection_id"].as_str().is_none_or(str::is_empty)
             || mapping["capability"] != "media.generate"
@@ -396,12 +575,12 @@ impl AgenticosExternalAdapter {
             return Err("provider quote names an unreviewed action".into());
         }
         let token = self.lease_token(credential, config)?;
-        let (status, envelope) = self.get_media(
-            &format!("{}{MEDIA_PRICE_PATH}", self.base),
-            token,
-            MEDIA_BODY_CAP,
-            "AgenticOS media price read could not reach the service",
-        )?;
+        let operation = if reference_edit {
+            crate::remote_cli::AccountImageOperation::QuoteReference
+        } else {
+            crate::remote_cli::AccountImageOperation::Quote
+        };
+        let (status, envelope) = self.image_json(token, operation)?;
         match status {
             200 if envelope["ok"] == true => {}
             404 => return Err("AgenticOS media serving is not enabled for this deployment".into()),
@@ -437,14 +616,19 @@ impl AgenticosExternalAdapter {
                 )
             }
         };
+        let expected_slug = if reference_edit {
+            "generate_image.image-to-image"
+        } else {
+            IMAGE_TOOL
+        };
         if data["kind"] != "image"
             || data["model"] != IMAGE_MODEL
-            || price["slug"] != IMAGE_TOOL
+            || price["slug"] != expected_slug
             || price["currency"] != "USD"
         {
             return Err("AgenticOS media price view drifted from the reviewed image tool".into());
         }
-        let canonical = json!({"kind":"image","model":IMAGE_MODEL,"price":{"slug":IMAGE_TOOL,"chargeMinor":charge,"currency":"USD","version":version}});
+        let canonical = json!({"kind":"image","model":IMAGE_MODEL,"price":{"slug":expected_slug,"chargeMinor":charge,"currency":"USD","version":version}});
         let bytes = serde_json::to_vec(&canonical)
             .map_err(|_| "AgenticOS media price view cannot be serialized")?;
         Ok(AppCapabilityQuote {
@@ -453,7 +637,14 @@ impl AgenticosExternalAdapter {
             unit_price_micros: charge,
             units: 1,
             total_price_micros: charge,
-            price_revision: format!("media:sha256:{:x}", Sha256::digest(&bytes)),
+            price_revision: match &self.account_identity {
+                Some(identity) => format!(
+                    "{}{:x}",
+                    super::account_media::source_digest(identity),
+                    Sha256::digest(&bytes)
+                ),
+                None => format!("media:sha256:{:x}", Sha256::digest(&bytes)),
+            },
         })
     }
 
@@ -463,22 +654,20 @@ impl AgenticosExternalAdapter {
     /// retry under the same key replays the same upstream job. No price
     /// ceiling is enforced here (pass-through pricing); the receipt records
     /// the actual chargeMinor beside the approved rate.
-    fn call_image(
+    fn call_text(
         &self,
         credential: &[u8],
         authority: &Value,
         input: &Value,
         idempotency_key: &str,
     ) -> std::result::Result<AppCapabilityOutput, AppCapabilityError> {
-        if self.deployment_pin.as_deref() != Some(MANIFEST_PIN) {
-            return Err(AppCapabilityError::Refused(
-                "image generation has not been approved by this deployment".into(),
-            ));
+        const UNCERTAIN: &str =
+            "AgenticOS text generation outcome is uncertain; retry reuses the same key";
+        if self.deployment_pin.as_deref() != Some(TEXT_MANIFEST_PIN) {
+            return Err(AppCapabilityError::Refused("AgenticOS text generation is unavailable without the reviewed manifest v4 deployment".into()));
         }
-        let prompt = image_prompt(authority, input).map_err(AppCapabilityError::Refused)?;
-        // The frozen quote still proves shape (schema/currency/units); its
-        // amount is recorded, never enforced as a charge ceiling.
-        let quoted = frozen_charge_ceiling(authority).map_err(AppCapabilityError::Refused)?;
+        validate_text_authority(authority).map_err(AppCapabilityError::Refused)?;
+        let body = validate_text_input(input).map_err(AppCapabilityError::Refused)?;
         let token = self
             .lease_token(credential, &authority["binding"]["config"])
             .map_err(AppCapabilityError::Refused)?;
@@ -487,33 +676,151 @@ impl AgenticosExternalAdapter {
                 "provider idempotency key is invalid".into(),
             ));
         }
-        let request = self.http.post(format!("{}{MEDIA_SUBMIT_PATH}", self.base));
-        let mut response = authorized(request, token)
+        let ceiling = frozen_charge_ceiling(authority).map_err(AppCapabilityError::Refused)?;
+        let mut response = authorized(self.http.post(format!("{}{CALL_PATH}", self.base)), token)
             .header("idempotency-key", idempotency_key)
-            .send_json(json!({
-                "model": IMAGE_MODEL,
-                "prompt": prompt,
-                "aspectRatio": "1:1",
-            }))
-            .map_err(|_| AppCapabilityError::Uncertain(MEDIA_UNCERTAIN_SUBMIT.into()))?;
+            .send_json(json!({"slug":TEXT_TOOL,"body":body,"max_charge_minor":ceiling}))
+            .map_err(|_| AppCapabilityError::Uncertain(UNCERTAIN.to_owned()))?;
         let status = response.status().as_u16();
         let bytes = response
             .body_mut()
             .with_config()
             .limit(RESPONSE_CAP)
             .read_to_vec()
-            .map_err(|_| AppCapabilityError::Uncertain(MEDIA_UNCERTAIN_SUBMIT.into()))?;
+            .map_err(|_| AppCapabilityError::Uncertain(UNCERTAIN.to_owned()))?;
         let envelope: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| AppCapabilityError::Uncertain(MEDIA_UNCERTAIN_SUBMIT.into()))?;
+            .map_err(|_| AppCapabilityError::Uncertain(UNCERTAIN.to_owned()))?;
+        if status != 200 || envelope["ok"] != true {
+            let code = refused_code(&envelope);
+            // A conflict or throttle never proves the provider did not run:
+            // the same idempotency key must be retried or reconciled, so
+            // none of these is a free refusal (the image path agrees).
+            if matches!(status, 408 | 409 | 425 | 429) {
+                return Err(AppCapabilityError::Uncertain(format!(
+                    "AgenticOS text generation outcome is uncertain: {code}"
+                )));
+            }
+            if status >= 500 || status == 0 {
+                return Err(AppCapabilityError::Uncertain(UNCERTAIN.into()));
+            }
+            return Err(AppCapabilityError::Refused(format!(
+                "AgenticOS text generation refused: {code}"
+            )));
+        }
+        // A 200 with a malformed result may already have been charged:
+        // a missing acknowledgment is uncertain, never free.
+        let result = validate_text_result(&envelope["data"]["result"])
+            .map_err(AppCapabilityError::Uncertain)?;
+        Ok(AppCapabilityOutput {
+            result,
+            asset: None,
+        })
+    }
+
+    /// The pre-CAD-1315 entry (run-bound images): the typed failure folded
+    /// back into the generic refused/uncertain outcome.
+    fn call_image(
+        &self,
+        credential: &[u8],
+        authority: &Value,
+        input: &Value,
+        idempotency_key: &str,
+    ) -> std::result::Result<AppCapabilityOutput, AppCapabilityError> {
+        self.call_image_coded(credential, authority, input, idempotency_key)
+            .map_err(Into::into)
+    }
+
+    /// Submit (idempotent on `idempotency_key`: AgenticOS replays the same job
+    /// for the same key and body, never a second reserve), poll, fetch. Every
+    /// failure carries an allow-listed [`ImageReason`], classified here by
+    /// type and never from provider text.
+    pub(crate) fn call_image_coded(
+        &self,
+        credential: &[u8],
+        authority: &Value,
+        input: &Value,
+        idempotency_key: &str,
+    ) -> std::result::Result<AppCapabilityOutput, ImageFailure> {
+        use ImageReason as R;
+        let uncertain_submit = || ImageFailure::uncertain(R::SubmitError, MEDIA_UNCERTAIN_SUBMIT);
+        if !self.image_approved() {
+            return Err(ImageFailure::refused(
+                R::NotApproved,
+                "image generation has not been approved by this deployment",
+            ));
+        }
+        if self.transport == Transport::AccountImage {
+            let identity = self.account_identity.as_ref().ok_or_else(|| {
+                ImageFailure::refused(R::NotAuthorized, "account image identity unavailable")
+            })?;
+            super::account_media::validate_quote_source(
+                identity,
+                authority["quote"]["price_revision"].as_str().unwrap_or(""),
+            )
+            .map_err(|detail| ImageFailure::refused(R::NotAuthorized, detail))?;
+        }
+        // Library reference edits submit the frozen instructions and the
+        // verified original ref. They never fall through to subject/source.
+        let prompt = match library_reference_prompt(authority) {
+            Ok(Some(prompt)) => prompt,
+            Ok(None) => match authority["frozen_prompt"].as_str() {
+                Some(frozen) => frozen.to_owned(),
+                None => image::image_prompt_for(authority, input, self.image_provider())
+                    .map_err(|detail| ImageFailure::refused(R::PlanInvalid, detail))?,
+            },
+            Err(detail) => return Err(ImageFailure::refused(R::PlanInvalid, detail)),
+        };
+        // The frozen approval maximum uses the same micro-USD units as
+        // AgenticOS chargeMinor; submit it for enforcement before reservation.
+        let quoted = frozen_charge_ceiling(authority)
+            .map_err(|detail| ImageFailure::refused(R::PlanInvalid, detail))?;
+        let token = self
+            .lease_token(credential, &authority["binding"]["config"])
+            .map_err(|detail| ImageFailure::refused(R::NotApproved, detail))?;
+        if !valid_caller_key(idempotency_key) {
+            return Err(ImageFailure::refused(
+                R::PlanInvalid,
+                "provider idempotency key is invalid",
+            ));
+        }
+        let reference = authority["reference_edit"]["ref"]
+            .as_str()
+            .filter(|reference| valid_media_ref(reference))
+            .map(str::to_string);
+        if authority
+            .get("reference_edit")
+            .is_some_and(|value| !value.is_null())
+            && reference.is_none()
+        {
+            return Err(ImageFailure::refused(
+                R::PlanInvalid,
+                "reference edit has no verified artifact reference",
+            ));
+        }
+        let mut submit_input = json!({"model":IMAGE_MODEL,"prompt":prompt,"aspectRatio":"1:1","max_charge_minor":quoted});
+        if let Some(reference) = &reference {
+            submit_input["references"] = json!([reference]);
+        }
+        let (status, envelope) = self
+            .image_json(
+                token,
+                crate::remote_cli::AccountImageOperation::Submit {
+                    input: submit_input,
+                    idempotency_key: idempotency_key.to_owned(),
+                },
+            )
+            .map_err(|_| uncertain_submit())?;
         match status {
             200 | 201 if envelope["ok"] == true => {}
             404 if envelope["ok"] == false => {
-                return Err(AppCapabilityError::Refused(
-                    "AgenticOS media serving is not enabled for this deployment".into(),
+                return Err(ImageFailure::refused(
+                    R::MediaDisabled,
+                    "AgenticOS media serving is not enabled for this deployment",
                 ))
             }
             403 if envelope["ok"] == false => {
-                return Err(AppCapabilityError::Refused(
+                return Err(ImageFailure::refused(
+                    R::NotAuthorized,
                     match refused_code(&envelope).as_str() {
                         "insufficient_scope" => {
                             "AgenticOS connection credential lacks the runtime draft scope".into()
@@ -526,63 +833,84 @@ impl AgenticosExternalAdapter {
                 ))
             }
             402 if envelope["ok"] == false && refused_code(&envelope) == "insufficient_funds" => {
-                return Err(AppCapabilityError::Refused(
-                    "AgenticOS workspace has insufficient credit".into(),
+                return Err(ImageFailure::refused(
+                    R::InsufficientFunds,
+                    "AgenticOS workspace has insufficient credit",
+                ));
+            }
+            409 if envelope["ok"] == false
+                && matches!(refused_code(&envelope).as_str(), "disabled" | "unpriced") =>
+            {
+                return Err(ImageFailure::refused(
+                    R::SubmitRefused,
+                    format!(
+                        "AgenticOS image submit refused: {}",
+                        refused_code(&envelope)
+                    ),
                 ));
             }
             409 | 408 | 425 | 429 => {
-                return Err(AppCapabilityError::Uncertain(format!(
-                    "AgenticOS image submit outcome is uncertain: {}",
-                    refused_code(&envelope)
-                )))
+                let code = refused_code(&envelope);
+                let reason = match (status, code.as_str()) {
+                    (409, "price_changed") => R::PriceChanged,
+                    (409, "uncertain" | "key_conflict") => R::ProviderUncertain,
+                    _ => R::ProviderBusy,
+                };
+                return Err(ImageFailure::uncertain(
+                    reason,
+                    format!("AgenticOS image submit outcome is uncertain: {code}"),
+                ));
             }
-            s if s >= 500 => {
-                return Err(AppCapabilityError::Uncertain(MEDIA_UNCERTAIN_SUBMIT.into()))
-            }
+            s if s >= 500 => return Err(uncertain_submit()),
             s if (400..500).contains(&s) && envelope["ok"] == false => {
-                return Err(AppCapabilityError::Refused(format!(
-                    "AgenticOS image submit refused: {}",
-                    refused_code(&envelope)
-                )))
+                return Err(ImageFailure::refused(
+                    R::SubmitRefused,
+                    format!(
+                        "AgenticOS image submit refused: {}",
+                        refused_code(&envelope)
+                    ),
+                ))
             }
-            _ => return Err(AppCapabilityError::Uncertain(MEDIA_UNCERTAIN_SUBMIT.into())),
+            _ => return Err(uncertain_submit()),
         }
         let mut job = envelope["data"]["job"].clone();
-        checked_media_job(&job, None).map_err(AppCapabilityError::Uncertain)?;
+        checked_media_job(&job, None, reference.is_some())
+            .map_err(|detail| ImageFailure::uncertain(R::JobMalformed, detail))?;
         let deadline = Instant::now() + self.poll_deadline();
         loop {
             let id = job["id"].as_str().unwrap_or_default().to_owned();
             match job["status"].as_str().unwrap_or("") {
                 "succeeded" => break,
                 "failed" | "released" => {
-                    return Err(AppCapabilityError::Uncertain(format!(
-                        "AgenticOS image job {id} ended without a retained image; no automatic retry was made"
-                    )))
+                    return Err(ImageFailure::uncertain(
+                        R::JobFailed,
+                        format!("AgenticOS image job {id} ended without a retained image"),
+                    ))
                 }
                 "uncertain" => {
-                    return Err(AppCapabilityError::Uncertain(format!(
-                        "AgenticOS image job {id} needs reconciliation"
-                    )))
+                    return Err(ImageFailure::uncertain(
+                        R::ProviderUncertain,
+                        format!("AgenticOS image job {id} needs reconciliation"),
+                    ))
                 }
                 "admitting" | "submitted" | "queued" | "running" => {}
                 _ => {
-                    return Err(AppCapabilityError::Uncertain(
-                        "AgenticOS media job status is unknown".into(),
+                    return Err(ImageFailure::uncertain(
+                        R::JobMalformed,
+                        "AgenticOS media job status is unknown",
                     ))
                 }
             }
             if Instant::now() >= deadline {
-                return Err(AppCapabilityError::Uncertain(format!(
-                    "AgenticOS image job {id} is still running; no automatic retry was made"
-                )));
+                return Err(ImageFailure::uncertain(
+                    R::PollTimeout,
+                    format!("AgenticOS image job {id} is still running"),
+                ));
             }
             std::thread::sleep(self.poll_interval());
-            let url = format!("{}{MEDIA_JOBS_PATH}{id}", self.base);
-            let (status, envelope) = match self.get_media(
-                &url,
+            let (status, envelope) = match self.image_json(
                 token,
-                MEDIA_BODY_CAP,
-                "AgenticOS image job read failed",
+                crate::remote_cli::AccountImageOperation::Job { job_id: id.clone() },
             ) {
                 Ok(pair) => pair,
                 // A transient read failure keeps polling until the deadline.
@@ -592,20 +920,29 @@ impl AgenticosExternalAdapter {
                 if status >= 500 {
                     continue;
                 }
-                return Err(AppCapabilityError::Uncertain(format!(
-                    "AgenticOS image job status could not be confirmed: {}",
-                    refused_code(&envelope)
-                )));
+                return Err(ImageFailure::uncertain(
+                    if matches!(status, 408 | 425 | 429) {
+                        R::ProviderBusy
+                    } else {
+                        R::ProviderUncertain
+                    },
+                    format!(
+                        "AgenticOS image job status could not be confirmed: {}",
+                        refused_code(&envelope)
+                    ),
+                ));
             }
             job = envelope["data"]["job"].clone();
-            checked_media_job(&job, Some(&id)).map_err(AppCapabilityError::Uncertain)?;
+            checked_media_job(&job, Some(&id), reference.is_some())
+                .map_err(|detail| ImageFailure::uncertain(R::JobMalformed, detail))?;
         }
         let id = job["id"].as_str().unwrap_or_default().to_owned();
         let artifacts = job["artifacts"].as_array().cloned().unwrap_or_default();
         if artifacts.is_empty() {
-            return Err(AppCapabilityError::Uncertain(format!(
-                "AgenticOS image job {id} succeeded without a retained artifact"
-            )));
+            return Err(ImageFailure::uncertain(
+                R::ArtifactUnavailable,
+                format!("AgenticOS image job {id} succeeded without a retained artifact"),
+            ));
         }
         let artifact = &artifacts[0];
         let artifact_ref = artifact["ref"].as_str().unwrap_or_default();
@@ -618,53 +955,53 @@ impl AgenticosExternalAdapter {
                 .unwrap_or(true)
             || artifact_bytes.is_none()
         {
-            return Err(AppCapabilityError::Uncertain(
-                "AgenticOS media artifact descriptor is malformed".into(),
+            return Err(ImageFailure::uncertain(
+                R::ArtifactMismatch,
+                "AgenticOS media artifact descriptor is malformed",
             ));
         }
-        let request = self
-            .http
-            .get(format!("{}{MEDIA_ARTIFACTS_PATH}{artifact_ref}", self.base));
-        let mut response = authorized(request, token).call().map_err(|_| {
-            AppCapabilityError::Uncertain("AgenticOS media artifact could not be confirmed".into())
-        })?;
-        if response.status().as_u16() != 200 {
-            return Err(AppCapabilityError::Uncertain(
-                "AgenticOS media artifact could not be confirmed".into(),
-            ));
-        }
-        let header = response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_owned();
-        let asset_bytes = response
-            .body_mut()
-            .with_config()
-            .limit(ASSET_LIMIT as u64 + 1)
-            .read_to_vec()
-            .map_err(|_| {
-                AppCapabilityError::Uncertain(
-                    "AgenticOS media artifact exceeds the custody bound".into(),
-                )
-            })?;
-        if asset_bytes.len() as u64 != artifact_bytes.unwrap_or_default() {
-            return Err(AppCapabilityError::Uncertain(
-                "AgenticOS media artifact byte count differs from its receipt".into(),
-            ));
-        }
-        if format!("{:x}", Sha256::digest(&asset_bytes)) != artifact_digest {
-            return Err(AppCapabilityError::Uncertain(
-                "AgenticOS media artifact digest differs from its receipt".into(),
-            ));
-        }
-        let media_type =
-            image_mime(&asset_bytes, &header).map_err(AppCapabilityError::Uncertain)?;
-        let digest = format!("sha256:{artifact_digest}");
+        // The verified original is fetched by the same bounded,
+        // integrity-checked artifact GET the read-only retrieval uses.
+        let (original_mime, asset_bytes) =
+            self.fetch_media_artifact(token, artifact_ref, artifact_digest, artifact_bytes)?;
+        let fault = |(fault, detail): (ImageFault, &str)| {
+            ImageFailure::uncertain(
+                match fault {
+                    ImageFault::Unsupported => R::UnsupportedImage,
+                    ImageFault::NotSquare => R::NotSquare,
+                    ImageFault::Decode => R::DecodeFailed,
+                    // Upload-only faults never arise from the generated-image
+                    // path; if one ever did it is an invalid image.
+                    ImageFault::Aspect | ImageFault::TooSmall => R::DecodeFailed,
+                    ImageFault::TooLarge => R::ArtifactTooLarge,
+                },
+                detail,
+            )
+        };
+        // The verified original rides the result as a provenance receipt;
+        // every field comes from the descriptor and bytes proven above,
+        // captured before the custody re-encode shadows them.
+        let original_artifact = json!({
+            "schema":1,
+            "ref":artifact_ref,
+            "sha256":format!("sha256:{artifact_digest}"),
+            "bytes":artifact_bytes.unwrap_or_default(),
+            "media_type":original_mime,
+        });
+        // The original is proven against the AgenticOS descriptor above; what
+        // is retained must fit custody, so a larger one is re-encoded.
+        // The fetch already byte-sniffed the original; the retained
+        // derivative is re-checked only after a custody re-encode.
+        let (media_type, asset_bytes) = if asset_bytes.len() > ASSET_LIMIT {
+            let jpeg = fit_to_custody(&asset_bytes).map_err(fault)?;
+            (image_checked(&jpeg, "image/jpeg").map_err(fault)?, jpeg)
+        } else {
+            (original_mime, asset_bytes)
+        };
+        let digest = format!("sha256:{:x}", Sha256::digest(&asset_bytes));
         let charge_minor = job["price"]["chargeMinor"].as_u64().unwrap_or_default();
         let result = json!({
-            "schema":1,"kind":"media.generated.image","provider":PLATFORM,
+            "schema":1,"kind":"media.generated.image","provider":self.image_provider(),
             "source_receipt_id":authority["source"]["receipt_id"],
             "source_post_id":authority["source"]["post"]["id"],
             "model":IMAGE_MODEL,"aspect_ratio":"1:1","n":1,
@@ -674,7 +1011,19 @@ impl AgenticosExternalAdapter {
             "quoted_micros":quoted,
             "repeated":job["repeated"],
             "asset_sha256":digest,"asset_media_type":media_type,
+            "original_artifact":original_artifact,
         });
+        let mut result = result;
+        if let Some(edit) = authority
+            .get("reference_edit")
+            .filter(|value| value.is_object())
+        {
+            result["source_asset"] = json!({
+                "asset_id": edit["asset_id"],
+                "sha256": edit["sha256"],
+                "ref": edit["ref"],
+            });
+        }
         Ok(AppCapabilityOutput {
             result,
             asset: Some(AppCapabilityAsset {
@@ -683,6 +1032,170 @@ impl AgenticosExternalAdapter {
             }),
         })
     }
+
+    /// CAD-1365: the authenticated artifact GET half of `call_image_coded`,
+    /// shared with the read-only original retrieval. Fetches exactly
+    /// `artifact_ref` — no submit, poll, billing, claim or enrollment — and
+    /// proves the bytes against the descriptor: status, size cap, byte
+    /// count, digest and image safety/MIME. Returns the verified
+    /// `(media_type, bytes)`; every failure is a typed [`ImageFailure`].
+    fn fetch_media_artifact(
+        &self,
+        token: Option<&str>,
+        artifact_ref: &str,
+        artifact_digest: &str,
+        artifact_bytes: Option<u64>,
+    ) -> std::result::Result<(&'static str, Vec<u8>), ImageFailure> {
+        use ImageReason as R;
+        let unconfirmed = || {
+            ImageFailure::uncertain(
+                R::ArtifactUnavailable,
+                "AgenticOS media artifact could not be confirmed",
+            )
+        };
+        let (header, asset_bytes) = if let Some(identity) = &self.account_identity {
+            let response = crate::remote_cli::account_image_request(
+                identity,
+                crate::remote_cli::AccountImageOperation::Artifact {
+                    reference: artifact_ref.to_owned(),
+                },
+                60,
+            )
+            .map_err(|error| {
+                if error.code() == Some("account_image_response_too_large") {
+                    ImageFailure::uncertain(
+                        R::ArtifactTooLarge,
+                        "account image artifact exceeds the import bound",
+                    )
+                } else {
+                    unconfirmed()
+                }
+            })?;
+            if response.status != 200 {
+                return Err(unconfirmed());
+            }
+            (response.content_type.unwrap_or_default(), response.bytes)
+        } else {
+            let request = self
+                .http
+                .get(format!("{}{MEDIA_ARTIFACTS_PATH}{artifact_ref}", self.base));
+            let mut response = authorized(request, token)
+                .config()
+                .timeout_global(Some(ARTIFACT_TIMEOUT))
+                .build()
+                .call()
+                .map_err(|_| unconfirmed())?;
+            if response.status().as_u16() != 200 {
+                return Err(unconfirmed());
+            }
+            let header = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            let asset_bytes = response
+                .body_mut()
+                .with_config()
+                .limit(FETCH_LIMIT as u64 + 1)
+                .read_to_vec()
+                .map_err(|error| match error {
+                    // Only the size cap is "too large"; a timeout, reset or
+                    // truncated body is retried under the same key.
+                    ureq::Error::BodyExceedsLimit(_) => ImageFailure::uncertain(
+                        R::ArtifactTooLarge,
+                        "AgenticOS media artifact exceeds the AgenticOS import bound",
+                    ),
+                    _ => ImageFailure::uncertain(
+                        R::ArtifactUnavailable,
+                        "AgenticOS media artifact download did not complete",
+                    ),
+                })?;
+            (header, asset_bytes)
+        };
+        if asset_bytes.len() as u64 != artifact_bytes.unwrap_or_default() {
+            return Err(ImageFailure::uncertain(
+                R::ArtifactMismatch,
+                "AgenticOS media artifact byte count differs from its receipt",
+            ));
+        }
+        if format!("{:x}", Sha256::digest(&asset_bytes)) != artifact_digest {
+            return Err(ImageFailure::uncertain(
+                R::ArtifactMismatch,
+                "AgenticOS media artifact digest differs from its receipt",
+            ));
+        }
+        let media_type = image_checked(&asset_bytes, &header).map_err(|(fault, detail)| {
+            ImageFailure::uncertain(
+                match fault {
+                    ImageFault::Unsupported => R::UnsupportedImage,
+                    ImageFault::NotSquare => R::NotSquare,
+                    ImageFault::Decode => R::DecodeFailed,
+                    // Upload-only faults never arise from the generated-image
+                    // path; if one ever did it is an invalid image.
+                    ImageFault::Aspect | ImageFault::TooSmall => R::DecodeFailed,
+                    ImageFault::TooLarge => R::ArtifactTooLarge,
+                },
+                detail,
+            )
+        })?;
+        Ok((media_type, asset_bytes))
+    }
+
+    /// CAD-1365: the descriptor a stored `original_artifact` receipt
+    /// carries, re-checked before any fetch — canonical ref grammar, the
+    /// digest agreeing with `sha256`, a bounded positive size and an
+    /// allowlisted image MIME. A malformed stored receipt refuses
+    /// without provider traffic.
+    fn checked_original_descriptor(
+        descriptor: &Value,
+    ) -> std::result::Result<(String, String, u64, String), String> {
+        let reference = descriptor["ref"]
+            .as_str()
+            .filter(|r| valid_media_ref(r))
+            .ok_or("stored original artifact ref is malformed")?;
+        let sha256 = descriptor["sha256"]
+            .as_str()
+            .and_then(|s| s.strip_prefix("sha256:"))
+            .filter(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+            .ok_or("stored original artifact digest is malformed")?;
+        if reference
+            .split_once('.')
+            .map(|(_, digest)| digest != sha256)
+            .unwrap_or(true)
+        {
+            return Err("stored original artifact ref does not carry its digest".into());
+        }
+        let bytes = descriptor["bytes"]
+            .as_u64()
+            .filter(|n| *n > 0 && *n <= FETCH_LIMIT as u64)
+            .ok_or("stored original artifact size is outside the fetch bound")?;
+        let media_type = descriptor["media_type"]
+            .as_str()
+            .filter(|m| matches!(*m, "image/png" | "image/jpeg" | "image/webp"))
+            .ok_or("stored original artifact media type is not a retained image")?;
+        Ok((
+            reference.to_string(),
+            sha256.to_string(),
+            bytes,
+            media_type.to_string(),
+        ))
+    }
+}
+
+/// Test-seam builds only: an integration test shortens the media timings
+/// through the environment (the daemon builds its own adapter).
+#[cfg(feature = "test-seam")]
+fn test_env_ms(name: &str) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
 }
 
 /// The hosted lease door takes no bearer; the external door always has one.
@@ -743,10 +1256,77 @@ fn valid_media_ref(reference: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
+fn library_reference_prompt(authority: &Value) -> std::result::Result<Option<String>, String> {
+    let inputs = &authority["inputs"];
+    let keys = [
+        "library_asset_id",
+        "library_revision",
+        "library_sha256",
+        "instructions",
+    ];
+    if keys.iter().all(|key| inputs.get(*key).is_none()) {
+        return Ok(None);
+    }
+    if keys.iter().any(|key| inputs.get(*key).is_none())
+        || inputs.get("subject").is_some()
+        || inputs.get("source").is_some()
+    {
+        return Err("reference edit inputs must be the four frozen library strings".into());
+    }
+    let asset_id = inputs["library_asset_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or("library asset id is not a string")?;
+    let revision = inputs["library_revision"]
+        .as_str()
+        .filter(|value| {
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) && *value != "0"
+        })
+        .ok_or("library revision is not a decimal pin")?;
+    let sha256 = inputs["library_sha256"]
+        .as_str()
+        .filter(|value| {
+            value.len() == 71
+                && value.starts_with("sha256:")
+                && value[7..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+        .ok_or("library digest is not canonical")?;
+    let instructions = inputs["instructions"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("reference instructions are blank")?;
+    let edit = authority
+        .get("reference_edit")
+        .filter(|value| value.is_object())
+        .ok_or("reference edit has no verified artifact reference")?;
+    let reference = edit["ref"]
+        .as_str()
+        .filter(|reference| valid_media_ref(reference))
+        .ok_or("producer reference is not the retained original artifact")?;
+    if !reference.ends_with(&format!(".{}", &sha256[7..]))
+        || edit["asset_id"] != asset_id
+        || edit["sha256"] != sha256
+    {
+        return Err("producer reference does not match the frozen source pin".into());
+    }
+    if let Some(frozen) = authority["frozen_prompt"].as_str() {
+        if frozen != instructions {
+            return Err("frozen reference instructions do not match the library input".into());
+        }
+    }
+    let _ = revision;
+    Ok(Some(instructions.to_owned()))
+}
 
 /// Strict job validation, identical on submit and on every poll; a poll
 /// must echo the job the submit returned.
-fn checked_media_job(job: &Value, expected_id: Option<&str>) -> std::result::Result<(), String> {
+fn checked_media_job(
+    job: &Value,
+    expected_id: Option<&str>,
+    reference_edit: bool,
+) -> std::result::Result<(), String> {
     let id = job["id"]
         .as_str()
         .ok_or("AgenticOS media job is malformed")?;
@@ -757,7 +1337,12 @@ fn checked_media_job(job: &Value, expected_id: Option<&str>) -> std::result::Res
         return Err("AgenticOS media job drifted from the reviewed image tool".into());
     }
     let price = &job["price"];
-    if price["slug"] != IMAGE_TOOL
+    let expected_slug = if reference_edit {
+        "generate_image.image-to-image"
+    } else {
+        IMAGE_TOOL
+    };
+    if price["slug"] != expected_slug
         || price["currency"] != "USD"
         || !price["chargeMinor"].is_u64()
         || price["version"]
@@ -793,6 +1378,112 @@ fn money_micros(value: &Value) -> Option<u64> {
         .ok()?
         .checked_mul(1_000_000)?
         .checked_add(fractional.parse::<u64>().ok()?)
+}
+
+fn validate_text_input(input: &Value) -> std::result::Result<Value, String> {
+    let fields = input
+        .as_object()
+        .ok_or("text generation input must be an object")?;
+    if fields
+        .keys()
+        .any(|k| !matches!(k.as_str(), "model" | "messages" | "maxOutputTokens"))
+    {
+        return Err("text generation input has unsupported fields".into());
+    }
+    let model = fields
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("z-ai/glm-5.3-flash");
+    if model != "z-ai/glm-5.3-flash" {
+        return Err("text generation model is not reviewed".into());
+    }
+    let messages = fields
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or("text generation messages must be an array")?;
+    if messages.is_empty() || messages.len() > 100 {
+        return Err("text generation messages exceed their supported bound".into());
+    }
+    let mut clean = Vec::with_capacity(messages.len());
+    for message in messages {
+        let m = message
+            .as_object()
+            .ok_or("text generation message must be an object")?;
+        if m.len() != 2 || m.keys().any(|k| !matches!(k.as_str(), "role" | "content")) {
+            return Err("text generation message has unsupported fields".into());
+        }
+        let role = m
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or("text generation message role is missing")?;
+        let content = m
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or("text generation message content is missing")?;
+        if !matches!(role, "system" | "user")
+            || content.chars().count() > 64_000
+            || content.contains('\0')
+        {
+            return Err("text generation message role or content is invalid".into());
+        }
+        clean.push(json!({"role":role,"content":content}));
+    }
+    let tokens = fields
+        .get("maxOutputTokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(4096);
+    if !(1..=8192).contains(&tokens) {
+        return Err("text generation output token limit is invalid".into());
+    }
+    Ok(json!({"model":model,"messages":clean,"maxOutputTokens":tokens}))
+}
+
+fn validate_text_result(result: &Value) -> std::result::Result<Value, String> {
+    let fields = result
+        .as_object()
+        .ok_or("AgenticOS text result is malformed")?;
+    if fields.len() != 3
+        || fields
+            .keys()
+            .any(|k| !matches!(k.as_str(), "text" | "finishReason" | "usage"))
+    {
+        return Err("AgenticOS text result has unsupported fields".into());
+    }
+    let text = result["text"]
+        .as_str()
+        .ok_or("AgenticOS text result is missing text")?;
+    if text.is_empty() || text.len() > 65_536 || text.contains('\0') {
+        return Err("AgenticOS text result exceeds its supported bound".into());
+    }
+    if !matches!(result["finishReason"].as_str(), Some("stop" | "length")) {
+        return Err("AgenticOS text result finish reason is invalid".into());
+    }
+    let usage = result
+        .get("usage")
+        .ok_or("AgenticOS text result is missing usage")?;
+    if !usage.is_null() {
+        let u = usage
+            .as_object()
+            .ok_or("AgenticOS text result usage is malformed")?;
+        const KEYS: &[&str] = &[
+            "inputTokens",
+            "outputTokens",
+            "totalTokens",
+            "cachedInputTokens",
+            "reasoningOutputTokens",
+        ];
+        if u.keys().any(|k| !KEYS.contains(&k.as_str())) {
+            return Err("AgenticOS text result usage has unsupported fields".into());
+        }
+        for key in KEYS {
+            if let Some(value) = u.get(*key) {
+                if !value.is_null() && value.as_u64().is_none() {
+                    return Err("AgenticOS text result usage is malformed".into());
+                }
+            }
+        }
+    }
+    Ok(json!({"text":text,"finishReason":result["finishReason"],"usage":usage}))
 }
 
 fn quote_view(
@@ -846,7 +1537,7 @@ fn frozen_charge_ceiling(authority: &Value) -> std::result::Result<u64, String> 
     Ok(amount)
 }
 
-fn valid_base(base: &str) -> Result<String> {
+pub(crate) fn valid_base(base: &str) -> Result<String> {
     let base = base.trim_end_matches('/');
     let uri: ureq::http::Uri = base
         .parse()
@@ -878,6 +1569,26 @@ fn valid_base(base: &str) -> Result<String> {
     Ok(base.to_owned())
 }
 
+fn validate_text_authority(authority: &Value) -> std::result::Result<(), String> {
+    let config = &authority["binding"]["config"];
+    let mapping = &config["mapping"];
+    if authority["schema"] != 1
+        || config["provider"] != PLATFORM
+        || config["install_id"] != authority["install_id"]
+        || config["connection_id"].as_str().is_none_or(str::is_empty)
+        || config["account"].as_str().is_none_or(str::is_empty)
+        || mapping["capability"] != "text.generate"
+        || mapping["version"] != 1
+        || mapping["action"] != "generate_text"
+        || mapping["resource_kind"] != "connection_account"
+        || mapping["tool"] != TEXT_TOOL
+        || mapping["effect"] != "draft"
+    {
+        return Err("frozen text binding does not authorize this provider action".into());
+    }
+    Ok(())
+}
+
 fn validate_source_authority<'a>(
     authority: &'a Value,
     input: &Value,
@@ -885,7 +1596,6 @@ fn validate_source_authority<'a>(
     let config = &authority["binding"]["config"];
     let mapping = &config["mapping"];
     if authority["schema"] != 1
-        || authority["slot"] != "source"
         || config["provider"] != PLATFORM
         || config["install_id"] != authority["install_id"]
         || config["connection_id"].as_str().is_none()
@@ -946,10 +1656,16 @@ fn register_with_deployment(
 /// Otherwise external access remains opt-in per daemon. Caller URL settings
 /// and conflicting pre-registration cannot replace a hosted transport.
 pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
+    super::account_media::attach(opts)?;
     let metadata = match &opts.provider_deployments {
         Some(value) => Some(value.clone()),
         None => super::deployments::load()?,
     };
+    // CAD-1416: cache the already-validated owned metadata so `Shared` and the
+    // other readers see the same assertions without a second root read.
+    if opts.provider_deployments.is_none() {
+        opts.provider_deployments = metadata.clone();
+    }
     if let Some(admission) = metadata.as_ref().and_then(|value| value.hosted_media()) {
         if std::env::var_os("CADENCE_AGENTICOS_EXTERNAL_URL").is_some() {
             return Err(Error::rejected(
@@ -983,6 +1699,23 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
 }
 
 impl PlatformAdapter for AgenticosExternalAdapter {
+    /// `execute` refuses: every tool here needs a scoped app-run
+    /// capability, never a plain `platform_call`.
+    fn direct_call(&self, _tool: &str) -> bool {
+        false
+    }
+
+    fn quote_reference_app_capability(
+        &self,
+        credential: &[u8],
+        binding: &Value,
+    ) -> std::result::Result<AppCapabilityQuote, String> {
+        if binding["config"]["mapping"]["capability"] == "media.generate" {
+            return self.quote_reference_image(credential, binding);
+        }
+        self.quote_app_capability(credential, binding)
+    }
+
     fn quote_app_capability(
         &self,
         credential: &[u8],
@@ -1020,16 +1753,83 @@ impl PlatformAdapter for AgenticosExternalAdapter {
         input: &Value,
         idempotency_key: &str,
     ) -> std::result::Result<AppCapabilityOutput, AppCapabilityError> {
-        match authority["slot"].as_str() {
-            Some("source") => Ok(AppCapabilityOutput {
+        // The slot name is the app's own choice (Social Content calls its
+        // text slot `writer`); the frozen binding's capability is what the
+        // operator bound and what each adapter re-validates.
+        match authority["binding"]["config"]["mapping"]["capability"].as_str() {
+            Some("social.read") => Ok(AppCapabilityOutput {
                 result: self.call_source(credential, authority, input, idempotency_key)?,
                 asset: None,
             }),
-            Some("image") => self.call_image(credential, authority, input, idempotency_key),
+            Some("media.generate") => {
+                self.call_image(credential, authority, input, idempotency_key)
+            }
+            Some("text.generate") => self.call_text(credential, authority, input, idempotency_key),
             _ => Err(AppCapabilityError::Refused(
                 "AgenticOS capability slot has no reviewed execution adapter".into(),
             )),
         }
+    }
+
+    fn execute_app_image(
+        &self,
+        credential: &[u8],
+        authority: &Value,
+        input: &Value,
+        idempotency_key: &str,
+    ) -> std::result::Result<AppCapabilityOutput, ImageFailure> {
+        if authority["binding"]["config"]["mapping"]["capability"] != "media.generate" {
+            return Err(ImageFailure::refused(
+                ImageReason::NotApproved,
+                "AgenticOS capability slot has no reviewed image adapter",
+            ));
+        }
+        self.call_image_coded(credential, authority, input, idempotency_key)
+    }
+
+    /// CAD-1365: read-only retrieval of the verified retained original
+    /// behind a stored `original_artifact` receipt. The frozen binding
+    /// config must still authorize the reviewed image action on the
+    /// recorded account; the fetch is the shared bounded artifact GET —
+    /// never a submit, poll, billing, claim, enrollment or signed URL —
+    /// and the returned bytes are re-proven byte-for-byte, digest and
+    /// image safety against the stored descriptor.
+    fn read_app_media_original(
+        &self,
+        credential: &[u8],
+        config: &Value,
+        descriptor: &Value,
+    ) -> std::result::Result<(String, Vec<u8>), String> {
+        if !self.image_approved() {
+            return Err("original media retrieval has not been approved by this deployment".into());
+        }
+        let mapping = &config["mapping"];
+        if config["provider"] != self.image_provider()
+            || config["account"].as_str().is_none_or(str::is_empty)
+            || config["connection_id"].as_str().is_none_or(str::is_empty)
+            || mapping["capability"] != "media.generate"
+            || mapping["version"] != 1
+            || mapping["action"] != "generate_image"
+            || mapping["resource_kind"] != "connection_account"
+            || mapping["effect"] != "draft"
+            || mapping["tool"] != IMAGE_TOOL
+        {
+            return Err("frozen binding does not authorize original media retrieval".into());
+        }
+        let (reference, sha256, bytes, media_type) = Self::checked_original_descriptor(descriptor)?;
+        let token = self.lease_token(credential, config)?;
+        let (served_type, original) = self
+            .fetch_media_artifact(token, &reference, &sha256, Some(bytes))
+            .map_err(|failure| {
+                format!(
+                    "AgenticOS original artifact retrieval failed ({})",
+                    failure.reason.code()
+                )
+            })?;
+        if served_type != media_type {
+            return Err("AgenticOS original artifact media type differs from its receipt".into());
+        }
+        Ok((served_type.to_string(), original))
     }
 
     fn table(&self) -> &ToolTable {
@@ -1088,6 +1888,28 @@ impl PlatformAdapter for AgenticosExternalAdapter {
                 },
             ],
         };
+        if self.deployment_pin.as_deref() == Some(TEXT_MANIFEST_PIN) {
+            descriptor.capabilities.push(CapabilityDescriptor {
+                id: "text.generate".into(),
+                version: 1,
+                tools: vec![TEXT_TOOL.into()],
+                scopes: vec!["provider.draft".into()],
+                effect: "draft".into(),
+                semantics: CapabilitySemantics::PreviewOnly,
+            });
+            descriptor.action_mappings.push(BoundActionMapping {
+                capability: "text.generate".into(),
+                version: 1,
+                action: "generate_text".into(),
+                resource_kind: "connection_account".into(),
+                tool: TEXT_TOOL.into(),
+                scopes: vec!["provider.draft".into()],
+                effect: "draft".into(),
+                semantics: CapabilitySemantics::PreviewOnly,
+                input_contract: "text.generate.input@1".into(),
+                output_contract: "text.generate.result@1".into(),
+            });
+        }
         if self.transport == Transport::HostedMediaLease {
             // CAD-1060: the same lease door also serves the source read, so
             // the revision moves and every media-only hosted binding stales.
@@ -1152,6 +1974,102 @@ mod tests {
         json!({"schema":1,"install_id":"install1","slot":"source","inputs":{"profile_handle":"juicysuite_crm"},"binding":{"config":{
             "provider":PLATFORM,"account":"company1","install_id":"install1","connection_id":"conn1","mapping":{
                 "capability":"social.read","version":1,"action":"list_posts","resource_kind":"connection_account","tool":POSTS_TOOL,"effect":"read"}}}})
+    }
+
+    /// A frozen text binding under the slot name the app chose.
+    fn text_authority(slot: &str) -> Value {
+        let mut proof = authority();
+        proof["slot"] = json!(slot);
+        let mapping = &mut proof["binding"]["config"]["mapping"];
+        mapping["capability"] = json!("text.generate");
+        mapping["action"] = json!("generate_text");
+        mapping["tool"] = json!(TEXT_TOOL);
+        mapping["effect"] = json!("draft");
+        proof
+    }
+
+    /// CAD-1302: the adapter is chosen by the frozen capability, never by the
+    /// app-chosen slot name.
+    #[test]
+    fn cad1302_adapter_follows_the_bound_capability_not_the_slot_name() {
+        let input = json!({"messages":[{"role":"user","content":"Draft a caption."}]});
+        let door = |body: Value| {
+            let (base, seen, worker) = media_door(move |_| json_response(200, body.clone()));
+            let adapter =
+                AgenticosExternalAdapter::with_deployment_pin(&base, Some(TEXT_MANIFEST_PIN))
+                    .unwrap();
+            (adapter, seen, worker)
+        };
+        let reply = json!({"ok":true,"data":{"result":{"text":"A grounded social caption.","finishReason":"stop","usage":null}}});
+        // `writer` bound to text.generate reaches the text door.
+        let (adapter, seen, worker) = door(reply.clone());
+        let mut proof = text_authority("writer");
+        proof["quote"] = media_quote();
+        let out = adapter
+            .execute_app_capability_outcome(b"token", &proof, &input, "app-call-1302")
+            .unwrap();
+        assert_eq!(out.result["text"], "A grounded social caption.");
+        worker.join().unwrap();
+        assert_eq!(seen.lock().unwrap()[0].url, CALL_PATH);
+        // A slot NAMED `text` bound to another capability never reaches the
+        // text adapter: each of these is refused with no door traffic.
+        for capability in [
+            "text.publish",
+            "text.draft",
+            "social.read",
+            "media.generate",
+            "",
+        ] {
+            let adapter = AgenticosExternalAdapter::with_deployment_pin(
+                "http://127.0.0.1:1",
+                Some(TEXT_MANIFEST_PIN),
+            )
+            .unwrap();
+            let mut proof = text_authority("text");
+            proof["quote"] = media_quote();
+            proof["binding"]["config"]["mapping"]["capability"] = json!(capability);
+            let Err(error) =
+                adapter.execute_app_capability_outcome(b"token", &proof, &input, "app-call-1302")
+            else {
+                panic!("{capability} must be refused");
+            };
+            assert!(
+                matches!(&error, AppCapabilityError::Refused(_)),
+                "{capability}: {error:?}"
+            );
+            if !matches!(capability, "social.read" | "media.generate") {
+                assert_eq!(
+                    error.to_string(),
+                    "AgenticOS capability slot has no reviewed execution adapter",
+                    "{capability}"
+                );
+            }
+        }
+        // The text adapter keeps its own mapping validation.
+        for forge in [
+            ("tool", json!(IMAGE_TOOL)),
+            ("action", json!("generate_image")),
+            ("effect", json!("send")),
+            ("version", json!(2)),
+            ("resource_kind", json!("other")),
+        ] {
+            let mut proof = text_authority("writer");
+            proof["quote"] = media_quote();
+            proof["binding"]["config"]["mapping"][forge.0] = forge.1;
+            assert!(adapter_refuses(&proof, &input), "{}", forge.0);
+        }
+    }
+
+    fn adapter_refuses(proof: &Value, input: &Value) -> bool {
+        let adapter = AgenticosExternalAdapter::with_deployment_pin(
+            "http://127.0.0.1:1",
+            Some(TEXT_MANIFEST_PIN),
+        )
+        .unwrap();
+        matches!(
+            adapter.execute_app_capability_outcome(b"token", proof, input, "app-call-1302"),
+            Err(AppCapabilityError::Refused(_))
+        )
     }
 
     #[test]
@@ -1345,7 +2263,9 @@ mod tests {
         bytes
     }
 
-    fn image_proof(quote: Value) -> Value {
+    // CAD-1365: shared with the dedicated original-artifact acceptance
+    // module; test-only visibility, no production surface.
+    pub(super) fn image_proof(quote: Value) -> Value {
         let mut proof = authority();
         proof["slot"] = json!("image");
         proof["binding"]["config"]["mapping"] = json!({"capability":"media.generate","version":1,"action":"generate_image","resource_kind":"connection_account","tool":IMAGE_TOOL,"effect":"draft"});
@@ -1355,27 +2275,30 @@ mod tests {
         proof
     }
 
-    fn media_quote() -> Value {
+    pub(super) fn media_quote() -> Value {
         json!({"schema":1,"currency":"USD","unit_price_micros":31500,"units":1,"total_price_micros":31500,"price_revision":"media:sha256:test-quote"})
     }
 
     #[derive(Clone, Debug)]
-    struct DoorRequest {
-        method: String,
-        url: String,
-        auth: Option<String>,
-        idem: Option<String>,
-        body: Value,
+    pub(super) struct DoorRequest {
+        pub(super) method: String,
+        pub(super) url: String,
+        pub(super) auth: Option<String>,
+        pub(super) idem: Option<String>,
+        pub(super) body: Value,
     }
 
-    fn json_response(status: u16, payload: Value) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    pub(super) fn json_response(
+        status: u16,
+        payload: Value,
+    ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
         tiny_http::Response::from_string(payload.to_string()).with_status_code(status)
     }
 
     /// Loopback AgenticOS media door. It answers exactly `expected` requests
     /// and the test joins the worker, so a call that issues one extra
     /// request (a forbidden re-POST) fails instead of passing silently.
-    fn media_door(
+    pub(super) fn media_door(
         answer: impl Fn(&DoorRequest) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> + Send + 'static,
     ) -> (
         String,
@@ -1427,11 +2350,138 @@ mod tests {
         (base, seen, worker)
     }
 
+    /// CAD-1392 acceptance (owned by the independent reviewer, not the
+    /// batching implementer): under the deferred-join pattern — sequential
+    /// API calls on private per-variant fixtures, every (adapter, seen,
+    /// worker) tuple retained until its worker's join — a deliberate extra
+    /// POST arriving inside the first door's UNCHANGED 500ms quiet window
+    /// must still be served and recorded. This proves only that the
+    /// physical window and retained `seen` capture the delayed extra POST
+    /// (the bad case a shortened window, closed door or early join would
+    /// miss); whether the actual batched loops keep every adapter and
+    /// context alive is checked by independently reviewing that code, not
+    /// asserted here — the injector uses its own ureq client, so an
+    /// adapter drop could never hide the injected request.
+    #[test]
+    fn cad1392_full_observation_detects_delayed_extra_post() {
+        let (base, seen, worker) = media_door(|request| {
+            if request.method == "POST" && request.url == MEDIA_SUBMIT_PATH {
+                json_response(
+                    403,
+                    json!({"ok":false,"error":{"code":"credential_revoked"}}),
+                )
+            } else {
+                json_response(
+                    400,
+                    json!({"ok":false,"error":{"code":"unexpected_request"}}),
+                )
+            }
+        });
+        // The real initial call: one submit POST refused as a confirmed
+        // credential_revoked. Its adapter, `seen` and worker are retained
+        // un-joined, exactly like a pending batch entry.
+        let adapter = image_adapter(&base);
+        let proof = image_proof(media_quote());
+        let error = adapter
+            .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-1")
+            .err()
+            .unwrap();
+        assert!(error.contains("no longer authorized"), "{error}");
+        // The door worker pushes the record before responding, so by the
+        // time the call returned the first POST is already observed.
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.method == "POST")
+                .count(),
+            1,
+            "the first POST is recorded before its response returns"
+        );
+        // A second PRIVATE fixture runs its own real API call sequentially
+        // while the first door's 500ms quiet window is still open; its
+        // (adapter, seen, worker) tuple is likewise retained.
+        let (base2, seen2, worker2) = media_door(|request| {
+            if request.method == "POST" && request.url == MEDIA_SUBMIT_PATH {
+                json_response(
+                    403,
+                    json!({"ok":false,"error":{"code":"insufficient_scope"}}),
+                )
+            } else {
+                json_response(
+                    400,
+                    json!({"ok":false,"error":{"code":"unexpected_request"}}),
+                )
+            }
+        });
+        let adapter2 = image_adapter(&base2);
+        let error2 = adapter2
+            .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-2")
+            .err()
+            .unwrap();
+        assert!(error2.contains("runtime draft scope"), "{error2}");
+        // A deliberate extra POST at ~250ms into the FIRST door's still-open
+        // window, over real loopback HTTP from an owned thread.
+        let injector = std::thread::spawn({
+            let base = base.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(250));
+                let agent: ureq::Agent = ureq::Agent::config_builder()
+                    .timeout_global(Some(Duration::from_secs(5)))
+                    .http_status_as_error(false)
+                    .build()
+                    .into();
+                agent
+                    .post(format!("{base}{MEDIA_SUBMIT_PATH}"))
+                    .header("idempotency-key", "app-call-injected-1")
+                    .send_json(json!({"model":"openai/gpt-image-2.5","prompt":"injected","aspectRatio":"1:1"}))
+                    .expect("the delayed extra POST must be served")
+            }
+        });
+        // Each worker is joined only after its own full quiet window closes
+        // on its own; neither door gets an early shutdown, and both
+        // adapters stayed alive through their joins.
+        worker.join().unwrap();
+        worker2.join().unwrap();
+        let response = injector.join().unwrap();
+        assert_eq!(response.status().as_u16(), 403);
+        // The bad case the original `seen.len() == 1` checks guard: the
+        // first door must show the extra POST. A fixture that joined
+        // before the full window would see one request and fail this.
+        let seen = seen.lock().unwrap();
+        let posts: Vec<&DoorRequest> = seen
+            .iter()
+            .filter(|request| request.method == "POST")
+            .collect();
+        assert_eq!(
+            posts.len(),
+            2,
+            "the delayed extra POST inside the 500ms window must be observed"
+        );
+        assert_eq!(posts[0].url, MEDIA_SUBMIT_PATH);
+        assert_eq!(posts[0].idem.as_deref(), Some("app-call-image-1"));
+        assert_eq!(posts[1].url, MEDIA_SUBMIT_PATH);
+        assert_eq!(posts[1].idem.as_deref(), Some("app-call-injected-1"));
+        drop(seen);
+        // The untouched second fixture keeps the original shape: exactly
+        // one submit POST observed after its own full window.
+        let seen2 = seen2.lock().unwrap();
+        assert_eq!(seen2.len(), 1);
+        assert_eq!(seen2[0].method, "POST");
+        assert_eq!(seen2[0].idem.as_deref(), Some("app-call-image-2"));
+    }
+
     fn price_view(charge_minor: u64, version: &str) -> Value {
         json!({"ok":true,"data":{"kind":"image","model":IMAGE_MODEL,"price":{"slug":IMAGE_TOOL,"chargeMinor":charge_minor,"currency":"USD","version":version}}})
     }
 
-    fn job_view(id: &str, status: &str, artifacts: Value, repeated: bool, charge: u64) -> Value {
+    pub(super) fn job_view(
+        id: &str,
+        status: &str,
+        artifacts: Value,
+        repeated: bool,
+        charge: u64,
+    ) -> Value {
         json!({"id":id,"kind":"image","status":status,"model":IMAGE_MODEL,"provider":"upstream-fixture",
             "providerTaskId":null,"artifacts":artifacts,"artifactError":null,
             "usage":{"providerCredits":null},
@@ -1439,17 +2489,17 @@ mod tests {
             "repeated":repeated,"cached":false,"stale":false})
     }
 
-    fn artifact_entry(job_id: &str, bytes: &[u8]) -> Value {
+    pub(super) fn artifact_entry(job_id: &str, bytes: &[u8]) -> Value {
         let digest = format!("{:x}", Sha256::digest(bytes));
         json!({"ref":format!("{job_id}.{digest}"),"digest":digest,"bytes":bytes.len(),"mime":"image/png"})
     }
 
-    fn artifact_response(bytes: &[u8]) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    pub(super) fn artifact_response(bytes: &[u8]) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
         tiny_http::Response::from_data(bytes.to_vec())
             .with_header(tiny_http::Header::from_bytes("Content-Type", "image/png").unwrap())
     }
 
-    fn image_adapter(base: &str) -> AgenticosExternalAdapter {
+    pub(super) fn image_adapter(base: &str) -> AgenticosExternalAdapter {
         AgenticosExternalAdapter::with_deployment_pin(base, Some(MANIFEST_PIN)).unwrap()
     }
 
@@ -1457,9 +2507,140 @@ mod tests {
         image_proof(Value::Null)["binding"].clone()
     }
 
+    #[test]
+    fn text_generation_never_records_uncertain_outcomes_as_a_refusal() {
+        let proof = {
+            let mut proof = text_authority("text");
+            proof["quote"] = media_quote();
+            proof
+        };
+        let input = json!({"messages":[{"role":"user","content":"Draft a caption."}]});
+        let run = |status: u16, payload: Value| {
+            let (base, _seen, worker) = media_door(move |_| json_response(status, payload.clone()));
+            let adapter =
+                AgenticosExternalAdapter::with_deployment_pin(&base, Some(TEXT_MANIFEST_PIN))
+                    .unwrap();
+            let out =
+                adapter.execute_app_capability_outcome(b"token", &proof, &input, "app-call-1177");
+            // The adapter stays alive inside the pending entry through its
+            // worker's full observation window: dropping it at loop end
+            // could cancel any transport retry and weaken the no-retry
+            // proof the worker's quiet window observes.
+            (out.map(|_| ()), (worker, adapter))
+        };
+        let mut pending = Vec::new();
+        for (status, code) in [
+            (409, "uncertain"),
+            (409, "idempotency_in_progress"),
+            (409, "generation_result_unavailable"),
+            (408, "timeout"),
+            (425, "too_early"),
+            (429, "rate_limited"),
+            (503, "unavailable"),
+        ] {
+            let (outcome, entry) = run(status, json!({"ok":false,"error":{"code":code}}));
+            assert!(
+                matches!(outcome, Err(AppCapabilityError::Uncertain(_))),
+                "{status} {code} must be uncertain"
+            );
+            pending.push(entry);
+        }
+        // A 200 whose result fails validation may already be charged.
+        let (outcome, entry) = run(
+            200,
+            json!({"ok":true,"data":{"result":{"text":"","finishReason":"stop","usage":null}}}),
+        );
+        assert!(matches!(outcome, Err(AppCapabilityError::Uncertain(_))));
+        pending.push(entry);
+        // A confirmed refusal stays a refusal.
+        let (outcome, entry) = run(403, json!({"ok":false,"error":{"code":"forbidden"}}));
+        assert!(matches!(outcome, Err(AppCapabilityError::Refused(_))));
+        pending.push(entry);
+        // Each door keeps its own full quiet window; only the joins moved
+        // after the sequential API calls so the windows overlap.
+        for (worker, _adapter) in pending {
+            worker.join().unwrap();
+        }
+    }
+
     fn hosted_adapter() -> AgenticosExternalAdapter {
         let metadata = super::super::deployments::DeploymentMetadata::parse(br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#).unwrap();
         AgenticosExternalAdapter::hosted_media(metadata.hosted_media().unwrap()).unwrap()
+    }
+
+    fn hosted_with_pin(pin: &str) -> Result<AgenticosExternalAdapter> {
+        let metadata = super::super::deployments::DeploymentMetadata::parse(
+            format!(r#"{{"schema":1,"providers":[{{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"{pin}","transport":"hosted-media-lease@1"}}]}}"#).as_bytes(),
+        )?;
+        AgenticosExternalAdapter::hosted_media(metadata.hosted_media().unwrap())
+    }
+
+    fn hosted_text_proof() -> Value {
+        let mut proof = text_authority("text");
+        proof["quote"] = media_quote();
+        proof["binding"]["config"]["account"] = json!("hosted");
+        proof["binding"]["config"]["connection_kind"] = json!("builtin");
+        proof
+    }
+
+    #[test]
+    fn hosted_text_is_refused_under_manifest_3_and_callable_under_manifest_4() {
+        let input = json!({"messages":[{"role":"user","content":"Draft a caption."}]});
+        let has_text = |adapter: &AgenticosExternalAdapter| {
+            adapter
+                .connection_descriptor()
+                .unwrap()
+                .capabilities
+                .iter()
+                .any(|capability| capability.id == "text.generate")
+        };
+        // @3: text is not advertised and a call is refused before any HTTP.
+        let v3 = hosted_with_pin(MANIFEST_PIN).unwrap();
+        assert!(!has_text(&v3));
+        let refused = v3
+            .execute_app_capability_outcome(b"", &hosted_text_proof(), &input, "app-call-1177")
+            .err()
+            .expect("@3 refuses text");
+        assert!(
+            matches!(&refused, AppCapabilityError::Refused(reason) if reason.contains("manifest v4")),
+            "{refused:?}"
+        );
+        // @4: advertised, and a call goes through the same guards to the door
+        // with no bearer.
+        let (base, seen, worker) = media_door(|_| {
+            json_response(
+                200,
+                json!({"ok":true,"data":{"result":{"text":"A grounded social caption.","finishReason":"stop","usage":{"inputTokens":9,"outputTokens":5,"totalTokens":14,"cachedInputTokens":null,"reasoningOutputTokens":null}}}}),
+            )
+        });
+        let mut v4 = hosted_with_pin(TEXT_MANIFEST_PIN).unwrap();
+        v4.base = base;
+        assert!(has_text(&v4));
+        let Ok(out) =
+            v4.execute_app_capability_outcome(b"", &hosted_text_proof(), &input, "app-call-1177")
+        else {
+            panic!("@4 allows text");
+        };
+        assert_eq!(out.result["text"], "A grounded social caption.");
+        worker.join().unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].auth.is_none(), "the hosted door carries no bearer");
+        assert_eq!(seen[0].url, CALL_PATH);
+        // The guards still hold under @4: a credentialed account is refused.
+        let mut forged = hosted_text_proof();
+        forged["binding"]["config"]["account"] = json!("company1");
+        assert!(v4
+            .execute_app_capability_outcome(b"", &forged, &input, "app-call-1177")
+            .is_err());
+        // Only reviewed pins parse as a hosted media transport.
+        for bad in [
+            "agenticos-external-provider-tools@5",
+            "agenticos-external-provider-tools@4x",
+            "agenticos-external-provider-tools@2",
+        ] {
+            assert!(hosted_with_pin(bad).is_err(), "{bad}");
+        }
     }
 
     fn hosted_image_proof() -> Value {
@@ -1719,7 +2900,8 @@ mod tests {
                     assert_eq!(request.idem.as_deref(), Some("app-call-image-1"));
                     assert_eq!(request.body["model"], json!("openai/gpt-image-2.5"));
                     assert_eq!(request.body["aspectRatio"], json!("1:1"));
-                    assert_eq!(request.body.as_object().unwrap().len(), 3);
+                    assert_eq!(request.body.as_object().unwrap().len(), 4);
+                    assert_eq!(request.body["max_charge_minor"], json!(31_500));
                     assert!(request.body["prompt"]
                         .as_str()
                         .unwrap()
@@ -1771,6 +2953,7 @@ mod tests {
 
     #[test]
     fn cad816_image_refusal_variants_never_repost() {
+        let mut pending = Vec::new();
         for (status, payload, needle) in [
             (
                 404u16,
@@ -1826,6 +3009,15 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(error.contains(needle), "{error} lacks {needle}");
+            // Keep the adapter alive inside the entry until its worker's
+            // full 500ms quiet window ends: dropping it early could cancel
+            // an async retry and weaken the no-re-POST proof.
+            pending.push((worker, adapter, seen, status));
+        }
+        // All API calls above stayed sequential; only the doors' quiet
+        // windows overlap now. Each original observation runs after its own
+        // worker's full join, in the original order.
+        for (worker, _adapter, seen, status) in pending {
             worker.join().unwrap();
             let seen = seen.lock().unwrap();
             assert_eq!(seen.len(), 1, "exactly one POST for status {status}");
@@ -1854,10 +3046,84 @@ mod tests {
         );
     }
 
+    /// CAD-1335: AgenticOS `openMediaTool` answers a 409 `disabled` or
+    /// `unpriced` admission refusal before provider dispatch. Both are
+    /// confirmed refusals, never busy/uncertain; every other 409 shape
+    /// (uncertain, key_conflict, idempotency_in_progress, price_changed,
+    /// an unknown or missing code, or a non-refusal envelope) and every
+    /// other transient status stays uncertain. Each case issues exactly
+    /// one submit POST — no poll, no re-POST.
+    #[test]
+    fn cad1335_image_submit_admission_refusals_split_definite_from_uncertain() {
+        let proof = image_proof(media_quote());
+        let mut pending = Vec::new();
+        for code in ["disabled", "unpriced"] {
+            let payload = json!({"ok":false,"error":{"code":code}});
+            let (base, seen, worker) = media_door(move |_| json_response(409, payload.clone()));
+            let adapter = image_adapter(&base);
+            let failure = adapter
+                .execute_app_image(b"test-token", &proof, &json!({}), "app-call-image-1")
+                .err()
+                .expect("409 admission refusal");
+            assert!(
+                failure.not_executed,
+                "409 {code} must be a definite refusal, got {failure:?}"
+            );
+            assert!(
+                failure.detail.contains(code),
+                "{} loses the {code} detail",
+                failure.detail
+            );
+            pending.push((worker, adapter, seen));
+        }
+        // Sequential calls done; each door's full quiet window still ran
+        // and the original observations follow their own worker's join.
+        for (worker, _adapter, seen) in pending {
+            worker.join().unwrap();
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one submit POST, no poll or re-POST");
+            assert_eq!(seen[0].method, "POST");
+            assert_eq!(seen[0].url, MEDIA_SUBMIT_PATH);
+        }
+        let mut pending = Vec::new();
+        for (status, payload) in [
+            (409u16, json!({"ok":false,"error":{"code":"uncertain"}})),
+            (409, json!({"ok":false,"error":{"code":"key_conflict"}})),
+            (
+                409,
+                json!({"ok":false,"error":{"code":"idempotency_in_progress"}}),
+            ),
+            (409, json!({"ok":false,"error":{"code":"price_changed"}})),
+            (409, json!({"ok":false,"error":{"code":"unknown_code"}})),
+            (409, json!({"ok":false,"error":{"message":"no code"}})),
+            (409, json!({"ok":true,"data":{"job":{}}})),
+            (408, json!({"ok":false,"error":{"code":"disabled"}})),
+            (429, json!({"ok":false,"error":{"code":"unpriced"}})),
+        ] {
+            let label = payload.to_string();
+            let (base, seen, worker) = media_door(move |_| json_response(status, payload.clone()));
+            let adapter = image_adapter(&base);
+            let failure = adapter
+                .execute_app_image(b"test-token", &proof, &json!({}), "app-call-image-1")
+                .err()
+                .expect("failure");
+            assert!(
+                !failure.not_executed,
+                "{status} {label} must stay uncertain, got {failure:?}"
+            );
+            pending.push((worker, adapter, seen));
+        }
+        for (worker, _adapter, seen) in pending {
+            worker.join().unwrap();
+            assert_eq!(seen.lock().unwrap().len(), 1);
+        }
+    }
+
     #[test]
     fn cad816_image_terminal_failures_and_bad_artifacts_refuse() {
         let png = test_png();
         let artifact = artifact_entry("med_job1", &png);
+        let mut pending = Vec::new();
         for (status_name, artifacts) in [
             ("failed", json!([])),
             ("released", json!([])),
@@ -1880,6 +3146,9 @@ mod tests {
                 error.contains("med_job1") || status_name == "succeeded",
                 "{error}"
             );
+            pending.push((worker, adapter));
+        }
+        for (worker, _adapter) in pending {
             worker.join().unwrap();
         }
         // Artifact descriptor and bytes must agree exactly.
@@ -1890,11 +3159,12 @@ mod tests {
                 json!("med_other.5c1480e7e57bb317cfc0431d6b0b2457815986cd9f55b8d07a1c6c9c24e1b697");
             entry
         };
-        // Past the custody bound the artifact read is refused at the cap.
-        let big = vec![0u8; image::ASSET_LIMIT + 1];
+        // Past what AgenticOS itself imports the artifact read is refused at the cap.
+        let big = vec![0u8; image::FETCH_LIMIT + 1];
         let oversized_entry = artifact_entry("med_job1", &big);
+        let mut pending = Vec::new();
         for (entry, bytes, needle) in [
-            (oversized_entry, big, "custody bound"),
+            (oversized_entry, big, "import bound"),
             (wrong_digest, png.clone(), "differs from its receipt"),
             (bad_ref, png.clone(), "artifact descriptor"),
             (artifact.clone(), b"different bytes".to_vec(), "differs"),
@@ -1921,6 +3191,9 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(error.contains(needle), "{error} lacks {needle}");
+            pending.push((worker, adapter, seen));
+        }
+        for (worker, _adapter, seen) in pending {
             worker.join().unwrap();
             let seen = seen.lock().unwrap();
             assert_eq!(seen.iter().filter(|r| r.method == "POST").count(), 1);
@@ -1964,7 +3237,8 @@ mod tests {
                         ("GET", MEDIA_PRICE_PATH) => json_response(200, price_view(31_500, "v1")),
                         ("POST", MEDIA_SUBMIT_PATH) => {
                             assert_eq!(request.idem.as_deref(), Some("app-call-868"));
-                            assert_eq!(request.body.as_object().unwrap().len(), 3);
+                            assert_eq!(request.body.as_object().unwrap().len(), 4);
+                            assert_eq!(request.body["max_charge_minor"], json!(31_500));
                             json_response(
                                 201,
                                 json!({"ok":true,"data":{"job":job_view("med_job868", "queued", json!([]), false, 40_000)}}),
@@ -2056,7 +3330,7 @@ mod tests {
                         assert_eq!(request.auth.as_deref(), Some("Bearer test-token"));
                         assert_eq!(
                             request.body,
-                            json!({"model":"openai/gpt-image-2.5","prompt":request.body["prompt"],"aspectRatio":"1:1"})
+                            json!({"model":"openai/gpt-image-2.5","prompt":request.body["prompt"],"aspectRatio":"1:1","max_charge_minor":31_500})
                         );
                         json_response(
                             201,
@@ -2198,7 +3472,7 @@ mod tests {
                     request.as_reader().read_to_string(&mut body).unwrap();
                     let body: Value = serde_json::from_str(&body).unwrap();
                     assert_eq!(body["slug"], POSTS_TOOL);
-                    assert_eq!(body["query"], json!({"handle":"juicysuite_crm"}));
+                    assert_eq!(body["query"], json!({"handle":"juicysuite_crm","count":12}));
                     assert_eq!(body["max_charge_minor"], 2000);
                     assert!(body.get("company").is_none());
                     request
@@ -2236,3 +3510,6 @@ mod tests {
         worker.join().unwrap();
     }
 }
+
+#[cfg(test)]
+mod text_contract_tests;

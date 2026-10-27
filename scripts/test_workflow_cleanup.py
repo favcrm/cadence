@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -25,6 +26,46 @@ def job(text, name):
 
 
 class CleanupTests(unittest.TestCase):
+    def test_release_store_secrets_are_read_only_from_a_scoped_environment(self):
+        # CAD-1506: the release-store write credentials are environment-scoped.
+        # A repository-scoped secret is readable by any run from a branch of
+        # this repo, including a PR run of the PR's own code, so every job
+        # that reads one must declare a scoped environment whose branch policy
+        # keeps the key off PR refs. The refused case is exactly that: a
+        # referencing job with no environment.
+        #
+        # `release-store` carries the publishing jobs (branch policy: main and
+        # v* tags, no reviewers, so no approval click is added). The
+        # visibility flip in release-visibility.yml keeps the `production`
+        # environment because its operator approval is the gate on the
+        # outward action; the key therefore lives in both environments.
+        allowed = ("release-store", "production")
+        expected = {
+            ("ci.yml", "release-publish-r2", "release-store"),
+            ("promotion-completion.yml", "publish-release", "release-store"),
+            ("release-mirror.yml", "mirror", "release-store"),
+            ("release-visibility.yml", "make-public", "production"),
+        }
+        seen = set()
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            jobs_text = path.read_text().partition("\njobs:\n")[2]
+            for match in re.finditer(r"(?m)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)",
+                                     jobs_text, re.S):
+                name, body = match.group(1), match.group(2)
+                if "secrets.RELEASES_R2_" not in body:
+                    continue
+                environment = re.search(r"(?m)^    environment: (\S+)$", body)
+                self.assertIsNotNone(
+                    environment,
+                    f"{path.name} job {name} reads the release-store secrets "
+                    "without a scoped environment")
+                self.assertIn(
+                    environment.group(1), allowed,
+                    f"{path.name} job {name} uses environment "
+                    f"{environment.group(1)!r}, not one that holds the release-store key")
+                seen.add((path.name, name, environment.group(1)))
+        self.assertEqual(seen, expected, "release-store consumers changed")
+
     def test_pr_rehearsal_cache_is_read_only_and_never_replaces_real_checks(self):
         # CAD-1135: inspect the actual consumer configuration. This proves
         # wiring, not a remote cache hit or GitHub's runtime save refusal.
@@ -56,8 +97,8 @@ class CleanupTests(unittest.TestCase):
         install = step_index("run", "scripts/ci-rust-toolchain --profile minimal")
         cache = step_index("uses", "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6")
         export = step_index("run", "scripts/ci-rust-toolchain --export --profile minimal")
-        ui_install = step_index("run", "pnpm install --frozen-lockfile")
-        ui_build = step_index("run", "pnpm build")
+        ui_install = step_index("run", "bun install --frozen-lockfile")
+        ui_build = step_index("run", "bun run build")
         build = step_index("run", "cargo build --release --locked --features ui")
         rehearsal = step_index("name", "Real-binary migration and backup recovery rehearsal")
         self.assertLess(install, cache)
@@ -84,7 +125,7 @@ class CleanupTests(unittest.TestCase):
         uses = re.findall(r"^      (?:- |  )uses: ([^ #\n]+)", body, re.M)
         self.assertCountEqual(uses, [
             "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
-            "pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1",
+            "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
             "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
             "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
             "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
@@ -111,17 +152,32 @@ class CleanupTests(unittest.TestCase):
     def test_required_gates_still_have_real_checks_and_scope_wiring(self):
         ci = workflow("ci.yml")
         self.assertIn("  merge_group:", ci)
-        for name in ("fmt", "clippy", "test", "build", "ui"):
+        for name in ("fmt", "clippy", "test-shards", "build", "ui"):
             body = job(ci, name)
             self.assertIn("change-scope", body)
             self.assertIn("needs.queue-evidence.outputs.tested", body)
             commands = [step for step in re.split(r"(?=^      - )", body, flags=re.M)
-                        if re.search(r"(?:run:|uses:).*(?:cargo |pnpm |rust-cache@|ci-rust-toolchain)", step)]
+                        if re.search(r"(?:run:|uses:).*(?:cargo |bun |rust-cache@|ci-rust-toolchain)", step)]
             self.assertTrue(commands, name)
             for step in commands:
                 category = "ui" if name == "ui" else "rust"
                 self.assertIn(f"needs.change-scope.outputs.{category} != 'false'", step)
-        test = job(ci, "test")
+        # CAD-1480: the required `test` check is the shard aggregate — it
+        # runs on every shard outcome (never silently skipped), requires
+        # green shards, then re-runs the full zero-target coverage guard
+        # over the merged junit reports.
+        agg = job(ci, "test")
+        self.assertIn("needs: [queue-evidence, change-scope, test-shards]", agg)
+        self.assertIn("always()", agg)
+        self.assertIn("needs.test-shards.result", agg)
+        self.assertIn("download-artifact", agg)
+        self.assertIn("check-test-junit.py", agg)
+        self.assertIn("--targets-file", agg)
+        # CAD-1480: a shard that skips its junit OR its inventory fails
+        # here — both artifact counts are pinned to the matrix size.
+        self.assertIn("expected 6 shard junit", agg)
+        self.assertIn("expected 6 shard inventories", agg)
+        shards = job(ci, "test-shards")
         # CAD-1124: retiring the empty doctest invocation must retain BOTH
         # default-feature compilation gates, not just feature-on tests.
         rust_scope = "        if: ${{ needs.change-scope.outputs.rust != 'false' }}"
@@ -154,19 +210,45 @@ class CleanupTests(unittest.TestCase):
                     r"            echo [^\n]+\n"
                     r"            exit 1\n"
                     r"          fi$")
-        # CAD-1090: every tests/*.rs target, via the shared selection script.
-        self.assertIn("scripts/run-result-tests", test)
+        # CAD-1090: the shared selection script reports every test target
+        # (CAD-1727: now the one suite binary).
+        self.assertIn("scripts/run-result-tests", shards)
+        self.assertIn("--partition", shards)
         runner = (ROOT / "scripts/run-result-tests").read_text()
         self.assertIn("scripts/result-test-args", runner)
-        # CAD-1105: the lib unit tests run too, in the same runner.
-        for needle in ("--features test-seam", "--no-fail-fast", "--test-threads 2",
-                       "running 0 tests", "HOME=", "XDG_CONFIG_HOME=",
-                       "--features test-seam --lib --no-fail-fast",
-                       "CARGO_BUILD_TARGET_DIR", "unset CARGO_TARGET_DIR"):
+        # CAD-1334: one pinned nextest invocation keeps every selected
+        # integration target plus lib and bins, with bounded concurrency;
+        # the coverage guard lives in scripts/check-test-junit.py so the
+        # CI aggregate can re-run it over merged shard reports.
+        for needle in ('scripts/cadence-nextest" --locked --features test-seam',
+                       '"${target_args[@]}" --lib --bins', '-j "$jobs"',
+                       'check-test-junit.py', 'expected-targets.txt',
+                       '--partition "hash:', 'junit_report=', 'HOME=',
+                       'XDG_CONFIG_HOME=', 'CARGO_BUILD_TARGET_DIR',
+                       'unset CARGO_TARGET_DIR'):
             self.assertIn(needle, runner)
+        # CAD-1480: shard partitions are hash-strict — an empty, repeated
+        # or oversized argument must refuse before touching nextest.
+        for needle in ('partition_seen', 'jobs_seen',
+                       '--partition given twice', '--jobs given twice',
+                       '[0-9]{1,3})/([0-9]{1,3}', '10#${BASH_REMATCH[1]}',
+                       '[0-9]{1,2}$', '10#$jobs'):
+            self.assertIn(needle, runner)
+        # CAD-1487: shards link with mold/lld, and the warm test leg enables
+        # the identical flag — fingerprints must match or gate-test misses.
+        self.assertIn("ci-fast-linker enable", shards)
+        warm = job(ci, "cache-warm")
+        self.assertIn("test and release legs", warm)
+        junit = (ROOT / "scripts/check-test-junit.py").read_text()
+        for needle in ('no runnable tests', 'findall(".//testsuite")',
+                       'failure', '--targets-file', 'skipped'):
+            self.assertIn(needle, junit)
         selected = subprocess.run([str(ROOT / "scripts/result-test-args")],
                                   capture_output=True, text=True, check=True).stdout.split()
-        self.assertIn("safety_floor", selected)
+        # CAD-1727: the safety floor is a module of the one suite target now;
+        # the selection must still cover it.
+        self.assertIn("suite", selected)
+        self.assertIn("mod safety_floor;", (ROOT / "tests" / "suite.rs").read_text())
         meta = json.loads(subprocess.run(
             ["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked"],
             cwd=ROOT, capture_output=True, text=True, check=True).stdout)
@@ -234,30 +316,54 @@ class CleanupTests(unittest.TestCase):
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
 
-# CAD-1105: scripts/run-result-tests against a stub cargo. The stub answers
-# `cargo metadata` with one test target and logs every `cargo test` call
-# with the environment the test binaries would inherit.
+    def test_public_artifacts_and_store_bindings_stay_pinned(self):
+        # CAD-1511: on a public repository every Actions artifact is
+        # downloadable by any GitHub account, and artifact bytes are never
+        # redacted. A staging upload must therefore not carry a shared temp dir
+        # whose writer it does not control, and a publisher that spends the
+        # release-store key must write the dedicated literals, never a
+        # repository variable.
+        staging = workflow("staging.yml")
+        uploads = [step for step in re.split(r"(?=^      - )", staging, flags=re.M)
+                   if "actions/upload-artifact@" in step]
+        self.assertGreaterEqual(len(uploads), 3, "staging.yml artifact uploads")
+        path_lines = 0
+        for step in uploads:
+            for line in step.splitlines():
+                if "runner.temp" not in line:
+                    continue
+                path_lines += 1
+                self.assertNotIn(
+                    "staging-e2e", line,
+                    "a staging artifact declares the retired journey's shared temp dir")
+        self.assertGreaterEqual(path_lines, len(uploads),
+                                "each artifact upload carries a path entry")
+
+        mirror = workflow("release-mirror.yml")
+        self.assertIn(
+            'RELEASES_ENDPOINT="https://87b59a40e130c425e35474687ad98a4f.r2.cloudflarestorage.com"',
+            mirror)
+        self.assertIn('--endpoint "$RELEASES_ENDPOINT"', mirror)
+        self.assertIn('--bucket "$RELEASES_BUCKET"', mirror)
+        self.assertNotIn("RELEASES_R2_PUBLIC_VISIBILITY", mirror)
+        # Asserted so that changing it is deliberate: the retry keeps the
+        # private record, and the production-gated release-visibility workflow
+        # owns the public flip.
+        self.assertIn("--visibility private", mirror)
+
+
+# The provider-refusal case uses a stub cargo only to keep metadata lookup
+# local; every runner behavior (selection, isolation, lock, and zero-test
+# refusal) is exercised by the independent real-nextest acceptance below.
 STUB_CARGO = r"""#!/bin/sh
 case "$1" in
 metadata)
   printf '%s' '{"packages":[{"targets":[{"name":"floor","kind":["test"]}]}]}'
   exit 0 ;;
-test)
-  printf '%s|PATH=%s|CTD=%s|CBTD=%s|HOME=%s\n' "$*" "$PATH" \
-    "${CARGO_TARGET_DIR-unset}" "${CARGO_BUILD_TARGET_DIR-unset}" "$HOME" >> "$STUB_LOG"
-  case " $* " in
-  *" --lib "*)
-    [ -n "${STUB_LIB_SILENT:-}" ] || echo "running ${STUB_LIB_N:-3} tests"
-    exit "${STUB_LIB_RC:-0}" ;;
-  *)
-    echo "running 2 tests"
-    [ -z "${STUB_INT_ZERO:-}" ] || echo "running 0 tests"
-    exit "${STUB_INT_RC:-0}" ;;
-  esac ;;
 esac
+echo "unexpected cargo invocation: $*" >&2
 exit 1
 """
-SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 class RunResultTestsRunner(unittest.TestCase):
@@ -278,32 +384,19 @@ class RunResultTestsRunner(unittest.TestCase):
         log = Path(root) / "cargo-test.log"
         env = {"PATH": f"{toolchain}:{host}:/usr/bin:/bin", "RUNNER_TEMP": root,
                "STUB_LOG": str(log), "CARGO_HOME": str(Path(root) / "cargo-home"),
-               "RUSTUP_HOME": str(Path(root) / "rustup-home"), "HOME": root}
+               "RUSTUP_HOME": str(Path(root) / "rustup-home"), "HOME": root,
+               "CADENCE_SUITE_LOCK": str(Path(root) / "fixture-suite.lock")}
         env.update(env_extra)
         result = subprocess.run([str(ROOT / "scripts/run-result-tests")], cwd=root,
                                 env=env, capture_output=True, text=True)
         calls = log.read_text().splitlines() if log.exists() else []
         return result, calls, toolchain
 
-    def test_lib_suite_runs_isolated_after_the_integration_targets(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as root:
-            result, calls, toolchain = self.run_runner(root, CARGO_TARGET_DIR="rel/tgt")
-            out = result.stdout + result.stderr
-            self.assertEqual(result.returncode, 0, out)
-            self.assertEqual(len(calls), 2, calls)
-            integration, lib = calls
-            self.assertIn("--test floor", integration)
-            self.assertNotIn("--lib", integration)
-            for needle in ("test --locked --features test-seam --lib --no-fail-fast",
-                           "-- --test-threads 2"):
-                self.assertIn(needle, lib)
-            # The lib suite's PATH is the toolchain dir plus system dirs only.
-            self.assertIn(f"|PATH={toolchain}:{SYSTEM_PATH}|", lib)
-            self.assertNotIn("host-bin", lib)
-            for call in calls:
-                self.assertIn("|CTD=unset|", call)
-                self.assertIn(f"|CBTD={root}/rel/tgt|", call)
-                self.assertIn(f"|HOME={root}/result-tests.", call)
+    def test_real_nextest_runner_acceptance(self):
+        check = ROOT / "scripts/acceptance/test-cad-1334-nextest-contract.py"
+        result = subprocess.run([sys.executable, str(check)], cwd=ROOT,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_provider_cli_beside_cargo_refuses_before_any_test_runs(self):
         for cli in ("claude", "codex", "cursor-agent", "pi", "devin"):
@@ -312,23 +405,6 @@ class RunResultTestsRunner(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn(f"provider CLI {cli} resolves", result.stderr)
                 self.assertEqual(calls, [])
-
-    def test_red_lib_or_red_integration_fails_and_both_still_run(self):
-        for env in ({"STUB_LIB_RC": "101"}, {"STUB_INT_RC": "101"}):
-            with self.subTest(env=env), tempfile.TemporaryDirectory(dir="/tmp") as root:
-                result, calls, _ = self.run_runner(root, **env)
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertEqual(len(calls), 2, calls)
-                self.assertIn("--lib", calls[1])
-
-    def test_target_that_runs_no_tests_fails(self):
-        # One of several targets at 0 still fails; so does a lib with none.
-        for env in ({"STUB_LIB_N": "0"}, {"STUB_LIB_SILENT": "1"}, {"STUB_INT_ZERO": "1"}):
-            with self.subTest(env=env), tempfile.TemporaryDirectory(dir="/tmp") as root:
-                result, calls, _ = self.run_runner(root, **env)
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertIn("ran 0 tests", result.stderr)
-                self.assertEqual(len(calls), 2, calls)
 
 
 if __name__ == "__main__":

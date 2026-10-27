@@ -2,7 +2,8 @@
 declare function require(name: string): any;
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/projects/cadence/context" });
-for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"]) {
+// Response blobs, FileReader and object URLs share this browser fixture realm.
+for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "Event", "MouseEvent", "KeyboardEvent", "FileReader", "URL", "location", "history", "sessionStorage"]) {
   Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
 }
 for (const name of ["addEventListener", "removeEventListener"]) Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
@@ -26,6 +27,7 @@ const { navigate } = require("../src/lib/useLocation") as typeof import("../src/
 const { wiki, WikiError } = require("../src/features/wiki/api") as typeof import("../src/features/wiki/api");
 const { draftKey, stashDraft } = require("../src/features/wiki/editor") as typeof import("../src/features/wiki/editor");
 const requests: string[] = [];
+const imageFetchRequests: { path: string; headers: HeadersInit }[] = [];
 const writes: { path?: string; from?: string; to?: string; text?: string; if_rev?: string }[] = [];
 let conflict = false;
 let holdSave = false;
@@ -51,6 +53,11 @@ globalThis.fetch = async (input, init) => {
     if (missing) return json({ error: `wiki ls '${path}': no such directory` }, 400);
     return json({ path, entries: [{ path: `${path}/README.md`, name: "README.md", kind: "text" }, { path: `${path}/research`, name: "research", kind: "dir" }, { path: `${path}/logo.png`, name: "logo.png", kind: "blob", mime: "image/png" }] });
   }
+  if (url.pathname.endsWith("/file") && path.endsWith(".png")) {
+    imageFetchRequests.push({ path, headers: init?.headers ?? {} });
+    const png = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/aYkAAAAASUVORK5CYII="), (byte) => byte.charCodeAt(0));
+    return new win.Response(png, { headers: { "Content-Type": "image/png" } });
+  }
   if (url.pathname.endsWith("/file")) return json({ path, kind: "text", text: `# Project brief\n\nNotes for ${path}`, rev: "base-rev" });
   if (url.pathname.endsWith("/search")) return json({ matches: [
     { path: pagePath, line: 3, text: "Project brief match" },
@@ -66,9 +73,14 @@ function assert(value: unknown, what: string): asserts value { if (!value) throw
 const host = document.createElement("div");
 document.body.append(host);
 const view = createRoot(host);
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
+function renderWithNavigation(children: React.ReactNode) {
+  view.render(React.createElement(NavigationProvider, { adapter: hostNavigation, children }));
+}
 const props = { project: "cadence", readOnly: false, actor: "master", onToast: () => {}, navHref: () => "/" };
 const flush = async () => { await new Promise((resolve) => setTimeout(resolve, 10)); };
-async function render(extra: Partial<typeof props> = {}) { await React.act(async () => { view.render(React.createElement(Context, { ...props, ...extra })); await flush(); }); await React.act(flush); }
+async function render(extra: Partial<typeof props> = {}) { await React.act(async () => { renderWithNavigation(React.createElement(Context, { ...props, ...extra })); await flush(); }); await React.act(flush); }
 async function go(href: string) { await React.act(async () => { navigate(href); await flush(); }); await React.act(flush); }
 async function run() {
   await render();
@@ -165,7 +177,13 @@ async function run() {
   assert(!host.textContent?.includes("Restore this version"), "unsupported restore is not offered");
   await go("/projects/cadence/context?file=logo.png");
   await render({ project: "assets" });
-  assert(host.querySelector("img")?.getAttribute("src")?.includes("projects%2Fassets%2Flogo.png"), "pasted blob links preview using metadata, not a JSON read of bytes");
+  sessionStorage.setItem("cadence.sessionKey", "synthetic-unit-tab-key");
+  await go("/projects/assets/context?file=logo.png");
+  await React.act(flush);
+  const image = host.querySelector("img");
+  const expectedPng = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/aYkAAAAASUVORK5CYII=";
+  assert(image?.getAttribute("src") === expectedPng, "pasted blob uses image metadata and renders the actual PNG bytes as a data URL");
+  assert(imageFetchRequests.some(({ path, headers }) => path === "projects/assets/logo.png" && new Headers(headers).get("X-Cadence-Session") === "synthetic-unit-tab-key"), "unit mock confirms the project-scoped image fetch includes this synthetic tab key (not native-auth proof)");
   await render({ project: "other" });
   assert(!host.textContent?.includes("Draft in this project"), "changing project clears prior editor state");
   const beforeInvalid = requests.length;
@@ -200,7 +218,7 @@ async function run() {
   assert(location.search.includes("mode=search") && location.search.includes("q=kept"), "a completed save does not pull the operator away from a newer destination");
   assert(sessionStorage.getItem(draftKey(pagePath))?.includes("Newer draft in another editor"), "a late save does not erase a newer draft for the same page");
   await React.act(async () => {
-    view.render(React.createElement(Wiki, { route: { screen: "wiki", mode: "browse", path: pagePath, query: null }, navHref: (route) => route.screen === "wiki" ? `/wiki/${route.mode}/${route.path ?? ""}` : "/", readOnly: true, actor: "master", onToast: () => {} }));
+    renderWithNavigation(React.createElement(Wiki, { route: { screen: "wiki", mode: "browse", path: pagePath, query: null }, navHref: (route) => route.screen === "wiki" ? `/wiki/${route.mode}/${route.path ?? ""}` : "/", readOnly: true, actor: "master", onToast: () => {} }));
     await flush();
   });
   await React.act(flush);
@@ -208,12 +226,14 @@ async function run() {
   assert(Array.from(host.querySelectorAll("button")).some((button) => button.textContent?.trim() === "Files"), "global Wiki uses the same collapsible explorer");
   assert(Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Edit")?.disabled, "shared reader respects read-only access in Wiki");
 
-  const apiModule = require("../src/features/wiki/api");
-  const originalUpload = apiModule.uploadFile;
+  // The pane now drives the durable transfer import; the queue contract
+  // below is unchanged, so it is asserted at that seam.
+  const transferModule = require("../src/features/wiki/transfer");
+  const originalImport = transferModule.importFile;
   const uploads: string[] = [];
-  apiModule.uploadFile = async (_dir: string, file: File) => { uploads.push(file.name); };
+  transferModule.importFile = async (_dir: string, file: File) => { uploads.push(file.name); return { outcome: "applied", extraction: "indexed", index: "covered" }; };
   await React.act(async () => {
-    view.render(React.createElement(UploadPane, { dir: "projects/cadence", navHref: () => "/", readOnly: true, onToast: () => {}, onUploaded: () => {} }));
+    renderWithNavigation(React.createElement(UploadPane, { dir: "projects/cadence", navHref: () => "/", readOnly: true, onToast: () => {}, onUploaded: () => {} }));
     await flush();
   });
   await React.act(async () => {
@@ -225,11 +245,12 @@ async function run() {
   assert(uploads.length === 0 && !host.querySelector(".wk-uprow"), "a read-only file drop neither queues nor starts an upload");
   const uploadProps = { dir: "projects/cadence", navHref: () => "/", readOnly: false, onToast: () => {}, onUploaded: () => {} };
   let releaseUpload: (() => void) | null = null;
-  apiModule.uploadFile = async (_dir: string, file: File) => {
+  transferModule.importFile = async (_dir: string, file: File) => {
     uploads.push(file.name);
     if (uploads.length === 1) await new Promise<void>((resolve) => { releaseUpload = resolve; });
+    return { outcome: "applied", extraction: "indexed", index: "covered" };
   };
-  await React.act(() => view.render(React.createElement(UploadPane, uploadProps)));
+  await React.act(() => renderWithNavigation(React.createElement(UploadPane, uploadProps)));
   const choose = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Choose files");
   const picker = host.querySelector("input[type='file']");
   assert(choose && picker, "upload has a native Choose files button");
@@ -244,20 +265,20 @@ async function run() {
   });
   const clearUploads = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Clear completed uploads");
   assert(Number(uploads.length) === 1 && clearUploads?.disabled, "uploads are sequential and an active queue cannot be cleared");
-  await React.act(() => view.render(React.createElement(UploadPane, { ...uploadProps, readOnly: true })));
+  await React.act(() => renderWithNavigation(React.createElement(UploadPane, { ...uploadProps, readOnly: true })));
   await React.act(async () => { releaseUpload?.(); await flush(); });
   assert(Number(uploads.length) === 1, "becoming read-only pauses remaining queued uploads");
-  await React.act(async () => { view.render(React.createElement(UploadPane, uploadProps)); await flush(); });
+  await React.act(async () => { renderWithNavigation(React.createElement(UploadPane, uploadProps)); await flush(); });
   await React.act(flush);
   assert(uploads.join(",") === "one.md,two.md" && host.querySelectorAll(".wk-uprow.done").length === 2 && !clearUploads.disabled, "the queue resumes without losing either completed row");
   await React.act(() => clearUploads.click());
   assert(!host.querySelector(".wk-uprow"), "completed uploads can be cleared");
-  apiModule.uploadFile = originalUpload;
+  transferModule.importFile = originalImport;
 
   const folderErrors: string[] = [];
   const folderProps = { entries: [{ name: "README.md", path: pagePath, kind: "page" as const }], navHref: () => "/", readOnly: false, onRefresh: () => {}, onToast: () => {}, onFail: (error: unknown) => folderErrors.push(String(error)) };
   const renderFolder = async (readOnly = false) => {
-    await React.act(() => view.render(React.createElement(WikiScopeContext, { value: { root: "projects/cadence", label: "Cadence" } }, React.createElement(FolderPane, { ...folderProps, readOnly }))));
+    await React.act(() => renderWithNavigation(React.createElement(WikiScopeContext, { value: { root: "projects/cadence", label: "Cadence" } }, React.createElement(FolderPane, { ...folderProps, readOnly }))));
   };
   await renderFolder();
   assert(host.querySelector(".wk-flist") && host.querySelector("[aria-label='List view']")?.getAttribute("aria-pressed") === "true", "folder defaults to a compact list");

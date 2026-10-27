@@ -8,17 +8,30 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::agents::Agent;
+use super::assistants::AssistDispatchExpect;
 use super::kickoff::{check_commit_sha, criteria_too_long, flatten_controls, kickoff_body};
 use super::messages::{row_message, Message, Priority};
 use super::StoreConn;
 use super::{is_task_terminal, is_terminal, now, take_bytes, Sender, Store};
+
+/// CAD-1239: an archived worker cannot be assigned new work or have a
+/// terminal task reopened onto it. Runs inside the assignment transaction.
+fn refuse_archived_assignee(worker: &Agent) -> Result<()> {
+    if worker.archived_at.is_some() {
+        return Err(Error::rejected(format!(
+            "Agent '{}' is archived — it cannot take an assignment",
+            worker.alias
+        )));
+    }
+    Ok(())
+}
 
 /// The `jobs.state` vocabulary for `job list --state`.
 pub const JOB_STATES: &[&str] = &["draft", "open", "done", "failed", "cancelled"];
 
 /// A job: the rollup container binding a spec, a PM (group root) and a
 /// set of tasks. `state`: `draft|open|done|failed|cancelled`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Job {
     pub id: String,
     pub title: Option<String>,
@@ -41,9 +54,27 @@ pub struct Job {
     pub updated: f64,
 }
 
+/// A non-terminal task assigned to an alias with its job's binding:
+/// `issue` is the job's issue (`None` when unbound); `job_title` and
+/// `job_state` are `None` only if the job row is missing.
+#[derive(Debug, Clone)]
+pub struct AssigneeTask {
+    pub task: Task,
+    pub issue: Option<String>,
+    pub job_title: Option<String>,
+    pub job_state: Option<String>,
+}
+
+/// [`Store::job_task_summary`]: per-job task counts by state and task lists.
+#[derive(Default)]
+pub struct JobTaskSummary {
+    pub counts: std::collections::HashMap<String, std::collections::BTreeMap<String, i64>>,
+    pub lists: std::collections::HashMap<String, Vec<Task>>,
+}
+
 /// A task: the dispatch/QA unit inside a job. `revision` counts
 /// attempts; each attempt is one kickoff message (`dispatch_message`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub id: String,
     pub job_id: String,
@@ -194,7 +225,102 @@ impl Verdict {
     }
 }
 
+/// A pre-dispatch snapshot: the exact native task/job/worker inputs and
+/// proposed kickoff revision/id. Capture source bytes outside the write
+/// transaction, then fence this snapshot when admitting the prepared delivery.
+pub struct DispatchPlan {
+    pub task: Task,
+    pub job: Job,
+    pub worker: Agent,
+    pub revision: i64,
+    pub message_id: String,
+    pub duplicate: bool,
+}
+
+impl DispatchPlan {
+    /// Source capture must not authorize a changed task/job/worker. Compare
+    /// the material rows, not timestamps alone, inside the admission write.
+    pub(super) fn verify_current(
+        &self,
+        task: &Task,
+        job: &Job,
+        worker: &Agent,
+        revision: i64,
+        message: &str,
+    ) -> Result<()> {
+        if self.duplicate
+            || task != &self.task
+            || job != &self.job
+            || revision != self.revision
+            || message != self.message_id
+            || worker.alias != self.worker.alias
+            || worker.uid != self.worker.uid
+            || worker.provider != self.worker.provider
+            || worker.endpoint_kind != self.worker.endpoint_kind
+            || worker.role != self.worker.role
+            || worker.team_role != self.worker.team_role
+            || worker.cwd != self.worker.cwd
+            || worker.sandbox != self.worker.sandbox
+            || worker.instructions != self.worker.instructions
+            || worker.params != self.worker.params
+            || worker.model_selection != self.worker.model_selection
+        {
+            return Err(Error::rejected(format!(
+                "context refused: stale-task-inputs: task '{}' or its job/worker changed \
+                 while preparing context — retry to capture its current scope; nothing was queued",
+                self.task.id
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub(super) struct DispatchPreparation<'a> {
+    pub(super) plan: &'a DispatchPlan,
+    /// Absent only when the captured plan already names an accepted kickoff.
+    pub(super) delivery: Option<(String, super::messages::IssueSelection)>,
+}
+
 impl Store {
+    /// Re-prove assist provenance at the message admission boundary, including
+    /// the automatic-monitor path when it consumes a prepared native dispatch.
+    pub(super) fn task_dispatch_authority_in(
+        &self,
+        tx: &impl StoreConn,
+        task: &Task,
+        expect: Option<&AssistDispatchExpect>,
+    ) -> Result<()> {
+        match expect {
+            Some(expect) => {
+                if expect.job != task.job_id {
+                    return Err(Error::rejected(
+                        "task dispatch refused: the captured assist provenance names a \
+                         different job (CAD-1380)",
+                    ));
+                }
+                self.assist_expect_in(tx, expect)?;
+            }
+            None => {
+                let bound = task.job_id.starts_with("assist-")
+                    || tx
+                        .query_opt(
+                            "SELECT 1 FROM assist_requests WHERE job=?",
+                            [task.job_id.as_str()],
+                            |_| Ok(()),
+                        )?
+                        .is_some();
+                if bound {
+                    return Err(Error::rejected(format!(
+                        "task dispatch refused: job '{}' is assist-bound and needs its \
+                         member provenance re-proven (CAD-1380)",
+                        task.job_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn job_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<Job> {
         conn.query_row("SELECT * FROM jobs WHERE id=?", [id], row_job)
             .map_err(|e| match e {
@@ -339,6 +465,48 @@ impl Store {
         })
     }
 
+    /// CAD-1280: what `job list` asked of [`Self::tasks_for_job`] once per
+    /// job, in one read: every job's task counts by state (a grouped query
+    /// `tasks_job(job_id, state)` covers) and, when `lists` is
+    /// `Some(open_only)`, the tasks grouped by job in `tasks_for_job` order.
+    /// `open_only` leaves out the terminal tasks (`verified`, `done`,
+    /// `cancelled`, `failed`), the ones an assignee no longer holds.
+    pub fn job_task_summary(&self, lists: Option<bool>) -> Result<JobTaskSummary> {
+        self.read_tx(|conn| {
+            let mut summary = JobTaskSummary::default();
+            for (job, state, n) in conn.query_vec(
+                "SELECT job_id, state, COUNT(*) FROM tasks GROUP BY job_id, state",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )? {
+                summary.counts.entry(job).or_default().insert(state, n);
+            }
+            if let Some(open_only) = lists {
+                let sql = if open_only {
+                    "SELECT * FROM tasks
+                     WHERE state NOT IN ('verified','done','cancelled','failed')
+                     ORDER BY created, rowid"
+                } else {
+                    "SELECT * FROM tasks ORDER BY created, rowid"
+                };
+                for task in conn.query_vec(sql, [], row_task)? {
+                    summary
+                        .lists
+                        .entry(task.job_id.clone())
+                        .or_default()
+                        .push(task);
+                }
+            }
+            Ok(summary)
+        })
+    }
+
     /// An alias's non-terminal task assignments — derived, never stored.
     pub fn tasks_for_assignee(&self, alias: &str) -> Result<Vec<Task>> {
         self.read_tx(|conn| {
@@ -349,6 +517,77 @@ impl Store {
                 .query_vec(stmt_sql, [alias], row_task)
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    /// CAD-1266: every assignee's non-terminal task ids in one pass, each
+    /// list in [`Self::tasks_for_assignee`] order. The fleet list scans once
+    /// instead of once per agent. `tasks_assignee(assignee, state)` (CAD-1280)
+    /// serves assignee-specific reads; the fleet query may still scan tasks.
+    pub fn open_task_ids_by_assignee(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        self.read_tx(|conn| {
+            let rows = conn.query_vec(
+                "SELECT assignee, id FROM tasks WHERE assignee IS NOT NULL
+                 AND state NOT IN ('verified','done','cancelled','failed')
+                 ORDER BY updated",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?;
+            let mut by_assignee: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for (assignee, id) in rows {
+                by_assignee.entry(assignee).or_default().push(id);
+            }
+            Ok(by_assignee)
+        })
+    }
+
+    /// CAD-1752: the issue ids of each assignee's non-terminal tasks (a
+    /// task's job binds the issue), for `agent list --project`.
+    pub fn open_task_issues_by_assignee(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        self.read_tx(|conn| {
+            let rows = conn.query_vec(
+                "SELECT t.assignee, j.issue_id FROM tasks t JOIN jobs j ON j.id = t.job_id
+                 WHERE t.assignee IS NOT NULL AND COALESCE(j.issue_id,'') != ''
+                 AND t.state NOT IN ('verified','done','cancelled','failed')
+                 ORDER BY t.updated",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?;
+            let mut by_assignee: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for (assignee, issue) in rows {
+                by_assignee.entry(assignee).or_default().push(issue);
+            }
+            Ok(by_assignee)
+        })
+    }
+
+    /// An alias's non-terminal task assignments (the same rows as
+    /// [`Self::tasks_for_assignee`], same order) each with its job's issue
+    /// and job title/state, in one join over this alias's tasks. The
+    /// agent-scoped binding `agent show` serves, so a detail read never
+    /// lists the fleet's tasks or jobs. `issue` is `None` for an unbound job.
+    pub fn assignee_tasks_bound(&self, alias: &str) -> Result<Vec<AssigneeTask>> {
+        self.read_tx(|conn| {
+            let stmt_sql = "SELECT t.*, NULLIF(j.issue_id,'') AS bound_issue,
+                         j.title AS job_title, j.state AS job_state
+                         FROM tasks t LEFT JOIN jobs j ON j.id = t.job_id
+                         WHERE t.assignee=? AND t.state NOT IN
+                         ('verified','done','cancelled','failed')
+                         ORDER BY t.updated";
+            Ok(conn.query_vec(stmt_sql, [alias], |row| {
+                Ok(AssigneeTask {
+                    task: row_task(row)?,
+                    issue: row.get("bound_issue")?,
+                    job_title: row.get("job_title")?,
+                    job_state: row.get("job_state")?,
+                })
+            })?)
         })
     }
 
@@ -474,6 +713,7 @@ impl Store {
                 let job = self.job_in(&tx, id)?;
                 let worker = self.agent_in(&tx, a)?;
                 self.check_group_member(&job, &worker)?;
+                refuse_archived_assignee(&worker)?;
             }
             let task_id = format!("{id}-t1");
             tx.execute(
@@ -540,6 +780,7 @@ impl Store {
             if let Some(w) = assignee {
                 let worker = self.agent_in(&tx, w)?;
                 self.check_group_member(&job, &worker)?;
+                refuse_archived_assignee(&worker)?;
             }
             let t = now();
             tx.execute(
@@ -590,6 +831,106 @@ impl Store {
         Ok(())
     }
 
+    /// Capture native dispatch inputs before resolving task/project sources.
+    /// A live or uncertain accepted kickoff returns its original identity;
+    /// callers must not recapture source bytes for that retry.
+    pub fn plan_task_dispatch(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        requested_message_id: Option<&str>,
+    ) -> Result<DispatchPlan> {
+        let task = self.task(task_id)?;
+        let job = self.job(&task.job_id)?;
+        if job.state != "open" {
+            return Err(Error::rejected(format!(
+                "Job '{}' is '{}' — dispatch needs an open job",
+                job.id, job.state
+            )));
+        }
+        let assignee = to.or(task.assignee.as_deref()).ok_or_else(|| {
+            Error::rejected(format!(
+                "Task '{task_id}' has no assignee — \
+                 `cadence job dispatch {task_id} --to <worker>`"
+            ))
+        })?;
+        let worker = self.agent(assignee)?;
+        self.check_group_member(&job, &worker)?;
+        let mut revision = task.revision;
+        match task.state.as_str() {
+            "draft" | "revising" => revision += 1,
+            "dispatched" | "running" => {
+                let live = task
+                    .dispatch_message
+                    .as_deref()
+                    .and_then(|id| self.message(id).ok().flatten())
+                    .filter(|message| {
+                        !is_terminal(&message.state)
+                            || (message.state == "unknown" && message.source == "job_dispatch")
+                    });
+                if let Some(live) = live {
+                    if to.is_some() && to != task.assignee.as_deref() {
+                        return Err(Error::rejected(format!(
+                            "Task '{task_id}' has a live kickoff — reassign \
+                             after it finishes or is reconciled"
+                        )));
+                    }
+                    let current_revision = task.revision;
+                    return Ok(DispatchPlan {
+                        task,
+                        job,
+                        worker,
+                        revision: current_revision,
+                        message_id: live.id,
+                        duplicate: true,
+                    });
+                }
+                revision += 1;
+            }
+            "blocked" => {
+                if to.is_some() && to != task.assignee.as_deref() {
+                    revision += 1;
+                } else {
+                    return Err(Error::rejected(format!(
+                        "Task '{task_id}' is blocked — `cadence job task reopen \
+                         {task_id}` re-scopes it, or `job dispatch {task_id} \
+                         --to <worker>` reassigns"
+                    )));
+                }
+            }
+            state => {
+                return Err(Error::rejected(format!(
+                    "Task '{task_id}' is '{state}' — dispatch is legal from \
+                     draft, revising, or after the live kickoff ended"
+                )));
+            }
+        }
+        let attempt: i64 = self.read_tx(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE task_id=? AND source='job_dispatch'",
+                [task_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+        })?;
+        let message_id = requested_message_id.map(str::to_string).unwrap_or_else(|| {
+            Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!("cadence-dispatch:{task_id}:r{revision}:a{attempt}").as_bytes(),
+            )
+            .simple()
+            .to_string()
+        });
+        Ok(DispatchPlan {
+            task,
+            job,
+            worker,
+            revision,
+            message_id,
+            duplicate: false,
+        })
+    }
+
     /// `job dispatch`: one transaction — task `dispatched` at a new (or
     /// retried) revision, the kickoff message enqueued, events scoped.
     ///
@@ -610,11 +951,150 @@ impl Store {
         message_id: Option<&str>,
         by: &str,
     ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(task_id, to, message_id, by, None, None, None, None)
+    }
+
+    /// `dispatch_task` for a caller that selected the backend from the
+    /// pre-transaction assignee. The transaction refuses if the task's
+    /// assignee changed before this write, so a local/cloud choice can
+    /// never be applied to a different worker.
+    pub fn dispatch_task_for(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        expected_worker: Option<&Agent>,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(
+            task_id,
+            to,
+            message_id,
+            by,
+            expected_worker,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// `dispatch_task` with the caller's per-dispatch stall budget. The
+    /// budget is written inside the same guarded transaction as the
+    /// kickoff, before it is visible or notified; a duplicate writes
+    /// nothing.
+    pub fn dispatch_task_with_stall(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        stall_secs: Option<i64>,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(task_id, to, message_id, by, None, None, stall_secs, None)
+    }
+
+    /// Admit a daemon-prepared delivery with the existing native job guards.
+    /// The optional delivery is consumed only for a genuinely new kickoff;
+    /// an accepted duplicate retains its original message and selection.
+    pub(crate) fn dispatch_task_planned(
+        &self,
+        plan: &DispatchPlan,
+        delivery: Option<(String, super::messages::IssueSelection)>,
+        by: &str,
+        expect: Option<&AssistDispatchExpect>,
+        stall_secs: Option<i64>,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(
+            &plan.task.id,
+            Some(&plan.worker.alias),
+            Some(&plan.message_id),
+            by,
+            Some(&plan.worker),
+            expect,
+            stall_secs,
+            Some(DispatchPreparation { plan, delivery }),
+        )
+    }
+
+    /// `dispatch_task` for an assist-bound job: the fenced transaction first
+    /// re-reads the local provenance the caller's preflight captured. A changed,
+    /// revoked, deleted or missing row refuses before any task, enqueue or event
+    /// write. The remote authority proof stays outside this lock.
+    pub fn dispatch_task_expecting(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        expect: &AssistDispatchExpect,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(task_id, to, message_id, by, None, Some(expect), None, None)
+    }
+
+    /// `dispatch_task_expecting` with the pre-transaction assignee pinned
+    /// in the same fenced write.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_task_expecting_for(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        expect: &AssistDispatchExpect,
+        expected_worker: Option<&Agent>,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(
+            task_id,
+            to,
+            message_id,
+            by,
+            expected_worker,
+            Some(expect),
+            None,
+            None,
+        )
+    }
+
+    /// `dispatch_task_expecting` with the per-dispatch stall budget.
+    pub fn dispatch_task_expecting_with_stall(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        expect: &AssistDispatchExpect,
+        stall_secs: Option<i64>,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(
+            task_id,
+            to,
+            message_id,
+            by,
+            None,
+            Some(expect),
+            stall_secs,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_task_inner(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        expected_worker: Option<&Agent>,
+        expect: Option<&AssistDispatchExpect>,
+        stall_secs: Option<i64>,
+        prepared: Option<DispatchPreparation<'_>>,
+    ) -> Result<(Task, String, bool, bool)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             Self::refuse_app_task(&tx, task_id)?;
             let task = self.task_in(&tx, task_id)?;
             let job = self.job_in(&tx, &task.job_id)?;
+            self.task_dispatch_authority_in(&tx, &task, expect)?;
             if job.state != "open" {
                 return Err(Error::rejected(format!(
                     "Job '{}' is '{}' — dispatch needs an open job",
@@ -628,6 +1108,27 @@ impl Store {
                 ))
             })?;
             let worker = self.agent_in(&tx, assignee)?;
+            if let Some(expected) = expected_worker {
+                if worker.alias != expected.alias
+                    || worker.uid != expected.uid
+                    || worker.provider != expected.provider
+                    || worker.endpoint_kind != expected.endpoint_kind
+                {
+                    return Err(Error::rejected(format!(
+                        "Task '{task_id}' worker identity changed to '{}' while \
+                         dispatching — retry so the local/cloud choice follows the \
+                         final registered agent",
+                        worker.alias
+                    )));
+                }
+            }
+            refuse_archived_assignee(&worker)?;
+            if !worker.enabled {
+                return Err(Error::rejected(format!(
+                    "Agent '{}' is disabled — resume it before dispatching",
+                    worker.alias
+                )));
+            }
             self.check_group_member(&job, &worker)?;
 
             // Same-revision retry vs new revision.
@@ -639,7 +1140,10 @@ impl Store {
                         .dispatch_message
                         .as_deref()
                         .and_then(|m| self.message_in(&tx, m).ok().flatten())
-                        .filter(|m| !is_terminal(&m.state))
+                        .filter(|m| {
+                            !is_terminal(&m.state)
+                                || (m.state == "unknown" && m.source == "job_dispatch")
+                        })
                         .map(|m| m.id);
                     if let Some(live_id) = live_id {
                         // Kickoff still in flight — a second dispatch is a
@@ -694,11 +1198,34 @@ impl Store {
                 .simple()
                 .to_string()
             });
-            let body = kickoff_body(&job, &task, revision, &kickoff, &worker)?;
+            if let Some(prepared) = prepared.as_ref() {
+                prepared
+                    .plan
+                    .verify_current(&task, &job, &worker, revision, &kickoff)?;
+            }
+            let (body, selection) = match prepared {
+                Some(prepared) => {
+                    let (body, selection) = prepared.delivery.ok_or_else(|| {
+                        Error::rejected(format!(
+                            "Task '{}' no longer has the captured live kickoff — retry to \
+                             select its new task context before dispatch",
+                            prepared.plan.task.id
+                        ))
+                    })?;
+                    (body, Some(selection))
+                }
+                None => (
+                    kickoff_body(&job, &task, revision, &kickoff, &worker)?,
+                    None,
+                ),
+            };
             // PM self-task: the PM's own turn IS the report path — a
             // reply_to to itself would fail enqueue's self-reply rule.
             let reply_to = (assignee != job.pm_alias).then_some(job.pm_alias.as_str());
-            let (duplicate, _state) = self.enqueue_tx(
+            if matches!(&selection, Some(super::messages::IssueSelection::Pin(_))) {
+                Self::ensure_thread_in(&tx, assignee)?;
+            }
+            let (duplicate, _state) = self.enqueue_tx_with_conversation(
                 &tx,
                 assignee,
                 &body,
@@ -710,9 +1237,26 @@ impl Store {
                 task.worktree.as_deref(),
                 &Sender::Unattributed,
                 Priority::Normal,
+                false,
                 None,
                 None,
+                None,
+                None,
+                None,
+                None,
+                selection,
             )?;
+            if !duplicate {
+                if let Some(secs) = stall_secs {
+                    if secs < 0 {
+                        return Err(Error::rejected("stall_secs must be non-negative"));
+                    }
+                    tx.execute(
+                        "UPDATE messages SET stall_secs=? WHERE id=?",
+                        params![secs, &kickoff],
+                    )?;
+                }
+            }
             if duplicate {
                 return Ok((task, kickoff, true, false));
             }
@@ -977,6 +1521,11 @@ impl Store {
                     task.state
                 )));
             }
+            self.refuse_active_cloud(tx, &task, "reopening the task")?;
+            if let Some(assignee) = task.assignee.as_deref() {
+                let worker = self.agent_in(&tx, assignee)?;
+                refuse_archived_assignee(&worker)?;
+            }
             tx.execute(
                 "UPDATE tasks SET state='draft',revision=0,head_sha=NULL,
                          error=NULL,updated=? WHERE id=?",
@@ -1006,6 +1555,7 @@ impl Store {
                     task.state
                 )));
             }
+            self.refuse_active_cloud(tx, &task, "failing the task")?;
             tx.execute(
                 "UPDATE tasks SET state='failed',error=?,updated=? WHERE id=?",
                 params![reason, now(), task_id],
@@ -1042,7 +1592,47 @@ impl Store {
         })
     }
 
+    /// The sandbox alias holding an active cloud kickoff for this task.
+    fn active_cloud_alias(
+        &self,
+        tx: &impl super::StoreConn,
+        task: &Task,
+    ) -> Result<Option<String>> {
+        let Some(kickoff) = &task.dispatch_message else {
+            return Ok(None);
+        };
+        let Some(alias) = tx.query_opt(
+            "SELECT alias FROM messages WHERE id=? AND source='job_dispatch' \
+             AND state IN ('queued','running','unknown')",
+            [kickoff.as_str()],
+            |r| r.get::<_, String>(0),
+        )?
+        else {
+            return Ok(None);
+        };
+        let agent = self.agent_in(tx, &alias)?;
+        Ok((agent.provider == "sandbox" && agent.endpoint_kind == "sandbox").then_some(alias))
+    }
+
+    fn refuse_active_cloud(
+        &self,
+        tx: &impl super::StoreConn,
+        task: &Task,
+        verb: &str,
+    ) -> Result<()> {
+        if let Some(alias) = self.active_cloud_alias(tx, task)? {
+            return Err(Error::rejected(format!(
+                "Task '{}' has an active cloud dispatch on '{alias}' — \
+                 run `cadence agent stop {alias}` and reconcile the remote \
+                 before {verb}",
+                task.id
+            )));
+        }
+        Ok(())
+    }
+
     fn cancel_task_tx(&self, tx: &impl super::StoreConn, task: &Task, by: &str) -> Result<()> {
+        self.refuse_active_cloud(tx, task, "cancelling the task")?;
         if let Some(kickoff) = &task.dispatch_message {
             tx.execute(
                 "UPDATE messages SET state='cancelled',completed=?

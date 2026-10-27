@@ -1,0 +1,1873 @@
+//! Closed screen-records adapter. No caller-selected native method, scope,
+//! credential connection or approval material reaches an executor.
+use super::{app_tools_rpc::ToolContext, required_str, Shared};
+use crate::error::{Error, Result};
+use crate::issue::{
+    app_catalog::workspace,
+    app_screen_decl::{ScreenOperation, HOST_CONTRACT_RECORDS, MAY_RECORDS_CALL, MAY_RECORDS_SLOT},
+    app_screen_pkg,
+};
+use crate::operator_auth::Origin;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const RESULT_CAP: usize = 1_048_576;
+/// CAD-1827: installation bound for campaign-work source discovery.
+const CAMPAIGN_WORK_SOURCES_MAX: usize = 64;
+const CONFIRM_TTL: Duration = Duration::from_secs(60);
+
+fn screen_access_denied(reason: &'static str) -> Error {
+    Error::invalid("screen_access_denied", reason)
+}
+
+// Only authority derivations use this adapter. Storage/transport failures
+// keep their class, and executor/CAS errors never pass through it.
+fn screen_authority_error(error: Error, reason: &'static str) -> Error {
+    if error.kind() == "rejected" {
+        screen_access_denied(reason)
+    } else {
+        error
+    }
+}
+
+/// Private, non-deserializable authority carried into the actual executor.
+/// Every use re-proves the stored context inside its runtime/release fence.
+#[derive(Clone)]
+pub(super) struct ScreenServiceProof {
+    action_token: String,
+    // Server-private bearer; only native attribution consumers receive it.
+    public_session: Option<String>,
+    context: ToolContext,
+    operation: ScreenOperation,
+    confirmed: Option<(Value, Value)>,
+    csv_confirmation: Option<(String, String)>,
+    command_args: Option<Value>,
+}
+
+impl ScreenServiceProof {
+    pub(super) fn install(&self) -> &str {
+        &self.context.install_id
+    }
+    pub(super) fn context(&self) -> Result<&str> {
+        self.context
+            .context_id
+            .as_deref()
+            .ok_or_else(|| screen_access_denied("missing screen context"))
+    }
+    pub(super) fn csv_confirmation(&self) -> Option<(&str, &str)> {
+        self.csv_confirmation
+            .as_ref()
+            .map(|(token, digest)| (token.as_str(), digest.as_str()))
+    }
+}
+
+pub(super) struct ScreenServiceConfirmation {
+    proof: ScreenServiceProof,
+    args: Value,
+    facts: Value,
+    issued: Instant,
+}
+
+impl ScreenServiceConfirmation {
+    pub(super) fn current_in(
+        &self,
+        mounts: &std::collections::HashMap<String, ToolContext>,
+    ) -> bool {
+        self.issued.elapsed() < CONFIRM_TTL
+            && mounts.get(&self.proof.action_token).is_some_and(|ctx| {
+                ctx.mount == self.proof.context.mount && ctx.session == self.proof.context.session
+            })
+    }
+}
+
+#[cfg(test)]
+impl Shared {
+    /// Test-only clock seam: age every held confirmation past
+    /// [`CONFIRM_TTL`] so the expiry refusal runs without sleeping.
+    #[cfg(feature = "test-seam")]
+    pub(crate) fn age_screen_confirmations_for_test(&self) {
+        let aged = Instant::now()
+            .checked_sub(CONFIRM_TTL)
+            .expect("monotonic clock covers the TTL");
+        for item in self
+            .screen_service_confirmations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values_mut()
+        {
+            item.issued = aged;
+        }
+    }
+}
+
+struct CsvInFlight<'a> {
+    key: String,
+    live: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+}
+impl Drop for CsvInFlight<'_> {
+    fn drop(&mut self) {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CallRequest {
+    action_token: String,
+    operation: ScreenOperation,
+    args: Value,
+    token: String,
+    #[serde(default)]
+    key: String,
+    origin: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmRequest {
+    action_token: String,
+    confirmation_token: String,
+    confirmation: Confirmation,
+    token: String,
+    #[serde(default)]
+    key: String,
+    origin: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Confirmation {
+    Tap(Tap),
+    Recipient(Recipient),
+    Connection(Connection),
+    Resolution(Resolution),
+    GlobalOrigin(GlobalOrigin),
+    Csv(CsvConfirmation),
+    Brief(BriefConfirmation),
+    WorksChoice(WorksChoice),
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BriefConfirmation {
+    confirmed: bool,
+    brief: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Tap {
+    confirmed: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Recipient {
+    confirmed: bool,
+    to_email: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Connection {
+    confirmed: bool,
+    connection_id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Resolution {
+    confirmed: bool,
+    resolution: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorksChoice {
+    confirmed: bool,
+    choice: String,
+    note: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalOrigin {
+    confirmed: bool,
+    unsubscribe_origin: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CsvConfirmation {
+    confirmed: bool,
+    csv_confirm_token: String,
+}
+
+// Each operation decodes a closed top-level body; native nested validators
+// remain authoritative. Option fields are omitted, never converted to null.
+macro_rules! args {
+    ($name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
+        #[derive(Deserialize, Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct $name { $($field: $ty),* }
+    };
+}
+args!(Empty {});
+args!(RecordList { query: Option<String>, limit: Option<u64>, cursor: Option<String> });
+args!(RecordId { record_id: String });
+args!(RecordCreate { record_id: String, profile: Value, consent_provenance: Option<Value> });
+args!(RecordUpdate { record_id: String, expected_revision: i64, profile: Value, consent_provenance: Option<Value> });
+args!(CsvPreview { csv_text: String });
+args!(CsvImport { csv_text: String, preview_token: String, request_id: String, decisions: Option<Vec<Value>> });
+args!(SegmentId { segment_id: String });
+args!(SegmentSave { segment_id: String, name: String, predicates: Vec<Value>, expected_revision: Option<i64> });
+args!(ExclusionId { list_id: String });
+args!(ExclusionSave { list_id: String, name: String, member_ids: Vec<String>, expected_revision: Option<i64> });
+args!(SuppressionAdd { email: Option<String>, customer_id: Option<String>, reason: String });
+args!(AudiencePreviewArgs { base: Value, exclusion_list_id: Option<String> });
+args!(AudiencePrepareArgs { freeze_id: String, base: Value, exclusion_list_id: Option<String>, max_recipients: i64 });
+args!(FreezeId { freeze_id: String });
+args!(CampaignId {
+    campaign_id: String
+});
+args!(ContentSaveArgs { campaign_id: String, subject: String, preheader: Option<String>, blocks: Option<Vec<Value>>, html: Option<String>, text: Option<String>, name: Option<String>, expected_revision: Option<i64> });
+args!(ContentCloneArgs { campaign_id: String, expected_revision: i64, name: String, copy_audience: bool, copy_sender: bool, source_freeze_id: Option<String>, source_binding_id: Option<String> });
+args!(ContentRenderArgs { campaign_id: String, revision: Option<i64>, sample_first_name: Option<String>, binding_id: Option<String> });
+args!(ContentApproveArgs {
+    campaign_id: String,
+    expected_revision: i64
+});
+args!(ProposalList { campaign_id: Option<String> });
+args!(ProposalId {
+    proposal_id: String
+});
+args!(ProposalApply { proposal_id: String, expected_revision: Option<i64> });
+args!(BindingId { binding_id: String });
+// Deliberately NO connection_id: only the live admitted scoped SMTP link
+// can supply custody selection, inside the executor fence.
+args!(BindingSave { binding_id: String, sender_name: String, sender_address: String, unsubscribe_base: String, expected_revision: Option<i64> });
+args!(TestPrepare { campaign_id: String, to_email: String, binding_id: Option<String> });
+args!(SendPrepare { campaign_id: String, binding_id: String, audience_freeze_id: Option<String> });
+args!(SendPrepareArgs {
+    campaign_id: String,
+    audience_freeze_id: String,
+    request_id: String,
+    base: Option<Value>,
+    exclusion_list_id: Option<String>,
+    max_recipients: Option<i64>
+});
+args!(SendId { send_id: String });
+args!(ResolveArgs {
+    send_id: String,
+    customer_id: String
+});
+args!(CampaignBrief {
+    campaign_id: String,
+    brief: String
+});
+args!(PreviewShow {
+    preview_id: String,
+    document: String,
+    anchor: PreviewAnchor,
+    mode: PreviewMode
+});
+args!(PreviewClear { preview_id: String });
+args!(Anchor {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64
+});
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum PreviewAnchor {
+    Box(Anchor),
+    Footer(Footer),
+}
+#[derive(Deserialize, Serialize)]
+enum Footer {
+    #[serde(rename = "footer")]
+    Footer,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum PreviewMode {
+    Draft,
+    Saved,
+}
+// CAD-1562: WhatsApp door arguments. No key, digest, company or
+// connection field exists: the host derives each of them.
+args!(WaPage { cursor: Option<String>, limit: Option<u64> });
+args!(WaConversation {
+    conversation_id: String
+});
+args!(WaMessages { conversation_id: String, cursor: Option<String>, limit: Option<u64> });
+args!(WaReply { conversation_id: String, text: String, reply_to_message_id: Option<String> });
+args!(WaReplySend { conversation_id: String, text: String, effect_id: String, reply_to_message_id: Option<String> });
+args!(WaEffect { effect_id: String });
+// CAD-1590: door v2. Nested audience/exclusions/variables stay JSON and
+// are validated natively; no key, digest or connection field exists.
+args!(WaTemplates { status: Option<String> });
+args!(WaTemplate {
+    template_id: String
+});
+args!(WaTemplatePrepare {
+    conversation_id: String,
+    template_id: String,
+    variables: Value
+});
+args!(WaTemplateSend {
+    effect_id: String,
+    conversation_id: String,
+    template_id: String,
+    variables: Value
+});
+args!(WaBroadcast {
+    broadcast_id: String
+});
+args!(WaResults { broadcast_id: String, cursor: Option<String>, limit: Option<u64>, status: Option<String> });
+args!(WaDraft { broadcast_id: Option<String>, name: String, template_id: String, body_parameters: Value, header_media_url: Option<String>, audience: Value, exclusions: Option<Value> });
+args!(WaTestPrepare {
+    broadcast_id: String,
+    to: String
+});
+args!(WaBroadcastPrepare { broadcast_id: String, send_at: Option<String> });
+// CAD-1636: the reply copilot's brief.
+args!(WaBrief {
+    conversation_id: String,
+    guidance: String
+});
+args!(RoutePatch { section: Option<String>, view: Option<String>, record_id: Option<String>, segment_id: Option<String>, replace: Option<bool> });
+// CAD-1662: Works content. Bounds follow the store's grammar; the daemon
+// re-validates every field, these structs only close the shape.
+args!(WorksId { id: String });
+args!(WorksQueryArgs { text: Option<String>, kind: Option<String>, review: Option<String>, export: Option<String>, tag: Option<String>, owner: Option<String>, sort: Option<String> });
+args!(WorksCreateArgs { kind: String, title: String, content: Value, tags: Option<Value>, idempotency_key: String });
+args!(WorksPatchArgs { id: String, if_revision: i64, operations: Vec<Value>, idempotency_key: String });
+args!(WorksTrashArgs {
+    id: String,
+    if_revision: i64,
+    idempotency_key: String
+});
+args!(WorksRequestReviewArgs {
+    id: String,
+    revision: i64
+});
+args!(WorksReviewArgs { id: String, revision: i64, decision: Option<String>, note: Option<String> });
+args!(WorksExportArgs { id: String, revision: i64, format: Option<String> });
+// CAD-1827: campaign work. Scope and the writing actor are host-derived;
+// the body carries only the campaign, the CAS token and the values. Nulls
+// are kept (a typed round-trip would drop an explicit clear), so `save`
+// decodes the raw object exactly like the route patch does.
+args!(CampaignWorkSaveArgs {
+    campaign_id: String,
+    expected_revision: i64,
+    assignee: Option<Value>,
+    due_at: Option<Value>,
+    status: Option<Value>,
+    blocked_reason: Option<Value>
+});
+
+fn typed<T: for<'de> Deserialize<'de> + Serialize>(value: &Value) -> Result<Value> {
+    let body: T = serde_json::from_value(value.clone())
+        .map_err(|_| Error::rejected("screen service arguments exceed their closed shape"))?;
+    let mut value = serde_json::to_value(body)?;
+    // Option fields are absent on native APIs, not null. Unknown/forged keys
+    // already refused above; this never strips caller-selected scope fields.
+    if let Some(fields) = value.as_object_mut() {
+        fields.retain(|_, value| !value.is_null());
+    }
+    Ok(value)
+}
+
+fn call_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
+    use ScreenOperation::*;
+    match operation {
+        RecordsList => typed::<RecordList>(value),
+        RecordsShow => typed::<RecordId>(value),
+        RecordsCreate => typed::<RecordCreate>(value),
+        RecordsUpdate => typed::<RecordUpdate>(value),
+        RecordsCsvPreview => typed::<CsvPreview>(value),
+        WorksQuery => typed::<WorksQueryArgs>(value),
+        WorksGet => typed::<WorksId>(value),
+        WorksCreate => typed::<WorksCreateArgs>(value),
+        WorksPatch => typed::<WorksPatchArgs>(value),
+        WorksTrash | WorksRestore => typed::<WorksTrashArgs>(value),
+        WorksRequestReview => typed::<WorksRequestReviewArgs>(value),
+        // CAD-1827: a campaign work read is the campaign alone; a save keeps
+        // its explicit nulls so `null` clears instead of disappearing.
+        CampaignWorkShow => typed::<CampaignId>(value),
+        CampaignWorkSave => {
+            let _: CampaignWorkSaveArgs = serde_json::from_value(value.clone()).map_err(|_| {
+                Error::rejected("screen service arguments exceed their closed shape")
+            })?;
+            Ok(value.clone())
+        }
+        SegmentsList | ExclusionsList | SuppressionsList | ContentList | SenderBindingsList => {
+            typed::<Empty>(value)
+        }
+        SegmentsShow => typed::<SegmentId>(value),
+        SegmentsSave => typed::<SegmentSave>(value),
+        ExclusionsShow => typed::<ExclusionId>(value),
+        ExclusionsSave => typed::<ExclusionSave>(value),
+        SuppressionsAdd => typed::<SuppressionAdd>(value),
+        AudiencePreview => typed::<AudiencePreviewArgs>(value),
+        AudiencePrepare => typed::<AudiencePrepareArgs>(value),
+        AudienceShow => typed::<FreezeId>(value),
+        ContentShow => typed::<CampaignId>(value),
+        ContentSave => typed::<ContentSaveArgs>(value),
+        ContentClone => typed::<ContentCloneArgs>(value),
+        ContentRender => typed::<ContentRenderArgs>(value),
+        ProposalsList => typed::<ProposalList>(value),
+        ProposalsShow | ProposalsRender | ProposalsDiscard => typed::<ProposalId>(value),
+        ProposalsApply => typed::<ProposalApply>(value),
+        SenderBindingsShow => typed::<BindingId>(value),
+        SenderBindingsSave => typed::<BindingSave>(value),
+        ContentTestPrepare => typed::<TestPrepare>(value),
+        ContentSendPrepare => typed::<SendPrepare>(value),
+        SendsPrepare => typed::<SendPrepareArgs>(value),
+        SendsShow => typed::<SendId>(value),
+        SendsList => typed::<ProposalList>(value),
+        SmtpShow | OriginShow => typed::<Empty>(value),
+        WhatsappStatus | WhatsappConnectSession => typed::<Empty>(value),
+        WhatsappConversationsList => typed::<WaPage>(value),
+        WhatsappConversationsShow => typed::<WaConversation>(value),
+        WhatsappMessages => typed::<WaMessages>(value),
+        WhatsappReplyPrepare => typed::<WaReply>(value),
+        WhatsappReplyStatus => typed::<WaEffect>(value),
+        WhatsappTemplatesList => typed::<WaTemplates>(value),
+        WhatsappTemplateShow => typed::<WaTemplate>(value),
+        WhatsappTemplatePrepare => typed::<WaTemplatePrepare>(value),
+        WhatsappTemplateStatus => typed::<WaEffect>(value),
+        WhatsappBroadcastsList => typed::<WaPage>(value),
+        WhatsappBroadcastShow | WhatsappBroadcastEstimate => typed::<WaBroadcast>(value),
+        WhatsappBroadcastResults => typed::<WaResults>(value),
+        WhatsappBroadcastDraft => typed::<WaDraft>(value),
+        WhatsappBroadcastTestPrepare => typed::<WaTestPrepare>(value),
+        WhatsappBroadcastPrepare => typed::<WaBroadcastPrepare>(value),
+        ChatWhatsappOpen | WhatsappDraftShow | WhatsappDraftDiscard | WhatsappHandoffSet => {
+            typed::<WaConversation>(value)
+        }
+        ScreenPreviewShow => typed::<PreviewShow>(value),
+        ScreenPreviewClear => typed::<PreviewClear>(value),
+        ScreenRoutePatch => {
+            // Preserve explicit null clears and field absence separately.
+            let _: RoutePatch = serde_json::from_value(value.clone())
+                .map_err(|_| Error::rejected("unsupported route patch"))?;
+            if value.get("replace").is_some_and(|flag| !flag.is_boolean()) {
+                return Err(Error::rejected("route replace must be a boolean"));
+            }
+            Ok(value.clone())
+        }
+        _ => Err(Error::rejected(
+            "operation is not an implemented non-protected screen CALL",
+        )),
+    }
+}
+
+/// The four value fields of a `campaign-work.save` body, exactly as the
+/// caller sent them: an absent key stays absent (untouched) and an explicit
+/// `null` stays a clear.
+fn campaign_work_values(params: &Value) -> Value {
+    let mut values = serde_json::Map::new();
+    for key in ["assignee", "due_at", "status", "blocked_reason"] {
+        if let Some(value) = params.get(key) {
+            values.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(values)
+}
+
+fn slot_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
+    match operation {
+        ScreenOperation::RecordsCsvImport | ScreenOperation::RecordsCsvConfirm => {
+            typed::<CsvImport>(value)
+        }
+        ScreenOperation::ContentApprove => typed::<ContentApproveArgs>(value),
+        ScreenOperation::SendsApprove => typed::<SendId>(value),
+        ScreenOperation::SendsResolve => typed::<ResolveArgs>(value),
+        ScreenOperation::SmtpBind
+        | ScreenOperation::SmtpRebind
+        | ScreenOperation::SmtpRevoke
+        | ScreenOperation::SmtpManage
+        | ScreenOperation::OriginManage => typed::<Empty>(value),
+        ScreenOperation::SmtpTestSend | ScreenOperation::ChatCampaignOpen => {
+            typed::<CampaignId>(value)
+        }
+        ScreenOperation::ChatCampaignBrief => typed::<CampaignBrief>(value),
+        ScreenOperation::WhatsappReplySend => typed::<WaReplySend>(value),
+        ScreenOperation::WhatsappTemplateSend => typed::<WaTemplateSend>(value),
+        ScreenOperation::WhatsappBroadcastTestSend | ScreenOperation::WhatsappBroadcastSend => {
+            typed::<WaEffect>(value)
+        }
+        ScreenOperation::WhatsappBroadcastStop => typed::<WaBroadcast>(value),
+        ScreenOperation::WhatsappHandoffRelease => typed::<WaConversation>(value),
+        ScreenOperation::ChatWhatsappBrief => typed::<WaBrief>(value),
+        // CAD-1662: review and export are host-confirmed SLOT operations; the
+        // decode mirrors their CALL shape so slot-prepare can fix the facts.
+        ScreenOperation::WorksReview => typed::<WorksReviewArgs>(value),
+        ScreenOperation::WorksExport => typed::<WorksExportArgs>(value),
+        _ => Err(Error::rejected("screen SLOT operation is not implemented")),
+    }
+}
+
+fn native_method(operation: ScreenOperation) -> Result<&'static str> {
+    use ScreenOperation::*;
+    Ok(match operation {
+        RecordsList => "app_record_list",
+        RecordsShow => "app_record_show",
+        RecordsCreate => "app_record_create",
+        RecordsUpdate => "app_record_update",
+        RecordsCsvPreview => "app_record_csv_preview",
+        RecordsCsvImport => "app_record_csv_import",
+        RecordsCsvConfirm => "app_record_csv_confirm",
+        SegmentsList => "app_segment_list",
+        SegmentsShow => "app_segment_show",
+        SegmentsSave => "app_segment_save",
+        ExclusionsList => "app_exclusion_list",
+        ExclusionsShow => "app_exclusion_show",
+        ExclusionsSave => "app_exclusion_save",
+        SuppressionsList => "app_suppression_list",
+        SuppressionsAdd => "app_suppression_add",
+        AudiencePreview => "app_audience_preview",
+        AudiencePrepare => "app_audience_prepare",
+        AudienceShow => "app_audience_show",
+        ContentList => "app_content_list",
+        ContentShow => "app_content_show",
+        ContentSave => "app_content_save",
+        ContentClone => "app_content_clone",
+        ContentRender => "app_content_render",
+        ContentApprove => "app_content_approve",
+        ProposalsList => "app_content_proposal_list",
+        ProposalsShow => "app_content_proposal_show",
+        ProposalsRender => "app_content_proposal_render",
+        ProposalsApply => "app_content_proposal_apply",
+        ProposalsDiscard => "app_content_proposal_discard",
+        SenderBindingsList => "app_sender_binding_list",
+        SenderBindingsShow => "app_sender_binding_show",
+        SenderBindingsSave => "app_sender_binding_save",
+        ContentTestPrepare => "app_content_test_prepare",
+        ContentSendPrepare => "app_content_send_prepare",
+        SendsPrepare => "crm_send_prepare",
+        SendsShow => "crm_send_show",
+        SendsList => "crm_send_list",
+        SendsApprove => "crm_send_approve",
+        SendsResolve => "crm_send_resolve",
+        SmtpShow => "crm_smtp_show",
+        SmtpBind => "crm_smtp_bind",
+        SmtpRebind => "crm_smtp_rebind",
+        SmtpRevoke => "crm_smtp_revoke",
+        SmtpTestSend => "crm_smtp_test_send",
+        OriginShow => "crm_send_origin_show",
+        OriginManage => "crm_send_origin_set",
+        WhatsappStatus => "whatsapp_status",
+        WhatsappConnectSession => "whatsapp_connect_session",
+        WhatsappConversationsList => "whatsapp_conversations_list",
+        WhatsappConversationsShow => "whatsapp_conversations_show",
+        WhatsappMessages => "whatsapp_messages",
+        WhatsappReplyPrepare => "whatsapp_reply_prepare",
+        WhatsappReplySend => "whatsapp_reply_send",
+        WhatsappReplyStatus => "whatsapp_reply_status",
+        WhatsappTemplatesList => "whatsapp_templates_list",
+        WhatsappTemplateShow => "whatsapp_template_show",
+        WhatsappTemplatePrepare => "whatsapp_template_prepare",
+        WhatsappTemplateSend => "whatsapp_template_send",
+        WhatsappTemplateStatus => "whatsapp_template_status",
+        WhatsappBroadcastsList => "whatsapp_broadcasts_list",
+        WhatsappBroadcastShow => "whatsapp_broadcast_show",
+        WhatsappBroadcastEstimate => "whatsapp_broadcast_estimate",
+        WhatsappBroadcastResults => "whatsapp_broadcast_results",
+        WhatsappBroadcastDraft => "whatsapp_broadcast_draft",
+        WhatsappBroadcastTestPrepare => "whatsapp_broadcast_test_prepare",
+        WhatsappBroadcastTestSend => "whatsapp_broadcast_test_send",
+        WhatsappBroadcastPrepare => "whatsapp_broadcast_prepare",
+        WhatsappBroadcastSend => "whatsapp_broadcast_send",
+        WhatsappBroadcastStop => "whatsapp_broadcast_stop",
+        WhatsappHandoffSet => "whatsapp_handoff_set",
+        WhatsappHandoffRelease => "whatsapp_handoff_release",
+        WorksQuery => "app_works_query",
+        WorksGet => "app_works_get",
+        WorksCreate => "app_works_create",
+        WorksPatch => "app_works_patch",
+        WorksTrash => "app_works_trash",
+        WorksRestore => "app_works_restore",
+        WorksRequestReview => "app_works_request_review",
+        WorksReview => "app_works_review",
+        WorksExport => "app_works_export",
+        // CAD-1827: the paired campaign-work contract's two operations.
+        CampaignWorkShow => "crm_campaign_work_show",
+        CampaignWorkSave => "crm_campaign_work_save",
+        _ => {
+            return Err(Error::rejected(
+                "screen operation has no implemented executor",
+            ))
+        }
+    })
+}
+
+fn sanitized_smtp(mut value: Value) -> Value {
+    if let Some(binding) = value.get_mut("binding").and_then(Value::as_object_mut) {
+        // Native projection remains unchanged for native clients. A frame
+        // receives only sender/status/revisions, not custody discovery rows.
+        binding.remove("connection");
+        binding.remove("transport");
+        binding.remove("install_id");
+        binding.remove("context_id");
+    }
+    value
+}
+
+fn bounded(operation: ScreenOperation, args: &Value) -> Result<()> {
+    if !args.is_object() || serde_json::to_vec(args)?.len() > operation.args_limit() {
+        return Err(Error::rejected(
+            "screen operation arguments exceed their byte bound",
+        ));
+    }
+    Ok(())
+}
+
+fn response(value: Value) -> Result<Value> {
+    if serde_json::to_vec(&value)?.len() > RESULT_CAP {
+        return Err(Error::rejected(
+            "screen service response exceeds its byte bound",
+        ));
+    }
+    Ok(value)
+}
+
+impl Shared {
+    fn screen_csv_claim(&self, proof: &ScreenServiceProof) -> Result<Option<CsvInFlight<'_>>> {
+        if !matches!(
+            proof.operation,
+            ScreenOperation::RecordsCsvPreview
+                | ScreenOperation::RecordsCsvImport
+                | ScreenOperation::RecordsCsvConfirm
+        ) {
+            return Ok(None);
+        }
+        let mut live = self
+            .screen_service_csv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if live.len() >= super::app_tools_rpc::TOOL_CTX_GLOBAL
+            || !live.insert(proof.action_token.clone())
+        {
+            return Err(Error::rejected(
+                "a CSV operation is already in flight for this mount",
+            ));
+        }
+        Ok(Some(CsvInFlight {
+            key: proof.action_token.clone(),
+            live: &self.screen_service_csv,
+        }))
+    }
+
+    fn screen_service_proof(
+        &self,
+        action_token: &str,
+        token: &str,
+        key: &str,
+        origin: &str,
+        operation: ScreenOperation,
+    ) -> Result<ScreenServiceProof> {
+        let origin = match origin {
+            "loopback" => Origin::Loopback,
+            "tailnet" => Origin::Tailnet,
+            "public" => Origin::Public,
+            _ => {
+                return Err(screen_access_denied(
+                    "screen service requires classified session origin",
+                ))
+            }
+        };
+        let (session, view) = self
+            .tool_session(token, key, origin)
+            .ok_or_else(|| screen_access_denied("screen service requires live operator session"))?;
+        let member = origin == Origin::Public
+            && !view
+                .user
+                .as_ref()
+                .is_some_and(crate::operator_auth::BoardUser::is_operator);
+        let context = self
+            .tool_context_proven(action_token, &session)
+            .map_err(|error| {
+                screen_authority_error(error, "screen mount or session unavailable")
+            })?;
+        // CAD-1537: a member uses only a read-only mount, and a read-only
+        // mount admits only the read allowlist — every write, SLOT
+        // (prepare and confirm) and host command is refused here.
+        if member && !context.read_only {
+            return Err(screen_access_denied(
+                "screen service requires operator-role public session",
+            ));
+        }
+        if context.read_only && !operation.is_screen_read() {
+            return Err(screen_access_denied(
+                "a read-only screen admits only read operations",
+            ));
+        }
+        if context.context_id.is_none() {
+            return Err(screen_access_denied(
+                "screen service requires active context",
+            ));
+        }
+        Ok(ScreenServiceProof {
+            action_token: action_token.to_owned(),
+            public_session: (origin == Origin::Public).then(|| token.to_owned()),
+            context,
+            operation,
+            confirmed: None,
+            csv_confirmation: None,
+            command_args: None,
+        })
+    }
+
+    /// Native None retains its auth/context/CAS contract, but holds the
+    /// release fence through execution too: native edits must not race a
+    /// screen's frozen facts and its actual executor. Screen Some adds its
+    /// current action-context map entry held through the actual DB operation.
+    /// Lock order: PM -> optional custody -> release -> action contexts.
+    pub(super) fn screen_service_scope<R>(
+        &self,
+        install: &str,
+        context: &str,
+        prove_context: bool,
+        proof: Option<&ScreenServiceProof>,
+        action: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        if let Some(proof) = proof {
+            workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                let _custody = matches!(
+                    proof.operation,
+                    ScreenOperation::SenderBindingsSave
+                        | ScreenOperation::SendsPrepare
+                        | ScreenOperation::SendsShow
+                        | ScreenOperation::SendsList
+                        | ScreenOperation::SendsApprove
+                        | ScreenOperation::SendsResolve
+                        | ScreenOperation::SmtpShow
+                        | ScreenOperation::SmtpManage
+                        | ScreenOperation::SmtpBind
+                        | ScreenOperation::SmtpRebind
+                        | ScreenOperation::SmtpRevoke
+                        | ScreenOperation::SmtpTestSend
+                        | ScreenOperation::OriginShow
+                        | ScreenOperation::OriginManage
+                )
+                .then(|| {
+                    self.platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                });
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let current = self
+                    .tool_context_proven(&proof.action_token, &proof.context.session)
+                    .map_err(|error| {
+                        screen_authority_error(error, "screen mount or session unavailable")
+                    })?;
+                let mounts = self.tool_contexts.lock().unwrap_or_else(|e| e.into_inner());
+                let mounted = mounts
+                    .get(&proof.action_token)
+                    .ok_or_else(|| screen_access_denied("screen mount retired"))?;
+                if current.install_id != install
+                    || current.context_id.as_deref() != Some(context)
+                    || current.digest != proof.context.digest
+                    || current.mount != proof.context.mount
+                    || current.generation != proof.context.generation
+                    || current.tag != proof.context.tag
+                    || mounted.install_id != current.install_id
+                    || mounted.mount != current.mount
+                    || mounted.generation != current.generation
+                    || mounted.session != current.session
+                    || mounted.context_id != current.context_id
+                    || mounted.digest != current.digest
+                    || mounted.tag != current.tag
+                {
+                    return Err(screen_access_denied(
+                        "screen service scope or current mount changed",
+                    ));
+                }
+                let digest = required_str(bundle, "digest").map_err(|error| {
+                    screen_authority_error(error, "screen installation digest unavailable")
+                })?;
+                if digest != current.digest
+                    || self.store.app_capability_status(install, digest)?["state"] != "approved"
+                {
+                    return Err(screen_access_denied(
+                        "screen bundle changed or approval revoked",
+                    ));
+                }
+                let pkg = app_screen_pkg::extract(files, &current.tag).map_err(|error| {
+                    screen_authority_error(error, "current screen package unavailable")
+                })?;
+                let manifest =
+                    crate::issue::app::parse_manifest(files.get("app.md").ok_or_else(|| {
+                        screen_access_denied("screen installation manifest missing")
+                    })?)
+                    .map_err(|error| {
+                        screen_authority_error(error, "screen installation manifest unavailable")
+                    })?;
+                let permission = if proof.operation.is_slot() {
+                    MAY_RECORDS_SLOT
+                } else {
+                    MAY_RECORDS_CALL
+                };
+                if pkg.app != manifest.app
+                    || pkg.host_contract.as_deref() != Some(HOST_CONTRACT_RECORDS)
+                    || !pkg.operations.contains(&proof.operation)
+                    || !pkg.may.iter().any(|p| p == permission)
+                {
+                    return Err(screen_access_denied(
+                        "screen operation is not declared by current package",
+                    ));
+                }
+                self.store
+                    .app_context_proof(install, context)
+                    .map_err(|error| screen_authority_error(error, "screen context unavailable"))?;
+                if proof.operation == ScreenOperation::ScreenRoutePatch {
+                    let navigation = pkg
+                        .navigation
+                        .as_ref()
+                        .ok_or_else(|| Error::rejected("screen has no navigation declaration"))?;
+                    let args = proof
+                        .command_args
+                        .as_ref()
+                        .ok_or_else(|| Error::rejected("missing route command"))?;
+                    if let Some(section) = args.get("section").filter(|s| !s.is_null()) {
+                        if !navigation
+                            .sections
+                            .iter()
+                            .any(|declared| section.as_str() == Some(declared.id.as_str()))
+                        {
+                            return Err(Error::rejected(
+                                "section is not declared by current screen",
+                            ));
+                        }
+                    }
+                }
+                if let Some((args, facts)) = &proof.confirmed {
+                    // A takeover cleared since the card was drawn is the same
+                    // changed-facts refusal; only this exact code maps.
+                    let now = match self.screen_slot_facts_locked(proof, args) {
+                        Err(e) if e.code() == Some("not_taken_over") => None,
+                        other => Some(other?),
+                    };
+                    if now.as_ref() != Some(facts) {
+                        return Err(Error::conflict_coded(
+                            "facts_changed",
+                            "confirmation facts changed; prepare again",
+                        ));
+                    }
+                }
+                action()
+            })
+        } else {
+            workspace::with_runtime_snapshot(&pm, install, |_, _| {
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if prove_context {
+                    self.store.app_context_proof(install, context)?;
+                }
+                action()
+            })
+        }
+    }
+
+    pub(super) fn screen_service_method(
+        proof: Option<&ScreenServiceProof>,
+        method: &str,
+    ) -> Result<()> {
+        if let Some(proof) = proof {
+            if native_method(proof.operation)? != method {
+                return Err(Error::rejected("screen executor does not match operation"));
+            }
+        }
+        Ok(())
+    }
+
+    fn screen_service_execute(
+        self: &Arc<Self>,
+        proof: &ScreenServiceProof,
+        args: Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let mut params = args;
+        params["install_id"] = json!(proof.context.install_id);
+        params["context_id"] = json!(proof.context.context_id);
+        use ScreenOperation::*;
+        if matches!(proof.operation, WorksReview | WorksExport) && proof.confirmed.is_none() {
+            return Err(Error::rejected(
+                "works review and export require host confirmation",
+            ));
+        }
+        // Only native attribution consumers receive the verified public bearer;
+        // each re-derives the human from its live session, never child fields.
+        if matches!(
+            proof.operation,
+            RecordsCreate
+                | RecordsUpdate
+                | RecordsCsvImport
+                | ContentSave
+                | WorksCreate
+                | WorksPatch
+                | WorksTrash
+                | WorksRestore
+                | WorksRequestReview
+                | WorksReview
+                | WorksExport
+                // CAD-1827: a campaign work save records who made the
+                // assignment decision from the verified caller.
+                | CampaignWorkSave
+        ) {
+            if let Some(public_session) = &proof.public_session {
+                params["public_session"] = json!(public_session);
+            }
+        }
+        if matches!(
+            proof.operation,
+            ScreenRoutePatch | ScreenPreviewShow | ScreenPreviewClear | SmtpManage
+        ) {
+            let mut command_proof = proof.clone();
+            command_proof.command_args = Some(params.clone());
+            return self.screen_service_scope(
+                proof.install(),
+                proof.context()?,
+                true,
+                Some(&command_proof),
+                || self.screen_host_command_locked(proof, &params),
+            );
+        }
+        if matches!(proof.operation, ChatCampaignOpen | ChatCampaignBrief) {
+            return self.screen_service_scope(proof.install(), proof.context()?, true, Some(proof), || {
+                self.operator_chat("screen campaign chat", peer_pid)?;
+                let campaign = required_str(&params, "campaign_id")?;
+                let context = proof.context()?;
+                let subject = format!("campaign:{campaign}");
+                self.verify_campaign_subject(proof.install(), context, &subject)?;
+                let alias = self.resolve_alias("master")?;
+                if proof.operation == ChatCampaignOpen {
+                    // Page entry selects an existing conversation or a draft
+                    // subject. It must not create one until the first send.
+                    let conversation = self.store.conversation_list(&alias, proof.install())?
+                        .into_iter().find(|row| !row.archived && row.context_id.as_deref() == Some(context) && row.subject.as_deref() == Some(subject.as_str()));
+                    return Ok(json!({"host_command": {"operation": proof.operation, "args": {"campaign_id": campaign},
+                        "conversation_id": conversation.map(|row| row.id)}}));
+                }
+                let shown = crate::store::app_records::RecordStore::open(&self.state_dir, proof.install())?.app_content_show(context, campaign)?;
+                let name = shown["content"]["name"].as_str().unwrap_or(campaign);
+                let text = format!("Draft the email for campaign {campaign} (“{name}”): {}", required_str(&params, "brief")?.trim());
+                let (conversation, _) = self.store.conversation_create(&alias, proof.install(), Some(context), crate::store::ConversationKind::Subject(&subject))?;
+                // Native thread validation and enqueue execute while the
+                // current mount/runtime/release guard remains held. No frame
+                // alias, scope, message ID, receipt or turn token is accepted.
+                let message = format!("screen-{}", uuid::Uuid::new_v4().simple());
+                let mut thread_params = json!({"alias": alias, "text": text,
+                    "message": message, "app": {"install_id": proof.install(), "context_id": proof.context()?},
+                    "conversation": conversation.id});
+                if let Some(public_session) = &proof.public_session {
+                    thread_params["public_session"] = json!(public_session);
+                }
+                let receipt = self.rpc_thread_send(&thread_params, peer_pid)?;
+                Ok(json!({"host_command": {"operation": proof.operation, "args": {"campaign_id": campaign}, "conversation_id": conversation.id},
+                    "receipt": {"message": receipt["message"], "queued": true}}))
+            });
+        }
+        if matches!(
+            proof.operation,
+            ChatWhatsappOpen | ChatWhatsappBrief | WhatsappDraftShow | WhatsappDraftDiscard
+        ) {
+            let public_session = proof.public_session.clone();
+            return self.screen_service_scope(
+                proof.install(),
+                proof.context()?,
+                true,
+                Some(proof),
+                || {
+                    self.whatsapp_copilot_screen(
+                        proof.operation,
+                        proof.install(),
+                        proof.context()?,
+                        &params,
+                        public_session.as_deref(),
+                        peer_pid,
+                    )
+                },
+            );
+        }
+        if matches!(proof.operation, OriginShow | OriginManage) {
+            params
+                .as_object_mut()
+                .expect("typed object")
+                .remove("install_id");
+            params
+                .as_object_mut()
+                .expect("typed object")
+                .remove("context_id");
+        }
+        let method = native_method(proof.operation)?;
+        match proof.operation {
+            RecordsList | RecordsShow | RecordsCreate | RecordsUpdate | RecordsCsvPreview
+            | RecordsCsvImport | RecordsCsvConfirm => {
+                self.rpc_app_record_with_proof(method, &params, peer_pid, Some(proof))
+            }
+            SegmentsList | SegmentsShow | SegmentsSave | ExclusionsList | ExclusionsShow
+            | ExclusionsSave | SuppressionsList | SuppressionsAdd | AudiencePreview
+            | AudiencePrepare | AudienceShow => {
+                self.rpc_app_audience_with_proof(method, &params, peer_pid, Some(proof))
+            }
+            SendsPrepare | SendsShow | SendsList | SendsApprove | SendsResolve | OriginShow
+            | OriginManage => self.rpc_crm_send_with_proof(method, &params, peer_pid, Some(proof)),
+            SmtpShow | SmtpBind | SmtpRebind | SmtpRevoke | SmtpTestSend => {
+                let value = self.rpc_crm_smtp_with_proof(method, &params, peer_pid, Some(proof))?;
+                Ok(sanitized_smtp(value))
+            }
+            op if op.is_whatsapp() => {
+                self.rpc_whatsapp_with_proof(method, &params, peer_pid, Some(proof))
+            }
+            WorksQuery | WorksGet | WorksCreate | WorksPatch | WorksTrash | WorksRestore
+            | WorksRequestReview | WorksReview | WorksExport => {
+                self.rpc_app_works(method, &params, peer_pid, Some(proof))
+            }
+            // CAD-1827: campaign work metadata is the paired contract's own
+            // scope; save is a direct CAS write, never a SLOT confirmation.
+            CampaignWorkShow | CampaignWorkSave => {
+                self.rpc_crm_campaign_work(method, &params, peer_pid, Some(proof))
+            }
+            _ => self.rpc_app_content_with_proof(method, &params, peer_pid, Some(proof)),
+        }
+    }
+
+    /// CAD-1827: the paired `crm-campaign-work/v1` operations. Scope is the
+    /// proven mount (install + context); `install_id`/`context_id` arrive
+    /// from the daemon, never from the frame. `save` is a direct revision-CAS
+    /// write: the actor is derived from the authenticated caller, and the
+    /// content revision is read inside the same transaction. Neither
+    /// operation approves, sends or publishes anything.
+    fn rpc_crm_campaign_work(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+        proof: Option<&ScreenServiceProof>,
+    ) -> Result<Value> {
+        use crate::issue::app_campaign_work::{self as work, WorkPatch};
+        Self::screen_service_method(proof, method)?;
+        self.operator_connection("campaign work", params, peer_pid)?;
+        let allowed: &[&str] = match method {
+            "crm_campaign_work_show" => &["install_id", "context_id", "campaign_id"],
+            "crm_campaign_work_save" => &[
+                "install_id",
+                "context_id",
+                "campaign_id",
+                "expected_revision",
+                "assignee",
+                "due_at",
+                "status",
+                "blocked_reason",
+                "public_session",
+            ],
+            _ => return Err(Error::invalid("invalid", "unknown campaign work method")),
+        };
+        let fields = params
+            .as_object()
+            .ok_or_else(|| Error::invalid("invalid", "campaign work payload must be an object"))?;
+        for key in fields.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(Error::invalid(
+                    "invalid",
+                    "campaign work payload has unsupported fields",
+                ));
+            }
+        }
+        // A screen call derives install/context from the private proof, never
+        // from frame fields; a native call takes them from the operator caller.
+        let install = match proof {
+            Some(proof) => proof.install().to_string(),
+            None => required_str(params, "install_id")?.to_string(),
+        };
+        let context = match proof {
+            Some(proof) => proof.context()?.to_string(),
+            None => required_str(params, "context_id")?.to_string(),
+        };
+        let campaign = required_str(params, "campaign_id")?.to_string();
+        work::check_campaign_id(&campaign)?;
+        // The source identity is the installed package's own app tag — never
+        // a frame field and never an app-name branch on the host.
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        let app = workspace::with_runtime_read(&pm, &install, |description, _| {
+            description
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| Error::rejected("installation app identity unavailable"))
+        })?;
+        if method == "crm_campaign_work_show" {
+            return self.screen_service_scope(&install, &context, true, proof, || {
+                let records =
+                    crate::store::app_records::RecordStore::open(&self.state_dir, &install)?;
+                records.app_campaign_work_facts(&context, &campaign, &app)
+            });
+        }
+        let expected_revision = params
+            .get("expected_revision")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                Error::invalid(
+                    "invalid_body",
+                    "a campaign work save needs the revision it was read at",
+                )
+            })?;
+        let human = self.verified_owner_human(params)?;
+        // Refuses before the installation/context or record file is touched.
+        let actor = super::app_works_rpc::works_actor(human.as_ref())?;
+        let patch = WorkPatch::from_body(&campaign_work_values(params))?;
+        self.screen_service_scope(&install, &context, true, proof, || {
+            let records = crate::store::app_records::RecordStore::open(&self.state_dir, &install)?;
+            records.app_campaign_work_save(
+                &context,
+                &campaign,
+                expected_revision,
+                &patch,
+                &actor,
+                &app,
+            )
+        })
+    }
+
+    /// CAD-1827: authorized discovery of campaign-work sources. The host
+    /// enumerates installed packages by the `crm-campaign-work` contract and
+    /// their declared `campaign-work.show` operation — never by app name —
+    /// and names only the contexts that are still live. No caller scope is
+    /// accepted: the host's own catalog is the only input.
+    pub(super) fn rpc_crm_campaign_work_sources(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        use crate::issue::app_campaign_work as work;
+        self.operator_connection("campaign work sources", params, peer_pid)?;
+        if params.as_object().is_none_or(|fields| !fields.is_empty()) {
+            return Err(Error::invalid(
+                "invalid",
+                "campaign work sources takes no fields",
+            ));
+        }
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        let listed = workspace::list(&pm)?;
+        let rows = match listed {
+            Value::Array(rows) => rows,
+            _ => return Err(Error::internal("installation catalog is unavailable")),
+        };
+        if rows.len() > CAMPAIGN_WORK_SOURCES_MAX {
+            return Err(Error::rejected(
+                "installation catalog exceeds the campaign work discovery bound",
+            ));
+        }
+        let mut sources = Vec::new();
+        // A source whose inspection fails is reported, never dropped: the
+        // inventory says `partial` and names it without any recorded values.
+        let mut unavailable = Vec::new();
+        for row in rows {
+            if row.get("removed").is_some_and(|removed| !removed.is_null()) {
+                continue;
+            }
+            let (Some(install), Some(app)) = (row["install_id"].as_str(), row["name"].as_str())
+            else {
+                continue;
+            };
+            let inspected = workspace::with_runtime_read(&pm, install, |_, files| {
+                Ok(app_screen_pkg::campaign_work_source(files))
+            });
+            match inspected {
+                // Valid non-participation: the package never claimed the
+                // contract, so it is simply not a source.
+                Ok(app_screen_pkg::CampaignWorkSource::NotDeclared) => continue,
+                Ok(app_screen_pkg::CampaignWorkSource::Served) => {
+                    let contexts = self
+                        .store
+                        .app_context_list(install)?
+                        .get("contexts")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|context| context["state"] == "active")
+                        .filter_map(|context| context["id"].as_str().map(str::to_string))
+                        .collect::<Vec<String>>();
+                    sources.push(json!({"install_id": install, "app": app, "contexts": contexts}));
+                }
+                Ok(app_screen_pkg::CampaignWorkSource::Unavailable(reason)) => {
+                    unavailable.push(json!({"install_id": install, "app": app, "reason": reason}));
+                }
+                // The installation changed or disappeared after the catalog
+                // read: it cannot be inspected, so it cannot be called a
+                // non-source either.
+                Err(_) => unavailable.push(json!({
+                    "install_id": install,
+                    "app": app,
+                    "reason": "installation changed during discovery",
+                })),
+            }
+        }
+        let state = if unavailable.is_empty() {
+            "ok"
+        } else {
+            "partial"
+        };
+        Ok(json!({
+            "contract": work::CONTRACT,
+            "state": state,
+            "sources": sources,
+            "unavailable": unavailable,
+        }))
+    }
+
+    /// CAD-1827: the authorized core-facing read. Scope comes from verified
+    /// host state: the installation's own live package must serve
+    /// `campaign-work.show` and the context must be live, otherwise the
+    /// contract's `forbidden` shape is returned and no row is read. A
+    /// caller-supplied `expected_revision` that no longer matches yields
+    /// `stale` with revision tokens only.
+    pub(super) fn rpc_crm_campaign_work_read(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        use crate::issue::app_campaign_work::{self as work, Access, ReadInput};
+        self.operator_connection("campaign work read", params, peer_pid)?;
+        let allowed: &[&str] = &[
+            "install_id",
+            "context_id",
+            "campaign_id",
+            "expected_revision",
+        ];
+        let fields = params
+            .as_object()
+            .ok_or_else(|| Error::invalid("invalid", "campaign work read must be an object"))?;
+        for key in fields.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(Error::invalid(
+                    "invalid",
+                    "campaign work read has unsupported fields",
+                ));
+            }
+        }
+        let install = required_str(params, "install_id")?;
+        crate::proto::identifier(install, "installation ID")?;
+        let context = required_str(params, "context_id")?;
+        crate::proto::identifier(context, "context ID")?;
+        let campaign = required_str(params, "campaign_id")?;
+        work::check_campaign_id(campaign)?;
+        let expected = match params.get("expected_revision") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_i64()
+                    .filter(|revision| *revision >= 0)
+                    .ok_or_else(|| {
+                        Error::invalid(
+                            "invalid",
+                            "expected_revision must be a non-negative integer",
+                        )
+                    })?,
+            ),
+        };
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        // PM snapshot -> release fence -> active-context proof -> live package
+        // declaration, all held through the record open and read, exactly like
+        // `screen_service_scope`. A context archived, an installation removed
+        // or a bundle updated after the proof therefore cannot be read as an
+        // authorized source.
+        workspace::with_runtime_snapshot(&pm, install, |description, files| {
+            let app = description["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| Error::rejected("installation app identity unavailable"))?
+                .to_string();
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let context_live = match self.store.app_context_proof(install, context) {
+                Ok(_) => true,
+                // An unknown or archived context is not an authorized source.
+                Err(error) if error.kind() == "rejected" => false,
+                Err(error) => return Err(error),
+            };
+            let declared = app_screen_pkg::campaign_work_source(files)
+                == app_screen_pkg::CampaignWorkSource::Served;
+            if !context_live || !declared {
+                return Ok(work::read(ReadInput {
+                    app: &app,
+                    install,
+                    context: Some(context),
+                    campaign,
+                    work: None,
+                    content: None,
+                    readiness: None,
+                    access: Access::Forbidden,
+                    expected_revision: None,
+                }));
+            }
+            let records = crate::store::app_records::RecordStore::open(&self.state_dir, install)?;
+            records.app_campaign_work_read(context, campaign, &app, Access::Authorized, expected)
+        })
+    }
+
+    pub(super) fn rpc_app_screen_service_call(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("app screen service call", params, peer_pid)
+            .map_err(|error| {
+                screen_authority_error(error, "screen service requires operator connection")
+            })?;
+        let request: CallRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::rejected("unsupported screen service request"))?;
+        bounded(request.operation, &request.args)?;
+        let args = call_args(request.operation, &request.args)?;
+        let proof = self.screen_service_proof(
+            &request.action_token,
+            &request.token,
+            &request.key,
+            &request.origin,
+            request.operation,
+        )?;
+        let _csv = self.screen_csv_claim(&proof)?;
+        response(self.screen_service_execute(&proof, args, peer_pid)?)
+    }
+
+    fn screen_slot_facts(&self, proof: &ScreenServiceProof, args: &Value) -> Result<Value> {
+        let install = &proof.context.install_id;
+        let context = proof
+            .context
+            .context_id
+            .as_deref()
+            .ok_or_else(|| Error::rejected("missing screen context"))?;
+        self.screen_service_scope(install, context, true, Some(proof), || {
+            self.screen_slot_facts_locked(proof, args)
+        })
+    }
+
+    fn screen_slot_facts_locked(&self, proof: &ScreenServiceProof, args: &Value) -> Result<Value> {
+        let install = &proof.context.install_id;
+        let context = proof
+            .context
+            .context_id
+            .as_deref()
+            .ok_or_else(|| Error::rejected("missing screen context"))?;
+        let records = crate::store::app_records::RecordStore::open(&self.state_dir, install)?;
+        match proof.operation {
+            ScreenOperation::ContentApprove => {
+                let shown =
+                    records.app_content_show(context, required_str(args, "campaign_id")?)?;
+                if shown["content"]["revision"] != args["expected_revision"] {
+                    return Err(Error::rejected(
+                        "content revision changed before confirmation",
+                    ));
+                }
+                Ok(shown)
+            }
+            ScreenOperation::RecordsCsvImport | ScreenOperation::RecordsCsvConfirm => {
+                let preview = records
+                    .app_record_csv_preview(context, &super::app_records_rpc::csv_text(args)?)?;
+                if preview["preview_token"] != args["preview_token"] {
+                    return Err(Error::rejected("CSV preview changed before confirmation"));
+                }
+                super::app_records_rpc::csv_decisions(args)?;
+                Ok(preview)
+            }
+            ScreenOperation::WorksReview | ScreenOperation::WorksExport => {
+                // CAD-1662: the confirmation facts are the doc's current
+                // revision and state, re-read here under the scope lock.
+                let id = required_str(args, "id")?;
+                let shown = records.app_works_get(context, id)?;
+                if shown["revision"] != args["revision"] {
+                    return Err(Error::conflict_coded(
+                        "facts_changed",
+                        "works revision changed before confirmation",
+                    ));
+                }
+                Ok(shown)
+            }
+            ScreenOperation::SendsApprove | ScreenOperation::SendsResolve => {
+                let id = required_str(args, "send_id")?;
+                let send = records
+                    .app_campaign_send(context, id)?
+                    .ok_or_else(|| Error::rejected("send is unavailable in this scope"))?;
+                if proof.operation == ScreenOperation::SendsResolve {
+                    let customer = required_str(args, "customer_id")?;
+                    let row = records
+                        .app_campaign_delivery(context, id, customer)?
+                        .ok_or_else(|| Error::rejected("delivery is unavailable in this scope"))?;
+                    if row.state != "uncertain" {
+                        return Err(Error::rejected("only uncertain deliveries can be resolved"));
+                    }
+                    return Ok(
+                        json!({"send_id": id, "customer_id": customer, "state": row.state,
+                        "email": crate::store::app_sends::masked_email(&row.email), "send_digest": send.send_digest}),
+                    );
+                }
+                if send.state != "prepared" {
+                    return Err(Error::rejected("send is not awaiting approval"));
+                }
+                let content = records.app_content_approved(context, &send.campaign_id)?;
+                Ok(
+                    json!({"send_id": id, "state": send.state, "send_digest": send.send_digest,
+                    "campaign_id": send.campaign_id, "content_revision": content.0, "content_digest": content.1,
+                    "audience": records.app_audience_show(context, &send.audience_freeze_id)?,
+                    "binding": self.screen_smtp_facts_locked(proof)?,
+                    "unsubscribe_origin": self.crm_send_origin()?}),
+                )
+            }
+            ScreenOperation::SmtpBind
+            | ScreenOperation::SmtpRebind
+            | ScreenOperation::SmtpRevoke
+            | ScreenOperation::SmtpManage => {
+                let mut facts = self.screen_smtp_facts_locked(proof)?;
+                if matches!(
+                    proof.operation,
+                    ScreenOperation::SmtpBind | ScreenOperation::SmtpRebind
+                ) {
+                    let mut choices = Vec::new();
+                    for row in self.connection_list_locked()? {
+                        if let Some(id) = row["id"].as_str() {
+                            if let Ok(rev) = self.crm_sender_revision(id) {
+                                if let Ok((_, projection)) = self.crm_smtp_authority(id, rev) {
+                                    choices.push(json!({"connection_id": id, "auth_revision": rev, "sender": projection.to_json()}));
+                                }
+                            }
+                        }
+                    }
+                    facts["connections"] = json!(choices);
+                }
+                Ok(facts)
+            }
+            ScreenOperation::SmtpTestSend => Ok(json!({
+                "content": records.app_content_show(context, required_str(args, "campaign_id")?)?,
+                "binding": self.screen_smtp_facts_locked(proof)?,
+            })),
+            ScreenOperation::ChatCampaignOpen | ScreenOperation::ChatCampaignBrief => {
+                let shown =
+                    records.app_content_show(context, required_str(args, "campaign_id")?)?;
+                if proof.operation == ScreenOperation::ChatCampaignBrief {
+                    let brief = required_str(args, "brief")?;
+                    if brief.trim().is_empty() || brief.len() > 12_000 {
+                        return Err(Error::rejected("campaign brief exceeds its bound"));
+                    }
+                    Ok(json!({"content": shown, "brief": brief, "effect": "assistant-message"}))
+                } else {
+                    Ok(json!({"content": shown}))
+                }
+            }
+            ScreenOperation::WhatsappReplySend => self.whatsapp_reply_facts(install, context, args),
+            ScreenOperation::WhatsappTemplateSend => {
+                self.whatsapp_template_facts(install, context, args)
+            }
+            ScreenOperation::WhatsappBroadcastTestSend => {
+                self.whatsapp_test_facts(install, context, args)
+            }
+            ScreenOperation::WhatsappBroadcastSend => {
+                self.whatsapp_broadcast_facts(install, context, args)
+            }
+            ScreenOperation::WhatsappBroadcastStop => self.whatsapp_stop_facts(args),
+            ScreenOperation::WhatsappHandoffRelease => self.whatsapp_release_facts(args),
+            ScreenOperation::ChatWhatsappBrief => self.whatsapp_brief_facts(args),
+            ScreenOperation::OriginManage => Ok(json!({"scope": "daemon-global",
+                "unsubscribe_origin": self.store.crm_setting("unsubscribe_origin")?.or_else(|| self.unsubscribe_origin.clone())})),
+            _ => Err(Error::rejected(
+                "screen SLOT has no implemented authoritative card",
+            )),
+        }
+    }
+
+    fn screen_smtp_facts_locked(&self, proof: &ScreenServiceProof) -> Result<Value> {
+        let Some(link) = self
+            .store
+            .crm_smtp_link(proof.install(), proof.context()?)?
+        else {
+            return Ok(json!({"binding": null}));
+        };
+        Ok(
+            json!({"binding": {"connection_id": link.connection_id, "auth_revision": link.auth_revision,
+            "link_revision": link.link_revision, "state": link.state, "digest": link.digest}}),
+        )
+    }
+
+    fn screen_confirmation_args(
+        &self,
+        proof: &mut ScreenServiceProof,
+        args: &mut Value,
+        confirmation: Confirmation,
+    ) -> Result<()> {
+        use ScreenOperation::*;
+        match (proof.operation, confirmation) {
+            (
+                RecordsCsvConfirm | ContentApprove | SendsApprove | SmtpRevoke | SmtpManage
+                | ChatCampaignOpen,
+                Confirmation::Tap(tap),
+            ) if tap.confirmed => {}
+            // CAD-1562: the tap approves the host-computed digest of the
+            // prepared reply the card drew; the frame never supplies it.
+            (WhatsappReplySend, Confirmation::Tap(tap)) if tap.confirmed => {
+                let facts = &proof
+                    .confirmed
+                    .as_ref()
+                    .ok_or_else(|| Error::rejected("confirmation missing"))?
+                    .1;
+                *args = json!({"effect_id": facts["effect_id"], "digest": facts["digest"]});
+            }
+            // CAD-1590: each send tap approves the host-drawn card's own
+            // effect and digest; the stop tap the card's broadcast.
+            (
+                WhatsappTemplateSend | WhatsappBroadcastTestSend | WhatsappBroadcastSend,
+                Confirmation::Tap(tap),
+            ) if tap.confirmed => {
+                let facts = &proof
+                    .confirmed
+                    .as_ref()
+                    .ok_or_else(|| Error::rejected("confirmation missing"))?
+                    .1;
+                *args = json!({"effect_id": facts["effect_id"], "digest": facts["digest"]});
+            }
+            (WhatsappBroadcastStop, Confirmation::Tap(tap)) if tap.confirmed => {
+                let facts = &proof
+                    .confirmed
+                    .as_ref()
+                    .ok_or_else(|| Error::rejected("confirmation missing"))?
+                    .1;
+                *args = json!({"broadcast_id": facts["broadcast_id"]});
+            }
+            // CAD-1651: the release tap confirms the card's own conversation.
+            (WhatsappHandoffRelease, Confirmation::Tap(tap)) if tap.confirmed => {
+                let facts = &proof
+                    .confirmed
+                    .as_ref()
+                    .ok_or_else(|| Error::rejected("confirmation missing"))?
+                    .1;
+                *args = json!({"conversation_id": facts["conversation_id"]});
+            }
+            // CAD-1662: a review or export tap confirms the facts re-read at
+            // execution (doc id and revision); the frame supplies neither.
+            (WorksReview, Confirmation::WorksChoice(input))
+                if input.confirmed && matches!(input.choice.as_str(), "approve" | "changes") =>
+            {
+                // CAD-1662: the reviewer's decision is bound to the doc
+                // revision the host re-proved; the frame never supplies it.
+                let facts = &proof
+                    .confirmed
+                    .as_ref()
+                    .ok_or_else(|| Error::rejected("confirmation missing"))?
+                    .1;
+                *args = json!({"id": facts["id"], "revision": facts["revision"],
+                    "decision": input.choice, "note": input.note});
+            }
+            (WorksExport, Confirmation::WorksChoice(input))
+                if input.confirmed
+                    && !input.choice.trim().is_empty()
+                    && input.choice.len() <= 40 =>
+            {
+                let facts = &proof
+                    .confirmed
+                    .as_ref()
+                    .ok_or_else(|| Error::rejected("confirmation missing"))?
+                    .1;
+                *args = json!({"id": facts["id"], "revision": facts["revision"], "format": input.choice});
+            }
+            (ChatCampaignBrief, Confirmation::Brief(input))
+                if input.confirmed && args["brief"].as_str() == Some(input.brief.as_str()) => {}
+            // CAD-1636: the tap confirms the guidance exactly as the card drew it.
+            (ChatWhatsappBrief, Confirmation::Brief(input))
+                if input.confirmed && args["guidance"].as_str() == Some(input.brief.as_str()) => {}
+            (RecordsCsvImport, Confirmation::Csv(input)) if input.confirmed => {
+                let held = self
+                    .screen_service_confirmations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&input.csv_confirm_token)
+                    .ok_or_else(|| Error::rejected("CSV confirmation is spent or unknown"))?;
+                let mut normalized = args.clone();
+                normalized["decisions"] =
+                    args.get("decisions").cloned().unwrap_or_else(|| json!([]));
+                if held.issued.elapsed() >= CONFIRM_TTL
+                    || held.proof.operation != RecordsCsvConfirm
+                    || held.proof.action_token != proof.action_token
+                    || held.proof.context.mount != proof.context.mount
+                    || held.proof.context.session != proof.context.session
+                    || held.args != normalized
+                {
+                    return Err(Error::rejected(
+                        "CSV confirmation does not belong to this mounted plan",
+                    ));
+                }
+                let digest =
+                    crate::store::app_records::csv_decisions_digest(&normalized["decisions"])?;
+                proof.csv_confirmation = Some((input.csv_confirm_token, digest));
+            }
+            (SmtpTestSend, Confirmation::Recipient(input)) if input.confirmed => {
+                args["to_email"] = json!(input.to_email);
+            }
+            (SmtpBind | SmtpRebind, Confirmation::Connection(input)) if input.confirmed => {
+                let facts = &proof
+                    .confirmed
+                    .as_ref()
+                    .ok_or_else(|| Error::rejected("confirmation missing"))?
+                    .1;
+                if !facts["connections"].as_array().is_some_and(|choices| {
+                    choices
+                        .iter()
+                        .any(|row| row["connection_id"] == input.connection_id)
+                }) {
+                    return Err(Error::rejected(
+                        "SMTP connection was not an admitted host choice",
+                    ));
+                }
+                args["connection_id"] = json!(input.connection_id);
+                if proof.operation == SmtpBind {
+                    args["request_id"] = json!(format!("screen-{}", crate::store::app_runs::material_digest(&json!({"mount": proof.context.mount, "connection": args["connection_id"]})).trim_start_matches("sha256:")));
+                }
+            }
+            (SendsResolve, Confirmation::Resolution(input))
+                if input.confirmed
+                    && matches!(input.resolution.as_str(), "accepted" | "failed") =>
+            {
+                args["resolution"] = json!(input.resolution);
+            }
+            (OriginManage, Confirmation::GlobalOrigin(input)) if input.confirmed => {
+                args["unsubscribe_origin"] = json!(input.unsubscribe_origin);
+            }
+            _ => {
+                return Err(Error::rejected(
+                    "confirmation does not match protected operation or was cancelled",
+                ))
+            }
+        }
+        let facts = &proof
+            .confirmed
+            .as_ref()
+            .ok_or_else(|| Error::rejected("confirmation missing"))?
+            .1;
+        if proof.operation == SendsApprove {
+            args["send_digest"] = facts["send_digest"].clone();
+        }
+        if matches!(proof.operation, SmtpRebind | SmtpRevoke) {
+            let revision = facts["binding"]["link_revision"]
+                .as_i64()
+                .ok_or_else(|| Error::rejected("no current SMTP binding"))?;
+            args["expected_revision"] = json!(revision);
+        }
+        Ok(())
+    }
+
+    fn screen_host_command_locked(
+        &self,
+        proof: &ScreenServiceProof,
+        params: &Value,
+    ) -> Result<Value> {
+        use ScreenOperation::*;
+        let mut args = params.clone();
+        let fields = args
+            .as_object_mut()
+            .ok_or_else(|| Error::rejected("host command must be an object"))?;
+        fields.remove("install_id");
+        fields.remove("context_id");
+        match proof.operation {
+            ScreenRoutePatch => {
+                if let Some(view) = args.get("view").filter(|v| !v.is_null()) {
+                    if !matches!(view.as_str(), Some("list" | "new")) {
+                        return Err(Error::rejected("unsupported screen view"));
+                    }
+                }
+                for key in ["record_id", "segment_id"] {
+                    if let Some(id) = args.get(key).filter(|v| !v.is_null()) {
+                        // CAD-1634: route-only grammar `[a-z0-9_-]{1,64}`, so
+                        // WhatsApp ids with `_` deep-link; `proto::identifier`
+                        // stays strict for every other caller.
+                        let ok = id.as_str().is_some_and(|s| {
+                            (1..=64).contains(&s.len())
+                                && s.bytes().all(|b| {
+                                    b.is_ascii_lowercase()
+                                        || b.is_ascii_digit()
+                                        || b == b'_'
+                                        || b == b'-'
+                                })
+                        });
+                        if !ok {
+                            return Err(Error::rejected("invalid screen selector"));
+                        }
+                    }
+                }
+            }
+            ScreenPreviewShow => {
+                crate::proto::identifier(required_str(&args, "preview_id")?, "preview ID")?;
+                let anchor: PreviewAnchor = serde_json::from_value(args["anchor"].clone())?;
+                if let PreviewAnchor::Box(a) = anchor {
+                    if [a.x, a.y, a.w, a.h].iter().any(|v| !v.is_finite()) || a.w < 0.0 || a.h < 0.0
+                    {
+                        return Err(Error::rejected("invalid preview anchor"));
+                    }
+                }
+            }
+            ScreenPreviewClear => {
+                crate::proto::identifier(required_str(&args, "preview_id")?, "preview ID")?;
+            }
+            SmtpManage => {}
+            _ => return Err(Error::rejected("unsupported host command")),
+        }
+        Ok(json!({"host_command": {"operation": proof.operation, "args": args}}))
+    }
+
+    pub(super) fn rpc_app_screen_service_slot_prepare(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("app screen service slot prepare", params, peer_pid)
+            .map_err(|error| {
+                screen_authority_error(error, "screen service requires operator connection")
+            })?;
+        let request: CallRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::rejected("unsupported screen slot request"))?;
+        bounded(request.operation, &request.args)?;
+        let args = slot_args(request.operation, &request.args)?;
+        let proof = self.screen_service_proof(
+            &request.action_token,
+            &request.token,
+            &request.key,
+            &request.origin,
+            request.operation,
+        )?;
+        let _csv = self.screen_csv_claim(&proof)?;
+        let facts = self.screen_slot_facts(&proof, &args)?;
+        let mut confirmations = self
+            .screen_service_confirmations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        confirmations.retain(|_, item| item.issued.elapsed() < CONFIRM_TTL);
+        if confirmations.len() >= 256
+            || confirmations
+                .values()
+                .filter(|item| item.proof.action_token == request.action_token)
+                .count()
+                >= 4
+        {
+            return Err(Error::rejected("screen confirmation capacity reached"));
+        }
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes)
+            .map_err(|_| Error::rejected("confirmation entropy unavailable"))?;
+        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        // Only the trusted host receives card facts and token. No frame proof.
+        let mut card = json!({"operation": request.operation, "facts": facts});
+        // CAD-1590: the stop card also shows live counts, outside the
+        // facts the confirmation binds.
+        if request.operation == ScreenOperation::WhatsappBroadcastStop {
+            card["live"] = self.whatsapp_stop_live(&args)?;
+        }
+        if request.operation == ScreenOperation::WhatsappHandoffRelease {
+            card["live"] = self.whatsapp_release_live(&args)?;
+        }
+        confirmations.insert(
+            token.clone(),
+            ScreenServiceConfirmation {
+                proof,
+                args,
+                facts,
+                issued: Instant::now(),
+            },
+        );
+        response(json!({"confirmation_token": token, "card": card}))
+    }
+
+    pub(super) fn rpc_app_screen_service_slot_confirm(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("app screen service slot confirm", params, peer_pid)
+            .map_err(|error| {
+                screen_authority_error(error, "screen service requires operator connection")
+            })?;
+        let request: ConfirmRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::rejected("unsupported screen confirmation request"))?;
+        // Burn BEFORE reproof or mutation. Failure is never automatic retry.
+        let confirmed = self
+            .screen_service_confirmations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&request.confirmation_token)
+            .ok_or_else(|| Error::rejected("screen confirmation is spent or unknown"))?;
+        if confirmed.issued.elapsed() >= CONFIRM_TTL
+            || confirmed.proof.action_token != request.action_token
+        {
+            return Err(Error::rejected(
+                "screen confirmation expired, cancelled or foreign",
+            ));
+        }
+        let mut proof = self.screen_service_proof(
+            &request.action_token,
+            &request.token,
+            &request.key,
+            &request.origin,
+            confirmed.proof.operation,
+        )?;
+        if proof.context.session != confirmed.proof.context.session
+            || proof.context.mount != confirmed.proof.context.mount
+        {
+            return Err(screen_access_denied(
+                "confirmation does not belong to current mount/session",
+            ));
+        }
+        let _csv = self.screen_csv_claim(&proof)?;
+        proof.confirmed = Some((confirmed.args.clone(), confirmed.facts));
+        let mut args = confirmed.args;
+        self.screen_confirmation_args(&mut proof, &mut args, request.confirmation)?;
+        if proof.operation == ScreenOperation::RecordsCsvConfirm {
+            // Native CSV semantics: absent decisions normalize to [].
+            let decisions = args.get("decisions").cloned().unwrap_or_else(|| json!([]));
+            args["decisions_digest"] =
+                json!(crate::store::app_records::csv_decisions_digest(&decisions)?);
+            args["decisions"] = decisions;
+        }
+        let result = self.screen_service_execute(&proof, args.clone(), peer_pid)?;
+        if proof.operation == ScreenOperation::RecordsCsvConfirm {
+            let token = required_str(&result, "confirm_token")?;
+            // Private bridge: bind the native nonce to this live mount and
+            // exact plan. Import consumes this entry and the native reserve
+            // transaction spends the nonce. Never forward it to the frame.
+            let mut held = self
+                .screen_service_confirmations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            held.retain(|_, item| item.issued.elapsed() < CONFIRM_TTL);
+            if held.len() >= 256
+                || held
+                    .values()
+                    .filter(|item| item.proof.action_token == proof.action_token)
+                    .count()
+                    >= 4
+            {
+                return Err(Error::rejected("CSV confirmation capacity reached"));
+            }
+            args.as_object_mut()
+                .expect("typed object")
+                .remove("decisions_digest");
+            let facts = proof.confirmed.as_ref().expect("confirmed facts").1.clone();
+            held.insert(
+                token.to_owned(),
+                ScreenServiceConfirmation {
+                    proof,
+                    args,
+                    facts,
+                    issued: Instant::now(),
+                },
+            );
+        }
+        response(result)
+    }
+}

@@ -72,6 +72,10 @@ pub struct ModelDefaults {
     pub schema: u32,
     #[serde(deserialize_with = "unique_string_map")]
     pub providers: BTreeMap<String, ProviderDefaults>,
+    /// Agents-settings overlay. Absent or null on documents written by
+    /// `model_defaults_set`; that writer keeps the stored object.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub agent_settings: Value,
 }
 
 impl ModelDefaults {
@@ -79,6 +83,7 @@ impl ModelDefaults {
         Self {
             schema: 1,
             providers: BTreeMap::new(),
+            agent_settings: Value::Null,
         }
     }
 }

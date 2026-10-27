@@ -3,7 +3,7 @@
  * "at the tail" (so new messages follow), where the tail sits, and the
  * jump pill's words.
  */
-import { atTail, jumpLabel, tailTop, TAIL_SLACK } from "../src/features/home/dock";
+import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop, TAIL_SLACK } from "../src/features/home/dock";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
@@ -45,5 +45,17 @@ equal(tailTop(200, 400), 0, "a short thread never goes negative");
 equal(jumpLabel(1), "Jump to latest · 1 new", "one arrival");
 equal(jumpLabel(7), "Jump to latest · 7 new", "several arrivals");
 equal(jumpLabel(0), "Jump to latest", "no count when nothing is unseen");
+
+// ---- repinOnResize ----
+ok(repinOnResize(true, 790, 746), "shrink while on the tail re-pins");
+ok(!repinOnResize(false, 790, 746), "shrink while scrolled up does not");
+ok(!repinOnResize(true, 790, 790), "no size change does not");
+
+
+// ---- showJumpPill ----
+
+ok(!showJumpPill(0, false), "nothing unseen: no pill");
+ok(showJumpPill(1, false), "a row arrived while reading history: pill");
+ok(showJumpPill(0, true), "the tail row kept growing in history: pill");
 
 console.log("homeDock.test.ts: all assertions passed");

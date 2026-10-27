@@ -1,5 +1,213 @@
 
     #[test]
+    fn cloud_stop_request_and_claim_requeue_are_guarded() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task("j1", "t1", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, message, ..) = s.dispatch_task("t1", None, None, "test").unwrap();
+        assert!(!s.cloud_stop_requested(&message).unwrap());
+        s.request_cloud_stop(&message).unwrap();
+        assert!(s.cloud_stop_requested(&message).unwrap());
+        let claim = format!("cloud:{message}");
+        assert!(s.mark_running_queued(&message, &claim).unwrap());
+        assert!(!s.requeue_cloud_claim(&message, "other").unwrap());
+        assert!(s.requeue_cloud_claim(&message, &claim).unwrap());
+        assert_eq!(s.message(&message).unwrap().unwrap().state, "queued");
+    }
+
+    #[test]
+    fn active_cloud_refuses_task_cancel_and_agent_remove() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        s.register_agent(&NewAgent {
+            alias: "sb",
+            provider: "sandbox",
+            endpoint_kind: "sandbox",
+            role: "worker",
+            cwd: cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(&json!({"upstream": "pm"}).to_string()),
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+        s.create_task(
+            "j1",
+            "t8",
+            None,
+            Some("sb"),
+            None,
+            Some("done"),
+            Some(cwd.to_str().unwrap()),
+            Some("cad-1"),
+            Some(&"0".repeat(40)),
+        )
+        .unwrap();
+        let (_, kickoff, ..) = s.dispatch_task("t8", None, None, "test").unwrap();
+        let error = s.inbox_drain("sb", 0).unwrap_err().to_string();
+        assert!(error.contains("inbox agents"), "{error}");
+        let row = s.message(&kickoff).unwrap().unwrap();
+        s.finish(&row, "unknown", &json!({"text": "unknown"}), None)
+            .unwrap();
+        let error = s
+            .reconcile(&kickoff, "interrupted", None, "test", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cloud sandbox work"), "{error}");
+        let error = s.cancel_task("t8", "test").unwrap_err().to_string();
+        assert!(error.contains("active cloud dispatch"), "{error}");
+        let error = s.fail_task("t8", "no", "test").unwrap_err().to_string();
+        assert!(error.contains("active cloud dispatch"), "{error}");
+        let error = s.cancel_job("j1", "test").unwrap_err().to_string();
+        assert!(error.contains("active cloud dispatch"), "{error}");
+        let error = s
+            .remove_agent("sb", true, &json!({"by": "test"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("active cloud dispatch"), "{error}");
+
+        s.set_enabled("sb", false).unwrap();
+        s.create_task("j1", "t10", None, Some("sb"), None, None, None, None, None)
+            .unwrap();
+        let error = s.dispatch_task("t10", None, None, "test").unwrap_err().to_string();
+        assert!(error.contains("disabled"), "{error}");
+    }
+
+    #[test]
+    fn same_alias_replacement_cannot_reuse_a_stale_backend_choice() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w3", &cwd);
+        s.create_task("j1", "t9", None, Some("w3"), None, None, None, None, None)
+            .unwrap();
+        let old = s.agent("w3").unwrap();
+        s.set_agent_state("w3", "stopped", None).unwrap();
+        s.remove_agent("w3", true, &json!({"by": "test"})).unwrap();
+        s.register_agent(&NewAgent {
+            alias: "w3",
+            provider: "devin",
+            endpoint_kind: "pty",
+            role: "worker",
+            cwd: cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(&json!({"upstream": "pm"}).to_string()),
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+        let error = s
+            .dispatch_task_for("t9", Some("w3"), None, "test", Some(&old))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("worker identity changed"), "{error}");
+    }
+
+    #[test]
+    fn dispatch_refuses_a_changed_assignee_and_blocks_unknown_kickoffs() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        reg_pty(&s, "w2", &cwd);
+        s.create_task("j1", "t6", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let replacement = s.agent("w2").unwrap();
+        let error = s
+            .dispatch_task_for("t6", None, None, "test", Some(&replacement))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("worker identity changed"), "{error}");
+
+        s.create_task("j1", "t7", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, message, ..) = s.dispatch_task("t7", None, None, "test").unwrap();
+        let row = s.message(&message).unwrap().unwrap();
+        s.finish(&row, "unknown", &json!({"text": "unknown"}), None)
+            .unwrap();
+        let (_, same, duplicate, _) = s.dispatch_task("t7", None, None, "test").unwrap();
+        assert!(duplicate);
+        assert_eq!(same, message);
+    }
+
+    #[test]
+    fn stopped_fresh_create_is_refused_but_replay_is_allowed() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task("j1", "t4", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, message, ..) = s.dispatch_task("t4", None, None, "test").unwrap();
+        assert_eq!(s.authorize_cloud_create(&message).unwrap(), (true, false));
+        s.request_cloud_stop(&message).unwrap();
+        assert_eq!(s.authorize_cloud_create(&message).unwrap(), (true, true));
+
+        s.create_task("j1", "t5", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, fresh, ..) = s.dispatch_task("t5", None, None, "test").unwrap();
+        s.request_cloud_stop(&fresh).unwrap();
+        assert_eq!(s.authorize_cloud_create(&fresh).unwrap(), (false, false));
+    }
+
+    #[test]
+    fn cloud_create_attempt_is_durable() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task("j1", "t3", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, message, ..) = s.dispatch_task("t3", None, None, "test").unwrap();
+        assert!(!s.cloud_create_attempted(&message).unwrap());
+        s.note_cloud_create_attempt(&message).unwrap();
+        assert!(s.cloud_create_attempted(&message).unwrap());
+    }
+
+    #[test]
+    fn cloud_publication_blocks_a_late_stop() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task("j1", "t2", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, message, ..) = s.dispatch_task("t2", None, None, "test").unwrap();
+        assert!(s.begin_cloud_publication(&message).unwrap());
+        let error = s.request_cloud_stop(&message).unwrap_err().to_string();
+        assert!(error.contains("already completing"), "{error}");
+    }
+
+    #[test]
+    fn dispatch_plan_is_the_transaction_preimage() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task("j1", "t1", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let plan = s.plan_task_dispatch("t1", None, None).unwrap();
+        assert!(!plan.duplicate);
+        assert_eq!(plan.revision, 1);
+        let (task, message, duplicate, _) = s
+            .dispatch_task("t1", None, Some(&plan.message_id), "test")
+            .unwrap();
+        assert_eq!(message, plan.message_id);
+        assert_eq!(task.revision, plan.revision);
+        assert!(!duplicate);
+        let live = s.plan_task_dispatch("t1", None, None).unwrap();
+        assert!(live.duplicate);
+        assert_eq!(live.message_id, message);
+        assert_eq!(live.revision, plan.revision);
+    }
+
+    #[test]
     fn current_verdict_follows_the_open_revision() {
         let rows = vec![verdict(1, 2), verdict(3, 2), verdict(2, 1)];
         let current = super::current_verdict(1, &rows).unwrap();
@@ -693,4 +901,126 @@
         assert!(b2.ends_with("reported revision."), "{b2}");
         task.acceptance = Some("a".repeat(5000));
         assert!(kickoff_body(&job, &task, 1, "m", &worker).is_err());
+    }
+
+    /// CAD-1266: the fleet list reads every assignee's open tasks in one
+    /// pass and the daemon's in-flight listing reads only running rows;
+    /// both must say what the per-agent / per-history reads said.
+    #[test]
+    fn fleet_reads_match_the_per_agent_reads() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let kickoff = seeded_task(&s, &cwd);
+        s.create_task("j1", "t-open", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        s.create_task("j1", "t-done", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        s.cancel_task("t-done", "test").unwrap();
+        s.create_task("j1", "t-free", None, None, None, None, None, None, None)
+            .unwrap();
+        // CAD-1280: a second agent with its own open and finished tasks, so
+        // the fleet read is compared on more than one assignee.
+        s.register_agent(&NewAgent {
+            alias: "w2",
+            provider: "fake",
+            endpoint_kind: "fake",
+            role: "worker",
+            cwd: cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(&json!({"upstream": "pm"}).to_string()),
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+        for id in ["t-w2-a", "t-w2-b", "t-w2-done"] {
+            s.create_task("j1", id, None, Some("w2"), None, None, None, None, None)
+                .unwrap();
+        }
+        s.cancel_task("t-w2-done", "test").unwrap();
+        let fleet = s.open_task_ids_by_assignee().unwrap();
+        for alias in ["w1", "w2", "pm", "ghost"] {
+            let per_agent: Vec<String> = s
+                .tasks_for_assignee(alias)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            assert_eq!(
+                fleet.get(alias).cloned().unwrap_or_default(),
+                per_agent,
+                "{alias}"
+            );
+        }
+        assert!(fleet["w1"].contains(&"t-open".to_string()), "{fleet:?}");
+        assert!(!fleet["w1"].contains(&"t-done".to_string()), "{fleet:?}");
+        assert_eq!(fleet["w2"].len(), 2, "{fleet:?}");
+        assert!(!fleet["w2"].contains(&"t-w2-done".to_string()), "{fleet:?}");
+
+        // In flight: only the running kickoff, never completed history.
+        assert!(s.inflight_messages().unwrap().is_empty());
+        let m = run_kickoff(&s, &kickoff);
+        let inflight = s.inflight_messages().unwrap();
+        assert_eq!(inflight.len(), 1, "{inflight:?}");
+        assert_eq!((inflight[0].0.as_str(), inflight[0].1.as_str()), ("w1", m.id.as_str()));
+        assert_eq!(inflight[0].2, "running");
+        // CAD-1280: a pty turn whose paste was accepted (`submitted`
+        // marker) is still the one in-flight row, not a second or none.
+        s.mark_submitted(&m).unwrap();
+        let inflight = s.inflight_messages().unwrap();
+        assert_eq!(inflight.len(), 1, "{inflight:?}");
+        assert_eq!((inflight[0].0.as_str(), inflight[0].1.as_str()), ("w1", m.id.as_str()));
+        assert_eq!(inflight[0].2, "running");
+        s.finish(&m, "completed", &json!({"status": "completed", "text": "x"}), None)
+            .unwrap();
+        assert!(s.inflight_messages().unwrap().is_empty());
+    }
+
+    /// CAD-1280: `job list` reads task counts and lists in one pass; each
+    /// job's numbers and list order equal the per-job `tasks_for_job`, and
+    /// `open_only` leaves out exactly the terminal tasks.
+    #[test]
+    fn job_task_summary_matches_the_per_job_reads() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_task(&s, &cwd);
+        s.create_task("j1", "t-open", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        s.create_task("j1", "t-done", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        s.cancel_task("t-done", "test").unwrap();
+        s.create_job(
+            "j2", None, "/s.md", &"0".repeat(64), "pm", None, None, None, 2, None, None, None,
+            None, None, None, None,
+        )
+        .unwrap();
+        for open_only in [false, true] {
+            let summary = s.job_task_summary(Some(open_only)).unwrap();
+            for job in ["j1", "j2"] {
+                let tasks = s.tasks_for_job(job).unwrap();
+                let mut counts = std::collections::BTreeMap::new();
+                for t in &tasks {
+                    *counts.entry(t.state.clone()).or_insert(0i64) += 1;
+                }
+                assert_eq!(summary.counts.get(job).cloned().unwrap_or_default(), counts);
+                let want: Vec<String> = tasks
+                    .iter()
+                    .filter(|t| {
+                        !open_only
+                            || !matches!(
+                                t.state.as_str(),
+                                "verified" | "done" | "cancelled" | "failed"
+                            )
+                    })
+                    .map(|t| t.id.clone())
+                    .collect();
+                let got: Vec<String> = summary
+                    .lists
+                    .get(job)
+                    .map(|l| l.iter().map(|t| t.id.clone()).collect())
+                    .unwrap_or_default();
+                assert_eq!(got, want, "{job} open_only={open_only}");
+            }
+        }
+        assert!(s.job_task_summary(None).unwrap().lists.is_empty());
     }

@@ -366,7 +366,15 @@ fn hosted_lease_attach_without_external_url_exposes_only_builtin_source_and_medi
     );
     crate::platform::agenticos_external::attach(&mut opts).unwrap();
     crate::platform::agenticos_external::attach(&mut opts).unwrap();
-    assert_eq!(opts.platforms.len(), 1);
+    assert_eq!(
+        opts.platforms
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["account-images", "agenticos_external"]
+            .into_iter()
+            .collect()
+    );
     let adapter = opts
         .platforms
         .get("agenticos_external")
@@ -553,4 +561,206 @@ fn pinned_directory_is_not_replaced_by_later_path_substitution() {
         metadata.pin("agenticos", "http://api.internal"),
         Some("agenticos-manifest@1/publish_post@2")
     );
+}
+
+/// CAD-1416 / AOS-230 independent acceptance (author: cad1393-devin-haiku-acceptance).
+/// Exercises the REAL metadata parse guard and the bounded file reader. The
+/// expected tuple literals come from the ticket contract, not from the
+/// implementation constants. Constructs no proof by hand and adds no test-only
+/// constructor. Writes only to a tempdir, never /etc, never env.
+#[test]
+fn cad1416_business_documents_admission_is_exact_tuple_only() {
+    const PROVIDER: &str = "business_documents";
+    const ORIGIN: &str = "http://api.internal";
+    const PIN: &str = "business-documents@1";
+    const TRANSPORT: &str = "hosted-business-documents@1";
+
+    let entry = |provider: &str, origin: &str, pin: &str, transport: serde_json::Value| {
+        serde_json::json!({"schema":1,"providers":[{
+            "provider": provider,
+            "origin": origin,
+            "manifest_pin": pin,
+            "transport": transport
+        }]})
+    };
+    let exact = || entry(PROVIDER, ORIGIN, PIN, serde_json::json!(TRANSPORT));
+    let bytes = |value: &serde_json::Value| serde_json::to_vec(value).unwrap();
+
+    // Positive: the exact tuple parses and yields the document proof only.
+    // No lease, SMTP or media authority is granted by it.
+    let metadata = DeploymentMetadata::parse(&bytes(&exact()))
+        .expect("exact business-documents tuple must parse");
+    assert_eq!(metadata.pin(PROVIDER, ORIGIN), Some(PIN));
+    assert!(
+        metadata.hosted_business_documents().is_some(),
+        "exact tuple must admit the document door"
+    );
+    assert!(
+        metadata.hosted_media().is_none(),
+        "documents grant no media"
+    );
+    assert!(metadata.hosted_smtp().is_none(), "documents grant no SMTP");
+
+    // Positive, real loader path: the same tuple read through the bounded
+    // file reader (owner = effective uid, tempdir only, no /etc write).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let file = dir.path().join("provider-deployments.json");
+    std::fs::write(&file, bytes(&exact())).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let loaded = read_fixture(dir.path(), "provider-deployments.json", uid)
+        .unwrap()
+        .expect("exact tuple file must load");
+    assert!(loaded.hosted_business_documents().is_some());
+
+    // Negative: mutate EACH tuple field, one at a time, to a wrong value.
+    // Every mutation must be refused by the real parse guard.
+    let mutations: Vec<(&str, serde_json::Value)> = vec![
+        ("provider", serde_json::json!("agenticos")),
+        ("provider", serde_json::json!("smtp")),
+        ("provider", serde_json::json!("business_documents_v2")),
+        ("provider", serde_json::json!("Business_Documents")),
+        ("provider", serde_json::json!("")),
+        ("origin", serde_json::json!("https://api.internal")),
+        ("origin", serde_json::json!("http://company.internal")),
+        ("origin", serde_json::json!("http://API.internal")),
+        ("origin", serde_json::json!("http://api.internal:80")),
+        ("origin", serde_json::json!("http://api.internal/")),
+        ("manifest_pin", serde_json::json!("business-documents@2")),
+        ("manifest_pin", serde_json::json!("business-documents@1 ")),
+        (
+            "manifest_pin",
+            serde_json::json!("business-documents@1/extra"),
+        ),
+        ("manifest_pin", serde_json::json!("business-documents")),
+        ("manifest_pin", serde_json::json!("")),
+        (
+            "manifest_pin",
+            serde_json::json!(crate::platform::agenticos_external::MANIFEST_PIN),
+        ),
+        ("manifest_pin", serde_json::json!("smtp-internal-relay@2")),
+        (
+            "transport",
+            serde_json::json!("hosted-business-documents@2"),
+        ),
+        (
+            "transport",
+            serde_json::json!("HOSTED-BUSINESS-DOCUMENTS@1"),
+        ),
+        ("transport", serde_json::json!("hosted-business-documents")),
+        ("transport", serde_json::json!("hosted-media-lease@1")),
+        ("transport", serde_json::json!("hosted-smtp-relay@1")),
+        ("transport", serde_json::json!("")),
+        ("transport", serde_json::Value::Null),
+        ("transport", serde_json::json!(true)),
+    ];
+    for (field, value) in &mutations {
+        let mut invalid = exact();
+        invalid["providers"][0][*field] = value.clone();
+        assert!(
+            DeploymentMetadata::parse(&bytes(&invalid)).is_err(),
+            "mutated business-documents field `{field}` = {value} was accepted"
+        );
+    }
+
+    // Negative: an unknown lifecycle field on the entry is refused (no second
+    // lease may ride on the document tuple).
+    let mut with_lease = exact();
+    with_lease["providers"][0]["lease"] = serde_json::json!("hosted");
+    assert!(
+        DeploymentMetadata::parse(&bytes(&with_lease)).is_err(),
+        "document tuple carrying a lease field was accepted"
+    );
+
+    // Negative: a duplicated business-documents provider entry is refused.
+    let mut duplicated = exact();
+    let first = duplicated["providers"][0].clone();
+    duplicated["providers"].as_array_mut().unwrap().push(first);
+    assert!(
+        DeploymentMetadata::parse(&bytes(&duplicated)).is_err(),
+        "duplicated business-documents entry was accepted"
+    );
+
+    // Negative, real loader path: a mutated tuple on disk is refused.
+    let mut mutated_file = exact();
+    mutated_file["providers"][0]["transport"] = serde_json::json!("hosted-business-documents@2");
+    std::fs::write(&file, bytes(&mutated_file)).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        read_fixture(dir.path(), "provider-deployments.json", uid).is_err(),
+        "mutated tuple file was accepted by the loader"
+    );
+
+    // Legitimate old tuples must still PARSE, and must grant no document
+    // authority: SMTP-only and media-only assertions are never refused here.
+    let smtp_only = entry(
+        SMTP_PROVIDER,
+        SMTP_ORIGIN,
+        SMTP_MANIFEST_PIN,
+        serde_json::json!("hosted-smtp-relay@1"),
+    );
+    let smtp = DeploymentMetadata::parse(&bytes(&smtp_only))
+        .expect("legitimate SMTP-only assertion must still parse");
+    assert!(smtp.hosted_smtp().is_some());
+    assert!(
+        smtp.hosted_business_documents().is_none(),
+        "SMTP-only assertion granted document authority"
+    );
+
+    let media = DeploymentMetadata::parse(HOSTED_MEDIA_CONFIG.as_bytes())
+        .expect("legitimate media-only assertion must still parse");
+    assert!(media.hosted_media().is_some());
+    assert!(
+        media.hosted_business_documents().is_none(),
+        "media-only assertion granted document authority"
+    );
+
+    let publisher = DeploymentMetadata::parse(CONFIG.as_bytes())
+        .expect("legitimate publisher-only metadata must still parse");
+    assert!(publisher.hosted_business_documents().is_none());
+
+    // Combined: all three distinct tuples in one file. Each proof is
+    // independent; the document proof is granted only by its own tuple.
+    let mut combined: serde_json::Value = serde_json::from_str(HOSTED_MEDIA_CONFIG).unwrap();
+    combined["providers"]
+        .as_array_mut()
+        .unwrap()
+        .push(smtp_only["providers"][0].clone());
+    combined["providers"]
+        .as_array_mut()
+        .unwrap()
+        .push(exact()["providers"][0].clone());
+    let all = DeploymentMetadata::parse(&bytes(&combined))
+        .expect("three distinct reviewed tuples must parse together");
+    assert!(all.hosted_business_documents().is_some());
+    assert!(all.hosted_media().is_some());
+    assert!(all.hosted_smtp().is_some());
+}
+
+#[test]
+fn whatsapp_door_admission_needs_the_exact_tuple() {
+    let doc = |provider: &str, origin: &str, pin: &str, transport: &str| {
+        serde_json::to_vec(&serde_json::json!({"schema":1,"providers":[
+            {"provider":provider,"origin":origin,"manifest_pin":pin,"transport":transport}]}))
+        .unwrap()
+    };
+    let exact = DeploymentMetadata::parse(&doc(
+        "whatsapp",
+        "http://api.internal",
+        "whatsapp-door@1",
+        "hosted-whatsapp-door@1",
+    ))
+    .expect("exact tuple parses");
+    assert!(exact.hosted_whatsapp().is_some());
+    assert!(exact.hosted_smtp().is_none() && exact.hosted_media().is_none());
+    for bad in [
+        ("whatsapp", "http://evil.example", "whatsapp-door@1"),
+        ("whatsapp", "http://api.internal", "whatsapp-door@2"),
+        ("other", "http://api.internal", "whatsapp-door@1"),
+    ] {
+        assert!(
+            DeploymentMetadata::parse(&doc(bad.0, bad.1, bad.2, "hosted-whatsapp-door@1")).is_err()
+        );
+    }
 }

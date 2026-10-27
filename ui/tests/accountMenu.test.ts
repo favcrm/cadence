@@ -1,9 +1,10 @@
 import type { Meta } from "../src/lib/types";
+import type * as SessionKeyModule from "../src/lib/sessionKey";
 
 declare function require(name: string): any;
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/" });
-for (const key of ["window", "document", "navigator", "HTMLElement", "Node", "Event", "KeyboardEvent", "location", "localStorage"]) {
+for (const key of ["window", "document", "navigator", "HTMLElement", "Node", "Event", "KeyboardEvent", "location", "localStorage", "sessionStorage"]) {
   Object.defineProperty(globalThis, key, { value: key === "window" ? win : win[key], configurable: true });
 }
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
@@ -26,6 +27,8 @@ const { createElement, act } = require("react");
 const { createRoot } = require("react-dom/client");
 const { default: AccountMenu } = require("../src/ui/AccountMenu") as typeof import("../src/ui/AccountMenu");
 const { default: SignIn } = require("../src/features/auth/SignIn") as typeof import("../src/features/auth/SignIn");
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const { sessionKey, setSessionKey } = require("../src/lib/sessionKey") as typeof SessionKeyModule;
 
 function assert(condition: unknown, message: string): void {
   if (!condition) throw new Error(message);
@@ -39,7 +42,7 @@ function mount(node: unknown) {
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
-  act(() => root.render(node));
+  act(() => root.render(createElement(LocaleProvider, null, node)));
   return { host, done: () => { act(() => root.unmount()); host.remove(); } };
 }
 const menu = (meta: Meta | null, extra: object = {}, onChange: () => void = () => undefined) =>
@@ -104,23 +107,21 @@ const pointerDown = (target: any) => act(() => { target.dispatchEvent(new win.Ev
   done();
 }
 
-// The sidebar row trigger: avatar, name, "role · host" with the full value in a title, an up-chevron.
+// The sidebar row trigger (CAD-1312): avatar, name and role on one compact
+// line with a title and an up-chevron — no host, which the header owns now.
 {
-  const longHost = "demo-company-with-a-very-long-name.cadencecloud.app";
-  const real = win.location.href;
-  win.happyDOM.setURL(`http://${longHost}/`);
   const { host, done } = mount(menu(signedIn, { trigger: "row", placement: "above-start" }));
   const t = trigger(host);
   assert(t.className.includes("navlink") && t.className.includes("account-row"), "row trigger uses the navlink family");
-  assert(t.textContent?.includes("Fable Chen") && t.textContent.includes(`operator · ${longHost}`), "row shows name and role · host");
-  assert(host.querySelector(`[title='operator · ${longHost}']`), "full role · host in a title");
-  assert(t.querySelector(".truncate") && t.querySelector(".rotate-180"), "host truncates and the chevron points up");
+  assert(t.textContent?.includes("Fable Chen") && t.textContent.includes("operator"), "row shows name and role");
+  assert(!t.textContent?.includes("localhost"), "row no longer repeats the host");
+  assert(host.querySelector("[title='Fable Chen · operator']"), "full name · role in a title");
+  assert(t.querySelector(".truncate") && t.querySelector(".rotate-180"), "name truncates and the chevron points up");
   assert(!t.textContent?.includes("Sign out"), "row trigger is only the trigger");
   act(() => t.click());
   const cls = panel(host).className as string;
   assert(cls.includes("bottom-full") && cls.includes("left-0") && !cls.includes("top-full"), "above-start opens above, left-aligned");
   done();
-  win.happyDOM.setURL(real);
 }
 
 // Identity and the writes line.
@@ -174,7 +175,7 @@ async function guardCases() {
     const { host, done } = mount(menu(ro));
     act(() => trigger(host).click());
     const text = panel(host).textContent as string;
-    assert(!text.includes("Sign out") && !text.includes("Writes commit"), "read-only board: no sign out, no writes line");
+    assert(text.includes("Sign out") && !text.includes("Writes commit"), "read-only boards keep session logout without enabling workspace writes");
     assert(text.includes("Fable Chen") && host.querySelector("[aria-pressed]"), "read-only board keeps identity and theme");
     done();
   }
@@ -191,11 +192,19 @@ async function guardCases() {
     const realFetch = globalThis.fetch;
     Object.defineProperty(globalThis, "fetch", { configurable: true, value: async () => { throw new Error("down"); } });
     let changed = 0;
+    setSessionKey("retained-tab-key");
+    let unavailable = 0;
+    const failed = () => { unavailable += 1; };
+    window.addEventListener("cadence:session-logout-unavailable", failed);
     const { host, done } = mount(menu(signedIn, {}, () => { changed += 1; }));
     act(() => trigger(host).click());
     const out = Array.from(panel(host).querySelectorAll("button")).find((b: any) => b.textContent === "Sign out") as HTMLButtonElement;
     await act(async () => { out.click(); });
-    assert(changed === 1, "closeSession rejects: onChange still runs once");
+    assert(changed === 0, "a failed logout cannot refresh and silently reopen the workspace");
+    assert(sessionKey() === "retained-tab-key", "unknown logout outcome retains the existing credential for verified recovery");
+    assert(unavailable === 1, "failed logout reports unavailable instead of confirmed sign-out");
+    window.removeEventListener("cadence:session-logout-unavailable", failed);
+    setSessionKey(null);
     Object.defineProperty(globalThis, "fetch", { configurable: true, value: realFetch });
     done();
   }
@@ -212,6 +221,13 @@ for (const value of [null, undefined, "true", 1]) {
   const { host, done } = mount(createElement("div", null, menu(signedOut), createElement(SignIn, { meta: signedOut, onChange: () => undefined })));
   assert(!host.querySelector("[data-account-menu]"), "no account menu when signed out");
   assert(host.querySelector("details summary")?.textContent?.includes("Sign in"), "SignIn disclosure present");
+  done();
+}
+{
+  const readonlyVisitor = { ...signedOut, read_only: true, anonymous_reads: true };
+  const { host, done } = mount(createElement(SignIn, { meta: readonlyVisitor, onChange: () => undefined }));
+  assert(host.querySelector("details summary"), "explicit anonymous read-only browsing still offers session sign-in");
+  assert(!host.textContent?.includes("Sign in to send messages"), "read-only policy is never presented as a promise that signing in enables workspace writes");
   done();
 }
 {

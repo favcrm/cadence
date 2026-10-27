@@ -3,14 +3,15 @@ import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import type { Agent, MasterState } from "../../lib/types";
 import { masterModelsOptions, pickLanded, type MasterModelsView } from "./master";
+import { useTranslate } from "../../lib/locale";
 
 /** Context chip's tooltip — the raw token counts when the provider sent them. */
-function ctxTitle(m: MasterState | null | undefined): string {
+function ctxTitle(m: MasterState | null | undefined, t: (s: string) => string): string {
   const c = m?.context;
   if (c?.tokens != null && c?.window != null) {
-    return `${c.tokens.toLocaleString()} of ${c.window.toLocaleString()} tokens of context`;
+    return `${c.tokens.toLocaleString()} ${t("of")} ${c.window.toLocaleString()} ${t("tokens of context")}`;
   }
-  return "Share of the context window in use";
+  return t("Share of the context window in use");
 }
 
 const COST_CHIP: Record<string, string> = {
@@ -73,6 +74,7 @@ export default function MasterChips({
   row?: Agent;
   readOnly: boolean;
 }) {
+  const t = useTranslate();
   const model =
     master?.model_label ?? master?.model ?? row?.model ?? row?.model_reported ?? row?.model_configured;
   const effort = master?.effort ?? row?.effort ?? row?.effort_reported;
@@ -150,7 +152,7 @@ export default function MasterChips({
             key={`m:${model}`}
             className="chip chip-in bg-ink-800 text-ink-300 chip-btn"
             title={
-              live ? "Reported by the live provider session — pick a model" : "Configured model — pick a model"
+              live ? t("Reported by the live provider session — pick a model") : t("Configured model — pick a model")
             }
             aria-expanded={open === "model"}
             disabled={disabled}
@@ -161,15 +163,15 @@ export default function MasterChips({
             <span aria-hidden> ▾</span>
           </button>
           {open === "model" && (
-            <ChipMenu label="pick a model" onClose={() => setOpen(null)}>
-              {loading && !view && <p className="px-2.5 py-1.5 text-label text-ink-500">Reading models…</p>}
+            <ChipMenu label={t("pick a model")} onClose={() => setOpen(null)}>
+              {loading && !view && <p className="px-2.5 py-1.5 text-label text-ink-500">{t("Reading models…")}</p>}
               {error && !view && (
                 <p className="px-2.5 py-1.5 text-label text-fail break-words" role="alert">
                   {error}
                 </p>
               )}
               {view && view.models.length === 0 && (
-                <p className="px-2.5 py-1.5 text-label text-ink-500">The provider lists no models.</p>
+                <p className="px-2.5 py-1.5 text-label text-ink-500">{t("The provider lists no models.")}</p>
               )}
               {view?.models.map((m) => (
                 <button
@@ -188,7 +190,7 @@ export default function MasterChips({
                     {m.cost}
                   </span>
                   {(view.model === m.id || model === m.label || model === m.id) && (
-                    <span className="text-ok shrink-0" aria-label="current">
+                    <span className="text-ok shrink-0" aria-label={t("current")}>
                       ✓
                     </span>
                   )}
@@ -204,24 +206,24 @@ export default function MasterChips({
             type="button"
             key={`e:${effort}`}
             className="chip chip-in bg-ink-800 text-ink-300 chip-btn"
-            title="Thinking effort — pick a level"
+            title={t("Thinking effort — pick a level")}
             aria-expanded={open === "effort"}
             disabled={disabled}
             onClick={() => toggle("effort")}
           >
-            {pending?.kind === "effort" ? `effort ${pending.id}…` : `effort ${effort}`}
+            {pending?.kind === "effort" ? `${t("effort")} ${pending.id}…` : `${t("effort")} ${effort}`}
             <span aria-hidden> ▾</span>
           </button>
           {open === "effort" && (
-            <ChipMenu label="pick a thinking level" onClose={() => setOpen(null)}>
-              {loading && !view && <p className="px-2.5 py-1.5 text-label text-ink-500">Reading levels…</p>}
+            <ChipMenu label={t("pick a thinking level")} onClose={() => setOpen(null)}>
+              {loading && !view && <p className="px-2.5 py-1.5 text-label text-ink-500">{t("Reading levels…")}</p>}
               {error && !view && (
                 <p className="px-2.5 py-1.5 text-label text-fail break-words" role="alert">
                   {error}
                 </p>
               )}
               {view && view.efforts.length === 0 && (
-                <p className="px-2.5 py-1.5 text-label text-ink-500">The provider lists no levels.</p>
+                <p className="px-2.5 py-1.5 text-label text-ink-500">{t("The provider lists no levels.")}</p>
               )}
               {view?.efforts.map((e) => (
                 <button
@@ -234,7 +236,7 @@ export default function MasterChips({
                 >
                   <span className="min-w-0 flex-1 truncate text-left">{e}</span>
                   {(view.effort === e || effort === e) && (
-                    <span className="text-ok shrink-0" aria-label="current">
+                    <span className="text-ok shrink-0" aria-label={t("current")}>
                       ✓
                     </span>
                   )}
@@ -250,12 +252,12 @@ export default function MasterChips({
           className={`chip chip-in ${
             pct >= 90 ? "bg-fail/15 text-fail" : pct >= 70 ? "bg-warn/10 text-warn" : "bg-ink-800 text-ink-300"
           }`}
-          title={ctxTitle(master)}
+          title={ctxTitle(master, t)}
         >
-          {Math.round(pct)}% ctx
+          {Math.round(pct)}% {t("ctx")}
         </span>
       )}
-      {pending && <span className="workdot live" aria-label="applying" />}
+      {pending && <span className="workdot live" aria-label={t("applying")} />}
       {error && view && (
         <span className="text-micro text-fail break-words" role="alert">
           {error}

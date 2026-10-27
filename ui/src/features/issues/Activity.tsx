@@ -1,7 +1,6 @@
 import { useRef, useState } from "react";
 import { type ResourceState } from "../../lib/cache";
 import { api, ApiError } from "../../lib/api";
-import { fmtTime } from "../../lib/fmt";
 import { resources } from "../../lib/resources";
 import type { IssueHistoryEntry } from "../../lib/types";
 import Button from "../../ui/Button";
@@ -9,6 +8,7 @@ import Md from "../../ui/Md";
 import { timelineRows } from "./model";
 import { type IssuePageProps as Props } from "./issuePageProps";
 import { ReadNotice } from "./issuePageShared";
+import { useLocale } from "../../lib/locale";
 
 const TONE: Record<string, string> = {
   done: "bg-ok",
@@ -38,6 +38,7 @@ export function Activity({
   onError: Props["onError"];
   onOpen: (id: string) => void;
 }) {
+  const { t, formatDate } = useLocale();
   const [comment, setComment] = useState("");
   const [preview, setPreview] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -55,7 +56,7 @@ export function Activity({
       setComment("");
       setPreview(false);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Comment could not be posted.");
+      setError(e instanceof Error ? e.message : t("Comment could not be posted."));
       onError(e, "comment");
       // Keep the draft and optimistic concurrency; the next explicit retry uses
       // a fresh revision after another writer changed the issue. Never replay it.
@@ -76,16 +77,16 @@ export function Activity({
       {rows.length === 0 && history.data !== null && !history.error ? (
         <div className="card px-4 py-8 text-center">
           <div className="text-cardtitle font-semibold text-ink-100">
-            No activity yet
+            {t("No activity yet")}
           </div>
           <p className="text-secondary text-ink-400 mt-1">
-            Comments and changes to this issue will appear here.
+            {t("Comments and changes to this issue will appear here.")}
           </p>
         </div>
       ) : rows.length > 0 ? (
         <>
           <h2 className="text-cardtitle font-semibold text-ink-100 m-0">
-            Recent activity
+            {t("Recent activity")}
           </h2>
           <ol className="grid issue-timeline">
             {rows.map((row, i) => (
@@ -100,7 +101,7 @@ export function Activity({
                   <b className="text-ink-100 font-semibold">{row.title}</b>
                   {row.at && (
                     <span className="num text-micro text-ink-500">
-                      {fmtTime(row.at)}
+                      {formatDate(row.at, { dateStyle: "medium", timeStyle: "short" })}
                     </span>
                   )}
                 </div>
@@ -120,7 +121,7 @@ export function Activity({
         <div className="card p-4 grid gap-2.5">
           <div className="flex items-baseline gap-2">
             <label className="slabel" htmlFor="issue-comment">
-              Comment
+              {t("Comment")}
             </label>
             <Button
               variant="ghost"
@@ -128,7 +129,7 @@ export function Activity({
               disabled={busy}
               onClick={() => setPreview((v) => !v)}
             >
-              {preview ? "Edit comment" : "Preview"}
+              {t(preview ? "Edit comment" : "Preview")}
             </Button>
           </div>
           {preview ? (
@@ -137,7 +138,7 @@ export function Activity({
                 <Md text={comment} onOpen={onOpen} />
               ) : (
                 <span className="text-ink-500">
-                  Write a comment to preview it.
+                  {t("Write a comment to preview it.")}
                 </span>
               )}
             </div>
@@ -149,7 +150,7 @@ export function Activity({
               rows={3}
               value={comment}
               onChange={(e) => setComment(e.target.value)}
-              placeholder="Add an update or a question…"
+              placeholder={t("Add an update or a question…")}
             />
           )}
           {error && (
@@ -164,7 +165,7 @@ export function Activity({
               disabled={!comment.trim()}
               onClick={send}
             >
-              {busy ? "Posting…" : "Post comment"}
+              {t(busy ? "Posting…" : "Post comment")}
             </Button>
           </div>
         </div>

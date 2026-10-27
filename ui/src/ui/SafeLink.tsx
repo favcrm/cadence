@@ -1,5 +1,6 @@
 import type { AnchorHTMLAttributes } from "react";
 import { defaultUrlTransform } from "react-markdown";
+import { useTranslate } from "../lib/locale";
 import { isLoopbackHref } from "./links";
 
 /**
@@ -36,6 +37,7 @@ export default function SafeLink({
    */
   encoded?: boolean;
 }) {
+  const t = useTranslate();
   let safe = href ? defaultUrlTransform(href) : "";
   if (safe && !encoded) {
     try {
@@ -52,7 +54,7 @@ export default function SafeLink({
       <span
         role={role}
         className={warnClassName ? `text-warn ${warnClassName}` : "text-warn"}
-        title="A link to this machine — not clickable on the board, so the board's session cookie is never sent to another local server. Copy it if you trust it."
+        title={t("A link to this machine — not clickable on the board, so the board's session cookie is never sent to another local server. Copy it if you trust it.")}
       >
         {children} <code className="num break-all">[{safe}]</code>
       </span>

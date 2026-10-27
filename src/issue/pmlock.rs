@@ -65,14 +65,16 @@
 //! (`--separate-git-dir`, a worktree) keeps its coordination files in
 //! the git dir `git rev-parse --git-dir` names.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::{Pm, MARKER_LOCK_FILE};
@@ -339,7 +341,12 @@ fn describe_holder(scan: &HolderScan, meta: Option<&MarkerMeta>) -> String {
     s
 }
 const FLOCK_FILE: &str = "cadence-write.flock";
-const DIRTY_FILE: &str = "cadence-write.dirty";
+/// The snapshot's file name carries its format. Builds before CAD-1190
+/// wrote a per-file list to `cadence-write.dirty`; this format (an
+/// untracked directory is one `dir/` entry) lives in `.v2` so neither
+/// side ever classifies against the other's format (CAD-1208). Never
+/// read, rewrite or delete the old name: an older binary still owns it.
+const DIRTY_FILE: &str = "cadence-write.dirty.v2";
 const TMP_PREFIX: &str = "cadence-write.tmp-";
 const WAIT: Duration = Duration::from_secs(15);
 /// A waiter parked in a blocking `flock` re-checks the lease and actor
@@ -387,7 +394,68 @@ pub struct PmLock {
     scope: Scope,
     /// When this writer took the lock, for the hold-time report.
     since: Instant,
+    /// The caller of `Pm::lock` and friends (CAD-1234): named in the
+    /// hold report and in a same-process busy refusal.
+    site: &'static Location<'static>,
+    /// Key of the process-wide holder record this guard set.
+    site_key: PathBuf,
+    /// A recovery guard (CAD-1601): it was taken over an interrupted
+    /// tracker to settle the crash. It is never a general writer's
+    /// lock, so the ordinary commit path refuses it — a recovery
+    /// commits only through its own exact-index path.
+    recovery: bool,
     _flock: Unlock,
+}
+
+/// What a crashed writer left behind, in the detail the operator
+/// recovery flow needs (CAD-1601).
+///
+/// `paths` are the paths the crash is blamed for — the only ones a
+/// recovery may select. `foreign` are protected: they pre-date the
+/// crash or cannot be attributed to it, and selecting one is refused
+/// however explicit the operator's confirmation is.
+#[derive(Debug, Clone, Default)]
+pub struct InterruptionReport {
+    pub paths: Vec<String>,
+    pub foreign: Vec<String>,
+    /// The protected paths themselves, without the `kind` prefix that
+    /// `foreign` carries for display. A recovery compares a selected
+    /// path against these, so they must be bare paths.
+    pub foreign_paths: Vec<String>,
+    pub named: Vec<String>,
+    /// Git-global hazards (`index.lock`, a merge/rebase/cherry-pick
+    /// state). A path-local recovery cannot settle them.
+    pub hazards: Vec<String>,
+    /// The scan stopped at its cap: the names are a SAMPLE, not the
+    /// complete leftover set. A recovery must not authorize a decision
+    /// from a sample (CAD-1601).
+    pub sampled: bool,
+    /// The acquisition snapshot was present and trustworthy. Without
+    /// it no path can be attributed to the crash (CAD-1601).
+    pub snapshot_known: bool,
+}
+
+/// CAD-1234: the acquiring call site of every lock this process holds,
+/// by coordination-file path. Set on acquire, cleared on drop, so a
+/// `resource_busy` raised by another thread of this process can name the
+/// holder. Diagnostic only: no decision reads it.
+static HOLDER_SITES: Mutex<BTreeMap<PathBuf, &'static Location<'static>>> =
+    Mutex::new(BTreeMap::new());
+
+fn set_holder_site(key: &Path, site: &'static Location<'static>) {
+    if let Ok(mut m) = HOLDER_SITES.lock() {
+        m.insert(key.to_path_buf(), site);
+    }
+}
+
+fn holder_site(key: &Path) -> Option<&'static Location<'static>> {
+    HOLDER_SITES.lock().ok()?.get(key).copied()
+}
+
+fn clear_holder_site(key: &Path) {
+    if let Ok(mut m) = HOLDER_SITES.lock() {
+        m.remove(key);
+    }
 }
 
 /// Repo-relative path overlap, component-wise in both directions: a
@@ -425,6 +493,16 @@ impl PmLock {
     /// by [`Pm::commit_scoped`](super::Pm::commit_scoped); the plain
     /// commit path never takes a scoped lock.
     pub(super) fn check_commit(&self, rel: &[String]) -> Result<()> {
+        if self.recovery {
+            // A recovery lock is not a writer's lock. The recovery
+            // commits only its confirmed set, through its own
+            // exact-index path; the ordinary commit path must never
+            // carry it.
+            return Err(Error::rejected(
+                "a recovery lock may not be used for an ordinary tracker commit — the \
+                 recovery commits only its confirmed set, through its own path",
+            ));
+        }
         let Scope::Paths { admitted, blocked } = &self.scope else {
             return Ok(());
         };
@@ -466,7 +544,7 @@ impl Drop for Unlock {
 /// (`held_ms`), by which process and binary (the same `pid` and `cmd`
 /// the CAD-1167 marker trailer carries) and, for a scoped write, the
 /// declared paths. `None` for a short hold.
-fn hold_line(held: Duration, scope: &Scope) -> Option<String> {
+fn hold_line(held: Duration, scope: &Scope, site: &Location<'_>) -> Option<String> {
     if held <= HOLD_REPORT {
         return None;
     }
@@ -481,12 +559,14 @@ fn hold_line(held: Duration, scope: &Scope) -> Option<String> {
     if let Scope::Paths { admitted, .. } = scope {
         line.push_str(&format!(" paths={}", admitted.join(",")));
     }
+    line.push_str(&format!(" at={}:{}", site.file(), site.line()));
     Some(line)
 }
 
 #[cfg(test)]
 thread_local! {
-    static HOLD_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    pub(crate) static HOLD_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    pub(crate) static WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
 }
 
 impl PmLock {
@@ -494,7 +574,7 @@ impl PmLock {
     /// (No `tracing` subscriber is installed in this crate, so an event
     /// would go nowhere.) Never panics: a closed stderr is ignored.
     fn report_hold(&self) {
-        let Some(line) = hold_line(self.since.elapsed(), &self.scope) else {
+        let Some(line) = hold_line(self.since.elapsed(), &self.scope, self.site) else {
             return;
         };
         #[cfg(test)]
@@ -507,6 +587,7 @@ impl PmLock {
 impl Drop for PmLock {
     fn drop(&mut self) {
         self.report_hold();
+        clear_holder_site(&self.site_key);
         // The kernel lock is released after this body, when `_flock`
         // drops, on the unarmed path as well.
         if !self.armed {
@@ -541,6 +622,10 @@ pub enum LockState {
     Interrupted {
         paths: Vec<String>,
         foreign: Vec<String>,
+        /// The Git-global hazards (`index.lock`, a merge/rebase/
+        /// cherry-pick state). They are not a path-local interruption
+        /// and no path-scoped recovery can settle them (CAD-1601).
+        hazards: Vec<String>,
     },
     /// A `.write.lock` this build did not write: an older binary may
     /// hold it, or crashed holding it. `holder` names it where the
@@ -638,8 +723,22 @@ struct Tree {
 struct Interruption {
     named: Vec<String>,
     foreign: Vec<String>,
+    /// The protected paths themselves, without the `kind` prefix that
+    /// `foreign` carries for display (CAD-1601: a recovery compares a
+    /// selected path against these).
+    foreign_paths: Vec<String>,
     paths: Vec<String>,
     global: bool,
+    /// The Git-global hazards that make the interruption unresolvable by
+    /// a path-local recovery: `index.lock`, a merge/rebase/cherry-pick
+    /// state. Kept apart from `named` so a caller can name them
+    /// exactly (CAD-1601).
+    hazards: Vec<String>,
+    /// The file scan stopped at its cap: the names are a SAMPLE.
+    sampled: bool,
+    /// The acquisition snapshot was present and trustworthy. Without
+    /// it, no path can be attributed to the crash (CAD-1601).
+    snapshot_known: bool,
 }
 
 fn open_coordination(path: &Path, create: bool) -> std::io::Result<Option<File>> {
@@ -688,7 +787,9 @@ fn create_exclusive(path: &Path, content: &str) -> std::io::Result<File> {
     Ok(f)
 }
 
-fn read_snapshot(git_dir: &Path) -> Result<HashSet<String>> {
+/// `None` when this version's snapshot does not exist (a crash by an
+/// older build, which wrote another format under another name).
+fn read_snapshot(git_dir: &Path) -> Result<Option<HashSet<String>>> {
     let path = git_dir.join(DIRTY_FILE);
     let file = match OpenOptions::new()
         .read(true)
@@ -696,34 +797,46 @@ fn read_snapshot(git_dir: &Path) -> Result<HashSet<String>> {
         .open(&path)
     {
         Ok(f) => f,
-        // No snapshot: every dirty path counts as the crashed writer's.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(io_unknown(&path, "the dirty-path snapshot", e)),
     };
     let mut buf = Vec::new();
-    file.take(16 << 20)
+    // One byte past the cap: a snapshot larger than this build reads is
+    // truncated, so its protected set is unknown and it is not trusted.
+    file.take((16 << 20) + 1)
         .read_to_end(&mut buf)
         .map_err(|e| io_unknown(&path, "the dirty-path snapshot", e))?;
-    Ok(String::from_utf8_lossy(&buf)
+    if buf.len() > (16 << 20) {
+        return Ok(None);
+    }
+    let mut names: Vec<String> = String::from_utf8_lossy(&buf)
         .split('\0')
         .filter(|p| !p.is_empty())
         .map(str::to_string)
-        .collect())
+        .collect();
+    // The tag proves THIS version wrote the file, including the staged
+    // set. An older build's snapshot has no tag, so its staged set is
+    // unknown and no provenance can be derived from it.
+    if names.first().map(String::as_str) != Some("cadence-snapshot v3") {
+        return Ok(None);
+    }
+    names.remove(0);
+    Ok(Some(names.into_iter().collect()))
 }
 
 /// When the dirty-path snapshot was written: the moment the last
 /// writer that rewrote it took the lock. `None` without a snapshot.
+/// A file older than it is treated as pre-existing — a tie is read as
+/// new, the refusing side. This only ever excludes a path from the
+/// diagnostic name list; it never authorizes a recovery action.
 fn snapshot_time(git_dir: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(git_dir.join(DIRTY_FILE))
         .and_then(|m| m.modified())
         .ok()
 }
 
-/// Files under `root/rel` (a directory that was already untracked when
-/// the snapshot was taken) modified at or after `since`: a crashed
-/// writer's output inside a foreign directory. `>=` because file times
-/// are coarse; a tie is read as new, the refusing side. Bounded, and
-/// symlinks are not followed.
+/// Files under `root/rel` modified at or after `since`. Symlinks are
+/// not followed.
 ///
 /// Returns true when the scan stopped early: the names are then only
 /// a sample, and the caller must block the whole directory.
@@ -738,14 +851,21 @@ fn files_since(
     let mut visited = 0usize;
     while let Some(dir) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(root.join(&dir)) else {
-            continue;
+            // A directory that cannot be read makes the scan incomplete.
+            return true;
         };
-        for e in rd.flatten() {
+        for e in rd {
+            let e = match e {
+                Ok(e) => e,
+                // An entry the iterator could not produce makes the scan
+                // incomplete, never silently shorter.
+                Err(_) => return true,
+            };
             visited += 1;
             if out.len() >= CAP || visited > 500_000 {
                 return true;
             }
-            let Ok(m) = e.metadata() else { continue };
+            let Ok(m) = e.metadata() else { return true };
             let name = format!("{dir}/{}", e.file_name().to_string_lossy());
             if m.is_dir() {
                 stack.push(name);
@@ -760,8 +880,16 @@ fn files_since(
 fn write_snapshot(git_dir: &Path, tree: &Tree) -> Result<()> {
     let tmp = git_dir.join(format!("{TMP_PREFIX}dirty-{}", std::process::id()));
     let path = git_dir.join(DIRTY_FILE);
-    let mut content = String::new();
+    let mut content = String::from("cadence-snapshot v3\0");
     for (_, p) in &tree.loose {
+        content.push_str(p);
+        content.push('\0');
+    }
+    // The STAGED set too (CAD-1601): a path staged when the crash took
+    // the lock is positive evidence that the crash did not stage it.
+    // Without it, a path staged before the acquisition could be blamed
+    // on the crash by a timestamp alone.
+    for p in &tree.staged {
         content.push_str(p);
         content.push('\0');
     }
@@ -786,25 +914,77 @@ fn sweep_tmp(git_dir: &Path) {
     }
 }
 
+/// True when the snapshot recorded `p`, or a directory that contains
+/// it. Git lists an untracked directory as one `dir/` entry, so its
+/// children are protected by that entry even when they are not named
+/// individually.
+fn snapshot_protects(snapshot: &HashSet<String>, p: &str) -> bool {
+    if snapshot.contains(p) {
+        return true;
+    }
+    let mut end = 0;
+    while let Some(i) = p[end..].find('/') {
+        end += i;
+        if snapshot.contains(&format!("{}/", &p[..end])) {
+            return true;
+        }
+        end += 1;
+    }
+    false
+}
+
 fn classify(
     tree: &Tree,
-    snapshot: &HashSet<String>,
+    snapshot: Option<&HashSet<String>>,
     inside: &[String],
+    ambiguous: &[String],
     whole: &[String],
+    sampled: bool,
 ) -> Option<Interruption> {
     let mut named: Vec<String> = Vec::new();
     let mut foreign: Vec<String> = Vec::new();
+    let mut foreign_paths: Vec<String> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
     for s in &tree.git_state {
         named.push(format!("git state {s}"));
     }
     for p in &tree.staged {
-        named.push(format!("staged {p}"));
-        paths.push(p.clone());
+        // Positive provenance, not a timestamp: a path already dirty
+        // when the crash took the lock is in the snapshot, so the crash
+        // did not create it. Without a snapshot (an older build's
+        // crash) nothing is proven, and the path is protected.
+        if snapshot.is_some_and(|s| !snapshot_protects(s, p)) {
+            named.push(format!("staged {p}"));
+            paths.push(p.clone());
+        } else {
+            // Staged before the crash took the lock (or with no
+            // snapshot): it blocks and is named, but no provenance
+            // proves the crash staged it, so it is protected too.
+            named.push(format!("staged {p}"));
+            foreign.push(format!("staged {p}"));
+            foreign_paths.push(p.clone());
+            paths.push(p.clone());
+        }
     }
     for (kind, p) in &tree.loose {
-        if snapshot.contains(p) {
+        if snapshot.is_none() {
+            if *kind == "untracked" {
+                // CAD-1208: present untracked paths cannot be told from
+                // leftovers, so none is blamed.
+                foreign.push(format!("{kind} {p}"));
+                foreign_paths.push(p.clone());
+            } else {
+                // A modified tracked file: it blocks, but with no
+                // snapshot nothing proves the crash modified it, so it
+                // is protected too.
+                named.push(format!("{kind} {p}"));
+                foreign.push(format!("{kind} {p}"));
+                foreign_paths.push(p.clone());
+                paths.push(p.clone());
+            }
+        } else if snapshot.is_some_and(|s| snapshot_protects(s, p)) {
             foreign.push(format!("{kind} {p}"));
+            foreign_paths.push(p.clone());
         } else if p.ends_with('/') && inside.iter().any(|f| f.starts_with(p.as_str())) {
             // Named by the files found inside it, below.
         } else {
@@ -813,7 +993,22 @@ fn classify(
         }
     }
     for p in inside {
+        if snapshot.is_some_and(|s| !snapshot_protects(s, p)) {
+            named.push(format!("untracked {p}"));
+            paths.push(p.clone());
+        } else {
+            foreign.push(format!("untracked {p}"));
+            foreign_paths.push(p.clone());
+        }
+    }
+    // Files under a directory that was ALREADY dirty when the crash
+    // took the lock: they block and they are named, but no timestamp
+    // proves the crash wrote them, so they are also protected — a
+    // recovery may not act on one.
+    for p in ambiguous {
         named.push(format!("untracked {p}"));
+        foreign.push(format!("untracked {p}"));
+        foreign_paths.push(p.clone());
         paths.push(p.clone());
     }
     // Names are a capped sample; a directory scanned in part blocks
@@ -828,7 +1023,11 @@ fn classify(
             global: !tree.git_state.is_empty(),
             named,
             foreign,
+            foreign_paths,
             paths,
+            hazards: tree.git_state.clone(),
+            sampled,
+            snapshot_known: snapshot.is_some(),
         })
     }
 }
@@ -1033,30 +1232,47 @@ impl Pm {
     /// by the write path and by `lock_state`/doctor alike. Call it only
     /// with the kernel lock held.
     fn interruption(&self, git_dir: &Path, tree: &Tree) -> Result<Option<Interruption>> {
-        let snapshot = read_snapshot(git_dir)?;
-        // An untracked directory is one `dir/` line. A new one is the
-        // crash's: name the files in it, as the per-file listing did.
-        // One already in the snapshot cannot be told apart from a crashed
-        // writer's new file inside it by the listing; files modified
-        // since the snapshot can.
+        let Some(snapshot) = read_snapshot(git_dir)? else {
+            // An older build's crash: no snapshot means no provenance,
+            // so classify protects every path it cannot prove.
+            return Ok(classify(tree, None, &[], &[], &[], false));
+        };
+        // An untracked directory is one `dir/` line. A NEW one is the
+        // crash's: every file in it is its work, so they are named and
+        // may be recovered. One already in the snapshot cannot be told
+        // apart from a crashed writer's write inside it by anything
+        // better than a coarse mtime: its files block and are named,
+        // but they are protected, and the operator settles them by
+        // hand. `whole` keeps the bound past the scan cap.
         let mut inside = Vec::new();
+        let mut ambiguous = Vec::new();
         let mut whole = Vec::new();
-        let taken = snapshot_time(git_dir);
+        let mut sampled = false;
+        let taken = snapshot_time(git_dir).unwrap_or(std::time::UNIX_EPOCH);
         for (kind, p) in &tree.loose {
             if *kind != "untracked" || !p.ends_with('/') {
                 continue;
             }
-            if !snapshot.contains(p) {
-                // A new directory is the crash's: block all of it.
-                files_since(&self.dir, p, std::time::UNIX_EPOCH, &mut inside);
-                whole.push(p.clone());
-            } else if let Some(since) = taken {
-                if files_since(&self.dir, p, since, &mut inside) {
-                    whole.push(p.clone());
+            if !snapshot_protects(&snapshot, p) {
+                if files_since(&self.dir, p, std::time::UNIX_EPOCH, &mut inside) {
+                    sampled = true;
                 }
+            } else {
+                if files_since(&self.dir, p, taken, &mut ambiguous) {
+                    sampled = true;
+                }
+                ambiguous.retain(|f| !snapshot.contains(f));
             }
+            whole.push(p.clone());
         }
-        Ok(classify(tree, &snapshot, &inside, &whole))
+        Ok(classify(
+            tree,
+            Some(&snapshot),
+            &inside,
+            &ambiguous,
+            &whole,
+            sampled,
+        ))
     }
 
     /// One acquisition attempt. `declared` (repo-relative or absolute
@@ -1070,7 +1286,13 @@ impl Pm {
     /// `queued` is a kernel lock a parked waiter already won (see
     /// [`Waiter`]): it is used as the lock taken, in place of a fresh
     /// non-blocking `flock`.
-    fn attempt(&self, declared: Option<&[PathBuf]>, queued: Option<Unlock>) -> Result<Attempt> {
+    #[track_caller]
+    fn attempt(
+        &self,
+        declared: Option<&[PathBuf]>,
+        queued: Option<Unlock>,
+        recovery: bool,
+    ) -> Result<Attempt> {
         let git_dir = self.lock_git_dir().map_err(|e| self.git_dir_error(e))?;
         let flock_path = git_dir.join(FLOCK_FILE);
         // From here every exit releases the lock explicitly.
@@ -1096,29 +1318,48 @@ impl Pm {
         // content carries a diagnostic trailer (holder pid, host,
         // version, start time, binary); liveness still comes from the
         // flock alone.
-        let tmp = git_dir.join(format!("{TMP_PREFIX}{}", std::process::id()));
-        let tmp_file = create_exclusive(&tmp, &marker_content())
-            .map_err(|e| io_unknown(&tmp, "the lock marker", e))?;
-        let tmp_ident = tmp_file
-            .metadata()
-            .map(|m| (m.dev(), m.ino()))
-            .map_err(|e| io_unknown(&tmp, "the lock marker", e))?;
-        let linked = std::fs::hard_link(&tmp, &legacy);
-        let _ = std::fs::remove_file(&tmp);
-        let (ident, reused, stale_meta) = match linked {
-            Ok(()) => (tmp_ident, false, None),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                match self.legacy_file() {
-                    // Our own marker under a flock we now hold: the writer
-                    // that left it is gone. Reuse it once the git state is
-                    // shown free of its leftovers. Its trailer, where
-                    // present, names the dead writer in a refusal.
-                    Ok(Some((MarkerClass::Ours(meta), id))) => (id, true, meta),
-                    Ok(_) => return Ok(Attempt::Legacy),
-                    Err(e) => return Err(io_unknown(&legacy, ".write.lock", e)),
+        let (ident, reused, stale_meta) = if recovery {
+            // A recovery never publishes a marker: the crash's own
+            // marker is the evidence being acted on, and replacing it
+            // would lose the exact marker the operator inspected.
+            match self.legacy_file() {
+                Ok(Some((MarkerClass::Ours(meta), id))) => (id, true, meta),
+                Ok(Some((MarkerClass::Foreign, _))) => return Err(self.busy_error(true)),
+                Ok(None) => {
+                    return Err(Error::rejected(
+                        "there is no interrupted write to recover — the tracker has no \
+                         crash marker. Recovery needs the marker a crashed writer left; \
+                         if the leftovers are real, inspect them with `git status` and \
+                         decide by hand. A retry will not help.",
+                    ))
                 }
+                Err(e) => return Err(io_unknown(&legacy, ".write.lock", e)),
             }
-            Err(e) => return Err(io_unknown(&legacy, ".write.lock", e)),
+        } else {
+            let tmp = git_dir.join(format!("{TMP_PREFIX}{}", std::process::id()));
+            let tmp_file = create_exclusive(&tmp, &marker_content())
+                .map_err(|e| io_unknown(&tmp, "the lock marker", e))?;
+            let tmp_ident = tmp_file
+                .metadata()
+                .map(|m| (m.dev(), m.ino()))
+                .map_err(|e| io_unknown(&tmp, "the lock marker", e))?;
+            let linked = std::fs::hard_link(&tmp, &legacy);
+            let _ = std::fs::remove_file(&tmp);
+            match linked {
+                Ok(()) => (tmp_ident, false, None),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    match self.legacy_file() {
+                        // Our own marker under a flock we now hold: the writer
+                        // that left it is gone. Reuse it once the git state
+                        // is shown free of its leftovers. Its trailer, where
+                        // present, names the dead writer in a refusal.
+                        Ok(Some((MarkerClass::Ours(meta), id))) => (id, true, meta),
+                        Ok(_) => return Ok(Attempt::Legacy),
+                        Err(e) => return Err(io_unknown(&legacy, ".write.lock", e)),
+                    }
+                }
+                Err(e) => return Err(io_unknown(&legacy, ".write.lock", e)),
+            }
         };
         // Declared paths as repo-relative strings, up front: a path
         // outside the tracker is a caller bug, refused like commit's.
@@ -1126,15 +1367,50 @@ impl Pm {
             declared.map(|ps| self.rel_paths(ps)).transpose()?;
         // Dropping an unarmed lock leaves the stale marker in place, so
         // a refused attempt is re-checked by the next one.
+        let site = Location::caller();
+        set_holder_site(&flock_path, site);
         let mut lock = PmLock {
             legacy,
             ident,
             armed: !reused,
             scope: Scope::Full,
             since: Instant::now(),
+            site,
+            site_key: flock_path,
+            recovery,
             _flock: file,
         };
         let tree = self.tree_state(&git_dir)?;
+        if recovery {
+            // The recovery is the one operation that may run over an
+            // interrupted tracker. It is deliberately narrow: the
+            // crash's leftovers must exist, they must be path-local,
+            // and the crash's marker and snapshot are left exactly as
+            // the dead writer left them — the marker is the evidence
+            // and the tripwire, and the snapshot is the attribution
+            // baseline. A global Git hazard is not a path-local
+            // interruption and cannot be settled here.
+            let Some(i) = self.interruption(&git_dir, &tree)? else {
+                return Err(Error::rejected(
+                    "there is no interrupted write to recover — the crashed writer's \
+                     leftovers are gone. Recovery needs the marker and the staged \
+                     work they named; if the tracker really still holds work, inspect \
+                     it with `git status` and decide by hand. A retry will not help.",
+                ));
+            };
+            if i.global {
+                return Err(Error::rejected(format!(
+                    "the tracker has a Git-global state that a path-local recovery cannot \
+                     settle: {}. Resolve the Git operation itself first (finish or abort \
+                     the merge/rebase, or clear the stale index.lock), then review \
+                     again. A retry of this recovery will not help.",
+                    i.hazards.join(", ")
+                )));
+            }
+            // The marker stays unarmed: it survives this guard, and only
+            // a later writer reuses it once the leftovers are gone.
+            return Ok(Attempt::Got(lock));
+        }
         if reused {
             if let Some(i) = self.interruption(&git_dir, &tree)? {
                 match &declared_rel {
@@ -1189,10 +1465,12 @@ impl Pm {
     /// lock. The lease and actor fences are re-checked on every turn
     /// of the wait and again once the lock is ours: a kernel lock that
     /// frees up is not authority.
+    #[track_caller]
     pub(super) fn acquire(
         &self,
         wait: Option<Duration>,
         declared: Option<&[PathBuf]>,
+        recovery: bool,
     ) -> Result<Option<PmLock>> {
         self.fence_check()?;
         let deadline = wait.map(|w| Instant::now() + w);
@@ -1200,7 +1478,7 @@ impl Pm {
         let mut waiter: Option<Waiter> = None;
         loop {
             let queued = waiter.as_mut().and_then(Waiter::take);
-            let busy = match self.attempt(declared, queued)? {
+            let busy = match self.attempt(declared, queued, recovery)? {
                 Attempt::Got(lock) => {
                     self.fence_check()?;
                     return Ok(Some(lock));
@@ -1208,6 +1486,12 @@ impl Pm {
                 Attempt::Held => false,
                 Attempt::Legacy => true,
             };
+            #[cfg(test)]
+            WAITING.with(|observer| {
+                if let Some(sender) = observer.borrow_mut().take() {
+                    let _ = sender.send(());
+                }
+            });
             match deadline {
                 None if !busy && retries < PROBE_RETRIES => {
                     retries += 1;
@@ -1280,20 +1564,50 @@ impl Pm {
         })
     }
 
+    #[track_caller]
     pub(super) fn acquire_default(&self) -> Result<PmLock> {
         self.acquire_for(WAIT)
     }
 
+    #[track_caller]
     pub(super) fn acquire_scoped_default(&self, declared: &[PathBuf]) -> Result<PmLock> {
         Ok(self
-            .acquire(Some(WAIT), Some(declared))?
+            .acquire(Some(WAIT), Some(declared), false)?
             .expect("a waiting acquire answers"))
     }
 
+    #[track_caller]
     pub(super) fn acquire_for(&self, wait: Duration) -> Result<PmLock> {
         Ok(self
-            .acquire(Some(wait), None)?
+            .acquire(Some(wait), None, false)?
             .expect("a waiting acquire answers"))
+    }
+
+    /// CAD-1601: the recovery lock — the kernel flock every other
+    /// writer takes, taken over an interrupted tracker for the one
+    /// operation that settles it.
+    ///
+    /// The admission does NOT wait: a live writer refuses the recovery
+    /// with `busy` (75) rather than being waited through. A writer
+    /// that releases without changing the bound state must not let the
+    /// recovery mutate with a confirmation made against the old state.
+    ///
+    /// It differs from an ordinary write in three deliberate ways: it
+    /// publishes no marker (the crash's own marker is the evidence
+    /// being acted on), it rewrites no dirty snapshot (the snapshot is
+    /// the attribution baseline), and the marker survives the guard
+    /// (only a verified, complete recovery settles the transaction, and
+    /// until then the tripwire must stay).
+    ///
+    /// A global Git hazard refuses it: a path-local recovery cannot
+    /// settle Git-global state. A legacy or foreign marker refuses it:
+    /// that is not this build's crash to settle.
+    #[track_caller]
+    pub fn lock_for_recovery(&self) -> Result<PmLock> {
+        match self.acquire(None, None, true)? {
+            Some(lock) => Ok(lock),
+            None => Err(self.busy_error(false)),
+        }
     }
 
     fn busy_error(&self, legacy: bool) -> Error {
@@ -1322,9 +1636,16 @@ impl Pm {
                 ),
             )
         } else {
+            // CAD-1234: when this process is the holder, name its call site.
+            let at = self
+                .lock_git_dir()
+                .ok()
+                .and_then(|d| holder_site(&d.join(FLOCK_FILE)))
+                .map(|l| format!(" at={}:{}", l.file(), l.line()))
+                .unwrap_or_default();
             Error::busy(format!(
                 "PM dir is locked by another live writer (kernel lock on \
-                 .git/cadence-write.flock); it frees when that process exits ({holder})"
+                 .git/cadence-write.flock); it frees when that process exits ({holder}{at})"
             ))
         }
     }
@@ -1434,6 +1755,7 @@ impl Pm {
                     Ok(Some(i)) => LockState::Interrupted {
                         paths: i.named,
                         foreign: i.foreign,
+                        hazards: i.hazards,
                     },
                     Err(e) => LockState::IoUnknown(e.to_string()),
                 }
@@ -1444,6 +1766,77 @@ impl Pm {
                 self.dir.join(MARKER_LOCK_FILE).display()
             )),
         }
+    }
+
+    /// CAD-1601: the interruption details, read under the coordination
+    /// lock so the answer is exactly what the write path would decide.
+    /// Read-only: it creates, rewrites and removes nothing.
+    pub fn interruption_report(&self) -> Result<InterruptionReport> {
+        let git_dir = match self.lock_git_dir() {
+            Ok(d) => d,
+            Err(GitDirError::NotRepo) => {
+                return Err(Error::internal(format!(
+                    "{} is not a git repository",
+                    self.dir.display()
+                )))
+            }
+            Err(GitDirError::Io(e)) => {
+                return Err(Error::internal(format!(
+                    "{}: {e}",
+                    self.dir.join(".git").display()
+                )))
+            }
+        };
+        let flock_path = git_dir.join(FLOCK_FILE);
+        let _probe = match open_coordination(&flock_path, false) {
+            Ok(Some(f)) => match flock(&f, libc::LOCK_EX) {
+                Ok(true) => Some(Unlock(f)),
+                Ok(false) => {
+                    return Err(self.busy_error(false));
+                }
+                Err(e) => return Err(Error::internal(format!("{}: {e}", flock_path.display()))),
+            },
+            Ok(None) => None,
+            Err(e) => return Err(Error::internal(format!("{}: {e}", flock_path.display()))),
+        };
+        let tree = self.tree_state(&git_dir)?;
+        // The marker this flow acts on must be this build's and
+        // readable: a foreign or unreadable one is a different refusal,
+        // and it must not degrade into "no start time" (CAD-1601).
+        match self.legacy_file() {
+            Ok(Some((MarkerClass::Foreign, _))) => {
+                return Err(Error::gate_coded(
+                    "legacy_write_lock",
+                    format!(
+                        "the tracker's write marker ({}) is not one this build wrote; an older \
+                         writer may be live or may have crashed holding it. This build will not \
+                         act on it, and retrying will not help: the rollout owner clears it in \
+                         a quiescent migration after every pre-flock cadence process stops",
+                        self.dir.join(MARKER_LOCK_FILE).display()
+                    ),
+                ))
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(Error::internal(format!(
+                    "the tracker's write marker could not be read ({e}); the interrupted state \
+                     is unknown, so no recovery can be authorized. Restore readable evidence, \
+                     then review again."
+                )))
+            }
+        }
+        Ok(match self.interruption(&git_dir, &tree)? {
+            Some(i) => InterruptionReport {
+                paths: i.paths,
+                foreign: i.foreign,
+                foreign_paths: i.foreign_paths,
+                named: i.named,
+                hazards: i.hazards,
+                sampled: i.sampled,
+                snapshot_known: i.snapshot_known,
+            },
+            None => InterruptionReport::default(),
+        })
     }
 
     /// A crashed writer leaves the git index and worktree mid-write.
@@ -1463,7 +1856,7 @@ impl Pm {
             String::new()
         } else {
             format!(
-                " {} foreign path(s) already present before the crash are left alone.",
+                " {} foreign path(s) already present before the crash, or not attributable to it, are left alone.",
                 i.foreign.len()
             )
         };
@@ -1525,6 +1918,9 @@ impl Drop for LegacyWrite {
 }
 
 #[cfg(test)]
+mod cad1208_acceptance;
+
+#[cfg(test)]
 mod tests {
     //! CAD-1190: blocking wait, cheap snapshot, hold-time report. The
     //! CAD-852 crash proofs stay in `lock_tests`.
@@ -1542,13 +1938,16 @@ mod tests {
         let held = pm.lock().unwrap();
         let t = Instant::now();
         std::thread::scope(|sc| {
-            sc.spawn(|| {
-                std::thread::sleep(Duration::from_millis(400));
+            let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+            WAITING.with(|observer| *observer.borrow_mut() = Some(waiting_tx));
+            sc.spawn(move || {
+                waiting_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("writer never contended");
                 drop(held);
             });
             let got = pm.lock_for(Duration::from_secs(10)).unwrap();
             let waited = t.elapsed();
-            assert!(waited >= Duration::from_millis(350), "waited {waited:?}");
             assert!(waited < Duration::from_secs(3), "waited {waited:?}");
             drop(got);
         });
@@ -1588,8 +1987,8 @@ mod tests {
             HOLD_LINES.with(|l| l.borrow().is_empty()),
             "short hold reported"
         );
-        let lock = pm.lock_for_paths(&[pm.dir.join("proj")]).unwrap();
-        std::thread::sleep(HOLD_REPORT + Duration::from_millis(100));
+        let mut lock = pm.lock_for_paths(&[pm.dir.join("proj")]).unwrap();
+        lock.since = Instant::now() - HOLD_REPORT - Duration::from_millis(100);
         drop(lock);
         let lines = HOLD_LINES.with(|l| l.borrow().clone());
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -1610,22 +2009,55 @@ mod tests {
         let (_d, pm) = tracker();
         std::fs::create_dir_all(pm.dir.join("foreign")).unwrap();
         std::fs::write(pm.dir.join("foreign/old.txt"), "mine\n").unwrap();
-        std::thread::sleep(Duration::from_millis(30));
+        std::fs::File::open(pm.dir.join("foreign/old.txt"))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(2)),
+            )
+            .unwrap();
         let mut lock = pm.lock().unwrap();
-        std::thread::sleep(Duration::from_millis(30));
         // Dying here leaves the fence file behind: a crashed writer.
         lock.armed = false;
         drop(lock);
         let clean = pm.lock().unwrap();
         // The foreign file alone is not a leftover: that lock was
         // admitted. Now the crash adds a file inside the foreign dir.
-        std::thread::sleep(Duration::from_millis(30));
         let mut clean = clean;
         clean.armed = false;
         std::fs::write(pm.dir.join("foreign/half-written.md"), "x\n").unwrap();
+        std::fs::File::open(pm.dir.join("foreign/half-written.md"))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() + Duration::from_secs(2)),
+            )
+            .unwrap();
         drop(clean);
         let err = pm.lock().unwrap_err();
         assert!(err.to_string().contains("foreign/half-written.md"), "{err}");
         assert!(!err.to_string().contains("foreign/old.txt"), "{err}");
+    }
+
+    /// CAD-1208: a crash marker plus only an older build's per-file
+    /// snapshot (`cadence-write.dirty`, a name this build never reads)
+    /// must not turn a pre-existing untracked file into a leftover, and
+    /// this build must leave the older file untouched.
+    #[test]
+    fn an_older_format_snapshot_blames_no_present_untracked_path() {
+        let (_d, pm) = tracker();
+        std::fs::create_dir_all(pm.dir.join("foreign")).unwrap();
+        std::fs::write(pm.dir.join("foreign/old.txt"), "mine\n").unwrap();
+        let mut lock = pm.lock().unwrap();
+        lock.armed = false;
+        drop(lock);
+        // What the older writer left: its own file, no `.v2`.
+        let git = pm.dir.join(".git");
+        std::fs::remove_file(git.join(DIRTY_FILE)).unwrap();
+        let old = git.join("cadence-write.dirty");
+        std::fs::write(&old, "foreign/old.txt\0").unwrap();
+        let got = pm.lock().expect("an untracked file is not blamed");
+        drop(got);
+        assert_eq!(std::fs::read(&old).unwrap(), b"foreign/old.txt\0");
     }
 }

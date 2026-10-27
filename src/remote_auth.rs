@@ -333,6 +333,200 @@ fn environment_credential(
     })
 }
 
+/// One existing device grant for a single tool lane. This is `/v1/device/code`
+/// and `/v1/device/token` with that lane as the only scope. It does not read
+/// or write the workspace `hct_` credential, and it does not call an
+/// assignment route.
+pub fn authorize_lane(
+    issuer: &str,
+    org: &str,
+    lane: &str,
+    dir: &Path,
+    no_open: bool,
+) -> Result<PathBuf> {
+    let issuer = issuer_origin(issuer)?;
+    validate_org(org)?;
+    if !matches!(lane, "provider.draft" | "publish.send") {
+        return Err(rejected("tool lane must be provider.draft or publish.send"));
+    }
+    let (status, value) = post(
+        &issuer,
+        "/v1/device/code",
+        json!({"client_label":"cadence-cli","scope":lane}),
+    )?;
+    if status == 404 {
+        return Err(Error::invalid(
+            "api_missing",
+            "this issuer has no /v1/device/code; no lane credential was saved",
+        ));
+    }
+    if status != 200 {
+        return Err(rejected("Device authorization unavailable at this issuer"));
+    }
+    let code: DeviceCode = serde_json::from_value(value)
+        .map_err(|_| rejected("Invalid device authorization response"))?;
+    validate_token(&code.device_code)?;
+    if code.expires_in == 0
+        || code.expires_in > 3600
+        || code.interval == 0
+        || code.interval > 60
+        || code.user_code.len() != 9
+        || !code
+            .user_code
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(rejected("Invalid device authorization timing or code"));
+    }
+    let browser: ureq::http::Uri = code
+        .verification_uri_complete
+        .parse()
+        .map_err(|_| rejected("Invalid verification URL"))?;
+    if browser.scheme_str() != Some("https")
+        || browser.authority().is_none_or(|a| a.as_str().contains('@'))
+        || code.verification_uri.contains(['\n', '\r'])
+    {
+        return Err(rejected("Verification URL must use HTTPS"));
+    }
+    eprintln!(
+        "Authorize {lane} for organization {org}. Open {} and enter {}",
+        code.verification_uri_complete, code.user_code
+    );
+    if !no_open {
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let mut command = std::process::Command::new(program);
+        command
+            .arg(&code.verification_uri_complete)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if !crate::reaper::status(&mut command).is_ok_and(|status| status.success()) {
+            eprintln!("Browser unavailable; use the URL above on another device.");
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(code.expires_in);
+    let mut interval = code.interval;
+    let token = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining <= Duration::from_secs(interval) {
+            return Err(rejected(
+                "Device authorization expired; start the lane grant again",
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(interval));
+        let (status, value) = post(
+            &issuer,
+            "/v1/device/token",
+            json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code","device_code":code.device_code}),
+        )?;
+        if status == 404 {
+            return Err(Error::invalid(
+                "api_missing",
+                "this issuer has no /v1/device/token; no lane credential was saved",
+            ));
+        }
+        if status == 200 {
+            let token: DeviceToken = serde_json::from_value(value)
+                .map_err(|_| rejected("Invalid credential exchange response"))?;
+            validate_token(&token.access_token)?;
+            if token.access_token.starts_with("hct_")
+                || token.token_type != "Bearer"
+                || token.expires_in == 0
+            {
+                return Err(rejected(
+                    "Device grant did not return a bearer for one lane; nothing was saved",
+                ));
+            }
+            if token.scope != lane {
+                return Err(rejected(
+                    "Device grant scope is not that single lane; nothing was saved",
+                ));
+            }
+            if !safe_workspace_id(&token.workspace_id) {
+                return Err(rejected(
+                    "Device grant did not return a workspace id; nothing was saved",
+                ));
+            }
+            // The coordinator passes its verified server workspace id, not a
+            // slug or a default selected from another saved login.
+            if org != token.workspace_id {
+                return Err(rejected(
+                    "Device grant workspace does not match the requested workspace id; nothing was saved",
+                ));
+            }
+            break token;
+        }
+        interval = next_poll_interval(status, &value, interval)?;
+    };
+    let expires_at = unix_now()?
+        .checked_add(token.expires_in)
+        .ok_or_else(|| rejected("Invalid credential expiry"))?;
+    save_lane_credential(
+        dir,
+        &issuer,
+        &token.workspace_id,
+        lane,
+        &token.access_token,
+        expires_at,
+    )
+}
+
+fn save_lane_credential(
+    dir: &Path,
+    issuer: &str,
+    org: &str,
+    lane: &str,
+    token: &str,
+    expires_at: u64,
+) -> Result<PathBuf> {
+    private_dir(dir, true)?;
+    if !safe_workspace_id(org) {
+        return Err(rejected(
+            "lane credential is stored only under the server workspace id",
+        ));
+    }
+    let folder = dir.join("lanes").join(org);
+    fs::create_dir_all(&folder)?;
+    fs::set_permissions(dir.join("lanes"), fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o700))?;
+    let path = folder.join(lane);
+    let binding = json!({
+        "issuer": issuer,
+        "organization_id": org,
+        "lane": lane,
+        "expires_at": expires_at,
+    });
+    write_private(
+        &folder.join(format!("{lane}.binding.json")),
+        &serde_json::to_vec(&binding).map_err(|_| rejected("Cannot encode lane credential"))?,
+    )?;
+    write_private(&path, token.as_bytes())?;
+    Ok(path)
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Hosted organization ids are opaque safe ids (`hostedIdSchema`): letters,
+/// digits, `_` and `-`, at most 200 characters. `ws_ops` and `ws_example`
+/// are valid. Shape is path safety, not a `ws_<uuid>` promise.
+fn safe_workspace_id(account: &str) -> bool {
+    validate_org(account).is_ok()
+}
+
 pub fn login(issuer: &str, org: &str, dir: &Path, token_stdin: bool, no_open: bool) -> Result<i32> {
     let issuer = issuer_origin(issuer)?;
     validate_org(org)?;

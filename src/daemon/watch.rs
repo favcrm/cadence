@@ -28,6 +28,13 @@ pub(super) const NUDGE_MAX_CHARS: usize = 500;
 
 /// `stall_secs` when neither the job nor the agent sets one.
 const DEFAULT_STALL_SECS: u64 = 1800;
+/// The member-assist supervisor's stall bound — the agreed feature
+/// interval, independent of the generic PM turn's 1800 s default. A
+/// job's own `stall_secs` overrides it; a supervisor check never
+/// dispatches work.
+const ASSIST_STALL_SECS: u64 = 300;
+/// CAD-1380 R4: how often the assist-notice drain runs.
+const ASSIST_NOTICE_EVERY: Duration = Duration::from_secs(2);
 
 /// `silent_end_secs` when the agent doesn't set one: ten minutes of
 /// probe-verified idle pane on a running message before
@@ -324,6 +331,26 @@ impl Shared {
                 .max(0) as f64
     }
 
+    /// The epoch of the last activity the provider adapter itself
+    /// recorded for `alias`, when it tracks one. Unlike the message
+    /// snapshot (taken before the claim), this moves with later provider
+    /// events.
+    pub(super) fn provider_activity_epoch(&self, alias: &str) -> Option<f64> {
+        let ctl = self.lifecycle.lock().unwrap().agents.get(alias)?.clone();
+        let at = ctl.adapter.lock().unwrap().as_ref()?.activity_at()?;
+        Some(self.stall_epoch() - self.stall_now().saturating_duration_since(at).as_secs_f64())
+    }
+
+    /// Screen-observer fallback: the epoch of the last activity the stall
+    /// watch actually saw for `alias`, when it is tracking a turn.
+    pub(super) fn last_activity_epoch(&self, alias: &str) -> Option<f64> {
+        let ctl = self.lifecycle.lock().unwrap().agents.get(alias)?.clone();
+        let watch = ctl.stall.lock().unwrap();
+        watch.message.as_ref()?;
+        let silent = self.stall_now().saturating_duration_since(watch.activity);
+        Some(self.stall_epoch() - silent.as_secs_f64())
+    }
+
     /// Sample owned agents on a slow cadence until shutdown. The stall
     /// watch itself only ever emits events and notices — it never
     /// interrupts, re-dispatches or fences anything it observes. The
@@ -335,6 +362,14 @@ impl Shared {
         let mut checkup_at: Option<Instant> = None;
         let mut events_rolled: Option<Instant> = None;
         let mut reconcile_at: Option<Instant> = None;
+        let mut assist_stalls_swept: Option<Instant> = None;
+        let mut assist_notices_routed: Option<Instant> = None;
+        // CAD-1241: in-memory continuation for the bounded reconcile —
+        // the last candidate the previous tick classified. In-memory
+        // only: a daemon restart restarts the sweep at the head (the
+        // cursor is not persisted; continual restarts do not promise
+        // coverage).
+        let mut reconcile_cursor: Option<String> = None;
         while !self.closing.load(Ordering::SeqCst) {
             self.stall_tick();
             // CAD-250 N3: a nudge still queued past its TTL is stale
@@ -367,6 +402,47 @@ impl Shared {
                     }
                 };
             }
+            // CAD-1380: member-assistant job supervision — an assist-
+            // bound job whose progress watermark has not moved past its
+            // bound is marked stalled (one `assist_stall` job event,
+            // dedup'd per watermark via `assist_stall_checks`). It
+            // never dispatches; the same stall budget semantics the PM
+            // checkup uses apply.
+            if assist_stalls_swept
+                .is_none_or(|at| at.elapsed() >= screen_sample(&self.stall_sample_secs))
+            {
+                // The member-assist stall supervisor: one bounded sweep
+                // over assist-bound jobs; a moved watermark resets the
+                // check, so the same stall never re-fires. Failures log
+                // only — a supervisor error never stops the watch.
+                match self
+                    .store
+                    .assist_stall_sweep(ASSIST_STALL_SECS as i64, epoch_secs())
+                {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("assist stall watch: flagged {n} stalled job(s)"),
+                    Err(e) => eprintln!("assist stall watch: {e}"),
+                }
+                assist_stalls_swept = Some(Instant::now());
+            }
+            // CAD-1380 R4: drain pending assist-job notices. Outside any store
+            // transaction; a failure logs only and the intents stay pending.
+            if assist_notices_routed.is_none_or(|at| at.elapsed() >= ASSIST_NOTICE_EVERY) {
+                let drained = self.route_assist_job_notifications();
+                match &drained {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("assist notice watch: queued {n} notice(s)"),
+                    Err(e) => eprintln!("assist notice watch: {e}"),
+                }
+                assist_notices_routed = Some(Instant::now());
+                #[cfg(feature = "test-seam")]
+                if drained.is_ok() {
+                    super::test_events::completed(
+                        &self.state_dir,
+                        super::test_events::Event::AssistNoticesDrained,
+                    );
+                }
+            }
             // CAD-199: off unless configured; sweeps at most hourly.
             self.agent_gc_tick();
             // CAD-96: idle auto-stop — checks at most once a minute.
@@ -384,8 +460,11 @@ impl Shared {
             // CAD-754: tracker reconcile — close doing/review issues
             // whose recorded work merged, hourly, a bounded batch per
             // tick so a backlog drains over hours not one stall-watch.
+            // CAD-1241: the batch is a rotating window over the board,
+            // not the first N every tick — `reconcile_cursor` resumes
+            // strictly after the last classified candidate.
             if reconcile_at.is_none_or(|at| at.elapsed() >= RECONCILE_EVERY) {
-                self.reconcile_tick();
+                self.reconcile_tick(&mut reconcile_cursor);
                 reconcile_at = Some(Instant::now());
             }
             std::thread::sleep(self.stall_tick);
@@ -805,27 +884,22 @@ impl Shared {
                 running.as_ref().unwrap(),
                 self.stall_now().saturating_duration_since(at),
                 episode,
+                budget,
             ),
             StallTransition::Stall(episode, silent) => {
-                self.stall_fired(&agent, running.as_ref().unwrap(), silent, episode)
+                self.stall_fired(&agent, running.as_ref().unwrap(), silent, episode, budget)
             }
             StallTransition::Emit => {}
         }
     }
 
-    /// The silence budget for a running message: the job's
-    /// `stall_secs` for task-attached deliveries, else the agent's
+    /// The silence budget for a running message: the budget recorded on
+    /// this dispatch, else the job's `stall_secs`, else the agent's
     /// `stall_secs` param, else the default. `0` disables the episode
     /// (silence is still measured for the views).
     fn stall_budget(&self, agent: &Agent, message: &Message) -> u64 {
-        if let Some(task_id) = &message.task_id {
-            if let Ok(task) = self.store.task(task_id) {
-                if let Ok(job) = self.store.job(&task.job_id) {
-                    if let Some(s) = job.stall_secs {
-                        return s.max(0) as u64;
-                    }
-                }
-            }
+        if let Some(secs) = self.store.message_stall_budget(message) {
+            return secs.max(0) as u64;
         }
         agent
             .params
@@ -883,12 +957,20 @@ impl Shared {
 
     /// `turn_stalled`: record the event and send the one notice this
     /// episode gets. Fires once per silence episode.
-    fn stall_fired(&self, agent: &Agent, message: &Message, silent: Duration, episode: u64) {
+    fn stall_fired(
+        &self,
+        agent: &Agent,
+        message: &Message,
+        silent: Duration,
+        episode: u64,
+        budget: u64,
+    ) {
         let silent_secs = silent.as_secs();
         let (job_id, task_id) = self.message_scope(message);
         let mut payload = json!({
             "message": message.id,
             "silent_secs": silent_secs,
+            "budget_secs": budget,
             "last_activity": epoch_secs() - silent_secs as f64,
         });
         if let Some(t) = task_id {
@@ -902,15 +984,26 @@ impl Shared {
             task_id,
         );
         self.wake();
-        self.stall_notice(agent, message, episode, true, silent_secs);
+        self.stall_notice(agent, message, episode, true, silent_secs, budget);
     }
 
     /// `turn_resumed`: the first activity after a stall closes the
     /// episode — same event/notice pair to the same recipients.
-    fn stall_resumed(&self, agent: &Agent, message: &Message, silent: Duration, episode: u64) {
+    fn stall_resumed(
+        &self,
+        agent: &Agent,
+        message: &Message,
+        silent: Duration,
+        episode: u64,
+        budget: u64,
+    ) {
         let silent_secs = silent.as_secs();
         let (job_id, task_id) = self.message_scope(message);
-        let mut payload = json!({"message": message.id, "silent_secs": silent_secs});
+        let mut payload = json!({
+            "message": message.id,
+            "silent_secs": silent_secs,
+            "budget_secs": budget,
+        });
         if let Some(t) = task_id {
             payload["task"] = json!(t);
         }
@@ -922,7 +1015,7 @@ impl Shared {
             task_id,
         );
         self.wake();
-        self.stall_notice(agent, message, episode, false, silent_secs);
+        self.stall_notice(agent, message, episode, false, silent_secs, budget);
     }
 
     /// `approval_menu`: the sampled pane just showed an approval menu
@@ -1092,17 +1185,19 @@ impl Shared {
         episode: u64,
         stalled: bool,
         silent_secs: u64,
+        budget: u64,
     ) {
         let what = message.task_id.as_deref().unwrap_or(&message.id);
         let body = if stalled {
             let cursor = self.store.event_cursor(&agent.alias).unwrap_or(0);
             format!(
-                "Worker {} has shown no activity for {} on {} — this is \
-                 informational; nothing was changed or interrupted. \
+                "Worker {} has shown no activity for {} (stall budget {}) on {} — \
+                 this is informational; nothing was changed or interrupted. \
                  Look with: `cadence agent capture {}`, \
                  `cadence agent probe {}`, `cadence events {} --after {}`.",
                 agent.alias,
                 fmt_duration(silent_secs),
+                fmt_duration(budget),
                 what,
                 agent.alias,
                 agent.alias,
@@ -1111,11 +1206,13 @@ impl Shared {
             )
         } else {
             format!(
-                "Worker {} is active again on {} after {} of silence — \
-                 the earlier stall notice is resolved; nothing was changed.",
+                "Worker {} is active again on {} after {} of silence \
+                 (stall budget {}) — the earlier stall notice is resolved; \
+                 nothing was changed.",
                 agent.alias,
                 what,
-                fmt_duration(silent_secs)
+                fmt_duration(silent_secs),
+                fmt_duration(budget)
             )
         };
         let kind = if stalled { "stalled" } else { "resumed" };

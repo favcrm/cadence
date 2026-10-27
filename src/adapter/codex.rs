@@ -47,24 +47,37 @@ fn agent_mcp_config(agent: &Agent, log_path: &Path) -> Result<Value> {
         ))
     })?;
     let binary = std::env::current_exe()?;
+    // The managed client's allowlist is built from the same reviewed
+    // inventory the MCP server lists, so a generated platform tool cannot be
+    // discoverable but undispatchable (or vice versa). Managed Codex runs
+    // with approvalPolicy=never, so every reviewed tool is approved here;
+    // the server still returns only the static five plus direct-callable
+    // adapter tools.
+    let generated = crate::mcp_agent::generated_tool_names(
+        crate::platform::inventory()
+            .iter()
+            .map(|row| (row.platform.as_str(), row.tool.as_str(), row.direct)),
+    );
+    let mut enabled: Vec<String> = crate::mcp_agent::static_tool_names()
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    let mut approvals = serde_json::Map::new();
+    for name in crate::mcp_agent::static_tool_names() {
+        approvals.insert((*name).to_string(), json!({"approval_mode": "approve"}));
+    }
+    for (name, _, _) in &generated {
+        enabled.push(name.clone());
+        approvals.insert(name.clone(), json!({"approval_mode": "approve"}));
+    }
     Ok(json!({
         "command": binary,
         "args": ["--state-dir", state_dir, "mcp-agent"],
         "env": {"CADENCE_ALIAS": agent.alias, "CADENCE_STATE_DIR": state_dir},
         "startup_timeout_sec": 10,
-        // Managed Codex runs with approvalPolicy=never. Without these
-        // per-tool approvals, it lists the MCP tools but rejects every
-        // model-initiated call before the daemon can apply its own scope.
-        // Keep future tools undiscoverable and subject to a prompt, which
-        // the unattended worker cannot grant.
-        "enabled_tools": ["self", "wiki_search", "wiki_read", "issue_show"],
+        "enabled_tools": enabled,
         "default_tools_approval_mode": "prompt",
-        "tools": {
-            "self": {"approval_mode": "approve"},
-            "wiki_search": {"approval_mode": "approve"},
-            "wiki_read": {"approval_mode": "approve"},
-            "issue_show": {"approval_mode": "approve"},
-        },
+        "tools": approvals,
     }))
 }
 
@@ -90,9 +103,15 @@ fn check_agent_mcp(transport: &Transport, thread_id: &str, alias: &str) -> Resul
         })?;
         if let Some(server) = servers.iter().find(|server| server["name"] == "cadence") {
             if server["runtimeStatus"] != "connected"
-                || !["self", "wiki_search", "wiki_read", "issue_show"]
-                    .iter()
-                    .all(|name| server["tools"].get(*name).is_some())
+                || ![
+                    "self",
+                    "wiki_search",
+                    "wiki_read",
+                    "issue_show",
+                    "app_run_artifact",
+                ]
+                .iter()
+                .all(|name| server["tools"].get(*name).is_some())
             {
                 return Err(Error::provider(format!(
                     "Codex Cadence MCP readiness failed: status {}, tools {}",
@@ -172,7 +191,12 @@ fn verified_steering_runtime(reply: &Value) -> bool {
     reply
         .get("userAgent")
         .and_then(Value::as_str)
-        .is_some_and(|agent| agent.split_whitespace().next() == Some("cadence-agent/0.160.0"))
+        .is_some_and(|agent| {
+            matches!(
+                agent.split_whitespace().next(),
+                Some("cadence-agent/0.160.0" | "cadence-agent/0.161.0")
+            )
+        })
 }
 
 const ENV_SCRUB: &[&str] = &[
@@ -1087,9 +1111,17 @@ impl ProviderAdapter for CodexAdapter {
                 instructions.push_str("\n\n");
             }
             instructions.push_str(
-                "Use the cadence MCP tools for Cadence identity, wiki search/read, and issue reads. \
-                 The command sandbox cannot reach Cadence's RPC socket. Your final answer is the \
-                 managed turn result; do not call cadence message result from a shell.",
+                "Use the cadence MCP tools for Cadence identity, wiki search/read, issue reads, \
+                 and an assigned app dependency artifact. wiki_search is lexical AND over at most \
+                 12 tokens: send scoped keywords (vendor, operation or field, exact version or \
+                 identifier) in the collection the question is authorized for, at most 3 variants \
+                 and 20 merged candidates per question, then wiki_read at most 8 sources and cite \
+                 path and revision. Stop and state the evidence limit when nothing authoritative \
+                 is found. The command sandbox cannot reach Cadence's RPC socket. For an app \
+                 dependency, call self and then app_run_artifact with the kickoff artifact_id and \
+                 that turn's id and turn_id; do not pass an alias or fetch it from a shell. Your \
+                 final answer is the managed turn result; do not call cadence message result from \
+                 a shell.",
             );
             params["developerInstructions"] = json!(instructions);
             if let Some(thread) = &agent.thread_id {
@@ -1371,7 +1403,7 @@ impl ProviderAdapter for CodexAdapter {
         client_message_id: &str,
     ) -> Result<SteerOutcome> {
         if !self.native_turn_steering() {
-            return Err(Error::rejected("Codex runtime has no verified exact-turn input capability (validated server: 0.160.0)"));
+            return Err(Error::rejected("Codex runtime has no verified exact-turn input capability (validated servers: 0.160.0, 0.161.0)"));
         }
         steer_shared(
             &self.shared,
@@ -1411,13 +1443,18 @@ mod tests {
 
     #[test]
     fn steering_requires_the_verified_initialize_version() {
-        assert!(verified_steering_runtime(
-            &json!({"userAgent": "cadence-agent/0.160.0 (Linux; x86_64)"})
-        ));
+        for version in ["0.160.0", "0.161.0"] {
+            assert!(verified_steering_runtime(
+                &json!({"userAgent": format!("cadence-agent/{version} (Linux; x86_64)")})
+            ));
+        }
         for reply in [
             json!({}),
             json!({"userAgent": "cadence-agent/0.159.0"}),
             json!({"userAgent": "cadence-agent/0.160.0-dev"}),
+            json!({"userAgent": "cadence-agent/0.161.0-dev"}),
+            json!({"userAgent": "cadence-agent/0.161.1"}),
+            json!({"userAgent": "cadence-agent/0.162.0"}),
             json!({"serverInfo": {"version": "0.160.0"}}),
         ] {
             assert!(!verified_steering_runtime(&reply), "{reply}");

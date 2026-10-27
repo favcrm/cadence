@@ -4,7 +4,8 @@ import type { AppNav } from "../features/app-shell/appNav";
 import type { Route, Screen } from "../lib/router";
 import type { IssueCard, Project } from "../lib/types";
 import { Logo } from "./Logo";
-import { NavList, ProjectList } from "./NavList";
+import { NavList, ProjectsSection } from "./NavList";
+import { useLocale } from "../lib/locale";
 
 interface Props {
   screen: Screen;
@@ -30,11 +31,16 @@ interface Props {
    *  menu (CAD-784): sections arrive as data with real hrefs — the
    *  sidebar never invents entries from the bare route. */
   appMenu?: AppNav | null;
+  /** Pending To do items, for the Home row's badge. */
+  homeCount?: number;
+  /** A hosted tenant does not serve the wiki; do not advertise it there. */
+  hosted?: boolean;
 }
 
-export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, accountOpen = false, appMenu = null }: Props) {
+export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, accountOpen = false, appMenu = null, homeCount = 0, hosted = false }: Props) {
+  const { t } = useLocale();
   return (
-    <aside data-account-open={accountOpen || undefined} className={`hidden lg:flex sticky top-0 ${accountOpen ? "z-[35]" : ""} h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[16px] pb-4`}>
+    <aside data-account-open={accountOpen || undefined} className={`hidden lg:flex sticky top-0 ${accountOpen ? "z-[35]" : ""} h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[16px] pb-1`}>
       {/* Only the nav scrolls: the footer's account dialog opens above its row and must not be clipped by a scroll container. */}
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="px-[7px] pb-[14px]">
@@ -45,16 +51,12 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
             </span>
           </span>
         </div>
-        <NavList screen={screen} navHref={navHref} appMenu={appMenu} />
-        <div className="slabel flex justify-between mx-[11px] mt-[18px] mb-[5px]">
-          <span>Projects</span>
-          <span className="text-[10px]">~/pm</span>
-        </div>
-        <ProjectList project={project} projectHref={projectHref} projects={projects} issues={issues} projectsError={projectsError} />
+        <NavList screen={screen} navHref={navHref} appMenu={appMenu} homeCount={homeCount} hosted={hosted} />
+        <ProjectsSection project={project} projectHref={projectHref} projects={projects} issues={issues} projectsError={projectsError} />
       </div>
-      <div data-sidebar-footer className="pt-2 border-t border-ink-700 text-label text-ink-500">
+      <div data-sidebar-footer className="pt-1 border-t border-ink-700 text-label text-ink-500">
         {signedIn === true ? account : (
-          <div className="px-2 py-1.5">{signedIn === false ? "not signed in · read only" : "…"}</div>
+          <div className="px-2 leading-9">{signedIn === false ? t("not signed in · read only") : "…"}</div>
         )}
       </div>
     </aside>

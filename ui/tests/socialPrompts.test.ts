@@ -1,5 +1,5 @@
 import { promptDefault, effectivePrompt, promptError } from "../src/features/workspace-apps/promptFields";
-import { forgetContext, initialContext, rememberContext, rememberedContext } from "../src/features/workspace-apps/contextSelection";
+import { forgetContext, initialContext, screenContext, rememberContext, rememberedContext } from "../src/features/workspace-apps/contextSelection";
 
 function equal(actual: unknown, expected: unknown, why: string) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(`${why}: ${JSON.stringify(actual)} !== ${JSON.stringify(expected)}`);
@@ -25,13 +25,23 @@ Object.defineProperty(globalThis, "window", { configurable: true, value: { sessi
   setItem: (key: string, value: string) => storage.set(key, value),
   removeItem: (key: string) => storage.delete(key),
 } } });
-equal(initialContext("install-a", ["fav-limited"]), "fav-limited", "First visit selects the only active brand so its plans are visible");
-equal(rememberedContext("install-a"), "fav-limited", "Selected context survives a page remount");
+equal(initialContext(rememberedContext("install-a"), ["fav-limited"]), "fav-limited", "First visit selects the only active brand so its plans are visible");
 equal(rememberedContext("install-b"), null, "Context selection is isolated by installation");
 rememberContext("install-a", "");
-equal(initialContext("install-a", ["fav-limited"]), "", "Explicit No brand context survives reload even when one brand exists");
+equal(initialContext(rememberedContext("install-a"), ["fav-limited"]), "", "Explicit No brand context survives reload even when one brand exists");
 rememberContext("install-a", "stale-brand");
-equal(initialContext("install-a", ["fav-limited"]), "fav-limited", "Archived selection resolves to the sole active brand");
+equal(initialContext(rememberedContext("install-a"), ["fav-limited"]), "stale-brand", "Archived selection stays stale — the binding refuses rather than broadening");
+// A private screen has no picker: exactly one active context is selected for it.
+equal(screenContext(rememberedContext("install-s"), ["only"]), "only", "A lone active context is auto-selected for a screen");
+rememberContext("install-s", "");
+equal(screenContext(rememberedContext("install-s"), ["only"]), "only", "A stale no-context choice cannot hide the lone company context");
+rememberContext("install-s", "gone");
+equal(screenContext(rememberedContext("install-s"), ["only"]), "gone", "A stale nonempty id is never auto-retargeted — the operator picks to recover");
+equal(screenContext(rememberedContext("install-z"), []), "", "Zero contexts select nothing: the app shows its own not-set-up state");
+rememberContext("install-m", "");
+equal(screenContext(rememberedContext("install-m"), ["a", "b"]), "", "Several contexts are never silently picked among");
+rememberContext("install-m", "b");
+equal(screenContext(rememberedContext("install-m"), ["a", "b"]), "b", "Several contexts keep the remembered explicit choice");
 forgetContext("install-a");
 equal(rememberedContext("install-a"), null, "Access loss forgets the private context selection");
 Object.defineProperty(globalThis, "window", { configurable: true, value: { sessionStorage: { getItem() { throw Error("blocked"); }, setItem() { throw Error("blocked"); }, removeItem() { throw Error("blocked"); } } } });

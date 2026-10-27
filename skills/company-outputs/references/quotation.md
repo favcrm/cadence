@@ -1,0 +1,13 @@
+# Quotation and invoice authoring and reconciliation
+
+Use this reference only when the output contains prices, options or financial totals. An authoring pack is not a quotation: it has no line items, no calculation rules and no PDF export, and `document create`, `template sample` and `document export` reject it. A native quotation or invoice uses the financial template path in [cadence.md](cadence.md): DOCX source, confirmed calculation, operator approval of that exact version, then a retained draft.
+
+Record each selected item's quantity and unit, price, currency, dated approved source, scope and option status. Establish tax basis, discount order, precision, rounding and validity or terms from the governing commercial inputs. Keep internal costs separate from customer prices; disclose unit rates where required by the client form.
+
+Use existing trusted calculation facilities (for example the native draft model where its contract fits, or an inspected Decimal calculation for a local agreed draft). Do not create a calculator just to populate this skill. Record exact inputs, formulas, rounding and results. Independently reconcile the output using a different calculation representation or reviewer; repeating the same calculator result is insufficient.
+
+Exclude unselected alternatives from the selected base and label them separately. A required item without a price blocks the full total and final-price or issuable claim; show any known-items total explicitly as partial. Never drop the mandatory item or price it at zero to pass validation. Native line items have no selection or missing-price flag: filter options explicitly and do not misrepresent a partial native calculation as a complete quotation.
+
+Check line extensions, selected subtotal, discount, tax basis and rate and total, plus cross-document quantities and scope. A change in option selection or price returns to Stage 1; layout repairs do not. Label a draft `SUGGESTED — NOT APPROVED — HUMAN REVIEW REQUIRED`, with unresolved decisions visible. Request confirmation does not grant issuance, numbering, signing or sending authority.
+
+Presentation is separate from amounts. The presentation standard is the approved financial DOCX, not authoring-pack guidelines. Follow [document-design.md](document-design.md) to review the native export: identifiers, dates, status, payment provenance, and long-item pagination. A separately selected company reference pack may inform that review; it does not render the document or approve the financial version. Do not render the quotation or invoice as arbitrary HTML. Changing the DOCX or its spec is a financial revision and still needs the required operator approval.

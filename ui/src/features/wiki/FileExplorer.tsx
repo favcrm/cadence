@@ -1,5 +1,4 @@
 import { useId, useState } from "react";
-import { fmtBytes } from "../../lib/fmt";
 import Link from "../../ui/Link";
 import { IconCaret } from "../../ui/icons";
 import { KindIcon, LockIcon } from "./shared";
@@ -40,7 +39,6 @@ export default function FileExplorer({ label, rows, current, folder, emptyText, 
             </Link>
             {row.own && <span className="kicker">you</span>}
             {row.locked && <LockIcon />}
-            <span className="wk-tmeta num">{row.size != null ? fmtBytes(row.size) : row.childCount ?? ""}</span>
           </div>
         ))}
       </nav>

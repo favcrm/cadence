@@ -1,5 +1,5 @@
 //! Operator controls for app bindings and reviewed artifact release.
-use super::{err_response, json_response, read_body, HttpResp};
+use super::{app_screens, err_response, json_response, operator, read_body, HttpResp, ServeOpts};
 use crate::{client, error::Error};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -18,7 +18,15 @@ pub(super) enum Route<'a> {
     Effects(Option<&'a str>, Option<&'a str>),
     Effect(&'a str),
     Decide(&'a str),
+    PublishNow(&'a str),
+    /// CAD-1328: the board's one-tap confirm of a screen-staged social draft effect.
+    ConfirmPublish(&'a str),
+    Schedule(&'a str),
+    Reschedule(&'a str),
+    Cancel(&'a str),
     Resolve(&'a str),
+    /// CAD-1290: `destinations` is an operator read; `connect-link` and `use` are POST writes.
+    Publishing(&'a str, &'a str),
 }
 fn segment(id: &str) -> bool {
     !id.is_empty()
@@ -36,6 +44,11 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         return match parts.as_slice() {
             [id] if segment(id) => Some(Route::Effect(id)),
             [id, "decide"] if segment(id) => Some(Route::Decide(id)),
+            [id, "publish-now"] if segment(id) => Some(Route::PublishNow(id)),
+            [id, "confirm-publish"] if segment(id) => Some(Route::ConfirmPublish(id)),
+            [id, "schedule"] if segment(id) => Some(Route::Schedule(id)),
+            [id, "reschedule"] if segment(id) => Some(Route::Reschedule(id)),
+            [id, "cancel"] if segment(id) => Some(Route::Cancel(id)),
             [id, "resolve"] if segment(id) => Some(Route::Resolve(id)),
             _ => None,
         };
@@ -62,6 +75,11 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         [install, "bindings", binding, "revoke"] if segment(install) && segment(binding) => {
             Some(Route::Revoke(install, binding))
         }
+        [install, "publishing", verb @ ("connect-link" | "destinations" | "use")]
+            if segment(install) =>
+        {
+            Some(Route::Publishing(install, verb))
+        }
         [install, "effects"] if segment(install) => Some(Route::Effects(Some(install), None)),
         [install, "contexts", context, "bindings"] if segment(install) && segment(context) => {
             Some(Route::Bindings(install, Some(context)))
@@ -86,6 +104,7 @@ impl Route<'_> {
                 | Self::Quote(..)
                 | Self::Effects(..)
                 | Self::Effect(_)
+                | Self::Publishing(_, "destinations")
         )
     }
     pub(super) fn is_write(self) -> bool {
@@ -96,7 +115,13 @@ impl Route<'_> {
                 | Self::Revoke(..)
                 | Self::Stage(_)
                 | Self::Decide(_)
+                | Self::PublishNow(_)
+                | Self::ConfirmPublish(_)
+                | Self::Schedule(_)
+                | Self::Reschedule(_)
+                | Self::Cancel(_)
                 | Self::Resolve(_)
+                | Self::Publishing(_, "connect-link" | "use")
         )
     }
 }
@@ -117,6 +142,32 @@ struct Create {
         skip_serializing_if = "Option::is_none"
     )]
     context_id: Option<String>,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectLink {
+    return_to: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UseDestination {
+    destination_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_revision: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "nonnull_context",
+        skip_serializing_if = "Option::is_none"
+    )]
+    context_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "nonnull_context",
+        skip_serializing_if = "Option::is_none"
+    )]
+    timezone: Option<String>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -148,6 +199,30 @@ enum Choice {
 struct Decision {
     digest: String,
     decision: Choice,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PublishNow {
+    digest: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Schedule {
+    digest: String,
+    due_epoch: i64,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Reschedule {
+    digest: String,
+    expected_due_epoch: i64,
+    due_epoch: i64,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Cancel {
+    digest: String,
+    expected_due_epoch: i64,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,6 +260,36 @@ pub(super) fn handle(
     route: Route<'_>,
     write: bool,
 ) -> HttpResp {
+    handle_inner(
+        request,
+        state,
+        route,
+        write,
+        operator::PublicRelay::NotPublic,
+        None,
+    )
+}
+
+/// Quote ownership is the request's native session, never this relay's PID.
+pub(super) fn handle_with_relay(
+    request: &mut Request,
+    state: &Path,
+    route: Route<'_>,
+    write: bool,
+    relay: operator::PublicRelay,
+    opts: &ServeOpts,
+) -> HttpResp {
+    handle_inner(request, state, route, write, relay, Some(opts))
+}
+
+fn handle_inner(
+    request: &mut Request,
+    state: &Path,
+    route: Route<'_>,
+    write: bool,
+    relay: operator::PublicRelay,
+    opts: Option<&ServeOpts>,
+) -> HttpResp {
     if request
         .url()
         .split_once('?')
@@ -209,6 +314,18 @@ pub(super) fn handle(
             Route::Quote(install, context, slot) => {
                 let mut params = scoped(Some(install), context);
                 params["slot"] = json!(slot);
+                let Some((token, key, origin)) =
+                    opts.and_then(|opts| app_screens::request_credentials(request, opts))
+                else {
+                    return Err(err_response(
+                        403,
+                        "capability quote needs a live operator session",
+                    ));
+                };
+                params["token"] = json!(token);
+                params["key"] = json!(key);
+                params["origin"] = json!(origin);
+                operator::relay_owner_proof(&mut params, relay)?;
                 ("app_binding_quote", params)
             }
             Route::Update(install, binding) => {
@@ -235,12 +352,48 @@ pub(super) fn handle(
                 params["effect_id"] = json!(effect);
                 ("app_effect_decide", params)
             }
+            Route::PublishNow(effect) => {
+                let mut params = typed::<PublishNow>(request)?;
+                params["effect_id"] = json!(effect);
+                ("app_effect_publish_now", params)
+            }
+            Route::ConfirmPublish(effect) => {
+                let mut params = typed::<PublishNow>(request)?;
+                params["effect_id"] = json!(effect);
+                ("app_effect_confirm_publish", params)
+            }
+            Route::Schedule(effect) => {
+                let mut params = typed::<Schedule>(request)?;
+                params["effect_id"] = json!(effect);
+                ("app_effect_schedule", params)
+            }
+            Route::Reschedule(effect) => {
+                let mut params = typed::<Reschedule>(request)?;
+                params["effect_id"] = json!(effect);
+                ("app_effect_reschedule", params)
+            }
+            Route::Cancel(effect) => {
+                let mut params = typed::<Cancel>(request)?;
+                params["effect_id"] = json!(effect);
+                ("app_effect_cancel", params)
+            }
             Route::Resolve(effect) => {
                 let mut params = typed::<Resolve>(request)?;
                 params["effect_id"] = json!(effect);
                 ("app_effect_resolve", params)
             }
-            Route::Bindings(_, Some(_)) => return Err(err_response(405, "method not allowed")),
+            Route::Publishing(_, "connect-link") => {
+                ("social_connect_link", typed::<ConnectLink>(request)?)
+            }
+            Route::Publishing(_, "destinations") if !write => ("social_destinations", json!({})),
+            Route::Publishing(install, "use") => {
+                let mut params = typed::<UseDestination>(request)?;
+                params["install_id"] = json!(install);
+                ("app_binding_use_destination", params)
+            }
+            Route::Publishing(..) | Route::Bindings(_, Some(_)) => {
+                return Err(err_response(405, "method not allowed"))
+            }
         })
     })();
     let (method, params) = match result {
@@ -323,6 +476,65 @@ mod tests {
         }
     }
     #[test]
+    fn publishing_routes_are_exact_and_destinations_is_the_only_read() {
+        for (path, verb) in [
+            (
+                "/api/app-installations/i/publishing/connect-link",
+                "connect-link",
+            ),
+            (
+                "/api/app-installations/i/publishing/destinations",
+                "destinations",
+            ),
+            ("/api/app-installations/i/publishing/use", "use"),
+        ] {
+            let found = route(path).expect(path);
+            assert!(matches!(found, Route::Publishing("i", v) if v == verb));
+            assert_eq!(found.is_read(), verb == "destinations", "{path}");
+            assert_eq!(found.is_write(), verb != "destinations", "{path}");
+        }
+        for path in [
+            "/api/app-installations/i/publishing",
+            "/api/app-installations/i/publishing/",
+            "/api/app-installations/i/publishing/use/extra",
+            "/api/app-installations/i/publishing/other",
+            "/api/app-installations/i/contexts/c/publishing/use",
+        ] {
+            assert!(route(path).is_none(), "admitted {path}");
+        }
+    }
+    #[test]
+    fn publishing_schemas_reject_forged_authority() {
+        assert!(serde_json::from_str::<ConnectLink>(r#"{"return_to":"https://b/x"}"#).is_ok());
+        assert!(serde_json::from_str::<ConnectLink>(
+            r#"{"return_to":"https://b/x","issuer":"https://evil"}"#
+        )
+        .is_err());
+        let ok = r#"{"destination_id":"d","request_id":"r"}"#;
+        assert!(serde_json::from_str::<UseDestination>(ok).is_ok());
+        for field in [
+            "install_id",
+            "destination_label",
+            "label",
+            "toolkit",
+            "connection_id",
+            "grant_id",
+            "operator",
+            "connection_id",
+        ] {
+            let mut body: Value = serde_json::from_str(ok).unwrap();
+            body[field] = json!("forged");
+            assert!(
+                serde_json::from_value::<UseDestination>(body).is_err(),
+                "accepted {field}"
+            );
+        }
+        assert!(serde_json::from_str::<UseDestination>(
+            r#"{"destination_id":"d","context_id":null}"#
+        )
+        .is_err());
+    }
+    #[test]
     fn release_schemas_reject_forged_authority_and_caller_content() {
         let valid = r#"{"slot":"publication","connection_id":"conn-a","request_id":"bind-a"}"#;
         assert!(serde_json::from_str::<Create>(valid).is_ok());
@@ -396,3 +608,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "app_release/cad1459_account_quote_acceptance.rs"]
+mod cad1459_account_quote_acceptance;

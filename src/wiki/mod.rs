@@ -5,7 +5,7 @@
 //! the served tracker's `wiki/` under the legacy layout):
 //!
 //! ```text
-//! global/                     operator-written shared knowledge
+//! global/                     shared knowledge (operator and members write)
 //! projects/<key>/             a project team's pages (agents write
 //!                             only their own project's)
 //! agents/<alias>/knowledge/   the agent's own pages (self-written)
@@ -17,6 +17,7 @@
 //!                             the operator administers
 //! .trash/                     `wiki rm` landings (not API-addressable)
 //! .blobs/                     content-addressed binary store
+//! .knowledge/                 collection metadata sidecars (not API-addressable)
 //! ```
 //!
 //! Text files live IN the tracker git: one commit per write with an
@@ -37,7 +38,7 @@
 //! layer additionally refuses any symlinked component.
 
 use std::collections::BTreeSet;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -49,8 +50,15 @@ use crate::error::{Error, Result};
 use crate::issue::Pm;
 
 pub mod cli;
+pub mod collection;
+pub mod correction;
+pub mod envelope;
 pub mod index;
 pub mod ingest;
+pub mod revision;
+pub mod transfer;
+pub mod transfer_client;
+pub mod upload;
 
 /// `if_rev` value meaning "the page does not exist yet" — a
 /// create-only write. Any real content rev is `fnv1a:<16 hex>`.
@@ -58,8 +66,9 @@ pub const ABSENT: &str = "none";
 
 /// Largest accepted `search` answer.
 const SEARCH_CAP: usize = 200;
-/// Largest accepted `history` answer.
-const HISTORY_CAP: usize = 50;
+/// Largest accepted `history` answer. Historical `at` resolution uses the
+/// same bound and reports unavailable past it.
+pub(crate) const HISTORY_CAP: usize = 50;
 /// Longest single path segment (bytes) — the filesystem's own cap.
 const SEG_CAP: usize = 255;
 /// Longest normalized path (bytes).
@@ -71,6 +80,10 @@ const DEPTH_CAP: usize = 32;
 const TEXT_CAP: u64 = 64 * 1024 * 1024;
 /// Largest profile view file (matches master's cap order).
 const VIEW_CAP: u64 = 1_048_576;
+/// Existing native tool line bound. A bounded read's compact JSON plus
+/// its stdout newline stays strictly under this. It is not a new cap:
+/// an unbounded `read` still returns the whole page.
+pub const NATIVE_TOOL_LINE_BOUND: usize = 50_000;
 
 /// Who the daemon derived from the connection — never a request
 /// field. `wiki_as` on an operator connection produces the same
@@ -112,6 +125,9 @@ impl Caller {
 pub enum Op {
     Read,
     Write,
+    /// `wiki rm`, and the source of `wiki mv`; uses the same namespace grant
+    /// as writing a page. Shared wiki collaboration includes moving/deleting.
+    Remove,
 }
 
 impl Op {
@@ -119,6 +135,7 @@ impl Op {
         match self {
             Op::Read => "read",
             Op::Write => "write",
+            Op::Remove => "rm",
         }
     }
 }
@@ -134,7 +151,7 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
     let no = |why: &str| -> Result<()> { Err(Error::rejected(format!("{}: {why}", verb()))) };
     // CAD-615: the operator's permission rules. Not a knowledge page,
     // not a profile write, not something the master can put.
-    if op == Op::Write && segs == ["agents", "master", "permissions.yaml"] {
+    if matches!(op, Op::Write | Op::Remove) && segs == ["agents", "master", "permissions.yaml"] {
         return no(
             "agents/master/permissions.yaml is operator-owned — only a permission decision writes it",
         );
@@ -143,25 +160,31 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
     match top {
         "" => match op {
             Op::Read => Ok(()),
-            Op::Write => no("the wiki root is not writable"),
+            Op::Write | Op::Remove => no("the wiki root is not writable"),
         },
         "global" => match op {
             Op::Read => Ok(()),
-            Op::Write => match caller {
+            Op::Write | Op::Remove => match caller {
                 Caller::Operator => Ok(()),
-                _ => no("global/ is operator-written; agents and users keep their own areas"),
+                Caller::User(_) if segs.len() > 1 => Ok(()),
+                Caller::User(_) => no("members mutate pages below global/, not the namespace root"),
+                _ => no(
+                    "global/ writes are the operator's and a board member's; agents keep their own areas",
+                ),
             },
         },
         "projects" => {
             if segs.len() == 1 {
                 return match op {
                     Op::Read => Ok(()),
-                    Op::Write => no("projects/ itself is not writable — write inside a project"),
+                    Op::Write | Op::Remove => {
+                        no("projects/ itself is not writable — write inside a project")
+                    }
                 };
             }
             match op {
                 Op::Read => Ok(()),
-                Op::Write => match caller {
+                Op::Write | Op::Remove => match caller {
                     Caller::Operator => Ok(()),
                     Caller::Agent { alias, project } if project.as_deref() == Some(segs[1]) => {
                         let _ = alias;
@@ -172,9 +195,12 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
                          project: {})",
                         project
                             .as_deref()
-                            .unwrap_or("none — cwd is no project repo")
+                            .unwrap_or("none — no running task, and cwd is no project repo")
                     )),
-                    _ => no("only the operator and the project's own agents write projects/"),
+                    Caller::User(_) => Ok(()),
+                    Caller::Public => no(
+                        "only the operator, a board member, and the project's own agents write projects/",
+                    ),
                 },
             }
         }
@@ -183,26 +209,26 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
                 // `agents/` and `agents/<a>/` — listing folders.
                 return match op {
                     Op::Read => Ok(()),
-                    Op::Write => no("agent folders are layout — write under knowledge/ instead"),
+                    Op::Write | Op::Remove => no("agent folders are layout — write under knowledge/ instead"),
                 };
             }
             let area = segs[2];
             match area {
                 "profile" => match op {
                     Op::Read => Ok(()),
-                    Op::Write => no(
+                    Op::Write | Op::Remove => no(
                         "profiles are a read-only view of the agent's files — write \
                          through `cadence master edit` (agent_file_write)",
                     ),
                 },
                 "memory" => match op {
                     Op::Read => Ok(()),
-                    Op::Write => no("memory/ is a read-only view of the memory store — propose \
+                    Op::Write | Op::Remove => no("memory/ is a read-only view of the memory store — propose \
                          through `cadence memory`"),
                 },
                 "knowledge" => match op {
                     Op::Read => Ok(()),
-                    Op::Write => match caller {
+                    Op::Write | Op::Remove => match caller {
                         Caller::Operator => Ok(()),
                         Caller::Agent { alias, .. } if alias == segs[1] => Ok(()),
                         Caller::Agent { .. } => no("an agent writes only its own knowledge/"),
@@ -219,7 +245,7 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
                 return match (op, caller) {
                     (Op::Read, Caller::Operator | Caller::User(_)) => Ok(()),
                     (Op::Read, _) => no("users/ is private — only a member sees own entry"),
-                    (Op::Write, _) => no("users/ itself is not writable"),
+                    (Op::Write | Op::Remove, _) => no("users/ itself is not writable"),
                 };
             }
             match caller {
@@ -296,6 +322,18 @@ pub fn normalize(path: &str) -> Result<String> {
     Ok(segs.join("/"))
 }
 
+/// A directory address as the board prints it (`global/`). One trailing
+/// slash names that directory. File writes and uploads stay on
+/// [`normalize`], so `a/b/` is still refused there. `//` still refuses.
+pub fn normalize_dir(path: &str) -> Result<String> {
+    let trimmed = if !path.starts_with('/') && path.len() > 1 && path.ends_with('/') {
+        &path[..path.len() - 1]
+    } else {
+        path
+    };
+    normalize(trimmed)
+}
+
 /// The vault this tracker serves — [`crate::home::vault_for`]:
 /// `<home>/vault` under `CADENCE_HOME`, the served tracker's `wiki/`
 /// under the legacy layout (the daemon's tracker is instance-bound,
@@ -318,7 +356,7 @@ fn trash_dir(vault: &Path) -> PathBuf {
 /// `git log`. `None` when the vault is not inside the tracker
 /// (CAD-584's `<home>/vault`; commits then refuse — the tracker git
 /// cannot see them — and the caller reports why).
-fn git_rel(pm: &Pm, abs: &Path) -> Result<PathBuf> {
+pub(crate) fn git_rel(pm: &Pm, abs: &Path) -> Result<PathBuf> {
     abs.strip_prefix(&pm.dir).map(PathBuf::from).map_err(|_| {
         Error::internal(format!(
             "wiki path {} is outside tracker {}",
@@ -332,7 +370,7 @@ fn git_rel(pm: &Pm, abs: &Path) -> Result<PathBuf> {
 /// components — every existing ancestor and the leaf itself must be
 /// a real directory entry. A missing leaf is fine (a write creates
 /// it); a missing ancestor is fine (mkdir -p at write).
-fn resolve(vault: &Path, norm: &str) -> Result<PathBuf> {
+pub(crate) fn resolve(vault: &Path, norm: &str) -> Result<PathBuf> {
     if vault
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink())
@@ -401,7 +439,7 @@ fn rev_of(abs: &Path) -> Result<String> {
     }
 }
 
-fn rev_bytes(bytes: &[u8]) -> String {
+pub(crate) fn rev_bytes(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
         h ^= u64::from(*b);
@@ -565,7 +603,7 @@ fn blob_meta(pointer: &Path) -> Result<Value> {
 /// caller-visible names: blob pointer files appear once, under the
 /// logical name.
 pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
-    let norm = normalize(path)?;
+    let norm = normalize_dir(path)?;
     let segs: Vec<&str> = if norm.is_empty() {
         Vec::new()
     } else {
@@ -763,9 +801,24 @@ pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
         Ok(_) => Err(Error::rejected(format!(
             "wiki ls '{norm}' refused: not a directory"
         ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::rejected(format!(
-            "wiki ls '{norm}': no such directory"
-        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // The root always advertises these folders, and `users/`
+            // already lists as empty when the directory has not been
+            // created. `global/` and `projects/` must do the same, or
+            // an assistant copies the root listing, gets a tool error,
+            // and cannot tell "nothing filed here" from a broken wiki.
+            // `agents/<alias>` likewise always advertises `knowledge`,
+            // which may not exist in the vault yet.
+            if matches!(
+                segs[..],
+                ["global"] | ["projects"] | ["agents", _, "knowledge"]
+            ) {
+                return Ok(json!({"path": norm, "entries": []}));
+            }
+            Err(Error::rejected(format!(
+                "wiki ls '{norm}': no such directory"
+            )))
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -833,10 +886,446 @@ fn profile_file(pm: &Pm, alias: &str, name: &str) -> Result<PathBuf> {
     }
 }
 
+/// One bounded read of an original text page. `offset` is a UTF-8 byte
+/// index. `bytes` is the maximum length; `None` returns the longest
+/// slice from `offset` that fits [`NATIVE_TOOL_LINE_BOUND`]. `rev`,
+/// when set, must be the original page revision — a mismatch returns
+/// no body.
+pub struct BodyRange<'a> {
+    pub offset: u64,
+    pub bytes: Option<u64>,
+    pub rev: Option<&'a str>,
+}
+
+struct TextPage {
+    path: String,
+    text: String,
+    /// Revision of the whole original, not of the returned slice.
+    rev: String,
+}
+
+enum Opened {
+    Dir { path: String },
+    Blob(Value),
+    Text(TextPage),
+}
+
 /// `wiki read` — text as `{kind:"text",text,rev}`; a blob page as
 /// `{kind:"blob",sha256,size,mime,name,rev}` (rev = the pointer's);
 /// a directory as `{kind:"dir"}`. View paths read their source.
+/// The text `rev` is the original body's revision.
 pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
+    match open_page(pm, caller, path)? {
+        Opened::Dir { path } => Ok(json!({"path": path, "kind": "dir"})),
+        Opened::Blob(value) => Ok(value),
+        Opened::Text(page) => Ok(json!({
+            "path": page.path,
+            "kind": "text",
+            "text": page.text,
+            "rev": page.rev,
+            "sha256": transfer::sha256_bytes(page.text.as_bytes()),
+        })),
+    }
+}
+
+/// Read `path` at `at`. This does not call [`read`] when the selector
+/// misses: an unknown, ambiguous, or non-commit name is an error.
+pub fn read_revision(
+    pm: &Pm,
+    caller: &Caller,
+    path: &str,
+    at: &str,
+    range: Option<BodyRange<'_>>,
+) -> Result<Value> {
+    let pinned = revision::pin(pm, caller, path, at)?;
+    let mut value = match (&pinned.body, range) {
+        (revision::Body::Dir, Some(_)) => {
+            return Err(Error::rejected(format!(
+                "wiki revision '{path}' refused: a range read needs a text page or blob"
+            )))
+        }
+        (revision::Body::Dir, None) => json!({
+            "path": pinned.path,
+            "kind": "dir",
+            "rev": Value::Null,
+            "sha256": Value::Null,
+        }),
+        (revision::Body::Text(text), None) => json!({
+            "path": pinned.path,
+            "kind": "text",
+            "text": text,
+            "rev": pinned.rev,
+            "sha256": pinned.sha256,
+        }),
+        (revision::Body::Text(text), Some(range)) => {
+            let page = TextPage {
+                path: pinned.path.clone(),
+                text: text.clone(),
+                rev: pinned.rev.clone(),
+            };
+            text_read_range(page, range)?
+        }
+        (revision::Body::Blob(blob), None) => json!({
+            "path": pinned.path,
+            "kind": "blob",
+            "sha256": blob.sha256,
+            "size": blob.size,
+            "mime": blob.mime,
+            "name": blob.name,
+            "rev": pinned.rev,
+        }),
+        (revision::Body::Blob(blob), Some(range)) => {
+            let meta = json!({
+                "path": pinned.path,
+                "kind": "blob",
+                "sha256": blob.sha256,
+                "size": blob.size,
+                "mime": blob.mime,
+                "name": blob.name,
+                "rev": pinned.rev,
+            });
+            blob_read_range(pm, &meta, range)?
+        }
+    };
+    if let Some(obj) = value.as_object_mut() {
+        // `rev` is the selector the caller asked for. A commit name is not
+        // rewritten to the live FNV token, or the board cannot tell this
+        // page from latest. `git` stays the resolved commit.
+        obj.insert("rev".to_string(), json!(at));
+        obj.insert("at".to_string(), json!(at));
+        obj.insert("git".to_string(), json!(pinned.git));
+        if obj.get("sha256").is_none() {
+            obj.insert("sha256".to_string(), json!(pinned.sha256));
+        }
+    }
+    if value.get("range").is_some() || value.get("data_base64").is_some() {
+        let len = serde_json::to_vec(&value)
+            .map(|body| body.len())
+            .unwrap_or(usize::MAX);
+        if len.saturating_add(1) >= NATIVE_TOOL_LINE_BOUND {
+            return Err(Error::rejected(
+                "wiki revision refused: the historical range does not fit the native tool line bound",
+            ));
+        }
+    }
+    Ok(value)
+}
+
+/// Bounded original-body read. Same authorization and sandbox path as
+/// [`read`]. A text page adds `text` and `range`. A blob page keeps the
+/// pointer metadata and adds `range` plus `data_base64` (standard
+/// base64 of that byte slice). A directory is refused. The reply does
+/// not copy the page or raise [`TEXT_CAP`].
+pub fn read_range(pm: &Pm, caller: &Caller, path: &str, range: BodyRange<'_>) -> Result<Value> {
+    match open_page(pm, caller, path)? {
+        Opened::Text(page) => text_read_range(page, range),
+        Opened::Blob(meta) => blob_read_range(pm, &meta, range),
+        Opened::Dir { .. } => Err(Error::rejected(format!(
+            "wiki read '{path}' refused: a range read needs a text page or blob — \
+             directories have no original text range"
+        ))),
+    }
+}
+
+fn text_read_range(page: TextPage, range: BodyRange<'_>) -> Result<Value> {
+    if let Some(want) = range.rev {
+        if want != page.rev {
+            return Err(Error::rejected(format!(
+                "wiki read '{}' refused: revision '{want}' is not the original \
+                 revision '{}' — ranges are not combined across revisions",
+                page.path, page.rev
+            )));
+        }
+    }
+    let total = page.text.len() as u64;
+    if range.offset > total {
+        return Err(Error::rejected(format!(
+            "wiki read '{}' refused: offset {} is past the original {total} bytes",
+            page.path, range.offset
+        )));
+    }
+    let start = range.offset as usize;
+    if !page.text.is_char_boundary(start) {
+        return Err(Error::rejected(format!(
+            "wiki read '{}' refused: offset {start} is inside a UTF-8 character",
+            page.path
+        )));
+    }
+    let end = match range.bytes {
+        Some(n) => explicit_end(&page, start, n)?,
+        None => fitting_end(&page, start)?,
+    };
+    Ok(ranged_value(&page, start, end))
+}
+
+struct BlobView<'a> {
+    path: &'a str,
+    sha256: &'a str,
+    size: u64,
+    mime: &'a str,
+    name: &'a str,
+    rev: &'a str,
+}
+
+fn blob_str<'a>(meta: &'a Value, key: &str, path: &str) -> Result<&'a str> {
+    meta.get(key).and_then(Value::as_str).ok_or_else(|| {
+        Error::rejected(format!(
+            "wiki read '{path}' refused: blob pointer '{key}' is not a string"
+        ))
+    })
+}
+
+fn blob_view(meta: &Value) -> Result<BlobView<'_>> {
+    let path = blob_str(meta, "path", "")?;
+    let sha256 = blob_str(meta, "sha256", path)?;
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(Error::rejected(format!(
+            "wiki read '{path}' refused: blob pointer sha256 is not 64 lowercase hex digits"
+        )));
+    }
+    let size = meta.get("size").and_then(Value::as_u64).ok_or_else(|| {
+        Error::rejected(format!(
+            "wiki read '{path}' refused: blob pointer size is not a non-negative integer"
+        ))
+    })?;
+    Ok(BlobView {
+        mime: blob_str(meta, "mime", path)?,
+        name: blob_str(meta, "name", path)?,
+        rev: blob_str(meta, "rev", path)?,
+        path,
+        sha256,
+        size,
+    })
+}
+
+fn blob_ranged_value(view: &BlobView<'_>, start: u64, end: u64, data_base64: String) -> Value {
+    let mut value = json!({
+        "path": view.path,
+        "kind": "blob",
+        "sha256": view.sha256,
+        "size": view.size,
+        "mime": view.mime,
+        "name": view.name,
+        "rev": view.rev,
+        "range": {"start": start, "end": end, "total": view.size},
+    });
+    value["data_base64"] = Value::String(data_base64);
+    value
+}
+
+fn b64_len(n: usize) -> usize {
+    n.div_ceil(3).saturating_mul(4)
+}
+
+fn decimal_len_u64(n: u64) -> usize {
+    if n == 0 {
+        1
+    } else {
+        (n.ilog10() as usize) + 1
+    }
+}
+
+/// Compact length of [`blob_ranged_value`]. Base64 uses the standard
+/// alphabet, which needs no JSON escape. Key order matches `json!`.
+fn blob_line_len(view: &BlobView<'_>, start: u64, end: u64) -> usize {
+    let Ok(n) = usize::try_from(end.saturating_sub(start)) else {
+        return usize::MAX;
+    };
+    if n >= NATIVE_TOOL_LINE_BOUND {
+        return usize::MAX;
+    }
+    "{\"data_base64\":".len()
+        + 2
+        + b64_len(n)
+        + ",\"kind\":\"blob\",\"mime\":".len()
+        + json_string_len(view.mime)
+        + ",\"name\":".len()
+        + json_string_len(view.name)
+        + ",\"path\":".len()
+        + json_string_len(view.path)
+        + ",\"range\":{\"end\":".len()
+        + decimal_len_u64(end)
+        + ",\"start\":".len()
+        + decimal_len_u64(start)
+        + ",\"total\":".len()
+        + decimal_len_u64(view.size)
+        + "},\"rev\":".len()
+        + json_string_len(view.rev)
+        + ",\"sha256\":".len()
+        + json_string_len(view.sha256)
+        + ",\"size\":".len()
+        + decimal_len_u64(view.size)
+        + "}".len()
+}
+
+fn blob_fits(view: &BlobView<'_>, start: u64, end: u64) -> bool {
+    if end < start {
+        return false;
+    }
+    let len = blob_line_len(view, start, end);
+    len.checked_add(1)
+        .is_some_and(|n| n < NATIVE_TOOL_LINE_BOUND)
+}
+
+fn blob_end(view: &BlobView<'_>, start: u64, bytes: Option<u64>) -> Result<u64> {
+    let total = view.size;
+    let end = match bytes {
+        Some(n) => start.saturating_add(n).min(total),
+        None => {
+            let mut lo = start;
+            let mut hi = total;
+            let mut best = None;
+            while lo <= hi {
+                let mid = lo + (hi - lo) / 2;
+                if blob_fits(view, start, mid) {
+                    best = Some(mid);
+                    if mid == total {
+                        break;
+                    }
+                    lo = mid + 1;
+                } else if mid == start {
+                    break;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            best.ok_or_else(|| oversize(view.path))?
+        }
+    };
+    if !blob_fits(view, start, end) {
+        return Err(oversize(view.path));
+    }
+    Ok(end)
+}
+
+fn blob_read_range(pm: &Pm, meta: &Value, range: BodyRange<'_>) -> Result<Value> {
+    let view = blob_view(meta)?;
+    if let Some(want) = range.rev {
+        if want != view.rev {
+            return Err(Error::rejected(format!(
+                "wiki read '{}' refused: revision '{want}' is not the original \
+                 revision '{}' — ranges are not combined across revisions",
+                view.path, view.rev
+            )));
+        }
+    }
+    if range.offset > view.size {
+        return Err(Error::rejected(format!(
+            "wiki read '{}' refused: offset {} is past the original {} bytes",
+            view.path, range.offset, view.size
+        )));
+    }
+    let start = range.offset;
+    let end = blob_end(&view, start, range.bytes)?;
+    let bytes = read_blob_slice(pm, &view, start, end)?;
+    use base64::Engine;
+    let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let value = blob_ranged_value(&view, start, end, data_base64);
+    debug_assert_eq!(
+        blob_line_len(&view, start, end),
+        serde_json::to_string(&value)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX)
+    );
+    Ok(value)
+}
+
+/// Read only the requested slice of an immutable, content-addressed object.
+/// Upload verifies its digest; remote cat verifies the assembled bytes once.
+fn read_blob_slice(pm: &Pm, view: &BlobView<'_>, start: u64, end: u64) -> Result<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let vault = vault_dir(pm)?;
+    let blobs = blobs_dir(&vault);
+    match blobs.symlink_metadata() {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(Error::rejected(format!(
+                "wiki read '{}' refused: blob store is not a real directory",
+                view.path
+            )))
+        }
+        Err(e) => {
+            return Err(Error::rejected(format!(
+                "wiki read '{}' refused: blob store is unavailable: {e}",
+                view.path
+            )))
+        }
+    }
+    let object = blobs.join(view.sha256);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&object)
+        .map_err(|_| {
+            Error::rejected(format!(
+                "wiki read '{}' refused: blob object is not a regular file",
+                view.path
+            ))
+        })?;
+    let meta = file.metadata().map_err(|e| {
+        Error::rejected(format!(
+            "wiki read '{}' refused: blob object is unreadable: {e}",
+            view.path
+        ))
+    })?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err(Error::rejected(format!(
+            "wiki read '{}' refused: blob object is not a regular file",
+            view.path
+        )));
+    }
+    if meta.len() != view.size {
+        return Err(Error::rejected(format!(
+            "wiki read '{}' refused: blob object is {} bytes, pointer size is {}",
+            view.path,
+            meta.len(),
+            view.size
+        )));
+    }
+    let len = usize::try_from(end - start).unwrap_or(usize::MAX);
+    let mut buf = vec![0u8; len];
+    if len > 0 {
+        file.seek(SeekFrom::Start(start)).map_err(|e| {
+            Error::rejected(format!(
+                "wiki read '{}' refused: blob object is unreadable: {e}",
+                view.path
+            ))
+        })?;
+        file.read_exact(&mut buf).map_err(|_| {
+            Error::rejected(format!(
+                "wiki read '{}' refused: blob object is shorter than its pointer",
+                view.path
+            ))
+        })?;
+    }
+    Ok(buf)
+}
+
+/// Optional JSON integer field. Absent is `None`. A float, a negative,
+/// or a non-number is refused — never coerced.
+pub fn json_u64(params: &Value, key: &str) -> Result<Option<u64>> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "wiki read refused: '{key}' must be a non-negative integer"
+                ))
+            })
+            .map(Some),
+        Some(_) => Err(Error::rejected(format!(
+            "wiki read refused: '{key}' must be a non-negative integer"
+        ))),
+    }
+}
+
+fn open_page(pm: &Pm, caller: &Caller, path: &str) -> Result<Opened> {
     let norm = normalize(path)?;
     if norm.is_empty() {
         return Err(Error::rejected(
@@ -863,12 +1352,7 @@ pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
             }
             let text = std::fs::read_to_string(&file)
                 .map_err(|e| Error::rejected(format!("wiki read '{norm}': {e}")))?;
-            return Ok(json!({
-                "path": norm,
-                "kind": "text",
-                "text": text,
-                "rev": rev_of(&file)?,
-            }));
+            return Ok(text_page(norm, text));
         }
         View::Memory { alias } => {
             if segs.len() != 5 {
@@ -880,19 +1364,14 @@ pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
             let file = memory_file(pm, &alias, segs[3], segs[4])?;
             let text = std::fs::read_to_string(&file)
                 .map_err(|e| Error::rejected(format!("wiki read '{norm}': {e}")))?;
-            return Ok(json!({
-                "path": norm,
-                "kind": "text",
-                "text": text,
-                "rev": rev_of(&file)?,
-            }));
+            return Ok(text_page(norm, text));
         }
         View::Real => {}
     }
 
     let abs = resolve(&vault, &norm)?;
     match abs.symlink_metadata() {
-        Ok(m) if m.is_dir() => Ok(json!({"path": norm, "kind": "dir"})),
+        Ok(m) if m.is_dir() => Ok(Opened::Dir { path: norm }),
         Ok(m) if m.is_file() => {
             if m.len() > TEXT_CAP {
                 return Err(Error::rejected(format!(
@@ -904,12 +1383,7 @@ pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
                     "wiki read '{norm}' refused: not UTF-8 text (is it a blob?)"
                 ))
             })?;
-            Ok(json!({
-                "path": norm,
-                "kind": "text",
-                "text": text,
-                "rev": rev_of(&abs)?,
-            }))
+            Ok(text_page(norm, text))
         }
         Ok(_) => Err(Error::rejected(format!("wiki read '{norm}': not a file"))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -918,7 +1392,7 @@ pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
             match pointer.symlink_metadata() {
                 Ok(m) if m.is_file() && !m.file_type().is_symlink() => {
                     let meta = blob_meta(&pointer)?;
-                    Ok(json!({
+                    Ok(Opened::Blob(json!({
                         "path": norm,
                         "kind": "blob",
                         "sha256": meta.get("sha256").cloned().unwrap_or(Value::Null),
@@ -926,13 +1400,150 @@ pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
                         "mime": meta.get("mime").cloned().unwrap_or(Value::Null),
                         "name": meta.get("name").cloned().unwrap_or(Value::Null),
                         "rev": rev_of(&pointer)?,
-                    }))
+                    })))
                 }
                 _ => Err(Error::rejected(format!("wiki read '{norm}': no such file"))),
             }
         }
         Err(e) => Err(e.into()),
     }
+}
+
+fn text_page(path: String, text: String) -> Opened {
+    let rev = rev_bytes(text.as_bytes());
+    Opened::Text(TextPage { path, text, rev })
+}
+
+fn ranged_value(page: &TextPage, start: usize, end: usize) -> Value {
+    json!({
+        "path": page.path,
+        "kind": "text",
+        "rev": page.rev,
+        "text": &page.text[start..end],
+        "range": {
+            "start": start,
+            "end": end,
+            "total": page.text.len(),
+        }
+    })
+}
+
+fn oversize(path: &str) -> Error {
+    Error::rejected(format!(
+        "wiki read '{path}' refused: the range exceeds the \
+         {NATIVE_TOOL_LINE_BOUND}-byte native tool line bound"
+    ))
+}
+
+/// Bytes one UTF-8 byte contributes inside a `serde_json` string.
+/// Controls use the short escapes (`\n`, `\r`, `\t`, `\b`, `\f`); every
+/// other byte below 0x20 is `\u00XX`.
+fn json_byte_escape_len(b: u8) -> usize {
+    match b {
+        b'"' | b'\\' | 0x08 | b'\t' | b'\n' | 0x0c | b'\r' => 2,
+        0x00..=0x1F => 6,
+        _ => 1,
+    }
+}
+
+fn json_string_len(s: &str) -> usize {
+    let mut n = 2;
+    for &b in s.as_bytes() {
+        n += json_byte_escape_len(b);
+    }
+    n
+}
+
+fn decimal_len(n: usize) -> usize {
+    if n == 0 {
+        1
+    } else {
+        (n.ilog10() as usize) + 1
+    }
+}
+
+/// Compact length of [`ranged_value`], matching `serde_json::to_string`.
+/// `json!` maps sort keys, so the line is
+/// `{"kind":"text","path":…,"range":{"end":…,"start":…,"total":…},"rev":…,"text":…}`.
+fn compact_line_len(page: &TextPage, start: usize, end: usize) -> usize {
+    "{\"kind\":\"text\",\"path\":".len()
+        + json_string_len(&page.path)
+        + ",\"range\":{\"end\":".len()
+        + decimal_len(end)
+        + ",\"start\":".len()
+        + decimal_len(start)
+        + ",\"total\":".len()
+        + decimal_len(page.text.len())
+        + "},\"rev\":".len()
+        + json_string_len(&page.rev)
+        + ",\"text\":".len()
+        + json_string_len(&page.text[start..end])
+        + "}".len()
+}
+
+fn line_fits(len: usize) -> bool {
+    len + 1 < NATIVE_TOOL_LINE_BOUND
+}
+
+fn explicit_end(page: &TextPage, start: usize, bytes: u64) -> Result<usize> {
+    let mut end = start.saturating_add(usize::try_from(bytes).unwrap_or(usize::MAX));
+    if end > page.text.len() {
+        end = page.text.len();
+    }
+    if !page.text.is_char_boundary(end) {
+        return Err(Error::rejected(format!(
+            "wiki read '{}' refused: range end {end} is inside a UTF-8 character",
+            page.path
+        )));
+    }
+    // The JSON line is longer than the raw slice, so a slice that already
+    // meets the line bound cannot fit.
+    if end - start + 1 >= NATIVE_TOOL_LINE_BOUND || !line_fits(compact_line_len(page, start, end)) {
+        return Err(oversize(&page.path));
+    }
+    Ok(end)
+}
+
+/// Largest char-boundary end at or after `start` whose compact JSON
+/// line fits the native tool bound. One forward pass; escaped length
+/// is accumulated, not recomputed, and no JSON string is built.
+fn fitting_end(page: &TextPage, start: usize) -> Result<usize> {
+    let text = page.text.as_str();
+    let limit = start
+        .saturating_add(NATIVE_TOOL_LINE_BOUND.saturating_sub(1))
+        .min(text.len());
+    let base = compact_line_len(page, start, start) - decimal_len(start);
+    let mut end = start;
+    let mut escaped = 0usize;
+    let mut i = start;
+    while i < limit {
+        let ch_end = i + text[i..].chars().next().map(char::len_utf8).unwrap_or(0);
+        if ch_end > limit {
+            break;
+        }
+        let mut add = 0;
+        for &b in &text.as_bytes()[i..ch_end] {
+            add += json_byte_escape_len(b);
+        }
+        let line = base + decimal_len(ch_end) + escaped + add;
+        if !line_fits(line) {
+            break;
+        }
+        escaped += add;
+        end = ch_end;
+        i = ch_end;
+    }
+    let line = base + decimal_len(end) + escaped;
+    if !line_fits(line) {
+        return Err(oversize(&page.path));
+    }
+    debug_assert_eq!(
+        line,
+        serde_json::to_string(&ranged_value(page, start, end))
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX)
+    );
+    Ok(end)
 }
 
 /// `wiki write` — a text page. `if_rev` is the optimistic-concurrency
@@ -1114,7 +1725,7 @@ pub fn mv(pm: &Pm, caller: &Caller, from: &str, to: &str) -> Result<Value> {
             return Err(Error::rejected("wiki mv refused: source is the root"));
         }
         let segs_from: Vec<&str> = norm_from.split('/').collect();
-        allowed(caller, Op::Write, &segs_from)?;
+        allowed(caller, Op::Remove, &segs_from)?;
         if classify(&segs_from) != View::Real {
             unreachable!()
         }
@@ -1220,7 +1831,7 @@ pub fn rm(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
         return Err(Error::rejected("wiki rm '' refused: the root stays"));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Write, &segs)?;
+    allowed(caller, Op::Remove, &segs)?;
     if classify(&segs) != View::Real {
         unreachable!()
     }
@@ -1287,7 +1898,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 /// A first-block MIME guess: magic bytes for the kinds the board
 /// streams; UTF-8 → text/plain; else octet-stream. The pointer file
 /// records it; the board's serve rules decide inline vs attachment.
-fn sniff_mime(head: &[u8]) -> &'static str {
+pub(crate) fn sniff_mime(head: &[u8]) -> &'static str {
     match head {
         [0x89, b'P', b'N', b'G', ..] => "image/png",
         [0xff, 0xd8, 0xff, ..] => "image/jpeg",
@@ -1319,9 +1930,21 @@ fn sniff_mime(head: &[u8]) -> &'static str {
 /// `wiki_put_blob` — verify a staged upload and land it: re-hash the
 /// tmp file (the caller's `sha256` is advisory and must match),
 /// enforce the cap BEFORE the move, sniff MIME, secret-scan text
-/// content, then move the file into `.blobs/<sha256>` and commit the
+/// content, then publish the bytes at `.blobs/<sha256>` and commit the
 /// `<path>.blob` pointer. The tracker write lock is taken only for
 /// the pointer's commit — never while the upload is being checked.
+///
+/// Blob bytes are immutable and content-addressed: publication stages
+/// the verified tmp to a unique sibling on the blob filesystem and
+/// then links it in under the hash name without ever overwriting or
+/// partially exposing an existing object. A name collision is not
+/// trusted — the existing entry must prove it is a confined regular
+/// file holding exactly the upload's sha256 bytes before the upload
+/// dedupes to it, else the call refuses. Once staged this call NEVER
+/// unlinks `.blobs/<sha256>` — another pointer, history or a trash
+/// entry may already reference it; a refusal removes only this call's
+/// own unpublished staging file (unreferenced blob cleanup is GC
+/// work, not this op's).
 ///
 /// `tmp` must sit under `<state_dir>/wiki-uploads/` — a tmp anywhere
 /// else is refused (the daemon never renames an arbitrary caller
@@ -1397,29 +2020,47 @@ pub fn put_blob(
         }
     }
 
-    // Land the blob — hard-link the verified tmp into `.blobs/<sha>`
-    // (atomic, never overwrites), copy+unlink only across mounts
-    // (state dir and vault may differ). `created` marks whether THIS
-    // call made the blob: a refusal below removes only what it
-    // created — a deduped `.blobs/<sha>` is another page's content.
+    // Land the blob: stage the verified tmp to a unique sibling name
+    // on `.blobs/`'s own filesystem, then publish it at `<sha256>`
+    // atomically and without overwrite. A partial copy never appears
+    // under the hash name; an already-published object is verified
+    // byte-for-byte before it is deduped — never blindly trusted by
+    // name and never rewritten. From here on this call may only
+    // unlink `stage` — `dest` is shared content another pointer may
+    // already reference.
     ensure_layout(pm)?;
-    let dest = blobs_dir(&vault).join(&actual);
-    let mut created = false;
-    match std::fs::hard_link(&tmp_canon, &dest) {
+    let blobs = blobs_dir(&vault);
+    let stage = blobs.join(format!(
+        ".{actual}.upload-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    match std::fs::hard_link(&tmp_canon, &stage) {
         Ok(()) => {
-            created = true;
             let _ = std::fs::remove_file(&tmp_canon);
         }
-        Err(_) if dest.exists() => {
-            // Already addressable — deduped.
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            // The state dir and the vault may live on different
+            // mounts: copy bytes onto the blob filesystem. A failed
+            // copy leaves the tmp in place and `dest` untouched — but
+            // the private `stage` it may have partially written is
+            // ours alone, so it is always removed.
+            if let Err(e) = std::fs::copy(&tmp_canon, &stage) {
+                let _ = std::fs::remove_file(&stage);
+                return Err(e.into());
+            }
             let _ = std::fs::remove_file(&tmp_canon);
         }
-        Err(_) => {
-            std::fs::copy(&tmp_canon, &dest)?;
-            created = true;
-            let _ = std::fs::remove_file(&tmp_canon);
-        }
+        Err(e) => return Err(e.into()),
     }
+    let dest = blobs.join(&actual);
+    publish_blob(&stage, &dest)?;
+    // CAD-911 test seam — compiled ONLY into test builds (`cfg(test)`;
+    // shipped daemons and libraries never carry it): a unit test that
+    // armed this thread parks HERE — blob published, pointer lock not
+    // yet taken, no lock held while parked — to interleave a second
+    // real put_blob deterministically. Unarmed it is a no-op.
+    #[cfg(test)]
+    test_pause::at_publish_seam();
 
     // The pointer file — a normal tracker text write under the lock.
     let pointer = vault.join(format!("{norm}.blob"));
@@ -1431,17 +2072,14 @@ pub fn put_blob(
     let cur = rev_of(&pointer)?;
     if let Some(want) = if_rev {
         if want != cur {
-            if created {
-                let _ = std::fs::remove_file(&dest);
-            }
+            // Conflict. `publish_blob` already consumed this call's
+            // private stage; `dest` is shared custody another pointer
+            // may already reference — nothing here unlinks it.
             return Ok(json!({"conflict": "if_rev", "current_rev": cur, "path": norm}));
         }
     }
     if resolve(&vault, &norm)?.symlink_metadata().is_ok() {
         // A text page already sits at the logical name.
-        if created {
-            let _ = std::fs::remove_file(&dest);
-        }
         return Err(Error::rejected(format!(
             "wiki put_blob '{norm}' refused: a text page exists there — rm it first"
         )));
@@ -1484,6 +2122,244 @@ pub fn put_blob(
         out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
     }
     Ok(out)
+}
+
+/// Publish staged blob bytes at `dest` — atomically, never over an
+/// existing object, and never trusting a name as proof of content.
+/// `stage` already sits on `dest`'s filesystem (it is the unique
+/// sibling name `put_blob` staged onto `.blobs/` itself), so a
+/// `hard_link` lands the complete bytes at the hash name in one
+/// atomic, no-overwrite step.
+///
+/// `AlreadyExists` is a collision claim, not a byte proof: the
+/// existing entry is verified to be a confined regular non-symlink
+/// file whose size and sha256 match the hash name exactly before the
+/// upload is deduped to it. Foreign bytes, a directory, a symlink or
+/// any size/hash mismatch refuse the upload — the existing object is
+/// left byte-for-byte as found, no pointer is committed by this
+/// caller, and only the private `stage` name is removed. A
+/// `hard_link` that lands means `stage`'s own verified bytes now own
+/// the name, so no re-check is needed.
+///
+/// Publication is link-based on purpose: it makes the no-overwrite
+/// guarantee atomic on every filesystem the vault deploys to here
+/// (Linux ext4/tmpfs). A filesystem without hard links cannot promise
+/// that, so `publish_blob` surfaces the link error rather than
+/// falling back to a copy or a rename that could overwrite or expose
+/// partial bytes at the hash name.
+fn publish_blob(stage: &Path, dest: &Path) -> Result<()> {
+    match std::fs::hard_link(stage, dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            verify_existing_blob(stage, dest)?;
+        }
+        Err(e) => {
+            // The staging name is ours alone — never leave it behind.
+            let _ = std::fs::remove_file(stage);
+            return Err(e.into());
+        }
+    }
+    // Whether the link landed or the existing object verified as the
+    // same content, our private staging name is ours alone — removed.
+    let _ = std::fs::remove_file(stage);
+    Ok(())
+}
+
+/// The `AlreadyExists` half of [`publish_blob`]: prove the entry at
+/// `dest` is a regular, non-symlink file holding exactly `stage`'s
+/// bytes — the same sha256 the name claims — before the upload
+/// dedupes to it. Any other shape or content refuses. `stage` is
+/// removed on EVERY failing exit — refusal or I/O error alike —
+/// because it is this call's private name, while `dest` is shared
+/// custody a failure must never touch.
+fn verify_existing_blob(stage: &Path, dest: &Path) -> Result<()> {
+    let out = verify_existing_blob_inner(stage, dest);
+    if out.is_err() {
+        let _ = std::fs::remove_file(stage);
+    }
+    out
+}
+
+fn verify_existing_blob_inner(stage: &Path, dest: &Path) -> Result<()> {
+    let refuse = |why: String| -> Error {
+        Error::rejected(format!(
+            "wiki put_blob refused: existing blob object {} {why}",
+            dest.display()
+        ))
+    };
+    let meta = dest.symlink_metadata()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(refuse("is not a regular file".to_string()));
+    }
+    let staged = stage.symlink_metadata()?;
+    if meta.len() != staged.len() {
+        return Err(refuse(format!(
+            "holds {} bytes, expected {}",
+            meta.len(),
+            staged.len()
+        )));
+    }
+    if sha256_file(dest)? != sha256_file(stage)? {
+        return Err(refuse("content does not match its hash name".to_string()));
+    }
+    Ok(())
+}
+
+/// CAD-911 — TEST-ONLY synchronization hooks for the `put_blob`
+/// unit tests; `cfg(test)` keeps every byte of this module out of
+/// shipped binaries and libraries. It is NOT a production hook: no
+/// request field, env var or exported API reaches it — a test arms a
+/// per-thread, one-shot [`Pause`] on the thread that will run
+/// `put_blob`, and only that thread's next call parks, exactly once,
+/// at the publication↔pointer-lock seam. Ordering is established by
+/// channels, never sleeps; every wait is bounded so a panicking
+/// controller cannot strand a thread.
+#[cfg(test)]
+mod test_pause {
+    use std::cell::RefCell;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::time::Duration;
+
+    /// The half parked inside `put_blob` — installed by [`arm`] on the
+    /// calling thread, consumed by [`at_publish_seam`].
+    pub(super) struct Pause {
+        reached: Sender<()>,
+        release: Receiver<()>,
+    }
+
+    /// The controlling half a test holds: [`Control::arrived`] resolves
+    /// once the armed call has published its blob; [`Control::release`]
+    /// lets it run on to the pointer lock.
+    pub(super) struct Control {
+        arrived: Receiver<()>,
+        release: Sender<()>,
+    }
+
+    /// How a parked call's bounded release wait ended.
+    ///
+    /// The three outcomes are deliberately distinct because they license
+    /// different choreography conclusions:
+    /// - `Released`: the controller explicitly released the parked call —
+    ///   the intended sequence ran.
+    /// - `Timeout`: the controller NEVER released within the bound while
+    ///   still connected — the parked call did not wait for its partner,
+    ///   so the strict ordering the test set up did not happen. Failing
+    ///   loudly (rather than resuming as if success) is what keeps a
+    ///   controller stall past the bound from silently re-sequencing
+    ///   the race into a passing-by-accident sequential run.
+    /// - `Disconnected`: the controller was dropped — the test's
+    ///   controller thread panicked or finished early — so the parked
+    ///   call resumes for bounded teardown rather than stranding.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum WaitOutcome {
+        Released,
+        Timeout,
+        Disconnected,
+    }
+
+    /// No parked call outlives this bound and no controller wait
+    /// exceeds it: a test that panics drops its channel end, and a
+    /// stuck call fails the test instead of hanging the suite.
+    const BOUND: Duration = Duration::from_secs(60);
+
+    thread_local! {
+        static ARMED: RefCell<Option<Pause>> = const { RefCell::new(None) };
+        /// A private cfg(test) bound override. `None` means the real
+        /// 60s `BOUND`; a lifecycle test sets a tiny per-test value so
+        /// the timeout path is exercised without a 60s-per-run cost.
+        /// Scoped to the arming thread and consumed by `arm`/`wait` —
+        /// never a production knob and never visible to other tests.
+        static WAIT_BOUND: RefCell<Option<Duration>> = const { RefCell::new(None) };
+    }
+
+    /// Arm the NEXT `put_blob` call made by THIS thread — one shot,
+    /// consumed when it fires; other threads and later calls see
+    /// nothing. Re-arming replaces a stale pause, whose `Control`
+    /// then times out rather than deadlocking.
+    pub(super) fn arm() -> Control {
+        let (reached, arrived) = channel();
+        let (release, hold) = channel();
+        ARMED.with(|armed| {
+            *armed.borrow_mut() = Some(Pause {
+                reached,
+                release: hold,
+            });
+        });
+        Control { arrived, release }
+    }
+
+    /// Set a private cfg(test) release-wait bound for THIS thread's
+    /// next parked call — the lifecycle tests' per-test bound, so a
+    /// `Timeout` outcome is provable without a real 60s wait. `None`
+    /// restores the default `BOUND`. Test-only; consumed by the same
+    /// thread's `arm`/`wait`, cleared on `drop`/`clear`.
+    pub(super) fn set_wait_bound(bound: Option<Duration>) {
+        WAIT_BOUND.with(|b| {
+            *b.borrow_mut() = bound;
+        });
+    }
+
+    /// The bounded release wait, separated so the outcome is
+    /// inspectable: `Timeout` and `Disconnected` are different
+    /// failure geometries and must not be conflated.
+    ///
+    /// - `Released` → the controller released the parked call.
+    /// - `Timeout` → the bound elapsed with the controller still
+    ///   connected: it never released. The parked call did NOT
+    ///   synchronize — treat this as loud failure, never a resume.
+    /// - `Disconnected` → the controller's `Control` was dropped while
+    ///   the call was parked: the test orchestrator is gone, so the
+    ///   call resumes for bounded teardown rather than stranding.
+    pub(super) fn wait_for_release(release: &Receiver<()>, bound: Duration) -> WaitOutcome {
+        match release.recv_timeout(bound) {
+            Ok(()) => WaitOutcome::Released,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WaitOutcome::Timeout,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => WaitOutcome::Disconnected,
+        }
+    }
+
+    /// The seam inside `put_blob`: blob bytes published, pointer lock
+    /// not yet taken, no lock held. Fires once on the armed thread
+    /// only; unarmed it is a no-op, so unrelated parallel tests are
+    /// untouched.
+    ///
+    /// A `Timeout` outcome FAILS the test: the parked call did not wait
+    /// for its partner, so the strict choreography did not happen and
+    /// continuing would let a later assertion pass on a silently
+    /// degraded schedule. `Disconnected` resumes — the controller
+    /// already dropped, so the call unwinds for bounded teardown.
+    pub(super) fn at_publish_seam() {
+        let pause = ARMED.with(|armed| armed.borrow_mut().take());
+        if let Some(pause) = pause {
+            let bound = WAIT_BOUND.with(|b| b.borrow().unwrap_or(BOUND));
+            let _ = pause.reached.send(());
+            match wait_for_release(&pause.release, bound) {
+                WaitOutcome::Released | WaitOutcome::Disconnected => {}
+                WaitOutcome::Timeout => {
+                    panic!(
+                        "the armed put_blob's controller never released it \
+                         within {bound:?} — the strict publish/pointer-lock \
+                         choreography did not run, so the test must not \
+                         resume it as if it had"
+                    );
+                }
+            }
+        }
+    }
+
+    impl Control {
+        /// Block until the armed call parks at the seam — bounded, so
+        /// a call that never arrives fails the test, not the suite.
+        pub(super) fn arrived(&self) {
+            self.arrived
+                .recv_timeout(BOUND)
+                .expect("the armed put_blob never reached the publish seam");
+        }
+        /// Release the parked call toward the pointer lock.
+        pub(super) fn release(&self) {
+            let _ = self.release.send(());
+        }
+    }
 }
 
 /// Search the derived index. The caller and path checks remain the wiki's
@@ -1585,6 +2461,7 @@ pub fn history(pm: &Pm, caller: &Caller, path: &str, limit: usize) -> Result<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn segs(path: &str) -> Vec<&str> {
         if path.is_empty() {
@@ -1627,22 +2504,30 @@ mod tests {
             (&op, Op::Read, "", true),
             (&public, Op::Read, "", true),
             (&op, Op::Write, "", false),
-            // global/: read by all, written by the operator only.
+            // global/: read by all; members may mutate pages, not the namespace root.
             (&op, Op::Read, "global/notes.md", true),
             (&agent(), Op::Read, "global/notes.md", true),
             (&public, Op::Read, "global/notes.md", true),
             (&user, Op::Read, "global/notes.md", true),
             (&op, Op::Write, "global/notes.md", true),
+            (&op, Op::Remove, "global/notes.md", true),
             (&agent(), Op::Write, "global/notes.md", false),
-            (&user, Op::Write, "global/notes.md", false),
+            (&agent(), Op::Remove, "global/notes.md", false),
+            (&user, Op::Write, "global/notes.md", true),
+            (&user, Op::Remove, "global/notes.md", true),
+            (&user, Op::Write, "global", false),
+            (&user, Op::Remove, "global", false),
             (&public, Op::Write, "global/notes.md", false),
-            // projects/<key>/: all read; write = operator + owning agent.
+            (&public, Op::Remove, "global/notes.md", false),
+            // projects/<key>/: all read; write = operator, owning agent, or a board member.
             (&op, Op::Read, "projects/cadence/a.md", true),
             (&public, Op::Read, "projects/cadence/a.md", true),
             (&agent(), Op::Write, "projects/cadence/a.md", true),
+            (&agent(), Op::Remove, "projects/cadence/a.md", true),
             (&agent(), Op::Write, "projects/other/a.md", false),
             (&agentless(), Op::Write, "projects/cadence/a.md", false),
-            (&user, Op::Write, "projects/cadence/a.md", false),
+            (&user, Op::Write, "projects/cadence/a.md", true),
+            (&user, Op::Remove, "projects/cadence/a.md", true),
             (&public, Op::Write, "projects/cadence/a.md", false),
             (&op, Op::Write, "projects", false),
             (&agent(), Op::Read, "projects", true),
@@ -1700,8 +2585,10 @@ mod tests {
             (&op, Op::Read, "users/fable/diary.md", true),
             (&user, Op::Read, "users/fable/diary.md", true),
             (&user, Op::Write, "users/fable/diary.md", true),
+            (&user, Op::Remove, "users/fable/diary.md", true),
             (&user2, Op::Read, "users/fable/diary.md", false),
             (&user2, Op::Write, "users/fable/diary.md", false),
+            (&user2, Op::Remove, "users/fable/diary.md", false),
             (&agent(), Op::Read, "users/fable/diary.md", false),
             (&agent(), Op::Write, "users/fable/diary.md", false),
             (&public, Op::Read, "users/fable/diary.md", false),
@@ -1737,6 +2624,8 @@ mod tests {
             "/a/b",
             "a//b",
             "a/b/",
+            "a/b//",
+            "global//",
             "a\\b",
             "a\0b",
             "a%2Fb",
@@ -1775,12 +2664,469 @@ mod tests {
         assert_eq!(normalize(nfd).unwrap(), "projects/p/caf\u{e9}.md");
     }
 
+    /// The root listing promises `global` and `projects` even before
+    /// anyone has created them, and the board prints those folders with
+    /// a trailing slash. Listing either form is an empty directory.
+    /// A path under a missing folder is still missing.
+    #[test]
+    fn advertised_roots_list_empty_with_or_without_a_trailing_slash() {
+        assert!(
+            normalize("global/").is_err(),
+            "a file path keeps the trailing-slash refusal"
+        );
+        assert_eq!(normalize_dir("global/").unwrap(), "global");
+        assert_eq!(
+            normalize_dir("projects/cadence/").unwrap(),
+            "projects/cadence"
+        );
+        assert!(normalize_dir("a//b").is_err());
+        assert!(normalize_dir("a/b//").is_err());
+
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = cad911_pm(root.path());
+        let vault = vault_dir(&pm).unwrap();
+        let _ = std::fs::remove_dir_all(vault.join("global"));
+        let _ = std::fs::remove_dir_all(vault.join("projects"));
+
+        let root_names: Vec<_> = ls(&pm, &Caller::Operator, "").unwrap()["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(root_names.iter().any(|n| n == "global"), "{root_names:?}");
+        assert!(root_names.iter().any(|n| n == "projects"), "{root_names:?}");
+
+        for path in ["global", "global/", "projects", "projects/"] {
+            let got = ls(&pm, &Caller::Operator, path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            assert_eq!(got["path"], path.trim_end_matches('/'), "{path}: {got}");
+            assert!(
+                got["entries"].as_array().unwrap().is_empty(),
+                "{path}: {got}"
+            );
+        }
+        let missing = ls(&pm, &Caller::Operator, "global/missing").unwrap_err();
+        assert!(
+            missing.to_string().contains("no such directory"),
+            "{missing}"
+        );
+
+        std::fs::create_dir_all(pm.dir.join("agents/master")).unwrap();
+        let layout: Vec<_> = ls(&pm, &Caller::Operator, "agents/master").unwrap()["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(layout.iter().any(|n| n == "knowledge"), "{layout:?}");
+        for path in ["agents/master/knowledge", "agents/master/knowledge/"] {
+            let got = ls(&pm, &Caller::Operator, path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            assert_eq!(got["path"], "agents/master/knowledge", "{path}: {got}");
+            assert!(
+                got["entries"].as_array().unwrap().is_empty(),
+                "{path}: {got}"
+            );
+        }
+        let missing_knowledge =
+            ls(&pm, &Caller::Operator, "agents/master/knowledge/missing").unwrap_err();
+        assert!(
+            missing_knowledge.to_string().contains("no such directory"),
+            "{missing_knowledge}"
+        );
+        std::fs::create_dir_all(vault.join("agents/master/knowledge")).unwrap();
+        std::fs::write(vault.join("agents/master/knowledge/notes.md"), b"hello\n").unwrap();
+        let filed = ls(&pm, &Caller::Operator, "agents/master/knowledge/").unwrap();
+        let filed_names: Vec<_> = filed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            filed_names.iter().any(|n| n == "notes.md"),
+            "{filed_names:?}"
+        );
+
+        std::fs::create_dir_all(vault.join("global")).unwrap();
+        std::fs::write(vault.join("global/notes.md"), b"hello\n").unwrap();
+        for path in ["global", "global/"] {
+            let got = ls(&pm, &Caller::Operator, path).unwrap();
+            assert_eq!(got["path"], "global");
+            let names: Vec<_> = got["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["name"].as_str().unwrap().to_string())
+                .collect();
+            assert!(names.iter().any(|n| n == "notes.md"), "{path}: {names:?}");
+        }
+    }
+
     #[test]
     fn actor_names() {
         assert_eq!(Caller::Operator.actor(), "operator");
         assert_eq!(agent().actor(), "swe-1");
         assert_eq!(Caller::User("f".into()).actor(), "f (ui)");
         assert_eq!(Caller::Public.actor(), "anonymous (ui)");
+    }
+
+    fn body_range<'a>(offset: u64, bytes: Option<u64>, rev: Option<&'a str>) -> BodyRange<'a> {
+        BodyRange { offset, bytes, rev }
+    }
+
+    fn range_pm() -> (tempfile::TempDir, Pm) {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = Pm::init(&root.path().join("pm")).unwrap();
+        (root, pm)
+    }
+
+    /// CAD-1456: a large original is readable in revision-pinned ranges.
+    /// The compact line stays under the native tool bound, slices
+    /// concatenate to the original, and a later revision is not mixed in.
+    #[test]
+    fn bounded_ranges_pin_one_revision_and_cover_a_large_original() {
+        let (_root, pm) = range_pm();
+        let path = "global/large.md";
+        let original = format!("BODYSTART{}", "a".repeat(60_000));
+        write(&pm, &Caller::Operator, path, &original, None).unwrap();
+        let before = std::fs::read(vault_dir(&pm).unwrap().join(path)).unwrap();
+
+        let full = read(&pm, &Caller::Operator, path).unwrap();
+        assert!(
+            full.get("range").is_none(),
+            "an unbounded read stays unbounded"
+        );
+        assert_eq!(full["text"].as_str().unwrap(), original);
+        let rev = full["rev"].as_str().unwrap().to_string();
+
+        let mut got = String::new();
+        let mut offset = 0u64;
+        for _ in 0..8 {
+            let page = read_range(
+                &pm,
+                &Caller::Operator,
+                path,
+                body_range(offset, None, Some(&rev)),
+            )
+            .unwrap();
+            let line = serde_json::to_string(&page).unwrap();
+            assert!(
+                line.len() + 1 < NATIVE_TOOL_LINE_BOUND,
+                "range line is {} bytes",
+                line.len() + 1
+            );
+            assert_eq!(page["path"].as_str(), Some(path));
+            assert_eq!(page["rev"].as_str(), Some(rev.as_str()));
+            assert_eq!(page["range"]["start"].as_u64().unwrap(), offset);
+            let end = page["range"]["end"].as_u64().unwrap();
+            let total = page["range"]["total"].as_u64().unwrap();
+            assert_eq!(total, original.len() as u64);
+            assert!(end > offset && end <= total);
+            let text = page["text"].as_str().unwrap();
+            assert_eq!(
+                text.as_bytes(),
+                &original.as_bytes()[offset as usize..end as usize]
+            );
+            got.push_str(text);
+            offset = end;
+            if offset == total {
+                break;
+            }
+        }
+        assert_eq!(got, original);
+        assert_eq!(
+            std::fs::read(vault_dir(&pm).unwrap().join(path)).unwrap(),
+            before
+        );
+
+        let err = read_range(
+            &pm,
+            &Caller::Operator,
+            path,
+            body_range(0, Some(original.len() as u64), None),
+        )
+        .unwrap_err();
+        let err = err.to_string();
+        assert!(err.contains("50000"), "{err}");
+        assert!(!err.contains("BODYSTART"), "{err}");
+
+        write(&pm, &Caller::Operator, path, "NEXTVERSION-SENTINEL", None).unwrap();
+        let mismatch = read_range(
+            &pm,
+            &Caller::Operator,
+            path,
+            body_range(0, Some(4), Some(&rev)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(mismatch.contains(&rev), "{mismatch}");
+        assert!(!mismatch.contains("NEXTVERSION-SENTINEL"), "{mismatch}");
+        assert!(!mismatch.contains("BODYSTART"), "{mismatch}");
+    }
+
+    #[test]
+    fn range_edges_are_exact_utf8_boundaries() {
+        let (_root, pm) = range_pm();
+        let path = "global/chars.md";
+        let text = "a\u{00e9}b";
+        assert_eq!(text.len(), 4);
+        write(&pm, &Caller::Operator, path, text, None).unwrap();
+
+        let mid = read_range(&pm, &Caller::Operator, path, body_range(1, Some(2), None)).unwrap();
+        assert_eq!(mid["text"], "\u{00e9}");
+        assert_eq!(mid["range"]["start"].as_u64(), Some(1));
+        assert_eq!(mid["range"]["end"].as_u64(), Some(3));
+        assert_eq!(mid["range"]["total"].as_u64(), Some(4));
+
+        let split = read_range(&pm, &Caller::Operator, path, body_range(0, Some(2), None))
+            .unwrap_err()
+            .to_string();
+        assert!(split.contains("UTF-8"), "{split}");
+        let inside = read_range(&pm, &Caller::Operator, path, body_range(2, Some(1), None))
+            .unwrap_err()
+            .to_string();
+        assert!(inside.contains("UTF-8"), "{inside}");
+
+        let eof = read_range(&pm, &Caller::Operator, path, body_range(4, Some(10), None)).unwrap();
+        assert_eq!(eof["text"], "");
+        assert_eq!(eof["range"]["start"].as_u64(), Some(4));
+        assert_eq!(eof["range"]["end"].as_u64(), Some(4));
+        let empty = read_range(&pm, &Caller::Operator, path, body_range(0, Some(0), None)).unwrap();
+        assert_eq!(empty["text"], "");
+        assert_eq!(empty["range"]["end"].as_u64(), Some(0));
+
+        let past = read_range(&pm, &Caller::Operator, path, body_range(5, None, None))
+            .unwrap_err()
+            .to_string();
+        assert!(past.contains("past"), "{past}");
+        assert!(!past.contains('\u{00e9}'));
+    }
+
+    #[test]
+    fn range_read_denies_the_same_callers_and_leaves_bytes_in_place() {
+        let (root, pm) = range_pm();
+        let secret = "DENY-SENTINEL-private";
+        write(
+            &pm,
+            &Caller::Operator,
+            "users/fable/secret.md",
+            secret,
+            None,
+        )
+        .unwrap();
+        let denied = read_range(
+            &pm,
+            &agent(),
+            "users/fable/secret.md",
+            body_range(0, Some(1), None),
+        )
+        .unwrap_err()
+        .to_string();
+        let full = read(&pm, &agent(), "users/fable/secret.md")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(denied, full);
+        assert!(!denied.contains("DENY-SENTINEL"), "{denied}");
+        assert_eq!(
+            std::fs::read(vault_dir(&pm).unwrap().join("users/fable/secret.md")).unwrap(),
+            secret.as_bytes()
+        );
+
+        mkdir(&pm, &Caller::Operator, "global/folder").unwrap();
+        let dir = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/folder",
+            body_range(0, None, None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(dir.contains("text page"), "{dir}");
+
+        let bad = vault_dir(&pm).unwrap().join("global/bad.md");
+        let raw = [0xff, 0xfe, b'x'];
+        std::fs::write(&bad, raw).unwrap();
+        let utf8 = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/bad.md",
+            body_range(0, Some(1), None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(utf8.contains("UTF-8"), "{utf8}");
+        assert_eq!(std::fs::read(&bad).unwrap(), raw);
+
+        let state = root.path().join("state");
+        let uploads = state.join(UPLOAD_DIR);
+        std::fs::create_dir_all(&uploads).unwrap();
+        let tmp = uploads.join("a.bin");
+        std::fs::write(&tmp, b"not-text-blob").unwrap();
+        put_blob(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/a.bin",
+            &tmp,
+            None,
+            None,
+        )
+        .unwrap();
+        let blob = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/a.bin",
+            body_range(0, Some(4), None),
+        )
+        .unwrap();
+        assert_eq!(blob["kind"], "blob");
+        assert_eq!(blob["range"]["start"], 0);
+        assert_eq!(blob["range"]["end"], 4);
+        assert_eq!(blob["range"]["total"], b"not-text-blob".len() as u64);
+        assert!(blob.get("text").is_none(), "{blob}");
+        let encoded = blob["data_base64"].as_str().unwrap();
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(raw, b"not-");
+        let line = serde_json::to_string(&blob).unwrap();
+        assert!(line.len() + 1 < NATIVE_TOOL_LINE_BOUND, "{}", line.len());
+        assert!(!line.contains("not-text-blob"), "{line}");
+        let rev = blob["rev"].as_str().unwrap().to_string();
+        let rest = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/a.bin",
+            body_range(4, None, Some(&rev)),
+        )
+        .unwrap();
+        assert_eq!(rest["rev"], rev);
+        assert_eq!(rest["sha256"], blob["sha256"]);
+        assert_eq!(rest["range"]["start"], 4);
+        assert_eq!(rest["range"]["end"], b"not-text-blob".len() as u64);
+        let tail = base64::engine::general_purpose::STANDARD
+            .decode(rest["data_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(tail, b"text-blob");
+        let stale = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/a.bin",
+            body_range(0, Some(4), Some("fnv1a:0000000000000000")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(stale.contains("revision"), "{stale}");
+        assert!(!stale.contains("not-text"), "{stale}");
+        let meta_only = read(&pm, &Caller::Operator, "global/a.bin").unwrap();
+        assert!(meta_only.get("data_base64").is_none(), "{meta_only}");
+        assert!(meta_only.get("range").is_none(), "{meta_only}");
+        assert_eq!(meta_only["sha256"], blob["sha256"]);
+        let object = blobs_dir(&vault_dir(&pm).unwrap()).join(blob["sha256"].as_str().unwrap());
+        assert_eq!(std::fs::read(&object).unwrap(), b"not-text-blob");
+        std::fs::write(&object, b"short").unwrap();
+        let short = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/a.bin",
+            body_range(0, Some(4), Some(&rev)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(short.contains("pointer size"), "{short}");
+        assert!(!short.contains("data_base64"), "{short}");
+        std::fs::write(&object, b"not-text-blob").unwrap();
+        let empty_tmp = uploads.join("empty.bin");
+        std::fs::write(&empty_tmp, b"").unwrap();
+        put_blob(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/empty.bin",
+            &empty_tmp,
+            None,
+            None,
+        )
+        .unwrap();
+        let empty = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/empty.bin",
+            body_range(0, None, None),
+        )
+        .unwrap();
+        assert_eq!(empty["data_base64"], "");
+        assert_eq!(empty["range"]["start"], 0);
+        assert_eq!(empty["range"]["end"], 0);
+        assert_eq!(empty["range"]["total"], 0);
+        assert_eq!(empty["size"], 0);
+
+        let wide_tmp = uploads.join("wide.bin");
+        std::fs::write(&wide_tmp, vec![0xA5u8; 60_000]).unwrap();
+        put_blob(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/wide.bin",
+            &wide_tmp,
+            None,
+            None,
+        )
+        .unwrap();
+        let refused = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/wide.bin",
+            body_range(0, Some(50_000), None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refused.contains("50000-byte native tool line bound"),
+            "{refused}"
+        );
+        assert!(!refused.contains("data_base64"), "{refused}");
+        let fitted = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/wide.bin",
+            body_range(0, None, None),
+        )
+        .unwrap();
+        let n = (fitted["range"]["end"].as_u64().unwrap()
+            - fitted["range"]["start"].as_u64().unwrap()) as usize;
+        let line = serde_json::to_string(&fitted).unwrap();
+        assert!(n < 40_000, "slice {n} did not reserve base64 and metadata");
+        assert!(
+            line.len() > n,
+            "compact JSON must count base64 and metadata"
+        );
+        assert!(line.len() + 1 < NATIVE_TOOL_LINE_BOUND, "{}", line.len());
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(fitted["data_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(raw, vec![0xA5u8; n]);
+        let past = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/wide.bin",
+            body_range(0, Some(n as u64 + 1), None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(past.contains("50000-byte native tool line bound"), "{past}");
+    }
+
+    #[test]
+    fn json_u64_rejects_non_integers() {
+        let params = json!({"ok": 0, "float": 1.5, "neg": -1, "str": "1", "flag": true});
+        assert_eq!(json_u64(&params, "ok").unwrap(), Some(0));
+        assert_eq!(json_u64(&params, "missing").unwrap(), None);
+        assert!(json_u64(&params, "float").is_err());
+        assert!(json_u64(&params, "neg").is_err());
+        assert!(json_u64(&params, "str").is_err());
+        assert!(json_u64(&params, "flag").is_err());
     }
 
     #[test]
@@ -1794,5 +3140,647 @@ mod tests {
             sniff_mime(&[0xde, 0xad, 0xbe, 0xef]),
             "application/octet-stream"
         );
+    }
+
+    // ---- CAD-911: deterministic custody evidence --------------------
+    //
+    // These tests exercise the REAL `put_blob` end to end (Pm, vault,
+    // pointer commit included). The publication↔pointer-lock seam is
+    // `test_pause`: a thread arms its own next call, parks there, and
+    // the test orchestrates a second real call — channel ordering,
+    // never sleeps. Coverage the suite carries for this fix:
+    //
+    //   unit/deterministic — this module: both interleavings of a
+    //       same-bytes winner/loser pair through the publish seam;
+    //       a same-length wrong-digest dedupe refusal; the real-I/O
+    //       partial-copy cleanup (a capped child writes a genuine
+    //       partial stage).
+    //   integration/live-RPC — tests/wiki.rs:
+    //       `concurrent_same_bytes_upload_never_orphans_an_accepted_
+    //       pointer` (probabilistic Barrier check) and the sequential
+    //       `same_bytes_accepted_and_rejected_keep_bytes_under_both_
+    //       orderings` (an invariant, NOT the race reproduction — the
+    //       defect needed an interleaving, which is what the seam
+    //       tests below pin down).
+
+    /// A private tracker + upload-state pair under one root. `Pm::at`
+    /// is what a second caller would open — each thread takes its own
+    /// handle; the pointer lock is the file lock, so that is the same
+    /// serialization the daemon gets.
+    fn cad911_pm(root: &Path) -> Pm {
+        Pm::init(&root.join("pm")).unwrap()
+    }
+
+    fn cad911_uploads(state: &Path) -> PathBuf {
+        let up = state.join(UPLOAD_DIR);
+        std::fs::create_dir_all(&up).unwrap();
+        up
+    }
+
+    fn cad911_stage_tmp(uploads: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let tmp = uploads.join(name);
+        std::fs::write(&tmp, bytes).unwrap();
+        tmp
+    }
+
+    /// `.blobs/` entry names — staging-leak evidence.
+    fn cad911_blob_names(blobs: &Path) -> Vec<String> {
+        let mut v: Vec<_> = std::fs::read_dir(blobs)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn cad911_no_stage_left(blobs: &Path) {
+        let stray: Vec<_> = cad911_blob_names(blobs)
+            .into_iter()
+            .filter(|n| n.contains(".upload-"))
+            .collect();
+        assert!(stray.is_empty(), "staging leftovers: {stray:?}");
+    }
+
+    /// One `put_blob` against `pm_dir` for `path`, armed to park at
+    /// the publish seam. The `Control` is sent to `ctl_tx` BEFORE the
+    /// call runs — the call itself parks, so handing the controller
+    /// back afterwards would deadlock.
+    fn cad911_call(
+        pm_dir: &Path,
+        state: &Path,
+        path: &str,
+        tmp: &Path,
+        if_rev: Option<&str>,
+        ctl_tx: &std::sync::mpsc::Sender<test_pause::Control>,
+    ) -> Result<Value> {
+        let pm = Pm::at(pm_dir).unwrap();
+        ctl_tx.send(test_pause::arm()).unwrap();
+        put_blob(&pm, state, &Caller::Operator, path, tmp, None, if_rev)
+    }
+
+    /// CAD-911 — deterministic interleaving (a): the LOSER publishes
+    /// `.blobs/<sha>` first and parks; the WINNER dedupes those exact
+    /// bytes and commits its pointer; the loser resumes and conflicts
+    /// on its stale `if_rev`. Under the legacy `created=true` cleanup
+    /// the loser's exit unlinked the object the winner's pointer now
+    /// references — restoring that cleanup makes this test fail.
+    /// Channel rendezvous order the stages; no sleeps, no timing loop.
+    #[test]
+    fn loser_publishes_winner_dedupes_and_commits_then_loser_conflicts() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = cad911_pm(root.path());
+        let pm_dir = pm.dir.clone();
+        let state = root.path().join("state");
+        let uploads = cad911_uploads(&state);
+        let bytes: &[u8] = b"identical bytes for winner and loser (a)";
+        let loser_tmp = cad911_stage_tmp(&uploads, "loser.bin", bytes);
+        let winner_tmp = cad911_stage_tmp(&uploads, "winner.bin", bytes);
+        let vault = vault_dir(&pm).unwrap();
+        let blobs = blobs_dir(&vault);
+
+        let (ctl_tx, ctl_rx) = std::sync::mpsc::channel();
+        let state_t = state.clone();
+        let pm_dir_t = pm_dir.clone();
+        let loser = std::thread::spawn(move || {
+            cad911_call(
+                &pm_dir_t,
+                &state_t,
+                "global/loser.bin",
+                &loser_tmp,
+                Some("fnv1a:deadbeefdeadbeef"),
+                &ctl_tx,
+            )
+        });
+        let loser_ctl = ctl_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the loser thread never armed its call");
+        // The loser has PUBLISHED the shared object and is parked
+        // before its pointer lock — the exact window the defect hit.
+        loser_ctl.arrived();
+
+        let winner_out = put_blob(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/winner.bin",
+            &winner_tmp,
+            None,
+            None,
+        )
+        .unwrap();
+        let sha = winner_out["sha256"].as_str().unwrap().to_string();
+        loser_ctl.release();
+        let loser_out = loser.join().unwrap().unwrap();
+
+        assert!(winner_out["rev"].is_string(), "winner commits");
+        assert_eq!(
+            loser_out["conflict"].as_str().unwrap_or(""),
+            "if_rev",
+            "loser conflicts, never an error or success: {loser_out}"
+        );
+        assert_eq!(
+            std::fs::read(blobs.join(&sha))
+                .unwrap_or_else(|e| panic!("the accepted pointer's blob is missing/corrupt: {e}")),
+            bytes,
+            "a rejected same-bytes upload must never delete the accepted blob"
+        );
+        assert!(
+            vault
+                .join("global/loser.bin.blob")
+                .symlink_metadata()
+                .is_err(),
+            "no loser pointer"
+        );
+        cad911_no_stage_left(&blobs);
+    }
+
+    /// CAD-911 — deterministic interleaving (b): the loser publishes
+    /// and parks; the WINNER dedupes the published bytes and parks
+    /// before ITS pointer finalization; the loser resumes and
+    /// conflicts; the winner resumes and commits. The legacy
+    /// `created=true` cleanup deleted the object in the loser's
+    /// conflict exit — between the winner's dedupe and its commit —
+    /// so this fails there too, deterministically.
+    #[test]
+    fn winner_dedupes_then_pauses_loser_conflicts_then_winner_commits() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = cad911_pm(root.path());
+        let pm_dir = pm.dir.clone();
+        let state = root.path().join("state");
+        let uploads = cad911_uploads(&state);
+        let bytes: &[u8] = b"identical bytes for winner and loser (b)";
+        let loser_tmp = cad911_stage_tmp(&uploads, "loser.bin", bytes);
+        let winner_tmp = cad911_stage_tmp(&uploads, "winner.bin", bytes);
+        let vault = vault_dir(&pm).unwrap();
+        let blobs = blobs_dir(&vault);
+
+        let (l_tx, l_rx) = std::sync::mpsc::channel();
+        let (w_tx, w_rx) = std::sync::mpsc::channel();
+        let pm_l = pm_dir.clone();
+        let state_l = state.clone();
+        let loser = std::thread::spawn(move || {
+            cad911_call(
+                &pm_l,
+                &state_l,
+                "global/loser.bin",
+                &loser_tmp,
+                Some("fnv1a:deadbeefdeadbeef"),
+                &l_tx,
+            )
+        });
+        let loser_ctl = l_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the loser thread never armed its call");
+        // Stage 1 — the loser published the shared object and parks.
+        // The winner is spawned only AFTER that rendezvous, so the
+        // loser is provably the publisher and the winner provably the
+        // deduper — the interleaving, not a race for who creates it.
+        loser_ctl.arrived();
+        let pm_w = pm_dir.clone();
+        let state_w = state.clone();
+        let winner = std::thread::spawn(move || {
+            cad911_call(
+                &pm_w,
+                &state_w,
+                "global/winner.bin",
+                &winner_tmp,
+                None,
+                &w_tx,
+            )
+        });
+        let winner_ctl = w_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the winner thread never armed its call");
+        // Stage 2 — the winner deduped that object (same bytes) and
+        // parks before its pointer write; the object is now visible
+        // to a second caller's commit path.
+        winner_ctl.arrived();
+        // Stage 3 — the loser resumes and conflicts on its stale rev.
+        loser_ctl.release();
+        let loser_out = loser.join().unwrap().unwrap();
+        assert_eq!(loser_out["conflict"], "if_rev", "{loser_out}");
+        // Stage 4 — the winner resumes and commits its pointer.
+        winner_ctl.release();
+        let winner_out = winner.join().unwrap().unwrap();
+
+        assert!(winner_out["rev"].is_string(), "winner commits");
+        let sha = winner_out["sha256"].as_str().unwrap();
+        assert_eq!(
+            std::fs::read(blobs.join(sha))
+                .unwrap_or_else(|e| panic!("the accepted pointer's blob is missing/corrupt: {e}")),
+            bytes,
+            "the loser's conflict must not delete bytes the winner deduped"
+        );
+        assert!(
+            vault
+                .join("global/loser.bin.blob")
+                .symlink_metadata()
+                .is_err(),
+            "no loser pointer"
+        );
+        cad911_no_stage_left(&blobs);
+    }
+
+    /// CAD-911 — the dedupe guard's DIGEST half. A foreign object
+    /// planted at the upload's hash name with the SAME length as the
+    /// upload passes the size check and is refused ONLY by the
+    /// sha256 comparison — the discriminating line. Removing that
+    /// comparison (counterfactual) makes this dedupe commit a pointer
+    /// to foreign bytes and the test fails.
+    #[test]
+    fn same_length_foreign_bytes_at_the_hash_name_refuse() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = cad911_pm(root.path());
+        let state = root.path().join("state");
+        let uploads = cad911_uploads(&state);
+        let vault = vault_dir(&pm).unwrap();
+        let blobs = blobs_dir(&vault);
+
+        // Publish once so the hash name exists, then REPLACE the
+        // object with same-length foreign bytes.
+        let bytes: &[u8] = b"uploaded bytes, 38 bytes long exactly.";
+        let foreign: &[u8] = b"FOREIGN bytes,  38 bytes long exactly!";
+        assert_eq!(
+            bytes.len(),
+            foreign.len(),
+            "the plant must be same-length — only the digest discriminates"
+        );
+        let tmp_a = cad911_stage_tmp(&uploads, "a.bin", bytes);
+        let out = put_blob(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/a.bin",
+            &tmp_a,
+            None,
+            None,
+        )
+        .unwrap();
+        let sha = out["sha256"].as_str().unwrap().to_string();
+        let object = blobs.join(&sha);
+        std::fs::write(&object, foreign).unwrap();
+
+        let tmp_b = cad911_stage_tmp(&uploads, "b.bin", bytes);
+        let err = put_blob(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/b.bin",
+            &tmp_b,
+            None,
+            None,
+        )
+        .expect_err("same-length foreign bytes at the hash name must refuse");
+        assert!(
+            err.to_string().contains("content does not match"),
+            "the digest guard names its refusal: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&object).unwrap(),
+            foreign,
+            "the refused upload leaves the planted object byte-exact"
+        );
+        assert!(
+            vault.join("global/b.bin.blob").symlink_metadata().is_err(),
+            "no pointer commits against unverified bytes"
+        );
+        cad911_no_stage_left(&blobs);
+    }
+
+    // ---- CAD-911: a REAL failed partial copy ------------------------
+    //
+    // `cad911_partial_copy_child` re-executes this test binary under a
+    // CHILD-ONLY RLIMIT_FSIZE (applied in pre_exec — post-fork,
+    // pre-exec; the parent suite's own limits are never touched) with
+    // SIGXFSZ ignored so the kernel reports EFBIG to `fs::copy`
+    // instead of killing the child. The tmp lives on /dev/shm
+    // (proven a different filesystem than the fixture root), so the
+    // tmp→stage publish takes the real EXDEV `fs::copy` branch — and
+    // the cap makes that copy fail mid-write: a genuine partial
+    // private stage, then the real cleanup path. No injected fault.
+
+    /// Set only on the spawned child; names the env keys carrying its
+    /// fixture paths.
+    const COPY_CHILD_ENV: &str = "CAD911_PARTIAL_COPY_CHILD";
+    const COPY_CHILD_PM: &str = "CAD911_PARTIAL_COPY_PM";
+    const COPY_CHILD_STATE: &str = "CAD911_PARTIAL_COPY_STATE";
+    const COPY_CHILD_TMP: &str = "CAD911_PARTIAL_COPY_TMP";
+
+    /// Exclusive state dir on tmpfs — `create_dir`, never `create_dir_all`:
+    /// a pre-existing or raced name is a failure, not a shared dir.
+    struct Cad911ShmState {
+        dir: PathBuf,
+    }
+    impl Cad911ShmState {
+        fn new(vault_fs_root: &Path) -> Self {
+            use std::os::unix::fs::MetadataExt;
+            let shm = Path::new("/dev/shm");
+            assert_ne!(
+                shm.metadata().unwrap().dev(),
+                vault_fs_root.metadata().unwrap().dev(),
+                "/dev/shm must be a different filesystem than the fixture root \
+                 — the EXDEV copy path is the point of this test"
+            );
+            let dir = shm.join(format!(
+                "cad911-copy-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir(&dir).unwrap_or_else(|e| {
+                panic!(
+                    "exclusive shm state dir {} must not exist: {e}",
+                    dir.display()
+                )
+            });
+            Self { dir }
+        }
+    }
+    impl Drop for Cad911ShmState {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// CAD-911 — a REAL partial-copy failure through the real
+    /// `put_blob` EXDEV branch, in an owned child whose RLIMIT_FSIZE
+    /// caps its file writes mid-copy. Asserts: the failed upload
+    /// removes only its private `.upload-` stage, the source tmp is
+    /// untouched, the already-accepted blob keeps byte-exact custody,
+    /// and no pointer commits. Omitting the copy-failure cleanup
+    /// (counterfactual) leaves the partial stage and fails this test.
+    #[test]
+    fn failed_partial_copy_cleans_only_its_private_stage() {
+        use std::os::unix::process::CommandExt;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = cad911_pm(root.path());
+        let pm_dir = pm.dir.clone();
+        let shm_state = Cad911ShmState::new(root.path());
+        let uploads = cad911_uploads(&shm_state.dir);
+        let vault = vault_dir(&pm).unwrap();
+        let blobs = blobs_dir(&vault);
+
+        // An accepted blob BEFORE the failure — the custody the failed
+        // copy must never touch. Its commit also settles `.gitignore`
+        // so the capped child writes nothing before the copy itself.
+        let kept_bytes: &[u8] = b"the already-accepted blob, byte-exact";
+        let kept_tmp = cad911_stage_tmp(&uploads, "kept.bin", kept_bytes);
+        let kept = put_blob(
+            &pm,
+            &shm_state.dir,
+            &Caller::Operator,
+            "global/kept.bin",
+            &kept_tmp,
+            None,
+            None,
+        )
+        .unwrap();
+        let kept_sha = kept["sha256"].as_str().unwrap().to_string();
+
+        // The failing upload's tmp: created on tmpfs NOW, before any
+        // limit exists — and sized over the child's 512-byte cap so
+        // the copy fails mid-write with a partial stage on disk.
+        let fail_bytes: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8 ^ 0x5a).collect();
+        let fail_tmp = cad911_stage_tmp(&uploads, "failed.bin", &fail_bytes);
+        let fail_sha = sha256_file(&fail_tmp).unwrap();
+
+        // Spawn THIS test binary's ignored child entry with the
+        // child-only file-size cap. The suite lock/nextest markers are
+        // not the child's to honour — it is a plain libtest process.
+        let logs = tempfile::TempDir::new().unwrap();
+        let out_path = logs.path().join("child.log");
+        let out = std::fs::File::create(&out_path).unwrap();
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "wiki::tests::cad911_partial_copy_child",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .stdout(out.try_clone().unwrap())
+        .stderr(out)
+        .env(COPY_CHILD_ENV, "1")
+        .env(COPY_CHILD_PM, &pm_dir)
+        .env(COPY_CHILD_STATE, &shm_state.dir)
+        .env(COPY_CHILD_TMP, &fail_tmp)
+        .env_remove("CADENCE_SUITE_LOCK")
+        .env_remove("CADENCE_REVIEW_SUITE_LOCK_HELD");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("NEXTEST") {
+                cmd.env_remove(key);
+            }
+        }
+        unsafe {
+            cmd.pre_exec(|| {
+                // Child-only, pre-exec: cap file writes so fs::copy
+                // fails mid-write with EFBIG. SIGXFSZ is ignored so
+                // the syscall reports the error instead of killing
+                // the child before cleanup runs.
+                let mut rl = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_FSIZE, &mut rl) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                rl.rlim_cur = 512;
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &rl) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "the partial-copy child did not finish: {}",
+                    std::fs::read_to_string(&out_path).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let text = std::fs::read_to_string(&out_path).unwrap_or_default();
+        assert!(status.success(), "the partial-copy child failed: {text}");
+        assert!(
+            text.contains("test result: ok. 1 passed"),
+            "the child must actually run its assertion: {text}"
+        );
+
+        // The child saw the copy fail. Now the custody assertions:
+        // tmp untouched, no object at the failed hash name, no
+        // pointer, no stage — and the earlier accepted blob intact.
+        assert_eq!(
+            std::fs::read(&fail_tmp).unwrap(),
+            fail_bytes,
+            "a failed copy preserves the source tmp"
+        );
+        assert!(
+            blobs.join(&fail_sha).symlink_metadata().is_err(),
+            "no object may be left at the failed upload's hash name"
+        );
+        assert!(
+            vault
+                .join("global/failed.bin.blob")
+                .symlink_metadata()
+                .is_err(),
+            "no pointer commits for a failed copy"
+        );
+        assert_eq!(
+            std::fs::read(blobs.join(&kept_sha)).unwrap(),
+            kept_bytes,
+            "the accepted blob is byte-exact after the failed copy"
+        );
+        cad911_no_stage_left(&blobs);
+    }
+
+    /// The owned child the parent test re-executes: RLIMIT_FSIZE is
+    /// already in force (set pre-exec), the fixture was pre-built by
+    /// the parent, and the real `put_blob` EXDEV copy is the only
+    /// file write the cap cuts. Runs `#[ignore]`d — never standalone.
+    #[test]
+    #[ignore = "child entry point of failed_partial_copy_cleans_only_its_private_stage"]
+    fn cad911_partial_copy_child() {
+        if std::env::var_os(COPY_CHILD_ENV).is_none() {
+            return;
+        }
+        let pm_dir = PathBuf::from(std::env::var_os(COPY_CHILD_PM).unwrap());
+        let state = PathBuf::from(std::env::var_os(COPY_CHILD_STATE).unwrap());
+        let tmp = PathBuf::from(std::env::var_os(COPY_CHILD_TMP).unwrap());
+        let before = std::fs::read(&tmp).unwrap();
+        let pm = Pm::at(&pm_dir).unwrap();
+        let err = put_blob(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/failed.bin",
+            &tmp,
+            None,
+            None,
+        )
+        .expect_err("a copy capped mid-write must fail");
+        // An I/O failure — never a wiki policy refusal — so the store
+        // could not even consider committing a pointer.
+        assert!(
+            !err.to_string().contains("refused"),
+            "the failure is the real I/O error, not a guard: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            before,
+            "the capped copy preserved the source tmp"
+        );
+    }
+
+    // ---- CAD-911 R4: seam release lifecycle -------------------------
+    //
+    // These tests pin the `test_pause` seam's own release lifecycle,
+    // distinct from the put_blob custody choreography above: a Timeout
+    // (controller still connected but never released within the bound)
+    // is a loud failure, while Disconnected (the controller dropped)
+    // is a bounded teardown. They run the private `wait_for_release`
+    // collaborator directly — no real put_blob, no lock — and use a
+    // per-test bound so the timeout path costs milliseconds, not 60s.
+
+    /// Release the parked call explicitly → Released. Baseline: the
+    /// normal, intended exit the custody tests rely on.
+    #[test]
+    fn release_wait_released_is_ok() {
+        // channel() -> (Sender, Receiver): the controller holds the
+        // Sender; the parked call waits on the Receiver.
+        let (release_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let ctl = std::thread::spawn(move || {
+            // The channel retains the release even before the waiter parks.
+            let _ = release_tx.send(());
+        });
+        let out = test_pause::wait_for_release(&parked_rx, std::time::Duration::from_secs(60));
+        ctl.join().unwrap();
+        assert_eq!(
+            out,
+            test_pause::WaitOutcome::Released,
+            "an explicit release resumes the seam"
+        );
+    }
+
+    /// A controller that stays connected but NEVER releases within the
+    /// bound → Timeout. This is the loud failure: without it, a >BOUND
+    /// controller stall re-sequences the strict choreography into a
+    /// silently-passing sequential run. A tiny private bound proves
+    /// the timeout branch without a real 60s wait.
+    #[test]
+    fn release_wait_timeout_fails() {
+        let (release_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        // The sender stays ALIVE (never dropped, never sends) so only
+        // the bound can end the wait — a connected-but-stalled
+        // controller, which must be Timeout, not Disconnected.
+        let _keep_connected = release_tx;
+        let out = test_pause::wait_for_release(&parked_rx, std::time::Duration::from_millis(20));
+        assert_eq!(
+            out,
+            test_pause::WaitOutcome::Timeout,
+            "a connected controller that never releases must fail loudly"
+        );
+    }
+
+    /// A controller that is DROPPED while the call is parked →
+    /// Disconnected → the parked call resumes for bounded teardown.
+    /// This is the seam's strand-prevention: a panicking controller
+    /// must not leave the armed thread parked forever.
+    #[test]
+    fn release_wait_disconnected_resumes() {
+        let (release_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        // Drop the controller side: the parked call sees Disconnected.
+        drop(release_tx);
+        let out = test_pause::wait_for_release(&parked_rx, std::time::Duration::from_secs(60));
+        assert_eq!(
+            out,
+            test_pause::WaitOutcome::Disconnected,
+            "a dropped controller resumes the parked call for teardown"
+        );
+    }
+
+    /// The `at_publish_seam` entry a real `put_blob` hits: arm this
+    /// thread with a tiny bound, never release, and the parked seam
+    /// PANICS on Timeout — the loud failure the choreography requires.
+    /// Using a per-test bound keeps the run at milliseconds.
+    #[test]
+    fn publish_seam_timeout_panics() {
+        test_pause::set_wait_bound(Some(std::time::Duration::from_millis(20)));
+        let _ctl = test_pause::arm();
+        // The seam consumes the armed pause and panics on Timeout.
+        let outcome = std::panic::catch_unwind(test_pause::at_publish_seam);
+        test_pause::set_wait_bound(None);
+        let err = outcome.expect_err("an unreleased armed seam must fail loudly on timeout");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("never released"),
+            "the timeout panic names its cause: {msg}"
+        );
+    }
+
+    /// With a dropped `Control`, the armed seam takes the Disconnected
+    /// teardown path — resumes, does not panic, and consumes the
+    /// one-shot pause so a later unarmed call is untouched.
+    #[test]
+    fn publish_seam_disconnect_resumes_for_teardown() {
+        let ctl = test_pause::arm();
+        // Controller gone before the seam runs: the parked call must
+        // take the Disconnected teardown path — resume, never panic.
+        drop(ctl);
+        test_pause::at_publish_seam();
+        // The pause was consumed: a second unarmed call is a no-op.
+        test_pause::at_publish_seam();
     }
 }

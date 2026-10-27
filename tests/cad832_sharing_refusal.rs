@@ -17,11 +17,10 @@ use std::time::{Duration, Instant};
 use tempfile::{Builder, TempDir};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_cadence");
-const PORT: u16 = 3117;
+const DEFAULT_PORT: u16 = 3117;
 const BIND_TEST_PORT: u16 = 3199;
-const GRANT_TEST_PORT: u16 = 3119;
 const SHARE_PORT: u16 = 19450;
-const TARGET: &str = "http://127.0.0.1:3117";
+const DEFAULT_TARGET: &str = "http://127.0.0.1:3117";
 const FOREIGN_TARGET: &str = "http://127.0.0.1:3118";
 const FORGED_TARGET: &str = "http://127.0.0.1:3010";
 const HOSTPORT: &str = "acceptance.example.ts.net:19450";
@@ -292,6 +291,7 @@ fn mapping(port: u16, target: &str) -> Value {
 
 struct Fixture {
     _root: TempDir,
+    port: u16,
     home: PathBuf,
     state: PathBuf,
     fake_bin: PathBuf,
@@ -302,6 +302,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Self {
+        Self::new_with_port(label, DEFAULT_PORT)
+    }
+
+    fn new_with_port(label: &str, port: u16) -> Self {
         let root = Builder::new()
             .prefix(&format!("c832-{label}-"))
             .tempdir_in("/tmp")
@@ -331,6 +335,7 @@ impl Fixture {
         let api = LocalApi::new(socket);
         Self {
             _root: root,
+            port,
             home,
             state,
             fake_bin,
@@ -342,7 +347,9 @@ impl Fixture {
 
     fn write_opts(&self, target: &str) -> Vec<u8> {
         let bytes = format!(
-            "{{\n  \"port\": {PORT},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{target}\"\n  }}\n}}\n"
+            "{{\n  \"port\": {},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{}\"\n  }}\n}}\n",
+            self.port,
+            target
         )
         .into_bytes();
         fs::write(self.state.join("ui.json"), &bytes).unwrap();
@@ -350,7 +357,7 @@ impl Fixture {
     }
 
     fn write_unshared_opts(&self) -> Vec<u8> {
-        let bytes = format!("{{\n  \"port\": {PORT}\n}}\n").into_bytes();
+        let bytes = format!("{{\n  \"port\": {}\n}}\n", self.port).into_bytes();
         fs::write(self.state.join("ui.json"), &bytes).unwrap();
         bytes
     }
@@ -461,15 +468,69 @@ fn snapshot_response(f: &Fixture) -> Option<(u16, Option<String>)> {
         .map(|(_, response)| response)
 }
 
+struct SharingPortLease {
+    port: u16,
+    _lock: std::fs::File,
+}
+
+fn sharing_test_port() -> SharingPortLease {
+    use std::os::fd::AsRawFd;
+
+    const FIRST_PORT: u16 = 3110;
+    const PORT_COUNT: usize = 90;
+    const RESERVED_FIXTURE_PORTS: [u16; 3] = [3118, 3119, BIND_TEST_PORT];
+    let lock_dir = std::path::Path::new("/tmp/cadence-test-ports");
+    std::fs::create_dir_all(lock_dir).unwrap();
+
+    let preferred = std::env::var("CADENCE_TEST_PORT")
+        .ok()
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| (FIRST_PORT..FIRST_PORT + PORT_COUNT as u16).contains(port));
+    let start = std::process::id() as usize * 31 % PORT_COUNT;
+    for port in preferred
+        .into_iter()
+        .chain((0..PORT_COUNT).map(|i| FIRST_PORT + ((start + i) % PORT_COUNT) as u16))
+    {
+        if RESERVED_FIXTURE_PORTS.contains(&port) {
+            continue;
+        }
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_dir.join(format!("{port}.lock")))
+            .unwrap();
+        // Keep this lock for the whole test so concurrent acceptance tests
+        // cannot select the same port. Drop the probe socket before UI startup.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            continue;
+        }
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return SharingPortLease { port, _lock: lock };
+        }
+    }
+    panic!("no free, unreserved fixture port in 3110-3199")
+}
+
 fn snapshot_etag(f: &Fixture) -> Option<String> {
     snapshot_response(f).and_then(|(_, etag)| etag)
 }
 
 #[test]
 fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutations() {
+    let _port_lease = sharing_test_port();
+    #[allow(non_snake_case)]
+    let PORT = _port_lease.port;
+    assert_ne!(PORT, 3118, "real target must differ from foreign target");
+    assert_ne!(
+        PORT, 3119,
+        "real target must differ from second-host target"
+    );
+    #[allow(non_snake_case)]
+    let TARGET = format!("http://127.0.0.1:{PORT}");
     // The established guards still run before any LocalAPI operation and
     // preserve the persisted record verbatim.
-    let forged = Fixture::new("forged");
+    let forged = Fixture::new_with_port("forged", PORT);
     let original = forged.write_opts(FORGED_TARGET);
     let rejected = forged.cli(&["ui", "start"]);
     assert!(
@@ -505,7 +566,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
             vec!["ui", "tailscale", "start", "--port", "19450"],
         ),
     ] {
-        let route = Fixture::new(label);
+        let route = Fixture::new_with_port(label, PORT);
         let before = route.write_opts(FORGED_TARGET);
         let out = route.cli(&args);
         assert!(
@@ -536,7 +597,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
         );
     }
 
-    let partial = Fixture::new("partial-device-login");
+    let partial = Fixture::new_with_port("partial-device-login", PORT);
     let partial_original = partial.write_unshared_opts();
     let partial_out = partial.cli(&[
         "ui",
@@ -564,7 +625,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
         partial.tailscale_calls()
     );
 
-    let foreground = Fixture::new("foreground-sandbox");
+    let foreground = Fixture::new_with_port("foreground-sandbox", PORT);
     let foreground_original = foreground.write_unshared_opts();
     let foreground_out = foreground.cli_without_home_or_pm(&["ui", "run", "--tailscale", "19450"]);
     assert!(!foreground_out.status.success());
@@ -584,7 +645,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
 
     // Honest create: exact owned port, ETag from the GET snapshot, and
     // unrelated service settings survive the replacement.
-    let honest = Fixture::new("honest-create");
+    let honest = Fixture::new_with_port("honest-create", PORT);
     let seed = json!({
         "Web": {"acceptance.example.ts.net:19449":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9042","AcceptAppCaps":["peer-cap:opaque-one","peer-cap:opaque-two"]},"/text":{"Text":"existing"}}}},
         "TCP":{"19451":{"TCPForward":"127.0.0.1:9040","TerminateTLS":"service.example.com","ProxyProtocol":1},"19449":{"HTTPS":true}},
@@ -592,7 +653,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
         "Foreground":{"session":{"TCP":{"19448":{"HTTPS":true}},"Web":{"acceptance.example.ts.net:19448":{"Handlers":{"/":{"Text":"keep"}}}}}}
     });
     honest.api.seed(seed.clone());
-    honest.write_opts(TARGET);
+    honest.write_opts(&TARGET);
     let created = honest.cli(&["ui", "start"]);
     assert!(
         created.status.success(),
@@ -655,12 +716,12 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
             vec!["ui", "tailscale", "start", "--port", "19450"],
         ),
     ] {
-        let route = Fixture::new(label);
+        let route = Fixture::new_with_port(label, PORT);
         route.api.seed(json!({
             "Web":{"acceptance.example.ts.net:19449":{"Handlers":{"/":{"Text":"keep"}}}},
             "TCP":{"19449":{"HTTPS":true}}
         }));
-        route.write_opts(TARGET);
+        route.write_opts(&TARGET);
         let out = route.cli(&args);
         assert!(
             out.status.success(),
@@ -686,7 +747,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
         );
     }
 
-    let honest_remove = Fixture::new("honest-remove");
+    let honest_remove = Fixture::new_with_port("honest-remove", PORT);
     let remove_seed = json!({
         "Web": {HOSTPORT:{"Handlers":{"/":{"Proxy":TARGET}}},"acceptance.example.ts.net:19449":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9042","AcceptAppCaps":["peer-cap:opaque-one","peer-cap:opaque-two"]},"/text":{"Text":"keep"}}}},
         "TCP":{"19450":{"HTTPS":true},"19451":{"TCPForward":"127.0.0.1:9040","TerminateTLS":"service.example.com","ProxyProtocol":1},"19449":{"HTTPS":true}},
@@ -695,7 +756,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
         "Foreground":{"session":{"TCP":{"19448":{"HTTPS":true}},"Web":{"acceptance.example.ts.net:19448":{"Handlers":{"/":{"Text":"keep"}}}}}}
     });
     honest_remove.api.seed(remove_seed.clone());
-    honest_remove.write_opts(TARGET);
+    honest_remove.write_opts(&TARGET);
     let remove_out = honest_remove.cli(&["ui", "tailscale", "stop"]);
     assert!(
         remove_out.status.success(),
@@ -739,7 +800,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
     // Deterministic lost-update race: a foreign mapping is installed after
     // the client's GET but before its POST is compared. The backend returns
     // 412 and retains the foreign winner; no CLI fallback may overwrite it.
-    let race_create = Fixture::new("race-create");
+    let race_create = Fixture::new_with_port("race-create", PORT);
     race_create.api.seed(json!({
         "Web":{"acceptance.example.ts.net:19449":{"Handlers":{"/":{"Text":"keep"}}}},
         "TCP":{"19451":{"TCPForward":"127.0.0.1:9040"},"19449":{"HTTPS":true}},
@@ -748,7 +809,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
         "Foreground":{"session":{"TCP":{"19448":{"HTTPS":true}},"Web":{"acceptance.example.ts.net:19448":{"Handlers":{"/":{"Text":"keep"}}}}}}
     }));
     race_create.api.race_next_post(SHARE_PORT);
-    race_create.write_opts(TARGET);
+    race_create.write_opts(&TARGET);
     let create_out = race_create.cli(&["ui", "start"]);
     assert!(
         !create_out.status.success(),
@@ -810,7 +871,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
     // Missing ETag is a fail-closed client condition. This server can omit
     // the header for GET but permits unconditional POST exactly as upstream
     // does; therefore a client that omits If-Match would visibly mutate.
-    let no_etag = Fixture::new("missing-etag");
+    let no_etag = Fixture::new_with_port("missing-etag", PORT);
     let no_etag_config = json!({
         "Web":{"acceptance.example.ts.net:19449":{"Handlers":{"/":{"Text":"keep"}}}},
         "TCP":{"19449":{"HTTPS":true}},
@@ -818,7 +879,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
     });
     no_etag.api.seed(no_etag_config.clone());
     no_etag.api.state.lock().unwrap().generation = 0;
-    no_etag.write_opts(TARGET);
+    no_etag.write_opts(&TARGET);
     let no_etag_out = no_etag.cli(&["ui", "start"]);
     assert!(
         !no_etag_out.status.success(),
@@ -856,8 +917,8 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
     // Remove through the real `ui tailscale stop` route after the exact
     // mapping has been seeded. A foreign change in the GET/POST window must
     // remain, and failure must retain both the durable record and sandbox.
-    let race_remove = Fixture::new("race-remove");
-    let record = race_remove.write_opts(TARGET);
+    let race_remove = Fixture::new_with_port("race-remove", PORT);
+    let record = race_remove.write_opts(&TARGET);
     race_remove.api.seed(config_with_mapping(
         &json!({
             "Web":{"acceptance.example.ts.net:19449":{"Handlers":{"/":{"Text":"keep"}}}},
@@ -867,7 +928,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
             "Foreground":{"session":{"TCP":{"19448":{"HTTPS":true}},"Web":{"acceptance.example.ts.net:19448":{"Handlers":{"/":{"Text":"keep"}}}}}}
         }),
         SHARE_PORT,
-        TARGET,
+        &TARGET,
     ));
     race_remove.api.race_next_post(SHARE_PORT);
     let removed = race_remove.cli(&["ui", "tailscale", "stop"]);
@@ -932,8 +993,8 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
     // Foreign existing owner: reject before POST; do not clear/add unrelated
     // ports or alter funnel/foreground settings. This checks ownership is an
     // exact snapshot fact, not merely a desired destination assertion.
-    let foreign_owner = Fixture::new("foreign-owner");
-    foreign_owner.write_opts(TARGET);
+    let foreign_owner = Fixture::new_with_port("foreign-owner", PORT);
+    foreign_owner.write_opts(&TARGET);
     let mut foreign_config = mapping(SHARE_PORT, FOREIGN_TARGET);
     foreign_config["TCP"]["19451"] = json!({"TCPForward":"127.0.0.1:9040"});
     foreign_config["TCP"]["19448"] = json!({"HTTPS":true});
@@ -956,8 +1017,8 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
     );
     assert_eq!(foreign_owner.api.config(), foreign_config);
 
-    let ambiguous = Fixture::new("ambiguous-owned-port");
-    ambiguous.write_opts(TARGET);
+    let ambiguous = Fixture::new_with_port("ambiguous-owned-port", PORT);
+    ambiguous.write_opts(&TARGET);
     let ambiguous_config = json!({
         "Web": {HOSTPORT:{"Handlers":{"/":{"Proxy":TARGET},"/extra":{"Text":"unexpected second handler"}}}},
         "TCP":{"19450":{"HTTPS":true},"19451":{"TCPForward":"127.0.0.1:9040"}}
@@ -979,8 +1040,8 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
     );
     assert_eq!(ambiguous.api.config(), ambiguous_config);
 
-    let second_host = Fixture::new("second-host-shares-owned-port");
-    let second_host_record = second_host.write_opts(TARGET);
+    let second_host = Fixture::new_with_port("second-host-shares-owned-port", PORT);
+    let second_host_record = second_host.write_opts(&TARGET);
     let second_host_config = json!({
         "TCP":{"19450":{"HTTPS":true}},
         "Web":{
@@ -1019,7 +1080,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
         second_host.tailscale_calls()
     );
 
-    let reset_foreign = Fixture::new("reset-foreign-owner");
+    let reset_foreign = Fixture::new_with_port("reset-foreign-owner", PORT);
     let base = reset_foreign._root.path().join("sandboxes");
     let root = base.join("refusal");
     let state = root.join("state");
@@ -1068,7 +1129,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
     // Existing safety contract: reset under the actual native up lock must
     // wait and then clean up. Every child receives this fixture's private
     // socket, including reset and Fixture::drop cleanup.
-    let serialized = Fixture::new("reset-up-serialization");
+    let serialized = Fixture::new_with_port("reset-up-serialization", PORT);
     let sandbox_base = serialized._root.path().join("sandboxes");
     let sandbox_name = "serialized";
     let sandbox_root = sandbox_base.join(sandbox_name);
@@ -1168,10 +1229,10 @@ fn sharing_requires_literal_ipv4_loopback_and_a_matching_bind() {
     // safe, and the listener must actually bind that same host and port.
     let persisted = Fixture::new("persisted-ipv6-bind");
     let original = format!(
-        "{{\n  \"host\": \"::1\",\n  \"port\": {PORT},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{TARGET}\"\n  }}\n}}\n"
+        "{{\n  \"host\": \"::1\",\n  \"port\": {DEFAULT_PORT},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{DEFAULT_TARGET}\"\n  }}\n}}\n"
     );
     fs::write(persisted.state.join("ui.json"), &original).unwrap();
-    let config = mapping(SHARE_PORT, TARGET);
+    let config = mapping(SHARE_PORT, DEFAULT_TARGET);
     persisted.api.seed(config.clone());
     let mut failures = Vec::new();
     let out = persisted.cli(&["ui", "start"]);
@@ -1288,14 +1349,14 @@ fn stop_refuses_forged_or_production_target_before_api_mutation() {
             vec!["ui", "tailscale", "stop"],
             FORGED_TARGET,
             SHARE_PORT,
-            PORT,
+            DEFAULT_PORT,
         ),
         (
             "stop-off-forged",
             vec!["ui", "stop", "--tailscale-off"],
             FORGED_TARGET,
             SHARE_PORT,
-            PORT,
+            DEFAULT_PORT,
         ),
         (
             "tailscale-stop-production-port",
@@ -1349,7 +1410,7 @@ fn reset_refuses_known_ui_options_decode_failure_without_mutation() {
         (
             "reset-malformed-known-option-with-share",
             format!(
-                "{{\n  \"dist\": false,\n  \"port\": {PORT},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{TARGET}\"\n  }}\n}}\n"
+                "{{\n  \"dist\": false,\n  \"port\": {DEFAULT_PORT},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{DEFAULT_TARGET}\"\n  }}\n}}\n"
             )
             .into_bytes(),
         ),
@@ -1358,7 +1419,7 @@ fn reset_refuses_known_ui_options_decode_failure_without_mutation() {
         ("reset-scalar-root", b"17\n".to_vec()),
         (
             "reset-malformed-options-without-share",
-            format!("{{\n  \"dist\": false,\n  \"port\": {PORT}\n}}\n").into_bytes(),
+            format!("{{\n  \"dist\": false,\n  \"port\": {DEFAULT_PORT}\n}}\n").into_bytes(),
         ),
     ];
     let mut failures = Vec::new();
@@ -1377,7 +1438,7 @@ fn reset_refuses_known_ui_options_decode_failure_without_mutation() {
         )
         .unwrap();
         fs::write(state.join("ui.json"), &record).unwrap();
-        let config = mapping(SHARE_PORT, TARGET);
+        let config = mapping(SHARE_PORT, DEFAULT_TARGET);
         fixture.api.seed(config.clone());
         let out = fixture.cli(&["sandbox", "reset", sandbox_name]);
         let root_exists = root.is_dir();
@@ -1480,8 +1541,10 @@ fn unsupported_localapi_serve_schema_refuses_without_post_or_data_loss() {
 
 #[test]
 fn allow_global_requires_matching_persisted_sandbox_grant_for_ui_sharing() {
+    let _port_lease = sharing_test_port();
+    let grant_test_port = _port_lease.port;
     let sandbox_name = "cad832-acceptance";
-    let mut fixture = Fixture::new("grant-marker-refusal");
+    let mut fixture = Fixture::new_with_port("grant-marker-refusal", grant_test_port);
     let sandbox_root = fixture._root.path().join("sandboxes").join(sandbox_name);
     let state = sandbox_root.join("state");
     fs::create_dir_all(&state).unwrap();
@@ -1489,9 +1552,9 @@ fn allow_global_requires_matching_persisted_sandbox_grant_for_ui_sharing() {
     let marker_path = sandbox_root.join(".cadence-sandbox");
     let marker =
         |allow_global| format!(r#"{{"name":"{sandbox_name}","allow_global":{allow_global}}}"#);
-    let target = format!("http://127.0.0.1:{GRANT_TEST_PORT}");
+    let target = format!("http://127.0.0.1:{grant_test_port}");
     let record = format!(
-        "{{\n  \"port\": {GRANT_TEST_PORT},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{target}\"\n  }}\n}}\n"
+        "{{\n  \"port\": {grant_test_port},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{target}\"\n  }}\n}}\n"
     );
     fs::write(fixture.state.join("ui.json"), &record).unwrap();
     let config = mapping(SHARE_PORT, &target);
@@ -1534,7 +1597,7 @@ fn allow_global_requires_matching_persisted_sandbox_grant_for_ui_sharing() {
     // The identical canonical layout reaches the operation with a true
     // persisted grant; the positive control prevents name/layout rejection
     // from masquerading as enforcement.
-    let mut fixture = Fixture::new("grant-marker-positive");
+    let mut fixture = Fixture::new_with_port("grant-marker-positive", grant_test_port);
     let sandbox_root = fixture._root.path().join("sandboxes").join(sandbox_name);
     let state = sandbox_root.join("state");
     fs::create_dir_all(&state).unwrap();

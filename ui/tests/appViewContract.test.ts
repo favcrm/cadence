@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 import {
   AppViewContractError,
   FORBIDDEN_DESCRIPTOR_KEYS,
@@ -328,12 +329,6 @@ await React.act(async () => { root.unmount(); });
 
 // Real shell lifecycle with fixture HTTP receipts: direct preview links and
 // same-installation navigation remain, App-menu installation switches exit.
-let streams = 0;
-Object.defineProperty(globalThis, "EventSource", { configurable: true, value: class {
-  onopen = null; onerror = null;
-  constructor() { streams += 1; }
-  addEventListener() {} removeEventListener() {} close() {}
-} });
 const shellBase = {
   title: "Reports", name: "reports", version: "0.1.0", digest: "fixture-digest",
   catalog_generation: "fixture-generation", approved: true, storage_kind: "workspace",
@@ -341,8 +336,11 @@ const shellBase = {
 };
 globalThis.fetch = (async (input: unknown) => {
   const url = String(input);
+  if (new URL(url, "http://localhost").pathname.endsWith("/stream")) return streamFixture(url);
   if (url.endsWith("/conversations")) return new Response("{}", { status: 404 });
-  const receipt = url.endsWith("/contexts") ? { contexts: [] }
+  const receipt = url === "/api/app-installations/install-b/contexts"
+    ? { contexts: [{ id: "ctx-b", install_id: "install-b", revision: 1, state: "active", digest: "cb", config: { schema: 1, label: "General", input_defaults: {} } }] }
+    : url.endsWith("/contexts") ? { contexts: [] }
     : url.startsWith("/api/threads/master") ? { entries: [], more_before: false }
     : url === "/api/app-installations/install-a" ? { ...shellBase, install_id: "install-a" }
     : url === "/api/app-installations/install-b" ? { ...shellBase, install_id: "install-b", name: "social-content", title: "Social Content" }
@@ -350,7 +348,10 @@ globalThis.fetch = (async (input: unknown) => {
   assert(receipt !== null, `unexpected fixture read ${url}`);
   return new Response(JSON.stringify(receipt), { status: 200 });
 }) as typeof fetch;
-const AppShell = (require("../src/features/app-shell/AppShell") as typeof import("../src/features/app-shell/AppShell")).default;
+const AppShellComponent = (require("../src/features/app-shell/AppShell") as typeof import("../src/features/app-shell/AppShell")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) =>
+  React.createElement(LocaleProvider, null, React.createElement(AppShellComponent, props));
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { contextNavigationSearch } = require("../src/features/projects/contextRoute") as typeof import("../src/features/projects/contextRoute");
 history.replaceState(null, "", "/app-installations/install-a?contract-preview=crm");
@@ -372,7 +373,7 @@ await React.act(async () => {
   navigate(`/app-installations/install-b?${menuQuery}`);
   shellRoot.render(React.createElement(AppShell, {
     installId: "install-b", viewer: { operator: true, readOnly: false },
-    children: React.createElement("p", null, "Social operational outlet"),
+    children: () => React.createElement("p", null, "Social operational outlet"),
   }));
 });
 await flush(); await flush(); await flush();
@@ -380,7 +381,6 @@ assert(!location.search.includes("contract-preview"), "App menu installation swi
 assert(!host.querySelector("[data-contract-preview]"), "new installation never stays behind an old fixture");
 assert(text().includes("Social operational outlet"), "new installation opens its real outlet");
 equal(host.querySelectorAll("[data-chat-pane]").length, 1, "installation switch preserves one chat pane");
-equal(streams, 2, "installation switch reconnects the chat stream once (per-install legacy detection)");
 await React.act(async () => { shellRoot.unmount(); });
 console.log("app view contract checks passed");
 }

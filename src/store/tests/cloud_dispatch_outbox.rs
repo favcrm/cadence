@@ -36,6 +36,37 @@ fn ordinary_local_dispatch_never_creates_a_cloud_claim_candidate() {
 }
 
 #[test]
+fn dispatch_stall_budget_is_written_to_its_kickoff_only() {
+    let (_dir, s) = draft_task();
+    let (_, first, duplicate, _) = s
+        .dispatch_task_with_stall("t1", None, None, "operator", Some(60))
+        .unwrap();
+    assert!(!duplicate);
+    assert_eq!(
+        s.message(&first).unwrap().unwrap().stall_secs,
+        Some(60),
+        "the fresh dispatch records its own budget in the guarded transaction"
+    );
+
+    // A later task in the same job must not retune the first kickoff,
+    // and a duplicate must not rewrite its budget.
+    s.create_task("j1", "t2", None, Some("w1"), None, None, None, None, None)
+        .unwrap();
+    let (_, second, duplicate, _) = s
+        .dispatch_task_with_stall("t2", None, None, "operator", Some(0))
+        .unwrap();
+    assert!(!duplicate);
+    assert_eq!(s.message(&second).unwrap().unwrap().stall_secs, Some(0));
+    assert_eq!(s.message(&first).unwrap().unwrap().stall_secs, Some(60));
+    let (_, same, duplicate, _) = s
+        .dispatch_task_with_stall("t1", None, None, "operator", Some(5))
+        .unwrap();
+    assert!(duplicate);
+    assert_eq!(same, first);
+    assert_eq!(s.message(&first).unwrap().unwrap().stall_secs, Some(60));
+}
+
+#[test]
 fn a_cloud_outbox_insert_failure_does_not_rollback_local_dispatch() {
     let (_dir, s) = draft_task();
     s.fixture_write(|c| {
@@ -71,6 +102,7 @@ fn ordinary_local_plain_dispatch_never_creates_cloud_candidate() {
             &Steer::NONE,
             None,
             None,
+            None,
         )
         .unwrap();
     assert!(!duplicate);
@@ -88,6 +120,7 @@ fn ordinary_local_plain_dispatch_never_creates_cloud_candidate() {
             Some(cwd.to_str().unwrap()),
             &Sender::Unattributed,
             &Steer::NONE,
+            None,
             None,
             None,
         )

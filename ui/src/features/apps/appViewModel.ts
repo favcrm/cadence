@@ -8,6 +8,7 @@ import type {
   AppWorkflow,
   WorkflowRow,
 } from "../../lib/types";
+import type { Installation } from "../workspace-apps/workspaceApps";
 import type { HomeNeed } from "../home/needs";
 import type { Viewer } from "../projects/work";
 
@@ -27,9 +28,67 @@ import type { Viewer } from "../projects/work";
  */
 export type GateRow = Pick<AppRow, "error" | "approval" | "connections" | "source" | "project" | "name">;
 
-/** `/apps/<project>/<name>` — one app's detail route. */
+/** `/apps/<project>/<name>` — one project's legacy app detail route. */
 export function appHref(project: string, name: string): string {
   return `/apps/${encodeURIComponent(project)}/${encodeURIComponent(name)}`;
+}
+
+/** A package key's readable route, or null when its segment is reserved or unsafe. */
+export function installedAppHref(name: string): string | null {
+  if (
+    ["explore", "catalog", "manage"].includes(name) ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name) ||
+    name === "." || name === ".."
+  ) return null;
+  return `/apps/${encodeURIComponent(name)}`;
+}
+
+/** The active (not removed) installs sharing one package key. */
+type KeyedInstall = Pick<Installation, "install_id" | "name" | "removed">;
+function activeInstallsForKey(
+  installs: readonly KeyedInstall[] | null | undefined,
+  name: string,
+): KeyedInstall[] {
+  return (installs ?? []).filter((i) => i.removed == null && i.name === name);
+}
+
+/**
+ * CAD-1438: one installation's canonical `/apps/<key>` route, or null when
+ * the key cannot name it uniquely — no active install with that id, the
+ * install is removed, its key resolves to more than one active install, or
+ * the key itself is not a safe route segment. A `null` answer is the
+ * retired/unavailable outcome: never substitute another install's key.
+ */
+export function installationAppHref(
+  installs: readonly KeyedInstall[] | null | undefined,
+  installId: string,
+): string | null {
+  const install = (installs ?? []).find((i) => i.install_id === installId && i.removed == null);
+  if (!install) return null;
+  if (activeInstallsForKey(installs, install.name).length !== 1) return null;
+  return installedAppHref(install.name);
+}
+
+/**
+ * The v3 app screen of the installation a project app card stands for, or
+ * null: the card keeps its legacy link unless exactly one installation of
+ * that project and name declares a supported screen (CAD-1253) — and the
+ * package key names no other ACTIVE install anywhere (CAD-1438: counting
+ * only this project's installs could mint an ambiguous `/apps/<key>`).
+ * Whether the screen mounts stays the host's own approval check.
+ */
+export function screenInstallHref(
+  installs: Pick<Installation, "install_id" | "name" | "project_link" | "files" | "removed" | "state">[] | null,
+  project: string,
+  name: string,
+): string | null {
+  const hits = (installs ?? []).filter(
+    (i) =>
+      i.removed == null && (i.state ?? "active") === "active" && i.name === name && i.project_link === project &&
+      i.files.some((f) => /^screens\/[a-z0-9][a-z0-9-]{0,31}\/screens\.json$/.test(f)),
+  );
+  if (hits.length !== 1) return null;
+  return installationAppHref(installs, hits[0].install_id);
 }
 
 /**
@@ -359,7 +418,11 @@ export function runState(run: AppRun, needs: HomeNeed[]): RunState {
 }
 
 /** What the Apps list card says under the title: "2 in progress · 1 needs you". */
-export function runsSummary(runs: AppRun[], needs: HomeNeed[]): string | null {
+export function runsSummary(
+  runs: AppRun[],
+  needs: HomeNeed[],
+  t: (english: string) => string = (english) => english,
+): string | null {
   if (runs.length === 0) return null;
   let progress = 0;
   let waiting = 0;
@@ -369,9 +432,10 @@ export function runsSummary(runs: AppRun[], needs: HomeNeed[]): string | null {
     else if (state.text === "running") progress += 1;
   }
   const parts: string[] = [];
-  if (progress > 0) parts.push(`${progress} in progress`);
-  if (waiting > 0) parts.push(`${waiting} need${waiting === 1 ? "s" : ""} you`);
-  return parts.length > 0 ? parts.join(" · ") : "Nothing running";
+  if (progress > 0) parts.push(t("{count} in progress").replace("{count}", String(progress)));
+  if (waiting > 0)
+    parts.push(t(waiting === 1 ? "{count} needs you" : "{count} need you").replace("{count}", String(waiting)));
+  return parts.length > 0 ? parts.join(" · ") : t("Nothing running");
 }
 
 /**
@@ -550,17 +614,20 @@ export function appWorkflowRow(project: string, app: AppDetail, wf: AppWorkflow)
 }
 
 /** The approval chip for an app row — a static class per state. */
-export function appApprovalChip(row: GateRow): { text: string; cls: string } {
-  if (row.error) return { text: "broken", cls: "bg-fail/10 text-fail" };
+export function appApprovalChip(
+  row: GateRow,
+  t: (english: string) => string = (english) => english,
+): { text: string; cls: string } {
+  if (row.error) return { text: t("broken"), cls: "bg-fail/10 text-fail" };
   switch (row.approval) {
     case "approved":
-      return { text: "approved", cls: "bg-ok/15 text-ok" };
+      return { text: t("approved"), cls: "bg-ok/15 text-ok" };
     case "changed":
-      return { text: "changed since approval", cls: "bg-warn/10 text-warn" };
+      return { text: t("changed since approval"), cls: "bg-warn/10 text-warn" };
     case "unknown":
-      return { text: "approval unknown", cls: "bg-ink-800 text-ink-400" };
+      return { text: t("approval unknown"), cls: "bg-ink-800 text-ink-400" };
     default:
-      return { text: "unapproved", cls: "bg-warn/10 text-warn" };
+      return { text: t("unapproved"), cls: "bg-warn/10 text-warn" };
   }
 }
 
@@ -685,13 +752,23 @@ export function isReadyToRun(app: AppDetail): boolean {
  * the operator's language ("Approve the app, then set the team"), never
  * the engine's "pass `--input k=v`".
  */
-export function notReadyText(app: AppDetail): string | null {
-  const gaps = readyChecklist(app).filter((i) => !i.done);
-  if (gaps.length === 0) return null;
-  const actions = { approved: "approve the app", team: "choose the team", publish: "connect publishing to Local outbox" };
-  const words = gaps.map((g) => actions[g.key]);
-  const list = words.length > 1 ? `${words.slice(0, -1).join(", ")} and ${words.at(-1)}` : words[0];
-  return `${list[0].toUpperCase()}${list.slice(1)} to start a run.`;
+export function notReadyText(
+  app: AppDetail,
+  t: (english: string) => string = (english) => english,
+): string | null {
+  const gaps = new Set(readyChecklist(app).filter((i) => !i.done).map((i) => i.key));
+  if (gaps.size === 0) return null;
+  // One whole sentence per gap set: a translation keeps its own word order.
+  const approved = gaps.has("approved");
+  const team = gaps.has("team");
+  const publish = gaps.has("publish");
+  if (approved && team && publish) return t("Approve the app, choose the team and connect publishing to Local outbox to start a run.");
+  if (approved && team) return t("Approve the app and choose the team to start a run.");
+  if (approved && publish) return t("Approve the app and connect publishing to Local outbox to start a run.");
+  if (team && publish) return t("Choose the team and connect publishing to Local outbox to start a run.");
+  if (approved) return t("Approve the app to start a run.");
+  if (team) return t("Choose the team to start a run.");
+  return t("Connect publishing to Local outbox to start a run.");
 }
 
 /**
@@ -700,7 +777,7 @@ export function notReadyText(app: AppDetail): string | null {
  * worker that can run.
  */
 export function teamCandidates(
-  agents: { alias: string; state?: string; inbox?: boolean }[] | undefined,
+  agents: { alias: string; state?: string | null; inbox?: boolean | null }[] | undefined,
 ): { alias: string; state: string }[] {
   return (agents ?? [])
     .filter((a) => !a.inbox)

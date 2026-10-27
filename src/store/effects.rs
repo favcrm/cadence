@@ -457,14 +457,41 @@ impl Store {
     /// A separate commit keeps "accept recorded, execution unproven"
     /// distinguishable from "executing" at restart — both reconcile,
     /// but the record says exactly where the run stopped.
-    pub fn effect_executing(&self, effect_id: &str) -> Result<()> {
+    pub fn effect_executing(&self, effect_id: &str, expected: &EffectRow) -> Result<EffectRow> {
         self.write_tx(|conn| {
-            conn.execute(
+            let n = conn.execute(
                 "UPDATE platform_effects SET state='executing', updated_at=?2
                          WHERE effect_id=?1 AND state='decided'",
                 params![effect_id, now()],
             )?;
-            Ok(())
+            if n != 1 {
+                return Err(Error::invalid(
+                    "effect_not_claimable",
+                    "effect is not claimable",
+                ));
+            }
+            let row = conn.query_row(
+                "SELECT * FROM platform_effects WHERE effect_id=?1",
+                params![effect_id],
+                EffectRow::from_row,
+            )?;
+            if row.effect_id != expected.effect_id
+                || row.request != expected.request
+                || row.agent != expected.agent
+                || row.platform != expected.platform
+                || row.account != expected.account
+                || row.tool != expected.tool
+                || row.input != expected.input
+                || row.source_name != expected.source_name
+                || row.source_hash != expected.source_hash
+                || row.scopes != expected.scopes
+            {
+                return Err(Error::invalid(
+                    "effect_not_claimable",
+                    "effect call identity changed",
+                ));
+            }
+            Ok(row)
         })
     }
 

@@ -1,10 +1,10 @@
 import { NO_FILTERS } from "../src/lib/filters";
+import { readThreadsUrl } from "../src/features/threads/threadsView";
 import {
   goTo,
   legacyRedirect,
   locationHref,
   matchRoute,
-  NAV,
   openProject,
   projectScope,
   readLocation,
@@ -24,6 +24,7 @@ function equal(actual: unknown, expected: unknown, what: string): void {
 // Every MVP route matches and prints back to the same path.
 const paths: [string, Route][] = [
   ["/", { screen: "home" }],
+  ["/my-work", { screen: "myWork" }],
   ["/projects", { screen: "projects", slug: null, section: "overview" }],
   ["/projects/cadence", { screen: "projects", slug: "cadence", section: "overview" }],
   ["/projects/cadence/issues", { screen: "projects", slug: "cadence", section: "issues" }],
@@ -33,15 +34,22 @@ const paths: [string, Route][] = [
   ["/projects/cadence/workflows", { screen: "projects", slug: "cadence", section: "workflows" }],
   ["/projects/cadence/issues/CAD-607", { screen: "issue", project: "cadence", id: "CAD-607", tab: "overview" }],
   ["/apps", { screen: "apps", project: null, name: null }],
+  ["/apps/social-content", { screen: "workspaceAppKey", appKey: "social-content" }],
+  ["/apps/crm", { screen: "workspaceAppKey", appKey: "crm" }],
   ["/app-installations/install-social", { screen: "workspaceApp", installId: "install-social" }],
   ["/apps/cadence/studio", { screen: "apps", project: "cadence", name: "studio" }],
   ["/agents", { screen: "agents", alias: null }],
   ["/agents/cc-1", { screen: "agents", alias: "cc-1" }],
+  ["/threads", { screen: "threads" }],
   ["/setup", { screen: "setup" }],
   ["/overview", { screen: "overview" }],
   ["/settings", { screen: "settings", section: "models" }],
   ["/settings/memory", { screen: "settings", section: "memory" }],
   ["/settings/permissions", { screen: "settings", section: "permissions" }],
+  ["/settings/connections", { screen: "settings", section: "connections" }],
+  ["/settings/connections/new", { screen: "settings", section: "connections", page: { kind: "add" } }],
+  ["/settings/connections/new/smtp", { screen: "settings", section: "connections", page: { kind: "addProvider", provider: "smtp" } }],
+  ["/settings/connections/account/c-1", { screen: "settings", section: "connections", page: { kind: "detail", id: "c-1" } }],
   ["/settings/email", { screen: "settings", section: "email" }],
   ["/outbox", { screen: "outbox" }],
   ["/login", { screen: "login" }],
@@ -55,25 +63,55 @@ equal(matchRoute("/agents/a%20b"), { screen: "agents", alias: "a b" }, "decoded 
 equal(routePath({ screen: "agents", alias: "a b" }), "/agents/a%20b", "encoded alias");
 equal(matchRoute("/index.html"), { screen: "home" }, "index.html is home");
 equal(projectScope({ screen: "workspaceApp", installId: "install-social" }), "none", "workspace app has no project scope");
+equal(projectScope({ screen: "workspaceAppKey", appKey: "crm" }), "none", "friendly app route has no project scope");
 for (const path of ["/app-installations", "/app-installations/..", "/app-installations/a%2Fb", "/app-installations/a/extra"]) {
   equal(matchRoute(path).screen, "notFound", `invalid installation route ${path}`);
 }
-for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/issues/CAD-1/extra", "/agents/a/b", "/apps/p", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0"]) {
+for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/issues/CAD-1/extra", "/agents/a/b", "/apps/%2F", "/apps/%E0", "/apps/catalog", "/apps/manage", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0", "/settings/connections/new/smtp/extra", "/settings/connections/account", "/settings/connections/bogus", "/settings/connections/new/%E0", "/settings/account/unwanted", "/settings/memory/extra", "/settings/update/extra", "/settings/permissions/extra", "/settings/email/extra", "/settings/connections/account/x/y", "/settings/connections/new//smtp", "/settings/connections/account//c-1", "/settings/connections//new"]) {
   equal(matchRoute(dead).screen, "notFound", `not found ${dead}`);
 }
+equal(matchRoute("/my-work/extra").screen, "notFound", "My work has no nested routes");
 
-// Main nav: MVP screens only (Wiki joined in CAD-581).
-equal(
-  NAV.map((n) => n.label),
-  ["Home", "Projects", "Wiki", "Apps", "Agents", "Outbox", "Settings"],
-  "nav",
-);
+// CAD-1703: My work's tab, search and filters live in its URL and round-trip;
+// they never follow a navigation to another screen.
+{
+  const search = "?tab=done&search=smtp+relay&project=agenticos-v2&priority=P1&blocked=1&sort=priority";
+  const loc = readLocation("/my-work", search);
+  equal(loc.route, {
+    screen: "myWork",
+    view: { tab: "done", search: "smtp relay", project: "agenticos-v2", priority: "P1", blocked: true, sort: "priority" },
+  }, "My work reads its view");
+  equal(locationHref(loc, search), "/my-work?tab=done&search=smtp+relay&project=agenticos-v2&priority=P1&blocked=1&sort=priority", "My work view round-trips");
+  equal(scopeRedirect("/my-work", search), null, "My work keeps its project filter");
+  equal(readLocation("/my-work", "?tab=bogus&priority=P9&project=..%2Fx&sort=owner").route, { screen: "myWork" }, "malformed view values fall back to defaults");
+  equal(locationHref(goTo(loc, { screen: "threads" }), search), "/threads", "My work view stays on My work");
+  equal(locationHref({ ...loc, route: { screen: "myWork", view: {} } }, search), "/my-work", "the default view has a bare URL");
+}
+
+
+// CAD-1811: the shared issue detail opens over Threads through `?issue=`.
+// Threads owns its list scope in `?project=`, so opening and closing the
+// detail must keep the conversation, agent, kind, system flag and project.
+{
+  const search = "?c=conv-1&project=cadence&agent=cc-1&kind=agents&system=1";
+  const loc = readLocation("/threads", search);
+  const params = (href: string) => {
+    const q = new URLSearchParams(href.slice(href.indexOf("?") + 1));
+    return [...q].sort(([a], [b]) => a.localeCompare(b));
+  };
+  const openedHref = locationHref({ ...loc, openId: "CAD-77" }, search, { screen: "threads" });
+  equal(params(openedHref), params("/threads?c=conv-1&project=cadence&agent=cc-1&kind=agents&system=1&issue=CAD-77"), "the detail URL keeps Threads scope");
+  const openedSearch = openedHref.slice(openedHref.indexOf("?"));
+  equal(readThreadsUrl(openedSearch), { conversation: "conv-1", kind: "agents", project: "cadence", agent: "cc-1", includeSystem: true }, "Threads reads unchanged list scope with the detail open");
+  const reopened = readLocation("/threads", openedSearch);
+  equal(params(locationHref({ ...reopened, openId: null }, openedSearch, { screen: "threads" })), params("/threads?c=conv-1&project=cadence&agent=cc-1&kind=agents&system=1"), "closing the detail keeps Threads scope");
+}
 
 // Which screens keep a project. One table.
 equal(projectScope({ screen: "projects", slug: "cadence", section: "issues" }), "slug", "projects are the slug");
-equal(projectScope({ screen: "agents", alias: null }), "chips", "agents");
+equal(projectScope({ screen: "agents", alias: null }), "none", "agents (CAD-1772: the team, not a project)");
 equal(projectScope({ screen: "overview" }), "chips", "overview");
-equal(projectScope({ screen: "apps", project: null, name: null }), "chips", "apps list");
+equal(projectScope({ screen: "apps", project: null, name: null }), "none", "apps list is a workspace home");
 equal(projectScope({ screen: "apps", project: "cadence", name: "studio" }), "none", "app detail is not a filter");
 equal(projectScope({ screen: "settings", section: "memory" }), "picker", "memory");
 equal(projectScope({ screen: "settings", section: "models" }), "none", "models");
@@ -87,7 +125,8 @@ equal(showProjectChoices(0, "all"), false, "no projects hides the row");
 equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible");
 
 // Reading a location: the slug is the scope on Projects. ?project= is the
-// in-page filter on Agents, Overview, Apps and Memory. Elsewhere it is ignored.
+// in-page filter on Agents, Team overview and Settings → Memory. Elsewhere
+// it is ignored.
 {
   const loc = readLocation("/projects/cadence", "?view=kanban&tag=ui&issue=CAD-1", "list");
   equal(loc.project, "cadence", "slug scope");
@@ -95,7 +134,7 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
   equal(loc.filters.tags, ["ui"], "filters on projects");
   equal(loc.openId, "CAD-1", "drawer");
   const agents = readLocation("/agents", "?project=cadence&tag=ui");
-  equal(agents.project, "cadence", "agents filter");
+  equal(agents.project, "all", "agents carry no project filter");
   equal(agents.filters, NO_FILTERS, "filters only on projects");
   equal(readLocation("/projects", "", "kanban").view, "kanban", "stored view");
   equal(readLocation("/", "").project, "all", "no scope");
@@ -110,7 +149,7 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
   const detail = readLocation("/apps/cadence/studio", "?project=other");
   equal(detail.project, "all", "app detail ignores query project");
   equal(detail.route, { screen: "apps", project: "cadence", name: "studio" }, "app detail route");
-  equal(readLocation("/apps", "?project=cadence").project, "cadence", "apps query scope");
+  equal(readLocation("/apps", "?project=cadence").project, "all", "apps ignores query project");
 }
 
 // An app detail href does not repeat its path's project in the query.
@@ -118,11 +157,13 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
   const loc = readLocation("/apps/cadence/studio", "");
   equal(locationHref(loc), "/apps/cadence/studio", "app detail href");
   const list = readLocation("/apps", "?project=cadence");
-  equal(locationHref(list), "/apps?project=cadence", "apps href keeps scope");
+  equal(locationHref(list), "/apps", "apps href drops the query project");
 }
 
 // CAD-1026: an app page's native-controls choice never follows to another installation.
 {
+  const friendly = readLocation("/apps/crm", "?crm=segments&ctx=scope-a");
+  equal(locationHref(friendly, "?crm=segments&ctx=scope-a"), "/apps/crm?crm=segments&ctx=scope-a", "friendly app href keeps app query context");
   const here = readLocation("/app-installations/install-a", "?screen=native");
   equal(
     locationHref(goTo(here, { screen: "workspaceApp", installId: "install-b" }), "?screen=native&foo=1"),
@@ -171,8 +212,8 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
   equal(locationHref(withProject(page, "other")), "/projects/other/issues?view=list", "leaving an issue for another project's issue list");
   equal(
     locationHref(goTo(page, { screen: "agents", alias: null })),
-    "/agents?project=cadence",
-    "issue → agents keeps the project and drops the peek",
+    "/agents",
+    "issue → agents carries no project and drops the peek",
   );
 }
 
@@ -181,20 +222,20 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
   const here = readLocation("/projects/cadence", "?view=list&issue=CAD-3");
   equal(
     locationHref(goTo(here, { screen: "agents", alias: null })),
-    "/agents?project=cadence&issue=CAD-3",
-    "projects → agents",
+    "/agents?issue=CAD-3",
+    "projects → agents carries no project",
   );
-  const agents = readLocation("/agents", "?project=cadence");
+  const agents = readLocation("/overview", "?project=cadence");
   equal(
     locationHref(goTo(agents, { screen: "projects", slug: null, section: "issues" })),
     "/projects/cadence/issues?view=list",
-    "agents → projects keeps the scope as the slug",
+    "overview → projects keeps the scope as the slug",
   );
   equal(locationHref(openProject(here, "all")), "/projects?view=list&issue=CAD-3", "sidebar all projects opens the board");
   equal(
-    locationHref(openProject(readLocation("/agents", "?project=kidult"), "cadence")),
+    locationHref(openProject(readLocation("/overview", "?project=kidult"), "cadence")),
     "/projects/cadence",
-    "sidebar on agents opens the project overview",
+    "sidebar on overview opens the project overview",
   );
   equal(
     locationHref(openProject(readLocation("/projects/cadence/epics", ""), "kidult")),
@@ -202,9 +243,9 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
     "sidebar keeps the project section",
   );
   equal(
-    locationHref(withProject(readLocation("/agents", ""), "cadence")),
-    "/agents?project=cadence",
-    "agents chip sets the filter",
+    locationHref(withProject(readLocation("/overview", ""), "cadence")),
+    "/overview?project=cadence",
+    "an overview chip sets the filter",
   );
   equal(
     locationHref(withProject(readLocation("/", "?issue=CAD-1"), "cadence")),
@@ -241,7 +282,7 @@ const legacy: [string, string][] = [
   ["?view=list", "/projects?view=list"],
   ["?tab=plan&project=cadence", "/projects/cadence/context"],
   ["?tab=plan", "/projects?view=list"],
-  ["?tab=agents&project=cadence&issue=CAD-7", "/agents?project=cadence&issue=CAD-7"],
+  ["?tab=agents&project=cadence&issue=CAD-7", "/agents?issue=CAD-7"],
   ["?tab=memory&project=cadence", "/settings/memory?project=cadence"],
   ["?tab=settings", "/settings"],
   ["?tab=loops&x=1", "/?x=1"],
@@ -262,8 +303,9 @@ equal(scopeRedirect("/outbox", "?project=cadence&item=ef-1"), "/outbox?item=ef-1
 equal(scopeRedirect("/settings", "?project=cadence"), "/settings", "settings drops ?project=");
 equal(scopeRedirect("/settings/update", "?project=cadence"), "/settings/update", "update drops ?project=");
 equal(scopeRedirect("/apps/cadence/studio", "?project=other"), "/apps/cadence/studio", "app detail drops query project");
-equal(scopeRedirect("/agents", "?project=cadence"), null, "agents keeps the filter");
-equal(scopeRedirect("/apps", "?project=cadence"), null, "apps keeps the filter");
+equal(scopeRedirect("/agents", "?project=cadence"), "/agents", "agents drops ?project= (the team, not a project)");
+equal(scopeRedirect("/overview", "?project=cadence"), null, "overview keeps the filter");
+equal(scopeRedirect("/apps", "?project=cadence"), "/apps", "apps drops the query project");
 equal(scopeRedirect("/overview", "?project=cadence"), null, "overview keeps the filter");
 equal(scopeRedirect("/settings/memory", "?project=cadence"), null, "memory keeps the filter");
 equal(legacyRedirect("/projects/cadence", "?view=list"), null, "a routed URL is not legacy");

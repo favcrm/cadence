@@ -1,10 +1,11 @@
 # Connected-platform contract fixture — v1
 
-The machine-readable copy of [ADR 0006](../../../docs/adr/0006-connected-platform-contract.md)
-§5.2/§5.4 — the contract two codebases implement: **Cadence** (CAD-366
+The machine-readable copy of ADR 0006 §5.2/§5.4 (the decision record is
+local working material and is not shipped in this repository) — the contract
+two codebases implement: **Cadence** (CAD-366
 credential proxy, CAD-506 effect gate) and **AgenticOS v2** (AOS-49
-credential exchange, AOS-52 tool manifest). Both test suites consume
-this directory so neither side drifts (§5.6).
+credential exchange, AOS-52 tool manifest). This directory supplies shared
+test inputs (§5.6); current Cadence coverage is described below.
 
 ## Contents
 
@@ -31,15 +32,14 @@ The path is the version: `contracts/connected-platform/v<N>/`.
 
 ## How consumers use it
 
-**Cadence** — `tests/contract_fixture.rs` loads this directory
-(`CARGO_MANIFEST_DIR/contracts/connected-platform/v1/`), validates the
-table and every vector against the schemas, asserts malformed tables
-are really rejected, and checks each vector's expectations against the
-contract's classification rules (C1–C3) and the C6 press-authority
-invariant. A broken vector fails CI. Executing the vectors through the
-real gate is CAD-506's job; the seam is the `step`/`expect` vocabulary
-plus the fake platform (`src/contract_fixture.rs`,
-`FakePlatform::standard()`).
+**Cadence** — the vector driver `tests/contract_fixture.rs` was retired
+under CAD-1073; its absence is not evidence that every vector still runs
+in CI. `src/contract_fixture.rs` retains the production tool-table,
+classification and read-back vocabulary. Its unit check exercises
+fail-closed classification, and the connection-descriptor check uses
+`FakePlatform::standard()` in a test-only build. The shared schemas,
+table and vectors remain available for pinned consumers; the unused Rust
+pending-record mirrors are no longer maintained.
 
 **AgenticOS** (AOS-49/52) — vendor or fetch this directory at a pinned
 cadence commit; treat it as immutable. Validate `vectors.json` and
@@ -118,11 +118,13 @@ it. The DSL, in full:
 
 The behavioural `expect` keys — `result`, `press`, `fired`,
 `executions`, `verified`, `needs_you`, `delivered`, `wait`, `state`,
-`close_reason`, `effect_id` — are asserted by CAD-506 when it executes
-the vectors against the real gate. This directory's own check
-(`tests/contract_fixture.rs`) proves only what data can prove: schema
-conformance, classification coherence (C1–C3, C6), and that specimen
-hashes match the declared source bytes.
+`close_reason`, `effect_id` — describe the expected CAD-506 gate behavior
+when a consumer executes the vectors against the real gate. The retired
+`tests/contract_fixture.rs` driver checked schema conformance,
+classification coherence (C1–C3, C6), and specimen hashes against the
+declared source bytes; it did not prove those runtime behaviors. These
+vectors remain contract inputs, not evidence that the retired driver or
+every scenario currently runs in CI.
 
 ### The scenario list and what each proves
 
@@ -150,10 +152,11 @@ hashes match the declared source bytes.
 
 ## The fake adapter
 
-`src/contract_fixture.rs` ships `FakePlatform`: the deterministic
-platform-side double these vectors describe — this directory's
-`fake-tool-table.json` as its declared table, a recorded execution log
-("did it fire?"), idempotency-key dedupe (C9), source artifacts with
-sha256 hashes, and read-back/fault knobs matching `given.adapter`. No
-network, no credentials. Cadence's proxy and effect-gate tests
-(CAD-366/506) drive it; AgenticOS implements the same knobs.
+`src/contract_fixture.rs` provides `FakePlatform` only under `cfg(test)`:
+the deterministic platform-side double these vectors describe — this
+directory's `fake-tool-table.json` as its declared table, a recorded
+execution log ("did it fire?"), idempotency-key dedupe (C9), source
+artifacts with sha256 hashes, and read-back/fault knobs matching
+`given.adapter`. No network, no credentials. AgenticOS implements the
+same knobs; Cadence's active descriptor check does not execute every
+vector or prove all of those simulated behaviors.

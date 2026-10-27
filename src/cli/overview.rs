@@ -13,6 +13,7 @@ pub(super) fn run_overview(
     scope: cadence_agent::overview::Scope,
 ) -> Result<i32> {
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let json = cadence_agent::output::json_selected(json_out);
     let pm_dir = cadence_agent::issue::default_dir().unwrap_or_default();
     let opts = cadence_agent::overview::Options {
         scope,
@@ -21,8 +22,11 @@ pub(super) fn run_overview(
     loop {
         let view = cadence_agent::overview::overview_with(state_dir, &pm_dir, &opts)
             .map_err(Error::rejected)?;
-        if json_out {
-            print_json(&view);
+        if json {
+            println!(
+                "{}",
+                cadence_agent::output::observation_body(&view, watch.is_some())?
+            );
         } else {
             print_overview(&view);
         }
@@ -30,7 +34,7 @@ pub(super) fn run_overview(
             return Ok(0);
         };
         std::thread::sleep(Duration::from_secs(secs));
-        if tty && !json_out {
+        if tty && !json {
             print!("\x1b[2J\x1b[H");
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }

@@ -1,0 +1,33 @@
+{
+  "alias": "master",
+  "commands": [
+    "state",
+    "stats"
+  ],
+  "context": {
+    "percent": 0.617,
+    "tokens": 1234,
+    "window": 200000
+  },
+  "effort": "medium",
+  "endpoint_kind": "managed",
+  "identity": {
+    "look": "robot",
+    "name": null,
+    "revision": "b40c80878cd6912c06e80a3da722e0babdf1720f8c14d33c3f98da53d1a5d169",
+    "tone": null
+  },
+  "live": true,
+  "model": "live/model-2",
+  "model_label": "Live Model 2",
+  "provider": "pi",
+  "queue": [],
+  "queued": 0,
+  "session": {
+    "compacting": false,
+    "id": "sess-1",
+    "messages": 7,
+    "streaming": true
+  },
+  "turn": null
+}

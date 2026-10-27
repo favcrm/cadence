@@ -1,5 +1,8 @@
 //! Operator-only HTTP for stable-ID local runs. Worker artifact access is RPC-only.
-use super::{err_response, home, json_response, parse_json, read_body, HttpResp};
+use super::{
+    app_screens, err_response, home, json_response, operator, parse_json, read_body, HttpResp,
+    ServeOpts,
+};
 use crate::client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -154,6 +157,8 @@ where
 #[serde(deny_unknown_fields)]
 struct Decision {
     digest: String,
+    #[serde(default)]
+    expected_generation: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -193,11 +198,38 @@ fn query(request: &Request, allow_install: bool) -> Result<Value, HttpResp> {
     Ok(Value::Object(params))
 }
 
+/// The read-only path (and the pre-CAD-1374 signature): a write here has no
+/// public-session relay, so it is refused rather than sent unattributed.
 pub(super) fn handle(
     request: &mut Request,
     state: &Path,
     route: Route<'_>,
     write: bool,
+    opts: &ServeOpts,
+) -> HttpResp {
+    if write {
+        return err_response(405, "method not allowed");
+    }
+    handle_with_relay(
+        request,
+        state,
+        route,
+        false,
+        operator::PublicRelay::NotPublic,
+        opts,
+    )
+}
+
+/// CAD-1374: the write-capable handler. `relay` is the caller's public-session
+/// proof; writes on the public host must carry one, and it is attached only to
+/// the owner lifecycle verbs the daemon attributes.
+pub(super) fn handle_with_relay(
+    request: &mut Request,
+    state: &Path,
+    route: Route<'_>,
+    write: bool,
+    relay: operator::PublicRelay,
+    opts: &ServeOpts,
 ) -> HttpResp {
     let route = if write && matches!(route, Route::List) {
         Route::Create
@@ -225,10 +257,19 @@ pub(super) fn handle(
                 Ok(value) => value,
                 Err(response) => return response,
             };
-            (
-                "app_run_create",
-                serde_json::to_value(value).expect("typed create serializes"),
-            )
+            let mut params = serde_json::to_value(value).expect("typed create serializes");
+            // CAD-1365: the trusted host adds the request's own proven
+            // session credential for native creator resolution — the
+            // typed body can never carry one, and a request without a
+            // live session fails closed, never a credential-less
+            // operator relay.
+            let Some((token, key, origin)) = app_screens::request_credentials(request, opts) else {
+                return err_response(403, "run create needs a live operator session");
+            };
+            params["token"] = json!(token);
+            params["key"] = json!(key);
+            params["origin"] = json!(origin);
+            ("app_run_create", params)
         }
         Route::Start => {
             let bytes = match read_body(request, BODY_CAP) {
@@ -239,10 +280,14 @@ pub(super) fn handle(
                 Ok(value) => value,
                 Err(response) => return response,
             };
-            (
-                "app_run_start",
-                serde_json::to_value(value).expect("typed start serializes"),
-            )
+            let mut params = serde_json::to_value(value).expect("typed start serializes");
+            let Some((token, key, origin)) = app_screens::request_credentials(request, opts) else {
+                return err_response(403, "run start needs a live operator session");
+            };
+            params["token"] = json!(token);
+            params["key"] = json!(key);
+            params["origin"] = json!(origin);
+            ("app_run_start", params)
         }
         Route::Team(id) if !write => ("app_install_team_show", json!({"install_id":id})),
         Route::Team(id) => {
@@ -267,15 +312,29 @@ pub(super) fn handle(
                 Ok(value) => value,
                 Err(response) => return response,
             };
+            if decision.expected_generation.is_some()
+                && !matches!(route, Route::InstallDecision(_, false))
+            {
+                return err_response(
+                    400,
+                    "expected_generation is only valid for installation revoke",
+                );
+            }
             match route {
                 Route::InstallDecision(_, true) => (
                     "app_local_install_approve",
                     json!({"install_id":id,"digest":decision.digest}),
                 ),
-                Route::InstallDecision(_, false) => (
-                    "app_local_install_revoke",
-                    json!({"install_id":id,"digest":decision.digest}),
-                ),
+                Route::InstallDecision(_, false) => {
+                    let mut params = json!({"install_id":id,"digest":decision.digest});
+                    if let Some(generation) = decision.expected_generation {
+                        params["expected_generation"] = json!(generation);
+                    }
+                    if let Some(operation_id) = super::apps::hosted_operation_id(request) {
+                        params["hosted_operation_id"] = json!(operation_id);
+                    }
+                    ("app_local_install_revoke", params)
+                }
                 _ => (
                     "app_run_approve",
                     json!({"run_id":id,"digest":decision.digest}),
@@ -300,6 +359,25 @@ pub(super) fn handle(
             )
         }
     };
+    // CAD-1374: attribute owner writes. Only the verbs the daemon stamps
+    // with a verified human take the proof; a public-host write without one
+    // is refused before any RPC.
+    let mut params = params;
+    let attributed = matches!(
+        method,
+        "app_local_install_approve"
+            | "app_local_install_revoke"
+            | "app_run_create"
+            | "app_run_start"
+            | "app_run_approve"
+            | "app_run_cancel"
+            | "app_run_dispatch"
+    );
+    if attributed {
+        if let Err(response) = operator::relay_owner_proof(&mut params, relay) {
+            return response;
+        }
+    }
     match client::rpc(state, method, params) {
         Ok(value) => {
             if let Route::Artifact(id) = route {

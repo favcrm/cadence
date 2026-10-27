@@ -32,15 +32,14 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::issue::model;
 use crate::issue::time;
-use crate::issue::{board, finish, line_times::LineTimes, project, write, Pm};
-use crate::proc::run_bounded;
+use crate::issue::{board, finish, line_times::LineTimes, project, start, write, Pm};
 use crate::worktree::layout;
 
 /// One GitHub PR row relevant to an issue lane.
@@ -95,7 +94,7 @@ fn gh_list(root: &Path, branch: &str) -> GhProbe {
         "10",
     ])
     .current_dir(root);
-    let Ok(out) = run_bounded(&mut cmd, Duration::from_secs(10)) else {
+    let Ok(out) = crate::gh_guard::run(&mut cmd, Duration::from_secs(10)) else {
         return GhProbe::Unreachable;
     };
     if !out.status.success() {
@@ -136,7 +135,7 @@ fn gh_view(cwd: &Path, url: &str) -> GhProbe {
         "number,state,mergedAt,headRefOid,baseRefName",
     ])
     .current_dir(cwd);
-    let Ok(out) = run_bounded(&mut cmd, Duration::from_secs(10)) else {
+    let Ok(out) = crate::gh_guard::run(&mut cmd, Duration::from_secs(10)) else {
         return GhProbe::Unreachable;
     };
     if !out.status.success() {
@@ -326,8 +325,9 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
     let mut merged_at: Option<i64> = None;
     let mut saw_unmerged = false;
     let mut saw_not_started = false;
-    let mut gh_failed = false;
-    let mut gh_checked = false;
+    // Every ref whose GitHub probe could not answer (CAD-1755): one
+    // successful probe never vouches for another ref's PR state.
+    let mut unverified: Vec<String> = Vec::new();
 
     for (branch, root) in &p.lanes {
         let into = finish::default_ref(root);
@@ -368,11 +368,10 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
         match pr_list(root, branch) {
             GhProbe::NoRemote => row["prs"] = json!("no-remote"),
             GhProbe::Unreachable => {
-                gh_failed = true;
+                unverified.push(branch.clone());
                 row["prs"] = json!("unreachable");
             }
             GhProbe::Ok(prs) => {
-                gh_checked = true;
                 row["prs"] = json!(prs
                     .iter()
                     .map(|pr| json!({"number": pr.number, "state": pr.state}))
@@ -408,7 +407,6 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
         });
         match pr_view(&cwd, url) {
             GhProbe::Ok(prs) => {
-                gh_checked = true;
                 for pr in prs {
                     match pr.state.as_str() {
                         "open" => {
@@ -428,20 +426,24 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
                     }
                 }
             }
-            GhProbe::Unreachable => gh_failed = true,
+            GhProbe::Unreachable => unverified.push(url.clone()),
             GhProbe::NoRemote => {}
         }
     }
 
-    let detail = json!({"lanes": detail_lanes});
+    let mut detail = json!({"lanes": detail_lanes});
+    if !unverified.is_empty() {
+        detail["unverified"] = json!(unverified);
+    }
     let verdict = match merged {
         Some((how, lane, pr, _)) => {
             if open_pr.is_some() {
                 Verdict::Held("open-pr")
-            } else if gh_failed && !gh_checked {
-                // Local evidence says merged but GitHub is unverifiable
-                // — an open PR or closed-unmerged PR could change the
-                // verdict. Never close on a guess.
+            } else if !unverified.is_empty() {
+                // Merge evidence exists but some ref's PR state is
+                // unverifiable — an open follow-up PR or a
+                // closed-unmerged PR there could change the verdict.
+                // Never close on a guess; `detail.unverified` names them.
                 Verdict::Held("pr-state-unverified")
             } else if let Some(claim) = p.claim_at {
                 match merged_at {
@@ -480,22 +482,35 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
     (verdict, detail)
 }
 
+/// One lock-wait deadline shared by every close of a CLI reconcile
+/// (CAD-1153): a busy tracker costs at most this across the whole run
+/// — not `wait` per close — so N merged tickets cannot block ~N x 30 s.
+/// The daemon path passes `None` and keeps the never-wait rule.
+const CLI_CLOSE_LOCK_WAIT: Duration = Duration::from_secs(30);
+
 /// `issue reconcile [--project P] [--dry-run] [--limit N]` — the
 /// sweep. Leaf issues whose file OR derived status is `doing`/`review`
 /// are marked done when their recorded work merged. The derived side
 /// (CAD-823) covers a ticket whose file never left backlog/ready
 /// while a note or a live job says in flight — a verdict no longer
 /// fakes `done`, so it must still reach the probe — and a live job
-/// still outranks even a terminal file (CAD-244). (One commit per
-/// issue, `mark_done_on_merge` semantics: `expect` pins the status it
-/// was read at so a mid-sweep reopen is never overwritten.)
-/// `held`/`stalled` rows are reported, not moved.
+/// still outranks even a terminal file (CAD-244). The notes-derived
+/// arm admits only a fresh note: a `status:` write recorded after the
+/// newest tagged note (an operator park/reopen) wins, and a failed
+/// history walk admits nothing through it — the sweep reports that
+/// failure on `history` instead of widening on a guess (CAD-878).
+/// A job-derived candidate needs no history at all; it widens even
+/// when the walk fails. (One commit per issue, `mark_done_on_merge`
+/// semantics: `expect` pins the status it was read at so a mid-sweep
+/// reopen is never overwritten.) `held`/`stalled` rows are reported,
+/// not moved. `limit` charges only evidence-bearing candidates — an
+/// issue with lanes or `pr:` refs; a ref-less candidate classifies
+/// `skipped` for free so idle note-driven tickets ahead of it never
+/// starve it. The CLI starts at the head; daemon ticks retain a
+/// rotating cursor so unresolved candidates cannot starve later ones
+/// (see [`run_daemon`]).
 /// Then `finish --merged` sweeps the same evidence — worktree refs
 /// and branches the merge already covered get cleaned up.
-/// How long a CLI reconcile waits for a busy tracker lock before it
-/// reports a close as `error` (CAD-1150).
-const CLI_CLOSE_LOCK_WAIT: Duration = Duration::from_secs(30);
-
 pub fn run(
     pm: &Pm,
     project: Option<&str>,
@@ -504,36 +519,132 @@ pub fn run(
     state_dir: &Path,
     limit: usize,
 ) -> Result<Value> {
-    run_inner(
+    run_with_clock(
+        pm,
+        project,
+        dry_run,
+        actor,
+        state_dir,
+        limit,
+        &write::RealWait,
+    )
+}
+
+/// `run` bounded to one ticket (CAD-1377): `issue` names the only
+/// candidate the sweep classifies and the only issue whose lanes the
+/// cleanup half sweeps — every other `doing`/`review` leaf stays
+/// untouched (no probe, no row, no finish work). A `limit` still caps
+/// the selected candidates that reach classification; the rest are
+/// reported under `deferred`, never implied complete. `issue` must
+/// already exist (the CLI resolves it before the sweep, so an
+/// unknown id or a `--project` mismatch refuses ahead of any probe);
+/// a ticket whose file status is already terminal is reported
+/// `skipped`/`already-done` — done is not delete proof, its lanes
+/// still face `finish`'s guard.
+pub fn run_selected(
+    pm: &Pm,
+    issue: &str,
+    project: Option<&str>,
+    dry_run: bool,
+    actor: &str,
+    state_dir: &Path,
+    limit: usize,
+) -> Result<Value> {
+    run_inner_with_selected(
         pm,
         project,
         dry_run,
         actor,
         Some(state_dir),
         limit,
+        None,
+        Some(issue),
         &gh_list,
         &gh_view,
-        CLI_CLOSE_LOCK_WAIT,
+        Some(Instant::now() + CLI_CLOSE_LOCK_WAIT),
+        &write::RealWait,
+        &LineTimes::load,
+    )
+}
+
+/// [`run`] on an injected [`write::WaitClock`] (CAD-1359): the same
+/// production entry — the shared close deadline is still
+/// `clock.now() + CLI_CLOSE_LOCK_WAIT`, computed once, and each close
+/// waits the real `try_lock` loop on its remaining budget. `pub(crate)`
+/// for the deterministic shared-deadline check; production passes
+/// [`write::RealWait`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_with_clock(
+    pm: &Pm,
+    project: Option<&str>,
+    dry_run: bool,
+    actor: &str,
+    state_dir: &Path,
+    limit: usize,
+    clock: &dyn write::WaitClock,
+) -> Result<Value> {
+    run_inner_with(
+        pm,
+        project,
+        dry_run,
+        actor,
+        Some(state_dir),
+        limit,
+        None,
+        &gh_list,
+        &gh_view,
+        Some(clock.now() + CLI_CLOSE_LOCK_WAIT),
+        clock,
+        &LineTimes::load,
     )
 }
 
 /// The daemon tick — same sweep without the finish pass: worktree
 /// liveness probes go through `client::rpc`, which the daemon must
 /// not call on itself unbounded (CAD-754; the CAD-1021 reclaim pass
-/// bounds its probes). `limit` caps issues per tick; the
-/// next tick takes the rest.
-pub fn run_daemon(pm: &Pm, actor: &str, limit: usize) -> Result<Value> {
+/// bounds its probes). `limit` caps issues per tick; `cursor` is the
+/// daemon-owned continuation: the id of the last evidence-bearing
+/// candidate the previous tick examined. The sweep resumes strictly
+/// after it in natural id order and wraps to the head once, so a
+/// persistently unresolved prefix can never starve later merged
+/// tickets (CAD-1241). The result carries `"cursor"` — the last
+/// candidate this run classified — for the caller to hold; a deleted
+/// cursor resumes at its natural successor, insertions are reached
+/// when the rotation wraps, and a failed run returns `Err`, leaving
+/// the caller's cursor untouched.
+pub fn run_daemon(pm: &Pm, actor: &str, limit: usize, cursor: Option<&str>) -> Result<Value> {
     run_inner(
-        pm,
-        None,
-        false,
-        actor,
-        None,
-        limit,
-        &gh_list,
-        &gh_view,
-        Duration::ZERO,
+        pm, None, false, actor, None, limit, cursor, &gh_list, &gh_view, None,
     )
+}
+
+/// The `LineTimes::load` seam — tests inject a failure or a fixed
+/// clock so the sweep's fail-closed notes arm is provable without
+/// timing games. The string is the load error the sweep reports.
+type HistoryLoad<'a> = &'a dyn Fn(&Path, Duration) -> std::result::Result<LineTimes, String>;
+
+/// Scrub before truncating so a credential is never cut into an
+/// unrecognizable prefix. Keep one bounded, control-free diagnostic
+/// line for both sweep output and daemon logs.
+fn safe_history_error(e: &str) -> String {
+    let line = e.lines().next().unwrap_or("");
+    crate::doctor::host::redact_argv(&[line])
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(512)
+        .collect()
+}
+
+/// The scrubbed history-load error when the sweep's walk failed, for
+/// every output consumer (CLI rows, the sync post-pass, the daemon
+/// tick) — `Some` only on `"state": "failed"`, so a caller prints it
+/// or skips it in one check instead of re-reading two JSON fields.
+pub fn history_failure(out: &Value) -> Option<&str> {
+    if out["history"]["state"].as_str() == Some("failed") {
+        Some(out["history"]["error"].as_str().unwrap_or("unknown"))
+    } else {
+        None
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -544,9 +655,82 @@ fn run_inner(
     actor: &str,
     state_dir: Option<&Path>,
     limit: usize,
+    cursor: Option<&str>,
     pr_list: PrLookup<'_>,
     pr_view: PrView<'_>,
-    close_lock_wait: Duration,
+    close_lock_deadline: Option<Instant>,
+) -> Result<Value> {
+    run_inner_with(
+        pm,
+        project,
+        dry_run,
+        actor,
+        state_dir,
+        limit,
+        cursor,
+        pr_list,
+        pr_view,
+        close_lock_deadline,
+        &write::RealWait,
+        &LineTimes::load,
+    )
+}
+
+/// [`run_inner`] on an injected [`write::WaitClock`] (CAD-1359): each
+/// close passes the real try_lock retry loop the deadline's remaining
+/// budget measured on `clock` — identical arithmetic to the wall-time
+/// path, only the clock source differs.
+#[allow(clippy::too_many_arguments)]
+fn run_inner_with(
+    pm: &Pm,
+    project: Option<&str>,
+    dry_run: bool,
+    actor: &str,
+    state_dir: Option<&Path>,
+    limit: usize,
+    cursor: Option<&str>,
+    pr_list: PrLookup<'_>,
+    pr_view: PrView<'_>,
+    close_lock_deadline: Option<Instant>,
+    clock: &dyn write::WaitClock,
+    history: HistoryLoad<'_>,
+) -> Result<Value> {
+    run_inner_with_selected(
+        pm,
+        project,
+        dry_run,
+        actor,
+        state_dir,
+        limit,
+        cursor,
+        None,
+        pr_list,
+        pr_view,
+        close_lock_deadline,
+        clock,
+        history,
+    )
+}
+
+/// [`run_inner_with`] plus the `--issue` selector (CAD-1377):
+/// `selected` narrows the sweep — after views and the children set
+/// are derived — to exactly that issue and gates its cleanup half on
+/// a safe verdict.
+#[allow(clippy::too_many_arguments)]
+fn run_inner_with_selected(
+    pm: &Pm,
+    project: Option<&str>,
+    dry_run: bool,
+    actor: &str,
+    state_dir: Option<&Path>,
+    limit: usize,
+    cursor: Option<&str>,
+    selected: Option<&str>,
+    pr_list: PrLookup<'_>,
+    pr_view: PrView<'_>,
+    close_lock_deadline: Option<Instant>,
+    clock: &dyn write::WaitClock,
+    history: HistoryLoad<'_>,
 ) -> Result<Value> {
     let issues = board::load_all(&pm.dir, project)?;
     // Candidacy follows the derived status, not only the file field:
@@ -555,22 +739,102 @@ fn run_inner(
     // or job derive doing|review — must still reach the probe, else a
     // merged PR strands it at review forever.
     let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
-    let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    let mut views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    // CAD-1241 continuation: rotate the natural-ordered board so the
+    // sweep starts strictly after `cursor` and wraps once to the head.
+    // A bounded tick then spends its budget on the NEXT batch instead
+    // of re-examining the same unresolved prefix every run; one pass
+    // over the rotated list never revisits a candidate in the same
+    // tick. A cursor id that no longer exists lands on its natural
+    // successor; a cursor at or past the end wraps to the start.
+    if let Some(c) = cursor {
+        let key = board::natural_key(c);
+        let start = views
+            .iter()
+            .position(|v| board::natural_key(&v.issue.front.id) > key)
+            .unwrap_or(views.len());
+        views.rotate_left(start);
+    }
     // `status:` line times from tracker history — the note-driven arm
     // is only as fresh as the newest note vs the last status write
     // (a status move after the note is a deliberate park/reopen and
-    // wins). `None` when the walk fails: then nothing widens.
-    let times = LineTimes::load(&pm.dir, Duration::from_secs(10)).ok();
-    let children: HashSet<&str> = views
+    // wins). When the walk fails the notes arm does not widen — a
+    // candidacy that cannot tell a park from a fresh note stays
+    // parked — and the failure is reported on the sweep's `history`
+    // field instead of swallowed, so a stuck walk is diagnosable
+    // rather than silently starving every note-driven ticket. Jobs
+    // still widen on their own; file `doing`/`review` rows are
+    // unaffected.
+    let (times, history_state) = match history(&pm.dir, Duration::from_secs(10)) {
+        Ok(t) => (Some(t), json!({"state": "ok"})),
+        Err(e) => (
+            None,
+            json!({"state": "failed", "error": safe_history_error(&e)}),
+        ),
+    };
+    // Owned strings: the `--issue` narrowing below mutates `views`,
+    // which a borrowed set could not outlive.
+    let children: HashSet<String> = views
         .iter()
-        .filter_map(|v| v.issue.front.parent.as_deref())
+        .filter_map(|v| v.issue.front.parent.clone())
         .collect();
+    // CAD-1377: `--issue` selects one ticket. The full board is
+    // derived first so parent/container relationships stay correct,
+    // THEN the view list narrows to the selected id — every other
+    // candidate is filtered out BEFORE its probe, so its recorded
+    // lanes cost no git/gh/spawn work at all (the probe itself runs
+    // git: worktree roots and repo identity). An already-done selected
+    // ticket is no status candidate, but its lanes are still reported
+    // to the cleanup half — `done` is not delete proof.
     let mut rows = Vec::new();
+    let mut selected_has_lanes = false;
+    if let Some(sel) = selected {
+        eprintln!("reconcile: scoping to {sel}");
+        let Some(i) = views.iter().position(|v| v.issue.front.id == sel) else {
+            return Err(Error::rejected(format!(
+                "Unknown issue '{sel}' — `cadence issue ls` lists what exists"
+            )));
+        };
+        let view = views.swap_remove(i);
+        let f = &view.issue.front;
+        let in_flight = |s: &str| matches!(s, "doing" | "review");
+        let has_children = children.contains(f.id.as_str());
+        let mut candidate = !has_children && model::item_type(f, has_children) != "epic";
+        if candidate
+            && !in_flight(&f.status)
+            && !(in_flight(&view.status) && matches!(view.status_source, "job" | "notes"))
+        {
+            // Terminal or never-in-flight — the row says why the
+            // close phase skipped it. Only a file status of `done`
+            // earns the cleanup shortcut: a parked `ready`/`backlog`
+            // or a `dropped` ticket has no merge evidence behind it,
+            // so its lanes defer rather than sweep on a label.
+            let mut row = json!({"issue": f.id, "status": f.status});
+            row["detail"] = json!({});
+            row["outcome"] = json!("skipped");
+            row["reason"] = json!(if f.status == "done" {
+                "already-done"
+            } else {
+                "not-in-flight"
+            });
+            rows.push(row);
+            candidate = false;
+        }
+        selected_has_lanes = !start::open_worktrees(f).is_empty();
+        views = if candidate { vec![view] } else { Vec::new() };
+    }
     let mut done = Vec::new();
     let mut held = Vec::new();
     let mut stalled = Vec::new();
     let mut errors = Vec::new();
+    let mut deferred = Vec::new();
+    let mut cleanup_deferred = Vec::new();
     let mut classified = 0usize;
+    // The id of the last evidence-bearing candidate this run examined
+    // — advanced on every classify outcome (closed, held, stalled,
+    // open, skipped alike) so the next bounded tick resumes strictly
+    // after it instead of repeating the prefix.
+    let mut last_classified: Option<String> = None;
 
     for v in &views {
         let f = &v.issue.front;
@@ -586,15 +850,23 @@ fn run_inner(
         if is_parent || model::item_type(f, is_parent) == "epic" {
             continue;
         }
+        // CAD-1377: the budget is decided BEFORE the probe — `probe`
+        // itself runs git (worktree roots, repo identity), so a
+        // deferred ticket must be counted from its refs, never
+        // probed. Ref-less candidates classify `skipped` for free and
+        // never starve real probes.
+        let evidence_bearing = f
+            .refs
+            .iter()
+            .any(|r| matches!(r.kind.as_str(), "worktree" | "branch" | "pr"));
+        if evidence_bearing && limit > 0 && classified >= limit {
+            deferred.push(f.id.clone());
+            continue;
+        }
         let p = probe(&v.issue);
-        // Only evidence-bearing candidates spend the limited budget —
-        // a ref-less one classifies `skipped` for free and must never
-        // starve real probes when a tick caps `classified`.
-        if !p.lanes.is_empty() || !p.pr_urls.is_empty() {
-            if limit > 0 && classified >= limit {
-                break;
-            }
+        if evidence_bearing {
             classified += 1;
+            last_classified = Some(p.id.clone());
         }
         let (verdict, detail) = classify(&p, pr_list, pr_view);
         let mut row = json!({"issue": p.id, "status": p.status});
@@ -637,13 +909,16 @@ fn run_inner(
                 if dry_run {
                     row["outcome"] = json!("would-close");
                 } else {
-                    match write::mark_done_on_merge_waiting(
+                    match write::mark_done_on_merge_waiting_with(
                         pm,
                         &p.id,
                         &why,
                         actor,
                         Some(&p.status),
-                        close_lock_wait,
+                        close_lock_deadline
+                            .map(|d| d.saturating_duration_since(clock.now()))
+                            .unwrap_or(Duration::ZERO),
+                        clock,
                     ) {
                         Ok(None) => {
                             row["outcome"] = json!("closed");
@@ -665,26 +940,128 @@ fn run_inner(
         rows.push(row);
     }
 
-    // The worktree half: after status flips, sweep every merged open
-    // worktree ref in scope — the same merge evidence, one row each.
-    // Skipped entirely under the daemon (state_dir None).
+    // The worktree half: after status flips, sweep the merged open
+    // worktree refs in scope — the same merge evidence, one row each.
+    // Skipped entirely under the daemon (state_dir None). CAD-1377:
+    // a `--issue` or `limit`-bounded run sweeps ONLY the issues it
+    // actually examined and whose status verdict is safe — closed,
+    // would-close (dry run) or already done. A held, open, stalled or
+    // failed-close ticket's lanes are deferred, never implied done:
+    // its status says the work may still be live, so cleanup re-proves
+    // nothing behind the verdict's back. A `limit 0`, no-selector run
+    // keeps the full project sweep as deliberate maintenance.
+    let mut cleanup_ids: Vec<String> = Vec::new();
+    if let Some(sel) = selected {
+        if selected_has_lanes {
+            let safe = rows.iter().any(|r| {
+                r["issue"].as_str() == Some(sel)
+                    && matches!(r["outcome"].as_str(), Some("closed") | Some("would-close"))
+            }) || rows.iter().any(|r| {
+                r["issue"].as_str() == Some(sel) && r["reason"].as_str() == Some("already-done")
+            });
+            if safe {
+                cleanup_ids.push(sel.to_string());
+            } else {
+                cleanup_deferred.push(sel.to_string());
+            }
+        }
+    }
     let finish = match state_dir {
+        Some(d) if selected.is_some() => {
+            if cleanup_ids.is_empty() {
+                Some(json!({"rows": [], "refused": 0, "dry_run": dry_run}))
+            } else {
+                eprintln!(
+                    "reconcile: cleanup pass over {} issue(s) with recorded lanes",
+                    cleanup_ids.len()
+                );
+                Some(finish::sweep_selected(
+                    pm,
+                    &cleanup_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                    false,
+                    dry_run,
+                    actor,
+                    d,
+                )?)
+            }
+        }
+        Some(d) if limit > 0 => {
+            // Only a verdict-safe ticket's lanes face cleanup: closed,
+            // or would-close under dry run. Held, stalled, open and
+            // failed-close rows keep their lanes and are deferred —
+            // bounded classification must not silently become
+            // unbounded cleanup, and a live verdict never sweeps.
+            for r in &rows {
+                let Some(id) = r["issue"].as_str() else {
+                    continue;
+                };
+                match r["outcome"].as_str() {
+                    Some("closed") | Some("would-close") => cleanup_ids.push(id.to_string()),
+                    _ => {
+                        if views
+                            .iter()
+                            .find(|v| v.issue.front.id == id)
+                            .is_some_and(|v| !start::open_worktrees(&v.issue.front).is_empty())
+                        {
+                            cleanup_deferred.push(id.to_string());
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "reconcile: cleanup pass over {} safe issue(s); {} deferred",
+                cleanup_ids.len(),
+                cleanup_deferred.len()
+            );
+            if cleanup_ids.is_empty() {
+                Some(json!({"rows": [], "refused": 0, "dry_run": dry_run}))
+            } else {
+                Some(finish::sweep_selected(
+                    pm,
+                    &cleanup_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                    false,
+                    dry_run,
+                    actor,
+                    d,
+                )?)
+            }
+        }
         Some(d) => Some(finish::sweep(pm, project, false, dry_run, actor, d)?),
         None => None,
     };
+    let finish_refused = finish
+        .as_ref()
+        .and_then(|f| f["refused"].as_u64())
+        .unwrap_or(0);
 
     Ok(json!({
         "dry_run": dry_run,
         "project": project,
+        "scope": selected,
         "classified": classified,
+        "deferred": deferred,
+        "cleanup_deferred": cleanup_deferred,
+        "cursor": last_classified,
+        "history": history_state,
         "rows": rows,
         "done": done,
         "held": held,
         "stalled": stalled,
         "errors": errors,
         "finish": finish,
+        "finish_refused": finish_refused,
+        "partial": !deferred.is_empty()
+            || !cleanup_deferred.is_empty()
+            || !errors.is_empty()
+            || finish_refused > 0,
     }))
 }
+
+#[cfg(test)]
+mod cad1241_acceptance;
+
+#[cfg(test)]
+mod cad1755_unverified_ref_refusal_acceptance;
 
 #[cfg(test)]
 mod tests {
@@ -876,7 +1253,7 @@ mod tests {
     }
 
     fn sweep(rig: &Rig, dry: bool, pl: PrLookup<'_>, pv: PrView<'_>) -> Value {
-        run_inner(&rig.pm, None, dry, "op", None, 0, pl, pv, Duration::ZERO).unwrap()
+        run_inner(&rig.pm, None, dry, "op", None, 0, None, pl, pv, None).unwrap()
     }
 
     fn status(rig: &Rig, id: &str) -> String {
@@ -895,10 +1272,6 @@ mod tests {
         assert!(out["done"].as_array().unwrap().contains(&json!(id)));
     }
 
-    /// The guard that earns the gate: an unstarted branch's empty
-    /// diff reverse-applies, so `merge_rule` alone reports it "patch"
-    /// merged — a freshly claimed ticket would read as done. CAD-754's
-    /// own lane caught this on the first live dry run.
     /// CAD-1150: a CLI close finding the tracker lock busy (a claim-sweep
     /// commit in progress) waits and closes; with no wait (the daemon
     /// path) it reports `error` at once.
@@ -911,8 +1284,12 @@ mod tests {
         let out = sweep(&rig, false, &no_gh, &no_view);
         assert_eq!(out["rows"][0]["outcome"], json!("error"), "{out}");
         assert_eq!(status(&rig, &id), "doing");
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        super::super::pmlock::WAITING.with(|observer| *observer.borrow_mut() = Some(waiting_tx));
         let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(700));
+            waiting_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("close never contended");
             drop(held);
         });
         let out = run_inner(
@@ -922,15 +1299,83 @@ mod tests {
             "op",
             None,
             0,
+            None,
             &no_gh,
             &no_view,
-            Duration::from_secs(10),
+            Some(Instant::now() + Duration::from_secs(10)),
         )
         .unwrap();
         releaser.join().unwrap();
         assert_eq!(status(&rig, &id), "done", "{out}");
     }
 
+    /// CAD-1359: the check clock — `now` starts at a real base and
+    /// advances only through the backoff the real `try_lock` loop
+    /// requests, so the recorded total is the exact virtual budget
+    /// spent.
+    struct ScriptedWait {
+        now: std::cell::Cell<Instant>,
+        waited: std::cell::RefCell<Duration>,
+    }
+
+    impl write::WaitClock for ScriptedWait {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+        fn sleep(&self, d: Duration) {
+            *self.waited.borrow_mut() += d;
+            self.now.set(self.now.get() + d);
+        }
+    }
+
+    /// CAD-1153/CAD-1359: `run` creates the shared deadline — one
+    /// `CLI_CLOSE_LOCK_WAIT` across the whole run, not per close. The
+    /// scripted clock makes the real `try_lock` loop deterministic:
+    /// the first close spends the full budget, the second sees it
+    /// already spent. `run` returns the rows, not an Err, when closes
+    /// fail.
+    #[test]
+    fn run_shares_one_close_lock_deadline() {
+        let rig = rig();
+        let state = rig.repo.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let held = rig.pm.try_lock().unwrap().expect("lock free");
+        let id1 = put_issue(&rig, 60, None);
+        let id2 = put_issue(&rig, 61, None);
+        lane(&rig.repo, true);
+        let clock = ScriptedWait {
+            now: std::cell::Cell::new(Instant::now()),
+            waited: std::cell::RefCell::new(Duration::ZERO),
+        };
+        let out = run_with_clock(&rig.pm, None, false, "op", &state, 0, &clock).unwrap();
+        drop(held);
+        assert_eq!(out["rows"].as_array().unwrap().len(), 2, "{out}");
+        assert!(
+            out["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["outcome"] == "error"),
+            "{out}"
+        );
+        assert!(out["errors"].as_array().unwrap().len() == 2, "{out}");
+        assert!(out["finish"].is_object(), "{out}");
+        assert_eq!(status(&rig, &id1), "doing");
+        assert_eq!(status(&rig, &id2), "doing");
+        // The exact virtual total is independent of
+        // CLI_CLOSE_LOCK_WAIT's configured value: a ZERO or shortened
+        // constant underspends; a fresh 30 s per close totals 60 s.
+        assert_eq!(
+            *clock.waited.borrow(),
+            Duration::from_secs(30),
+            "two closes must share one 30 s close-lock deadline"
+        );
+    }
+
+    /// The guard that earns the gate: an unstarted branch's empty
+    /// diff reverse-applies, so `merge_rule` alone reports it "patch"
+    /// merged — a freshly claimed ticket would read as done. CAD-754's
+    /// own lane caught this on the first live dry run.
     #[test]
     fn unstarted_lane_is_not_merged() {
         let rig = rig();
@@ -1181,15 +1626,7 @@ mod tests {
         let id = put_issue(&rig, 99, None);
         lane(&rig.repo, true);
         let out = run_inner(
-            &rig.pm,
-            None,
-            false,
-            "op",
-            None,
-            5,
-            &no_gh,
-            &no_view,
-            Duration::ZERO,
+            &rig.pm, None, false, "op", None, 5, None, &no_gh, &no_view, None,
         )
         .unwrap();
         assert_eq!(status(&rig, &id), "done", "{out}");
@@ -1201,6 +1638,138 @@ mod tests {
             .filter(|r| r["outcome"] == "skipped")
             .count();
         assert_eq!(skipped, 30, "{out}");
+    }
+
+    /// CAD-878: a history-walk failure must surface on the sweep and
+    /// hold every note-driven candidate fail-closed — never widen on
+    /// an unknown park decision. The injected failure makes the arm
+    /// unreachable for the sweep's duration; the output says why.
+    #[test]
+    fn history_failure_parks_note_driven_and_reports() {
+        let rig = rig();
+        let id = put_issue_at(&rig, 40, None, "backlog");
+        verdict_note(&rig, &id, "20260928-120000-x-verdict.md");
+        lane(&rig.repo, true);
+        let boom = |_: &Path, _: Duration| -> std::result::Result<LineTimes, String> {
+            Err("tracker line times: git log HEAD failed".to_string())
+        };
+        let out = run_inner_with(
+            &rig.pm,
+            None,
+            false,
+            "op",
+            None,
+            0,
+            None,
+            &no_gh,
+            &no_view,
+            None,
+            &write::RealWait,
+            &boom,
+        )
+        .unwrap();
+        // Note-driven and not provably fresh → excluded entirely, the
+        // file keeps its parked status, and the sweep says why.
+        assert_eq!(status(&rig, &id), "backlog", "{out}");
+        assert!(out["rows"].as_array().unwrap().is_empty(), "{out}");
+        assert!(out["done"].as_array().unwrap().is_empty(), "{out}");
+        assert_eq!(out["history"]["state"], "failed", "{out}");
+        let err = out["history"]["error"].as_str().unwrap_or("");
+        assert!(err.contains("git log"), "{out}");
+    }
+
+    /// A file `doing`/`review` ticket does not need the notes arm, so
+    /// a failed history walk must not hold it back: only the
+    /// note-derived candidates park.
+    #[test]
+    fn history_failure_still_classifies_file_driven() {
+        let rig = rig();
+        let id = put_issue(&rig, 41, None); // file status doing
+        lane(&rig.repo, true);
+        let boom = |_: &Path, _: Duration| -> std::result::Result<LineTimes, String> {
+            Err("tracker line times: out of time".to_string())
+        };
+        let out = run_inner_with(
+            &rig.pm,
+            None,
+            false,
+            "op",
+            None,
+            0,
+            None,
+            &no_gh,
+            &no_view,
+            None,
+            &write::RealWait,
+            &boom,
+        )
+        .unwrap();
+        assert_eq!(status(&rig, &id), "done", "{out}");
+        assert_eq!(out["history"]["state"], "failed", "{out}");
+    }
+
+    /// Recovery: the same parked ticket regains candidacy once the
+    /// history load succeeds again — the failure parked it, it did
+    /// not disqualify it.
+    #[test]
+    fn history_recovery_restores_note_driven_candidacy() {
+        let rig = rig();
+        let id = put_issue_at(&rig, 42, None, "backlog");
+        verdict_note(&rig, &id, "20260928-120000-x-verdict.md");
+        lane(&rig.repo, true);
+        let boom = |_: &Path, _: Duration| -> std::result::Result<LineTimes, String> {
+            Err("tracker line times: git log HEAD failed".to_string())
+        };
+        let out = run_inner_with(
+            &rig.pm,
+            None,
+            false,
+            "op",
+            None,
+            0,
+            None,
+            &no_gh,
+            &no_view,
+            None,
+            &write::RealWait,
+            &boom,
+        )
+        .unwrap();
+        assert_eq!(status(&rig, &id), "backlog", "{out}");
+        // Next sweep: the walk answers again, the fresh note admits
+        // the arm and the merged lane closes the ticket.
+        let out = sweep(&rig, false, &no_gh, &no_view);
+        assert_eq!(status(&rig, &id), "done", "{out}");
+        assert_eq!(out["history"]["state"], "ok", "{out}");
+    }
+
+    /// The reported error is single-line and bounded — the daemon log
+    /// and CLI row print it verbatim.
+    #[test]
+    fn history_error_is_one_scrubbed_line() {
+        let rig = rig();
+        put_issue(&rig, 43, None);
+        let boom = |_: &Path, _: Duration| -> std::result::Result<LineTimes, String> {
+            Err("tracker line times: spawn git: first\nsecond\nthird".to_string())
+        };
+        let out = run_inner_with(
+            &rig.pm,
+            None,
+            false,
+            "op",
+            None,
+            0,
+            None,
+            &no_gh,
+            &no_view,
+            None,
+            &write::RealWait,
+            &boom,
+        )
+        .unwrap();
+        let err = out["history"]["error"].as_str().unwrap_or("");
+        assert_eq!(err, "tracker line times: spawn git: first", "{err}");
+        assert!(!err.contains('\n'), "{err}");
     }
 
     #[test]

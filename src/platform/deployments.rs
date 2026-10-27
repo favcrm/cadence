@@ -12,6 +12,7 @@ const CAP: u64 = 16 * 1024;
 #[derive(Clone, Debug)]
 pub struct DeploymentMetadata {
     providers: Vec<ProviderDeployment>,
+    company_master: Option<HostedCompanyMaster>,
 }
 
 #[derive(Deserialize)]
@@ -19,6 +20,8 @@ pub struct DeploymentMetadata {
 struct MetadataFile {
     schema: u32,
     providers: Vec<ProviderDeployment>,
+    #[serde(default, deserialize_with = "parse_master_trust_boundary")]
+    master_trust_boundary: Option<HostedCompanyMaster>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -38,11 +41,20 @@ struct ProviderDeployment {
 }
 
 #[derive(Clone, Debug)]
+// Variant names mirror the wire transports (`hosted-*`); the shared prefix is intentional.
+#[allow(clippy::enum_variant_names)]
 enum DeploymentTransport {
     HostedMediaLease,
     /// CAD-1158: dedicated bridge-owned SMTP admission. Binds the fixed
     /// `smtp.internal` relay contract only; never media or lease authority.
     HostedSmtpRelay,
+    /// CAD-1416: the image-owned hosted business-documents admission. Binds
+    /// the fixed `api.internal` document door only; never media, SMTP or a
+    /// lifecycle lease.
+    HostedBusinessDocuments,
+    /// CAD-1689: the image-owned hosted WhatsApp door admission. Binds the
+    /// fixed `api.internal` door only; never media, SMTP or a lifecycle lease.
+    HostedWhatsappDoor,
 }
 
 /// CAD-1158: the exact image-owned SMTP admission tuple. Only this tuple
@@ -51,6 +63,19 @@ enum DeploymentTransport {
 pub(crate) const SMTP_PROVIDER: &str = "smtp";
 pub(crate) const SMTP_ORIGIN: &str = "http://smtp.internal";
 pub(crate) const SMTP_MANIFEST_PIN: &str = "smtp-internal-relay@2";
+
+/// CAD-1416: the exact image-owned business-documents tuple. Only this
+/// tuple admits the hosted template document door; no other provider,
+/// origin or pin does.
+pub(crate) const BUSINESS_DOCUMENTS_PROVIDER: &str = "business_documents";
+pub(crate) const BUSINESS_DOCUMENTS_ORIGIN: &str = "http://api.internal";
+pub(crate) const BUSINESS_DOCUMENTS_MANIFEST_PIN: &str = "business-documents@1";
+
+/// CAD-1689: the exact image-owned WhatsApp door tuple. Only this tuple
+/// opens the hosted WhatsApp door without `hosted.lease`.
+pub(crate) const WHATSAPP_PROVIDER: &str = "whatsapp";
+pub(crate) const WHATSAPP_ORIGIN: &str = "http://api.internal";
+pub(crate) const WHATSAPP_MANIFEST_PIN: &str = "whatsapp-door@1";
 
 fn parse_transport<'de, D>(
     deserializer: D,
@@ -61,16 +86,45 @@ where
     match String::deserialize(deserializer)?.as_str() {
         "hosted-media-lease@1" => Ok(Some(DeploymentTransport::HostedMediaLease)),
         "hosted-smtp-relay@1" => Ok(Some(DeploymentTransport::HostedSmtpRelay)),
+        "hosted-business-documents@1" => Ok(Some(DeploymentTransport::HostedBusinessDocuments)),
+        "hosted-whatsapp-door@1" => Ok(Some(DeploymentTransport::HostedWhatsappDoor)),
         _ => Err(serde::de::Error::custom(
             "unknown provider transport assertion",
         )),
     }
 }
 
+/// The reviewed hosted media manifest pins: @3 (media + source, text stays
+/// refused) and @4 (adds `generate_text`). Anything else is not a pin.
+fn reviewed_media_pin(pin: &str) -> Option<&'static str> {
+    [
+        crate::platform::agenticos_external::MANIFEST_PIN,
+        crate::platform::agenticos_external::TEXT_MANIFEST_PIN,
+    ]
+    .into_iter()
+    .find(|reviewed| *reviewed == pin)
+}
+
 /// Only validated image metadata can produce this construction proof. It
 /// authorizes one fixed internal media door, not arbitrary HTTP or a lease.
 #[derive(Clone, Debug)]
 pub(crate) struct HostedMediaAdmission {
+    /// The reviewed manifest pin the image metadata asserted — only
+    /// `MANIFEST_PIN` (@3) or `TEXT_MANIFEST_PIN` (@4), never a free string.
+    pin: &'static str,
+}
+
+impl HostedMediaAdmission {
+    pub(crate) fn pin(&self) -> &'static str {
+        self.pin
+    }
+}
+
+/// CAD-1416: only validated image metadata carrying the exact business-
+/// documents tuple can produce this proof. It selects the hosted document
+/// door and grants no lifecycle lease, media or SMTP authority.
+#[derive(Clone, Debug)]
+pub(crate) struct HostedBusinessDocumentsAdmission {
     _private: (),
 }
 
@@ -81,6 +135,34 @@ pub(crate) struct HostedMediaAdmission {
 #[derive(Clone, Debug)]
 pub(crate) struct HostedSmtpAdmission {
     _private: (),
+}
+
+/// CAD-1689: only validated image metadata carrying the exact WhatsApp door
+/// tuple can produce this proof. It selects the fixed `api.internal` door and
+/// grants no lifecycle lease, media, SMTP or email authority.
+#[derive(Clone, Debug)]
+pub(crate) struct HostedWhatsappAdmission {
+    _private: (),
+}
+
+/// Image-owned company-container trust boundary, not filesystem confinement.
+/// The hosted Master may read company files, including operational originals.
+/// Only validated deployment metadata can construct this authority.
+#[derive(Clone, Debug)]
+pub(crate) struct HostedCompanyMaster {
+    _private: (),
+}
+
+fn parse_master_trust_boundary<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<HostedCompanyMaster>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match String::deserialize(deserializer)?.as_str() {
+        "company-container@1" => Ok(Some(HostedCompanyMaster { _private: () })),
+        _ => Err(serde::de::Error::custom("unknown Master trust boundary")),
+    }
 }
 
 fn refused() -> Error {
@@ -134,6 +216,7 @@ impl DeploymentMetadata {
                 .ok_or_else(refused)?;
             if !seen.insert(&entry.provider)
                 || (entry.provider != crate::platform::agenticos_external::PLATFORM
+                    && entry.provider != BUSINESS_DOCUMENTS_PROVIDER
                     && crate::proto::identifier(&entry.provider, "Provider").is_err())
                 || !valid_authority(authority)
                 // A transport assertion admits exactly its own reviewed
@@ -145,13 +228,22 @@ impl DeploymentMetadata {
                         DeploymentTransport::HostedMediaLease => {
                             entry.provider != crate::platform::agenticos_external::PLATFORM
                                 || entry.origin != "http://api.internal"
-                                || entry.manifest_pin
-                                    != crate::platform::agenticos_external::MANIFEST_PIN
+                                || reviewed_media_pin(&entry.manifest_pin).is_none()
                         }
                         DeploymentTransport::HostedSmtpRelay => {
                             entry.provider != SMTP_PROVIDER
                                 || entry.origin != SMTP_ORIGIN
                                 || entry.manifest_pin != SMTP_MANIFEST_PIN
+                        }
+                        DeploymentTransport::HostedBusinessDocuments => {
+                            entry.provider != BUSINESS_DOCUMENTS_PROVIDER
+                                || entry.origin != BUSINESS_DOCUMENTS_ORIGIN
+                                || entry.manifest_pin != BUSINESS_DOCUMENTS_MANIFEST_PIN
+                        }
+                        DeploymentTransport::HostedWhatsappDoor => {
+                            entry.provider != WHATSAPP_PROVIDER
+                                || entry.origin != WHATSAPP_ORIGIN
+                                || entry.manifest_pin != WHATSAPP_MANIFEST_PIN
                         }
                     }
                 })
@@ -162,8 +254,18 @@ impl DeploymentMetadata {
                 return Err(refused());
             }
         }
+        if metadata.master_trust_boundary.is_some()
+            && !metadata.providers.iter().any(|entry| {
+                entry.provider == "agenticos"
+                    && entry.origin == "http://api.internal"
+                    && entry.manifest_pin == "agenticos-manifest@1/publish_post@2"
+            })
+        {
+            return Err(refused());
+        }
         Ok(Self {
             providers: metadata.providers,
+            company_master: metadata.master_trust_boundary,
         })
     }
 
@@ -174,7 +276,8 @@ impl DeploymentMetadata {
         self.providers
             .iter()
             .find(|entry| matches!(entry.transport, Some(DeploymentTransport::HostedMediaLease)))
-            .map(|_| HostedMediaAdmission { _private: () })
+            .and_then(|entry| reviewed_media_pin(&entry.manifest_pin))
+            .map(|pin| HostedMediaAdmission { pin })
     }
 
     /// CAD-1158: the dedicated SMTP admission. `Some` only for the exact
@@ -192,6 +295,44 @@ impl DeploymentMetadata {
                     && matches!(entry.transport, Some(DeploymentTransport::HostedSmtpRelay))
             })
             .map(|_| HostedSmtpAdmission { _private: () })
+    }
+
+    /// CAD-1416: `Some` only for the exact business-documents tuple (all
+    /// four fields). An SMTP or media assertion never yields it.
+    pub(crate) fn hosted_business_documents(&self) -> Option<HostedBusinessDocumentsAdmission> {
+        self.providers
+            .iter()
+            .find(|entry| {
+                entry.provider == BUSINESS_DOCUMENTS_PROVIDER
+                    && entry.origin == BUSINESS_DOCUMENTS_ORIGIN
+                    && entry.manifest_pin == BUSINESS_DOCUMENTS_MANIFEST_PIN
+                    && matches!(
+                        entry.transport,
+                        Some(DeploymentTransport::HostedBusinessDocuments)
+                    )
+            })
+            .map(|_| HostedBusinessDocumentsAdmission { _private: () })
+    }
+
+    /// CAD-1689: `Some` only for the exact WhatsApp door tuple (all four
+    /// fields). No other assertion yields it.
+    pub(crate) fn hosted_whatsapp(&self) -> Option<HostedWhatsappAdmission> {
+        self.providers
+            .iter()
+            .find(|entry| {
+                entry.provider == WHATSAPP_PROVIDER
+                    && entry.origin == WHATSAPP_ORIGIN
+                    && entry.manifest_pin == WHATSAPP_MANIFEST_PIN
+                    && matches!(
+                        entry.transport,
+                        Some(DeploymentTransport::HostedWhatsappDoor)
+                    )
+            })
+            .map(|_| HostedWhatsappAdmission { _private: () })
+    }
+
+    pub(crate) fn hosted_company_master(&self) -> Option<HostedCompanyMaster> {
+        self.company_master.clone()
     }
 
     pub fn pin(&self, provider: &str, origin: &str) -> Option<&str> {
@@ -267,6 +408,63 @@ pub fn load() -> Result<Option<DeploymentMetadata>> {
     read_components(root, &["etc", "cadence", "provider-deployments.json"], 0)
 }
 
+/// CAD-1713: sandbox-only provider deployment metadata.
+///
+/// `cadence dev up` sets `CADENCE_DEV_PROVIDER_DEPLOYMENTS` to a 0600 file
+/// under the sandbox root. It is accepted only when the store is a dev
+/// store; a production daemon keeps the fixed root-owned file above.
+pub fn load_dev(state_dir: &Path) -> Result<Option<DeploymentMetadata>> {
+    let Some(path) = std::env::var_os("CADENCE_DEV_PROVIDER_DEPLOYMENTS") else {
+        return Ok(None);
+    };
+    let dev = crate::sandbox::dev_owner(state_dir)?.is_some();
+    load_dev_at(state_dir, Path::new(&path), dev)
+}
+
+fn load_dev_at(state_dir: &Path, path: &Path, dev: bool) -> Result<Option<DeploymentMetadata>> {
+    if path.as_os_str().is_empty() || !dev {
+        return Err(Error::rejected(
+            "CADENCE_DEV_PROVIDER_DEPLOYMENTS is only accepted in a dev store",
+        ));
+    }
+    if !path.is_absolute() {
+        return Err(Error::rejected(
+            "dev provider deployment metadata path must be absolute",
+        ));
+    }
+    let root = state_dir.parent().ok_or_else(refused)?;
+    let root = std::fs::canonicalize(root).map_err(|_| refused())?;
+    let link = std::fs::symlink_metadata(path).map_err(|_| refused())?;
+    if link.file_type().is_symlink() || !link.file_type().is_file() {
+        return Err(Error::rejected(
+            "dev provider deployment metadata must be a regular file, not a symlink",
+        ));
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| refused())?;
+    if canonical.as_path() != path || !canonical.starts_with(&root) {
+        return Err(Error::rejected(
+            "dev provider deployment metadata must live under the sandbox root \
+             without symlink traversal",
+        ));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&canonical)
+        .map_err(|_| refused())?;
+    let meta = file.metadata().map_err(|_| refused())?;
+    if !meta.file_type().is_file() || meta.len() > CAP || meta.mode() & 0o077 != 0 {
+        return Err(Error::rejected(
+            "dev provider deployment metadata must be a 0600 regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(CAP + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| refused())?;
+    DeploymentMetadata::parse(&bytes).map(Some)
+}
+
 #[cfg(test)]
 fn read_fixture(root: &Path, name: &str, owner: u32) -> Result<Option<DeploymentMetadata>> {
     let root = std::fs::OpenOptions::new()
@@ -279,3 +477,6 @@ fn read_fixture(root: &Path, name: &str, owner: u32) -> Result<Option<Deployment
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cad1689_acceptance;

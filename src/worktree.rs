@@ -159,7 +159,11 @@ pub fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
                 "Branch '{branch}' already exists without matching lifecycle ownership — refusing reuse"
             )));
         }
-        (crate::issue::start::resolve_base(&root, None)?.1, actor)
+        let resolved = crate::issue::start::resolve_base(&root, None, None)?;
+        if let Some(warning) = &resolved.warning {
+            eprintln!("cadence: {warning}");
+        }
+        (resolved.sha, actor)
     };
     ensure_cadence_ignored(&root)?;
     // The recovery branches below add a checkout without `begin`; refuse a
@@ -290,6 +294,8 @@ exit $rc
 /// pre-push` (0755) under the worktree's OWN git dir, enable
 /// `extensions.worktreeConfig` on the shared config once, then point
 /// this worktree's `config.worktree` `core.hooksPath` at that dir.
+/// Also sets this worktree's `core.editor` to `true` so commits in the lane
+/// never open an interactive editor; an explicit `GIT_EDITOR` still overrides.
 /// Idempotent — a re-start re-heals; an identical hook is left alone.
 /// Fail-closed: `issue start` treats a failed install as a failed lane
 /// (same rollback as `configure_cargo_target`), because a lane that
@@ -333,6 +339,9 @@ pub fn install_pre_push_hook(wt_dir: &Path) -> Result<PathBuf> {
             &hooks.to_string_lossy(),
         ],
     )?;
+    // Lane-local noninteractive commit messages: a sentinel or interactive
+    // editor must not block `git commit`. An explicit GIT_EDITOR still wins.
+    git(wt_dir, &["config", "--worktree", "core.editor", "true"])?;
     install_cargo_shim(wt_dir)?;
     Ok(script)
 }
@@ -403,8 +412,9 @@ case "${1:-}" in
         slot_kind=build ;;
 esac
 
-# `cadence` the lane recorded in its env; fall back to PATH.
-cad="${CADENCE_BUILD_SLOT:-cadence}"
+# The absolute admission helper is embedded by the lane generator; do not
+# depend on scrubbed CADENCE_* environment or fall back to ambient PATH.
+cad=@@CADENCE_BUILD_SLOT@@
 "$cad" build-slot run "$slot_kind" -- cargo "$@"
 rc=$?
 [ "$rc" -eq 0 ] || exit "$rc"
@@ -415,12 +425,27 @@ rc=$?
 /// minted before slice 3 re-heals on the next `issue start` (the reuse
 /// path calls `install_pre_push_hook`, which now calls this).
 fn install_cargo_shim(wt_dir: &Path) -> Result<PathBuf> {
+    let helper = std::env::current_exe()
+        .map_err(|e| Error::internal(format!("could not resolve lane build-slot helper: {e}")))?;
+    if !helper.is_absolute() {
+        return Err(Error::internal(format!(
+            "lane build-slot helper path is not absolute: {}",
+            helper.display()
+        )));
+    }
+    let helper = helper.to_str().ok_or_else(|| {
+        Error::internal("lane build-slot helper path is not valid UTF-8 for the shell shim")
+    })?;
+    let cargo_shim = CARGO_SHIM.replace(
+        "@@CADENCE_BUILD_SLOT@@",
+        &format!("'{}'", helper.replace('\'', "'\\''")),
+    );
     let git_dir = PathBuf::from(git(wt_dir, &["rev-parse", "--absolute-git-dir"])?);
     let bin = git_dir.join(HOOKS_DIR).join("bin");
     std::fs::create_dir_all(&bin)?;
     let shim = bin.join("cargo");
     let needs_write = match std::fs::read_to_string(&shim) {
-        Ok(existing) => existing != CARGO_SHIM,
+        Ok(existing) => existing != cargo_shim,
         Err(_) => true,
     };
     if needs_write {
@@ -433,7 +458,7 @@ fn install_cargo_shim(wt_dir: &Path) -> Result<PathBuf> {
                 .truncate(true)
                 .mode(0o755)
                 .open(&tmp)?;
-            f.write_all(CARGO_SHIM.as_bytes())?;
+            f.write_all(cargo_shim.as_bytes())?;
         }
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
         std::fs::rename(&tmp, &shim)?;
@@ -912,6 +937,8 @@ mod tests {
             build,
             memory: None,
             intake: None,
+            id: None,
+            policy: None,
         }
     }
 

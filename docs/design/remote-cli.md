@@ -1,12 +1,12 @@
 # Design contract: CAD-1019 remote CLI — login maps the org; allowlisted commands on the remote daemon
 
-Phase-1 contract for the remote CLI transport. No implementation is in this
-PR. Revised per PM direction: login rides the **hosted-cadence device grant**
-(`hcd_`/`hct_`, the AOS-76 owner-consent flow already implemented in
-`src/remote_enrollment.rs`), and remote calls go through AOS-128's
-`POST /__platform/cli/call` — the generalization of AOS-122's
-`/__platform/wiki/{authorize,call}` envelope proxy. CAD-913 (wiki) shares this
-transport rather than duplicating it.
+Historical phase-1 design for the remote CLI transport; the references and
+credential-lifetime questions below record that design stage, not the current
+deployment contract. For current login/renewal semantics see
+[REMOTE-AUTH](../REMOTE-AUTH.md); for explicit local-agent registration,
+WSS/FYI delivery and teammate collaboration see the
+[Hosted workspace guide](../guides/hosted-workspace.md). The current published
+app CLI is documented in [Workspace app catalog](../guides/app-catalog.md#selected-remote-immutable-published-releases).
 
 ## Evidence answers to the phase-1 questions (revised)
 
@@ -59,8 +59,10 @@ into CAD-657's registry (`src/cli/org.rs` `Destination::Remote{endpoint,
 org_id}`, inert until this work): `org_id = organization_id`,
 `endpoint = <audience>` (which is `https://<slug>.cadencecloud.app`), plus
 the enrollment record reference. The slug comes only from the issuer's grant,
-never derived from `org_id` — same rule as `platform_account.rs`. Select as
-default only when none exists or `--use` is passed.
+never derived from `org_id` — same rule as `platform_account.rs`. A later
+verified grant for an already-stored slug replaces that remote row's endpoint
+and workspace id (workspace recreation or rotation); a `local` row with the
+same name is never replaced. Select as default only with `--use`.
 
 ## Credential lifetime (revised — load-bearing)
 
@@ -103,8 +105,18 @@ login. Two consequences:
   org. A `503` waking reply with `Retry-After` is waited on per AOS-128's
   rule — bounded, counted, and still fails closed after the bound.
 - I4: Destination resolution is pinned once per command; `org switch` during
-  a running command cannot move it; `CADENCE_ALIAS`-bound callers keep
-  CAD-657's rule (inherited pins win; `--org` conflicts, never overrides).
+  a running command cannot move it. A `CADENCE_ALIAS` caller keeps its
+  inherited local daemon when `--org` is omitted and never consults the
+  registry default. An explicit `--org` is accepted only when the live local
+  daemon shows exactly one running message whose immutable kickoff binding
+  names that org and records an original member and issuer; the endpoint
+  and organization id come from the binding, and the saved login must still
+  name that same member and issuer on every credential load, including a
+  post-resolution reload or renewal. Audience, scope, and renewal checks
+  otherwise run unchanged. A binding without both original pins is not
+  eligible. A different org, no binding, queued, terminal, or unresolved
+  work, more than one running message, and an explicit `--state-dir` or
+  tracker pin stay refused. `org switch` stays refused.
 - I5: Login never changes an existing default org without `--use`; a second
   workspace login adds an org and leaves the default untouched; concurrent
   logins for different orgs cannot clobber each other's records (existing
@@ -119,10 +131,96 @@ Reads: `issue ls`, `issue show`, `issue history`, `agent list`,
 Writes shipped by CAD-1179: `issue new`, `issue comment`, `issue set`
 (frontmatter fields only — status/priority/owner/component/title/tags/
 type/milestone/size; body edits are not part of the field vocabulary).
-`message send` (to a named alias — lands as the cli actor's derived
-handle, never "operator") stays in the server verb table but has no
-client mapping in this build — the milestone sends the three `issue_*`
-write verbs only.
+`issue project policy` maps to `project_policy` (cli.write). Arguments are
+exactly `{project, visibility, grants}`: `visibility` is `workspace-visible`
+or `private` (canonical spellings; `private` stays refused until the
+isolation gate passes), and `grants` is the full replacement member list
+(`users/<handle>` or `operator`), not a merge. All three fields are required;
+missing or null values are refused without a write. An explicit empty
+`grants` array clears the recorded list. The success body is
+`{project, policy, committed}` — a policy record, not an issue card.
+Human Owner only (`role_at_issue=owner` and `principal_kind=user`); a
+member or an owner-role agent is refused before a write. The native policy
+commit records `Actor: users/<handle>` from that verified Owner, not the
+container's ambient alias. Local CLI writes retain their existing actor
+resolution. `issue project add` and `issue project ls` stay local.
+`message send`/`send` (CAD-1568) map to `message_send` (cli.write):
+a durable coordination enqueue to the hosted master for a verified human
+workspace owner. The recipient fence is the canonical `master` agent
+only: the raw spelling must be `master` *and* the daemon resolves the
+exact `master` agent row — a native session/thread id that happens to
+spell `master` never substitutes. The selected row's UID is retained through
+shared send and checked inside the enqueue transaction, so lifecycle removal
+or replacement cannot redirect the request. No refusal silently reroutes or
+enqueues elsewhere. Personal-assistant and local-worker recipients are
+typed unsupported-class refusals: separate assistant authority or local
+assignments are required, never a reroute or generic container execution.
+Generic member-to-member remote `send` and local-worker follow-up remain refused
+on this transport. The separate [directory-addressed FYI flow](../guides/hosted-workspace.md#a-teammates-own-agent-collaboration-flow)
+stores informational notices only; it does not extend this allowlist.
+Arguments are exactly `{alias, text, message}`
+— three strings. `message` is the caller-chosen stable id: required, the
+identifier grammar, never `sys-*`. It is the dedupe and reconciliation key —
+a resubmitted id with identical content is the same message (`duplicate`
+true on the receipt), and the same id with different content — or an id
+another member owns — is a typed `message_id_conflict`, never a retry.
+The original signed cli envelope rides to the daemon, which re-verifies it
+and stamps the principal-derived sender (`cli-<handle>`), never "operator"
+and never a caller-named source. The enqueue binds the recipient's Home
+`message_conversation`: a first-ever send creates the master's Home thread
+transactionally with the durable message, and every later send reports the
+same `conversation`. The reply is the complete enqueue receipt —
+`{message, alias, state, duplicate, workspace_id, sender_subject, sender,
+conversation}`: the echoed stable id and canonical `master` alias, the
+lifecycle state and duplicate bool, the verified immutable workspace ID
+(not the slug), the authenticated human's canonical subject, the `cli-*`
+display sender, and the persisted conversation id. The receipt is durable
+enqueue acceptance — never delivery, execution or a result; the outcome is
+`message read`'s report. A 2xx answer missing or falsifying any of those
+correlated fields is `unknown`, the same verdict as a lost reply: never a
+false success, never a blind replay — reconcile by the stable id.
+`cadence message read <id>` returns only that human's CLI-sent message —
+the body window plus `state`, sanitized `result`, `error`, `alias` and
+`awaiting_report` — carrying the same `workspace_id`, `sender_subject`,
+`sender` and `conversation` binding. Agent/service envelopes do not
+inherit the parent's `sub` ownership. Absent and foreign IDs share
+`not_found`; browser member-chat records are not CLI-owned. Reconcile
+the original identity and workspace before a same-ID retry; no automatic
+post-forward replay. Passive inbox inspection requires a human owner and
+does not expose managed assistants' private conversation. Accepted/queued
+is not delivery or completion; an offline recipient stays queued.
+
+Canonical-recipient acceptance is exercised at two boundaries. The independent
+`cad1584_http_master_native_collision_refused_then_canonical_home_preserved`
+check sends signed owner requests through the real isolated HTTP relay,
+requires refusal without a durable enqueue for native-ID collisions, and pairs
+that refusal with canonical-master Home, duplicate and owned-read controls.
+`cad1584_selected_uid_lifecycle_fence_refuses_removal_and_replacement`
+retains the selected UID, removes or replaces its registration, and exercises
+the shared-send transaction fence. The latter proves the selected-row boundary,
+not a deterministic lifecycle interleaving inside the HTTP handler. Run both
+with `cargo test --locked --features test-seam --lib cad1584_ -- --test-threads 2`
+under the repository's build-slot admission.
+
+Platform team administration shipped by CAD-1504: `team list` and
+`team invites` (`cli.read`), plus `team invite`, `team revoke-invite`,
+`team set-role` and `team remove` (`cli.write` plus a current Owner). These are
+**platform-owned verbs**: the Worker answers them from the workspace
+membership directory after the same `checkCliCall` gate and before runtime
+resolution, so they never wake or forward to a container. `team list` returns a
+privacy-minimized directory (user id, name, role) and never an email,
+invitation token or credential; `team invites` and the invite responses never
+carry the accept token. The `role` argument on `team invite`/`team set-role` is
+the requested **target** role; caller authority comes only from the verified
+envelope, and authority-shaped argument keys stay refused. Client-side
+refusals before any bytes leave the process: a managed `CADENCE_ALIAS`
+(including an empty one) and a local-org destination, neither of which becomes
+a hosted or fallback call. An explicit post-effect `mutation_outcome_uncertain`
+/ `invite_email_uncertain` is reported as an unknown outcome to reconcile with
+a read, never as a retryable availability error (see `docs/REMOTE-AUTH.md`).
+A team mutation whose reply is lost or arrives as a bare 5xx is the same
+unknown outcome: the Worker commits it in the same batch that records the
+receipt, so the write may already have landed.
 
 Client-side refusals (CAD-1179 — refused before any bytes leave the
 process): `issue new` without `--project`, or with `--id`/`--status`;
@@ -131,21 +229,71 @@ actor); `issue set` without a nonempty `--if-rev`, with `--force` (the hosted
 route accepts no force field), or naming more than
 one ticket (revisions are per-ticket — the hosted route checks it under
 the tracker lock via `set_fields_if_rev`, and a stale token answers the
-conflict payload rather than writing).
+conflict payload rather than writing). `project_policy` is not retried
+after a refusal, a conflict, or an ambiguous failure — the same wake-only
+retry as the other writes. A malformed project key is rejected by the
+tracker key grammar before any path join. Remote `send`/`message send`
+without `--message`, or with `--ready`/`--force`, `--nudge`,
+`--priority`/`--supersedes`, `--reply-to` or `--task` (local-endpoint,
+steering and routing surfaces a remote caller cannot carry) refuse before
+a request; `--file` bodies are read client-side (`-` = stdin) under the
+daemon's enqueue byte cap — an oversized body is refused, never truncated.
 
 Refused remotely (default-deny): every operator-only daemon verb
 (`agent join/stop/resume`, `daemon *`, `operator_*`, `rollout`, `master/*`,
 `approve`, `merge`, secrets), verbs naming local paths (`issue init`,
 `attach`, chunked wiki `put` — CAD-913's own envelope contract), and
-`issue start`/`dispatch` (worktree + ownership semantics are local).
+`issue start`/`dispatch` are not container verbs. On a selected remote org
+they coordinate this user's local agent through
+`/__platform/hosted-cadence/:organizationId/local-assignments`
+(`hosted-cadence-local-assignment.v1`). Local completion, including
+`cadence message result`, keeps the claim stored with that message, not a
+newer reclaim, and does not take `--org`. While that message is the alias's
+single running assignment, hosted ticket, wiki, and tool commands pass the
+binding's `--org` under its original member and issuer. A later login is not
+adopted. A managed worker is not instructed to `org switch` or to unset
+`CADENCE_ALIAS`. A worktree alone is not execution.
 Operator-only verbs need the remote operator proof tied to CAD-657's
 source-authority decision — out of scope for v1.
+
+`local-agent connect --alias <alias> --repo <checkout>` configures this
+machine and picks up current assignments once. Run `local-agent watch` for
+ongoing pickup, with a five-second poll and the org pinned for that process.
+Background pickup leaves blocked work alone; after resolving its blocker,
+explicitly reconnect or start that issue again. State-filtered reads prevent a
+recent terminal history page from hiding older queued work.
+Disconnect clears the saved alias and ends pickup; it neither stops existing
+actors nor cancels their claims. Each assignment generation has a separate
+worktree, and reconnect reuses its reserved actor message rather than starting
+the issue twice. A blocked claim resumes before handoff, so a fast result is
+never overwritten by a later `running` report.
+
+Completion is local-first: the durable message result is committed before
+the background reporter contacts the board. A held or unavailable report
+does not block actor completion, local pickup, daemon readiness or shutdown.
+The next daemon startup recovers a terminal result even if it finished before
+the pending-report record was written, and delivers its original claim.
+An unknown outcome is not converted into a success or failure. A fenced
+claim stops retrying without being recorded as an accepted result.
+
+The complete provider result remains in the local message. Automatic hosted
+summaries fit both 4,000 Unicode codepoints and 8,192 bytes for the complete
+pretty-serialized JSON request, retaining the reported revision when present.
+An oversized manual report is refused before HTTP. A durable `result.sha`
+takes precedence; managed endpoints may instead report the final `SHA: <hex>`
+line in their durable result text. Missing or invalid reported revisions make
+the hosted completion fail, even when the checkout has a HEAD or advances
+before recovery. Neither path infers a revision from that mutable checkout.
 
 ## Auth chain
 
 `cadence login --issuer <api-origin> --org <workspace-id>` →
-`/v1/hosted-cadence/device/code` (PKCE, `requested_capabilities` = the CLI
-set) → owner approves on the app → `/v1/hosted-cadence/device/token` → `hct_`
+`/v1/hosted-cadence/device/code` (PKCE; ordinary portal login and
+`--org` login request `cli.read`, `cli.write`, `wiki.read`, and
+`wiki.write`; `cadence login --web` requests `cli.read`, `cli.write`,
+`web.read`, and `web.prepare` and no wiki scopes; renewal resends the
+stored set and does not widen it) → a current workspace member approves on the app →
+`/v1/hosted-cadence/device/token` → `hct_`
 bridge + minted cli-actor enrollment record (locally sealed) → each command:
 `POST https://<slug>.cadencecloud.app/__platform/cli/authorize` (bridge
 bearer → envelope, ≤300 s, `aud` = board host, `organization_id` = slug's

@@ -110,12 +110,18 @@ const EFFECT_WORDS: Record<string, string> = {
 };
 
 /** One slot's requirement in plain words — never a tool or scope name. */
-export function plainRequirement(slot: DeclaredSlot): string {
+export function plainRequirement(
+  slot: DeclaredSlot,
+  t: (english: string) => string = (english) => english,
+): string {
   if (slot.declaration === null)
-    return "Any live connection (this app names no reviewed capability for this slot).";
+    return t("Any live connection (this app names no reviewed capability for this slot).");
   const { capability, version, effect } = slot.declaration;
-  const verb = EFFECT_WORDS[effect] ?? effect;
-  return `${verb} via ${capability} v${version}.`;
+  const verb = t(EFFECT_WORDS[effect] ?? effect);
+  return t("{verb} via {capability} v{version}.")
+    .replace("{verb}", () => verb)
+    .replace("{capability}", () => capability)
+    .replace("{version}", () => String(version));
 }
 
 export type BindingHealth =
@@ -163,6 +169,7 @@ export interface SlotReadiness {
   registered: boolean;
   /** CAD-1119: the slot contract changes awaiting the operator's confirm. */
   confirm: BindingChange[] | null;
+  unavailable: boolean;
   ready: boolean;
   nextAction: string;
 }
@@ -177,11 +184,33 @@ export interface SlotReadiness {
  * blocker. Legacy untyped slots never authorize an effect, so they stay
  * out of the list.
  */
+/**
+ * The next-action sentence for one readiness row, in whole translated
+ * templates (slot names are substituted literally, never joined from parts).
+ * English output is identical to `readinessFor`'s `nextAction`.
+ */
+export function readinessAction(
+  row: Pick<SlotReadiness, "slot" | "binding" | "health" | "custody" | "registered" | "confirm" | "unavailable">,
+  t: (english: string) => string = (english) => english,
+): string {
+  const slot = row.slot;
+  const fill = (template: string) => t(template).replace("{slot}", () => slot);
+  if (!row.binding || row.health === "not-configured") return fill("Choose a {slot} connection below and save it.");
+  if (row.health === "stale-bundle") return fill("Save the {slot} connection again for the current app version.");
+  if (row.health === "missing-connection") return fill("Its connection is gone — choose another {slot} connection below.");
+  if (!row.custody) return t("Its connection is unhealthy — see Settings → Connections, then rebind.");
+  if (!row.registered) return t("Its connection's provider is no longer registered — see Settings → Connections, then rebind.");
+  if (row.confirm) return t("Its connection changed what this slot may do. Review the change and confirm it.");
+  if (row.unavailable) return t("Its connection no longer fits this slot — see Settings → Connections, then rebind.");
+  return t("Ready to run.");
+}
+
 export function readinessFor(
   installation: Installation,
   bindings: AppBinding[],
   connections: Connection[],
   contextId: string | null,
+  t: (english: string) => string = (english) => english,
 ): SlotReadiness[] {
   return declaredSlots(installation)
     .filter((slot) => slot.declaration !== null)
@@ -222,13 +251,14 @@ export function readinessFor(
                     : `Ready to run.`;
       return {
         slot: slot.slot,
-        requirement: plainRequirement(slot),
+        requirement: plainRequirement(slot, t),
         binding,
         connection,
         health,
         custody,
         registered,
         confirm,
+        unavailable,
         ready,
         nextAction,
       };

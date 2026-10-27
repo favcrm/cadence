@@ -167,6 +167,9 @@ impl Fx {
             provider_env: env,
             stop: Some(Arc::clone(&stop)),
             test_seam: true,
+            // This fixture proves the manual send-now path against a daemon
+            // that "dies" on status; the scheduled driver would settle the row.
+            social_publish_driver_off: true,
             slots: Some(Default::default()),
             lease: Some(Default::default()),
             auto_stop: Some(daemon::AutoStopSetting::off()),
@@ -232,6 +235,67 @@ fn send_params(id: &str) -> Value {
     json!({"intent_id": id, "install_id": "install-a", "context_id": "ctx-a"})
 }
 
+/// The fake mirrors AOS's exclusive expiry while preserving not-before.
+#[test]
+fn fake_send_grant_uses_exclusive_expiry_and_inclusive_not_before() {
+    let binding = door::SendBinding {
+        key: "aaaaaaaa".into(),
+        connection_id: CONN.into(),
+        destination_id: DEST.into(),
+        toolkit: door::Toolkit::Facebook,
+        caption_digest: caption(),
+        image_digest: None,
+        source: door::PublicationSource::Run {
+            run_id: "run-1".into(),
+        },
+        cadence_effect_id: "fx-1".into(),
+        grant_id: GRANT.into(),
+    };
+    let destination = destination();
+    let ledger = door::FakePublishLedger::new();
+    let mut grant = door::SendGrant {
+        id: GRANT.into(),
+        workspace_id: "ws".into(),
+        connection_id: CONN.into(),
+        destination_id: DEST.into(),
+        toolkit: door::Toolkit::Facebook,
+        caption_digest: caption(),
+        image_digest: None,
+        cadence_approval_id: "appr-1".into(),
+        max_uses: 1,
+        remaining_uses: 1,
+        revoked: false,
+        not_before_epoch: NOW - 1,
+        expires_at_epoch: NOW,
+    };
+
+    assert!(ledger
+        .preflight(&binding, &destination, &grant, "ws", NOW - 1)
+        .is_ok());
+    assert_eq!(
+        ledger
+            .preflight(&binding, &destination, &grant, "ws", NOW)
+            .unwrap_err()
+            .code,
+        "grant_window",
+        "expiry is exclusive"
+    );
+
+    grant.not_before_epoch = NOW;
+    grant.expires_at_epoch = NOW + 1;
+    assert_eq!(
+        ledger
+            .preflight(&binding, &destination, &grant, "ws", NOW - 1)
+            .unwrap_err()
+            .code,
+        "grant_window",
+        "time before not-before is refused"
+    );
+    assert!(ledger
+        .preflight(&binding, &destination, &grant, "ws", NOW)
+        .is_ok());
+}
+
 /// R1: the operator's send-now on a queued, approved intent posts it once
 /// and the intent reads posted, its receipt verified against what the
 /// door returned. Another due intent is untouched; a second press sends
@@ -295,34 +359,55 @@ fn r3_agent_and_member_are_refused_over_rpc_and_http() {
             let _ = request.respond(tiny_http::Response::from_string(jwks.clone()));
         }
     });
-    let free = |p: &u16| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok();
-    let port = (3110..3200).find(free).unwrap();
+    // Start-and-acknowledge: a probed-then-dropped port can be taken by another
+    // test binary before this board binds, so a failed bind tries the next
+    // candidate instead of failing the test (CAD-1724).
+    let stop = Arc::new(AtomicBool::new(false));
+    let (port, board) = (3110..3200)
+        .find_map(|port| {
+            let (public, local) = (
+                format!("acme.board.localhost:{port}"),
+                format!("cadence-{port}.localhost:{port}"),
+            );
+            let _ = &local;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let public_board = cadence_agent::ui::PublicBoard {
+                host: public.clone(),
+                authorize_url: format!("{issuer}/v2/board/authorize"),
+                issuer: issuer.clone(),
+                company: "co_1".into(),
+            };
+            let opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(stop.clone()),
+                startup: Some(tx),
+                test_seam: true,
+                allow_hosts: vec![public.clone()],
+                allow_origins: vec![format!("http://{public}")],
+                public: Some(public_board),
+                ..Default::default()
+            };
+            let (dir, pm) = (fx.dir(), fx.dir().join("no-pm"));
+            let board = std::thread::spawn(move || cadence_agent::ui::serve(&dir, &pm, &opts));
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(())) => Some((port, board)),
+                Ok(Err(_)) => {
+                    // The board reported a bind failure and has returned; join it so
+                    // no server can survive the attempt.
+                    let _ = board.join();
+                    None
+                }
+                // A board that never reported is not a port collision: fail loudly
+                // rather than retry with a server possibly still running.
+                Err(_) => panic!("board on port {port} did not report startup"),
+            }
+        })
+        .expect("no board port in 3110-3199");
     let (public, local) = (
         format!("acme.board.localhost:{port}"),
         format!("cadence-{port}.localhost:{port}"),
     );
-    let (tx, rx) = std::sync::mpsc::channel();
-    let stop = Arc::new(AtomicBool::new(false));
-    let public_board = cadence_agent::ui::PublicBoard {
-        host: public.clone(),
-        authorize_url: format!("{issuer}/v2/board/authorize"),
-        issuer: issuer.clone(),
-        company: "co_1".into(),
-    };
-    let opts = cadence_agent::ui::ServeOpts {
-        host: "127.0.0.1".into(),
-        port,
-        stop: Some(stop.clone()),
-        startup: Some(tx),
-        test_seam: true,
-        allow_hosts: vec![public.clone()],
-        allow_origins: vec![format!("http://{public}")],
-        public: Some(public_board),
-        ..Default::default()
-    };
-    let (dir, pm) = (fx.dir(), fx.dir().join("no-pm"));
-    let board = std::thread::spawn(move || cadence_agent::ui::serve(&dir, &pm, &opts));
-    rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
     let post = |host: &str, path: &str, extra: &str, body: &str| -> (u16, String) {
         let req = format!(
             "POST {path} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\nX-Cadence-Board: 1\r\n\

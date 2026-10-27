@@ -7,11 +7,11 @@ CAD-631/632. Draft PR307 is a design reference, not a runtime dependency.
 
 ## Start
 
-Node22+ and the pnpm version pinned in ui/package.json are required. From a clean
+Node 22+ and Bun 1.4.4, pinned in ui/package.json, are required. From a clean
 source checkout, one command installs the locked existing tools and starts HMR:
 
 ```sh
-(cd ui && pnpm install --frozen-lockfile) && node scripts/app-dev.mjs social-content
+(cd ui && bun install --frozen-lockfile) && node scripts/app-dev.mjs social-content
 ```
 
 Default: http://127.0.0.1:3186/. Existing private reachability, without tailnet,
@@ -32,6 +32,27 @@ app/manifest or git URL is executed. The bridge dispatches before resolving
 state or sandbox profiles; it uses no daemon, PM or approval. Its child inherits
 only PATH/HOME/LANG/TERM/PNPM_HOME/XDG_CACHE_HOME, not native identity, state,
 provider credentials or NODE_OPTIONS. Dependencies must already be installed.
+
+## Container preview
+
+The same fixtures-only server can run in a local AgenticOS runtime image. The
+runner never pulls an image; supply one already present locally:
+
+```sh
+docker image inspect --format '{{.Id}}' <local-runtime-image>
+node app-previews/container.mjs --app social-content --port 3195 \
+  --image <local-runtime-image>
+```
+
+One container runs per checkout and port, so two agents in different worktrees
+use different ports and distinct container names. The checkout is the only
+mount (`/work`); no Cadence state, PM, daemon socket, tracker or provider
+credential is mounted or passed. The published port is `127.0.0.1:<port>` only.
+`SIGINT`/`SIGTERM` force-removes the container (including one created but
+not yet started); the runner also removes it after the container exits.
+The image must already contain Node 22+; the checkout's `ui/node_modules` is mounted so the
+preview uses the existing Vite install. This is a local execution plane, not a
+control plane: it cannot write the tracker.
 
 ## Boundary and ownership
 

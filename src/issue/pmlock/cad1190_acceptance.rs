@@ -20,11 +20,19 @@ fn tracker() -> (tempfile::TempDir, Pm) {
 /// releasing the fence (a crashed writer).
 fn crash_writing(pm: &Pm, files: &[String]) {
     let mut lock = pm.lock().unwrap();
-    std::thread::sleep(Duration::from_millis(30));
+    let after_snapshot = std::fs::metadata(pm.dir.join(".git").join(DIRTY_FILE))
+        .unwrap()
+        .modified()
+        .unwrap()
+        + Duration::from_secs(1);
     for f in files {
         let p = pm.dir.join(f);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, "half-written\n").unwrap();
+        std::fs::File::open(&p)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(after_snapshot))
+            .unwrap();
     }
     lock.armed = false;
     drop(lock);
@@ -63,9 +71,15 @@ fn cad1190_every_leftover_inside_a_foreign_untracked_dir_refuses_its_scoped_writ
     let (_d, pm) = tracker();
     std::fs::create_dir_all(pm.dir.join("foreign")).unwrap();
     std::fs::write(pm.dir.join("foreign/old.txt"), "operator's own\n").unwrap();
+    std::fs::File::open(pm.dir.join("foreign/old.txt"))
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(2)),
+        )
+        .unwrap();
     // A clean write records `foreign/` in the snapshot.
     drop(pm.lock().unwrap());
-    std::thread::sleep(Duration::from_millis(30));
     let files: Vec<String> = (0..LEFT).map(|i| format!("foreign/new{i:03}.md")).collect();
     crash_writing(&pm, &files);
     assert_every_leftover_refuses(&pm, &files);

@@ -4,31 +4,173 @@
 
 The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
 
-1. One PR per feature. Small PRs review and merge fast, and a split feature
-   leaves main half-built.
-   Essentials first: the simplest change that meets the acceptance items,
-   extras to a follow-up ticket, polish in later PRs.
-   One ticket per feature too; when the PR merges the lane reconciles the
-   ticket and cleans up its scratch and processes.
-2. Put the design note in the PR description, not in a separate document.
-3. Run `scripts/pre-push` before every push (`--tests` before asking for
-   review of Rust changes).
-4. One independent reviewer. Two for auth, identity, secrets, the daemon trees
-   and UI paths (`docs/roles/one-review-paths.toml` lists what gets one).
-5. Review notes never block. Findings that are not defects go in a follow-up
-   PR, not into this head.
-6. Operator approval: for a `human`-class PR the operator records ONE scope
+1. Requirement and plan: state the user outcome, observable acceptance,
+   non-goals and material unknowns in the ticket. Resolve consequential
+   ambiguity before implementation; a short ticket plan is enough for a
+   small change. One ticket and PR per end-to-end feature; split only for
+   another repository or an independently usable outcome, not per step.
+2. Implement the simplest change that meets acceptance. Reuse existing
+   conventions and modules; put a design note in the PR when AGENTS.md
+   requires it, not in a separate mandatory design-review round. Before
+   requesting review, simplify your changed lines without changing behaviour:
+   remove dead code, duplication and unnecessary abstractions. The
+   `code-simplifier` skill can help; it is not another approval stage.
+   Adjacent refactors and polish go to a follow-up ticket.
+3. Run `scripts/pre-push` before every push and show the ticket's outcome.
+   For a bug fix, show the failing case once, then fixed. Add checks only
+   under AGENTS.md's behavior-first and gates/security rules; do not restore
+   retired tests or routinely repeat suites. `--tests` is a focused local
+   diagnostic, not a blanket pre-review prerequisite; required CI and full
+   merge-group regression remain unchanged.
+4. Under strict requirements, one independent reviewer; two for auth, identity,
+   secrets, the daemon trees and UI paths (`docs/roles/one-review-paths.toml`
+   lists what gets one).
+5. The version-one delivery tiers apply to clean default-equivalent policies
+   by default after the reviewed implementation is installed; the introducing
+   PR must still satisfy the current trusted-base gates. Routine changes need
+   green exact-head CI and genuine
+   ticket-outcome evidence, with no mandatory review; consequential changes
+   need one independent combined standards/spec review. Sensitive changes
+   keep the existing strict review, operator, Browser QA and full-check
+   requirements. Unknown, incomplete, protected-mode, deletion and mixed
+   sensitive cases retain strict legacy floors. Explicitly approved custom
+   policies remain in force and strict; malformed or unapproved policy changes
+   fail closed. Approved version-one profiles remain readable for compatibility.
+   Mandatory protection checks, full merge-group regression, credential
+   isolation and operator-owned deployment remain unchanged. No fabricated
+   verdict/readiness counts as review or outcome evidence; dry-run is read-only
+   and requirements must be freshly bound before queueing.
+6. Required read-only code review may overlap CI on a stable head; pending
+   CI is not readiness and all required exact-head checks must be green
+   before enqueue. Rebase onto current main before requesting review, as
+   AGENTS.md requires; after approval, rebase only for conflicts. Review
+   correctness, security and ticket acceptance. Preserve independent refusal
+   acceptance for enforced rules and desktop/narrow Browser QA for `ui/**`.
+   REVISE only for correctness, security or ticket-requirement gaps. Other
+   findings are notes: one follow-up ticket or a recorded reason to drop them,
+   not another polish round on the reviewed head.
+7. Operator approval: for a `human`-class PR the operator may record one scope
    approval per ticket with
    `cadence audit approve --issue <ID> --action scope`. It covers the ticket
    only while it is ready, doing or review, and its body declares its risk
    triggers on exactly one `Risk:` line. It is bound to the ticket body, so
    editing the body voids it, and verdict notes state `Scope: in-scope <ID>`.
-   A per-PR approval (`--pr <n> --head <sha>`) is needed only for triggers 1
-   or 3, or for a diff outside the declared scope.
-7. Enqueue with `scripts/enqueue-reviewed <n> --head <full-sha>`; it checks the
-   scope rules above.
-8. Production: dispatch a staging promote, then the GitHub `production`
-   approval, then `cadence update --as operator:<n>`.
+   Scope approval is optional and valid only when every AGENTS.md condition
+   holds. Triggers 1/3, two-review paths, uncovered scope or invalid bindings
+   require per-head approval; conversation text is never approval evidence.
+8. Post the required exact-head ticket evidence and enqueue with
+   `scripts/enqueue-reviewed <n> --head <full-sha>`. Use the merge queue, not
+   routine `--admin` merges or duplicate local integration trains. Disable
+   auto-merge before editing an enqueued PR; a new head voids old verdicts.
+9. Follow the [artifact-specific rollout checklist](guides/rollout-checklist.md)
+   and [host release cycle](RELEASING.md). For a native host:
+   merged → attested main CI artifact → staged → manually promoted with GitHub
+   `production` approval → operator-installed → operationally verified.
+   **Automatic staging is not production promotion.** Check the successful
+   manual `staging.yml` run and its `production-candidate` receipt before
+   handing over the default update commands; a green CI/staging run alone
+   cannot advance the updater's candidate. Public version tags use the
+   separate numbered-release path, not a tag on every merge.
+   Production deployment is operator-owned; agents never restart the live
+   daemon. After merge, reconcile the ticket, leave the worktree to the sweep,
+   and clean up only your own scratch and processes. Record installation and
+   verification separately; reconciliation is merge evidence, not deployment.
+
+## Pragmatic design and cycle time
+
+Generic means using standard approaches and genuinely shared modules, not
+building a framework for hypothetical future callers. Keep interfaces small
+and changes local. Introduce an abstraction only when current acceptance or
+real variation needs it; do not force different workflows through one generic
+interface. When two approaches meet acceptance, choose the smaller one and
+explain why. Larger refactoring needs its own outcome and acceptance.
+
+One bounded author simplification pass precedes review. Stop when acceptance
+and required verification are complete; do not add planning documents,
+reviewers, repeated checks or handoffs merely to make the process look thorough.
+Reuse unchanged-head evidence and reviewer context as described below. Never
+trade away approval, independent review required by the effective policy,
+isolation or fail-closed guards to save time.
+
+For a slow cycle, inspect existing `cadence issue retro <ID> --json` evidence
+and CI job timings. Separate active work from waiting for scope decisions,
+resource admission, CI, review, approval, queue and rollout; unknown timings
+stay unknown. Compare similar risk tiers before changing the process. Use
+existing timestamps for median/p90 where enough comparable evidence exists;
+do not claim speed gains from one anecdote or add a mandatory evidence ledger.
+Fix the demonstrated bottleneck, not whichever gate is easiest to remove.
+
+Local role documents or generated briefings may be stale. Follow AGENTS.md and
+the effective delivery policy; do not treat an untracked briefing as merge or
+production authority. Changed instructions do not reload running contexts.
+
+## Bounded review brief
+
+A review dispatch is a contract for one bounded inspection, not a license to
+audit the codebase. The brief states, on one page:
+
+- the exact head SHA and the diff or changed paths under review;
+- the ticket's acceptance items the reviewer is answering;
+- the concrete risks and required checks for this diff (the risk class, the
+  one-or-two-review path, any gate or security acceptance check);
+- which existing evidence is still valid to reuse (a prior PASS on the same
+  head, unchanged-head CI, earlier findings);
+- what is excluded from this review;
+- the accountable reviewer and where the verdict files (the head-pinned
+  verdict note and `cadence report file` route);
+- an agreed effort and checkpoint budget — roughly how much inspection the
+  diff justifies and when to stop and report back.
+
+The reviewer inspects whether the diff meets its acceptance and whether its
+relevant dependencies and risks hold. They do not automatically add optional
+requirements, broader audits, extra tests, extra builds, browser journeys,
+refactors or additional reviewers. Wider optional inspection is allowed, but
+only after naming a concrete failure scenario, the proposed scope and cost,
+and getting the dispatcher's permission first — it is never folded silently
+into the same verdict.
+
+Mandatory safeguards are not optional scope. A concrete security, isolation
+or approval risk the reviewer actually sees is investigated or escalated on
+the spot; missing required evidence is a blocker, never a fabricated PASS.
+None of this changes the automated gates or reviewer counts AGENTS.md and
+the effective policy already fix.
+
+The review stops when every acceptance item has a disposition and the
+required checks are done. The verdict reports PASS or REVISE on the exact
+head, the evidence read, blockers and separate non-blocking notes. If the
+agreed budget runs out first, the reviewer files a scoped blocker naming the
+remaining work — not an automatic PASS and not open-ended continuation.
+
+### Converge instead of restarting
+
+The first pass covers the complete change against ticket acceptance and its
+relevant dependencies. Before returning REVISE, verify each blocking finding:
+name the file/function, concrete failure scenario and supporting source or
+runtime evidence. Report the bug class and all known affected instances in one
+response, not one instance per round. Optional polish stays non-blocking.
+
+A new head on the same ticket goes back to the same reviewer. The existing
+handoff names the previously reviewed head, new head, prior findings and fix
+evidence. Review the delta and affected behavior/dependencies rather than
+restarting the whole inspection. Widen when assumptions, scope or risks change;
+if the prior review is unavailable, perform a complete first pass. Do not
+repeat resolved findings without new evidence that the fix is incomplete.
+
+Delta review is a way to inspect the new head, not to carry an old PASS forward.
+File a fresh exact-head verdict and revalidate the required evidence; only
+still-valid evidence may be reused. New heads still invalidate old verdicts,
+and required CI, Browser QA, refusal acceptance and approval bindings remain
+unchanged. Read-only review may overlap CI; pending CI never permits enqueue.
+
+If a third round still returns REVISE, stop the automatic fix/review loop and
+escalate to the PM or operator with the remaining failure scenarios, attempted
+fixes and a recommended approach. A round cap is not permission to auto-pass,
+ignore a real bug or weaken the existing risk-class rules. Resume after the
+approach or disagreement is resolved, with the required exact-head checks.
+
+This applies the convergence lessons from
+[How the Claude Code team does code review](https://claude.dev/blog/solving-code-review-at-anthropic/):
+reduce repeated review and human waiting, not the safeguards.
 
 ## What #738 taught us
 
@@ -68,11 +210,18 @@ A classifier read from the **base revision** selects cheap PR feedback:
 | --- | --- | --- |
 | Isolated documentation guides | None; document/contracts checks still run | All current real gates |
 | Isolated UI source/assets | Frontend checks + embedded-UI build; no unrelated default Rust gates | All current real gates |
+| Edits to pre-existing independent top-level `tests/<name>.rs` only | fmt/clippy/build gates plus nextest on exactly those targets, still with lib and bins suites and zero-target guards | All current real gates |
 | Rust logic | All feature/build/test gates; embedded feature can depend on Rust | All current real gates |
 | Workflow, scripts, dependencies, governance, mixed/unknown changes | All gates | All current real gates |
 
 Deletions, renames, symlinks, bad SHAs, absent classifier or failed lookup
 fall back to full validation. PR code cannot supply its own selection policy.
+The tests scope narrows only when every changed file is a pre-existing
+top-level `tests/<name>.rs` modified in place, the base manifest has no
+explicit `[[test]]`/`autotests = false`, no `tests/<dir>/main.rs` cargo
+target exists at base, and no other tracked base `.rs` source references
+the file's name or path. `tests/fixtures/*.rs` helpers, new or deleted
+test files, mixed diffs and non-PR events never narrow.
 Required contexts explicitly report not-applicable commands, never 'built' or
 'passed tests' when they did not execute. Merge groups do not take the fast
 path: this keeps final integration coverage even when docs are read indirectly
@@ -89,9 +238,20 @@ scripts/pre-push --tests        # execute; stop at the first nonzero exit
 The diff selects Rust/UI/active script checks. The live doctor source
 inventory always runs. `--tests` always executes the safety floor (two test
 threads), even if its source is unchanged or diff discovery is uncertain.
-Add filtered tests for the behavior you changed; the floor is not that proof.
+Show the behavior you changed; add a focused check only when AGENTS.md requires
+it or the ticket's outcome cannot be shown without one. The floor is not
+that proof.
 Host Rust builds use four jobs and normal build-slot admission. If admission
 is unavailable, report that limitation rather than claiming local validation.
+
+The CAD-811 public-owner fixture uses the board's typed startup receipt, not a
+health probe. Its `Native::try_new_with_roles` refuses a lost bind; only native
+`AddrInUse` starts a fresh state/realm on the next candidate from
+`test_ports::reserve_board_port`. That helper's saturating per-process cursor
+bounds attempts but is not a cross-process lease. Other startup errors and
+missing receipts remain blocked. CAD-1838's competing-listener check proves the
+original listener stays owned while a fresh real board preserves Native owner
+attribution over HTTP; the retired-reviewer refusal is unchanged.
 
 ### Queueing without a pane (subagents, operator shells)
 
@@ -187,10 +347,13 @@ digest, no fresh full review for unchanged code, and no duplicate Node setup
 for cargo-only retired journeys. Measure failure-before-review rate and
 number of operator/reviewer handoffs as well as CI elapsed/runner minutes.
 
-Review count follows AGENTS.md "Review" (CAD-1099): one independent review by
-default, two for the excluded paths in `docs/roles/one-review-paths.toml`, and
-operator approval for human risk. Automating evidence collection, reviewer state,
-head-drift notifications or an operator decision UI is a separate reviewed
+Review count follows AGENTS.md "Review" and the effective delivery policy:
+eligible routine changes need no mandatory review, consequential changes one
+combined review, and sensitive/unknown cases retain strict floors. Under the
+strict path, use one independent review by default, two for excluded paths in
+`docs/roles/one-review-paths.toml` (subject to the documented solo-operator
+rule), and operator approval for human risk. Automating evidence collection,
+reviewer state, head-drift notifications or an operator decision UI is a separate reviewed
 implementation—not a license to self-approve. Likewise, consolidating required
 build/UI checks or changing branch protection requires baseline measurements
 and an operator decision. Do not change names in YAML before migrating the
@@ -227,3 +390,75 @@ normal gates return. An agent or PR may not grant that exception to itself.
   checks or the restored mandatory controls must be present before ordinary
   delivery resumes. The exception is evidence for a controlled transition, not
   proof that the removed coverage was safe or equivalent.
+
+## Local AgenticOS provider
+
+A dev sandbox can use the real AgenticOS provider for Social Content source
+reads, image/text generation and device publish. The app needs no fixture
+variant: the host emits the same `agenticos_external` receipts production does.
+The profile is sandbox-only; a production daemon still reads the fixed
+root-owned `/etc/cadence/provider-deployments.json`.
+
+Create the credentials with their exact scopes:
+
+| File | Scopes | Used for |
+| --- | --- | --- |
+| `provider.token` | `provider.read` + `provider.draft` | source, destination list, image and text |
+| `send.token` | `publish.send` | device publish |
+
+Cadence keeps one connection per provider/account, so read and draft share one
+connection. Publish stays a separate credential because AgenticOS does not
+allow `provider.*` and `publish.send` on one token. If the workspace issues
+separate read/draft tokens, provide `read.token` and `draft.token`; the command
+still enrolls one connection using `read.token`, which must carry both scopes
+for image/text work.
+
+```sh
+mkdir -p ~/.config/cadence/dev-tokens
+chmod 0600 ~/.config/cadence/dev-tokens/*.token
+
+cadence dev agenticos setup --name dev \
+  --workspace ws_<company-uuid> \
+  --token-dir ~/.config/cadence/dev-tokens
+
+cadence dev up dev
+cadence dev agenticos bind --name dev --bundle ./dist/bundle --context Default
+```
+
+`setup` writes `provider.json`, a sandbox-scoped `provider-deployments.json`
+with the reviewed `agenticos-external-provider-tools@4` pin, and the credential
+files under the sandbox root. `up` applies the profile to the daemon and its
+children; if the sandbox is already running, `cadence dev reload --name dev`
+applies it. `cadence dev env dev` prints the same exports for CLI use.
+
+`bind` installs the bundle, approves that exact digest in the sandbox, creates
+the context, enrolls the provider connection, binds every declared
+`source`/`image`/`writer` slot, and sets the publication destination from the
+live destination list. A changed bundle needs a fresh sandbox or a catalog
+upgrade before rebinding.
+
+To clear the sandbox's pending run and release approvals in one explicit step:
+
+```sh
+cadence dev agenticos approve --name dev --install <install-id> \
+  [--context-id <id>] [--dry-run]
+```
+
+It approves only runs in `awaiting_approval` with their exact snapshot digest
+and effects in `waiting` with their exact digest. `--dry-run` pages the
+read-only `waiting` list and prints the same candidate IDs and digests a live
+run would approve. Without `--dry-run` it approves each batch and re-queries
+the `waiting` state, so later windows are reachable. Its decision is
+`execute: false`: the effect is decided with its exact digest but not run, so
+the command never publishes; a normal board approval still executes. A dry run
+opens an existing record file read-only and creates or migrates nothing; a live
+run uses the normal listing path. It refuses a non-dev store, does not create
+or dispatch work, and never runs as a daemon watcher. All its RPCs use the checked sandbox socket, never an inherited
+`CADENCE_SOCKET`; a symlinked or non-socket `cadence.sock` is refused.
+
+Only the install approval is automatic, and only for the exact digest in a dev
+store. The `approve` command is an explicit operator call; run, quote and
+effect approvals remain the normal host checks. The device publish sender is
+configured by the profile’s `CADENCE_PUBLISH_*` exports, so local publish does
+not need a hosted lease. Use a test Instagram account: a device publish is a
+real external side effect.

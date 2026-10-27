@@ -1,5 +1,9 @@
-import Markdown, { defaultUrlTransform } from "react-markdown";
+import { createContext, isValidElement, useContext, useState, type ReactNode } from "react";
+import Markdown, { defaultUrlTransform, type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { citationSpans, isWikiRevisionHref, wikiRevisionHref } from "../features/wiki/citations";
+import { useTranslate } from "../lib/localeText";
+import Link from "./Link";
 import SafeLink from "./SafeLink";
 
 // Bare issue ids become `issue:` links as a remark pass over `text` nodes
@@ -38,6 +42,38 @@ function linkifyChildren(node: MdNode): void {
   node.children = out;
 }
 
+function linkifyCitations(node: MdNode): void {
+  const kids = node.children;
+  if (!kids || node.type === "link" || node.type === "linkReference") return;
+  const out: MdNode[] = [];
+  for (const kid of kids) {
+    if (kid.type !== "text" || !kid.value) {
+      linkifyCitations(kid);
+      out.push(kid);
+      continue;
+    }
+    const spans = citationSpans(kid.value);
+    if (spans.length === 0) {
+      out.push(kid);
+      continue;
+    }
+    let last = 0;
+    for (const span of spans) {
+      if (span.start > last) out.push({ type: "text", value: kid.value.slice(last, span.start) });
+      const href = wikiRevisionHref(span.citation.path, {
+        at: span.citation.revision,
+        ...(span.citation.section ? { section: span.citation.section } : {}),
+        ...(span.citation.page !== undefined ? { page: span.citation.page } : {}),
+      });
+      out.push({ type: "link", url: `wiki-rev:${href}`, children: [{ type: "text", value: span.label }] });
+      last = span.end;
+    }
+    if (last < kid.value.length) out.push({ type: "text", value: kid.value.slice(last) });
+  }
+  node.children = out;
+}
+
+const remarkWikiCitations = () => (tree: MdNode) => linkifyCitations(tree);
 const remarkIssueLinks = () => (tree: MdNode) => linkifyChildren(tree);
 
 // Agent-written Markdown must not initiate third-party image requests. The
@@ -56,6 +92,123 @@ function markdownImageSrc(src?: string): string | null {
 // agent-written Markdown, so the remainder is checked, not trusted.
 const WHOLE_ISSUE_ID = new RegExp(`^${ISSUE_ID_SRC}$`);
 
+function plainText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(plainText).join("");
+  return "";
+}
+
+/** A fenced block's language and text, read from the `<code>` child that
+ *  react-markdown nests inside `<pre>`. */
+function codeBlock(children: ReactNode): { lang: string; code: string } {
+  const child = Array.isArray(children) ? children[0] : children;
+  if (!isValidElement(child)) return { lang: "", code: "" };
+  const props = child.props as { className?: string; children?: ReactNode };
+  const lang = /(?:^|\s)language-([\w+-]+)/.exec(props.className ?? "")?.[1] ?? "";
+  return { lang, code: plainText(props.children) };
+}
+
+/** The one fenced-code renderer: language label, Copy, and the code in
+ *  the theme's mono face. Highlighting is deliberately absent: adding a
+ *  highlighter is a bundle-size decision, not a rendering detail. */
+function CodeBlock({ children }: { children?: ReactNode }) {
+  const t = useTranslate();
+  const { lang, code } = codeBlock(children);
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="codeblock">
+      <div className="codeblock-bar">
+        <span className="codeblock-lang num">{lang || t("code")}</span>
+        <button
+          type="button"
+          className="lnk codeblock-copy"
+          onClick={() => {
+            void navigator.clipboard
+              ?.writeText(code)
+              .then(() => {
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 1600);
+              })
+              .catch(() => undefined);
+          }}
+        >
+          {copied ? t("Copied") : t("Copy")}
+        </button>
+      </div>
+      <pre>{children}</pre>
+    </div>
+  );
+}
+
+const InLinkContext = createContext(false);
+const handlerComponents = new WeakMap<object, Components>();
+let noHandlerComponents: Components | null = null;
+
+/** The renderer set is cached per issue handler. Recreating these component
+ *  types on every thread update would make React unmount and reinsert old
+ *  code, links and images, which a live log would announce as new content. */
+function buildComponents(onOpen?: (id: string) => void): Components {
+  return {
+    img: ({ src, alt }) => {
+      const linked = useContext(InLinkContext);
+      const safe = markdownImageSrc(src);
+      if (!safe) return <span>{alt || "Image unavailable"}</span>;
+      const image = <img src={safe} alt={alt ?? ""} loading="lazy" decoding="async" />;
+      return linked ? (
+        image
+      ) : (
+        <a className="md-image" href={safe} target="_blank" rel="noreferrer">
+          {image}
+        </a>
+      );
+    },
+    pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
+    a: ({ href, children }) => {
+      const issueId = href?.startsWith("issue:") ? href.slice(6) : null;
+      const revisionHref = href?.startsWith("wiki-rev:") ? href.slice("wiki-rev:".length) : null;
+      const nested = <InLinkContext.Provider value={true}>{children}</InLinkContext.Provider>;
+      if (revisionHref !== null) {
+        return isWikiRevisionHref(revisionHref) ? (
+          <Link className="lnk" href={revisionHref}>{nested}</Link>
+        ) : (
+          <>{children}</>
+        );
+      }
+      return !href ? (
+        // react-markdown blanked an unsafe target: show text, not an
+        // anchor that would reopen the board in a new tab.
+        <>{children}</>
+      ) : issueId !== null ? (
+        WHOLE_ISSUE_ID.test(issueId) ? (
+          onOpen ? (
+            <button className="lnk num" onClick={() => onOpen(issueId)}>
+              {nested}
+            </button>
+          ) : (
+            <span className="num">{children}</span>
+          )
+        ) : (
+          // A malformed id is shown as text: no button, no anchor.
+          <>{children}</>
+        )
+      ) : (
+        <SafeLink className="lnk" href={href} encoded>
+          {nested}
+        </SafeLink>
+      );
+    },
+  };
+}
+
+function componentsFor(onOpen?: (id: string) => void): Components {
+  if (!onOpen) return (noHandlerComponents ??= buildComponents());
+  const cached = handlerComponents.get(onOpen);
+  if (cached) return cached;
+  const built = buildComponents(onOpen);
+  handlerComponents.set(onOpen, built);
+  return built;
+}
+
 export default function Md({
   text,
   onOpen,
@@ -67,40 +220,11 @@ export default function Md({
     <Markdown
       // GFM (CAD-551): tables, task lists, strikethrough, autolinks —
       // the providers' answers lean on them.
-      remarkPlugins={[remarkGfm, remarkIssueLinks]}
-      // `issue:` ids are ours; everything else takes react-markdown's
-      // safe transform (no `javascript:` and friends).
-      urlTransform={(url) => (url.startsWith("issue:") ? url : defaultUrlTransform(url))}
-      components={{
-        img: ({ src, alt }) => {
-          const safe = markdownImageSrc(src);
-          return safe ? <img src={safe} alt={alt ?? ""} /> : <span>{alt || "Image unavailable"}</span>;
-        },
-        a: ({ href, children }) => {
-          const issueId = href?.startsWith("issue:") ? href.slice(6) : null;
-          return !href ? (
-            // react-markdown blanked an unsafe target: show text, not an
-            // anchor that would reopen the board in a new tab.
-            <>{children}</>
-          ) : issueId !== null ? (
-            WHOLE_ISSUE_ID.test(issueId) ? (
-              <button
-                className="lnk num"
-                onClick={() => onOpen?.(issueId)}
-              >
-                {children}
-              </button>
-            ) : (
-              // A malformed id is shown as text: no button, no anchor.
-              <>{children}</>
-            )
-          ) : (
-            <SafeLink className="lnk" href={href} encoded>
-              {children}
-            </SafeLink>
-          );
-        },
-      }}
+      remarkPlugins={[remarkGfm, remarkWikiCitations, remarkIssueLinks]}
+      // `issue:` ids and pinned wiki revisions are ours; everything else
+      // takes react-markdown's safe transform (no `javascript:` and friends).
+      urlTransform={(url) => (url.startsWith("issue:") || url.startsWith("wiki-rev:") ? url : defaultUrlTransform(url))}
+      components={componentsFor(onOpen)}
     >
       {text}
     </Markdown>

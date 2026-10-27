@@ -5,9 +5,9 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-# CAD-426: the monolithic `integration` binary is split into per-area
-# tests/*.rs binaries. TARGET is `all-targets` or a test binary name
-# (the tests/<name>.rs stem, e.g. `daemon`, `board`, `agents_pty`).
+# CAD-1727: the integration checks are modules of the one `suite` target
+# (tests/suite.rs). TARGET is `all-targets` or a test target name
+# (`suite`, or a separately declared target).
 # CAD-482: remaining args (e.g. `--features test-seam`) reach both the
 # cargo and the nextest inventory, so parity holds on the same feature
 # set the suite runs with.
@@ -26,6 +26,13 @@ die() {
 # Other callers need no destination; CI uses the default target directory.
 TIMINGS_REPORT=${CADENCE_INVENTORY_TIMINGS_REPORT:-}
 TIMINGS_SOURCE="$ROOT/target/cargo-timings/cargo-timing.html"
+# CAD-1210: drop every CADENCE_* routing variable before cargo runs, except
+# an allowlist, so a pane's production CADENCE_PM_DIR/CADENCE_STATE_DIR never
+# reaches the test binaries (same approach as scripts/run-result-tests, CAD-1197).
+cadence_env_allow=" CADENCE_SUITE_LOCK CADENCE_NEXTTEST_BIN "
+for v in $(env | sed -n 's/^\(CADENCE_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    case $cadence_env_allow in *" $v "*) ;; *) unset "$v" ;; esac
+done
 capture=false
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
     printf 'timings_available=false\n' >> "$GITHUB_OUTPUT" ||
@@ -54,8 +61,9 @@ case "$TARGET" in
         NEXTEST_TARGET_ARGS="--all-targets"
         ;;
     integration)
-        die "the 'integration' binary was split into per-area tests/*.rs \
-binaries (CAD-426); use all-targets or a binary name such as 'daemon'"
+        die "the 'integration' binary was retired in CAD-426 and the \
+per-area binaries were collapsed into 'suite' (CAD-1727); use all-targets \
+or a test target name such as 'suite'"
         ;;
     *[!A-Za-z0-9_]*|"")
         die "unsupported target '$TARGET' (use all-targets or a tests/*.rs stem)"

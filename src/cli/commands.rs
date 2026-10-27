@@ -2,38 +2,114 @@
 
 use super::*;
 
+/// Where an agent's process runs. Derived from `(provider, endpoint_kind)`
+/// by the registry; this enum only lets a read filter name the value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum PlacementArg {
+    Local,
+    Cloud,
+    Queue,
+}
+
+impl PlacementArg {
+    pub(crate) fn placement(self) -> registry::Placement {
+        match self {
+            Self::Local => registry::Placement::Local,
+            Self::Cloud => registry::Placement::Cloud,
+            Self::Queue => registry::Placement::Queue,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub(crate) enum Commands {
+    /// List PM issues assigned to your signed-in hosted identity.
+    MyWork,
     /// Retain, inspect or explicitly send a local result to hosted queued custody.
     Remote {
         #[command(subcommand)]
         action: RemoteAction,
     },
-    /// Authenticate to an AgenticOS issuer and map the workspace to a remote
-    /// org (CAD-1019). `--slug` names the board host; the issuer's grant must
-    /// echo exactly the workspace and audience requested.
+    /// Sign in through the hosted AgenticOS portal and map the approved
+    /// workspace to a remote org (CAD-1019, CAD-1329). Bare `login` opens
+    /// the portal's workspace picker at the hosted issuer; an optional
+    /// positional slug is a server-verified selection hint. The issuer's
+    /// grant must carry the approved workspace, its slug and the canonical
+    /// audience before anything is recorded. A later verified login for an
+    /// already-stored slug replaces its endpoint and workspace id (for a
+    /// recreated workspace); a `local` connection with the same name is
+    /// never overwritten.
     Login {
-        /// AgenticOS HTTPS issuer origin (no path) — must match the
-        /// operator-pinned trusted issuer.
+        /// Workspace slug hint preselecting the approval (for example
+        /// `cadence login fav-limited`). Verified against the grant, never
+        /// trusted client-side.
+        #[arg(value_name = "SLUG", conflicts_with_all = ["slug", "org", "token_stdin"])]
+        hint: Option<String>,
+        /// AgenticOS HTTPS issuer origin (no path). Defaults to the hosted
+        /// issuer; a custom origin is an advanced self-hosted override that
+        /// needs the operator-pinned trusted issuer.
         #[arg(long)]
-        issuer: String,
-        /// Exact AgenticOS workspace ID to authorize.
-        #[arg(long)]
-        org: String,
-        /// Org slug: the board host is `https://<slug>.cadencecloud.app`.
-        /// Required for org login (not for `--token-stdin`).
+        issuer: Option<String>,
+        /// Exact AgenticOS workspace ID — legacy bound flow only, needs
+        /// --issuer and --slug.
+        #[arg(long, requires = "issuer")]
+        org: Option<String>,
+        /// With --issuer + --org: the workspace slug for the legacy bound
+        /// flow, audience `https://<slug>.cadencecloud.app`. Without --org:
+        /// the same selection hint as the positional slug.
         #[arg(long)]
         slug: Option<String>,
         /// Select the new org as the saved default. Without it, login records
         /// the org but keeps an existing default.
         #[arg(long = "use")]
         use_: bool,
-        /// Read an existing credential from stdin; never accept secrets in argv.
-        #[arg(long)]
+        /// Read an existing credential from stdin; never accept secrets in
+        /// argv. Needs --issuer and --org; not the hosted portal flow.
+        #[arg(long, requires_all = ["issuer", "org"])]
         token_stdin: bool,
         /// Print the authorization URL/code without opening a browser.
         #[arg(long, conflicts_with = "token_stdin")]
         no_open: bool,
+        /// Isolated credential directory; defaults to XDG_CONFIG_HOME/cadence/remote-auth.
+        #[arg(long)]
+        auth_dir: Option<PathBuf>,
+        /// CAD-1429: also request the Publish Web scopes (`web.read`,
+        /// `web.prepare`) for this consent. Without it the login is unchanged
+        /// and grants no web authority.
+        #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
+        web: bool,
+        /// CAD-1586: also request the Settings scopes (`settings.read`,
+        /// `settings.write`) for this consent — required before remote
+        /// `settings agents`, `master status` or `master resume` can run.
+        /// Combines with `--web`; without it the login is unchanged and
+        /// grants no settings authority.
+        #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
+        settings: bool,
+    },
+    /// Create a hosted workspace in the browser and approve this CLI. Opens
+    /// the AgenticOS registration page, waits for email OTP, workspace
+    /// creation and owner consent, then saves the issued credential. The
+    /// terminal never asks for an OTP, password, API key or payment detail.
+    Register {
+        /// Optional workspace name to prefill on the registration page.
+        #[arg(long)]
+        name: Option<String>,
+        /// Optional workspace slug to prefill on the registration page.
+        #[arg(long)]
+        slug: Option<String>,
+        /// AgenticOS HTTPS issuer origin (no path). Defaults to the hosted
+        /// issuer; a custom origin needs the operator-pinned trusted issuer.
+        #[arg(long)]
+        issuer: Option<String>,
+        /// Select the new workspace as the saved default.
+        #[arg(long = "use")]
+        use_: bool,
+        /// Print the registration/consent URL without opening a browser.
+        #[arg(long)]
+        no_open: bool,
+        /// Print machine-readable registration state.
+        #[arg(long)]
+        json: bool,
         /// Isolated credential directory; defaults to XDG_CONFIG_HOME/cadence/remote-auth.
         #[arg(long)]
         auth_dir: Option<PathBuf>,
@@ -154,15 +230,53 @@ pub(crate) enum Commands {
         /// The bundle directory to create. It must not exist.
         #[arg(long)]
         out: PathBuf,
+        /// Write a portable `cadence.portable/1` package (coordination
+        /// data and the pinned tracker) instead of the legacy bundle.
+        /// Requires `--tracker`; not a full workspace backup.
+        #[arg(long, requires = "tracker")]
+        portable: bool,
+        /// Git tracker checkout to pin into a portable package. Only with
+        /// `--portable`.
+        #[arg(long, requires = "portable")]
+        tracker: Option<PathBuf>,
+        /// Privately capture tracked changes/deletions and non-ignored
+        /// untracked files without changing the source tracker. Verify the
+        /// package and recheck the source before publication.
+        #[arg(long, requires = "portable")]
+        snapshot_working_tree: bool,
+        /// Redact credential-shaped spans (including warnings) in message
+        /// bodies on the private export copy only. Source history is unchanged;
+        /// all other fields and the sanitized copy still face normal scanning.
+        #[arg(long, requires = "portable")]
+        redact_history_secrets: bool,
+        /// Repeatable, with `--portable`: an app whose data to include. No
+        /// app schema is supported yet, so any selection is refused before
+        /// the store or tracker is read or the output is created.
+        #[arg(long = "app", value_name = "APP", requires = "portable")]
+        apps: Vec<String>,
+    },
+    /// Independently inspect a portable coordination package, read-only.
+    /// Prints JSON integrity, schema and exclusion evidence; does not restore,
+    /// start a daemon, or establish import readiness. Local-only.
+    InspectPortable {
+        /// Existing portable package directory.
+        source: PathBuf,
     },
     /// Restore a backup (its `.manifest.json`) or an export bundle (its
     /// directory) into the state dir. Refuses while a daemon holds the
     /// state dir, refuses a schema newer than this binary, and refuses to
     /// replace an existing store without `--force`. Repo paths are
     /// rewritten to the `--repo` checkout with the same origin remote.
+    /// On a remote org (`--org`), only `--portable` forms run, against the
+    /// hosted portable-migration contract: `--preflight` is read-only, a
+    /// plain call imports inactive, `--replace` replaces the destination
+    /// with rollback retained, and `--status`/`--rollback` act on a minted
+    /// operation id.
     Restore {
-        /// A backup manifest file, or an export bundle directory.
-        source: PathBuf,
+        /// A backup manifest file, an export bundle directory, or — on a
+        /// remote org — the portable package directory to migrate. Omitted
+        /// only for remote `--status`/`--rollback`.
+        source: Option<PathBuf>,
         /// A checkout on this host, matched to a recorded repo by its
         /// origin remote. Repeat for each repo.
         #[arg(long = "repo")]
@@ -171,6 +285,89 @@ pub(crate) enum Commands {
         /// it is taken into <state dir>/backups first.
         #[arg(long)]
         force: bool,
+        /// Restore a portable `cadence.portable/1` package (the `source`
+        /// directory) as an INACTIVE store at `--state-dir`. The destination
+        /// must be new and empty. `--repo` and `--force` are refused with it.
+        /// Replacement (`--replace`) and activation (`--activate`) are
+        /// separate actions that need the live controller's operator
+        /// connection. On a remote org `--portable` selects the hosted
+        /// migration flow instead.
+        #[arg(long)]
+        portable: bool,
+        /// With `--portable`: read-only preflight; changes nothing. Locally
+        /// it needs `--controller-state`; remotely it binds the package
+        /// digest to the destination workspace's digest and generation and
+        /// prints them for `--replace`.
+        #[arg(long, requires = "portable")]
+        preflight: bool,
+        /// With `--portable`: replace the destination root keeping a
+        /// rollback artifact. Locally it replaces the offline root at
+        /// `--state-dir` and needs the live controller's operator connection
+        /// (`--controller-state`). Remotely it needs `--request-id` and the
+        /// exact `--expected-*` digests from `restore --portable
+        /// --preflight`. The old root is kept; nothing is deleted.
+        #[arg(long, requires = "portable", conflicts_with = "preflight")]
+        replace: bool,
+        /// With `--preflight`, `--replace` or `--activate`: the live
+        /// controller state dir whose operator connection authorizes the
+        /// request. Never inferred. Local only — refused on a remote org.
+        #[arg(long)]
+        controller_state: Option<PathBuf>,
+        /// With `--replace` or `--activate` (not `--preflight`): sha256 of the
+        /// package `manifest.json`, from the preflight output.
+        #[arg(long)]
+        expected_package_digest: Option<String>,
+        /// With `--replace`, `--activate` or remote `--rollback`: the
+        /// preflight/status destination digest. Locally it hashes the complete
+        /// target set; remotely it binds the workspace, root, generation and
+        /// lease facts, not the destination's file bytes.
+        #[arg(long)]
+        expected_destination_digest: Option<String>,
+        /// With `--replace`, `--activate` or remote `--rollback`: the target
+        /// generation read by preflight/status.
+        #[arg(long)]
+        expected_generation: Option<String>,
+        /// With `--portable`: activate the inactive root at `--state-dir` in
+        /// manual mode, execution disabled. Needs `--controller-state` and the
+        /// exact `--expected-*` digests from `--activate --preflight`.
+        /// Imported actors stay disabled; nothing is scheduled or dispatched.
+        /// Local only — refused on a remote org.
+        #[arg(long, requires = "portable", conflicts_with = "replace")]
+        activate: bool,
+        /// With `--portable`: restore the package into a NEW `--state-dir` and
+        /// activate it in one step, manual mode with execution disabled
+        /// (AOS-339). The destination must not exist, so this can only create a
+        /// fenced root and never changes an existing one. No controller and no
+        /// operator connection; imported actors stay disabled.
+        #[arg(long, requires = "portable", conflicts_with = "activate_preflight")]
+        activate_disabled: bool,
+        /// With `--portable`: read-only activation plan for the package. Prints
+        /// the package digest and the exact required reconciliation list and
+        /// writes nothing.
+        #[arg(long, requires = "portable", conflicts_with = "activate_disabled")]
+        activate_preflight: bool,
+        /// With `--activate` or `--activate-disabled`: JSON reconciliation file.
+        /// Its `reconciliation` array lists every non-terminal row as retained
+        /// inert; the file must name each one. Omitted means an empty list.
+        #[arg(long, requires = "portable")]
+        reconciliation: Option<PathBuf>,
+        /// Remote `--portable` only: the caller-minted stable idempotency id
+        /// the migration operation is bound to. Mandatory for import,
+        /// `--replace` and `--rollback`; rollback reuses the original id.
+        /// Replay only with the identical action body. Status needs no source.
+        #[arg(long, requires = "portable")]
+        request_id: Option<String>,
+        /// Remote `--portable` only: print durable status by operation id,
+        /// or `request:<request-id>` to recover a lost begin response.
+        /// The source package is not needed.
+        #[arg(long, requires = "portable")]
+        status: Option<String>,
+        /// Remote `--portable` only: owner-authorized rollback of a replaced
+        /// hosted workspace to its retained root. Needs `--request-id` and
+        /// the current `--expected-destination-digest`/`--expected-generation`
+        /// (from `--status`).
+        #[arg(long, requires = "portable")]
+        rollback: Option<String>,
     },
     /// Manage registered agents.
     Agent {
@@ -534,6 +731,14 @@ pub(crate) enum Commands {
     /// the body is `--text`, `-m` or `--file`. There are no email-style
     /// `--subject`, `--body` or `--cc` flags.
     ///
+    /// On a remote org (`--org <slug>`) the supported form is the durable
+    /// enqueue only: `--message <id>` is required (the stable id a lost
+    /// reply reconciles by), and `--ready`/`--force`, `--nudge`,
+    /// `--priority`/`--supersedes`, `--reply-to` and `--task` refuse —
+    /// they are local-endpoint surfaces. The recipient is the hosted master
+    /// for a verified human workspace owner; read the outcome with
+    /// `cadence message read <id> --org <slug>`.
+    ///
     /// Multi-topic reports: open the body with a `SUBJECT: <topic>`
     /// line (a single-line pty body leads with `SUBJECT: <topic> —`)
     /// so the recipient can scan topics; there is no subject field.
@@ -577,6 +782,28 @@ pub(crate) enum Commands {
         nudge: bool,
         #[command(flatten)]
         steer: SteerArgs,
+        /// Wait for the turn's terminal state, like `message ask`.
+        /// Bare `--wait` uses 120 seconds; `--wait 30` uses 30.
+        #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "120",
+              value_parser = clap::value_parser!(u64),
+              conflicts_with_all = ["nudge", "priority", "supersedes"])]
+        wait: Option<u64>,
+    },
+    /// Hosted coordination for this user's local agent (CAD-1460).
+    /// Requires a selected remote org. It does not run in the container.
+    #[command(hide = true)]
+    LocalAgent {
+        #[command(subcommand)]
+        action: local_agent::LocalAgentAction,
+    },
+    /// Administer people on the selected hosted workspace.
+    /// Owner and member can list the directory. Invitations, role
+    /// changes and removal are owner-only and use the hosted CLI call.
+    /// They do not start a daemon. A managed agent cannot borrow a
+    /// saved human login. `--role` is the target role, never the caller.
+    Team {
+        #[command(subcommand)]
+        action: TeamAction,
     },
     /// One-step issue dispatch: `issue start` (idempotent, owner =
     /// the worker) then exactly one templated kickoff message, a
@@ -585,9 +812,10 @@ pub(crate) enum Commands {
     Dispatch {
         /// Issue id (e.g. CAD-55).
         issue: String,
-        /// Worker agent to dispatch to.
+        /// Worker agent to dispatch to. Required outside the master;
+        /// the master derives the ticket's owner.
         #[arg(long)]
-        to: String,
+        to: Option<String>,
         /// Kickoff note the worker reads (`read <note> — …`) [default:
         /// the ticket's own issue.md].
         #[arg(long)]
@@ -595,7 +823,9 @@ pub(crate) enum Commands {
         /// Worktree slug — default: the slugified issue title.
         #[arg(long)]
         name: Option<String>,
-        /// Base ref — else the repo's origin/HEAD, else current branch.
+        /// Integration ref to cut the lane from. Default: the repo's
+        /// configured base, else the remote HEAD. Never the main
+        /// checkout's current branch when that remote ref resolves.
         #[arg(long)]
         base: Option<String>,
         /// Repo path — same resolution as `issue start`.
@@ -684,6 +914,10 @@ pub(crate) enum Commands {
         /// their only delivery channel there.
         #[arg(long)]
         instructions_file: Option<PathBuf>,
+        /// Saved Agents settings profile. Its instructions and defaults are
+        /// resolved by the daemon and snapshotted for this new session.
+        #[arg(long, conflicts_with_all = ["instructions_file", "no_bootstrap"])]
+        profile: Option<String>,
         /// Run the worker in an isolated checkout of the PM's repo:
         /// `git worktree add <repo>/.cadence/wt/<name> -b cadence/<name>`.
         #[arg(long)]
@@ -926,9 +1160,9 @@ pub(crate) enum Commands {
         #[arg(long, default_value_t = 5)]
         exec_max_failures: u32,
     },
-    /// Install or inspect the `cadence` agent skill under
-    /// `~/.agents/skills/cadence` with symlinks into the `.claude`,
-    /// `.cursor` and `.copilot` skill dirs.
+    /// Install or inspect separate public agent guidance under
+    /// `~/.agents/skills`, with provider links. Company-private profiles
+    /// and renderer tools are not installed.
     Skill {
         #[command(subcommand)]
         action: SkillAction,
@@ -967,6 +1201,28 @@ pub(crate) enum Commands {
     Thread {
         #[command(subcommand)]
         action: ThreadAction,
+    },
+    /// CAD-1412: an agent reads and replies in a human room it is a member
+    /// of (`topic read <topic-id>`, `topic publish <topic-id> <text>`). The
+    /// daemon checks membership on each call; this adds no authority.
+    Topic {
+        #[command(subcommand)]
+        action: TopicAction,
+    },
+    /// Put a file on the agent canvas (CAD-1726): `artifact put --kind md
+    /// --title T --file F`. Only the master's live turn may; the same
+    /// `--id` again adds a version.
+    Artifact {
+        #[command(subcommand)]
+        action: ArtifactAction,
+    },
+    /// A retained chat attachment (CAD-1168): `attachment read <id>`
+    /// returns its bounded text (txt/md/csv). The operator reads any
+    /// retained id; the master reads only an id on its own running
+    /// turn's envelope.
+    Attachment {
+        #[command(subcommand)]
+        action: AttachmentAction,
     },
     /// Daemon-owned persistent supervision registrations and local alerts.
     /// Monitor state describes the observer; delivery remains explicitly
@@ -1128,17 +1384,47 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: cadence_agent::memory::cli::MemoryAction,
     },
+    /// CAD-1429/CAD-1642: publish a plain HTML page or built static site.
+    /// `prepare` freezes the output locally, stages it under the daemon's
+    /// state directory and sends every web request through `platform call`,
+    /// so the local daemon must be running. The hosted actions need a
+    /// selected AgenticOS workspace and never run project code.
+    Web {
+        #[command(subcommand)]
+        action: WebAction,
+    },
     /// The wiki: shared, scoped knowledge under the tracker's vault —
     /// git-backed text pages and content-addressed blobs (CAD-580).
     Wiki {
         #[command(subcommand)]
         action: cadence_agent::wiki::cli::WikiAction,
     },
+    /// CAD-1393: company document templates — versions, approval and the
+    /// digest a human approves. Drafting never issues or sends anything.
+    Template {
+        #[command(subcommand)]
+        action: TemplateAction,
+    },
+    /// CAD-1393: company document drafts created from an approved template.
+    Document {
+        #[command(subcommand)]
+        action: DocumentAction,
+    },
     /// Credential scan (CAD-109): the check `issue comment`, `report`,
     /// `memory propose` and the intake relay run before they write.
     Secret {
         #[command(subcommand)]
         action: SecretAction,
+    },
+    /// Settings surfaces. `settings agents` manages the Settings >
+    /// Agents document — harnesses, providers, models, catalogs, role
+    /// defaults, profiles and extension pins — through the daemon's
+    /// revision-checked transaction shared with the board. Every
+    /// mutation takes `--expected-revision` from `settings agents
+    /// show`; a stale token is a conflict, never a silent retry.
+    Settings {
+        #[command(subcommand)]
+        action: settings::SettingsAction,
     },
     /// The read-only board UI + JSON API on loopback.
     Ui {
@@ -1164,6 +1450,11 @@ pub(crate) enum Commands {
         /// Re-render every <secs> until interrupted.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         watch: Option<u64>,
+        /// Only agents whose process runs there: local (this host),
+        /// cloud (provider-hosted) or queue (a mailbox with no process).
+        /// `--org` picks the board; this picks the agent's host.
+        #[arg(long, value_enum)]
+        placement: Option<PlacementArg>,
     },
     /// Queue a cargo test on the daemon (CAD-129). `submit` returns a
     /// job id; a content-addressed hit returns the earlier job instead
@@ -1286,11 +1577,16 @@ pub(crate) enum Commands {
         #[arg(long)]
         group: Option<String>,
     },
-    /// Install the exact build CI tested on main (CAD-334). Downloads
-    /// the `cadence-<sha>-x86_64-linux` artifact through `gh` and refuses
-    /// unless the sha is on main, CI's `test` job passed on that exact sha,
-    /// the sha256 matches, the manifest names the sha, and the GitHub
-    /// build-provenance attestation verifies for this repo. Installs to
+    /// Install the exact build the release source proves for a commit
+    /// (CAD-334). From the default owned catalogue
+    /// (https://api-v2.agenticos.hk, CAD-1479; `--release-source` is the
+    /// advanced https:// override) it installs the published, offline-
+    /// verified release package; a non-default `--repo` selects the
+    /// GitHub route that downloads the `cadence-<sha>-x86_64-linux`
+    /// artifact through `gh`. Refuses unless the sha is on main, CI's
+    /// `test` job passed on that exact sha, the sha256 matches, the
+    /// manifest names the sha, and the build-provenance attestation
+    /// verifies for the trusted repo. Installs to
     /// `<releases>/<sha>/cadence` and atomically repoints the `cadence`
     /// symlink. A release already on disk is reinstalled without a
     /// download (rollback). Never restarts the daemon unless `--restart`.
@@ -1331,21 +1627,57 @@ pub(crate) enum Commands {
         /// found there are candidates for reuse.
         #[arg(long)]
         releases_dir: Option<PathBuf>,
+        /// Owned HTTPS release source (CAD-1455): the endpoint's
+        /// https:// origin only; consumes the published release through
+        /// the catalogue and signed offline evidence instead of live
+        /// GitHub queries. A source failure refuses — no silent GitHub
+        /// API fallback. Omit for the default owned catalogue
+        /// (https://api-v2.agenticos.hk, CAD-1479).
+        #[arg(long, value_name = "https://host")]
+        release_source: Option<String>,
     },
-    /// Update to the newest attested green main build in one command
-    /// (CAD-561): check → verify attestation + hash → backup → install
+    /// Upgrade a client-only installation (`install.sh --client-only`) to
+    /// the newest public release (CAD-1425, CAD-1437). Its receipt alone
+    /// selects this path, before any org or state work: a saved org default
+    /// never diverts it, it fetches only the owned public-client release
+    /// source, and it accepts only `--check` and `--version TAG` (forward
+    /// only). Any other installation refuses `--version`; its native
+    /// options and subcommands are untouched.
+    ///
+    /// Update to the newest published release in the owned catalogue
+    /// (default https://api-v2.agenticos.hk, CAD-1479; `--release-source`
+    /// is the advanced https:// override, no GitHub API fallback) in one
+    /// command (CAD-561): check → verify attestation + hash → backup → install
     /// side by side → bounded drain → switch → health check → done.
     /// The rollout lease is auto-claimed and auto-released, and the
     /// pre-update backup (outside the state dir by default) is recorded
     /// as the lease receipt, so no manual copy step. `--check` shows
     /// what would happen and changes nothing; `--rollback` returns to
     /// the previous release; `status` shows a pending update and what
-    /// it waits on. Operator-only: outside a pane with `--as`, never
-    /// from inside one. `upgrade` and `rollout` stay the low-level
-    /// commands.
+    /// it waits on. A native update also synchronizes bundled guidance
+    /// from the build that is active afterwards, including when the
+    /// binary is already current and after rollback. `--check` and
+    /// `status` do not write guidance, and they do not treat the
+    /// target build's guidance as verified. A guidance failure does
+    /// not roll back a healthy binary and does not restart the daemon
+    /// just to refresh skills. `cadence skill install` is the manual
+    /// repair. An existing agent session is not reloaded. Client-only
+    /// update does not install guidance or start a daemon.
+    /// Operator-only: the same process proof as
+    /// `rollout claim` runs either way, never from inside a pane;
+    /// `--as` is an optional audit label (a bare run labels itself
+    /// from the proven native OS identity). An image-managed runtime
+    /// is refused — AgenticOS owns updates there. `upgrade` and
+    /// `rollout` stay the low-level commands. Always local: a saved
+    /// remote default org is ignored, and an explicitly remote
+    /// `--org`/`CADENCE_ORG` refuses before any remote transport.
     Update {
         #[command(subcommand)]
         action: Option<UpdateAction>,
+        /// Client-only installation: install this release tag instead of
+        /// the newest one (forward only). Refused on a daemon installation.
+        #[arg(long, value_name = "TAG")]
+        version: Option<String>,
         /// Show current vs available version, the merged PR titles
         /// between them, whether a schema migration is involved and
         /// what would block — changing nothing.
@@ -1401,10 +1733,13 @@ pub(crate) enum Commands {
     /// `CADENCE_PROFILE=sandbox:<name>` — which skips the skill sync
     /// into `$HOME`, refuses `ui tailscale`, and keeps the provider WAL
     /// watcher observe-only. Refuses production's dirs and port 3010.
+    /// Always local: a saved remote default org is ignored, and an
+    /// explicitly remote `--org`/`CADENCE_ORG` refuses before any remote
+    /// transport. `sandbox` remains a supported command alias.
     #[command(name = "dev", visible_alias = "sandbox")]
-    Sandbox {
+    Dev {
         #[command(subcommand)]
-        action: cadence_agent::sandbox::SandboxAction,
+        action: cadence_agent::sandbox::DevAction,
     },
     /// Run a command under a filesystem sandbox (CAD-439): `--read`
     /// paths are readable and executable, `--write` paths fully usable,
@@ -1432,4 +1767,86 @@ pub(crate) enum Commands {
     /// Stdio MCP tools for a managed Codex endpoint.
     #[command(hide = true)]
     McpAgent,
+    /// Search public commands offline. JSON only. This describes syntax;
+    /// it does not grant permission to run a command.
+    #[command(name = "commands")]
+    Search {
+        /// Words to match against the path, aliases, and help. Omit to
+        /// list the core commands.
+        #[arg(value_name = "QUERY")]
+        query: Option<String>,
+        /// Maximum matches, 1–20. Requires a query.
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(u8).range(1..=20),
+            requires = "query",
+            conflicts_with = "all"
+        )]
+        limit: Option<u8>,
+        /// Every public command path. Conflicts with a query and `--limit`.
+        #[arg(long, conflicts_with = "query")]
+        all: bool,
+    },
+    /// Show one public command's input syntax as JSON. The parser and
+    /// handler remain authoritative; this is not a permission or readiness schema.
+    Schema {
+        /// Canonical path or a public alias, one word per argument
+        /// (`schema issue comment`).
+        #[arg(required = true, num_args = 1.., value_name = "COMMAND_PATH")]
+        path: Vec<String>,
+    },
+}
+
+/// Workspace role requested for an invite or a role change. This is the
+/// target role only, never the caller's authority.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub(crate) enum TeamRole {
+    Owner,
+    Member,
+}
+
+impl TeamRole {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Member => "member",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub(crate) enum TeamAction {
+    /// List workspace members: subject id, name and role. No email addresses.
+    #[command(alias = "ls")]
+    List,
+    /// List invitations for this workspace. Owner only. No invite tokens.
+    Invites,
+    /// Invite an email address. Owner only. Role defaults to member.
+    Invite {
+        /// Address to invite.
+        email: String,
+        /// Role to grant: `owner` or `member`.
+        #[arg(long, value_enum, default_value = "member")]
+        role: TeamRole,
+    },
+    /// Revoke one invitation by its id. Owner only.
+    #[command(name = "revoke-invite")]
+    RevokeInvite {
+        /// Invitation id returned by `team invites`.
+        invite_id: String,
+    },
+    /// Change one member's role. Owner only. `--role` is required.
+    #[command(name = "set-role")]
+    SetRole {
+        /// Member user id from `team list`.
+        user_id: String,
+        /// New role: `owner` or `member`.
+        #[arg(long, value_enum)]
+        role: TeamRole,
+    },
+    /// Remove one member by user id. Owner only.
+    Remove {
+        /// Member user id from `team list`.
+        user_id: String,
+    },
 }

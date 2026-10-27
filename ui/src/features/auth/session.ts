@@ -1,5 +1,7 @@
 import { ApiError } from "../../lib/api";
-import { sessionHeaders, setSessionKey } from "../../lib/sessionKey";
+import { errorMessage } from "../../lib/apiError";
+import { sessionHeaders, sessionKey, setSessionKey } from "../../lib/sessionKey";
+import { privateSessionGeneration } from "../../lib/privateSession";
 import { parseLoginNonce } from "./gate";
 
 /**
@@ -9,6 +11,7 @@ import { parseLoginNonce } from "./gate";
  * once by the login screen.
  */
 let captured: string | null = null;
+let nonceRequest: AbortController | null = null;
 
 export function captureLoginNonce(): void {
   if (location.pathname !== "/login" || !location.hash) return;
@@ -22,26 +25,33 @@ export function takeLoginNonce(): string | null {
   return nonce;
 }
 
-async function sessionPost(path: string, body: object): Promise<unknown> {
+/** Public login transports are independent of private-cache generations:
+ * an initial unsigned metadata answer must not cancel a one-use exchange. */
+async function sessionPost(path: string, body: object, signal?: AbortSignal): Promise<unknown> {
   const resp = await fetch(path, {
     method: "POST",
+    signal,
     headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
     body: JSON.stringify(body),
   });
   const parsed = await resp.json().catch(() => null);
+  if (signal?.aborted) throw new Error("Session changed during sign-in");
   if (!resp.ok) {
-    throw new ApiError(parsed?.error ?? `${resp.status} ${resp.statusText}`, resp.status, parsed ?? undefined);
+    throw new ApiError(errorMessage(parsed, `${resp.status} ${resp.statusText}`), resp.status, parsed ?? undefined);
   }
   return parsed;
 }
 
 /**
  * `POST /api/session` — exchange the nonce for the session: the server
- * sets the HttpOnly cookie and answers `{session_key}`, which this tab
- * keeps in `sessionStorage` and sends on every request.
+ * sets the HttpOnly cookie and answers `{session_key}`, which this
+ * browser keeps in `localStorage` and sends on every request.
  */
 export async function openSession(nonce: string): Promise<void> {
-  const out = (await sessionPost("/api/session", { nonce })) as { session_key?: unknown } | null;
+  nonceRequest?.abort();
+  const controller = new AbortController();
+  nonceRequest = controller;
+  const out = (await sessionPost("/api/session", { nonce }, controller.signal)) as { session_key?: unknown } | null;
   const key = typeof out?.session_key === "string" ? out.session_key : null;
   if (!key) throw new ApiError("the board answered no session key — upgrade the board", 500);
   setSessionKey(key);
@@ -81,9 +91,11 @@ export async function startDeviceSignIn(): Promise<DeviceDisplay> {
  *  as `ApiError` (e.g. `code` `device_subject_not_allowed`, `check`
  *  `session_from_agent`). */
 export async function pollDeviceSignIn(pendingId: string): Promise<DevicePollOutcome> {
+  const credential = sessionKey();
   const out = (await sessionPost("/api/session/device/poll", { pending_id: pendingId })) as
     | { session_key?: unknown; status?: unknown }
     | null;
+  if (credential !== sessionKey()) throw new Error("Session changed during sign-in");
   const key = typeof out?.session_key === "string" ? out.session_key : null;
   if (key) {
     setSessionKey(key);
@@ -98,9 +110,27 @@ export async function pollDeviceSignIn(pendingId: string): Promise<DevicePollOut
 
 /** `POST /api/session/logout` — end this browser's session. */
 export async function closeSession(): Promise<void> {
+  nonceRequest?.abort();
+  const key = sessionKey();
+  // Hide private observations immediately, including hosted cookie-only sessions.
+  window.dispatchEvent(new Event("cadence:session-ending"));
+  const generation = privateSessionGeneration();
+  const controller = new AbortController();
+  const changed = () => { if (sessionKey() !== key && sessionKey() !== null) controller.abort(); };
+  window.addEventListener("cadence:session-changed", changed);
+  let completed = false;
   try {
-    await sessionPost("/api/session/logout", {});
+    await sessionPost("/api/session/logout", {}, controller.signal);
+    completed = true;
   } finally {
-    setSessionKey(null);
+    window.removeEventListener("cadence:session-changed", changed);
+    if (generation === privateSessionGeneration() && sessionKey() === key) {
+      if (completed) {
+        setSessionKey(null);
+        window.dispatchEvent(new Event("cadence:session-ended"));
+      } else {
+        window.dispatchEvent(new Event("cadence:session-logout-unavailable"));
+      }
+    }
   }
 }

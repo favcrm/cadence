@@ -3,7 +3,7 @@
 //! One JSON object per line over a Unix-domain socket. Each request is
 //! `{"method": ..., "params": {...}}`; each response is either
 //! `{"ok": true, "result": ...}` or `{"ok": false, "error": {"kind", "message"}}`.
-//! See docs/PROTOCOL.md for the full contract.
+//! See docs/ARCHITECTURE.md for the surrounding boundaries.
 
 use serde_json::{json, Value};
 
@@ -139,7 +139,12 @@ pub const DAEMON_MESSAGE_PREFIX: &str = "sys-";
 /// ([`caller_message`]), so nobody can dress a message as a wake, as
 /// an answer to a question (CAD-447), or as a platform-effect outcome
 /// (CAD-506).
-pub const DAEMON_SOURCES: &[&str] = &["wake", "answer", "effect", "permission"];
+pub const DAEMON_SOURCES: &[&str] = &["wake", "answer", "effect", "permission", "topic_notice"];
+
+/// The one source a topic notice carries (CAD-810). It is daemon-only:
+/// [`caller_message`] refuses it on an ordinary send, so an agent cannot
+/// dress a message as a topic notice. The store consumes it without a turn.
+pub const TOPIC_NOTICE_SOURCE: &str = "topic_notice";
 
 /// The id of the daemon-originated message of `kind` for `key` — the
 /// dedupe key: the same `(kind, key)` always maps to the same id, so a

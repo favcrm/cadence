@@ -73,8 +73,18 @@ pub const PAGE_GAP: Duration = Duration::from_secs(15);
 /// this.
 pub const PAGE_BUDGET: usize = 4;
 pub const PAGE_WINDOW: Duration = Duration::from_secs(10 * 60);
-/// PRs one pass reads; the rest wait for the next pass.
-pub const MAX_PER_PASS: usize = 20;
+/// PRs one pass selects, least recently read first; the rest wait.
+pub const MAX_PER_PASS: usize = 4;
+/// `gh` processes one pass may start (CAD-1751). A sync starts a view and,
+/// when the observation asks for it, a `--disable-auto` write: at most
+/// [`GH_PER_SYNC`]. A pass starts no further PR once the next could pass
+/// the budget; the PRs it skips are the least recently read next time.
+pub const PASS_GH_BUDGET: usize = 4;
+pub const GH_PER_SYNC: usize = 2;
+/// Passes per hour at the default [`EVERY`] of 60 s: 3600 / 60 timer passes
+/// plus [`PAGE_BUDGET`] page-view passes per [`PAGE_WINDOW`] (4 per 10 min
+/// = 24) = 84. So the sync starts at most 84 x 4 = 336 `gh` an hour.
+pub const PASSES_PER_HOUR: usize = 60 + 24;
 /// Bytes of one error text a row shows.
 const ERROR_MAX: usize = 300;
 /// Failing tickets a row names before "and N more".
@@ -348,16 +358,28 @@ impl DeliverySync {
     }
 
     /// What `/api/meta` shows: the `gh` this board runs and its period.
-    pub fn meta(&self) -> Value {
+    pub fn meta(&self) -> cadence_core::board_api::DeliverySyncMeta {
+        let every_secs = self.every.as_secs();
         match &self.gh {
-            Ok(gh) => json!({"gh": gh, "every_secs": self.every.as_secs()}),
-            Err(e) => json!({"gh": null, "gh_error": e, "every_secs": self.every.as_secs()}),
+            Ok(gh) => cadence_core::board_api::DeliverySyncMeta {
+                gh: Some(gh.to_string_lossy().into_owned()),
+                gh_error: None,
+                every_secs,
+            },
+            Err(e) => cadence_core::board_api::DeliverySyncMeta {
+                gh: None,
+                gh_error: Some(e.clone()),
+                every_secs,
+            },
         }
     }
 
     /// The board's sync thread: wait for the timer or a page view, then
     /// run a pass. Never returns.
     fn run_forever(self: Arc<Self>, state_dir: PathBuf, pm_dir: PathBuf) {
+        // The pause lives in the board's state dir; bind it before the first
+        // pass, not on the first overview refresh (CAD-1751).
+        crate::gh_guard::bind(&state_dir);
         loop {
             let trigger = {
                 let mut st = self.lock();
@@ -386,7 +408,9 @@ impl DeliverySync {
                         super::home::board_is_operator(
                             &state_dir,
                             self.seam_armed.load(Ordering::Relaxed),
+                            None,
                         )
+                        .unwrap_or(false)
                     })
                 };
                 // CAD-482: an armed board's daemon calls assert the
@@ -417,7 +441,12 @@ impl DeliverySync {
     /// the board is the operator's, then read each due PR in its
     /// project's repos with the fixed `gh` and report it. One ticket's
     /// failure is that ticket's.
-    fn pass(&self, state_dir: &Path, board_pm: &Path, is_operator: impl Fn() -> bool) -> Pass {
+    pub(crate) fn pass(
+        &self,
+        state_dir: &Path,
+        board_pm: &Path,
+        is_operator: impl Fn() -> bool,
+    ) -> Pass {
         let list = match client::rpc(state_dir, "delivery_list", json!({})) {
             Ok(v) => v,
             Err(e) => {
@@ -463,13 +492,18 @@ impl DeliverySync {
                     .into(),
             );
         };
+        let mut spawned = 0;
         for rec in &due {
             let Some(url) = rec.pr.as_deref() else {
                 continue;
             };
+            if spawned + GH_PER_SYNC > PASS_GH_BUDGET {
+                break;
+            }
             let outcome = match delivery::project_pr_refusal(&pm_dir, &rec.project, url) {
                 Ok(None) => {
-                    let row = delivery::sync_pr(state_dir, &rec.issue, url, &gh);
+                    let (row, n) = delivery::sync_pr_counted(state_dir, &rec.issue, url, &gh);
+                    spawned += n;
                     match row["error"].as_str() {
                         Some(e) => Err(e.to_string()),
                         None => Ok(()),
@@ -608,6 +642,8 @@ mod tests {
         );
         s.lock().next_due = None;
         let gate = Arc::new(Barrier::new(8));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let done_rx = Arc::new(Mutex::new(done_rx));
         let handles: Vec<_> = (0..8)
             .map(|i| {
                 let (s, runs, live, peak, gate) = (
@@ -617,6 +653,8 @@ mod tests {
                     peak.clone(),
                     gate.clone(),
                 );
+                let done_tx = done_tx.clone();
+                let done_rx = done_rx.clone();
                 std::thread::spawn(move || {
                     gate.wait();
                     let trigger = if i % 2 == 0 {
@@ -624,20 +662,37 @@ mod tests {
                     } else {
                         Trigger::PageView
                     };
-                    s.tick(trigger, || {
+                    let result = s.tick(trigger, || {
                         runs.fetch_add(1, Ordering::SeqCst);
                         let now = live.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(now, Ordering::SeqCst);
-                        std::thread::sleep(Duration::from_millis(300));
+                        // Keep the winner in flight until every competing
+                        // trigger has returned, not for an assumed overlap.
+                        for _ in 0..7 {
+                            done_rx
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(5))
+                                .expect(
+                                    "competing triggers did not return while a pass was in flight",
+                                );
+                        }
                         live.fetch_sub(1, Ordering::SeqCst);
                         Pass::Synced(1)
-                    })
+                    });
+                    done_tx.send(()).unwrap();
+                    result
                 })
             })
             .collect();
+        let mut completed = 0;
         for h in handles {
-            h.join().unwrap();
+            if let Some(pass) = h.join().unwrap() {
+                assert_eq!(pass, Pass::Synced(1), "the elected pass did not complete");
+                completed += 1;
+            }
         }
+        assert_eq!(completed, 1, "one completed pass, seven dropped triggers");
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         assert_eq!(peak.load(Ordering::SeqCst), 1);
         // The in-flight flag is released: the next due pass runs.

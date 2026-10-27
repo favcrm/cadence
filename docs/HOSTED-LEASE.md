@@ -101,8 +101,9 @@ throughout.
 The adapter tests cover actual HTTP transport, response forgery, redirects,
 timeout, blip-then-heal inside the deadline, immediate 409 fencing, deadline
 fencing with no further host contact, bounded stalled attempts, deadline
-forgery and concurrent shared store/tracker fences. `tests/hosted_lease.rs`
-adds the stub-host shutdown-ordering proof above and retains process-level
-daemon shutdown and file-provider regressions. No hosted deployment,
+forgery and concurrent shared store/tracker fences. The stub-host
+shutdown-ordering proof and the process-level daemon shutdown and
+file-provider regressions lived in `tests/hosted_lease.rs`; CAD-1073 retired
+that file with the legacy suite, so those cases do not run today. No hosted deployment,
 native-agent reenrollment, cross-container persistence proof or complete
 migration acceptance is asserted.

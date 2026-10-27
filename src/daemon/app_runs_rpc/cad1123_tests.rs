@@ -72,10 +72,11 @@ fn start_refuses_forged_roles_owner_quotes_and_extra_fields() {
         params[field] = value;
         assert!(refusal(fx.operator("app_run_start", params)).contains("unsupported fields"));
     }
-    // A quote for a slot the workflow does not freeze is a price mismatch.
+    // A quote for a slot the workflow does not freeze is a stale slot set
+    // (CAD-1141: only the slot set is compared, never the price).
     let mut quoted = fx.start_params("f3");
     quoted["expected_quotes"] = json!({"image": {"schema": 1}});
-    assert!(refusal(fx.operator("app_run_start", quoted)).contains("price_changed"));
+    assert!(refusal(fx.operator("app_run_start", quoted)).contains("stale capability slot set"));
     let mut missing = fx.start_params("f4");
     missing.as_object_mut().unwrap().remove("expected_quotes");
     assert!(refusal(fx.operator("app_run_start", missing)).contains("expected_quotes"));
@@ -119,4 +120,24 @@ fn start_and_team_are_operator_only() {
     }
     // Stale team revision loses the compare-and-swap.
     assert!(refusal(fx.set_team()).contains("stale"));
+}
+
+/// CAD-1230: a replayed start races the run's own completion. The run was
+/// running when the replay read it, and is terminal by the time the replay
+/// dispatches it. The replay returns the run as it now stands; it does not
+/// fail with "approval absent or stale". A first start still fails.
+#[test]
+fn replayed_start_of_a_run_that_just_finished_returns_it() {
+    let fx = Fx::new();
+    fx.start_team();
+    fx.set_team().unwrap();
+    let run = fx.operator("app_run_start", fx.start_params("r1")).unwrap();
+    let id = run["id"].as_str().unwrap().to_string();
+    fx.operator("app_run_cancel", json!({"run_id": id}))
+        .unwrap();
+    let replay = fx.shared.dispatch_started_run(&id, true).unwrap();
+    assert_eq!(replay["id"], run["id"]);
+    assert_eq!(replay["state"], "cancelled", "{replay}");
+    let first = fx.shared.dispatch_started_run(&id, false);
+    assert!(refusal(first).contains("approval is absent or stale"));
 }

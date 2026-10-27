@@ -1,4 +1,5 @@
-import { CRM_SECTIONS, crmSectionHref, type AppMenuSection } from "./CrmOutlet";
+import { onPrivateSessionReset } from "../../lib/privateSession";
+import type { ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
 
 /** One installed app in the board's Apps menu (CAD-1116). */
 export interface AppNavEntry {
@@ -8,8 +9,15 @@ export interface AppNavEntry {
   href: string;
   /** The app on screen right now. */
   current: boolean;
-  /** Section rows, shown for the active or last-used app; null when the kind declares none. */
+  /** Section rows, shown for the active or last-used app; null when its screen declares none. */
   sections: AppMenuSection[] | null;
+}
+
+/** One section row under an app in the Apps menu. */
+export interface AppMenuSection {
+  label: string;
+  href: string;
+  current: boolean;
 }
 
 /** Shown under Apps when the installed-app list could not be refreshed. */
@@ -30,11 +38,11 @@ export interface VerifiedApp {
   installId: string;
   kind: string;
   title: string;
+  /** Consumed-mount declaration, pinned to verified package bytes by the host. */
+  navigation?: ScreenNavigation | null;
 }
 
-/** Per-kind section declarations. This table is the one place that names a
- *  kind; the CAD-811 surface declaration replaces it. Kinds without an
- *  entry (Social today) get only their app link. */
+/** Section rows for an app whose mounted screen declares navigation. */
 interface KindSections {
   sections: [string, string][];
   /** The section the URL query names; the default when it names none. */
@@ -42,20 +50,25 @@ interface KindSections {
   href: (base: string, section: string) => string;
 }
 
-const SECTIONS_BY_KIND: Record<string, KindSections> = {
-  crm: {
-    sections: CRM_SECTIONS,
-    fromSearch: (search) => {
-      const q = new URLSearchParams(search).get("crm");
-      return q === "segments" || q === "campaigns" ? q : "customers";
+/** The section the URL is on, for a screen that declares sections. */
+function declaredSections(navigation: ScreenNavigation): KindSections {
+  return {
+    sections: navigation.sections.map(s => [s.id, s.label]),
+    fromSearch: search => {
+      const selected = new URLSearchParams(search).get(navigation.section_query);
+      return navigation.sections.find(s => s.id === selected)?.id ?? navigation.default_section;
     },
-    href: (base, section) => crmSectionHref(base, section as Parameters<typeof crmSectionHref>[1]),
-  },
-};
-
-/** The section the URL is on, for a kind that declares sections. */
-export function sectionFromSearch(kind: string, search: string): string | null {
-  return SECTIONS_BY_KIND[kind]?.fromSearch(search) ?? null;
+    href: (base, section) => {
+      const [path, search] = base.split("?");
+      const q = new URLSearchParams(search ?? "");
+      if (section === navigation.default_section) q.delete(navigation.section_query); else q.set(navigation.section_query, section);
+      q.delete("appview"); q.delete("record"); q.delete("segment");
+      const next = q.toString(); return path + (next ? `?${next}` : "");
+    },
+  };
+}
+export function sectionFromSearch(search: string, navigation?: ScreenNavigation | null): string | null {
+  return navigation ? declaredSections(navigation).fromSearch(search) : null;
 }
 
 export interface LastApp {
@@ -64,6 +77,11 @@ export interface LastApp {
 }
 
 const LAST_APP_KEY = "cadence.apps.last";
+
+onPrivateSessionReset(() => {
+  try { safeStorage()?.removeItem(LAST_APP_KEY); }
+  catch { /* Storage may be blocked; the next private shell starts without app state. */ }
+});
 
 /** Per-browser memory of the last-used app and its section. Storage that is
  *  missing or throws means no memory, never an error. */
@@ -114,7 +132,7 @@ export function buildAppNav(input: {
   const expandedId = onAppScreen ? activeId : last?.installId ?? null;
   return {
     apps: apps.map((app) => {
-      const decl = SECTIONS_BY_KIND[app.kind];
+      const decl = app.navigation ? declaredSections(app.navigation) : null;
       const active = onAppScreen && app.installId === activeId;
       let sections: AppMenuSection[] | null = null;
       let href = active ? activeHref : installHref(app.installId);

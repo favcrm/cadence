@@ -1,0 +1,190 @@
+{
+  "contract": "app-assistant/v1",
+  "app": "crm",
+  "actions": [
+    {
+      "id": "customers.search",
+      "description": "Search customers in the current CRM context.",
+      "input_schema": { "type": "object", "properties": { "query": { "type": "string", "maxLength": 160 }, "limit": { "type": "integer", "minimum": 1, "maximum": 20 }, "cursor": { "type": "string", "maxLength": 256 } }, "required": [], "additionalProperties": false },
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "customers.show",
+      "description": "Show one customer from the current CRM context.",
+      "input_schema": { "type": "object", "properties": { "customer_id": { "type": "string", "minLength": 1, "maxLength": 128 } }, "required": ["customer_id"], "additionalProperties": false },
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "segments.list",
+      "description": "List saved segments in the current CRM context.",
+      "input_schema": { "type": "object", "properties": {}, "required": [], "additionalProperties": false },
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "segments.show",
+      "description": "Show one saved segment from the current CRM context.",
+      "input_schema": { "type": "object", "properties": { "segment_id": { "type": "string", "minLength": 1, "maxLength": 128 } }, "required": ["segment_id"], "additionalProperties": false },
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "segments.preview",
+      "description": "Preview a saved segment from the current CRM context.",
+      "input_schema": { "type": "object", "properties": { "segment_id": { "type": "string", "minLength": 1, "maxLength": 128 } }, "required": ["segment_id"], "additionalProperties": false },
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "segments.save",
+      "description": "Save a segment using the existing supported predicate grammar.",
+      "input_schema": { "type": "object", "properties": { "segment_id": { "type": "string", "minLength": 1, "maxLength": 128 }, "name": { "type": "string", "minLength": 1, "maxLength": 120 }, "predicates": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "object", "properties": { "field": { "type": "string" }, "op": { "type": "string" }, "value": {} }, "required": ["field", "op", "value"], "additionalProperties": false } }, "expected_revision": { "type": "integer", "minimum": 1 } }, "required": ["segment_id", "name", "predicates"], "additionalProperties": false },
+      "effect": "write",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "campaigns.list",
+      "description": "List campaigns in the current CRM context.",
+      "input_schema": { "type": "object", "properties": {}, "required": [], "additionalProperties": false },
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "campaigns.show",
+      "description": "Show one campaign from the current CRM context.",
+      "input_schema": { "type": "object", "properties": { "campaign_id": { "type": "string", "minLength": 1, "maxLength": 128 } }, "required": ["campaign_id"], "additionalProperties": false },
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "campaigns.create_draft",
+      "description": "Create a fresh editable campaign draft without freezing or sending an audience.",
+      "input_schema": { "type": "object", "properties": { "campaign_id": { "type": "string", "minLength": 1, "maxLength": 128 }, "name": { "type": "string", "minLength": 1, "maxLength": 120 }, "segment_id": { "type": "string", "maxLength": 128 } }, "required": ["campaign_id", "name"], "additionalProperties": false },
+      "effect": "draft",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "email.draft",
+      "description": "Create a structured pending email proposal for operator review; does not apply content or send.",
+      "input_schema": { "type": "object", "properties": { "campaign_id": { "type": "string", "minLength": 1, "maxLength": 128 }, "proposal_id": { "type": "string", "minLength": 1, "maxLength": 128 }, "draft": { "type": "object" } }, "required": ["campaign_id", "proposal_id", "draft"], "additionalProperties": false },
+      "effect": "proposal",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "customer.tags.update",
+      "description": "Propose a tags-only update for exactly one customer; consent, email and other profile fields are not writable.",
+      "input_schema": { "type": "object", "properties": { "customer_id": { "type": "string", "minLength": 1, "maxLength": 128 }, "tags": { "type": "array", "maxItems": 16, "items": { "type": "string", "maxLength": 40 } }, "expected_revision": { "type": "integer", "minimum": 1 } }, "required": ["customer_id", "tags", "expected_revision"], "additionalProperties": false },
+      "effect": "write",
+      "confirmation": "permission_required",
+      "availability": "requires_context"
+    },
+    {
+      "id": "segments.save_static",
+      "description": "Save a static segment from an explicit customer member list.",
+      "input_schema": {"type":"object","properties":{"segment_id":{"type":"string","minLength":1,"maxLength":128},"name":{"type":"string","minLength":1,"maxLength":120},"member_ids":{"type":"array","maxItems":1000,"items":{"type":"string","minLength":1,"maxLength":128}},"expected_revision":{"type":"integer","minimum":1}},"required":["segment_id","name","member_ids"],"additionalProperties":false},
+      "effect": "write",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "segments.delete",
+      "description": "Delete a saved segment. The revision log is retained.",
+      "input_schema": {"type":"object","properties":{"segment_id":{"type":"string","minLength":1,"maxLength":128}},"required":["segment_id"],"additionalProperties":false},
+      "effect": "delete",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "campaigns.apply",
+      "description": "Apply a pending assistant email proposal to the campaign draft.",
+      "input_schema": {"type":"object","properties":{"proposal_id":{"type":"string","minLength":1,"maxLength":128},"expected_revision":{"type":"integer","minimum":1}},"required":["proposal_id"],"additionalProperties":false},
+      "effect": "write",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "campaigns.discard",
+      "description": "Discard a pending assistant email proposal without changing the draft.",
+      "input_schema": {"type":"object","properties":{"proposal_id":{"type":"string","minLength":1,"maxLength":128}},"required":["proposal_id"],"additionalProperties":false},
+      "effect": "write",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "campaigns.approve",
+      "description": "Approve the campaign content at its exact current revision.",
+      "input_schema": {"type":"object","properties":{"campaign_id":{"type":"string","minLength":1,"maxLength":128},"expected_revision":{"type":"integer","minimum":1}},"required":["campaign_id","expected_revision"],"additionalProperties":false},
+      "effect": "write",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "audiences.prepare",
+      "description": "Freeze an exact audience for a campaign without sending.",
+      "input_schema": {"type":"object","properties":{"freeze_id":{"type":"string","minLength":1,"maxLength":128},"base":{"type":"object"},"exclusion_list_id":{"type":"string","maxLength":128},"max_recipients":{"type":"integer","minimum":1,"maximum":500}},"required":["freeze_id","base","max_recipients"],"additionalProperties":false},
+      "effect": "write",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "audiences.show",
+      "description": "Read a frozen audience and its live validity.",
+      "input_schema": {"type":"object","properties":{"freeze_id":{"type":"string","minLength":1,"maxLength":128}},"required":["freeze_id"],"additionalProperties":false},
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "sends.list",
+      "description": "List campaign sends and delivery counts.",
+      "input_schema": {"type":"object","properties":{"campaign_id":{"type":"string","minLength":1,"maxLength":128}},"required":[],"additionalProperties":false},
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "sends.show",
+      "description": "Read one campaign send and its delivery status.",
+      "input_schema": {"type":"object","properties":{"send_id":{"type":"string","minLength":1,"maxLength":128}},"required":["send_id"],"additionalProperties":false},
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "customers.notes.list",
+      "description": "List customer notes in the current CRM context.",
+      "input_schema": {"type":"object","properties":{"customer_id":{"type":"string","minLength":1,"maxLength":128},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["customer_id"],"additionalProperties":false},
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "customers.notes.create",
+      "description": "Append a plain-text note to a customer timeline.",
+      "input_schema": {"type":"object","properties":{"customer_id":{"type":"string","minLength":1,"maxLength":128},"note_id":{"type":"string","minLength":1,"maxLength":128},"body":{"type":"string","minLength":1,"maxLength":4000}},"required":["customer_id","note_id","body"],"additionalProperties":false},
+      "effect": "write",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "customers.notes.delete",
+      "description": "Soft-delete one customer note.",
+      "input_schema": {"type":"object","properties":{"customer_id":{"type":"string","minLength":1,"maxLength":128},"note_id":{"type":"string","minLength":1,"maxLength":128}},"required":["customer_id","note_id"],"additionalProperties":false},
+      "effect": "delete",
+      "confirmation": "none",
+      "availability": "requires_context"
+    }
+  ]
+}

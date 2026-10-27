@@ -7,12 +7,16 @@ check compiles and runs four `safety_floor` tests; green means that floor
 passed, **not** full behavior coverage. `fmt`, `clippy`, `build` and `ui`
 remain required on PRs and merge groups. CAD-1088 selects PR feedback from a
 classifier loaded from the base commit: isolated docs use no compilation;
-isolated UI code runs UI validation but not unrelated default Rust gates.
+isolated UI code runs UI validation but not unrelated default Rust gates;
+edits confined to pre-existing independent top-level `tests/<name>.rs`
+targets run the rust gates with only those integration targets (lib and
+bins suites unchanged).
 Required contexts explicitly report not-applicable commands rather than
 claiming to build. Governance, workflow, scripts, dependency manifests, mixed
 or unknown changes run all gates. Merge groups always run the full current
-validation (including the reduced floor); fast PR feedback is not evidence
-for skipping integration validation. `scripts/require-full-gates` refuses
+validation (including the reduced floor); the narrowed `tests` scope is
+pull_request feedback only and the runner refuses it on any other event.
+Fast PR feedback is not evidence for skipping integration validation. `scripts/require-full-gates` refuses
 release artifacts, candidate staging and promotion from any source SHA that
 commits `.github/reduced-gates`. CAD-1102 ended the CAD-1073 window by
 re-declaring the current gate as permanent, and removed the marker; a future
@@ -23,6 +27,9 @@ The shard/inventory benchmarks and old fixture journeys described below are
 historical full-gate design, not current measurements or restored coverage.
 See [development-loop simplification](DEV-CYCLE.md) for the #738 reflection,
 current local check recipe and approval handoff.
+
+For diagnosing slow shards and the rust-cache/sccache split, see
+[CI wall-time](guides/ci-performance.md).
 
 ## Full-gate delivery design (historical, before CAD-1073)
 
@@ -64,8 +71,11 @@ wait, refuses a changed attempt or digest, then publishes a
 install or restart production. Only a successful workflow whose `stage`
 and `promote` jobs both passed can supply the default updater's candidate.
 
-`cadence update --check`, `cadence update`, and
-`cadence upgrade --latest-main` now select that approved artifact. The
+`cadence update --check` and `cadence update` are the operator path;
+`cadence upgrade` is recovery only. `cadence update` with no `--to` (and
+`cadence upgrade --latest-main`) select that approved artifact.
+`cadence update --to <sha>` pins a commit and runs the `upgrade --sha`
+checks, not the production-candidate receipt. The
 resolver pins its CI run, attempt and digest, and does not fall back to
 an unapproved green build. A rerun that changes the artifact requires
 new staging and approval. Existing attestation, ancestry, backward-move,
@@ -118,17 +128,23 @@ let that code poison the cache or exfiltrate the key. Therefore:
   `needs` it. It builds the profiles the gates use (the feature-on test
   profile and the release profile) so main fills the
   cache. It skips the builds when sccache did not enable.
+- `cache-warm-cross` (CAD-1480) is the same pattern for the cross-build
+  gates: `push` to `refs/heads/main` only, one leg per cross target, and
+  it writes only the `cross-<target>` rust-cache keys the cross-build
+  matrix restores with `save-if: false`. It holds no secrets and no
+  environment.
 - Every other job, including all gate jobs on `pull_request` and
   `merge_group` and on main pushes, gets only the read-only pair and no
   `environment:`.
-- The guard evaluator in `tests/scripts/test_ci_sccache.py` (retired under CAD-1073) compares
-  strings case-insensitively like GitHub and supports `==` and `!=`; any
-  other expression form (functions, `!`) is rejected. The test also rejects
-  `secrets[...]`, `toJSON(secrets)` and any computed `environment:`.
-- `tests/scripts/test_ci_sccache.py` (retired under CAD-1073) (run in `fmt`) fails if an RW secret
-  appears anywhere but `cache-warm`, if its `if` admits any event but push
-  to main, if the writer environment is attached to another job, or if
-  any job waits on it.
+- The guard evaluator in `tests/scripts/test_ci_sccache.py` (retired under
+  CAD-1073) compared strings case-insensitively like GitHub and supported
+  `==` and `!=`; any other expression form (functions, `!`) was rejected.
+  The test also rejected `secrets[...]`, `toJSON(secrets)` and any computed
+  `environment:`.
+- `tests/scripts/test_ci_sccache.py` (retired under CAD-1073, formerly run
+  in `fmt`) failed if an RW secret appeared anywhere but `cache-warm`, if
+  its `if` admitted any event but push to main, if the writer environment
+  was attached to another job, or if any job waited on it.
 
 How it works:
 
@@ -230,6 +246,12 @@ all lib/bin tests and the split-map inventory contract. A reference from
 another tracked source makes the file shared. Production source, shared
 fixtures, manifests, workflows, tools and unknown paths run all targets.
 The selection is deliberately conservative, not a Rust dependency graph.
+
+CAD-1727 collapsed those targets into one `suite` binary and set
+`autotests = false`, so the trusted-base classifier refuses target
+narrowing for that shape and PRs run the full Rust scope. That is
+intentional: the six shards partition the one binary's tests, and a full
+build is now a single link.
 Non-PR events retain all targets; exact-SHA main queue-evidence reuse is
 unchanged. Inventory parity, pinned nextest, zero retries, default-feature
 refusal proofs and doctests remain for every Rust selection. Each run
@@ -263,17 +285,17 @@ one line per step (`[ OK ]`, `[FAIL] name: exit N`, `[SKIP] name: why`):
    `scripts/split-map-sync --check` only when its inventory exists;
 3. `cargo clippy --all-targets --locked -- -D warnings`, then the same with
    `--features test-seam`, when Rust or Cargo files changed;
-4. `pnpm --dir ui run typecheck` when `ui/` changed;
+4. `bun run --cwd ui typecheck` when `ui/` changed;
 5. the active Python test commands that CI's `fmt` job runs, including
    review-recipe and release-freeze regressions, when `scripts/`, `.github/`
    or `tests/scripts/` changed;
-6. with `--tests`, `cargo test --locked --test safety_floor -- --test-threads 2`
-   regardless of whether the floor's source appears in the diff.
+6. with `--tests`, `scripts/run-result-tests` (every test target, then the
+   lib and binary-target unit tests)
 
 "Changed" is the union of commits since `origin/main`, working-tree edits
 and untracked files; use `--base REF` to override and `--list` to print the
 plan without running it. It sets `CARGO_BUILD_JOBS=4` unless already set and
-does not run the full suite. During CAD-1073 the merge queue runs the same
+does not run the full suite. During CAD-1073 the merge queue ran the same
 reduced floor, not a hidden full integration suite.
 
 The legacy `tests/split-map*.toml` and `split_map_inventory` contract were
@@ -286,8 +308,18 @@ The required `fmt` job runs the shared scope/runner, shard-coverage,
 nextest-cost, delivery/staging/review-observation contracts and doctor/host
 split-map check once. Their failures still block the required gate and
 release evidence. They no longer repeat in every Rust test shard.
-`tests/scripts/test_ci_shared_checks.py` (retired under CAD-1073) checks that each command remains
-once-only and blocking, including early failures in multi-command steps.
+`tests/scripts/test_ci_shared_checks.py` (retired under CAD-1073) checked
+that each command remained once-only and blocking, including early failures
+in multi-command steps.
+
+The enqueue consumer checks run through
+`python3 scripts/test_enqueue_requirements.py` in `fmt`. Its
+`RequirementsConsumer` inherits all 18 evidence-posting checks and adds
+10 requirements cases, so one command runs both sets without duplicating
+the inherited checks. Local pre-push discovers that same command from the
+workflow. These checks drive the real enqueue consumer with synthetic
+external transports; they do not establish daemon identity or live
+GitHub/merge-queue acceptance.
 
 Each `test-shard` job selects the scope from the base policy, proves
 Cargo/nextest inventory parity, compiles on a rust-cache hit, builds its
@@ -296,6 +328,26 @@ The required `test` aggregate verifies complete, disjoint coverage from the
 assignment receipts (eight automatically; four or eight on a manual
 benchmark). Default-feature refusal proofs and doctests
 remain in `test-once`. Exact-SHA main queue-evidence reuse is unchanged.
+
+Uploads are named `test-shard-<n>-attempt-<run_attempt>` (CAD-1745). A
+failed-job-only rerun copies an untouched green partition into the new
+attempt without re-running or re-uploading it, so the aggregate resolves
+each copied row to the unique earlier execution it aliases (identical
+start/completion timestamps and runner, later `created_at`). It then takes
+every partition's latest *actual* execution and downloads exactly those
+six artifact IDs. Earlier reports remain on the run as evidence, and a
+non-green latest execution, missing or ambiguous provenance, or a missing,
+expired or foreign-run artifact fails the aggregate instead of falling
+back to an older success.
+
+An indexed `queued`/`in_progress` shard row is reconciled once by immutable
+job ID (CAD-1758): a successful matrix dependency can precede publication
+of its terminal state in the jobs index. The current record must match
+the row's ID, run, attempt, head and name before the same provenance and
+latest-execution checks apply. Terminal indexed failures are never
+refreshed into success. An unreadable, malformed, foreign or still
+nonterminal record refuses the aggregate; there is no sleep, retry loop
+or fallback to older evidence.
 
 ## Why shards compile themselves (CAD-869)
 
@@ -318,6 +370,13 @@ assignment receipts and zero retries, enforced by `scripts/ci-shard-check.py`
 in the `test` aggregate. Revisit build-once distribution only with a
 producer that is not serial on the critical path and a measured win over a
 cache-hit shard.
+
+CAD-1727 changed that cost shape: 83 of the per-file test binaries are now
+modules of one `suite` target, so a full test profile is 4.9 GiB (27
+executables) instead of 16.8 GiB (109), and a shard links the suite once
+plus the 15 explicitly declared targets. The CAD-869 measurement stands
+for the tree it was taken on; an archive producer's size and transfer cost
+are now different, so re-measure before reviving that flow.
 
 ## CI throughput benchmark (CAD-840)
 
@@ -407,7 +466,7 @@ from that file and runs `rustup toolchain install <channel>` with the
 profile and components the job passes. `--export` also sets
 `RUSTUP_TOOLCHAIN` for jobs that build another checkout (staging's
 `candidate-source`). Local `cargo` follows the file too, so a local
-`cargo clippy` matches CI. `tests/scripts/test_ci_toolchain_pin.py` (retired under CAD-1073) fails
+`cargo clippy` matches CI. `tests/scripts/test_ci_toolchain_pin.py` (retired under CAD-1073) failed
 if a workflow installs a literal or floating channel.
 
 A new stable release can no longer turn the queue red: lints and

@@ -3,20 +3,27 @@
 //! fans out to, plus the shared response plumbing (`send`, `coded_response`,
 //! `write_reply`) the read side reuses.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::Path;
 
+use cadence_core::board_api::{
+    AgentRegisterReq, CardAgent, CommentReq, IssueDetail, LinkReq, NewIssueReq, PatchReq, RefReq,
+    ReportReq,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 
+use super::endpoints::RouteId;
+use super::operator::RouteClass;
 use super::serve::{add_security_headers, err_response, json_response};
 use super::ServeOpts;
 use super::{
-    app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_records,
-    app_release, app_runs, app_screens, apps, connections, crm_send, crm_smtp, home, lane,
-    operator, read_model, social_publish, stages, threads, updates, wiki, workflows,
+    app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_media, app_records,
+    app_release, app_runs, app_screens, app_social_drafts, approvals, apps, business_templates,
+    connections, crm_send, crm_smtp, endpoints, home, lane, operator, read_model, social_publish,
+    stages, threads, updates, whatsapp, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -151,81 +158,6 @@ pub(crate) fn parse_json<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
 ) -> std::result::Result<T, HttpResp> {
     serde_json::from_slice(bytes).map_err(|e| err_response(400, &format!("bad request json: {e}")))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct NewIssueReq {
-    project: String,
-    title: String,
-    priority: Option<String>,
-    owner: Option<String>,
-    component: Option<String>,
-    tags: Option<Vec<String>>,
-    parent: Option<String>,
-    blocked_by: Option<Vec<String>>,
-    /// CAD-140: the board's report/idea composer files the description
-    /// with the issue — one call instead of create-then-comment.
-    /// `None`/blank keeps `new_issue`'s default body.
-    pub(crate) body: Option<String>,
-}
-
-/// CAD-140: `POST /api/reports` — file a question, feedback, idea or
-/// bug through the canonical intake path. `project` is the board the
-/// operator files from: ideas land there, while questions, feedback
-/// and bugs route to the `cadence` project like `cadence report` (the
-/// server decides — the UI never routes). Unknown fields are refused
-/// so a forged `by`/`actor` never reaches the write.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReportReq {
-    kind: String,
-    project: String,
-    title: String,
-    priority: Option<String>,
-    body: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PatchReq {
-    status: Option<String>,
-    priority: Option<String>,
-    /// `""` clears owner.
-    owner: Option<String>,
-    /// `""` clears component.
-    component: Option<String>,
-    title: Option<String>,
-    body: Option<String>,
-    /// Replaces the tag list; `[]` clears it.
-    tags: Option<Vec<String>>,
-    if_rev: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct LinkReq {
-    #[serde(rename = "type")]
-    kind: String,
-    target: String,
-    if_rev: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RefReq {
-    kind: String,
-    url: Option<String>,
-    path: Option<String>,
-    label: Option<String>,
-    if_rev: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CommentReq {
-    body: String,
-    if_rev: Option<String>,
 }
 
 /// A write op's outcome → HTTP response. Conflicts are 409 with the
@@ -377,6 +309,122 @@ pub(crate) fn post_report(
     }
 }
 
+/// Maps a setup location to the `(provider, endpoint_kind)` pair the daemon
+/// registers. `cloud` pins both to `sandbox`; `local` needs the explicit
+/// pair and refuses `sandbox`, which only Cloud may set.
+fn resolve_location(req: &AgentRegisterReq) -> std::result::Result<(String, String), String> {
+    match req.location.as_deref().map(str::trim).unwrap_or_default() {
+        "local" => {
+            let provider = req.provider.as_deref().map(str::trim).unwrap_or_default();
+            let endpoint = req
+                .endpoint_kind
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default();
+            if provider.is_empty() || endpoint.is_empty() {
+                return Err("a local agent needs a provider and endpoint kind".into());
+            }
+            if provider == "sandbox" || endpoint == "sandbox" {
+                return Err("sandbox is a cloud location - choose Cloud".into());
+            }
+            Ok((provider.to_string(), endpoint.to_string()))
+        }
+        "cloud" => {
+            if req.provider.is_some() || req.endpoint_kind.is_some() {
+                return Err("cloud sets provider and endpoint kind itself".into());
+            }
+            Ok(("sandbox".to_string(), "sandbox".to_string()))
+        }
+        other => Err(format!("location is local or cloud - not '{other}'")),
+    }
+}
+
+/// `POST /api/agents`: register one agent through the daemon's
+/// `agent_register` (`rpc_register`). The operator gate ran in `admit`;
+/// the daemon applies the same validation a CLI registration does.
+pub(crate) fn post_agent(request: &mut Request, state_dir: &Path) -> HttpResp {
+    let bytes = match read_body(request, JSON_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: AgentRegisterReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // CAD-1752: a catalogue hire is relayed without a runtime — the daemon
+    // takes provider and endpoint kind from the install and refuses a
+    // caller that names them; here the board refuses `location` as well.
+    if req.catalogue.is_some() {
+        if req.location.is_some() || req.provider.is_some() || req.endpoint_kind.is_some() {
+            return err_response(
+                400,
+                "a catalogue hire takes its runtime from the install - send no location, provider or endpoint kind",
+            );
+        }
+        let params = json!({
+            "alias": req.alias.trim(),
+            "catalogue": req.catalogue,
+            "look": req.look,
+            "role": req.role,
+            "team_role": req.team_role,
+            "model_policy": req.model_policy,
+            "cwd": req.cwd,
+            "sandbox": req.sandbox,
+            "instructions": req.instructions,
+            "params": req.params,
+        });
+        let instructions = match (&req.instructions, req.catalogue.as_deref()) {
+            (Some(text), _) => Some(text.clone()),
+            (None, Some(id)) => crate::agent_roles::find(id).map(|role| role.instructions()),
+            (None, None) => None,
+        };
+        return match client::rpc(state_dir, "agent_register", params) {
+            Ok(mut out) => {
+                crate::briefing::brief_registered(
+                    state_dir,
+                    req.alias.trim(),
+                    instructions.as_deref(),
+                    &mut out,
+                );
+                json_response(out)
+            }
+            Err(err) => super::home::rpc_err(&err, "agent_register"),
+        };
+    }
+    if req.look.is_some() {
+        return err_response(400, "look only applies to a catalogue hire");
+    }
+    let (provider, endpoint_kind) = match resolve_location(&req) {
+        Ok(pair) => pair,
+        Err(message) => return err_response(400, &message),
+    };
+    let params = json!({
+        "alias": req.alias.trim(),
+        "provider": provider,
+        "endpoint_kind": endpoint_kind,
+        "role": req.role,
+        "team_role": req.team_role,
+        "model_policy": req.model_policy,
+        "cwd": req.cwd,
+        "sandbox": req.sandbox,
+        "instructions": req.instructions,
+        "params": req.params,
+    });
+    match client::rpc(state_dir, "agent_register", params) {
+        Ok(mut out) => {
+            // CAD-1752: brief a board-registered agent as `join` does.
+            crate::briefing::brief_registered(
+                state_dir,
+                req.alias.trim(),
+                req.instructions.as_deref(),
+                &mut out,
+            );
+            json_response(out)
+        }
+        Err(err) => super::home::rpc_err(&err, "agent_register"),
+    }
+}
+
 /// Fresh card + detail payloads for one id after a write.
 pub(crate) fn issue_payloads(pm: &Pm, state_dir: &Path, id: &str) -> Result<(Value, Value)> {
     let read = read_model::get(state_dir, &pm.dir).board(pm, None);
@@ -392,7 +440,7 @@ pub(crate) fn issue_payloads(pm: &Pm, state_dir: &Path, id: &str) -> Result<(Val
     Ok((
         read.card(&ctx, view),
         with_agents(
-            crate::issue::work::detail_json(&pm.dir, &ctx, view),
+            crate::issue::work::detail(&pm.dir, &ctx, view),
             &read.by_issue,
             id,
         ),
@@ -407,6 +455,97 @@ pub(crate) fn write_err(e: &Error) -> HttpResp {
         Error::Rejected(m) => err_response(400, m),
         other => err_response(500, &other.to_string()),
     }
+}
+
+/// `needle`'s first offset in `hay`.
+pub(crate) fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+pub(crate) type Multipart = (std::collections::BTreeMap<String, String>, Option<Vec<u8>>);
+
+/// The simplest multipart reader that is still strict — and byte-safe:
+/// file payloads never pass through a UTF-8 decode. The body must be
+/// `--b\r\n<part-headers>\r\n\r\n<payload>\r\n--b\r\n…\r\n--b--`.
+/// Named fields land in `fields`; the FIRST `file` part's raw payload
+/// is the upload. A payload containing `\r\n--b` truncates early —
+/// the boundary is the client's own random marker, as the format
+/// intends.
+pub(crate) fn parse_multipart(
+    body: &[u8],
+    boundary: &str,
+) -> std::result::Result<Multipart, String> {
+    let delim = format!("--{boundary}").into_bytes();
+    let crlf_delim = {
+        let mut v = b"\r\n".to_vec();
+        v.extend_from_slice(&delim);
+        v
+    };
+    let mut fields = std::collections::BTreeMap::new();
+    let mut file = None;
+    let mut pos = 0;
+    loop {
+        if !body[pos..].starts_with(&delim) {
+            return Err("multipart part does not start with the boundary".to_string());
+        }
+        pos += delim.len();
+        if body[pos..].starts_with(b"--") {
+            break; // the final delimiter
+        }
+        if body[pos..].starts_with(b"\r\n") {
+            pos += 2;
+        } else {
+            return Err("multipart boundary is not followed by a part".to_string());
+        }
+        let rest = &body[pos..];
+        let Some(hdr_len) = find_sub(rest, b"\r\n\r\n") else {
+            return Err("multipart part with no header/body split".to_string());
+        };
+        let headers = String::from_utf8_lossy(&rest[..hdr_len]);
+        let content_start = pos + hdr_len + 4;
+        let Some(rel_end) = find_sub(&body[content_start..], &crlf_delim) else {
+            return Err("multipart part never terminates".to_string());
+        };
+        let payload = &body[content_start..content_start + rel_end];
+        let mut name = None;
+        let mut filename = None;
+        for line in headers.lines() {
+            if line
+                .to_ascii_lowercase()
+                .starts_with("content-disposition:")
+            {
+                for seg in line.split(';') {
+                    let seg = seg.trim();
+                    if let Some(v) = seg.strip_prefix("name=") {
+                        name = Some(v.trim_matches('"').to_string());
+                    } else if let Some(v) = seg.strip_prefix("filename=") {
+                        filename = Some(v.trim_matches('"').to_string());
+                    }
+                }
+            }
+        }
+        match name.as_deref() {
+            Some("file") => {
+                if file.is_none() {
+                    file = Some(payload.to_vec());
+                    // The part's own filename rides as `filename` — a
+                    // display hint only; the daemon sanitizes it.
+                    if let Some(f) = filename {
+                        fields.entry("filename".to_string()).or_insert(f);
+                    }
+                }
+            }
+            Some(n) => {
+                fields.insert(n.to_string(), String::from_utf8_lossy(payload).to_string());
+            }
+            None => {}
+        }
+        pos = content_start + rel_end + 2;
+    }
+    Ok((fields, file))
 }
 
 /// The actor a request would write as, header-wise, and the tailnet
@@ -513,14 +652,24 @@ pub(crate) fn tailnet_proxy(
 ///
 /// No store file means no agent was ever registered here: provably no
 /// agents. A store the daemon cannot answer for is an error.
+///
+/// `budget` bounds this one required identity read when the caller is a
+/// courtesy metadata read (CAD-1193); every guard caller passes
+/// `None` and keeps the full RPC bound. Either way the answer comes
+/// only from the daemon — a failed read maps nothing, so a stalled
+/// `agent_list` denies attribution, it never skips the check.
 pub(crate) fn agent_roots(
     state_dir: &Path,
+    budget: Option<client::MetaBudget>,
 ) -> std::result::Result<crate::peer::AgentRoots, String> {
     if !state_dir.join("cadence.sqlite3").exists() {
         return Ok(crate::peer::AgentRoots::default());
     }
-    let list = client::rpc(state_dir, "agent_list", json!({}))
-        .map_err(|e| format!("the daemon cannot list registered agents ({e})"))?;
+    let listed = match budget {
+        Some(b) => b.read(state_dir, "agent_list", json!({})),
+        None => client::rpc(state_dir, "agent_list", json!({})),
+    };
+    let list = listed.map_err(|e| format!("the daemon cannot list registered agents ({e})"))?;
     let agents = list["agents"]
         .as_array()
         .ok_or_else(|| "the daemon's agent list is malformed".to_string())?;
@@ -577,6 +726,21 @@ pub(crate) fn coded_response(
     let mut resp = Response::from_data(body).with_status_code(StatusCode(status));
     resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
     resp
+}
+
+/// One explorer write: the row's action and bound id, relayed with the
+/// board's public proof — the same call the chain made after parsing the
+/// path (CAD-1682).
+fn explorer_write(
+    request: &mut Request,
+    state_dir: &Path,
+    opts: &ServeOpts,
+    caller: Option<&operator::Caller>,
+    action: app_explorer::WriteAction,
+    install: Option<&str>,
+) -> HttpResp {
+    let relay = operator::public_relay(request, opts);
+    app_explorer::write(request, action, install, caller, relay, state_dir)
 }
 
 /// Seconds a client should wait before retrying a busy daemon.
@@ -687,6 +851,139 @@ pub(crate) fn read_settings_body(request: &mut Request) -> std::result::Result<V
     Ok(buf)
 }
 
+pub(crate) fn agent_settings_get(state_dir: &Path, read_only: bool) -> HttpResp {
+    match client::rpc(state_dir, "agent_settings_get", json!({})) {
+        Ok(mut snapshot) => {
+            if let Some(obj) = snapshot.as_object_mut() {
+                obj.insert("read_only".to_string(), json!(read_only));
+            }
+            json_response(snapshot)
+        }
+        Err(err) => settings_rpc_error(err),
+    }
+}
+
+fn agent_settings_body(request: &mut Request) -> std::result::Result<Value, HttpResp> {
+    const CAP: u64 = 256 * 1024;
+    let mut buf = Vec::new();
+    let mut limited = request.as_reader().take(CAP + 1);
+    if let Err(e) = limited.read_to_end(&mut buf) {
+        return Err(coded_response(
+            400,
+            "invalid_request",
+            &format!("body read failed: {e}"),
+            None,
+        ));
+    }
+    if buf.len() as u64 > CAP {
+        return Err(coded_response(
+            400,
+            "invalid_request",
+            "settings body exceeds 256 KiB",
+            None,
+        ));
+    }
+    let text = std::str::from_utf8(&buf).map_err(|_| {
+        coded_response(
+            400,
+            "invalid_request",
+            "settings body must be UTF-8 JSON",
+            None,
+        )
+    })?;
+    serde_json::from_str(text).map_err(|_| {
+        coded_response(
+            400,
+            "invalid_request",
+            "settings body must be a JSON object",
+            None,
+        )
+    })
+}
+
+fn agent_settings_error(err: Error) -> HttpResp {
+    if err.kind() == "conflict" {
+        let message = err.to_string();
+        let revision = message
+            .split_once("settings revision is ")
+            .map(|(_, token)| token.trim().to_string());
+        let body = serde_json::to_vec_pretty(&json!({
+            "error": message,
+            "code": "revision_conflict",
+            "revision": revision,
+        }))
+        .unwrap_or_default();
+        let mut resp = Response::from_data(body).with_status_code(StatusCode(409));
+        resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+        return resp;
+    }
+    settings_rpc_error(err)
+}
+
+/// The daemon method one settings subpath relays. The path is parsed by the
+/// endpoint table; this is the only place the four operations are named.
+fn agent_settings_rpc(op: Option<&str>) -> &'static str {
+    match op {
+        Some("catalog") => "agent_settings_catalog",
+        Some("sync") => "agent_settings_sync",
+        Some("preview") => "agent_settings_preview",
+        _ => "agent_settings_set",
+    }
+}
+
+pub(crate) fn agent_settings_post(
+    request: &mut Request,
+    state_dir: &Path,
+    op: Option<&'static str>,
+) -> HttpResp {
+    let body = match agent_settings_body(request) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let (method, params) = if op == Some("catalog") {
+        (
+            "agent_settings_catalog",
+            json!({"provider": body.get("provider").cloned().unwrap_or(Value::Null)}),
+        )
+    } else if op == Some("sync") {
+        (
+            "agent_settings_sync",
+            json!({
+                "expected_revision": body.get("expected_revision").cloned().unwrap_or(Value::Null),
+                "profile": body.get("profile").cloned().unwrap_or(Value::Null),
+            }),
+        )
+    } else if op == Some("preview") {
+        (
+            "agent_settings_preview",
+            json!({
+                "expected_revision": body.get("expected_revision").cloned().unwrap_or(Value::Null),
+                "profile": body.get("profile").cloned().unwrap_or(Value::Null),
+                "harness": body.get("harness").cloned().unwrap_or(Value::Null),
+            }),
+        )
+    } else {
+        (
+            agent_settings_rpc(op),
+            json!({
+                "expected_revision": body.get("expected_revision").cloned().unwrap_or(Value::Null),
+                "config": body.get("config").cloned().unwrap_or(Value::Null),
+            }),
+        )
+    };
+    match client::rpc(state_dir, method, params) {
+        Ok(mut snapshot) => {
+            if method == "agent_settings_set" {
+                if let Some(obj) = snapshot.as_object_mut() {
+                    obj.insert("read_only".to_string(), json!(false));
+                }
+            }
+            json_response(snapshot)
+        }
+        Err(err) => agent_settings_error(err),
+    }
+}
+
 /// `POST /api/settings/model-defaults` — operator-only, admitted by
 /// `operator::admit` (session plus process proof) before this runs.
 pub(crate) fn model_defaults_post(request: &mut Request, state_dir: &Path) -> HttpResp {
@@ -723,6 +1020,38 @@ pub(crate) fn model_defaults_post(request: &mut Request, state_dir: &Path) -> Ht
     }
 }
 
+/// CAD-1374: attach the human-attributed activity receipt to the PM for one
+/// mutation. The daemon proves the server-held public session bearer (read
+/// from the cookie, never a body field), persists the prepared receipt and
+/// returns its canonical context, which the PM carries into the commit. A
+/// local (non-public) write passes through unchanged. A public-host write
+/// with no bearer is refused as 401, never an anonymous fallback.
+pub(crate) fn activity_pm(
+    pm: Pm,
+    request: &Request,
+    opts: &ServeOpts,
+    state_dir: &Path,
+    action: &str,
+    resource: &str,
+) -> std::result::Result<Pm, HttpResp> {
+    let proof = match operator::public_relay(request, opts) {
+        operator::PublicRelay::NotPublic => return Ok(pm),
+        operator::PublicRelay::Proven(proof) => proof,
+        operator::PublicRelay::Missing => {
+            return Err(err_response(401, "board session required for this write"));
+        }
+    };
+    let params = json!({
+        "action": action,
+        "resource": resource,
+        "public_session": proof.token(),
+    });
+    let receipt =
+        client::rpc(state_dir, "pm_activity_prepare", params).map_err(|e| write_err(&e))?;
+    pm.with_activity_receipt(&receipt)
+        .map_err(|e| write_err(&e))
+}
+
 /// Dispatch POST/PATCH/DELETE on the write routes. Every route passes
 /// `write_guard` before reading a body or touching the PM dir, and every
 /// op goes through `issue::write` — one write path for CLI and API.
@@ -737,33 +1066,215 @@ pub(crate) fn write_route(
     opts: &ServeOpts,
     send: &dyn Fn(Request, HttpResp),
 ) {
-    // CAD-313: signing in and out — the nonce, or the session itself,
-    // is the credential (`operator`).
-    if path == "/api/session" || path == "/api/session/logout" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let resp = if path == "/api/session" {
-            operator::open(&mut request, state_dir, opts)
+    // CAD-1664: every route the endpoint table owns dispatches from its row —
+    // method, admission class and bound parameters in one declaration, so the
+    // dispatcher and `route_class` cannot disagree. A path no row owns falls
+    // through to the remaining chain below, unchanged.
+    if let Some(bound) = endpoints::resolve_or_path(method.as_str(), path) {
+        let endpoint = bound.endpoint;
+        // Admission runs before the method check for every non-Session row:
+        // a read-only board or an unauthenticated caller used to refuse these
+        // paths before the arm's own 405, and must still.
+        let caller = if endpoint.class == RouteClass::Session {
+            None
         } else {
-            operator::logout(&request, state_dir, opts)
+            match operator::admit(&request, method.as_str(), path, state_dir, opts) {
+                Ok(caller) => caller,
+                Err(resp) => {
+                    send(request, resp);
+                    return;
+                }
+            }
         };
-        send(request, resp);
-        return;
-    }
-    // CAD-777: device-grant sign-in — same login class as `/api/session`.
-    // Unconfigured boards answer 404 inside the handlers, like an
-    // unknown shape.
-    if path == "/api/session/device/code" || path == "/api/session/device/poll" {
-        if *method != Method::Post {
+        if endpoint.method != method.as_str() {
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let resp = if path == "/api/session/device/code" {
-            operator::device_code(&mut request, state_dir, opts)
-        } else {
-            operator::device_poll(&mut request, state_dir, opts)
+        // Validators run after admission, so an unauthenticated caller still
+        // sees the same refusal it saw before the migration.
+        if let Some(resp) = bound.invalid() {
+            send(request, resp);
+            return;
+        }
+        let resp = match endpoint.id {
+            // The read rows never reach this dispatcher: `read_dispatch`
+            // answers them from `handle` before a write is considered.
+            RouteId::WorkspaceList
+            | RouteId::WorkspaceShow
+            | RouteId::ConversationsRead
+            | RouteId::ArtifactRead
+            | RouteId::ArtifactVersions
+            | RouteId::AgentDetail
+            | RouteId::AgentRoles => err_response(500, "a read row reached the write dispatcher"),
+            RouteId::SessionOpen => operator::open(&mut request, state_dir, opts),
+            RouteId::SessionLogout => operator::logout(&request, state_dir, opts),
+            RouteId::SessionDeviceCode => operator::device_code(&mut request, state_dir, opts),
+            RouteId::SessionDevicePoll => operator::device_poll(&mut request, state_dir, opts),
+            RouteId::WorkspaceInstall => {
+                apps::workspace(&mut request, state_dir, "app_workspace_install", None)
+            }
+            RouteId::WorkspaceCheck => {
+                apps::workspace(&mut request, state_dir, "app_workspace_install_check", None)
+            }
+            RouteId::WorkspaceUpload => apps::workspace_upload(&mut request, state_dir),
+            RouteId::WorkspaceUploadCheck => apps::workspace_upload_check(&mut request, state_dir),
+            RouteId::WorkspaceMigrate => {
+                apps::workspace(&mut request, state_dir, "app_workspace_migrate", None)
+            }
+            RouteId::CatalogRecover => apps::workspace(
+                &mut request,
+                state_dir,
+                "app_workspace_migration_recover",
+                bound.get("id"),
+            ),
+            RouteId::WorkspaceRecover => apps::workspace(
+                &mut request,
+                state_dir,
+                "app_workspace_recover",
+                bound.get("id"),
+            ),
+            RouteId::WorkspaceUpgrade => apps::workspace(
+                &mut request,
+                state_dir,
+                "app_workspace_upgrade",
+                bound.get("id"),
+            ),
+            RouteId::WorkspaceUpgradeCheck => apps::workspace(
+                &mut request,
+                state_dir,
+                "app_workspace_upgrade_check",
+                bound.get("id"),
+            ),
+            RouteId::WorkspaceUpgradeRecover => apps::workspace(
+                &mut request,
+                state_dir,
+                "app_workspace_upgrade_recover",
+                bound.get("id"),
+            ),
+            RouteId::Conversations => {
+                let relay = operator::public_relay(&request, opts);
+                threads::post_conversation(
+                    &mut request,
+                    state_dir,
+                    crate::master::ALIAS,
+                    bound.get("id"),
+                    relay,
+                )
+            }
+            RouteId::ExplorerUpdateCheck => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::UpdateCheck,
+                bound.get("id"),
+            ),
+            RouteId::ExplorerRemovePreview => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::RemovePreview,
+                bound.get("id"),
+            ),
+            RouteId::ExplorerRemove => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::Remove,
+                bound.get("id"),
+            ),
+            RouteId::ExplorerRestore => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::Restore,
+                bound.get("id"),
+            ),
+            RouteId::Mount => app_screens::mount(
+                &mut request,
+                state_dir,
+                opts,
+                bound.get("id").unwrap_or_default(),
+                bound.get("tag").unwrap_or_default(),
+            ),
+            RouteId::UpdateStart => updates::start(state_dir, opts),
+            RouteId::UpdateCheck => updates::check_now(state_dir),
+            RouteId::SettingsAgents => agent_settings_post(&mut request, state_dir, None),
+            RouteId::SettingsAgentsCatalog => {
+                agent_settings_post(&mut request, state_dir, Some("catalog"))
+            }
+            RouteId::SettingsAgentsSync => {
+                agent_settings_post(&mut request, state_dir, Some("sync"))
+            }
+            RouteId::SettingsAgentsPreview => {
+                agent_settings_post(&mut request, state_dir, Some("preview"))
+            }
+            RouteId::ModelDefaults => model_defaults_post(&mut request, state_dir),
+            RouteId::Locale => super::locale::post(&mut request, state_dir, opts),
+            RouteId::Reports => match caller.as_ref() {
+                Some(caller) => post_report(&mut request, state_dir, pm_dir, caller.actor()),
+                None => err_response(500, "unadmitted write"),
+            },
+            RouteId::AgentRegister => post_agent(&mut request, state_dir),
+            RouteId::CatalogInstall => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::CatalogInstall,
+                None,
+            ),
+            RouteId::CatalogGitCheck => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::CatalogGitCheck,
+                None,
+            ),
+            RouteId::CatalogRequest => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::CatalogRequest,
+                None,
+            ),
+            RouteId::FavoriteSet => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::FavoriteSet,
+                None,
+            ),
+            RouteId::FavoriteDefault => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::FavoriteDefault,
+                None,
+            ),
+            RouteId::FavoriteOpened => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::FavoriteOpened,
+                None,
+            ),
+            RouteId::RequestDismiss => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::RequestDismiss,
+                None,
+            ),
         };
         send(request, resp);
         return;
@@ -803,47 +1314,6 @@ pub(crate) fn write_route(
             return;
         }
     };
-    // CAD-561: the operator's Update button — the same pipeline the CLI
-    // runs, in this process; the card polls `GET /api/update`.
-    if path == "/api/update" || path == "/api/update/check" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let resp = if path == "/api/update" {
-            updates::start(state_dir, opts)
-        } else {
-            updates::check_now(state_dir)
-        };
-        send(request, resp);
-        return;
-    }
-    if path == "/api/settings/model-defaults" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let resp = model_defaults_post(&mut request, state_dir);
-        send(request, resp);
-        return;
-    }
-    // CAD-140: filing a report or idea — the same `report::file` path
-    // `cadence report` uses (scrubbing, context, intake shape, PM
-    // heads-up), never a bare issue create. Admitted above, like every
-    // write; the actor below is the admitted caller, never a field.
-    if path == "/api/reports" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let Some(caller) = &caller else {
-            send(request, err_response(500, "unadmitted write"));
-            return;
-        };
-        let resp = post_report(&mut request, state_dir, pm_dir, caller.actor());
-        send(request, resp);
-        return;
-    }
     // Monitor acknowledgement: this is a daemon-owned durable write, kept
     // beside (and behind the same browser write guards as) tracker writes.
     // The UI never mutates the monitor SQLite store directly, which keeps a
@@ -951,6 +1421,41 @@ pub(crate) fn write_route(
         send(request, resp);
         return;
     }
+    // CAD-1393: company template and draft writes — OperatorOnly in
+    // `WRITE_ROUTES`, admitted above; the handler relays the daemon RPC.
+    if let Some(route) = business_templates::route(path) {
+        // Intake is a POST that stores nothing, admitted as OperatorOnly like
+        // every other template write (WRITE_ROUTES); the daemon reads it only.
+        if *method != Method::Post
+            || !(business_templates::is_write(&route)
+                || matches!(route, business_templates::Route::Intake))
+        {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let Some(caller) = &caller else {
+            send(request, err_response(500, "unadmitted write"));
+            return;
+        };
+        let resp = business_templates::handle_write(&mut request, state_dir, caller, route);
+        send(request, resp);
+        return;
+    }
+    // CAD-1218: the operator's PR-head approval and its revoke — guarded,
+    // operator-only, and only a `Caller::Operator` inside `approvals`.
+    if let Some(route) = approvals::route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let Some(caller) = &caller else {
+            send(request, err_response(500, "unadmitted write"));
+            return;
+        };
+        let resp = approvals::handle(&mut request, state_dir, caller, route);
+        send(request, resp);
+        return;
+    }
     // CAD-431: the operator's merge decision — guarded, operator-only,
     // inside `home`.
     if let Some((id, verb)) = home::delivery_route(path) {
@@ -996,7 +1501,9 @@ pub(crate) fn write_route(
         let context = query("context_id")
             .map(|value| format!("context_id={value}"))
             .unwrap_or_default();
-        let response = app_assistant::handle(&mut request, state_dir, route, &context);
+        let relay = operator::public_relay(&request, opts);
+        let response =
+            app_assistant::handle_with_relay(&mut request, state_dir, route, &context, relay);
         send(request, response);
         return;
     }
@@ -1026,7 +1533,8 @@ pub(crate) fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let response = app_records::handle(&mut request, state_dir, route, true);
+        let relay = operator::public_relay(&request, opts);
+        let response = app_records::handle(&mut request, state_dir, route, true, relay);
         send(request, response);
         return;
     }
@@ -1036,7 +1544,8 @@ pub(crate) fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let response = app_content::handle(&mut request, state_dir, route, true);
+        let relay = operator::public_relay(&request, opts);
+        let response = app_content::handle(&mut request, state_dir, route, true, relay);
         send(request, response);
         return;
     }
@@ -1059,6 +1568,17 @@ pub(crate) fn write_route(
             return;
         }
         let response = crm_smtp::handle(&mut request, state_dir, route);
+        send(request, response);
+        return;
+    }
+    // CAD-1562: every WhatsApp route is operator-proof POST-only, reads
+    // included, exactly like the daemon RPCs it relays.
+    if let Some(route) = whatsapp::route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = whatsapp::handle(&mut request, state_dir, route);
         send(request, response);
         return;
     }
@@ -1092,7 +1612,9 @@ pub(crate) fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let response = app_runs::handle(&mut request, state_dir, route, true);
+        let relay = operator::public_relay(&request, opts);
+        let response =
+            app_runs::handle_with_relay(&mut request, state_dir, route, true, relay, opts);
         send(request, response);
         return;
     }
@@ -1106,124 +1628,80 @@ pub(crate) fn write_route(
         send(request, response);
         return;
     }
-    // CAD-1098: the app panel's conversations — the master's, scoped to
-    // the installation in the path. Same operator-only class and daemon
-    // proof as `/api/threads/master/conversations`.
-    if let Some(install) = path
-        .strip_prefix("/api/app-installations/")
-        .and_then(|tail| tail.strip_suffix("/conversations"))
-        .filter(|id| !id.is_empty() && !id.contains('/'))
-    {
+    // CAD-1177: the standalone tool invoke — OperatorOnly write route,
+    // relays the live session + mount action context to `app_tool_invoke`.
+    if app_screens::tool_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let resp = threads::post_conversation(
-            &mut request,
-            state_dir,
-            crate::master::ALIAS,
-            Some(install),
-        );
-        send(request, resp);
-        return;
-    }
-    // CAD-1129: the apps Explorer's writes — catalog install/git-check,
-    // per-install update-check/remove/restore, and the member verbs
-    // (favorites, request). Classified in `WRITE_ROUTES`; the daemon's
-    // own caller rule is the second, strict layer.
-    if path == "/api/app-catalog/install"
-        || path == "/api/app-catalog/git-check"
-        || path == "/api/app-catalog/request"
-        || path == "/api/app-favorites"
-        || path == "/api/app-favorites/default"
-        || path == "/api/app-favorites/opened"
-        || path == "/api/app-requests/dismiss"
-        || path.starts_with("/api/app-installations/")
-            && (path.ends_with("/update-check")
-                || path.ends_with("/remove-preview")
-                || path.ends_with("/remove")
-                || path.ends_with("/restore"))
-    {
-        let response = app_explorer::write(&mut request, method, path, caller.as_ref(), state_dir);
+        let response = app_screens::tool_invoke(&mut request, state_dir, opts);
         send(request, response);
         return;
     }
-    let catalog_recovery = path
-        .strip_prefix("/api/app-installations/migrations/")
-        .and_then(|tail| tail.strip_suffix("/recover"))
-        .filter(|id| !id.is_empty() && !id.contains('/'));
-    let install_upgrade_recovery = path
-        .strip_prefix("/api/app-installations/")
-        .and_then(|tail| tail.strip_suffix("/upgrade/recover"))
-        .filter(|id| !id.is_empty() && !id.contains('/'));
-    let install_upgrade_check = path
-        .strip_prefix("/api/app-installations/")
-        .and_then(|tail| tail.strip_suffix("/upgrade/check"))
-        .filter(|id| !id.is_empty() && !id.contains('/'));
-    let install_upgrade = path
-        .strip_prefix("/api/app-installations/")
-        .and_then(|tail| tail.strip_suffix("/upgrade"))
-        .filter(|id| !id.is_empty() && !id.contains('/'));
-    let install_recovery = path
-        .strip_prefix("/api/app-installations/")
-        .and_then(|tail| tail.strip_suffix("/recover"))
-        .filter(|id| !id.is_empty() && !id.contains('/'));
-    if path == "/api/app-installations/migrate"
-        || catalog_recovery.is_some()
-        || install_recovery.is_some()
-        || install_upgrade.is_some()
-        || install_upgrade_check.is_some()
-        || install_upgrade_recovery.is_some()
-    {
+    // CAD-1177: the host's mount-teardown revoke — OperatorOnly write
+    // route, relays the live session + the mount's action token.
+    if app_screens::tool_revoke_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let (operation, id) = if let Some(id) = catalog_recovery {
-            ("app_workspace_migration_recover", Some(id))
-        } else if let Some(id) = install_upgrade_recovery {
-            ("app_workspace_upgrade_recover", Some(id))
-        } else if let Some(id) = install_upgrade_check {
-            ("app_workspace_upgrade_check", Some(id))
-        } else if let Some(id) = install_upgrade {
-            ("app_workspace_upgrade", Some(id))
-        } else if let Some(id) = install_recovery {
-            ("app_workspace_recover", Some(id))
-        } else {
-            ("app_workspace_migrate", None)
-        };
-        let response = apps::workspace(&mut request, state_dir, operation, id);
+        let response = app_screens::tool_revoke(&mut request, state_dir, opts);
         send(request, response);
         return;
     }
-    // CAD-1194: the read-only install-check — operator-only in
-    // `WRITE_ROUTES`, relays `app_workspace_install_check`.
-    if path == "/api/app-installations/check" {
+    // CAD-1365: the media catalog read — OperatorOnly write route (the
+    // unlisted fail-closed default), relays the request's proven session
+    // + mount action token to `app_media_read`. Closed body
+    // `{action_token, input}`; a body credential/scope field is 400.
+    if app_media::read_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let response =
-            apps::workspace(&mut request, state_dir, "app_workspace_install_check", None);
+        let response = app_media::media_read(&mut request, state_dir, opts);
         send(request, response);
         return;
     }
-    if path == "/api/app-installations" {
+    if app_media::chat_attach_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let response = apps::workspace(&mut request, state_dir, "app_workspace_install", None);
+        let response = app_media::media_chat_attach(&mut request, state_dir, opts);
         send(request, response);
         return;
     }
-    // CAD-1006: the private screen mount mint — OperatorOnly, `{}` body.
-    if let Some((install_id, tag)) = app_screens::mount_route(path) {
+    // CAD-1365: the media catalog publish — the same unlisted
+    // OperatorOnly write-route fallback, relays the request's proven
+    // session + mount action token to `app_media_publish`. Closed body
+    // `{action_token, asset_id, expected_revision, request_id}`; a body
+    // credential/scope field is 400.
+    if app_media::publish_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let response = app_screens::mount(&mut request, state_dir, opts, install_id, tag);
+        let response = app_media::media_publish(&mut request, state_dir, opts);
+        send(request, response);
+        return;
+    }
+    // CAD-1365: the original download — the same unlisted OperatorOnly
+    // write-route fallback, relays the request's proven session + mount
+    // action token to `app_media_original` and streams the verified
+    // bytes back. Closed body `{action_token, asset_id}`; a body
+    // credential/ref/scope field is 400 before dispatch.
+    if app_media::original_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = app_media::media_original(&mut request, state_dir, opts);
+        send(request, response);
+        return;
+    }
+    if let Some(action) = app_social_drafts::route(path) {
+        let response = app_social_drafts::handle(&mut request, state_dir, opts, action);
         send(request, response);
         return;
     }
@@ -1231,15 +1709,6 @@ pub(crate) fn write_route(
     // staged to a server-derived external temp dir (NOT under pm.dir, which
     // the installer refuses as a source), then installed via the unchanged
     // source-path installer. OperatorOnly in WRITE_ROUTES.
-    if path == "/api/app-installations/upload" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let response = apps::workspace_upload(&mut request, state_dir);
-        send(request, response);
-        return;
-    }
     // An app approval (CAD-557) — relayed to the daemon's
     // `app_approve`, operator-only on the board (see `apps`).
     if let Some((key, name)) = apps::approve_route(path) {
@@ -1321,6 +1790,32 @@ pub(crate) fn write_route(
         send(request, resp);
         return;
     }
+    // CAD-1817: the workspace coordinator's identity write. OperatorOnly in
+    // `WRITE_ROUTES` (admitted above); the handler narrows the body and the
+    // daemon proves the operator connection again.
+    if path == "/api/master/identity" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = home::master_identity(&mut request, state_dir);
+        send(request, resp);
+        return;
+    }
+    // CAD-1168: the chat attachment upload — OperatorOnly in
+    // `WRITE_ROUTES` (admitted above with the multipart carve-out);
+    // the handler streams the part into staging and relays
+    // `chat_file_upload` over the board's operator connection.
+    if path == "/api/chat/upload" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let proof = operator::chat_upload_session_proof(&request, opts);
+        let resp = threads::post_upload(&mut request, state_dir, proof);
+        send(request, resp);
+        return;
+    }
     // The operator's chat message to an agent (CAD-319) — guarded and
     // caller-attributed inside `threads::post_message`.
     if let Some((alias, sub)) = threads::route(path) {
@@ -1329,9 +1824,48 @@ pub(crate) fn write_route(
             return;
         }
         let resp = if sub == Some("conversations") {
-            threads::post_conversation(&mut request, state_dir, alias, None)
+            let relay = operator::public_relay(&request, opts);
+            threads::post_conversation(&mut request, state_dir, alias, None, relay)
         } else {
-            threads::post_message(&mut request, state_dir, alias)
+            match operator::public_relay(&request, opts) {
+                operator::PublicRelay::Missing => {
+                    send(
+                        request,
+                        err_response(401, "board session required for this chat"),
+                    );
+                    return;
+                }
+                relay => {
+                    let proof = operator::chat_upload_session_proof(&request, opts);
+                    threads::post_message(&mut request, state_dir, alias, proof, relay)
+                }
+            }
+        };
+        send(request, resp);
+        return;
+    }
+    // CAD-810 / CAD-821: the topic writes — operator-only (the admit gate
+    // above classifies each as `OperatorOnly`), relayed to the daemon's
+    // topic verbs, which re-prove the connection.
+    if path == "/api/topics" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = super::topics::create(state_dir, &mut request);
+        send(request, resp);
+        return;
+    }
+    if let Some((id, sub)) = super::topics::route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = match sub {
+            Some("subscribers") => super::topics::membership(state_dir, id, &mut request),
+            Some("posts") => super::topics::publish(state_dir, id, &mut request),
+            Some("requests") => super::topics::request(state_dir, id, &mut request),
+            _ => err_response(404, "no such topic write route"),
         };
         send(request, resp);
         return;
@@ -1390,14 +1924,15 @@ pub(crate) fn write_route(
             send(request, err_response(500, "unadmitted write"));
             return;
         };
+        let relay = operator::public_relay(&request, opts);
         let resp = wiki::write(
             &mut request,
             method,
             tail,
             &caller,
             query,
-            state_dir,
-            pm_dir,
+            (state_dir, pm_dir),
+            relay,
         );
         send(request, resp);
         return;
@@ -1440,6 +1975,9 @@ pub(crate) fn write_route(
         return;
     };
     let actor = caller.actor().to_string();
+    // AOS-274: the policy key, built from the variant — `actor()` above is
+    // display text for attribution.
+    let spelling = operator::caller_spelling(&caller);
     let pm = match Pm::at(pm_dir) {
         Ok(pm) => pm,
         Err(e) => {
@@ -1476,6 +2014,30 @@ pub(crate) fn write_route(
             );
             return;
         }
+        let Ok(project) = model::check_key(&req.project) else {
+            send(request, err_response(400, "bad project key"));
+            return;
+        };
+        // AOS-274: a caller may only file work into a project it can use;
+        // a restricted project answers exactly like an absent one.
+        if super::project_policy::refused(&pm, &project, &spelling) {
+            send(request, err_response(404, "unknown project"));
+            return;
+        }
+        let pm = match activity_pm(
+            pm,
+            &request,
+            opts,
+            state_dir,
+            "issue_created",
+            &format!("project:{project}"),
+        ) {
+            Ok(pm) => pm,
+            Err(resp) => {
+                send(request, resp);
+                return;
+            }
+        };
         match issue_write::new_issue(
             &pm,
             &pm.dir,
@@ -1505,6 +2067,15 @@ pub(crate) fn write_route(
         send(request, err_response(400, "bad issue id"));
         return;
     };
+    // AOS-274: every write against an existing issue must pass the same
+    // project decision, and a restricted project answers like an absent
+    // issue. An unknown id keeps each verb's own not-found answer.
+    if let Ok(issue) = crate::issue::board::find_issue(&pm.dir, &id) {
+        if super::project_policy::refused(&pm, &issue.project, &spelling) {
+            send(request, err_response(404, "unknown issue"));
+            return;
+        }
+    }
     if sub == Some("artifacts") {
         // POST /api/issues/:id/artifacts?name=<basename> — raw bytes.
         let name = query("name").unwrap_or_default();
@@ -1526,6 +2097,20 @@ pub(crate) fn write_route(
                 return;
             }
         };
+        let pm = match activity_pm(
+            pm,
+            &request,
+            opts,
+            state_dir,
+            "issue_artifact_added",
+            &format!("issue:{id}"),
+        ) {
+            Ok(pm) => pm,
+            Err(resp) => {
+                send(request, resp);
+                return;
+            }
+        };
         match issue_write::attach_bytes(&pm, &id, &name, &bytes, false, &actor) {
             Ok(out) => send(request, write_reply(&pm, state_dir, &id, out, false)),
             Err(e) => send(request, write_err(&e)),
@@ -1540,40 +2125,69 @@ pub(crate) fn write_route(
             return;
         }
     };
-    let out = match (sub, method) {
+    let resource = format!("issue:{id}");
+    // Each arm parses and validates its body first, then prepares the
+    // activity receipt, then writes. The prepared PM feeds the reply too.
+    let (pm, out) = match (sub, method) {
         (None, &Method::Patch) => match parse_json::<PatchReq>(&bytes) {
-            Ok(req) => issue_write::patch_issue(
-                &pm,
-                &id,
-                &issue_write::IssuePatch {
-                    status: req.status,
-                    priority: req.priority,
-                    owner: req.owner,
-                    component: req.component,
-                    title: req.title,
-                    body: req.body,
-                    tags: req.tags,
-                },
-                req.if_rev.as_deref(),
-                &actor,
-                Some(state_dir),
-            ),
+            Ok(req) => match activity_pm(pm, &request, opts, state_dir, "issue_updated", &resource)
+            {
+                Ok(pm) => {
+                    let out = issue_write::patch_issue(
+                        &pm,
+                        &id,
+                        &issue_write::IssuePatch {
+                            status: req.status,
+                            priority: req.priority,
+                            owner: req.owner,
+                            component: req.component,
+                            title: req.title,
+                            body: req.body,
+                            tags: req.tags,
+                        },
+                        req.if_rev.as_deref(),
+                        &actor,
+                        Some(state_dir),
+                    );
+                    (pm, out)
+                }
+                Err(resp) => {
+                    send(request, resp);
+                    return;
+                }
+            },
             Err(resp) => {
                 send(request, resp);
                 return;
             }
         },
         (Some("links"), m) => match parse_json::<LinkReq>(&bytes) {
-            Ok(req) => issue_write::link(
-                &pm,
-                &id,
-                &req.kind,
-                &req.target,
-                m == &Method::Delete,
-                req.if_rev.as_deref(),
-                &actor,
-                Some(state_dir),
-            ),
+            Ok(req) => match activity_pm(
+                pm,
+                &request,
+                opts,
+                state_dir,
+                "issue_link_changed",
+                &resource,
+            ) {
+                Ok(pm) => {
+                    let out = issue_write::link(
+                        &pm,
+                        &id,
+                        &req.kind,
+                        &req.target,
+                        m == &Method::Delete,
+                        req.if_rev.as_deref(),
+                        &actor,
+                        Some(state_dir),
+                    );
+                    (pm, out)
+                }
+                Err(resp) => {
+                    send(request, resp);
+                    return;
+                }
+            },
             Err(resp) => {
                 send(request, resp);
                 return;
@@ -1591,17 +2205,26 @@ pub(crate) fn write_route(
                         return;
                     }
                 };
-                issue_write::add_ref(
-                    &pm,
-                    &id,
-                    &req.kind,
-                    &target,
-                    req.label.as_deref(),
-                    None,
-                    None,
-                    req.if_rev.as_deref(),
-                    &actor,
-                )
+                match activity_pm(pm, &request, opts, state_dir, "issue_ref_added", &resource) {
+                    Ok(pm) => {
+                        let out = issue_write::add_ref(
+                            &pm,
+                            &id,
+                            &req.kind,
+                            &target,
+                            req.label.as_deref(),
+                            None,
+                            None,
+                            req.if_rev.as_deref(),
+                            &actor,
+                        );
+                        (pm, out)
+                    }
+                    Err(resp) => {
+                        send(request, resp);
+                        return;
+                    }
+                }
             }
             Err(resp) => {
                 send(request, resp);
@@ -1609,15 +2232,31 @@ pub(crate) fn write_route(
             }
         },
         (Some("comments"), _) => match parse_json::<CommentReq>(&bytes) {
-            Ok(req) => issue_write::add_comment(
-                &pm,
-                &id,
-                &req.body,
-                Some(caller.author()),
-                Some("ui"),
-                req.if_rev.as_deref(),
-                &actor,
-            ),
+            Ok(req) => match activity_pm(
+                pm,
+                &request,
+                opts,
+                state_dir,
+                "issue_comment_added",
+                &resource,
+            ) {
+                Ok(pm) => {
+                    let out = issue_write::add_comment(
+                        &pm,
+                        &id,
+                        &req.body,
+                        Some(caller.author()),
+                        Some("ui"),
+                        req.if_rev.as_deref(),
+                        &actor,
+                    );
+                    (pm, out)
+                }
+                Err(resp) => {
+                    send(request, resp);
+                    return;
+                }
+            },
             Err(resp) => {
                 send(request, resp);
                 return;
@@ -1715,14 +2354,16 @@ pub(crate) fn send(request: Request, mut resp: HttpResp, head_only: bool) {
     }
 }
 
-/// Merge the `by_issue` runtime strip into a card/detail payload —
-/// cards get `agents: [{alias, task, task_state, state, message,
-/// resume}]` only when a job actually binds agents to the issue.
-pub(crate) fn with_agents(mut payload: Value, by_issue: &Value, id: &str) -> Value {
-    if let Some(agents) = by_issue.get(id) {
-        payload["agents"] = agents.clone();
-    }
-    payload
+/// Merge the `by_issue` runtime strip into an issue detail — it gets
+/// `agents: [{alias, task, task_state, state, message, resume}]` only when
+/// a job actually binds agents to the issue.
+pub(crate) fn with_agents(
+    mut payload: IssueDetail,
+    by_issue: &BTreeMap<String, Vec<CardAgent>>,
+    id: &str,
+) -> Value {
+    payload.agents = by_issue.get(id).cloned();
+    serde_json::to_value(payload).expect("issue detail serializes")
 }
 
 #[cfg(test)]
@@ -1747,8 +2388,76 @@ mod busy_tests {
     }
 
     #[test]
+    fn every_settings_subpath_relays_its_own_method() {
+        assert_eq!(agent_settings_rpc(None), "agent_settings_set");
+        assert_eq!(
+            agent_settings_rpc(Some("catalog")),
+            "agent_settings_catalog"
+        );
+        assert_eq!(agent_settings_rpc(Some("sync")), "agent_settings_sync");
+        assert_eq!(
+            agent_settings_rpc(Some("preview")),
+            "agent_settings_preview"
+        );
+    }
+
+    #[test]
     fn other_errors_are_not_busy() {
         assert!(busy_response(&Error::Rejected("no".into())).is_none());
         assert!(busy_response(&Error::gate_coded("x", "standing")).is_none());
+    }
+}
+
+#[cfg(test)]
+mod agent_setup_tests {
+    use super::*;
+
+    fn req(location: &str, provider: Option<&str>, endpoint: Option<&str>) -> AgentRegisterReq {
+        AgentRegisterReq {
+            alias: "scout".into(),
+            location: Some(location.into()),
+            provider: provider.map(Into::into),
+            endpoint_kind: endpoint.map(Into::into),
+            role: None,
+            team_role: None,
+            model_policy: None,
+            cwd: None,
+            sandbox: None,
+            instructions: None,
+            params: None,
+            catalogue: None,
+            look: None,
+        }
+    }
+
+    #[test]
+    fn cloud_pins_provider_and_endpoint_to_sandbox() {
+        let pair = resolve_location(&req("cloud", None, None)).unwrap();
+        assert_eq!(pair, ("sandbox".to_string(), "sandbox".to_string()));
+    }
+
+    #[test]
+    fn cloud_refuses_a_caller_chosen_provider_or_endpoint() {
+        assert!(resolve_location(&req("cloud", Some("claude"), None)).is_err());
+        assert!(resolve_location(&req("cloud", None, Some("local"))).is_err());
+    }
+
+    #[test]
+    fn local_needs_an_explicit_pair() {
+        let pair = resolve_location(&req("local", Some("claude"), Some("pty"))).unwrap();
+        assert_eq!(pair, ("claude".to_string(), "pty".to_string()));
+        assert!(resolve_location(&req("local", Some("claude"), None)).is_err());
+        assert!(resolve_location(&req("local", None, Some("pty"))).is_err());
+    }
+
+    #[test]
+    fn local_refuses_sandbox_so_cloud_stays_the_only_sandbox_path() {
+        assert!(resolve_location(&req("local", Some("sandbox"), Some("pty"))).is_err());
+        assert!(resolve_location(&req("local", Some("claude"), Some("sandbox"))).is_err());
+    }
+
+    #[test]
+    fn unknown_location_is_refused() {
+        assert!(resolve_location(&req("remote", Some("claude"), Some("pty"))).is_err());
     }
 }

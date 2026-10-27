@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Success",
+  "description": "Success response.",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "const": true
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "app.manifest.preflight"
+        },
+        "value": {
+          "$ref": "#/$defs/ManifestPreflightValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "issue.validate"
+        },
+        "value": {
+          "$ref": "#/$defs/ValidateValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "issue.readiness"
+        },
+        "value": {
+          "$ref": "#/$defs/ReadinessValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
+    }
+  ],
+  "required": [
+    "ok"
+  ],
+  "$defs": {
+    "FieldRefusal": {
+      "description": "One refused field.",
+      "type": "object",
+      "properties": {
+        "field": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "field",
+        "message"
+      ]
+    },
+    "ManifestPreflightValue": {
+      "description": "Success value of `app.manifest.preflight`.",
+      "type": "object"
+    },
+    "ReadinessValue": {
+      "description": "Success value of `issue.readiness`.",
+      "type": "object",
+      "properties": {
+        "blocked": {
+          "type": "boolean"
+        },
+        "ready": {
+          "type": "boolean"
+        },
+        "refusal": {
+          "description": "Why `status=ready` would be refused; present only then.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "ready",
+        "blocked"
+      ]
+    },
+    "ValidateValue": {
+      "description": "Success value of `issue.validate`.",
+      "type": "object",
+      "properties": {
+        "refusals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FieldRefusal"
+          }
+        },
+        "tags": {
+          "description": "Sorted, de-duplicated tags; present when `tags` was given and valid.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "valid": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "valid",
+        "refusals"
+      ]
+    }
+  }
+}

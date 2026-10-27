@@ -16,6 +16,10 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
         "Me",
         &[
             ("self", "Your alias, running message and report token"),
+            (
+                "my-work",
+                "Issues assigned to your signed-in hosted identity",
+            ),
             ("done", "Report your running turn's result"),
             ("inbox", "Read an inbox agent's durable queue"),
         ],
@@ -48,7 +52,7 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
         &[
             (
                 "update",
-                "Ship a build to production: one command (--to <sha> pins)",
+                "Update this installation (client or native host); --to <sha> pins",
             ),
             (
                 "dev",
@@ -79,6 +83,7 @@ const OPERATOR: &[&str] = &[
     "backup",
     "restore",
     "export",
+    "inspect-portable",
     "ui",
     "master",
     "connection",
@@ -89,18 +94,24 @@ const OPERATOR: &[&str] = &[
     "session",
     "staging",
     "org",
+    "team",
+    "settings",
 ];
 
 /// Visible verbs that are neither core nor operator.
 const ADVANCED: &[&str] = &[
     "agent-uid",
     "attach",
+    "artifact",
+    "attachment",
     "auth",
     "claude",
     "codex",
+    "commands",
     "cursor",
     "delivery",
     "devin",
+    "document",
     "events",
     "idea",
     "intake",
@@ -112,14 +123,19 @@ const ADVANCED: &[&str] = &[
     "monitor",
     "overview",
     "project",
+    "register",
     "remote",
     "report",
     "resume",
+    "schema",
     "setup",
     "skill",
     "stop",
+    "template",
     "test",
     "thread",
+    "topic",
+    "web",
     "workflow",
 ];
 
@@ -129,6 +145,7 @@ const ADVANCED: &[&str] = &[
 #[cfg(test)]
 const INTERNAL: &[&str] = &[
     "confine",
+    "local-agent",
     "mcp-agent",
     "mcp-permission",
     "rollout",
@@ -141,6 +158,20 @@ const MORE_IN_PANE: &str = "More: cadence help all";
 
 fn is_core(name: &str) -> bool {
     CORE.iter().any(|(_, v)| v.iter().any(|(n, _)| *n == name))
+}
+
+/// The core root verb's existing one-line summary, when `name` is core.
+pub(super) fn core_blurb(name: &str) -> Option<&'static str> {
+    CORE.iter()
+        .flat_map(|(_, verbs)| verbs.iter())
+        .find(|(n, _)| *n == name)
+        .map(|(_, blurb)| *blurb)
+}
+
+/// Core root command names in help order.
+pub(super) fn core_names() -> impl Iterator<Item = &'static str> {
+    CORE.iter()
+        .flat_map(|(_, verbs)| verbs.iter().map(|(n, _)| *n))
 }
 
 /// True inside a cadence-owned pane. Presentation only.
@@ -158,6 +189,8 @@ pub(super) fn root_help_text() -> String {
         }
         out.push('\n');
     }
+    out.push_str("Find a command: cadence commands <query>\n");
+    out.push_str("Inspect one path: cadence schema <command-path>\n");
     out.push_str("Details for one verb: cadence help <verb>");
     out
 }
@@ -259,6 +292,177 @@ pub(super) fn all_help_text() -> String {
     }
     out.push_str("\nDetails for one verb: cadence help <verb> [<subcommand>]\n");
     out
+}
+
+/// CAD-1432: the master's `cadence help`. The Pi guard already admits
+/// only a literal admitted command path; this renders it — the profile's
+/// admitted paths only, never the whole clap tree — so a Claude master
+/// (no JS guard) and every operator tool sees the same bounded text.
+/// `None` for every caller but the master's own argv, so operator help is
+/// untouched. A malformed or disallowed master help form is a usage error
+/// (nonzero), never help text: refusal text must not exit 0.
+pub(super) fn master_help(args: &[String]) -> Option<cadence_agent::error::Result<String>> {
+    use cadence_agent::error::Error;
+    if !cadence_agent::master::caller_is_master() {
+        return None;
+    }
+    let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    let help_verb = rest.first() == Some(&"help");
+    // Same probe as the Pi guard: `--help`, or a single-dash cluster with
+    // an `h` before any standalone `--` (everything after `--` is payload).
+    let probe = help_probe(&rest);
+    if !help_verb && !probe {
+        return None;
+    }
+    // A scoped turn has no help route at all (CAD-1432).
+    if cadence_agent::master::in_app_conversation() {
+        return Some(Err(Error::rejected(
+            "help and --help are not available in a scoped chat turn — report the exact refusal and stop",
+        )));
+    }
+    if !help_verb {
+        // Every master --help/-h probe refuses, the root one included:
+        // the exact ticket contract admits only `help` and `help <path>`.
+        return Some(Err(Error::usage(
+            "--help and -h are not available — run cadence help <command-path> for the exact usage of a command you may run",
+        )));
+    }
+    let paths = cadence_agent::master::help_paths(cadence_agent::master::Profile::Home);
+    let target = &rest[1..];
+    if target.is_empty() {
+        return Some(Ok(master_listing()));
+    }
+    let path = target.join(" ");
+    if !target.iter().all(|t| is_token(t)) || !paths.iter().any(|p| p == &path) {
+        return Some(Err(Error::usage(format!(
+            "`{path}` is not a command path you may run — use cadence help, or cadence help <command-path> for one of: {}; flags, argument values and --help are refused",
+            paths.join(", ")
+        ))));
+    }
+    // Parent (other admitted paths sit under it): list only those.
+    let children: Vec<&String> = paths
+        .iter()
+        .filter(|p| p.starts_with(&format!("{path} ")))
+        .collect();
+    if !children.is_empty() {
+        let mut out = format!("`{path}` paths you may run:\n");
+        for c in &children {
+            out.push_str(&format!("  cadence {c}\n"));
+        }
+        return Some(Ok(out));
+    }
+    // Leaf: clap's usage for the command, built from the top tree so it
+    // keeps the full `cadence <path>` prefix. The global options and
+    // -h/--help are hidden: the guard admits none of them.
+    let mut cmd = Cli::command();
+    cmd.build();
+    let mut node = &cmd;
+    for tok in target {
+        match node.find_subcommand(tok) {
+            Some(sub) => node = sub,
+            None => {
+                return Some(Err(Error::usage(format!(
+                    "`{path}` is not a command path you may run"
+                ))));
+            }
+        }
+    }
+    let mut leaf = node.clone().mut_args(|a| {
+        let hide = matches!(
+            a.get_id().as_str(),
+            "help" | "state_dir" | "org" | "wake_timeout"
+        );
+        a.hide(hide)
+    });
+    let mut out = leaf.render_help().to_string().trim_end().to_string();
+    out.push('\n');
+    if let Some(limits) = master_leaf_limits(&path) {
+        out.push_str(&format!("\nLimits for you: {limits}\n"));
+    }
+    Some(Ok(out))
+}
+
+/// The master's bounded command listing: exactly the Home profile's
+/// admitted commands, never the whole clap tree.
+fn master_listing() -> String {
+    let mut out = String::from("Commands you may run (exact forms; anything else is refused):\n");
+    for stem in cadence_agent::master::allowed_tools(cadence_agent::master::Profile::Home) {
+        let Some(inner) = stem
+            .strip_prefix("Bash(cadence ")
+            .and_then(|t| t.strip_suffix(')'))
+        else {
+            continue;
+        };
+        let (head, args_ok) = match inner.strip_suffix(" *") {
+            Some(h) => (h, true),
+            None => (inner, false),
+        };
+        if head == "help" {
+            continue;
+        }
+        out.push_str(&format!(
+            "  cadence {head}{}\n",
+            if args_ok { " …" } else { "" }
+        ));
+    }
+    out.push_str("\nUsage of one path: cadence help <command-path>\n");
+    out
+}
+
+/// CAD-1432: a help probe is `--help`, or a single-dash option cluster
+/// whose leading letters include `h` (`-h`, `-hh`, `-vh`, `-h=x`, `-h1`),
+/// before any standalone `--`. Everything after `--` is payload.
+fn help_probe(rest: &[&str]) -> bool {
+    for t in rest {
+        if *t == "--" {
+            return false;
+        }
+        if *t == "--help" {
+            return true;
+        }
+        if let Some(cluster) = t.strip_prefix('-') {
+            if cluster.starts_with("-") {
+                continue;
+            }
+            let letters: String = cluster
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .collect();
+            if !letters.is_empty() && letters.contains('h') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_token(t: &str) -> bool {
+    !t.is_empty()
+        && t.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// The guard rules a leaf's usage line cannot show — stated so a fresh
+/// master reads the bounds it actually runs under, not clap's full flag
+/// grammar.
+fn master_leaf_limits(path: &str) -> Option<&'static str> {
+    Some(match path {
+        "issue new" => {
+            "backlog tickets only: never --owner or --id; --status only as `--status backlog`; \
+             --file names a file under master/tmp"
+        }
+        "wiki put" => {
+            "path must be under agents/master/knowledge/; body via --file <file under master/tmp>; \
+             -m/--text refused"
+        }
+        "project new" => {
+            "--goal and each --agent require --repo and take one plain token (letters, digits and . _ / = : -; no spaces, quotes or commas); repeat --agent for each agent"
+        }
+        "plan propose" | "report file" | "master escalate" => {
+            "--file names a file under master/tmp (stage it with the write tool first)"
+        }
+        _ => return None,
+    })
 }
 
 /// `cadence help operator|advanced|all` as typed (with an optional
@@ -433,7 +637,9 @@ mod tests {
     #[test]
     fn deliberately_hidden_commands_appear_in_no_help_view() {
         let hidden = originally_hidden();
-        assert_eq!(hidden.len(), 8, "{hidden:?}");
+        // `skill sync` is the hidden implementation `cadence update` calls.
+        // `cadence skill install` stays the visible manual repair.
+        assert_eq!(hidden.len(), 13, "{hidden:?}");
         for view in [
             render_root(false),
             render_root(true),

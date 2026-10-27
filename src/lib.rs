@@ -9,15 +9,28 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod adapter;
+pub mod agent_roles;
+pub mod agent_settings;
 pub mod agent_uid;
 pub mod app_assistant;
+pub mod app_preview_export;
+pub mod assistant_actor;
 pub mod audit;
 pub mod backup;
 pub mod board_identity;
+pub mod board_membership;
+pub mod briefing;
+pub mod business_export;
+pub mod business_templates;
 pub mod cli_actor;
 pub mod client;
 pub mod confine;
+pub mod context_pack;
 pub mod continuity;
+pub mod hosted_app_cli;
+pub mod notify_bridge;
+pub mod notify_host;
+pub mod web_push;
 // Test support for the shared ADR 0006 fixture — a deterministic
 // platform double, not a live adapter. Hidden from the public API docs.
 #[doc(hidden)]
@@ -31,14 +44,21 @@ pub mod devin_catalog;
 pub mod doctor;
 pub mod error;
 pub mod filter;
+pub mod gh_guard;
 pub mod home;
+mod ident;
 pub mod inbox;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod installer_bundle;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use installer_bundle::constructor::{helper_image_trust, HelperImageTrust};
 pub mod issue;
+#[cfg(test)]
+mod issuer_tls_fixture;
+pub(crate) mod issuer_transport;
 pub mod lease;
+pub mod local_assignment;
+pub(crate) mod managed_section;
 pub mod master;
 pub mod master_perm;
 pub mod mcp;
@@ -53,13 +73,14 @@ pub mod peer;
 pub mod pi_policy;
 pub mod platform;
 pub mod proc;
-#[allow(dead_code)] // Shared helper grammar; production prerequisites remain unavailable.
 pub(crate) mod protected_pi_profile;
 pub mod proto;
 pub mod reaper;
+pub mod releases;
 pub mod remote_auth;
 pub mod remote_cli;
 pub mod remote_enrollment;
+pub mod remote_migration;
 pub mod remote_result_outbox;
 pub mod review;
 pub mod rollout;
@@ -72,13 +93,27 @@ pub mod skill;
 pub mod slots;
 pub mod store;
 pub mod tailnet_proof;
+#[cfg(test)]
+pub(crate) mod test_ports;
 pub mod test_queue;
 pub mod test_seam;
 pub mod ui;
 pub mod update;
 pub mod upgrade;
+pub mod web_publish;
+pub mod web_sites;
 pub mod wiki;
 pub mod worktree;
+
+// CAD-1429: test-only harness that compiles the production `cli/web.rs`
+// into this library's unit tests (so the loopback test pin applies). Absent
+// from every non-test build.
+#[cfg(test)]
+extern crate self as cadence_agent;
+#[cfg(test)]
+mod test_web_issuer_tls;
+#[cfg(test)]
+mod web_cli_test_harness;
 
 pub use error::{Error, Result};
 

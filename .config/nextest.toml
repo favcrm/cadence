@@ -1,10 +1,66 @@
 # CAD-1073: reduced profile from the clean-slate transition (ended by CAD-1102).
 # Overrides and test-groups for deleted binaries are removed; they would
 # fail nextest config validation ("no binary IDs matched").
+#
+# GHSA-vc25-qg58-w57c: refuse 0.9.125–0.9.149, which recorded raw Cargo
+# args in portable reruns. scripts/cadence-nextest pins the same floor.
+nextest-version = "0.9.150"
+
 [profile.cadence]
 retries = 0
 fail-fast = false
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+# This fixture probes for a free port before starting its board; reserve the
+# whole worker pool so concurrent fixtures cannot claim that port in between.
+[[profile.cadence.overrides]]
+filter = 'test(/^cad1331_locale_member_refusal::/)'
+threads-required = 'num-test-threads'
+
+# CAD-1480: cad1374's explorer fixture has the same probe-then-bind port
+# race — it flaked once on a `-j 4` shard (AddrInUse). Reserving the pool
+# closes the window without lowering shard parallelism for the rest of
+# the suite.
+[[profile.cadence.overrides]]
+filter = 'test(/^cad1374_explorer_attribution_acceptance::/)'
+threads-required = 'num-test-threads'
+
+# CAD-1489: every test module whose fixture probes a port (bind, drop) or
+# flock-leases one before handing it to a server gets the same reservation
+# — the drop→bind window races with any concurrent fixture in the pool.
+# Racy modules (sweep on this ticket): probe-then-bind fixtures.
+[[profile.cadence.overrides]]
+filter = '''test(/^cad1041_send_now::/) or test(/^cad1123_hp4_acceptance::/) or test(/^cad1193_operator_metadata::/) or test(/^cad1206_board_identity_refusal::/) or test(/^cad1207_board_start_acceptance::/) or test(/^cad1251_acceptance::/) or test(/^cad1251_board_start_budget::/) or test(/^cad1290_acceptance::/) or test(/^cad1291_acceptance::/) or test(/^cad1328_acceptance::/) or test(/^cad1374_chat_identity_acceptance::/) or test(/^cad1374_issue_wiki_activity_acceptance::/) or test(/^cad1401_wiki_boundary_acceptance::/) or test(/^cad1456_bounded_read_refusal_acceptance::/) or test(/^cad1467_wiki_blob_read_guard_acceptance::/) or test(/^cad913_wiki_envelope_upload::/) or test(/^ui_pidfile::/)'''
+threads-required = 'num-test-threads'
+
+# cad832/cad864 partially mitigate with /tmp/cadence-test-ports flock
+# leases, but non-participating fixtures can still steal the probed port —
+# same reservation.
+[[profile.cadence.overrides]]
+filter = 'test(/^cad832_sharing_refusal::/) or test(/^cad864_app_views::/)'
+threads-required = 'num-test-threads'
+
+# cad811 lib fixtures with the reservation-drop→serve race, matched by test
+# name so the rest of the lib stays parallel. (remote_cli_native_chain's
+# probe fixture is #[ignore]d — it never runs under nextest, no override.)
+[[profile.cadence.overrides]]
+filter = 'test(/cad811_missing_freeze/) or test(/cad811_public_owner_attribution/)'
+threads-required = 'num-test-threads'
+
+# CAD-1727: collapsing the integration targets changes nextest's hash
+# partition, so lib tests share a shard with different neighbours. This
+# fixture's probe-then-bind board raced on shard 2 ("fixture BLOCKED: board
+# could not bind"); reserve the worker pool like the CAD-1489 fixtures.
+[[profile.cadence.overrides]]
+filter = 'test(/cad1590_templates_and_broadcasts/)'
+threads-required = 'num-test-threads'
+
+# CAD-347: this HTTP acceptance reuses a probe-then-bind board fixture.
+# Reserve the worker pool like the existing CAD-1489 fixtures so it cannot
+# take the safety floor's port between that test's probe and actual bind.
+[[profile.cadence.overrides]]
+filter = 'test(/^wiki_board_http_guard_acceptance::cad347_/)'
+threads-required = 'num-test-threads'
 
 [profile.cadence.junit]
 path = "junit.xml"

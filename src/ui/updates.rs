@@ -395,6 +395,9 @@ impl UpdateHost for BoardHost {
     fn board_running(&self) -> bool {
         crate::ui::detached_pid(&self.state_dir).is_some()
     }
+    fn start_board(&self, _binary: &Path) -> Result<()> {
+        Err(Self::not_the_pipeline())
+    }
     fn now(&self) -> f64 {
         crate::rollout::unix_now()
     }

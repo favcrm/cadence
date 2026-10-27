@@ -1,7 +1,9 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { Route } from "../../lib/router";
 import { sessionStore } from "../../lib/draft";
+import { privateSessionGeneration } from "../../lib/privateSession";
 import { navigate } from "../../lib/useLocation";
+import { useTranslate } from "../../lib/locale";
 import Md from "../../ui/Md";
 import { IconWarning } from "../../ui/icons";
 import { wiki } from "./api";
@@ -56,6 +58,7 @@ export default function EditorPane({
   const sourceId = useId();
   const previewId = useId();
   const previewLabelId = useId();
+  const t = useTranslate();
   const [editorView, setEditorView] = useState<"write" | "preview">("write");
   const [text, setText] = useState("");
   const [baseRev, setBaseRev] = useState("");
@@ -76,6 +79,7 @@ export default function EditorPane({
   const browseHref = navHref({ screen: "wiki", mode: "browse", path, query: null });
 
   useEffect(() => {
+    const generation = privateSessionGeneration();
     activeRef.current = true;
     let cancelled = false;
     setStatus("loading");
@@ -111,7 +115,7 @@ export default function EditorPane({
       activeRef.current = false;
       cancelled = true;
       window.clearTimeout(stashTimer.current);
-      if (storage && pendingDraft.current) stashDraft(storage, pendingDraft.current);
+      if (generation === privateSessionGeneration() && storage && pendingDraft.current) stashDraft(storage, pendingDraft.current);
       pendingDraft.current = null;
     };
   }, [path]);
@@ -121,10 +125,11 @@ export default function EditorPane({
     setText(value);
     setDirty(true);
     const storage = sessionStore();
+    const generation = privateSessionGeneration();
     window.clearTimeout(stashTimer.current);
     pendingDraft.current = { path, text: value, baseRev: baseRevRef.current, at: Date.now() };
     stashTimer.current = window.setTimeout(() => {
-      if (storage && pendingDraft.current) stashDraft(storage, pendingDraft.current);
+      if (generation === privateSessionGeneration() && storage && pendingDraft.current) stashDraft(storage, pendingDraft.current);
       pendingDraft.current = null;
     }, 400);
   };
@@ -140,9 +145,11 @@ export default function EditorPane({
     window.clearTimeout(stashTimer.current);
     pendingDraft.current = null;
     const storage = sessionStore();
+    const generation = privateSessionGeneration();
     if (storage) stashDraft(storage, { path, text, baseRev: baseRevRef.current, at: Date.now() });
     try {
       const page = await wiki.save(path, text, baseRevRef.current);
+      if (generation !== privateSessionGeneration()) return;
       // A newer editor may have written another draft while this request ran.
       if (storage && readDraft(storage, path)?.text === text) dropDraft(storage, path);
       if (!activeRef.current) return;
@@ -153,6 +160,7 @@ export default function EditorPane({
       onSaved();
       navigate(browseHref);
     } catch (e) {
+      if (generation !== privateSessionGeneration()) return;
       if (!activeRef.current) return;
       const refused = conflictFrom(e);
       if (refused) {
@@ -173,8 +181,10 @@ export default function EditorPane({
   };
 
   const reload = async () => {
+    const generation = privateSessionGeneration();
     try {
       const fresh = await wiki.file(path);
+      if (generation !== privateSessionGeneration()) return;
       window.clearTimeout(stashTimer.current);
       pendingDraft.current = null;
       const storage = sessionStore();
@@ -210,17 +220,17 @@ export default function EditorPane({
 
   return (
     <>
-      <WikiToolbar path={path} navHref={navHref} label="Editing" actions={<>
-          <span className="wk-save-state" role="status">{saving ? "Saving…" : readOnly ? "Read-only" : dirty ? "Unsaved changes" : "No changes"}</span>
-          <Button href={browseHref} disabled={saving}>Back to page</Button>
+      <WikiToolbar path={path} navHref={navHref} label={t("Editing")} actions={<>
+          <span className="wk-save-state" role="status">{saving ? t("Saving…") : readOnly ? t("Read-only") : dirty ? t("Unsaved changes") : t("No changes")}</span>
+          <Button href={browseHref} disabled={saving}>{t("Back to page")}</Button>
           <Button
             variant="primary"
             onClick={() => void save()}
             loading={saving}
             disabled={readOnly || !dirty}
-            title={readOnly ? "Sign in with editing access to edit" : undefined}
+            title={readOnly ? t("Sign in with editing access to edit") : undefined}
           >
-            Save
+            {t("Save")}
           </Button>
       </>} />
 
@@ -228,44 +238,44 @@ export default function EditorPane({
         <div className="wk-conflict" role="alert">
           <IconWarning size={13} />
           <span className="min-w-0">{conflictText(conflict)}</span>
-          <Button size="sm" onClick={() => setShowDiff((s) => !s)}>{showDiff ? "Hide comparison" : "Compare changes"}</Button>
-          <Button size="sm" onClick={() => void reload()}>Discard draft and reload</Button>
+          <Button size="sm" onClick={() => setShowDiff((s) => !s)}>{showDiff ? t("Hide comparison") : t("Compare changes")}</Button>
+          <Button size="sm" onClick={() => void reload()}>{t("Discard draft and reload")}</Button>
         </div>
       )}
 
       {showDiff && serverText != null && (
         <div className="wk-diffwrap">
           <div className="slabel wk-difflabel">
-            your draft vs the server · +{counts.added} −{counts.removed}
+            {t("your draft vs the server")} · +{counts.added} −{counts.removed}
           </div>
           <DiffLines lines={diff} />
         </div>
       )}
 
-      <div className="wk-editor-views" role="group" aria-label="Editor view">
-        <button type="button" aria-pressed={editorView === "write"} aria-controls={sourceId} onClick={() => setEditorView("write")}>Write</button>
-        <button type="button" aria-pressed={editorView === "preview"} aria-controls={previewId} onClick={() => setEditorView("preview")}>Preview</button>
+      <div className="wk-editor-views" role="group" aria-label={t("Editor view")}>
+        <button type="button" aria-pressed={editorView === "write"} aria-controls={sourceId} onClick={() => setEditorView("write")}>{t("Write")}</button>
+        <button type="button" aria-pressed={editorView === "preview"} aria-controls={previewId} onClick={() => setEditorView("preview")}>{t("Preview")}</button>
       </div>
 
       <div className="wk-esplit" data-view={editorView}>
-        <label className="wk-ehead wk-source-head" htmlFor={sourceId}>Markdown</label>
+        <label className="wk-ehead wk-source-head" htmlFor={sourceId}>{t("Markdown")}</label>
         <textarea
           id={sourceId}
           className="wk-esrc"
-          aria-label="Markdown"
+          aria-label={t("Markdown")}
           value={text}
           spellCheck={false}
           readOnly={readOnly || saving}
           onChange={(e) => change(e.target.value)}
         />
-        <div className="wk-ehead wk-preview-head" id={previewLabelId}>Preview</div>
+        <div className="wk-ehead wk-preview-head" id={previewLabelId}>{t("Preview")}</div>
         <div id={previewId} className="wk-eprev issue-reader" role="region" aria-labelledby={previewLabelId}>
           <Md text={text} />
         </div>
       </div>
 
       <p className="wk-hint">
-        Unsaved drafts stay in this tab when you leave. Use ⌘S or Ctrl+S to save.
+        {t("Unsaved drafts stay in this tab when you leave. Use ⌘S or Ctrl+S to save.")}
       </p>
     </>
   );

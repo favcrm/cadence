@@ -15,8 +15,18 @@
 //!   verdict; the turn's output streams afterwards and `agent_settled`
 //!   — emitted unconditionally once no retry/compaction/queued
 //!   continuation remains — ends the turn.
+//! - OMP uses a correlated `prompt_result`, then `session_settled` if
+//!   background work remains. Its first success response is only an ack;
+//!   a later scheduling/auth failure must still close the durable turn.
 //! - `message_end` for an assistant message is the authoritative text;
 //!   `stopReason` `aborted`/`error` maps to interrupted/failed.
+//! - A master `400` `invalid_request` before any tool is the CAD-1076
+//!   fresh-session continuation. Pi builds the provider HTTP body in
+//!   its own process; this adapter only sends `prompt` and cannot
+//!   measure that body or disable tools for a later prompt. A
+//!   serialized-body refusal after a tool is therefore not continued:
+//!   the turn fails with an explicit limitation and nothing is replayed.
+//!   A token or context-window refusal is not that body refusal.
 //! - `tool_execution_start`/`_end` → one `cadence/tool_use` /
 //!   `cadence/tool_result` event each (redacted one-line summaries via
 //!   `crate::store::tool_*_summary`, never raw I/O).
@@ -90,6 +100,12 @@ use super::{AdapterHooks, Identity, ProviderAdapter, ProviderEnv, TurnResult};
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
+/// The literal a guarded Pi submission prepends to the task prompt. The
+/// daemon reserves these bytes in its combined payload cap even when the guard
+/// is currently off: readiness can change between planning and the turn, so
+/// the reservation is conservative, not conditional.
+pub(crate) const TASK_INPUT_PREFIX: &str = "Cadence task input (not a runtime command):\n";
+
 /// Default inactivity window before a turn is `unknown`
 /// (`params.turn_idle_secs`); `params.turn_max_secs` is the optional
 /// absolute cap. Same rule as the Claude adapter.
@@ -107,1499 +123,140 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// arrives. Slice 1 cancels them; everything else is recorded only.
 const UI_DIALOG_METHODS: &[&str] = &["select", "confirm", "input", "editor"];
 
-/// The only inherited variables a Pi MASTER keeps (CAD-322 round 2,
-/// I3): its environment is cleared wholesale and only these names are
-/// re-read — connectivity and locale, never credentials. Every provider
-/// key (AWS_*, Moonshot/Kimi, Together, Fireworks, Baseten, Llama,
-/// NVIDIA, OpenCode, Minimax, Qwen, Xiaomi, ZAI_CN, Ant Ling,
-/// ANTHROPIC_AUTH_TOKEN, COPILOT_GITHUB_TOKEN, …), every `PI_*`,
-/// `CLAUDE_*`, `CADENCE_*`, `GIT_*`, `XDG_*`, `LD_*`, `NODE_OPTIONS`
-/// and `SSH_AUTH_SOCK` is gone however it is spelled — a denylist could
-/// never enumerate the next provider's variable. The daemon context and
-/// `PI_CODING_AGENT_DIR` arrive as explicit env pairs afterwards.
-const PI_MASTER_ENV_KEEP: &[&str] = &[
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "LC_MESSAGES",
-    "TERM",
-    "COLORTERM",
-    "SHELL",
-    "TZ",
-    // Connectivity config, not secrets: corporate CA roots and proxies.
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
-    "NODE_EXTRA_CA_CERTS",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-    "no_proxy",
-];
-
-/// The master's environment posture: cleared, then the allowlist.
-/// `DENIED_ENV`'s forge tokens are re-listed only as defense in depth —
-/// they are not in the keep set anyway.
-pub(crate) fn pi_master_env_scrub() -> EnvScrub {
-    EnvScrub::cleared_except(PI_MASTER_ENV_KEEP).and_names(crate::master::DENIED_ENV)
-}
-
-/// The only inherited variables a Pi WORKER keeps (CAD-544) — the same
-/// allowlist posture as the master ([`pi_master_env_scrub`]), plus what
-/// an unattended development worker needs:
-/// - `TMPDIR` and the `XDG_*` dirs — tool config lands where the
-///   operator put it (`XDG_CACHE_HOME` itself is overridden per agent
-///   at open — CAD-570 — so the inherited value never reaches a
-///   provider cache);
-/// - `SSH_AUTH_SOCK`/`SSH_AGENT_PID` — git over an ssh-agent;
-/// - `CARGO_HOME`, `RUSTUP_HOME`, `RUSTC_WRAPPER`, `SCCACHE_DIR` — the
-///   host's Rust toolchain layout;
-/// - `COLORTERM`/`TERM`/`SHELL`/`TZ`/`USER`/`LOGNAME`/`LANG`/`LC_*`,
-///   `PATH`, `HOME`, and the proxy/CA roots — inherited from the master
-///   keep-list unchanged.
-///
-/// git and gh authenticate through the operator's own files under
-/// `HOME` (`~/.gitconfig`, `~/.config/gh`) — never through an inherited
-/// token, so `GH_TOKEN`, `GITHUB_TOKEN` and every provider API key are
-/// gone however spelled. `PI_CODING_AGENT_DIR`, `CADENCE_ALIAS`,
-/// `CADENCE_STATE_DIR` and the daemon context arrive as explicit env
-/// pairs afterwards.
-const PI_WORKER_ENV_KEEP_EXTRA: &[&str] = &[
-    "TMPDIR",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_STATE_HOME",
-    "XDG_RUNTIME_DIR",
-    "SSH_AUTH_SOCK",
-    "SSH_AGENT_PID",
-    "CARGO_HOME",
-    "RUSTUP_HOME",
-    "RUSTC_WRAPPER",
-    "SCCACHE_DIR",
-];
-
-/// A pi worker's environment posture: cleared, then the allowlist —
-/// identical mechanism to the master's, with the dev additions above.
-/// `DENIED_ENV`'s forge tokens are re-listed only as defense in depth —
-/// minus `SSH_AUTH_SOCK`, which the worker keep-list deliberately
-/// retains (name-removal applies after the keep re-inherit, so listing
-/// it would silently win over the keep entry).
-pub(crate) fn pi_worker_env_scrub() -> EnvScrub {
-    let keep: Vec<&str> = PI_MASTER_ENV_KEEP
-        .iter()
-        .chain(PI_WORKER_ENV_KEEP_EXTRA)
-        .copied()
-        .collect();
-    let denied: Vec<&str> = crate::master::DENIED_ENV
-        .iter()
-        .copied()
-        .filter(|name| *name != "SSH_AUTH_SOCK")
-        .collect();
-    EnvScrub::cleared_except(&keep)
-        .and_names(&denied)
-        .and_names(PI_KEY_ENV)
-        .and_names(super::CLOUD_SECRET_ENV)
-}
-
-/// Provider API-key variables a Pi WORKER must not inherit from the
-/// daemon's environment — the master's child env is allowlisted
-/// wholesale ([`pi_master_env_scrub`]) instead. Scrubbed by name: Pi
-/// reads a fixed set, none of them `*_API_KEY`-suffixed generically.
-const PI_KEY_ENV: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_OAUTH_TOKEN",
-    "OPENAI_API_KEY",
-    "OPENAI_API_KEY_OAUTH",
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEY",
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "MISTRAL_API_KEY",
-    "GROQ_API_KEY",
-    "XAI_API_KEY",
-    "OPENROUTER_API_KEY",
-    "CEREBRAS_API_KEY",
-    "DEEPSEEK_API_KEY",
-    "ZAI_API_KEY",
-    "AI_GATEWAY_API_KEY",
-    "AWS_BEARER_TOKEN_BEDROCK",
-    "AZURE_OPENAI_API_KEY",
-    // Round-2 review set: vendor keys Pi reads that the original list
-    // missed (the master no longer depends on this list being complete).
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "MOONSHOT_API_KEY",
-    "KIMI_API_KEY",
-    "TOGETHER_API_KEY",
-    "FIREWORKS_API_KEY",
-    "BASETEN_API_KEY",
-    "LLAMA_API_KEY",
-    "NVIDIA_API_KEY",
-    "OPENCODE_API_KEY",
-    "MINIMAX_API_KEY",
-    "QWEN_API_KEY",
-    "DASHSCOPE_API_KEY",
-    "XIAOMI_API_KEY",
-    "ZAI_CN_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "COPILOT_GITHUB_TOKEN",
-];
-
-/// Provider binary; `CADENCE_PI_COMMAND` overrides it (test/mock) —
-/// the mock sees the same argv shape as the real CLI.
-fn pi_command(env: &ProviderEnv) -> Vec<String> {
-    if let Some(cmd) = env.var("CADENCE_PI_COMMAND") {
-        let parts: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
-        if !parts.is_empty() {
-            return parts;
-        }
-    }
-    vec!["pi".to_string()]
-}
-
-/// The master's own Pi config dir — its `PI_CODING_AGENT_DIR`: auth
-/// and extension state live here, never in the operator's `~/.pi`,
-/// mirroring [`crate::master::claude_config_dir`].
-pub fn pi_config_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join("master").join("pi")
-}
-
-/// The generated guard extension path (`<state>/master/pi-guard.js`).
-/// Plain `.js` — Pi's loader (jiti) accepts it, and Node can evaluate
-/// the grammar section verbatim in tests. It must live OUTSIDE
-/// `master/pi`: that dir is writable by the confined master, and a
-/// writable guard could rewrite itself.
-fn pi_guard_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("master").join("pi-guard.js")
-}
-
-/// The runtime turn guard lives outside each agent's writable tree.
-fn pi_turn_guard_path(state_dir: &Path, alias: &str) -> Result<PathBuf> {
-    let _ = pi_worker_dir(state_dir, alias)?;
-    Ok(state_dir
-        .join("pi-turn-guards")
-        .join(alias)
-        .join("guard.ts"))
-}
-
-fn write_pi_turn_guard(state_dir: &Path, alias: &str) -> Result<PathBuf> {
-    let path = pi_turn_guard_path(state_dir, alias)?;
-    ensure_private_dir(path.parent().unwrap())?;
-    std::fs::write(&path, include_str!("pi_turn_guard.ts"))?;
-    Ok(path)
-}
-
-/// A pi WORKER's private dir under the state dir (CAD-544):
-/// `<state>/agents/<alias>` holds its `PI_CODING_AGENT_DIR`
-/// (`pi/`, where the copied `auth.json` lives) and its session file
-/// (`session.jsonl`). Never the operator's `~/.pi`, never shared with
-/// another worker. The alias is a path component, so it is checked
-/// against the agent-name grammar — `[A-Za-z0-9._-]`, and never an
-/// all-dots name (`.`, `..`, `...` would climb out of `agents/`).
-fn pi_worker_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
-    let ok = !alias.is_empty()
-        && alias.len() <= 80
-        && alias.bytes().any(|b| b != b'.')
-        && alias
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
-    if !ok {
-        return Err(Error::rejected(format!(
-            "invalid worker alias '{alias}' — [A-Za-z0-9._-], 1-80 chars, not all dots"
-        )));
-    }
-    Ok(state_dir.join("agents").join(alias))
-}
-
-/// The worker's private `PI_CODING_AGENT_DIR` (`<worker>/pi`) — created
-/// 0700 on open, holding its copied `auth.json`.
-fn pi_worker_config_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
-    Ok(pi_worker_dir(state_dir, alias)?.join("pi"))
-}
-
-/// The worker's persistent Pi session file (`<worker>/session.jsonl`).
-fn pi_worker_session(state_dir: &Path, alias: &str) -> Result<PathBuf> {
-    Ok(pi_worker_dir(state_dir, alias)?.join("session.jsonl"))
-}
-
-/// The agent's own `XDG_CACHE_HOME` (CAD-570): the master gets
-/// `<state>/master/pi/cache`, a worker `<state>/agents/<alias>/pi/
-/// cache` — created 0700 on open. pi-devin's model catalog lands at
-/// `$XDG_CACHE_HOME/pi-devin/models.json`; under Landlock the
-/// operator's `~/.cache` is denied outright (a confined master's
-/// catalog fetch EACCES'd every open on the smoke host), and
-/// unconfined two agents must still never share one cache file.
-fn pi_cache_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
-    if crate::master::is_master(alias) {
-        Ok(pi_config_dir(state_dir).join("cache"))
-    } else {
-        Ok(pi_worker_config_dir(state_dir, alias)?.join("cache"))
-    }
-}
-
-/// Create `dir` (recursive) at mode 0700, tightening an existing one.
-fn ensure_private_dir(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
 #[path = "pi_devin_catalog.rs"]
 mod devin_catalog;
 
 #[path = "pi_agenticos.rs"]
 mod agenticos;
 
-/// Copy the operator's `auth.json` into `dir` (0600, atomic via
-/// `auth.json.tmp` rename) when the dir has no non-empty login of its
-/// own — the same scoped copy `master start --copy-login` makes
-/// ([`crate::master::copy_login_for`]). An existing login is never
-/// overwritten: the worker's own refresh owns its file afterwards.
-/// `Login::None` means the operator has no Pi login to copy — the
-/// worker then fails its first turn with Pi's own "No API key" error.
-pub fn copy_pi_auth(dir: &Path, operator_config: &Path) -> Result<crate::master::Login> {
-    use std::os::unix::fs::OpenOptionsExt;
-    ensure_private_dir(dir)?;
-    let target = dir.join("auth.json");
-    if std::fs::read_to_string(&target)
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v.as_object().map(|o| !o.is_empty()))
-        == Some(true)
-    {
-        return Ok(crate::master::Login::Own);
-    }
-    let Ok(text) = std::fs::read_to_string(operator_config.join("auth.json")) else {
-        return Ok(crate::master::Login::None);
-    };
-    if serde_json::from_str::<Value>(&text)
-        .ok()
-        .filter(Value::is_object)
-        .and_then(|v| v.as_object().map(|o| !o.is_empty()))
-        != Some(true)
-    {
-        return Ok(crate::master::Login::None);
-    }
-    let tmp = dir.join("auth.json.tmp");
-    let _ = std::fs::remove_file(&tmp);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    std::io::Write::write_all(&mut file, text.as_bytes())?;
-    file.sync_all()?;
-    std::fs::rename(&tmp, &target)?;
-    Ok(crate::master::Login::Copied)
-}
+#[path = "pi_confine.rs"]
+mod pi_confine;
+#[path = "pi_guard.rs"]
+mod pi_guard;
+#[path = "pi_launch.rs"]
+mod pi_launch;
 
-/// The dev-tool allowlist a pi WORKER launches with (CAD-544): Pi's
-/// full built-in set, named explicitly so the list is deliberate —
-/// `--tools` also fences out any extension/custom tool that a
-/// project-local config might otherwise register (with
-/// `--no-extensions` there is none anyway; the flag is the belt).
-const PI_WORKER_TOOLS: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "ls"];
+use pi_confine::*;
+use pi_guard::*;
+use pi_launch::*;
 
-/// An operator-supplied image file, never a company-configured extension.
-/// The managed master only exposes these two reviewed AgenticOS GET tools;
-/// all other extension tools remain absent from Pi's --tools allowlist.
-const AGENTICOS_READ_EXTENSION_ENV: &str = "CADENCE_PI_AGENTICOS_READ_EXTENSION";
-const AGENTICOS_READ_TOOLS: &[&str] = &["workspace_get", "account_get"];
+pub use pi_confine::{
+    launch_workdir, pi_master_confinement, pi_worker_confinement, refuse_confined_devin,
+    refuse_confined_devin_agent, worker_confined, CONFINE_WORKER_EXTRA_READ_ENV,
+    CONFINE_WORKER_EXTRA_WRITE_ENV,
+};
+pub use pi_launch::{copy_pi_auth, pi_agent_home, pi_config_dir};
+pub(crate) use pi_launch::{pi_master_env_scrub, pi_worker_env_scrub, resolve_pi_launch_command};
 
-fn agenticos_read_extension(env: &ProviderEnv) -> Result<Option<PathBuf>> {
-    let Some(raw) = env.var(AGENTICOS_READ_EXTENSION_ENV) else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(&raw);
-    if !path.is_absolute()
-        || std::fs::symlink_metadata(&path)
-            .map(|meta| !meta.file_type().is_file())
-            .unwrap_or(true)
-        || path.canonicalize().ok().as_deref() != Some(path.as_path())
-    {
-        return Err(Error::rejected(format!(
-            "{AGENTICOS_READ_EXTENSION_ENV} must name an existing absolute regular file with no symlink components"
-        )));
-    }
-    Ok(Some(path))
-}
-
-/// The tracker dir `[pi]` policy is read from (CAD-559): the daemon's
-/// `CADENCE_PM_DIR`, else the process default — the same seam
-/// `pi_confine_inputs` uses for its tracker grant.
-fn pi_pm_dir(env: &ProviderEnv) -> Option<PathBuf> {
-    env.var("CADENCE_PM_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| crate::issue::default_dir().ok())
-}
-
-/// The operator-pinned provider packages (`[pi].providers` in pm.yaml).
-/// Each `name@version` resolves under the OPERATOR's Pi npm dir
-/// (`<PI_CODING_AGENT_DIR|~/.pi/agent>/npm/node_modules`) — never the
-/// agent's private `PI_CODING_AGENT_DIR`, so a confined master cannot
-/// pick its own extensions. Resolution is fail-closed at launch: a
-/// missing package, a version drift or a malformed pin refuses the open.
-fn provider_packages(env: &ProviderEnv) -> Result<Vec<crate::pi_policy::ProviderPackage>> {
-    let Some(pm_dir) = pi_pm_dir(env) else {
-        return Ok(vec![]);
-    };
-    let Some(policy) = crate::pi_policy::read(&pm_dir)? else {
-        return Ok(vec![]);
-    };
-    if policy.providers.is_empty() {
-        return Ok(vec![]);
-    }
-    let operator = crate::master::operator_provider_config(
-        "pi",
-        env.var("PI_CODING_AGENT_DIR"),
-        env.var("HOME"),
-    )
-    .ok_or_else(|| {
-        Error::rejected(
-            "pm.yaml [pi].providers is set but the operator's Pi dir is \
-             unresolvable — set PI_CODING_AGENT_DIR or HOME (CAD-559)",
-        )
-    })?;
-    let root = operator.join("npm").join("node_modules");
-    policy
-        .providers
-        .iter()
-        .map(|spec| crate::pi_policy::resolve_package(spec, &root))
-        .collect()
-}
-
-/// `pi --mode rpc …`: direct argv, no shell. The master gets
-/// `--no-session` (continuity pack rebuilds context) plus
-/// `--no-extensions -e <guard>` and `--tools bash` — its whole toolset
-/// is the allowlisted `cadence` commands, exactly the CAD-339 posture
-/// the Claude master gets from `--tools`/`dontAsk`. A WORKER (CAD-544)
-/// gets `--session <file>` (its persistent conversation), the dev
-/// toolset [`PI_WORKER_TOOLS`], no extension guard, and reads repo
-/// context files like any other worker. `--offline`/`--no-*` keep
-/// startup deterministic: no update checks, skills, prompt-templates
-/// or themes.
-fn build_command(env: &ProviderEnv, agent: &Agent, state_dir: &Path) -> Result<Vec<String>> {
-    let params = agent.params.clone().unwrap_or(Value::Null);
-    let mut cmd = pi_command(env);
-    cmd.extend(["--mode".to_string(), "rpc".to_string()]);
-    if crate::master::is_master(&agent.alias) {
-        cmd.push("--no-session".to_string());
-    } else {
-        cmd.extend([
-            "--session".to_string(),
-            pi_worker_session(state_dir, &agent.alias)?
-                .to_string_lossy()
-                .to_string(),
-        ]);
-    }
-    for flag in [
-        "--offline",
-        "--no-themes",
-        "--no-skills",
-        "--no-prompt-templates",
-    ] {
-        cmd.push(flag.to_string());
-    }
-    if crate::master::is_master(&agent.alias) {
-        cmd.push("--no-context-files".to_string());
-    }
-    // CAD-559: the only extensions loaded are the generated guard
-    // (master) plus the operator's pinned `[pi].providers` packages —
-    // `--no-extensions` still fences off everything else, so each entry
-    // is an explicit `-e` file inside its pinned package dir.
-    let packages = provider_packages(env)?;
-    // Admission must close before another extension's awaited turn_end
-    // listener can yield. Load the turn guard first for both roles.
-    cmd.extend([
-        "--no-extensions".to_string(),
-        "--extension".to_string(),
-        pi_turn_guard_path(state_dir, &agent.alias)?
-            .to_string_lossy()
-            .to_string(),
-    ]);
-    if crate::master::is_master(&agent.alias) {
-        let agenticos_read = agenticos_read_extension(env)?;
-        cmd.extend([
-            "--extension".to_string(),
-            pi_guard_path(state_dir).to_string_lossy().to_string(),
-        ]);
-        for pkg in &packages {
-            for entry in &pkg.entries {
-                cmd.extend([
-                    "--extension".to_string(),
-                    entry.to_string_lossy().to_string(),
-                ]);
-            }
-        }
-        if let Some(path) = &agenticos_read {
-            cmd.extend([
-                "--extension".to_string(),
-                path.to_string_lossy().to_string(),
-            ]);
-        }
-        // bash (guard-checked `cadence` verbs), `read` and `write`.
-        // The guard confines both file tools to `master/tmp`: read
-        // re-opens Pi's spilled bash output (CAD-552); write is how
-        // the master stages `--file` input (CAD-614).
-        let mut tools = vec!["bash", "read", "write"];
-        if agenticos_read.is_some() {
-            tools.extend(AGENTICOS_READ_TOOLS);
-        }
-        cmd.extend(["--tools".to_string(), tools.join(",")]);
-    } else {
-        for pkg in &packages {
-            for entry in &pkg.entries {
-                cmd.extend([
-                    "--extension".to_string(),
-                    entry.to_string_lossy().to_string(),
-                ]);
-            }
-        }
-        cmd.extend(["--tools".to_string(), PI_WORKER_TOOLS.join(",")]);
-    }
-    // `agent.model` is the provider's report, never a launch param —
-    // only the configured param is replayed (same rule as Claude).
-    if let Some(model) = params.get("model").and_then(Value::as_str) {
-        cmd.extend(["--model".to_string(), model.to_string()]);
-    }
-    Ok(cmd)
-}
-
-/// The full launch argv: [`build_command`], and for a confined
-/// endpoint that line wrapped in `cadence confine` — the master
-/// always (CAD-439), a worker when its `confine` param asks
-/// (CAD-556). A confined launch on a host without Landlock is
-/// refused, never silently unconfined.
-fn launch_command(
-    env: &ProviderEnv,
-    state_dir: &Path,
-    agent: &Agent,
-) -> Result<(Vec<String>, Option<crate::confine::Policy>)> {
-    let command = build_command(env, agent, state_dir)?;
-    if master_confined(env, agent) {
-        let (confine, policy) = pi_master_confinement(env, state_dir);
-        let argv = crate::master::confine_argv(&confine, &policy, &command);
-        return Ok((argv, Some(policy)));
-    }
-    if !worker_confined(agent) {
-        return Ok((command, None));
-    }
-    // Opt-in confinement cannot quietly lapse: `--confine` on a host
-    // that cannot confine is an error, not a plain launch.
-    crate::master::confinement_available(env)?;
-    let (confine, policy) = pi_worker_confinement(env, state_dir, agent);
-    let argv = crate::master::confine_argv(&confine, &policy, &command);
-    Ok((argv, Some(policy)))
-}
-
-/// The master, confined wherever this host can confine it — the stored
-/// `unconfined` param counts only where it cannot (same rule as Claude).
-fn master_confined(env: &ProviderEnv, agent: &Agent) -> bool {
-    crate::master::is_master(&agent.alias)
-        && crate::master::is_confined(
-            agent.params.as_ref(),
-            crate::master::confinement_available(env).is_ok(),
-        )
-}
-
-/// The confining binary and policy for a Pi master (`cadence master
-/// confinement` prints the Claude one; Pi's differs only in the
-/// programs and provider dirs it names).
-pub fn pi_master_confinement(
-    env: &ProviderEnv,
-    state_dir: &Path,
-) -> (String, crate::confine::Policy) {
-    let command = pi_command(env);
-    (
-        confine_command(env),
-        crate::master::confinement(&pi_confine_inputs(env, state_dir, &command)),
-    )
-}
-
-fn confine_command(env: &ProviderEnv) -> String {
-    #[cfg(debug_assertions)]
-    let own = env
-        .own("CADENCE_CONFINE_COMMAND")
-        .filter(|c| !c.trim().is_empty());
-    #[cfg(not(debug_assertions))]
-    let own: Option<String> = {
-        let _ = env;
-        None
-    };
-    own.or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .map(|p| p.to_string_lossy().to_string())
-    })
-    .unwrap_or_else(|| "cadence".to_string())
-}
-
-/// The directory an npm-installed package lives in: `program`'s real
-/// path's first ancestor holding a `package.json`. Pi is a node script
-/// inside `…/node_modules/@earendil-works/pi-coding-agent`, so the bin
-/// symlink's parent alone is not enough — the package dir is added to
-/// the master's read set.
-fn package_root(program: &Path) -> Option<PathBuf> {
-    let real = program.canonicalize().ok()?;
-    real.ancestors()
-        .find(|dir| dir.join("package.json").is_file())
-        .map(Path::to_path_buf)
-}
-
-/// Read a small regular file without following a final-component symlink
-/// and with a hard allocation/read cap, even if it changes during the read.
-fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let before = std::fs::symlink_metadata(path).ok()?;
-    if !before.file_type().is_file() || before.len() > max_bytes {
-        return None;
-    }
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .ok()?;
-    let after = file.metadata().ok()?;
-    if !after.file_type().is_file() || after.len() > max_bytes {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(max_bytes as usize);
-    file.take(max_bytes + 1).read_to_end(&mut bytes).ok()?;
-    (bytes.len() as u64 <= max_bytes).then_some(bytes)
-}
-
-/// Resolve only the known managed launcher layout. The wrapper is never
-/// executed during policy discovery: its version pointer and expected
-/// release paths are read and checked as data instead.
-fn managed_pi_dependencies(program: &Path, env: &ProviderEnv) -> Vec<PathBuf> {
-    let Some(real) = program.canonicalize().ok() else {
-        return Vec::new();
-    };
-    let Some(bin) = real.parent() else {
-        return Vec::new();
-    };
-    if real.file_name().is_none_or(|name| name != "pi")
-        || bin.file_name().is_none_or(|name| name != "bin")
-    {
-        return Vec::new();
-    }
-    let Some(agent_root) = bin.parent() else {
-        return Vec::new();
-    };
-    if agent_root.file_name().is_none_or(|name| name != "agent")
-        || agent_root
-            .parent()
-            .and_then(Path::file_name)
-            .is_none_or(|name| name != ".pi")
-    {
-        return Vec::new();
-    }
-    // A managed install has exactly <agent>/bin/pi and a sibling
-    // <agent>/install tree. Do not infer this from an arbitrary script.
-    if agent_root
-        .join("bin")
-        .join("pi")
-        .canonicalize()
-        .ok()
-        .as_deref()
-        != Some(real.as_path())
-    {
-        return Vec::new();
-    }
-    let install = agent_root.join("install");
-    let Ok(real_install) = install.canonicalize() else {
-        return Vec::new();
-    };
-    if real_install != install || !real_install.is_dir() {
-        return Vec::new();
-    }
-
-    let pointer = install.join("current-version");
-    const MAX_POINTER_BYTES: u64 = 130; // 128 safe version bytes plus CRLF.
-    let Some(pointer_bytes) = read_bounded_regular_file(&pointer, MAX_POINTER_BYTES) else {
-        return Vec::new();
-    };
-    let Ok(contents) = std::str::from_utf8(&pointer_bytes) else {
-        return Vec::new();
-    };
-    let version = contents
-        .strip_suffix("\r\n")
-        .or_else(|| contents.strip_suffix('\n'))
-        .unwrap_or(contents);
-    if version.is_empty()
-        || version.len() > 128
-        || version == "."
-        || version == ".."
-        || !version
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
-    {
-        return Vec::new();
-    }
-
-    let releases = install.join("releases");
-    let Ok(real_releases) = releases.canonicalize() else {
-        return Vec::new();
-    };
-    if real_releases != releases || !real_releases.is_dir() {
-        return Vec::new();
-    }
-    let release = releases.join(version);
-    let Ok(real_release) = release.canonicalize() else {
-        return Vec::new();
-    };
-    // Reject a version entry that is a symlink or escapes the exact
-    // current-release directory; never grant a neighboring release.
-    if real_release != release || real_release.parent() != Some(real_releases.as_path()) {
-        return Vec::new();
-    }
-    let executable = release.join("node_modules/.bin/pi");
-    let Some(package) = package_root(&executable) else {
-        return Vec::new();
-    };
-    let Ok(real_package) = package.canonicalize() else {
-        return Vec::new();
-    };
-    if !real_package.starts_with(&real_release)
-        || executable
-            .canonicalize()
-            .ok()
-            .is_none_or(|target| !target.starts_with(&real_release))
-    {
-        return Vec::new();
-    }
-    let manifest = real_package.join("package.json");
-    let Some(manifest_bytes) = read_bounded_regular_file(&manifest, 1024 * 1024) else {
-        return Vec::new();
-    };
-    let Ok(manifest_json) = serde_json::from_slice::<serde_json::Value>(&manifest_bytes) else {
-        return Vec::new();
-    };
-    if manifest_json
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        != Some("@earendil-works/pi-coding-agent")
-    {
-        return Vec::new();
-    }
-
-    let mut roots = vec![pointer, real_release];
-    // The managed wrapper uses ${XDG_DATA_HOME:-$HOME/.local/share} for
-    // its optional Node. Match that environment, then accept only a direct
-    // version child of the canonical pi-node anchor.
-    let data_home = env
-        .var("XDG_DATA_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            env.var("HOME")
-                .filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(".local/share"))
-        });
-    if let Some(data_home) = data_home {
-        if let Ok(real_data_home) = data_home.canonicalize() {
-            let node_root = real_data_home.join("pi-node");
-            if let (Ok(node_root_meta), Ok(real_node_root)) = (
-                std::fs::symlink_metadata(&node_root),
-                node_root.canonicalize(),
-            ) {
-                if node_root_meta.file_type().is_dir() && real_node_root == node_root {
-                    let node = node_root.join("current/bin/node");
-                    if let Ok(real_node) = node.canonicalize() {
-                        if let Some(node_version) = real_node
-                            .parent()
-                            .and_then(Path::parent)
-                            .map(Path::to_path_buf)
-                        {
-                            if let Ok(real_node_version) = node_version.canonicalize() {
-                                use std::os::unix::fs::PermissionsExt;
-                                if real_node.is_file()
-                                    && real_node_version.parent() == Some(real_node_root.as_path())
-                                    && real_node
-                                        .metadata()
-                                        .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-                                    && real_node_version
-                                        .join("bin/node")
-                                        .canonicalize()
-                                        .ok()
-                                        .as_deref()
-                                        == Some(real_node.as_path())
-                                {
-                                    roots.push(real_node_version);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    roots
-}
-
-/// What the Pi master's confinement is computed from — same shape as
-/// Claude's inputs, plus Pi's package dir, the guard extension and its
-/// private `PI_CODING_AGENT_DIR`.
-fn pi_confine_inputs(
-    env: &ProviderEnv,
-    state_dir: &Path,
-    command: &[String],
-) -> crate::master::ConfineInputs {
-    use crate::master::{split_paths, which, with_interpreter};
-    let path = env.var("PATH");
-    let mut programs = Vec::new();
-    if let Some(p) = command.first().and_then(|c| which(c, path.as_deref())) {
-        programs.extend(with_interpreter(&p, path.as_deref()));
-        if let Some(root) = package_root(&p) {
-            programs.push(root);
-        }
-    }
-    if let Some(p) = which("cadence", path.as_deref()) {
-        programs.push(p);
-    }
-    programs.push(PathBuf::from(confine_command(env)));
-    let pm_dir = pi_pm_dir(env);
-    // The guard lives outside `master/pi` — a confined master must read
-    // but never write it. Its own provider dir is `master/pi`: nothing
-    // of `master/claude` (or its `.credentials.json`) is in the policy.
-    let mut extra_read = split_paths(env.var(crate::master::CONFINE_EXTRA_READ_ENV));
-    if let Some(program) = command.first().and_then(|c| which(c, path.as_deref())) {
-        extra_read.extend(managed_pi_dependencies(&program, env));
-    }
-    extra_read.push(pi_guard_path(state_dir));
-    if let Ok(path) = pi_turn_guard_path(state_dir, crate::master::ALIAS) {
-        extra_read.push(path);
-    }
-    if let Ok(Some(path)) = agenticos_read_extension(env) {
-        extra_read.push(path);
-    }
-    // CAD-559: exactly the pinned provider package dirs — read-only.
-    // `build_command` resolves the same list and refuses the launch on
-    // a bad pin, so a policy with an unresolvable package never runs.
-    if let Ok(packages) = provider_packages(env) {
-        extra_read.extend(packages.iter().map(|p| p.dir.clone()));
-    }
-    crate::master::ConfineInputs {
-        state_dir: state_dir.to_path_buf(),
-        home: env.var("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
-        pm_dir,
-        programs,
-        provider_dir: pi_config_dir(state_dir),
-        // Nothing of the operator's `$HOME` — Pi's npm package arrives
-        // via `programs`; Claude's `~/.local/share/claude` is not ours.
-        home_read: &[],
-        extra_read,
-        extra_write: split_paths(env.var(crate::master::CONFINE_EXTRA_WRITE_ENV)),
-    }
-}
-
-/// Daemon env naming extra paths (`:`-separated) a pi WORKER may read,
-/// or also write — the escape hatch for caches and push targets the
-/// built-in policy does not know (a `file://` remote, a private
-/// registry dir, a uv/npm cache). Set by whoever starts the daemon,
-/// never by an agent.
-pub const CONFINE_WORKER_EXTRA_READ_ENV: &str = "CADENCE_PI_WORKER_CONFINE_READ";
-pub const CONFINE_WORKER_EXTRA_WRITE_ENV: &str = "CADENCE_PI_WORKER_CONFINE_WRITE";
-
-/// Is `agent` a worker launched confined? Opt-in (`params.confine`,
-/// CAD-556 — `join … pi --confine` or `pm.yaml [host]
-/// confine_pi_workers`); the master alias's posture is `is_confined`,
-/// not this. Availability is checked by the caller. `agent_show`
-/// reports this verbatim as `confined`.
-pub fn worker_confined(agent: &Agent) -> bool {
-    !crate::master::is_master(&agent.alias)
-        && agent
-            .params
-            .as_ref()
-            .and_then(|p| p.get("confine"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-}
-
-/// The directory git uses for object/ref writes — the worktree's own
-/// `.git` for a plain clone, the main checkout's `.git` for a linked
-/// worktree (`git rev-parse --git-common-dir`). `None` when the cwd is
-/// not a repo (the policy then just grants the cwd).
-fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
-    let out = crate::reaper::output(
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(cwd)
-            .args(["rev-parse", "--git-common-dir"]),
-    )
-    .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let dir = PathBuf::from(&text);
-    let dir = if dir.is_absolute() {
-        dir
-    } else {
-        cwd.join(dir)
-    };
-    Some(dir.canonicalize().unwrap_or(dir))
-}
-
-/// The confining binary and policy for a pi WORKER (CAD-556) — the
-/// same `cadence confine` launcher as the master, a wider but still
-/// enumerated set. A worker edits, builds, commits and reports:
-///
-/// - **write**: its worktree (`agent.cwd`); the repo's shared git dir
-///   when the worktree links one (objects, refs, the per-worktree
-///   index); its cargo target dir ([`crate::worktree::
-///   effective_target_dir`] — the declared `--target-dir`/
-///   `CARGO_TARGET_DIR`/config value) plus the shared dep cache
-///   ([`crate::worktree::shared_target_dir`]) the worktree's target
-///   symlinks into; its own dir under the state dir (`pi/` config —
-///   including `pi/cache`, the agent's own XDG_CACHE_HOME (CAD-570) —
-///   session file, `tmp/` — the confined child's TMPDIR is redirected
-///   there because a `/tmp` write grant would expose every lane);
-///   the PM tracker (`issue` verbs commit to it); the cargo
-///   `registry`/`git` caches and their lock files (a worker fetches
-///   and updates deps — proven: cargo fails building without them);
-///   the sccache dir (`rustc-wrapper` writes miss entries).
-/// - **read**: the master's system trees; the programs the launch
-///   resolves (pi, its interpreter and npm package dir, `cadence`,
-///   the `confine` exe); its briefing file and the sandbox marker;
-///   `RUSTUP_HOME` (toolchain bins execute from it) and
-///   `$CARGO_HOME/bin` (the rustup shims on PATH); `~/.ssh/config` and
-///   `~/.ssh/known_hosts` — the two NON-secret ssh files, so `git
-///   push` over ssh + agent works while the keys themselves stay
-///   denied; `$CARGO_HOME/config.toml` — cargo aborts the whole run on
-///   an unreadable config (proven), and this file carries the
-///   rustc-wrapper/source-mirror settings builds need. Cargo's
-///   `credentials.toml` (registry tokens) and the Devin CLI login
-///   (`~/.local/share/devin/credentials.toml`) are never granted.
-///   The pinned `[pi].providers`
-///   package dirs the `-e` argv loads (CAD-559).
-/// - **denied** by omission: `$HOME` itself and everything under it
-///   not named above — `~/.ssh` keys, `~/.pi`, `~/.claude`, other
-///   agents' dirs under the state dir (`<state>/agents/<alias>` is the
-///   only granted one), the daemon store. Network is not covered by
-///   Landlock — unchanged from the unconfined posture (the provider's
-///   API and git remotes must still be reachable).
-///
-/// `GIT_CONFIG_GLOBAL` is redirected to the worker's own file by
-/// `open` (git fatals on an unreadable `~/.gitconfig` — proven).
-///
-/// A confined managed Pi worker cannot use the Devin provider: pi-devin
-/// reads the operator's login file on every turn, and granting that file
-/// to a worker would let its tools copy or transmit the credential.
-/// Call this before persisting a registration, changing a launch model,
-/// dispatching work, and opening an existing row.
-pub fn refuse_confined_devin(alias: &str, confined: bool, model: &str) -> Result<()> {
-    if confined && model.starts_with("devin/") {
-        return Err(Error::rejected(format!(
-            "pi worker '{alias}' cannot use model '{model}' while confined: \
-             pi-devin requires the operator's Devin credential, which a confined \
-             worker cannot safely read. Choose a non-Devin model or have the \
-             operator register an unconfined worker (CAD-751)"
-        )));
-    }
-    Ok(())
-}
-
-pub fn refuse_confined_devin_agent(agent: &Agent) -> Result<()> {
-    if agent.provider == "pi"
-        && agent.endpoint_kind == "managed"
-        && !crate::master::is_master(&agent.alias)
-    {
-        let params = agent.params.as_ref().unwrap_or(&Value::Null);
-        refuse_confined_devin(
-            &agent.alias,
-            params.get("confine").and_then(Value::as_bool) == Some(true),
-            params
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-        )?;
-    }
-    Ok(())
-}
-pub fn pi_worker_confinement(
-    env: &ProviderEnv,
-    state_dir: &Path,
-    agent: &Agent,
-) -> (String, crate::confine::Policy) {
-    use crate::master::{program_dirs, split_paths, which, with_interpreter};
-    let path = env.var("PATH");
-    let home = env.var("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
-    let command = pi_command(env);
-    let cwd = PathBuf::from(&agent.cwd);
-
-    let mut read: Vec<PathBuf> = crate::master::CONFINE_SYSTEM_READ
-        .iter()
-        .map(PathBuf::from)
-        .collect();
-    let mut write: Vec<PathBuf> = crate::master::CONFINE_SYSTEM_WRITE
-        .iter()
-        .map(PathBuf::from)
-        .collect();
-
-    // Programs the launch line and the worker's own commands resolve:
-    // pi + its interpreter/package, cadence (the CLI a worker calls:
-    // `message result`, `issue`), the `confine` exe that wraps it all.
-    let mut programs = Vec::new();
-    if let Some(p) = command.first().and_then(|c| which(c, path.as_deref())) {
-        programs.extend(with_interpreter(&p, path.as_deref()));
-        if let Some(root) = package_root(&p) {
-            programs.push(root);
-        }
-    }
-    if let Some(p) = which("cadence", path.as_deref()) {
-        programs.push(p);
-    }
-    programs.push(PathBuf::from(confine_command(env)));
-    for program in &programs {
-        for dir in program_dirs(program) {
-            if !read.contains(&dir) {
-                read.push(dir);
-            }
-        }
-    }
-
-    let params = agent.params.clone().unwrap_or(Value::Null);
-    if let Ok(path) = pi_turn_guard_path(state_dir, &agent.alias) {
-        read.push(path);
-    }
-    read.push(crate::client::briefing_path(
-        state_dir,
-        &params,
-        &agent.alias,
-    ));
-    if let Some(marker) = crate::sandbox::marker_for(state_dir) {
-        read.push(marker);
-    }
-
-    // The worktree and everything a commit/build writes into or
-    // through: the common git dir (objects, refs, per-worktree index),
-    // the effective target dir (covers `build.target-dir` and a
-    // declared `CARGO_TARGET_DIR`), and the shared dep cache the
-    // worktree's target links into (`<root>/.cadence/target/shared`).
-    write.push(cwd.clone());
-    if let Some(common) = git_common_dir(&cwd) {
-        write.push(common.clone());
-        if let Some(root) = common
-            .parent()
-            .filter(|_| common.file_name().is_some_and(|n| n == ".git"))
-        {
-            write.push(crate::worktree::shared_target_dir(root));
-        }
-    }
-    let target = crate::worktree::effective_target_dir(&cwd);
-    if target != cwd.join("target") {
-        write.push(target);
-    }
-
-    // Private state: the worker's own dir (config, session, tmp),
-    // the tracker, and the declared toolchain caches.
-    if let Ok(dir) = pi_worker_dir(state_dir, &agent.alias) {
-        write.push(dir);
-    }
-    let pm_dir = env
-        .var("CADENCE_PM_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| crate::issue::default_dir().ok());
-    if let Some(pm) = pm_dir {
-        write.push(pm);
-    }
-    let cargo_home = env
-        .var("CARGO_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|h| h.join(".cargo")));
-    if let Some(cargo) = &cargo_home {
-        read.push(cargo.join("bin"));
-        // `config.toml` — cargo dies on EACCES (proven); the rustc-
-        // wrapper and source mirrors live here. `credentials.toml`
-        // (registry tokens) is deliberately NOT granted.
-        read.push(cargo.join("config.toml"));
-        for cache in ["registry", "git", ".global-cache"] {
-            write.push(cargo.join(cache));
-        }
-        write.push(cargo.join(".package-cache"));
-    }
-    let rustup_home = env
-        .var("RUSTUP_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|h| h.join(".rustup")));
-    if let Some(rustup) = rustup_home {
-        read.push(rustup);
-    }
-    let sccache = env
-        .var("SCCACHE_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|h| h.join(".cache/sccache")));
-    if let Some(dir) = sccache {
-        write.push(dir);
-    }
-    if let Some(home) = &home {
-        // sccache's own config (`~/.config/sccache/config`) — settings,
-        // not secrets. The ssh files are the non-secret pair only:
-        // keys under `~/.ssh` stay denied; agent auth rides
-        // SSH_AUTH_SOCK, a unix-socket connect Landlock does not gate.
-        read.push(home.join(".config/sccache"));
-        read.push(home.join(".ssh/config"));
-        read.push(home.join(".ssh/known_hosts"));
-        // Devin login remains outside every worker's filesystem policy.
-    }
-    // CAD-570: the worker's own XDG_CACHE_HOME (`<worker>/pi/cache`),
-    // named explicitly so the write set shows it — it is inside the
-    // `agents/<alias>` grant either way, so the push is documentation
-    // plus resilience if that grant ever narrows.
-    if let Ok(cache) = pi_worker_config_dir(state_dir, &agent.alias).map(|d| d.join("cache")) {
-        if !write.contains(&cache) {
-            write.push(cache);
-        }
-    }
-    // CAD-559: the pinned `[pi].providers` package dirs the `-e`
-    // entries point into — read-only, the same grant the master gets.
-    // `build_command` refuses the launch on an unresolvable pin, so a
-    // missed grant here can never load anything else instead.
-    if let Ok(packages) = provider_packages(env) {
-        for pkg in packages {
-            if !read.contains(&pkg.dir) {
-                read.push(pkg.dir);
-            }
-        }
-    }
-    read.extend(split_paths(env.var(CONFINE_WORKER_EXTRA_READ_ENV)));
-    write.extend(split_paths(env.var(CONFINE_WORKER_EXTRA_WRITE_ENV)));
-    (confine_command(env), crate::confine::Policy { read, write })
-}
-
-/// Resolve the operator's git identity (`user.name`, `user.email`)
-/// into the worker's private `gitconfig` — the file
-/// `GIT_CONFIG_GLOBAL` points at once confined. Written only when the
-/// operator has an identity to copy; an absent file reads as empty
-/// config, so a repo-local `git config user.*` or none is honoured the
-/// same way an unconfined worker would.
-fn seed_worker_gitconfig(dir: &Path, env: &ProviderEnv) -> Result<()> {
-    let Some(home) = env.var("HOME").filter(|h| !h.is_empty()) else {
-        return Ok(());
-    };
-    let get = |key: &str| {
-        crate::reaper::output(
-            std::process::Command::new("git")
-                .env("HOME", &home)
-                .args(["config", "--global", "--get", key]),
-        )
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-    };
-    let (Some(name), Some(email)) = (get("user.name"), get("user.email")) else {
-        return Ok(());
-    };
-    std::fs::write(
-        dir.join("gitconfig"),
-        format!("[user]\n\tname = {name}\n\temail = {email}\n"),
-    )?;
-    Ok(())
-}
-
-/// The generated guard extension — the Pi analogue of
-/// `CLAUDE_ALLOWED_TOOLS` + `--tools Bash` (CAD-322 round 2, C1). Pi's
-/// bash tool takes a single command STRING that a shell parses, so a
-/// string-prefix check is a bypass waiting to happen (`cadence status;
-/// rm`, `cadence status | sh`, `FOO=x cadence …`). The check is a
-/// grammar instead: every character must be in `[A-Za-z0-9 ._\/=:-]` —
-/// `;`, `&`, `|`, `$`, backticks, `>`, `<`, `(`, `)`, quotes, newlines
-/// and every control character are refused outright — then the command
-/// tokenizes on whitespace, `argv[0]` must be `cadence` exactly (an
-/// `A=b` env prefix or a `bash -c …` wrapper fails it), and `argv[1..]`
-/// must match one allowlisted subcommand entry. The grammar section
-/// between the markers is evaluated verbatim by `tests/pi_master.rs`
-/// under Node — keep it dependency-free plain JavaScript.
-const PI_GUARD_HEAD: &str = r#"// Generated by cadence (CAD-322) — do not edit.
-import { spawnSync } from "node:child_process";
-// The master may run only the allowlisted `cadence` commands and
-// read or write files under its own tmp dir; every other tool call
-// and every other bash command is blocked. Claude's session stays
-// Bash-only — this write tool is the Pi master's.
-// Plain JS: tests/pi_master.rs evaluates the grammar section verbatim.
-export default function (pi) {
-  // >>> cadence-guard-grammar >>>
-  // A command is allowed iff it parses under a grammar, never a string
-  // prefix: charset, tokenization, argv[0] === "cadence", then an
-  // argv-prefix match on the allowlist. `args: true` entries are the
-  // `Bash(cadence <verb…> *)` forms — they need at least one arg.
-  const RULES = __RULES__;
-  const AGENTICOS_READ_TOOLS = __AGENTICOS_READ_TOOLS__;
-  // The master's own tmp dir — Pi's bash spills long output here
-  // (CAD-552) and the write tool stages `--file` input here (CAD-614).
-  // Lexical normalization refuses `..` and prefix siblings; a second
-  // walk refuses a symlink planted on any existing component, so a
-  // link inside the dir cannot point the tool at another file.
-  const MASTER_TMP = __MASTER_TMP__;
-  const WRITE_MAX = 262144;
-  // The refusal names the rule the command hit and the allowed forms —
-  // the master reads it and self-corrects instead of probing (CAD-552).
-  function piGuardRefusal(cmd) {
-    if (typeof cmd !== "string" || cmd.length === 0 || cmd.length > 4096) {
-      return "one `cadence …` command per call";
-    }
-    // Every metacharacter, quote, expansion, redirection, glob and
-    // control character is refused by the charset — `;`, `&&`, `||`,
-    // `|`, `$(`, backticks, `>`, `<`, `(`, `)`, `\n`, `"`, `'`, `\`.
-    if (!/^[A-Za-z0-9 ._\/=:-]+$/.test(cmd)) {
-      return "no pipes, chaining (`;`, `&&`, `||`), redirects, `$(…)`, backticks, quotes or escapes — run one plain `cadence …` and filter inside it (`--json`, `--status`, `--project`), never `head`/`grep`/`tail`/`jq`";
-    }
-    const argv = cmd.split(" ").filter((t) => t.length > 0);
-    if (argv[0] !== "cadence") {
-      return "every command starts `cadence` — no env prefixes (`FOO=bar cadence …`), wrappers (`bash -c …`) or other programs";
-    }
-    const rest = argv.slice(1);
-    const allowed = RULES.some(
-      (r) =>
-        r.argv.every((tok, i) => rest[i] === tok) &&
-        (r.args ? rest.length > r.argv.length : rest.length === r.argv.length),
-    );
-    if (!allowed) {
-      return (
-        "not an allowlisted verb — allowed: " +
-        RULES.map((r) => "cadence " + r.argv.join(" ") + (r.args ? " …" : "")).join("; ") +
-        ". request approval with: cadence master ask-permission --reason refused -- " +
-        cmd
-      );
-    }
-    return piIssueNewLimits(rest) || piWikiPutLimits(rest) || piFileArgLimits(rest);
-  }
-  function piGuardAllows(cmd) {
-    return piGuardRefusal(cmd) === null;
-  }
-  // Normalize `.`/`..`, resolve a relative path against cwd, then
-  // require the MASTER_TMP dir prefix — `<tmp>-evil/x`, `<tmp>/../x`
-  // and `/etc/passwd` all return null.
-  function piLexicalInside(p) {
-    if (typeof p !== "string" || p.length === 0) {
-      return null;
-    }
-    const abs = p.startsWith("/") ? p : process.cwd() + "/" + p;
-    const parts = [];
-    for (const seg of abs.split("/")) {
-      if (seg === "" || seg === ".") {
-        continue;
-      }
-      if (seg === "..") {
-        if (parts.length > 0) {
-          parts.pop();
-        }
-        continue;
-      }
-      parts.push(seg);
-    }
-    const norm = "/" + parts.join("/");
-    if (!(norm === MASTER_TMP || norm.startsWith(MASTER_TMP + "/"))) {
-      return null;
-    }
-    return norm;
-  }
-  // Lexical confinement plus a real lstat walk: any symlink on an
-  // existing component refuses, including one planted inside tmp.
-  // A path that does not exist yet is fine — nothing to follow.
-  function piPathConfined(p) {
-    const norm = piLexicalInside(p);
-    if (norm === null) {
-      return false;
-    }
-    const fs = process.getBuiltinModule("node:fs");
-    const rest = norm.slice(MASTER_TMP.length).split("/").filter((s) => s.length > 0);
-    let cur = MASTER_TMP;
-    let st;
-    try {
-      st = fs.lstatSync(cur);
-    } catch (e) {
-      return !!(e && e.code === "ENOENT");
-    }
-    if (st.isSymbolicLink()) {
-      return false;
-    }
-    for (const seg of rest) {
-      cur = cur + "/" + seg;
-      try {
-        st = fs.lstatSync(cur);
-      } catch (e) {
-        return !!(e && (e.code === "ENOENT" || e.code === "ENOTDIR"));
-      }
-      if (st.isSymbolicLink()) {
-        return false;
-      }
-    }
-    return true;
-  }
-  function piReadPathAllowed(p) {
-    return piPathConfined(p);
-  }
-  function piFlagValue(rest, name) {
-    const eq = name + "=";
-    for (let i = 0; i < rest.length; i++) {
-      if (rest[i] === name) {
-        return rest[i + 1];
-      }
-      if (rest[i].startsWith(eq)) {
-        return rest[i].slice(eq.length);
-      }
-    }
-    return undefined;
-  }
-  function piHasFlag(rest, name) {
-    return piFlagValue(rest, name) !== undefined || rest.includes(name);
-  }
-  function piFlagCount(rest, name) {
-    const eq = name + "=";
-    let n = 0;
-    for (let i = 0; i < rest.length; i++) {
-      if (rest[i] === name || rest[i].startsWith(eq)) {
-        n++;
-      }
-    }
-    return n;
-  }
-  // Backlog creation only. `--status backlog` is the one accepted
-  // override; `--owner` and `--id` are operator overrides.
-  function piIssueNewLimits(rest) {
-    if (rest[0] !== "issue" || rest[1] !== "new") {
-      return null;
-    }
-    if (piHasFlag(rest, "--owner")) {
-      return "the master creates backlog tickets without --owner — omit it; the ticket records actor=master";
-    }
-    if (piHasFlag(rest, "--id")) {
-      return "the master does not choose ticket ids — omit --id";
-    }
-    if (piHasFlag(rest, "--status")) {
-      const val = piFlagValue(rest, "--status");
-      if (val !== "backlog") {
-        return "the master creates backlog tickets only — omit --status or pass --status backlog";
-      }
-    }
-    return null;
-  }
-  // Own knowledge area only. `..` after the prefix is not a subpath.
-  function piWikiPutLimits(rest) {
-    if (rest[0] !== "wiki" || rest[1] !== "put") {
-      return null;
-    }
-    const path = rest[2];
-    const prefix = "agents/master/knowledge/";
-    const tail = typeof path === "string" && path.startsWith(prefix) ? path.slice(prefix.length) : null;
-    const safe =
-      tail !== null &&
-      tail.length > 0 &&
-      !tail.split("/").some((s) => s === "" || s === "." || s === "..");
-    if (!safe) {
-      return "wiki put writes only the master's own knowledge area — `cadence wiki put agents/master/knowledge/<name>.md --file <file under master/tmp>`. global/ and every other path stay denied";
-    }
-    // `-m` / `--text` is unbounded. The master writes the body with the
-    // write tool and passes one `--file` inside master/tmp.
-    if (piHasFlag(rest, "-m") || piHasFlag(rest, "--text")) {
-      return "the master does not pass -m — use the write tool into master/tmp, then --file <that path>";
-    }
-    if (!piHasFlag(rest, "--file")) {
-      return "wiki put takes --file from master/tmp — use the write tool into master/tmp, then --file <that path>";
-    }
-    return null;
-  }
-  // `--file` on any allowlisted verb must be a real file inside tmp.
-  // One `--file` only: clap keeps the last path, so a repeated flag
-  // whose first value sits inside tmp would otherwise sneak a second
-  // path past this check. Stdin (`--file -`) and a path outside tmp
-  // name the write-tool route.
-  function piFileArgLimits(rest) {
-    if (!piHasFlag(rest, "--file")) {
-      return null;
-    }
-    if (piFlagCount(rest, "--file") > 1) {
-      return "pass one --file — a repeated --file is refused; use the write tool into master/tmp, then --file <that path>";
-    }
-    const p = piFlagValue(rest, "--file");
-    if (typeof p !== "string" || p.length === 0 || p === "-") {
-      return "no stdin or heredoc — use the write tool into master/tmp, then --file <that path>";
-    }
-    if (!piPathConfined(p)) {
-      return "use the write tool into master/tmp, then --file <that path> — refused '" + p + "'";
-    }
-    return null;
-  }
-  // <<< cadence-guard-grammar <<<
-  // CAD-615: a live operator grant lets the exact command through.
-  // Otherwise a well-formed cadence or read-only command is filed as
-  // a permission request. Both calls are the guard's, not a bash
-  // command the grammar has to allow.
-  function piGrantAllows(cmd) {
-    if (typeof cmd !== "string" || !/^[A-Za-z0-9 ._\/=:-]+$/.test(cmd)) {
-      return false;
-    }
-    const argv = cmd.split(" ").filter((t) => t.length > 0);
-    const tool = argv[0];
-    // ls/cat/grep/find never re-enter this CLI, so a peek would leave
-    // the single-use grant live for every later call. Consume it first.
-    const verb = tool === "ls" || tool === "cat" || tool === "grep" || tool === "find"
-      ? "use-grant"
-      : "peek-grant";
-    try {
-      const r = spawnSync("cadence", ["master", verb, "--"].concat(argv), {
-        encoding: "utf8",
-        timeout: 8000,
-        cwd: process.cwd(),
-      });
-      return r.status === 0;
-    } catch (e) {
-      return false;
-    }
-  }
-  function piMaybeAsk(cmd) {
-    if (typeof cmd !== "string" || !/^[A-Za-z0-9 ._\/=:-]+$/.test(cmd)) {
-      return;
-    }
-    const argv = cmd.split(" ").filter((t) => t.length > 0);
-    const tool = argv[0];
-    if (tool !== "cadence" && tool !== "ls" && tool !== "cat" && tool !== "grep" && tool !== "find") {
-      return;
-    }
-    try {
-      spawnSync(
-        "cadence",
-        ["master", "ask-permission", "--reason", "guard refused a requestable command", "--"].concat(argv),
-        { encoding: "utf8", timeout: 8000, cwd: process.cwd() },
-      );
-    } catch (e) {}
-  }
-  pi.on("tool_call", async (event) => {
-    if (AGENTICOS_READ_TOOLS.includes(event.toolName)) {
-      return;
-    }
-    if (event.toolName === "read") {
-      const p = event.input && event.input.path;
-      if (!piReadPathAllowed(p)) {
-        return { block: true, reason: `cadence master: the read tool is confined to ${MASTER_TMP} (Pi's spilled bash output lives there) — got '${p}'` };
-      }
-      return;
-    }
-    if (event.toolName === "write") {
-      const p = event.input && event.input.path;
-      const content = event.input && event.input.content;
-      if (typeof content !== "string") {
-        return { block: true, reason: `cadence master: the write tool writes text into ${MASTER_TMP} — pass path and content, then use that path as --file` };
-      }
-      const bytes = Buffer.byteLength(content);
-      if (bytes > WRITE_MAX) {
-        return { block: true, reason: `cadence master: the write tool is capped at 256KB (${bytes} bytes) — split the note and write it under ${MASTER_TMP}` };
-      }
-      if (!piPathConfined(p)) {
-        return { block: true, reason: `cadence master: the write tool is confined to ${MASTER_TMP} — '..', symlinks and paths outside it are refused (got '${p}'). Write the file there, then pass --file` };
-      }
-      return;
-    }
-    if (event.toolName !== "bash") {
-      return { block: true, reason: `cadence master: only allowlisted \`cadence\` bash commands and read/write inside ${MASTER_TMP} are permitted (tool '${event.toolName}' is not enabled)` };
-    }
-    const cmd = String(event.input?.command ?? "");
-    const refusal = piGuardRefusal(cmd);
-    if (refusal !== null) {
-      if (piGrantAllows(cmd)) {
-        return;
-      }
-      piMaybeAsk(cmd);
-      return { block: true, reason: `cadence master refused bash '${cmd}': ${refusal}` };
-    }
-  });
-}
-"#;
-
-/// One allowlisted invocation in the generated guard: the argv after
-/// `cadence`, and whether trailing arguments are allowed
-/// (`Bash(cadence <verb…> *)` forms) or the match is exact.
-fn pi_guard_rules(profile: crate::master::Profile) -> Vec<Value> {
-    let mut rules = Vec::new();
-    for tool in crate::master::allowed_tools(profile) {
-        let Some(inner) = tool.strip_prefix("Bash(").and_then(|t| t.strip_suffix(')')) else {
-            continue;
-        };
-        let (stem, args) = match inner.strip_suffix(" *") {
-            Some(stem) => (stem, true),
-            None if inner.ends_with('*') => continue, // `foo*`-forms are never allowlisted
-            None => (inner, false),
-        };
-        let argv: Vec<&str> = stem.split_whitespace().collect();
-        if argv.first() != Some(&"cadence") || argv.len() < 2 {
-            continue; // a rule that cannot start with `cadence` is dead weight
-        }
-        rules.push(json!({"argv": argv[1..], "args": args}));
-    }
-    rules
-}
-
-/// Write the guard extension; a missing or stale file never weakens
-/// the posture because `open` regenerates it per launch.
-fn write_pi_guard(
-    state_dir: &Path,
-    agenticos_reads: bool,
-    profile: crate::master::Profile,
-) -> Result<PathBuf> {
-    // JSON strings are valid JS literals — the substitution needs no
-    // escaping of its own.
-    let source = PI_GUARD_HEAD
-        .replace("__RULES__", &json!(pi_guard_rules(profile)).to_string())
-        .replace(
-            "__AGENTICOS_READ_TOOLS__",
-            &json!(if agenticos_reads {
-                AGENTICOS_READ_TOOLS
-            } else {
-                &[]
-            })
-            .to_string(),
-        )
-        .replace(
-            "__MASTER_TMP__",
-            &json!(crate::master::tmpdir(state_dir).to_string_lossy()).to_string(),
-        );
-    let path = pi_guard_path(state_dir);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&path, source)?;
-    Ok(path)
+/// Pi's display form of a provider HTTP error (`formatProviderError`):
+/// `400 {…}` or `400: {…}`. Anything that is not that JSON body is
+/// absent — a rate limit or a bare status is not a history refusal.
+fn provider_error_body(error: &str) -> Option<Value> {
+    let rest = error.trim_start().strip_prefix("400")?;
+    let rest = rest.strip_prefix(':').unwrap_or(rest).trim();
+    serde_json::from_str(rest).ok()
 }
 
 /// CAD-1076: the provider refused the request itself — HTTP 400 whose
-/// JSON body carries `code: "invalid_request"` (the AgenticOS gateway's
-/// answer to a history over its schema limits; Pi renders it as
-/// `400 {…}` or `400: {…}`). A rate limit, an outage, a credential
-/// error or any other code never matches.
-fn history_rejected(error: &str) -> bool {
-    let Some(body) = error.trim_start().strip_prefix("400") else {
-        return false;
-    };
-    let body = body.strip_prefix(':').unwrap_or(body).trim();
-    let Ok(body) = serde_json::from_str::<Value>(body) else {
-        return false;
-    };
+/// JSON body carries `code: "invalid_request"`. A rate limit, an
+/// outage, a credential error or any other code never matches.
+/// [`serialized_body_rejected`] is the narrower serialized-body case;
+/// it does not invent a byte cap the provider did not state.
+fn history_rejected(body: &Value) -> bool {
     body.get("code")
         .or_else(|| body.pointer("/error/code"))
         .and_then(Value::as_str)
         == Some("invalid_request")
+}
+
+/// The provider refused the serialized HTTP body, as opposed to a token
+/// or context-window limit. The provider's own message is the evidence;
+/// this does not apply a locally chosen byte cap.
+fn serialized_body_rejected(body: &Value) -> bool {
+    if !history_rejected(body) {
+        return false;
+    }
+    let Some(message) = body
+        .get("message")
+        .or_else(|| body.pointer("/error/message"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let lower = message.to_ascii_lowercase();
+    !lower.contains("token")
+        && !lower.contains("context window")
+        && !lower.contains("context length")
+        && !lower.contains("context_length")
+        && lower.contains("request body")
+        && (lower.contains("kib") || lower.contains("byte"))
+}
+
+/// Outcome of one settled Pi turn. `reset_session` is the only supported
+/// continuation: a master history refusal before any tool, which the
+/// daemon answers with one fresh session and the same message. After a
+/// tool, `prompt` can still call tools, and Pi exposes no command that
+/// continues from retained evidence with tools disabled. The turn stays
+/// failed with [`serialized_body_limitation`] and is not submitted again.
+struct PiSettlement {
+    status: &'static str,
+    error: Option<String>,
+    reset_session: bool,
+    limited: bool,
+}
+
+fn settle_pi_turn(acc: &mut TurnAcc, master: bool, interrupted_here: bool) -> PiSettlement {
+    let aborted = acc.stop.as_deref() == Some("aborted");
+    let (status, mut error) = if aborted || (interrupted_here && acc.error.is_some()) {
+        ("interrupted", None)
+    } else if let Some(err) = acc.error.take() {
+        ("failed", Some(err))
+    } else if acc.stop.as_deref() == Some("error") {
+        (
+            "failed",
+            Some("pi turn ended with stopReason 'error'".to_string()),
+        )
+    } else {
+        ("completed", None)
+    };
+    let body = error.as_deref().and_then(provider_error_body);
+    // The no-tools guard is the side-effect boundary. Do not drop it
+    // for a serialized-body refusal: a fresh prompt would replay
+    // work that already ran.
+    let reset_session =
+        status == "failed" && !acc.tools && master && body.as_ref().is_some_and(history_rejected);
+    let limited = match error.take() {
+        Some(original)
+            if status == "failed"
+                && acc.tools
+                && body.as_ref().is_some_and(serialized_body_rejected) =>
+        {
+            error = Some(serialized_body_limitation(&original));
+            true
+        }
+        other => {
+            error = other;
+            false
+        }
+    };
+    PiSettlement {
+        status,
+        error,
+        reset_session,
+        limited,
+    }
+}
+
+fn serialized_body_limitation(original: &str) -> String {
+    format!(
+        "The provider rejected the serialized request body. This is not a token \
+         or context-window limit. A tool already ran, so this turn was not \
+         submitted again and its effects were not replayed. The original user \
+         message, recorded tool evidence, and actor permissions are unchanged. \
+         Continuation is not available: a new prompt can still call tools, and \
+         Pi has no command that continues from retained evidence without \
+         replaying them. Provider error: {original}"
+    )
 }
 
 /// One in-flight command's response slot.
@@ -1648,6 +305,11 @@ struct TurnAcc {
     tools: bool,
 }
 
+struct OmpPrompt {
+    id: String,
+    yielded: bool,
+}
+
 struct Shared {
     hooks: AdapterHooks,
     pending: Pending,
@@ -1677,11 +339,17 @@ struct Shared {
     transport: Mutex<Option<Arc<StdioAdapter>>>,
     dead: AtomicBool,
     guard_ready: AtomicBool,
+    /// OMP completes correlated prompts, then may settle background work later.
+    omp: AtomicBool,
+    omp_prompt: Mutex<Option<OmpPrompt>>,
     guard_receipts: Mutex<HashMap<String, GuardReceipt>>,
     /// CAD-1076: the last master turn the provider refused before any
     /// work — the one turn [`ProviderAdapter::reset_rejected_session`]
-    /// may reset for.
+    /// may reset for. A serialized-body refusal after a tool is never
+    /// stored here.
     rejected_turn: Mutex<Option<String>>,
+    /// Native Pi `images` for the next prompt, then cleared.
+    turn_images: Mutex<Vec<Value>>,
 }
 
 struct GuardReceipt {
@@ -1704,11 +372,13 @@ pub struct PiAdapter {
     agent_uid: Option<u32>,
     /// CAD-1098: the tool profile the next `open` launches with.
     profile: Mutex<crate::master::Profile>,
+    /// OMP mints its session path before creating the file on its first turn.
+    pending_session_file: Mutex<Option<(String, String)>>,
 }
 
 /// Identity evidence must include an actual namespace and model id;
 /// a display name or a full requested id cannot replace that namespace.
-fn resolved_pi_model(state: &Value) -> Option<(String, &str)> {
+fn pi_model_identity(state: &Value) -> Option<(&str, &str)> {
     let model = state.get("model")?;
     let provider = model.get("provider")?.as_str()?;
     let id = model.get("id")?.as_str()?;
@@ -1720,7 +390,35 @@ fn resolved_pi_model(state: &Value) -> Option<(String, &str)> {
     {
         return None;
     }
+    Some((provider, id))
+}
+
+fn resolved_pi_model(state: &Value) -> Option<(String, &str)> {
+    let (provider, id) = pi_model_identity(state)?;
     Some((format!("{provider}/{id}"), id))
+}
+
+/// Pi's live model object is the modality contract (`input` contains
+/// `"image"`). A missing list is not vision, and the model id is not a
+/// substitute for that list.
+fn selected_model_admits_image(state: &Value) -> Result<()> {
+    let Some((provider, id)) = pi_model_identity(state) else {
+        return Err(Error::pre_write(
+            "Pi did not identify its selected model, so the attached library image was not sent. The model was left unchanged.",
+        ));
+    };
+    let model = &state["model"];
+    let Some(input) = model.get("input").and_then(Value::as_array) else {
+        return Err(Error::pre_write(
+            "Pi did not report input modalities for the selected model, so the attached library image was not sent. The model was left unchanged.",
+        ));
+    };
+    if input.iter().any(|item| item.as_str() == Some("image")) {
+        return Ok(());
+    }
+    Err(Error::pre_write(format!(
+        "selected model {provider}/{id} admits no image input, so the attached library image was not sent. Choose a model whose reported input modalities include image; this model was left unchanged."
+    )))
 }
 
 impl PiAdapter {
@@ -1746,8 +444,11 @@ impl PiAdapter {
             transport: Mutex::new(None),
             dead: AtomicBool::new(false),
             guard_ready: AtomicBool::new(false),
+            omp: AtomicBool::new(false),
+            omp_prompt: Mutex::new(None),
             guard_receipts: Mutex::new(HashMap::new()),
             rejected_turn: Mutex::new(None),
+            turn_images: Mutex::new(Vec::new()),
         });
         let routed = Arc::clone(&shared);
         let disconnected = Arc::clone(&shared);
@@ -1771,7 +472,20 @@ impl PiAdapter {
                 .unwrap_or_else(|| PathBuf::from(".")),
             agent_uid,
             profile: Mutex::new(crate::master::Profile::Home),
+            pending_session_file: Mutex::new(None),
         }
+    }
+
+    fn persist_pending_session_file(&self) {
+        let mut pending = self.pending_session_file.lock().unwrap();
+        let Some((alias, file)) = pending.as_ref() else {
+            return;
+        };
+        if !Path::new(file).is_file() {
+            return;
+        }
+        record_current_session(&self.state_dir, alias, file);
+        *pending = None;
     }
 
     /// The emitted confinement, appended to the provider log so an
@@ -1780,10 +494,7 @@ impl PiAdapter {
         if let Some(dir) = self.log_path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)?;
+        let mut log = super::open_provider_log(&self.log_path)?;
         std::io::Write::write_all(
             &mut log,
             format!(
@@ -1959,10 +670,7 @@ impl PiAdapter {
         // the wire, exactly like the open path's re-check — under the
         // role this adapter opened as (CAD-575).
         let want = format!("{provider}/{model_id}");
-        let pi_policy = pi_pm_dir(&self.env)
-            .map(|dir| crate::pi_policy::read(&dir))
-            .transpose()?
-            .flatten();
+        let pi_policy = settings_policy(&self.env)?;
         let role = if self.shared.master.load(Ordering::SeqCst) {
             "master"
         } else {
@@ -2057,6 +765,12 @@ impl PiAdapter {
             .lock()
             .unwrap()
             .insert(id.clone(), tx);
+        if command == "prompt" && self.shared.omp.load(Ordering::SeqCst) {
+            *self.shared.omp_prompt.lock().unwrap() = Some(OmpPrompt {
+                id: id.clone(),
+                yielded: false,
+            });
+        }
         let mut frame = json!({"id": id, "type": command});
         if let Some(obj) = fields.as_object() {
             for (k, v) in obj {
@@ -2113,6 +827,22 @@ impl Shared {
         // Any parsed line is proof of life.
         *self.last_activity.lock().unwrap() = Instant::now();
         if method == "response" {
+            if self.omp.load(Ordering::SeqCst)
+                && params.get("command").and_then(Value::as_str) == Some("prompt")
+                && params.get("success").and_then(Value::as_bool) == Some(true)
+                && params
+                    .pointer("/data/agentInvoked")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+            {
+                let mut pending = self.omp_prompt.lock().unwrap();
+                if pending.as_ref().is_some_and(|prompt| {
+                    params.get("id").and_then(Value::as_str) == Some(prompt.id.as_str())
+                }) {
+                    *pending = None;
+                    self.finish_turn();
+                }
+            }
             self.pending.resolve(&params);
             return;
         }
@@ -2164,12 +894,52 @@ impl Shared {
                     .unwrap_or("pi auto-retry exhausted");
                 self.turn.lock().unwrap().error = Some(err.to_string());
             }
-            "agent_settled" => {
-                let acc = std::mem::take(&mut *self.turn.lock().unwrap());
-                self.outcomes.lock().unwrap().push_back(acc);
-                self.outcome_cv.notify_all();
+            "agent_settled" if !self.omp.load(Ordering::SeqCst) => self.finish_turn(),
+            "prompt_result" if self.omp.load(Ordering::SeqCst) => {
+                self.on_omp_prompt_result(&params);
+            }
+            "session_settled" if self.omp.load(Ordering::SeqCst) => {
+                let mut pending = self.omp_prompt.lock().unwrap();
+                if pending.as_ref().is_some_and(|prompt| prompt.yielded) {
+                    *pending = None;
+                    self.finish_turn();
+                }
             }
             _ => {}
+        }
+    }
+    fn finish_turn(&self) {
+        let acc = std::mem::take(&mut *self.turn.lock().unwrap());
+        self.outcomes.lock().unwrap().push_back(acc);
+        self.outcome_cv.notify_all();
+    }
+
+    fn on_omp_prompt_result(&self, event: &Value) {
+        let mut pending = self.omp_prompt.lock().unwrap();
+        let Some(prompt) = pending.as_mut() else {
+            return;
+        };
+        if event.get("id").and_then(Value::as_str) != Some(prompt.id.as_str()) {
+            return;
+        }
+        match event.get("status").and_then(Value::as_str) {
+            Some("completed") => {}
+            Some("aborted") => self.turn.lock().unwrap().stop = Some("aborted".to_string()),
+            Some("error") => {
+                self.turn.lock().unwrap().error = Some(
+                    event
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("OMP prompt failed")
+                        .to_string(),
+                );
+            }
+            _ => return,
+        }
+        prompt.yielded = true;
+        if event.get("sessionSettled").and_then(Value::as_bool) == Some(true) {
+            *pending = None;
+            self.finish_turn();
         }
     }
 
@@ -2365,16 +1135,13 @@ impl ProviderAdapter for PiAdapter {
         if want.trim().is_empty() {
             return Err(Error::rejected(format!(
                 "pi agent '{}' has no model configured — pass --model \
-                 <provider/id> or set pi.models.default.{} in pm.yaml; a \
+                 <provider/id> or configure the {} default in Settings > Agents; a \
                  silent provider fallback is never used (CAD-559)",
                 agent.alias,
                 if master { "master" } else { "worker" }
             )));
         }
-        let pi_policy = pi_pm_dir(&self.env)
-            .map(|dir| crate::pi_policy::read(&dir))
-            .transpose()?
-            .flatten();
+        let pi_policy = settings_policy(&self.env)?;
         crate::pi_policy::require_allowed(
             pi_policy.as_ref(),
             if master { "master" } else { "worker" },
@@ -2393,6 +1160,10 @@ impl ProviderAdapter for PiAdapter {
             None
         }; // Real owner provisions BEFORE verify-only topology walk.
         self.shared.master.store(master, Ordering::SeqCst);
+        self.shared
+            .omp
+            .store(agent.provider == "omp", Ordering::SeqCst);
+        *self.shared.omp_prompt.lock().unwrap() = None;
         if master && self.agent_uid.is_none() {
             let agenticos_reads = agenticos_read_extension(&self.env)?.is_some();
             write_pi_guard(
@@ -2513,7 +1284,11 @@ impl ProviderAdapter for PiAdapter {
                     self.env.var("PI_CODING_AGENT_DIR"),
                     self.env.var("HOME"),
                 );
-                if want.starts_with("agenticos/") {
+                if agent.provider == "omp" {
+                    // OMP uses its native agent.db, not Pi's auth.json. Keep its
+                    // login private; never copy the operator's entire database.
+                    ensure_private_dir(&config)?;
+                } else if want.starts_with("agenticos/") {
                     agenticos::seed(&config, &pi_config_dir(&self.state_dir), want)?;
                 } else if let Some(operator) = operator.as_deref() {
                     copy_pi_auth(&config, operator)?;
@@ -2569,6 +1344,7 @@ impl ProviderAdapter for PiAdapter {
         // including launch/effort setup, must revoke its prompt capability.
         // Keep all fallible post-launch work inside one cleanup boundary.
         *self.transport.write().unwrap() = Arc::clone(&transport);
+        let workdir = launch_workdir(agent).to_string_lossy().into_owned();
         let initialized = (|| {
             #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
             let pid = match protected {
@@ -2580,10 +1356,10 @@ impl ProviderAdapter for PiAdapter {
                     // stdio pipes/control channel, never a returned PID as custody.
                     transport.adopt_protected(launch, &self.log_path)?
                 }
-                None => transport.launch(&agent.cwd, &self.log_path, &env)?,
+                None => transport.launch(&workdir, &self.log_path, &env)?,
             };
             #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
-            let pid = transport.launch(&agent.cwd, &self.log_path, &env)?;
+            let pid = transport.launch(&workdir, &self.log_path, &env)?;
             // Effort: validate against the model's real levels, then verify
             // what stuck — Pi answers success even on a silent fallback.
             if let Some(effort) = params.get("effort").and_then(Value::as_str) {
@@ -2652,12 +1428,42 @@ impl ProviderAdapter for PiAdapter {
                 return Err(self.command_error("get_state", &state));
             }
             let data = state.get("data").cloned().unwrap_or(Value::Null);
-            let session_id = data
+            let session_id = match data
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            {
+                Some(id) => id.to_string(),
+                None if agent.provider == "omp" => {
+                    return Err(Error::provider(
+                        "OMP did not report its native session identity",
+                    ));
+                }
+                None => Uuid::new_v4().to_string(),
+            };
+            if agent.provider == "omp"
+                && !master
+                && [agent.thread_id.as_deref(), agent.session_id.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|owned| owned != session_id)
+            {
+                return Err(Error::rejected(
+                    "OMP reopened with a different native identity; refusing session replacement",
+                ));
+            }
+            *self.pending_session_file.lock().unwrap() = None;
+            // CAD-1752: the session file Pi actually opened (a lane
+            // relaunch forks into a new one) is this worker's current one.
+            if !master {
+                if let Some(file) = data.get("sessionFile").and_then(Value::as_str) {
+                    record_current_session(&self.state_dir, &agent.alias, file);
+                    if agent.provider == "omp" && !Path::new(file).is_file() {
+                        *self.pending_session_file.lock().unwrap() =
+                            Some((agent.alias.clone(), file.to_string()));
+                    }
+                }
+            }
             let Some((reported_full, reported_id)) = resolved_pi_model(&data) else {
                 return Err(Error::provider("pi did not report a nonempty provider and model id at open — transport closed (CAD-603)"));
             };
@@ -2716,8 +1522,35 @@ impl ProviderAdapter for PiAdapter {
         initialized
     }
 
-    /// One durable message → one `prompt` command → `agent_settled`.
-    /// The response gates acceptance; the settle carries the outcome.
+    fn bind_turn_images(&self, images: &[super::TurnImage]) -> Result<()> {
+        if images.is_empty() {
+            self.shared.turn_images.lock().unwrap().clear();
+            return Ok(());
+        }
+        let mut encoded = Vec::with_capacity(images.len());
+        for image in images {
+            if image.bytes.len() > 4 * 1024 * 1024
+                || !matches!(image.media_type, "image/png" | "image/jpeg" | "image/webp")
+            {
+                return Err(Error::pre_write(
+                    "retained image is outside the native prompt bound, so it was not sent",
+                ));
+            }
+            encoded.push(json!({
+                "type": "image",
+                "mimeType": image.media_type,
+                "data": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &image.bytes,
+                ),
+            }));
+        }
+        *self.shared.turn_images.lock().unwrap() = encoded;
+        Ok(())
+    }
+
+    /// One durable message → one `prompt` command → provider settlement.
+    /// The response gates acceptance; a correlated OMP result may fail later.
     fn run_turn(
         &self,
         prompt: &str,
@@ -2737,6 +1570,19 @@ impl ProviderAdapter for PiAdapter {
         _client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
+        if !self.shared.turn_images.lock().unwrap().is_empty() {
+            let state = match self.checked("get_state", json!({})) {
+                Ok(state) => state,
+                Err(error) => {
+                    self.shared.turn_images.lock().unwrap().clear();
+                    return Err(error);
+                }
+            };
+            if let Err(error) = selected_model_admits_image(&state) {
+                self.shared.turn_images.lock().unwrap().clear();
+                return Err(error);
+            }
+        }
         let generation = self.shared.generation.lock().unwrap().clone();
         let turn_id = registry::PI_MANAGED_TURN_TOKENS.mint(&generation);
         let prompt = &super::with_turn_token(prompt, slot, &turn_id);
@@ -2753,20 +1599,48 @@ impl ProviderAdapter for PiAdapter {
         *self.shared.turn.lock().unwrap() = TurnAcc::default();
         let guarded = self.native_turn_steering();
         if guarded {
-            let binding = self.guard_command("bind", &turn_id, &format!("bind-{turn_id}"), None)?;
+            let binding =
+                match self.guard_command("bind", &turn_id, &format!("bind-{turn_id}"), None) {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        self.shared.turn_images.lock().unwrap().clear();
+                        return Err(error);
+                    }
+                };
             if binding.get("outcome").and_then(Value::as_str) != Some("bound") {
+                self.shared.turn_images.lock().unwrap().clear();
                 return Err(Error::rejected("Pi runtime refused the new turn binding"));
             }
         }
         let submitted = if guarded {
             // RPC does not expose expandPromptTemplates:false. Do not let a
             // plain task body invoke our private slash-control commands.
-            format!("Cadence task input (not a runtime command):\n{prompt}")
+            format!("{TASK_INPUT_PREFIX}{prompt}")
         } else {
             prompt.to_string()
         };
-        let resp = self.request("prompt", json!({"message": submitted}))?;
+        let master = self.shared.master.load(Ordering::SeqCst);
+        let mut held = self.shared.turn_images.lock().unwrap();
+        let payload = if held.is_empty() {
+            json!({"message": submitted})
+        } else if master {
+            // A pre-tool history refusal retries this same prompt. Keep the
+            // blocks for that one retry; the worker path cannot retry.
+            json!({"message": submitted, "images": held.clone()})
+        } else {
+            let images = std::mem::take(&mut *held);
+            json!({"message": submitted, "images": images})
+        };
+        drop(held);
+        let resp = match self.request("prompt", payload) {
+            Ok(resp) => resp,
+            Err(error) => {
+                self.shared.turn_images.lock().unwrap().clear();
+                return Err(error);
+            }
+        };
         if resp.get("success").and_then(Value::as_bool) != Some(true) {
+            self.shared.turn_images.lock().unwrap().clear();
             if guarded {
                 // Definite prompt refusal can leave an unused pending binding.
                 // Clear only that exact unused binding, never an active run.
@@ -2837,43 +1711,48 @@ impl ProviderAdapter for PiAdapter {
             }
         })();
         *self.shared.active_turn.lock().unwrap() = None;
-        let acc = waited?;
+        self.persist_pending_session_file();
+        let mut acc = match waited {
+            Ok(acc) => acc,
+            Err(error) => {
+                self.shared.turn_images.lock().unwrap().clear();
+                return Err(error);
+            }
+        };
         if guarded {
             // The actor cannot dispatch its next kickoff until this returns.
             // Settlement has closed runtime admission. Clear any accepted but
             // unconsumed native input left by cancellation before a successor.
             // An uncertain cleanup fences the kickoff rather than risking replay.
-            self.checked("clear_queue", json!({})).map_err(|error| {
-                Error::unknown(format!(
+            if let Err(error) = self.checked("clear_queue", json!({})) {
+                self.shared.turn_images.lock().unwrap().clear();
+                return Err(Error::unknown(format!(
                     "Pi native input cleanup was not confirmed: {error}"
-                ))
-            })?;
+                )));
+            }
         }
         let interrupted_here = self.shared.interrupt_at.lock().unwrap().take().is_some();
-        let aborted = acc.stop.as_deref() == Some("aborted");
-        let (status, error) = if aborted || (interrupted_here && acc.error.is_some()) {
-            ("interrupted", None)
-        } else if let Some(err) = acc.error {
-            ("failed", Some(err))
-        } else if acc.stop.as_deref() == Some("error") {
-            (
-                "failed",
-                Some("pi turn ended with stopReason 'error'".to_string()),
-            )
-        } else {
-            ("completed", None)
-        };
-        *self.shared.rejected_turn.lock().unwrap() = (status == "failed"
-            && !acc.tools
-            && self.shared.master.load(Ordering::SeqCst)
-            && error.as_deref().is_some_and(history_rejected))
-        .then(|| turn_id.clone());
+        let master = self.shared.master.load(Ordering::SeqCst);
+        let settled = settle_pi_turn(&mut acc, master, interrupted_here);
+        if settled.limited {
+            // Durable failure record. Tool bodies stay on the thread
+            // entries already recorded; this event only classifies the
+            // refusal and states that the turn was not replayed.
+            self.shared.emit(
+                "cadence/serialized_body_limited",
+                &json!({"turn": turn_id, "replayed": false}),
+            );
+        }
+        *self.shared.rejected_turn.lock().unwrap() = settled.reset_session.then(|| turn_id.clone());
+        if !settled.reset_session {
+            self.shared.turn_images.lock().unwrap().clear();
+        }
         Ok(TurnResult {
             turn_id,
-            status: status.to_string(),
+            status: settled.status.to_string(),
             text: acc.text.unwrap_or_default(),
             stop_reason: acc.stop,
-            error,
+            error: settled.error,
         })
     }
 
@@ -3003,6 +1882,7 @@ impl ProviderAdapter for PiAdapter {
         // A reset that did not happen is no reset: the turn keeps the
         // provider's own error, and the daemon does not retry.
         if let Err(e) = self.checked("new_session", json!({})) {
+            self.shared.turn_images.lock().unwrap().clear();
             self.shared.emit(
                 "cadence/pi_session_reset_failed",
                 &json!({"turn": result.turn_id, "error": e.to_string()}),
@@ -3026,6 +1906,7 @@ impl ProviderAdapter for PiAdapter {
         transport.close_stdin();
         transport.wait_exit(Duration::from_secs(3));
         transport.close();
+        self.persist_pending_session_file();
         self.shared.on_disconnect();
     }
 }
@@ -3033,6 +1914,315 @@ impl ProviderAdapter for PiAdapter {
 #[cfg(test)]
 #[path = "pi/cad1195_acceptance.rs"]
 mod cad1195_acceptance;
+#[cfg(all(test, debug_assertions, unix))]
+mod cad1553_company_authority_acceptance {
+    use super::*;
+    use crate::platform::deployments::DeploymentMetadata;
+    use serde_json::json;
+
+    const EXACT: &str = r#"{"schema":1,"master_trust_boundary":"company-container@1","providers":[{"provider":"agenticos","origin":"http://api.internal","manifest_pin":"agenticos-manifest@1/publish_post@2"}]}"#;
+    const ORDINARY: &str = r#"{"schema":1,"providers":[{"provider":"agenticos","origin":"http://api.internal","manifest_pin":"agenticos-manifest@1/publish_post@2"}]}"#;
+
+    fn master(params: Value, state: &Path) -> Agent {
+        Agent {
+            alias: "master".into(),
+            uid: "agt-cad1553".into(),
+            provider: "pi".into(),
+            endpoint_kind: "managed".into(),
+            role: "worker".into(),
+            team_role: None,
+            cwd: state.to_string_lossy().into_owned(),
+            sandbox: "read-only".into(),
+            instructions: None,
+            thread_id: None,
+            session_id: None,
+            model: None,
+            effort: None,
+            pid: None,
+            pid_start: None,
+            endpoint: None,
+            params: Some(params),
+            model_selection: None,
+            quota: None,
+            generation: None,
+            state: "starting".into(),
+            enabled: true,
+            gc_keep: false,
+            archived_at: None,
+            archived_by: None,
+            archive_reason: None,
+            lifecycle_rev: 0,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        }
+    }
+
+    fn plan(
+        env: &ProviderEnv,
+        state: &Path,
+        agent: &Agent,
+    ) -> Result<(Vec<String>, Option<crate::confine::Policy>)> {
+        launch_command(env, state, agent)
+    }
+
+    fn inner(env: &ProviderEnv, state: &Path, agent: &Agent) -> Vec<String> {
+        build_command(env, agent, state).unwrap()
+    }
+
+    fn refused(env: &ProviderEnv, state: &Path, agent: &Agent, case: &str) {
+        let error = plan(env, state, agent)
+            .expect_err(&format!("{case} manufactured company file authority"));
+        assert!(
+            error.to_string().contains(
+                "cannot isolate operational upload workspace without effective Master confinement"
+            ),
+            "{case} refused for an unrelated reason: {error}"
+        );
+    }
+
+    #[test]
+    fn mutable_values_cannot_grant_company_authority_but_exact_image_proof_can() {
+        let root = tempfile::Builder::new()
+            .prefix("c1553-pi-")
+            .tempdir()
+            .unwrap();
+        let state = root.path().join("s");
+        let tracker = root.path().join("t");
+        let home = root.path().join("h");
+        let private = root.path().join("p");
+        let workspace = private.join("workspace");
+        for path in [&state, &home, &workspace] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        crate::issue::Pm::init(&tracker).unwrap();
+        let store = Arc::new(crate::store::Store::open(&state.join("cadence.sqlite3")).unwrap());
+        let mut settings = store.import_legacy_settings(&tracker).unwrap();
+        settings.doc.pi = Some(
+            serde_json::from_value(json!({
+                "models": { "allow": ["fixture/model"] }
+            }))
+            .unwrap(),
+        );
+        store
+            .save_settings(settings.revision, settings.doc, "cad1553-fixture")
+            .unwrap();
+        let mutable = ProviderEnv::refusing_providers().with_settings_store(Arc::clone(&store));
+        mutable.set("HOME", home.to_str().unwrap());
+        mutable.set("CADENCE_HOME", private.to_str().unwrap());
+        mutable.set("CADENCE_PM_DIR", tracker.to_str().unwrap());
+        mutable.set("CADENCE_CONFINE_COMMAND", "/bin/false");
+        mutable.set("CADENCE_PI_COMMAND", "/bin/false");
+        mutable.set("CADENCE_CLAUDE_COMMAND", "/bin/false");
+        mutable.set(crate::master::CONFINE_EXTRA_READ_ENV, "");
+        mutable.set(crate::master::CONFINE_EXTRA_WRITE_ENV, "");
+        // A real, fixture-owned absolute extension path avoids relying on the
+        // test runner having no installed image extension in its ambient env.
+        let extension = root.path().join("image-read-extension.js");
+        std::fs::write(&extension, "// command-planning fixture only\n").unwrap();
+        mutable.set(
+            "CADENCE_PI_AGENTICOS_READ_EXTENSION",
+            extension.to_str().unwrap(),
+        );
+        mutable.set(crate::master::TEST_NO_LANDLOCK, "1");
+        assert!(
+            crate::master::confinement_available(&mutable).is_err(),
+            "the real per-daemon no-Landlock seam must be effective"
+        );
+        let bound = mutable.with_workspace(workspace.clone());
+        let loose = master(json!({"unconfined":true,"model":"fixture/model"}), &state);
+        refused(&bound, &state, &loose, "absent authority");
+        let ordinary = DeploymentMetadata::parse(ORDINARY.as_bytes()).unwrap();
+        refused(
+            &bound
+                .clone()
+                .with_company_master(ordinary.hosted_company_master()),
+            &state,
+            &loose,
+            "ordinary provider metadata",
+        );
+
+        // These are hostile values, deliberately supplied below the registry
+        // validator: even an in-memory Agent with forged fields cannot grant
+        // the adapter authority. This is not a test-only granting boolean.
+        let forged = master(
+            json!({
+                "unconfined":true,"model":"fixture/model",
+                "master_trust_boundary":"company-container@1",
+                "company_master":true,"hosted_company_master":true,
+                "provider_deployments":serde_json::from_str::<Value>(EXACT).unwrap()
+            }),
+            &state,
+        );
+        refused(&bound, &state, &forged, "forged agent params alone");
+        let claims = [
+            ("master_trust_boundary", "company-container@1"),
+            ("CADENCE_MASTER_TRUST_BOUNDARY", "company-container@1"),
+            ("CADENCE_COMPANY_MASTER", "true"),
+            ("CADENCE_HOSTED_COMPANY_MASTER", "true"),
+            ("CADENCE_PROVIDER_DEPLOYMENTS", EXACT),
+        ];
+        for (key, value) in claims {
+            mutable.set(key, value);
+        }
+        refused(&bound, &state, &loose, "forged mutable env alone");
+        refused(
+            &bound.clone(),
+            &state,
+            &forged,
+            "forged mutable env plus params",
+        );
+
+        let image = DeploymentMetadata::parse(EXACT.as_bytes()).unwrap();
+        let trusted = bound
+            .clone()
+            .with_company_master(image.hosted_company_master());
+        for (case, env) in [
+            ("exact image", trusted.clone()),
+            (
+                "proof survives clone and checked workspace binding",
+                trusted.clone().with_workspace(workspace.clone()),
+            ),
+        ] {
+            let (argv, policy) = plan(&env, &state, &loose).unwrap_or_else(|error| {
+                panic!("{case} refused existing unconfined Master: {error}")
+            });
+            assert!(
+                policy.is_none(),
+                "{case} falsely emitted a confinement policy"
+            );
+            assert!(
+                !master_confined(&env, &loose),
+                "{case} falsely labeled an unconfined Master confined"
+            );
+            assert_eq!(
+                argv,
+                inner(&env, &state, &loose),
+                "{case} changed provider command instead of lifting only workspace refusal"
+            );
+        }
+
+        // vars() is the actual environment handoff. Re-importing every value
+        // must lose the proof rather than serializing company authority.
+        let replayed = ProviderEnv::default()
+            .with_workspace(workspace.clone())
+            .with_settings_store(Arc::clone(&store));
+        for (key, value) in trusted.vars() {
+            replayed.set(&key, value);
+        }
+        refused(&replayed, &state, &loose, "serialized env replay");
+        for (key, _) in claims {
+            mutable.remove(key);
+        }
+        assert!(
+            !bound.company_master(),
+            "mutable-map clone acquired the trusted sibling proof"
+        );
+        assert!(
+            trusted.company_master(),
+            "mutable-map changes erased image-owned proof"
+        );
+        let (argv, policy) = plan(&trusted, &state, &loose).unwrap();
+        assert!(policy.is_none());
+        assert_eq!(argv, inner(&trusted, &state, &loose));
+        refused(&bound, &state, &loose, "env claims removed again");
+
+        // Image authority is not an implicit unconfined opt-in. With the
+        // existing opt-in absent, the launch still uses cadence confine;
+        // on this simulated host that wrapper will fail closed at execution.
+        let not_opted_in = master(json!({"model":"fixture/model"}), &state);
+        let (argv, policy) = plan(&trusted, &state, &not_opted_in).unwrap();
+        assert!(
+            policy.is_some(),
+            "image assertion silently opted Master out of confinement"
+        );
+        assert_eq!(
+            &argv[..2],
+            &["/bin/false".to_string(), "confine".to_string()]
+        );
+
+        // Removing only the unavailable-host seam restores actual host
+        // availability. Where effective confinement exists it must win even
+        // with both valid image proof and the saved unconfined opt-in.
+        mutable.remove(crate::master::TEST_NO_LANDLOCK);
+        let available = crate::master::confinement_available(&trusted).is_ok();
+        let (argv, policy) = plan(&trusted, &state, &loose).unwrap();
+        assert_eq!(
+            policy.is_some(),
+            available,
+            "company trust overrode effective confinement or falsely claimed it"
+        );
+        assert_eq!(master_confined(&trusted, &loose), available);
+        if let Some(policy) = policy {
+            let expected = crate::master::confine_argv(
+                "/bin/false",
+                &policy,
+                &inner(&trusted, &state, &loose),
+            );
+            assert_eq!(argv, expected);
+        } else {
+            assert_eq!(argv, inner(&trusted, &state, &loose));
+        }
+    }
+}
+
+#[cfg(test)]
+mod cad1247_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// CAD-1247: the resolver the daemon-start warning and
+    /// `doctor --host` share — bare `pi` resolves on PATH, names the
+    /// PATH when absent; `CADENCE_PI_COMMAND` names its own program.
+    #[test]
+    fn pi_launch_command_resolution() {
+        let env = ProviderEnv::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        assert!(resolve_pi_launch_command(&env, Some(&path)).is_err());
+        let pi = dir.path().join("pi");
+        std::fs::write(&pi, "#!/bin/sh\n").unwrap();
+        let mut mode = pi.metadata().unwrap().permissions();
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&pi, mode).unwrap();
+        assert_eq!(
+            resolve_pi_launch_command(&env, Some(&path)).as_deref().ok(),
+            Some(pi.as_path())
+        );
+        let relative_dir = tempfile::Builder::new()
+            .prefix(".cad1247-resolution-")
+            .tempdir_in(".")
+            .unwrap();
+        let relative_root = Path::new(".").join(relative_dir.path().file_name().unwrap());
+        let relative_pi = relative_root.join("pi");
+        std::fs::copy(&pi, &relative_pi).unwrap();
+        let relative_path = relative_root.to_str().unwrap();
+        assert!(!relative_pi.is_absolute());
+        assert!(resolve_pi_launch_command(&env, Some(relative_path))
+            .unwrap_err()
+            .contains("indeterminate"));
+        assert_eq!(
+            resolve_pi_launch_command(&env, Some(&format!("{path}:{relative_path}"))).unwrap(),
+            pi
+        );
+        assert!(
+            resolve_pi_launch_command(&env, Some(&format!("{relative_path}:{path}")))
+                .unwrap_err()
+                .contains("indeterminate")
+        );
+        env.set("CADENCE_PI_COMMAND", relative_pi.to_str().unwrap());
+        assert!(resolve_pi_launch_command(&env, Some(&path))
+            .unwrap_err()
+            .contains("indeterminate"));
+        env.set("CADENCE_PI_COMMAND", "/missing/pi --flag");
+        assert!(resolve_pi_launch_command(&env, Some(&path)).is_err());
+        env.set("CADENCE_PI_COMMAND", "/bin/true --flag");
+        assert_eq!(
+            resolve_pi_launch_command(&env, Some(&path)).as_deref().ok(),
+            Some(Path::new("/bin/true"))
+        );
+    }
+}
 
 #[cfg(test)]
 mod cad1098_tests {
@@ -3058,7 +2248,13 @@ mod cad1098_tests {
         let (home, app) = (pi_guard_rules(Home), pi_guard_rules(App));
         assert!(heads(&home).iter().any(|h| h == "issue"));
         assert!(!app.is_empty());
-        assert!(heads(&app).iter().all(|h| h == "app"), "{app:?}");
+        assert!(
+            // CAD-1168: `attachment read` rides both profiles.
+            heads(&app)
+                .iter()
+                .all(|h| h == "app" || h == "attachment" || h == "artifact"),
+            "{app:?}"
+        );
         assert!(app.iter().all(|r| home.contains(r)));
         let dir = tempfile::Builder::new().prefix("c98p").tempdir().unwrap();
         let rules_in = |path: &Path| -> String {
@@ -3081,3 +2277,389 @@ mod cad1098_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cad1457_tests {
+    use super::*;
+    use super::{AdapterHooks, ProviderAdapter};
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
+
+    const USER: &str = "keep this user input";
+    const GENERIC_BODY: &str =
+        "400: {\"message\":\"Request body exceeds 100 bytes.\",\"code\":\"invalid_request\"}";
+    const TOKEN: &str = "400: {\"message\":\"maximum context length is 262144 tokens\",\"code\":\"invalid_request\"}";
+
+    struct Stop {
+        adapter: Option<PiAdapter>,
+        dir: Option<tempfile::TempDir>,
+    }
+
+    type ObservedEvents = Arc<Mutex<Vec<(String, Value)>>>;
+    type Launch = (Stop, std::path::PathBuf, ObservedEvents);
+
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            if let Some(adapter) = self.adapter.take() {
+                adapter.close();
+            }
+            self.dir.take();
+        }
+    }
+
+    fn hooks(events: Arc<Mutex<Vec<(String, Value)>>>) -> AdapterHooks {
+        AdapterHooks {
+            on_event: Box::new(move |method, params| {
+                events
+                    .lock()
+                    .unwrap()
+                    .push((method.to_string(), params.clone()));
+            }),
+            on_request: Box::new(|_| {}),
+        }
+    }
+
+    fn script(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("pi-rpc");
+        let mut file = std::fs::File::create(&path).unwrap();
+        write!(
+            file,
+            r#"#!/usr/bin/python3
+import json, os, sys
+mode = os.environ.get("CAD1457_MODE", "after")
+error = os.environ.get("CAD1457_ERROR", "")
+log_path = os.environ["CAD1457_LOG"]
+
+def record(req):
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(req, separators=(",", ":")) + "\n")
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+def respond(req):
+    emit({{"id": req.get("id"), "type": "response", "command": req.get("type"), "success": True}})
+
+def fail_turn(stop):
+    emit({{
+        "type": "message_end",
+        "message": {{
+            "role": "assistant",
+            "content": [{{"type": "text", "text": "partial answer"}}],
+            "stopReason": stop,
+            "errorMessage": error,
+        }},
+    }})
+    emit({{"type": "agent_settled"}})
+
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        req = json.loads(raw)
+    except json.JSONDecodeError:
+        continue
+    record(req)
+    kind = req.get("type")
+    if kind == "prompt":
+        respond(req)
+        if mode == "cancel":
+            continue
+        if mode == "after":
+            emit({{
+                "type": "tool_execution_start",
+                "toolName": "bash",
+                "toolCallId": "tool-1",
+                "args": {{"command": "cadence wiki put agents/master/knowledge/note.md --file /tmp/note"}},
+            }})
+            emit({{
+                "type": "tool_execution_end",
+                "toolCallId": "tool-1",
+                "isError": False,
+                "result": {{"content": [{{"type": "text", "text": "wrote"}}]}},
+            }})
+        fail_turn("error")
+    elif kind == "abort":
+        fail_turn("aborted")
+    else:
+        respond(req)
+"#
+        )
+        .unwrap();
+        let mut mode = file.metadata().unwrap().permissions();
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&path, mode).unwrap();
+        path
+    }
+
+    fn launch(mode: &str, error: &str, master: bool) -> Launch {
+        let dir = tempfile::tempdir().unwrap();
+        let script = script(dir.path());
+        let log = dir.path().join("stderr.log");
+        let commands = dir.path().join("commands.jsonl");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let env = ProviderEnv::default();
+        let adapter = PiAdapter::new(hooks(Arc::clone(&events)), &log, &env, None);
+        let generation = "cad1457".to_string();
+        *adapter.shared.generation.lock().unwrap() = generation.clone();
+        adapter.shared.master.store(master, Ordering::SeqCst);
+        adapter.shared.dead.store(false, Ordering::SeqCst);
+        adapter.shared.guard_ready.store(false, Ordering::SeqCst);
+        *adapter.shared.idle_window.lock().unwrap() = Duration::from_secs(5);
+        let transport =
+            adapter.transport_for(&[script.to_string_lossy().to_string()], master, &generation);
+        transport
+            .launch(
+                dir.path().to_str().unwrap(),
+                &log,
+                &[
+                    ("CAD1457_MODE".to_string(), mode.to_string()),
+                    ("CAD1457_ERROR".to_string(), error.to_string()),
+                    (
+                        "CAD1457_LOG".to_string(),
+                        commands.to_string_lossy().to_string(),
+                    ),
+                ],
+            )
+            .unwrap();
+        *adapter.transport.write().unwrap() = transport;
+        (
+            Stop {
+                adapter: Some(adapter),
+                dir: Some(dir),
+            },
+            commands,
+            events,
+        )
+    }
+
+    fn commands(path: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn count(frames: &[Value], kind: &str) -> usize {
+        frames
+            .iter()
+            .filter(|frame| frame.get("type").and_then(Value::as_str) == Some(kind))
+            .count()
+    }
+
+    #[test]
+    fn after_tool_body_rejection_does_not_submit_the_tool_again() {
+        let (stop, log, events) = launch("after", GENERIC_BODY, true);
+        let adapter = stop.adapter.as_ref().unwrap();
+        let result = adapter.run_turn(USER, "m1", &|_| {}).unwrap();
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.text, "partial answer");
+        let error = result.error.as_deref().unwrap();
+        assert!(error.contains(GENERIC_BODY));
+        assert!(!error.contains("256"));
+        assert!(!error.contains("KiB"));
+        assert!(!adapter.reset_rejected_session(&result).unwrap());
+        let frames = commands(&log);
+        assert_eq!(count(&frames, "prompt"), 1);
+        assert_eq!(count(&frames, "new_session"), 0);
+        assert!(frames.iter().any(|frame| {
+            frame.get("type").and_then(Value::as_str) == Some("prompt")
+                && frame
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| message.contains(USER))
+        }));
+        let seen = events.lock().unwrap();
+        assert!(seen.iter().any(|(method, _)| method == "cadence/tool_use"));
+        assert!(seen
+            .iter()
+            .any(|(method, _)| method == "cadence/tool_result"));
+        assert!(seen.iter().any(|(method, params)| {
+            method == "cadence/serialized_body_limited"
+                && params.get("replayed").and_then(Value::as_bool) == Some(false)
+        }));
+        assert!(adapter.shared.master.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn before_tool_body_rejection_still_resets_once() {
+        let (stop, log, events) = launch("before", GENERIC_BODY, true);
+        let adapter = stop.adapter.as_ref().unwrap();
+        let result = adapter.run_turn(USER, "m1", &|_| {}).unwrap();
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.error.as_deref(), Some(GENERIC_BODY));
+        assert!(adapter.reset_rejected_session(&result).unwrap());
+        let frames = commands(&log);
+        assert_eq!(count(&frames, "prompt"), 1);
+        assert_eq!(count(&frames, "new_session"), 1);
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, _)| { method == "cadence/serialized_body_limited" }));
+        let (worker, worker_log, _) = launch("before", GENERIC_BODY, false);
+        let worker_adapter = worker.adapter.as_ref().unwrap();
+        let worker_result = worker_adapter.run_turn(USER, "m2", &|_| {}).unwrap();
+        assert_eq!(worker_result.error.as_deref(), Some(GENERIC_BODY));
+        assert!(!worker_adapter
+            .reset_rejected_session(&worker_result)
+            .unwrap());
+        assert!(!worker_adapter.shared.master.load(Ordering::SeqCst));
+        assert_eq!(count(&commands(&worker_log), "new_session"), 0);
+    }
+
+    #[test]
+    fn token_refusal_is_not_treated_as_a_body_limitation() {
+        let (stop, _, _) = launch("before", TOKEN, true);
+        let adapter = stop.adapter.as_ref().unwrap();
+        let before = adapter.run_turn(USER, "m1", &|_| {}).unwrap();
+        assert_eq!(before.status, "failed");
+        assert_eq!(before.error.as_deref(), Some(TOKEN));
+        assert!(adapter.reset_rejected_session(&before).unwrap());
+
+        let (stop, log, events) = launch("after", TOKEN, true);
+        let adapter = stop.adapter.as_ref().unwrap();
+        let after = adapter.run_turn(USER, "m2", &|_| {}).unwrap();
+        assert_eq!(after.status, "failed");
+        assert_eq!(after.error.as_deref(), Some(TOKEN));
+        assert!(!adapter.reset_rejected_session(&after).unwrap());
+        assert_eq!(count(&commands(&log), "prompt"), 1);
+        assert_eq!(count(&commands(&log), "new_session"), 0);
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, _)| { method == "cadence/serialized_body_limited" }));
+    }
+
+    #[test]
+    fn cancellation_does_not_reset_or_continue() {
+        let (stop, log, events) = launch("cancel", GENERIC_BODY, true);
+        let adapter = stop.adapter.as_ref().unwrap();
+        let result = adapter
+            .run_turn(USER, "m1", &|_| adapter.interrupt())
+            .unwrap();
+        assert_eq!(result.status, "interrupted");
+        assert!(result.error.is_none());
+        assert!(!adapter.reset_rejected_session(&result).unwrap());
+        let frames = commands(&log);
+        assert_eq!(count(&frames, "prompt"), 1);
+        assert_eq!(count(&frames, "abort"), 1);
+        assert_eq!(count(&frames, "new_session"), 0);
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, _)| { method == "cadence/serialized_body_limited" }));
+    }
+}
+
+#[cfg(test)]
+mod cad1814_tests {
+    use super::*;
+
+    fn adapter(root: &Path) -> PiAdapter {
+        let adapter = PiAdapter::new(
+            AdapterHooks {
+                on_event: Box::new(|_, _| {}),
+                on_request: Box::new(|_| {}),
+            },
+            &root.join("provider.log"),
+            &ProviderEnv::refusing_providers(),
+            None,
+        );
+        adapter.shared.omp.store(true, Ordering::SeqCst);
+        *adapter.shared.omp_prompt.lock().unwrap() = Some(OmpPrompt {
+            id: "current".to_string(),
+            yielded: false,
+        });
+        adapter
+    }
+
+    fn event(shared: &Shared, method: &str, params: Value) {
+        shared.dispatch(Incoming::Notification {
+            method: method.to_string(),
+            params,
+        });
+    }
+
+    #[test]
+    fn omp_late_prompt_rejection_fails_only_its_matching_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let adapter = adapter(root.path());
+        let shared = &adapter.shared;
+        let mut rejection = json!({
+            "id": "previous",
+            "status": "error",
+            "agentInvoked": false,
+            "sessionSettled": true,
+            "error": {"message": "No API key found", "retryable": false}
+        });
+        event(shared, "prompt_result", rejection.clone());
+        assert!(shared.outcomes.lock().unwrap().is_empty());
+        rejection["id"] = json!("current");
+        event(shared, "prompt_result", rejection.clone());
+        let mut result = shared.outcomes.lock().unwrap().pop_front().unwrap();
+        assert_eq!(settle_pi_turn(&mut result, false, false).status, "failed");
+        event(shared, "prompt_result", rejection);
+        event(shared, "session_settled", json!({}));
+        assert!(shared.outcomes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn omp_yield_keeps_the_turn_open_until_background_work_settles() {
+        let root = tempfile::tempdir().unwrap();
+        let adapter = adapter(root.path());
+        let shared = &adapter.shared;
+        event(shared, "session_settled", json!({}));
+        event(
+            shared,
+            "prompt_result",
+            json!({"id": "current", "status": "completed", "sessionSettled": false}),
+        );
+        event(shared, "agent_end", json!({}));
+        event(shared, "agent_settled", json!({}));
+        assert!(shared.outcomes.lock().unwrap().is_empty());
+        event(shared, "session_settled", json!({}));
+        let mut result = shared.outcomes.lock().unwrap().pop_front().unwrap();
+        assert_eq!(
+            settle_pi_turn(&mut result, false, false).status,
+            "completed"
+        );
+        event(shared, "session_settled", json!({}));
+        assert!(shared.outcomes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn omp_local_completion_does_not_wait_for_a_nonexistent_model_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let adapter = adapter(root.path());
+        let shared = &adapter.shared;
+        let mut response = json!({
+            "id": "previous",
+            "command": "prompt",
+            "success": true,
+            "data": {"agentInvoked": false}
+        });
+        event(shared, "response", response.clone());
+        assert!(shared.outcomes.lock().unwrap().is_empty());
+        response["id"] = json!("current");
+        event(shared, "response", response.clone());
+        let mut result = shared.outcomes.lock().unwrap().pop_front().unwrap();
+        assert_eq!(
+            settle_pi_turn(&mut result, false, false).status,
+            "completed"
+        );
+        event(shared, "response", response);
+        event(shared, "session_settled", json!({}));
+        assert!(shared.outcomes.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+#[path = "pi_omp_acceptance.rs"]
+mod cad1814_independent_acceptance;

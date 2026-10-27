@@ -141,6 +141,22 @@ incomplete enumeration. Any failure retains the resource with the process
 identity and refusal reason when known; cleanup requires an authorized complete
 inspection mechanism rather than suppressing unrelated `EACCES`.
 
+**Policy-hidden processes (CAD-1196, accepted residual).** An unprivileged
+`issue finish` cannot read `/proc/<pid>/{cwd,fd}` of every process; the kernel
+hides them by policy. A `PermissionDenied` there is excused only when the
+kernel's own rule explains it: the `cwd` entry is owned by a uid/gid other than
+the caller's effective ones, or the target's permitted capabilities exceed the
+caller's. Any other `PermissionDenied`, and every other error, still leaves the
+enumeration incomplete and refuses (`--force` cannot override it). The scan
+therefore cannot see root's, foreign-uid and capability-bearing processes, and
+**an own-uid process that made itself non-dumpable** (`prctl(PR_SET_DUMPABLE,
+0)`, as `gpg-agent` or `ssh-agent` do, or one that exec'd an unreadable or
+setuid binary): its `cwd` entry is root-owned, so it is excused too. The
+operator accepted this residual. Dumpable same-uid processes stay fully
+checked. A successful finish reports the excused processes in
+`unscanned_processes` (`count` and `pids`), so the tolerance is visible in the
+audit trail rather than silent.
+
 A successful review using a clean no-commit merge-result tree declares its
 receipt paths, then acquires an exact-owner release guard before verifying and
 restoring the tree to the detached pinned PR head. The guard remains held while

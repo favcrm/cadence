@@ -1,3 +1,4 @@
+import { agentOn } from "../../lib/agentOn";
 import type { Agent, AgentDetail } from "../../lib/types";
 import { activityTimeMs } from "../../lib/fmt";
 import { asEntry } from "./thread";
@@ -7,6 +8,8 @@ export interface AgentUpdate {
   label: string;
   text: string;
   at: string | null;
+  /** Issue id carried by a stored work-report entry. */
+  issue?: string;
 }
 
 /** Keep provider turn completion distinct from a verified job completion. */
@@ -15,6 +18,10 @@ export function recentAgentUpdates(detail: AgentDetail | null, entries: unknown[
     const labels: Record<string, string> = {
       turn_started: "Started a turn", turn_finished: "Finished a turn",
       task_done: "Task completed", task_running: "Task started", task_failed: "Task failed",
+      // CAD-1380: an assist-bound job stalled past its budget — the
+      // supervisor's own observation event, shown as a check (never a
+      // fabricated dispatch or completion).
+      assist_stall: "Supervisor check — no progress on a member job",
     };
     const label = labels[event.kind];
     if (!label) return [];
@@ -34,7 +41,7 @@ export function recentAgentUpdates(detail: AgentDetail | null, entries: unknown[
 
 export function recentWorkingAgents(agents: Agent[]): Agent[] {
   return agents.filter((a) => a.alias !== "master" &&
-    (a.running > 0 || a.queued > 0 || a.on.length > 0 || !!a.last_activity || (a.event_cursor ?? 0) > 0),
+    (a.running > 0 || a.queued > 0 || agentOn(a).length > 0 || !!a.last_activity || (a.event_cursor ?? 0) > 0),
   ).sort((a, b) => activityTimeMs(b.last_activity) - activityTimeMs(a.last_activity) ||
     (b.event_cursor ?? 0) - (a.event_cursor ?? 0))
     .slice(0, 12);
@@ -51,7 +58,7 @@ export function reportedAgentUpdates(entries: unknown[]): Map<string, AgentUpdat
     const [, issue, kind, alias, at] = match;
     const summary = entry.text.split(/\n#+\s*Expected\s*\n/i)[1]?.split(/\n#+\s*Evidence/i)[0]?.trim();
     const rows = reports.get(alias) ?? [];
-    rows.push({ key: `report-${entry.seq}`, label: kind === "done" ? "Work reported" : "Progress report", text: `${issue}${summary ? ` — ${summary}` : " — Report delivered to Master"}`, at });
+    rows.push({ key: `report-${entry.seq}`, label: kind === "done" ? "Work reported" : "Progress report", issue, text: `${issue}${summary ? ` — ${summary}` : " — Report delivered to Master"}`, at });
     reports.set(alias, rows.sort((a, b) => (Date.parse(b.at ?? "") || 0) - (Date.parse(a.at ?? "") || 0)).slice(0, 3));
   }
   return reports;

@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::proto::identifier;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -45,6 +45,24 @@ pub const APPROVAL_RECORDED_EVENT: &str = "approval_recorded";
 /// An operator withdrew an earlier approval id. Message delivery state
 /// (a cancelled or superseded queue message) never writes this.
 pub const APPROVAL_REVOKED_EVENT: &str = "approval_revoked";
+
+/// CAD-225: durable marks for an operator-issued workflow grant's ONE
+/// plan admission — `intent` (reserved ids + canonical semantics, before
+/// any tracker file), `admitted` (the run receipt), `held` (a partial
+/// outcome kept explicit for reconciliation). Written only by the
+/// daemon's own admission path; `provenance: "native"` inside.
+pub const UNATTENDED_RUN_EVENT: &str = "unattended_run";
+
+/// CAD-225: the daemon's native intent to enqueue one exact head of an
+/// unattended run's PR — recorded BEFORE the `gh` mutation so a missing
+/// acknowledgement never replays the mutation. One row per
+/// (issue, head); a second intent refuses.
+pub const UNATTENDED_MERGE_INTENT_EVENT: &str = "unattended_merge_intent";
+
+/// CAD-225: the enqueue outcome record — the intent was attempted and
+/// its result observed (`reconciled` when the remote queue already
+/// proved the same-head state). One row per (issue, head).
+pub const UNATTENDED_MERGE_ENQUEUED_EVENT: &str = "unattended_merge_enqueued";
 
 /// One operator approval as `Store::record_approval` persists it: the
 /// operator approved `action` on the exact `head_sha` of PR `pr` in
@@ -172,6 +190,32 @@ pub(crate) fn event_store_stats(
     })
 }
 
+/// Is `a` the same approval scope as `b`: the same PR in the same repo,
+/// whatever the letter case of the repo (a CLI record keeps the case it
+/// was sent in; the board records lowercase).
+fn same_scope(a: &Value, b: &Value) -> bool {
+    a["pr"] == b["pr"]
+        && match (a["repo"].as_str(), b["repo"].as_str()) {
+            (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+            _ => false,
+        }
+}
+
+/// How an approval-evidence writer was authorized — the daemon's own
+/// statement, stamped on every record (CAD-217).
+pub const APPROVAL_RECORDED_VIA: &str = "operator-connection";
+
+/// CAD-1218: may the board revoke this approval record — one a board path
+/// wrote: action `merge`, `recorded_via` operator-connection, and a source
+/// ending ` via board`. The revoke target rule and the state read share it.
+pub fn board_revocable(record: &Value) -> bool {
+    record["action"] == "merge"
+        && record["recorded_via"] == APPROVAL_RECORDED_VIA
+        && record["source"]
+            .as_str()
+            .is_some_and(|s| s.ends_with(" via board"))
+}
+
 pub fn default_approval_id(action: &str, pr: u64, head: &str) -> String {
     format!("{action}-pr{pr}-{}", &head[..head.len().min(12)])
 }
@@ -260,6 +304,28 @@ pub(super) fn row_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
     })
 }
 
+/// CAD-1380 R3: the real task transitions that advance an assist-bound
+/// job's `updated` watermark when `event_scoped_raw` writes them. Each
+/// is emitted inside the same transaction as its task write. Excluded:
+/// `queued`, `assist_stall`, reads/polls, `turn_unknown` (evidence, not
+/// progress) and job-level `job_cancelled`/`job_closed`, which already
+/// set `jobs.updated` in their own UPDATE.
+const ASSIST_PROGRESS_KINDS: &[&str] = &[
+    "task_created",
+    "task_dispatched",
+    "task_running",
+    "task_reported",
+    "task_sha_recorded",
+    "verdict_recorded",
+    "task_blocked",
+    "task_revising",
+    "task_done",
+    "task_reopened",
+    "task_failed",
+    "task_cancelled",
+    "task_unassigned",
+];
+
 impl Event {
     pub fn to_json(&self) -> Value {
         json!({
@@ -315,6 +381,19 @@ impl Store {
              VALUES(?,?,?,?,?,?)",
             params![alias, kind, payload.to_string(), job_id, task_id, now()],
         )?;
+        if let Some(job) = job_id.filter(|_| ASSIST_PROGRESS_KINDS.contains(&kind)) {
+            // CAD-1380 R3: the assist watermark is `jobs.updated` (ms
+            // truncated by `rev_millis`). Advance it in THIS transaction,
+            // strictly past the stored millisecond, and only for an
+            // assist-bound job. `+0.5` ms keeps the stored f64 on the
+            // intended millisecond after truncation.
+            tx.execute(
+                "UPDATE jobs SET updated=(MAX(CAST(?1 AS INTEGER),
+                     CAST(updated*1000 AS INTEGER)+1)+0.5)/1000.0
+                 WHERE id=?2 AND EXISTS(SELECT 1 FROM assist_requests WHERE job=?2)",
+                params![(now() * 1000.0) as i64, job],
+            )?;
+        }
         Ok(())
     }
 
@@ -330,6 +409,108 @@ impl Store {
                 |row| row.get(0),
             )?;
             Ok(n > 0)
+        })
+    }
+
+    /// CAD-1822: the task contract pinned for one exact kickoff message. The
+    /// first pin wins — a retried enqueue keeps the contract its first
+    /// attempt pinned, and a second queued dispatch can never borrow this
+    /// message's pin. A malformed payload reads as no pin.
+    pub fn context_pin(&self, alias: &str, message_id: &str) -> Result<Option<Value>> {
+        let raw: Option<String> = self.read_tx(|conn| {
+            let raw = conn
+                .query_row(
+                    "SELECT payload FROM events WHERE alias=?1 AND kind='context_pin' \
+                     AND json_extract(payload,'$.message')=?2 ORDER BY seq LIMIT 1",
+                    params![alias, message_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(raw)
+        })?;
+        Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()))
+    }
+
+    /// CAD-1822: the newest confirmed delivery receipt in `alias`'s
+    /// conversation. Conversation-scoped: another conversation (or another
+    /// task's pin) can never inherit it. A malformed payload reads as no
+    /// receipt, because an unprovable supply is never residency.
+    pub fn last_context_supply(&self, alias: &str, conversation: &str) -> Result<Option<Value>> {
+        let raw: Option<String> = self.read_tx(|conn| {
+            let raw = conn
+                .query_row(
+                    "SELECT payload FROM events WHERE alias=?1 AND kind='context_supplied' \
+                     AND json_extract(payload,'$.conversation')=?2 ORDER BY seq DESC LIMIT 1",
+                    params![alias, conversation],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(raw)
+        })?;
+        Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()))
+    }
+
+    /// CAD-1822: the disabled-selection marker for one exact message. A native
+    /// dispatch whose assigned scope is not opted in carries this marker
+    /// instead of a pin; the actor uses it to clear the conversation's active
+    /// task binding before delivering the assignment.
+    pub fn context_disabled(&self, alias: &str, message_id: &str) -> Result<Option<Value>> {
+        let raw: Option<String> = self.read_tx(|conn| {
+            let raw = conn
+                .query_row(
+                    "SELECT payload FROM events WHERE alias=?1 AND kind='context_disabled' \
+                     AND json_extract(payload,'$.message')=?2 ORDER BY seq LIMIT 1",
+                    params![alias, message_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(raw)
+        })?;
+        Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()))
+    }
+
+    /// CAD-1822: whether this alias has ever carried feature context state,
+    /// read inside the caller's existing admission transaction. Used to decide
+    /// whether a disabled selection is persisted; never opens a second store
+    /// lock.
+    pub(super) fn has_context_state_in(tx: &impl StoreConn, alias: &str) -> Result<bool> {
+        let n: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM events WHERE alias=?1 \
+             AND kind IN ('context_pin','context_activated')",
+            params![alias],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// CAD-1822: the newest durable active-task binding in `alias`'s
+    /// conversation. This is task identity, not residency: it names the exact
+    /// kickoff pin the conversation currently serves, so an unbound follow-up
+    /// can restore its mandatory context even when the first turn's supply
+    /// receipt was lost. Conversation-scoped, never alias-latest. A newer
+    /// deactivation hides the older binding.
+    pub fn last_context_activation(
+        &self,
+        alias: &str,
+        conversation: &str,
+    ) -> Result<Option<Value>> {
+        let row: Option<(String, String)> = self.read_tx(|conn| {
+            let row = conn
+                .query_row(
+                    "SELECT kind, payload FROM events WHERE alias=?1 \
+                     AND kind IN ('context_activated','context_deactivated') \
+                     AND json_extract(payload,'$.conversation')=?2 ORDER BY seq DESC LIMIT 1",
+                    params![alias, conversation],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            Ok(row)
+        })?;
+        Ok(match row {
+            Some((kind, payload)) if kind == "context_activated" => {
+                serde_json::from_str(&payload).ok()
+            }
+            _ => None,
         })
     }
 
@@ -350,7 +531,9 @@ impl Store {
             let tx = &mut *conn;
             let mut rows: Vec<(i64, String, String, f64)> = tx.query_vec(
                 &format!(
-                    "SELECT e.seq, e.alias, e.kind, e.at FROM events e WHERE {} \
+                    "SELECT e.seq, e.alias, e.kind, e.at FROM events e WHERE {}
+                             AND e.alias NOT IN (SELECT alias FROM agents
+                               WHERE archived_at IS NOT NULL)
                              ORDER BY e.seq LIMIT ?2",
                     rollable_events_where()
                 ),
@@ -430,7 +613,48 @@ impl Store {
     /// `"<project>/<name>"` so a project approval and a workflow
     /// approval never share a row.
     pub fn record_workflow_approval(&self, payload: Value) -> Result<()> {
-        self.write_tx(|conn| Self::event(&conn, APPROVAL_STREAM, WORKFLOW_APPROVED_EVENT, payload))
+        self.write_tx(|conn| {
+            if let (Some(project), Some(name), Some(grant), Some(revision)) = (
+                payload["project"].as_str(),
+                payload["name"].as_str(),
+                payload["unattended"]["grant_id"].as_str(),
+                payload["unattended"]["revision"].as_u64(),
+            ) {
+                let existing: Option<String> = conn
+                    .query_row(
+                        "SELECT payload FROM events WHERE alias=?1 AND kind=?2
+                        AND json_extract(payload,'$.project')=?3
+                        AND json_extract(payload,'$.name')=?4
+                        AND json_extract(payload,'$.unattended.grant_id')=?5
+                        AND json_extract(payload,'$.unattended.revision')=?6
+                        ORDER BY seq LIMIT 1",
+                        params![
+                            APPROVAL_STREAM,
+                            WORKFLOW_APPROVED_EVENT,
+                            project,
+                            name,
+                            grant,
+                            revision
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(existing) = existing {
+                    let existing: Value = serde_json::from_str(&existing).map_err(|error| {
+                        Error::internal(format!("stored workflow approval is malformed: {error}"))
+                    })?;
+                    if existing != payload {
+                        return Err(Error::rejected(
+                            "a grant revision already has different approval evidence",
+                        ));
+                    }
+                    // An exact captured retry must not become the latest
+                    // approval after revocation or a newer renewal.
+                    return Ok(());
+                }
+            }
+            Self::event(conn, APPROVAL_STREAM, WORKFLOW_APPROVED_EVENT, payload)
+        })
     }
 
     /// CAD-487: the latest workflow approval per `"<project>/<name>"`.
@@ -453,6 +677,211 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// A replacement permanently revokes an old grant ID. Reappending a
+    /// captured approval or older renewal cannot restore its authority.
+    pub fn unattended_grant_current(
+        &self,
+        project: &str,
+        name: &str,
+        grant: &str,
+        revision: u32,
+    ) -> Result<bool> {
+        self.read_tx(|conn| {
+            Ok(conn.query_row(
+                "WITH approvals AS (
+                    SELECT seq,
+                        json_extract(payload,'$.unattended.grant_id') AS id,
+                        json_extract(payload,'$.unattended.revision') AS revision,
+                        json_type(payload,'$.unattended.revision') AS revision_type
+                    FROM events WHERE alias=?1 AND kind=?2
+                        AND json_extract(payload,'$.project')=?3
+                        AND json_extract(payload,'$.name')=?4
+                )
+                SELECT EXISTS(SELECT 1 FROM approvals WHERE id=?5)
+                    AND NOT EXISTS(
+                        SELECT 1 FROM approvals
+                        WHERE seq>(SELECT MIN(seq) FROM approvals WHERE id=?5)
+                            AND (id IS NULL OR id<>?5)
+                    )
+                    AND NOT EXISTS(
+                        SELECT 1 FROM approvals WHERE id=?5
+                            AND (revision_type IS NULL OR revision_type<>'integer')
+                    )
+                    AND (SELECT MAX(revision) FROM approvals WHERE id=?5)=?6",
+                params![
+                    APPROVAL_STREAM,
+                    WORKFLOW_APPROVED_EVENT,
+                    project,
+                    name,
+                    grant,
+                    revision
+                ],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
+    /// CAD-225: append a durable `unattended_run` mark (`intent`,
+    /// `admitted` or `held`) on [`APPROVAL_STREAM`]. Native provenance is
+    /// a payload field the daemon's own admission writes — no RPC can
+    /// mint it.
+    pub fn record_unattended_run(&self, payload: Value) -> Result<()> {
+        self.write_tx(|conn| {
+            // The native intent already carries the server-derived deadline.
+            // Recheck after acquiring the SQLite writer, before minting work.
+            if payload["status"] == "intent"
+                && payload["expires_at"].as_f64().is_none_or(|until| {
+                    !until.is_finite() || crate::issue::time::now_epoch() as f64 >= until
+                })
+            {
+                return Err(Error::rejected(
+                    "the bound grant expired before the admission intent — nothing was admitted",
+                ));
+            }
+            Self::event(&conn, APPROVAL_STREAM, UNATTENDED_RUN_EVENT, payload)
+        })
+    }
+
+    /// CAD-225: every `unattended_run` mark in write order. A payload
+    /// that is not valid JSON fails the whole read — a corrupt mark can
+    /// never look like "no binding" to the authorization query.
+    pub fn unattended_run_payloads(&self) -> Result<Vec<Value>> {
+        self.read_tx(|conn| {
+            let raws: Vec<String> = conn.query_vec(
+                "SELECT payload FROM events WHERE alias=?1 AND kind=?2 ORDER BY seq",
+                params![APPROVAL_STREAM, UNATTENDED_RUN_EVENT],
+                |r| r.get(0),
+            )?;
+            raws.iter()
+                .map(|raw| {
+                    serde_json::from_str::<Value>(raw).map_err(|e| {
+                        Error::internal(format!("{UNATTENDED_RUN_EVENT} payload: {e}"))
+                    })
+                })
+                .collect()
+        })
+    }
+
+    /// CAD-225: every issue id any `unattended_run` mark ever bound —
+    /// epics and tickets alike, held marks included. Plan creation
+    /// avoids them so a torn intent can never be silently reused by an
+    /// unrelated plan.
+    pub fn unattended_reserved_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let mut out = std::collections::HashSet::new();
+        for payload in self.unattended_run_payloads()? {
+            if let Some(epic) = payload["epic"].as_str() {
+                out.insert(epic.to_string());
+            }
+            if let Some(tickets) = payload["tickets"].as_array() {
+                for t in tickets {
+                    if let Some(id) = t.as_str() {
+                        out.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// CAD-225: the recorded enqueue intent for `(issue, head)` — at
+    /// most one row per pair; the dedupe insert keeps that true.
+    pub fn unattended_merge_intent(&self, issue: &str, head: &str) -> Result<Option<Value>> {
+        self.unattended_merge_evidence(issue, head, UNATTENDED_MERGE_INTENT_EVENT)
+    }
+
+    pub fn unattended_merge_enqueued(&self, issue: &str, head: &str) -> Result<Option<Value>> {
+        self.unattended_merge_evidence(issue, head, UNATTENDED_MERGE_ENQUEUED_EVENT)
+    }
+
+    fn unattended_merge_evidence(
+        &self,
+        issue: &str,
+        head: &str,
+        kind: &str,
+    ) -> Result<Option<Value>> {
+        self.read_tx(|conn| {
+            let raws: Vec<String> = conn.query_vec(
+                "SELECT payload FROM events WHERE alias=?1 AND kind=?2 \
+                     AND json_extract(payload,'$.issue')=?3 \
+                     AND json_extract(payload,'$.head')=?4 ORDER BY seq",
+                params![APPROVAL_STREAM, kind, issue, head],
+                |r| r.get(0),
+            )?;
+            if raws.len() > 1 {
+                return Err(Error::internal(format!(
+                    "two {kind} records name {issue}@{head} — held for \
+                     reconciliation"
+                )));
+            }
+            raws.first()
+                .map(|raw| {
+                    serde_json::from_str::<Value>(raw)
+                        .map_err(|e| Error::internal(format!("{kind} payload: {e}")))
+                })
+                .transpose()
+        })
+    }
+
+    /// CAD-225: record the enqueue intent for one exact head —
+    /// atomically inside the write tx. `Ok(false)` when an intent for
+    /// `(issue, head)` already exists: no second mutation is ever
+    /// authorized by a duplicate. `Err` when the payload is malformed or
+    /// its grant is already expired/nonfinite — the insert-time check
+    /// re-proves expiry because the earlier validation can be minutes
+    /// stale by the time `gh` answers.
+    pub fn record_unattended_merge_intent(&self, payload: Value) -> Result<bool> {
+        self.unattended_merge_record(payload, UNATTENDED_MERGE_INTENT_EVENT, true)
+    }
+
+    /// CAD-225: record the enqueue outcome (`issue`, `head`,
+    /// `grant_id`, `reconciled`) — the same one-row-per-(issue,head)
+    /// dedupe as the intent. `Ok(false)` when the outcome is already
+    /// on record.
+    pub fn record_unattended_merge_enqueued(&self, payload: Value) -> Result<bool> {
+        self.unattended_merge_record(payload, UNATTENDED_MERGE_ENQUEUED_EVENT, false)
+    }
+
+    fn unattended_merge_record(
+        &self,
+        payload: Value,
+        kind: &str,
+        check_expiry: bool,
+    ) -> Result<bool> {
+        let (Some(issue), Some(head)) = (payload["issue"].as_str(), payload["head"].as_str())
+        else {
+            return Err(Error::rejected(format!(
+                "{kind} needs string 'issue' and 'head'"
+            )));
+        };
+        let issue = issue.to_string();
+        let head = head.to_string();
+        self.write_tx(|conn| {
+            if check_expiry {
+                match payload["grant_expires_at"].as_f64() {
+                    Some(expires) if expires.is_finite() && expires > super::now() => {}
+                    _ => {
+                        return Err(Error::rejected(
+                            "the unattended grant is expired or its expiry is not a \
+                             finite epoch — the intent is refused, not recorded",
+                        ));
+                    }
+                }
+            }
+            let exists: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind=?2 \
+                     AND json_extract(payload,'$.issue')=?3 \
+                     AND json_extract(payload,'$.head')=?4",
+                params![APPROVAL_STREAM, kind, issue, head],
+                |r| r.get(0),
+            )?;
+            if exists > 0 {
+                return Ok(false);
+            }
+            Self::event(conn, APPROVAL_STREAM, kind, payload)?;
+            Ok(true)
+        })
     }
 
     /// CAD-547: record the operator's approval of an app's structural
@@ -527,6 +956,20 @@ impl Store {
     /// CAD-120: export requires immutable scope recorded by the native
     /// verdict intake. Legacy receipts deliberately cannot be exported.
     pub fn review_export_recorded(&self, record: &crate::delivery::Record) -> Result<bool> {
+        self.review_scope_recorded(record, false)
+    }
+
+    /// Automatic landing additionally needs the independent reviewer's
+    /// explicit non-sensitive declaration, bound to the native receipt.
+    pub fn unattended_review_recorded(&self, record: &crate::delivery::Record) -> Result<bool> {
+        self.review_scope_recorded(record, true)
+    }
+
+    fn review_scope_recorded(
+        &self,
+        record: &crate::delivery::Record,
+        require_auto: bool,
+    ) -> Result<bool> {
         let Some(verdict) = &record.verdict else {
             return Ok(false);
         };
@@ -544,6 +987,7 @@ impl Store {
              AND json_extract(payload,'$.pr')=?7 \
              AND json_extract(payload,'$.project')=?8 \
              AND json_extract(payload,'$.worker')=?9 \
+             AND (?10=0 OR json_extract(payload,'$.risk')='auto') \
              AND seq=(SELECT MAX(seq) FROM events WHERE alias=?1 AND kind=?2 \
                       AND json_extract(payload,'$.issue')=?3)",
             params![
@@ -555,7 +999,8 @@ impl Store {
                 verdict.report,
                 pr,
                 record.project,
-                record.worker
+                record.worker,
+                require_auto
             ],
             |row| row.get(0),
         )?;
@@ -654,9 +1099,10 @@ impl Store {
                     Self::event(&tx, APPROVAL_STREAM, APPROVAL_RECORDED_EVENT, payload)?;
                     return Ok((true, id));
                 };
-                let same = ["source", "action", "head_sha", "scope"]
+                let same = ["source", "action", "head_sha"]
                     .iter()
-                    .all(|k| old[k] == evidence[k]);
+                    .all(|k| old[k] == evidence[k])
+                    && same_scope(&old["scope"], &evidence["scope"]);
                 let revoked = Self::approval_event(&tx, APPROVAL_REVOKED_EVENT, &id)?.is_some();
                 match (a.id.is_some(), revoked, same) {
                     (_, false, true) => return Ok((false, id)),
@@ -677,6 +1123,110 @@ impl Store {
             Err(Error::rejected(format!(
                 "Approval id '{base}': no free default id — pass --id"
             )))
+        })
+    }
+
+    /// CAD-1218: record `a` only if the approval stream holds no record at
+    /// all — standing or revoked, any action — for its `(repo, pr, head)`.
+    /// The check and the write share one transaction, so concurrent calls
+    /// record at most one. Answers the new approval id.
+    pub fn record_approval_once(&self, a: &NewApproval, recorded_via: &str) -> Result<String> {
+        approval_source(a.source)?;
+        identifier(a.action, "Approval action")?;
+        approval_head(a.head_sha)?;
+        approval_repo(a.repo)?;
+        if a.pr == 0 {
+            return Err(Error::rejected("Approval PR number must be positive"));
+        }
+        let scope = json!({"repo": a.repo, "pr": a.pr});
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let stream = Self::approval_stream(&tx)?;
+            let seen = stream.iter().find(|(k, p, _)| {
+                k == APPROVAL_RECORDED_EVENT
+                    && same_scope(&p["scope"], &scope)
+                    && p["head_sha"] == a.head_sha
+            });
+            if let Some((_, p, _)) = seen {
+                return Err(Error::rejected(format!(
+                    "this head already has approval record {} — one record per head, standing \
+                     or revoked; approve a revoked head with `cadence audit approve`",
+                    p["approval_id"].as_str().unwrap_or("?")
+                )));
+            }
+            let base = default_approval_id(a.action, a.pr, a.head_sha);
+            let payload = json!({
+                "source": a.source,
+                "action": a.action,
+                "head_sha": a.head_sha,
+                "scope": scope,
+                "recorded_via": recorded_via,
+            });
+            Self::append_approval(&tx, &stream, &base, payload)
+        })
+    }
+
+    /// CAD-1300: a board Publish's approval — one record per `(repo, pr,
+    /// head)` from every board path. A standing merge record is reused
+    /// (Approve then Publish, or a retry after a failed enqueue); a head
+    /// with any other record, revoked included, is refused; otherwise a
+    /// new record is appended. One transaction. Answers the approval id.
+    pub fn record_or_reuse_board_approval(
+        &self,
+        a: &NewApproval,
+        recorded_via: &str,
+        issue: &str,
+    ) -> Result<String> {
+        approval_source(a.source)?;
+        identifier(a.action, "Approval action")?;
+        approval_head(a.head_sha)?;
+        approval_repo(a.repo)?;
+        if a.pr == 0 {
+            return Err(Error::rejected("Approval PR number must be positive"));
+        }
+        let scope = json!({"repo": a.repo, "pr": a.pr});
+        let head = json!(a.head_sha);
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let stream = Self::approval_stream(&tx)?;
+            let revoked = Self::revoked_ids(&stream);
+            let mut on_record = stream.iter().filter(|(k, p, _)| {
+                k == APPROVAL_RECORDED_EVENT
+                    && same_scope(&p["scope"], &scope)
+                    && p["head_sha"] == head
+            });
+            let standing = on_record.clone().find_map(|(_, p, _)| {
+                let id = p["approval_id"].as_str()?;
+                (p["action"] == "merge" && !revoked.contains(id)).then(|| id.to_string())
+            });
+            if let Some(id) = standing {
+                return Ok(id);
+            }
+            if let Some((_, p, _)) = on_record.next() {
+                let was_revoked = p["approval_id"]
+                    .as_str()
+                    .is_some_and(|id| revoked.contains(id));
+                return Err(Error::rejected(if was_revoked {
+                    format!(
+                        "{issue}: this head's board approval was revoked — one approval record \
+                         per head; re-approve it with `cadence audit approve` or push a new head"
+                    )
+                } else {
+                    format!(
+                        "{issue}: this head already has an approval record that is not a board \
+                         merge approval — one approval record per head"
+                    )
+                }));
+            }
+            let payload = json!({
+                "source": a.source,
+                "action": a.action,
+                "head_sha": a.head_sha,
+                "scope": scope,
+                "recorded_via": recorded_via,
+            });
+            let base = default_approval_id(a.action, a.pr, a.head_sha);
+            Self::append_approval(&tx, &stream, &base, payload)
         })
     }
 
@@ -917,15 +1467,46 @@ impl Store {
         reason: &str,
         recorded_via: &str,
     ) -> Result<bool> {
+        self.revoke_approval_inner(id, source, reason, recorded_via, false)
+    }
+
+    /// CAD-1218: [`Self::revoke_approval`] for the board, which may reach
+    /// only a record a board path wrote: action `merge`, `recorded_via`
+    /// operator-connection and a source ending ` via board`. The target is
+    /// checked in the revoking transaction.
+    pub fn revoke_board_approval(
+        &self,
+        id: &str,
+        source: &str,
+        reason: &str,
+        recorded_via: &str,
+    ) -> Result<bool> {
+        self.revoke_approval_inner(id, source, reason, recorded_via, true)
+    }
+
+    fn revoke_approval_inner(
+        &self,
+        id: &str,
+        source: &str,
+        reason: &str,
+        recorded_via: &str,
+        board_only: bool,
+    ) -> Result<bool> {
         identifier(id, "Approval id")?;
         approval_source(source)?;
         approval_text(reason, "Approval revocation reason", 256)?;
         let evidence = json!({"approval_id": id, "source": source, "reason": reason});
         self.write_tx(|conn| {
             let tx = &mut *conn;
-            if Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, id)?.is_none() {
+            let Some(recorded) = Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, id)? else {
                 return Err(Error::rejected(format!(
                     "Approval id '{id}' has no recorded approval to revoke"
+                )));
+            };
+            if board_only && !board_revocable(&recorded) {
+                return Err(Error::rejected(format!(
+                    "Approval '{id}' was not recorded from the board — revoke it with \
+                     `cadence audit revoke`"
                 )));
             }
             if let Some(old) = Self::approval_event(&tx, APPROVAL_REVOKED_EVENT, id)? {
@@ -1088,6 +1669,39 @@ impl Store {
             params![alias, kind],
             |row| row.get(0),
         )?)
+    }
+
+    /// CAD-1239: like [`Store::last_events_of_all`], but only for the
+    /// listed operational aliases, so archived rows are never read or
+    /// deserialized while enriching `agent_list`.
+    pub fn last_events_of(
+        &self,
+        aliases: &[String],
+        kinds: &[&str],
+    ) -> Result<std::collections::HashMap<String, Event>> {
+        if aliases.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.conn();
+        let kind_placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let alias_placeholders = aliases.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT e.seq,e.alias,e.kind,e.payload,e.job_id,e.task_id,e.at FROM events e
+             JOIN (SELECT MAX(seq) AS seq FROM events
+                   WHERE kind IN ({kind_placeholders}) AND alias IN ({alias_placeholders})
+                   GROUP BY alias) m ON e.seq = m.seq"
+        );
+        let mut args: Vec<&dyn rusqlite::ToSql> =
+            kinds.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+        args.extend(aliases.iter().map(|a| a as &dyn rusqlite::ToSql));
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(args.as_slice(), row_event)?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let event = row?;
+            out.insert(event.alias.clone(), event);
+        }
+        Ok(out)
     }
 
     /// CAD-96: per alias, the newest event of any of `kinds` — one

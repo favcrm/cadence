@@ -44,11 +44,13 @@ export interface HealthView {
   reasons: { detail: string; next: string; owner: string | null }[];
 }
 
-const HEALTH: Record<HealthState, { label: string; tone: Tone }> = {
-  on_track: { label: "on track", tone: "ok" },
-  at_risk: { label: "at risk", tone: "warn" },
-  stalled: { label: "stalled", tone: "fail" },
+const HEALTH: Record<HealthState, { tone: Tone }> = {
+  on_track: { tone: "ok" },
+  at_risk: { tone: "warn" },
+  stalled: { tone: "fail" },
 };
+type Translate = (english: string) => string;
+const identity: Translate = (english) => english;
 
 /** How a health block reads: label, tone, time in stage, reasons + next actions. */
 export function healthView(
@@ -57,18 +59,29 @@ export function healthView(
     | null
     | undefined,
   stage?: string | null,
+  t: Translate = identity,
 ): HealthView {
   const known = health && health.state in HEALTH ? HEALTH[health.state as HealthState] : null;
   const days = health?.days_in_stage;
   const timing =
     typeof days === "number" && stage
-      ? `${days} ${days === 1 ? "day" : "days"} in ${stage}${
-          typeof health?.limit_days === "number" ? ` (limit ${health.limit_days})` : ""
+      ? `${days} ${t(days === 1 ? "day" : "days")} ${t("in")} ${stage}${
+          typeof health?.limit_days === "number"
+            ? ` ${t("(limit {limit})").replace("{limit}", String(health.limit_days))}`
+            : ""
         }`
       : null;
   return {
     state: known ? (health!.state as HealthState) : "unknown",
-    label: known?.label ?? "health unknown",
+    label: t(
+      known && health?.state === "on_track"
+        ? "on track"
+        : known && health?.state === "at_risk"
+          ? "at risk"
+          : known
+            ? "stalled"
+            : "health unknown",
+    ),
     tone: known?.tone ?? "muted",
     timing,
     reasons: (health?.reasons ?? []).map((r) => ({
@@ -95,7 +108,7 @@ export interface ProgressView {
 }
 
 /** Size-weighted progress (S=1, M=3, L=8) as the bar shows it. */
-export function progressView(p: WorkProgress | null | undefined): ProgressView {
+export function progressView(p: WorkProgress | null | undefined, t: Translate = identity): ProgressView {
   const done = p?.done_weight ?? 0;
   const total = p?.total_weight ?? 0;
   const percent = total > 0 ? Math.round((done / total) * 100) : null;
@@ -103,15 +116,33 @@ export function progressView(p: WorkProgress | null | undefined): ProgressView {
     done,
     total,
     percent,
-    label: total > 0 ? `${done}/${total} weight` : "no tasks yet",
+    label: total > 0 ? t("{done}/{total} weight").replace("{done}", String(done)).replace("{total}", String(total)) : t("no tasks yet"),
   };
 }
 
 /** Who may move stages here. */
 export interface Viewer {
   readOnly: boolean;
-  /** Passed the board's operator proof (`/api/meta` → `operator`). */
-  operator: boolean;
+  /** Passed the board's operator proof (`/api/meta` → `operator`).
+   *  CAD-1193: `null` means the proof could not answer — access is
+   *  still being checked. Unknown is never shown as signed out and
+   *  grants nothing: every consumer reads `=== true` as the only yes. */
+  operator: boolean | null;
+  /** CAD-1193: when `operator` is `null`, `access` says which unknown
+   *  it is — `"checking"` while the first probe is still in flight,
+   *  `"unavailable"` once a completed probe failed or the server
+   *  could not answer. Absent/`null` reads as the unknown the
+   *  `operator` value already carries; it never grants anything and
+   *  never marks a signed-out or non-operator viewer. */
+  access?: "checking" | "unavailable" | null;
+  /** CAD-1193: a bounded retry of the access check itself — wired to
+   *  the real metadata refresh, never a reload or a sign-in. */
+  onRetryAccess?: () => void;
+  /** CAD-1537: a proven non-operator — a signed-in `member` session or a
+   *  viewer of a `--read-only` board — who may load an installed app's
+   *  receipts and mount its screen read-only. Never set while `operator`
+   *  is `null`; the daemon decides what each read-only mount may call. */
+  screenReader?: boolean;
 }
 
 /**
@@ -139,15 +170,22 @@ export function visibleMoves(stage: WorkStage | null | undefined, viewer: Viewer
 }
 
 /** Why no move is offered — the line shown in place of the buttons. */
-export function noMoveReason(stage: WorkStage | null | undefined, viewer: Viewer): string | null {
+export function noMoveReason(stage: WorkStage | null | undefined, viewer: Viewer, t: Translate = identity): string | null {
   if (!stage) return null;
-  if (!stage.moves) return "This board's server does not list stage moves.";
+  if (!stage.moves) return t("This board's server does not list stage moves.");
   if (stage.moves.length === 0) {
-    return stage.source === "plan" ? "The plan decides this stage until it is approved." : "No stage move is open.";
+    return t(stage.source === "plan" ? "The plan decides this stage until it is approved." : "No stage move is open.");
   }
-  if (viewer.readOnly) return "The board is read-only.";
+  if (viewer.readOnly) return t("The board is read-only.");
+  if (viewer.operator === null) {
+    return t(
+      viewer.access === "unavailable"
+        ? "The access check could not confirm this session — stage moves stay off until it answers."
+        : "Checking whether this session may move stages…",
+    );
+  }
   if (!viewer.operator) {
-    return "Stage moves on the board are the operator's. Agents move a stage with `cadence issue epic stage`.";
+    return t("Stage moves on the board are the operator's. Agents move a stage with `cadence issue epic stage`.");
   }
   return null;
 }
@@ -193,8 +231,8 @@ export function childrenOf(cards: IssueCard[], epic: string): IssueCard[] {
 }
 
 /** `build` → `2/5 build`: the stage's place in the project's list. */
-export function stageLabel(stage: WorkStage | null | undefined): string {
-  if (!stage) return "no stage";
+export function stageLabel(stage: WorkStage | null | undefined, t: Translate = identity): string {
+  if (!stage) return t("no stage");
   const i = stage.stages.indexOf(stage.id);
   return i === -1 ? stage.id : `${stage.id} ${i + 1}/${stage.stages.length}`;
 }

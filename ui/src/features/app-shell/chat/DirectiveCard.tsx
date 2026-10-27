@@ -1,4 +1,5 @@
 import { useRef } from "react";
+import { useTranslate } from "../../../lib/locale";
 import type { DirectiveCardSpec } from "./contract";
 import { runHostAction, type ActionContext } from "./actions";
 import { hideIds } from "./directive";
@@ -60,10 +61,11 @@ export default function DirectiveCard({
 
 /** Guard 10: a token-bearing message with no declared directive. */
 export function ConfirmationCard() {
+  const t = useTranslate();
   return (
     <div className="card app-chat-card" data-chat-card="directive">
-      <div className="text-label font-medium text-ink-100">Confirmation sent</div>
-      <div className="text-micro text-ink-400">The assistant has your confirmation.</div>
+      <div className="text-label font-medium text-ink-100">{t("Confirmation sent")}</div>
+      <div className="text-micro text-ink-400">{t("The assistant has your confirmation.")}</div>
     </div>
   );
 }

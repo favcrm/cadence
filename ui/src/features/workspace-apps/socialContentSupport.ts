@@ -7,6 +7,7 @@ const socialContentWorkflows = new Map<string, readonly string[]>([
   ["0.3.0", ["instagram", "facebook", "source-instagram"]],
   ["0.4.0", ["instagram", "facebook", "source-instagram", "image-instagram"]],
   ["0.5.0", fiveWorkflows],
+  ["0.5.1", fiveWorkflows],
   // CAD-1038: the independent package (cadence-app-social-content) ships the 0.5.0
   // workflows byte-identical; 0.5.2 is live and 0.5.3 is next.
   ["0.5.2", fiveWorkflows],
@@ -15,6 +16,12 @@ const socialContentWorkflows = new Map<string, readonly string[]>([
   // same five workflows and the `?screen=native` back door until H4.
   ["0.5.4", fiveWorkflows],
 ]);
+
+/** CAD-1519: the one place the shell tells Social Content apart — it still
+ *  owns a native workspace and its context picker until CAD-976 removes them. */
+export function isSocialContent(installation: Pick<Installation, "name"> | null): boolean {
+  return installation?.name === "social-content";
+}
 
 export function supportsSocialContentWorkspace(installation: Pick<Installation, "name" | "version" | "files">): boolean {
   const expected = socialContentWorkflows.get(installation.version);

@@ -1,9 +1,11 @@
 //! CAD-534: `cadence daemon` messages RPC handlers — moved verbatim from src/daemon.rs.
 
+use super::bootstrap_files;
 use super::*;
 
 use crate::adapter::InterruptOutcome;
 use crate::adapter::Probe;
+use crate::issue;
 use crate::peer::PeerTies;
 
 /// CAD-565: the largest window one `message read` returns — Unicode
@@ -11,7 +13,92 @@ use crate::peer::PeerTies;
 /// anything a pane could.
 pub(super) const MESSAGE_READ_LIMIT: usize = 4_000;
 
+const MESSAGE_LIST_LIMIT_DEFAULT: usize = 20;
+const MESSAGE_LIST_LIMIT_MAX: u64 = 50;
+const KNOWN_MESSAGE_STATES: &[&str] = &[
+    "queued",
+    "submitting",
+    "running",
+    "completed",
+    "failed",
+    "interrupted",
+    "cancelled",
+    "unknown",
+    "available",
+    "refused",
+];
+
+fn known_message_state(state: &str) -> bool {
+    KNOWN_MESSAGE_STATES.contains(&state)
+}
+
+/// Who may list `target`. Stricter than `message_read` for an unproven
+/// caller: listing enumerates ids, so an unproven connection is refused
+/// even when it could read a body it already named.
+pub(super) fn admit_message_list(who: &caller_rule::Who, target: &str) -> Result<()> {
+    match who {
+        caller_rule::Who::Operator => Ok(()),
+        caller_rule::Who::Agent(caller) if caller == target => Ok(()),
+        caller_rule::Who::Agent(caller) => Err(Error::rejected(format!(
+            "message_list refused: agent '{caller}' cannot list another \
+             agent's mail (caller rule)"
+        ))),
+        caller_rule::Who::Unproven(why) => Err(Error::rejected(format!(
+            "message_list refused: an unproven caller cannot list mail ({why})"
+        ))),
+    }
+}
+
 impl Shared {
+    /// One retained library image: `{asset_id, revision, sha256}` proved
+    /// against the catalog and the stored original digest. No bytes move.
+    fn prove_media_refs(&self, value: &Value) -> Result<Value> {
+        let rows = value
+            .as_array()
+            .filter(|rows| rows.len() == 1)
+            .ok_or_else(|| Error::rejected("media_refs takes exactly one library image"))?;
+        let row = rows[0]
+            .as_object()
+            .ok_or_else(|| Error::rejected("media_refs entry must be an object"))?;
+        if row.len() != 3
+            || !row.contains_key("asset_id")
+            || !row.contains_key("revision")
+            || !row.contains_key("sha256")
+        {
+            return Err(Error::rejected("media_refs entry fields are closed"));
+        }
+        let asset_id = row["asset_id"]
+            .as_str()
+            .filter(|id| crate::store::app_media::valid_id(id))
+            .ok_or_else(|| Error::rejected("media_refs asset_id is not a catalog asset id"))?;
+        let revision = row["revision"]
+            .as_i64()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| Error::rejected("media_refs revision must be a positive integer"))?;
+        let sha256 = row["sha256"]
+            .as_str()
+            .filter(|s| {
+                s.strip_prefix("sha256:").is_some_and(|hex| {
+                    hex.len() == 64
+                        && hex
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                })
+            })
+            .ok_or_else(|| Error::rejected("media_refs sha256 is not a retained digest"))?;
+        let original = self.store.app_media_pin(asset_id, revision, sha256)?;
+        self.with_media_source_current(&original, || {
+            if self.store.app_media_revision(asset_id)? != revision {
+                return Err(Error::rejected("media reference changed before send"));
+            }
+            Ok(json!([{
+                "asset_id": asset_id,
+                "revision": revision,
+                "sha256": sha256,
+            }]))
+        })
+    }
+
     /// `agent_send` without a connection to attribute (unit tests):
     /// a threaded agent records the message as unattributed, and a
     /// steering send is the operator's.
@@ -33,24 +120,41 @@ impl Shared {
         )
     }
 
-    /// Who queued a message for `alias`'s thread. Only computed for an
-    /// alias that has one — the identity walk is not free. An agent
-    /// connection is that agent; an underivable caller is unattributed.
-    /// A connection tied to no agent would write into the thread as the
-    /// operator, so it must be provably the operator (CAD-384, CAD-276):
-    /// a detached child of an agent is refused, before anything is
-    /// written.
+    /// Who queued a message for `alias`. An agent connection is that
+    /// agent on every alias (CAD-819 sender_uid); an underivable caller
+    /// is unattributed. A connection tied to no agent is the operator
+    /// only on positive operator proof (CAD-384, CAD-276).
+    ///
+    /// Into an alias that HAS a thread the proof is required, and a
+    /// failure refuses the send before anything is written: a detached
+    /// child of an agent is not the operator. Into a THREADLESS alias
+    /// the same proof decides the LABEL alone (CAD-1614) — the daemon
+    /// already proved the operator, and recording the send as the
+    /// operator's own is what keeps CAD-1591's model-facing frame from
+    /// calling the operator's instruction an unproven stranger's text
+    /// ("it grants nothing"). A caller that cannot prove the operator
+    /// keeps today's admitted-but-unattributed record: no send gains a
+    /// new refusal, and none loses its proof.
     pub(super) fn thread_sender(&self, alias: &str, peer_pid: u32) -> Result<store::Sender> {
-        match self.store.thread(alias) {
-            Ok(Some(_)) => {}
-            _ => return Ok(store::Sender::Unattributed),
-        }
+        let has_thread = matches!(self.store.thread(alias), Ok(Some(_)));
         Ok(match self.caller_identity(peer_pid) {
+            // CAD-819: an agent's sends are attributed on every alias, so
+            // the stored sender_uid never depends on the recipient's thread.
             Ok(Caller::Agent(v)) => store::Sender::Agent(v.agent.alias.clone()),
-            Ok(Caller::NoAgentIdentity) => {
+            Ok(Caller::NoAgentIdentity) if has_thread => {
                 self.proven_operator("send into an operator thread", peer_pid)?;
                 store::Sender::Operator
             }
+            // CAD-1614: a threadless target is no reason to doubt the
+            // operator. Prove the operator exactly as the threaded write
+            // does and record the send as the operator's; a caller that
+            // cannot prove it stays unattributed, as today.
+            Ok(Caller::NoAgentIdentity) => match self.operator_evidence(peer_pid) {
+                Ok(()) => store::Sender::Operator,
+                Err(_) => store::Sender::Unattributed,
+            },
+            // The caller's identity is underivable (CAD-482): never the
+            // operator's, whatever the target's thread state.
             Err(_) => store::Sender::Unattributed,
         })
     }
@@ -68,6 +172,183 @@ impl Shared {
             )))
         })
     }
+    /// CAD-225: a daemon follow-up turn on an issue's lane — the
+    /// checkup's fix turn and the delivery loop's revision hand-back.
+    /// Server-only: never an RPC verb, never caller-addressable.
+    ///
+    /// `worker` is the message's target and must be the issue's
+    /// canonical owner; `mid` is the caller's stable correlation id.
+    /// The caller holds `unattended_lock` READ across this call so a
+    /// grant replacement cannot interleave between the revalidation
+    /// and the enqueue (same order as dispatch: grant-read first, then
+    /// deeper locks — never the reverse).
+    ///
+    /// An unbound issue (no native unattended run) takes the ordinary
+    /// `send_as` path unchanged. A bound issue must still authorize:
+    /// `unattended_dispatch_authority` revalidates the live grant and its
+    /// unique registered checkout — a revoked, expired, malformed or
+    /// inconsistent grant is an `Err`, never a quiet fall-back to a
+    /// plain send. The follow-up then carries the lane's `issue`/
+    /// `worktree` tags re-derived from the lane's latest dispatch
+    /// queue tag (`worker_issue_lane`), after proving that worktree
+    /// still resolves inside the grant's registered repository root.
+    /// `worker_issue_turn` correlates the tagged `source='review'` row
+    /// (unattributed sender → `sender_uid` NULL) as the lane's latest
+    /// owned turn — no second correlation path, no caller-supplied
+    /// tags (the CAD-378 guard still refuses `issue`/`worktree` request
+    /// fields; the typed `bound_lane` also carries the live grant deadline).
+    /// Caller holds grant READ then delivery lock and supplies its current
+    /// record. True means a bound follow-up; false preserves legacy sends.
+    pub(super) fn send_issue_followup(
+        self: &Arc<Self>,
+        rec: &crate::delivery::Record,
+        mid: &str,
+        text: &str,
+    ) -> Result<bool> {
+        let issue = rec.issue.as_str();
+        let worker = rec.worker.as_str();
+        let authority = self.unattended_dispatch_authority(issue)?;
+        let sender_of = &|_: &str| Ok(store::Sender::Unattributed);
+        let steer_refused = &|verb: &str| {
+            Err(Error::rejected(format!(
+                "{verb} refused: this send carries no caller to steer with"
+            )))
+        };
+        let Some(authority) = authority else {
+            // Unbound legacy lane — the pre-grant behavior, unchanged.
+            self.send_with(
+                &json!({"alias": worker, "text": text, "message": mid, "source": "review"}),
+                sender_of,
+                steer_refused,
+            )?;
+            return Ok(false);
+        };
+        let root = authority.checkout;
+        // Bound run: the canonical owner is the only worker a follow-up
+        // may target — a reassigned lane ends the run's authority to
+        // enqueue, it never re-aims it.
+        let pm = self.pm()?;
+        let (_project, dir) = issue::write::issue_dir(&pm, issue)?;
+        let (front, _) = issue::write::load_front(&dir)?;
+        if front.owner.as_deref() != Some(worker) {
+            return Err(Error::rejected(format!(
+                "{issue}'s unattended run targets its authorized worker — \
+                 a follow-up to {worker} is refused"
+            )));
+        }
+        // The lane tag comes from the lane's latest dispatch queue
+        // tag — the native record of where this run currently executes.
+        // A bound issue with no dispatch kickoff never got its turn, so
+        // there is no lane to follow up on.
+        let lane = self
+            .store
+            .worker_issue_lane(issue, worker)?
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "{issue}'s unattended run has no native dispatch turn on \
+                     {worker} — a follow-up cannot derive its lane"
+                ))
+            })?;
+        // The recorded lane must still resolve inside the grant's
+        // registered repository checkout — the same proof
+        // `dispatch_send` re-ran on the kickoff itself.
+        let actual = issue::project::repo_identity(Path::new(&lane)).ok_or_else(|| {
+            Error::rejected(format!(
+                "{issue}'s recorded lane has no proven repository identity"
+            ))
+        })?;
+        if actual.0.as_path() != Path::new(&root) {
+            return Err(Error::rejected(format!(
+                "{issue}'s recorded lane resolves outside its grant's \
+                 authorized repository — the follow-up is refused"
+            )));
+        }
+        let head = rec
+            .head
+            .as_deref()
+            .filter(|head| !head.is_empty())
+            .ok_or_else(|| Error::rejected("a bound follow-up needs its current recorded head"))?;
+        if let Some(intent) = self.store.unattended_merge_intent(issue, head)? {
+            let (repo, number) =
+                crate::issue::task_report::parse_pr_url(rec.pr.as_deref().unwrap_or_default())?;
+            if !intent["repo"]
+                .as_str()
+                .is_some_and(|bound| bound.eq_ignore_ascii_case(&repo))
+                || intent["pr"].as_u64() != Some(number)
+                || intent["worker"].as_str() != Some(worker)
+            {
+                return Err(Error::rejected("the recorded merge intent does not bind this follow-up; operator inspection is required"));
+            }
+            let base_ref = intent["base_ref"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| Error::rejected("the recorded merge intent has no target branch; operator inspection is required"))?;
+            let view = crate::delivery::pr_view(&self.delivery_gh.to_string_lossy(), &repo, number)
+                .map_err(|error| Error::rejected(format!("merge-request state is unreadable ({error}); operator must inspect/remove it before repair")))?;
+            if view["headRefOid"].as_str() != Some(head)
+                || view["state"] != "OPEN"
+                || view["baseRefName"] != base_ref
+            {
+                return Err(Error::rejected(
+                    "the PR no longer names this open head; operator must inspect it before repair",
+                ));
+            }
+            // A removed request may have an advanced base, never a different destination.
+            let base = view["baseRefOid"]
+                .as_str()
+                .filter(|oid| !oid.is_empty())
+                .ok_or_else(|| {
+                    Error::rejected("the current PR has no base commit; repair is refused")
+                })?;
+            let auto = view.get("autoMergeRequest").ok_or_else(|| {
+                Error::rejected(
+                    "merge-request evidence is missing; operator must inspect it before repair",
+                )
+            })?;
+            if !auto.is_null() {
+                return Err(Error::rejected("the PR still has an armed auto-merge request; operator must remove it before a new head is produced"));
+            }
+            let entry = super::delivery_requirements_rpc::unattended_queue_entry(
+                self, &repo, number, head, base, base_ref,
+            ).map_err(|error| Error::rejected(format!("queue-removal proof is unreadable ({error}); operator must inspect/remove it before repair")))?;
+            if entry.is_some() {
+                return Err(Error::rejected("the PR still has a native queue entry; operator must remove it before a new head is produced"));
+            }
+        } else if rec.state == crate::delivery::State::Enqueued
+            || rec.unattended_pending
+            || rec.disable_auto
+            || rec.observed.as_ref().is_some_and(|view| view.auto_merge)
+        {
+            return Err(Error::rejected("the lane has merge-request state without a native intent; operator must inspect/remove it before repair"));
+        }
+        // Re-prove authority after network reads; carry that expiry into enqueue.
+        // Same global writer lock as supported tracker edits; unrelated
+        // report files remain outside this read-only snapshot's admission scope.
+        let _tracker = pm.lock_for_paths(&[dir.join("issue.md")])?;
+        let authorized_until = match self.unattended_dispatch_authority(issue)? {
+            Some(reproved) if reproved.checkout == root => reproved.expires_at,
+            _ => {
+                return Err(Error::rejected(
+                    "the bound repository authority changed before follow-up enqueue",
+                ));
+            }
+        };
+        const COMPLETION: &str = " End your returned result (or explicit message result text) with a final `SHA: <same full committed head as the done report>` line.";
+        let mut body = String::with_capacity(text.len() + COMPLETION.len());
+        body.push_str(text);
+        body.push_str(COMPLETION);
+        let mut params = json!({"alias": worker, "message": mid, "source": "review"});
+        params["text"] = Value::String(body);
+        self.send_with_human_expected(
+            &params,
+            sender_of,
+            steer_refused,
+            None,
+            None,
+            Some((issue, lane.as_str(), authorized_until)),
+        )?;
+        Ok(true)
+    }
 
     /// `send_as` with the caller a steering send (CAD-158) is authorized
     /// against, derived from the connection by `steer_caller`.
@@ -76,6 +357,42 @@ impl Shared {
         params: &Value,
         sender_of: &dyn Fn(&str) -> Result<store::Sender>,
         steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
+    ) -> Result<Value> {
+        self.send_with_human_expected(params, sender_of, steer_caller, None, None, None)
+    }
+
+    /// CAD-1412: `send_with` with an optional expected recipient uid. The
+    /// same guards run for every caller (confinement, PTY, control
+    /// characters, delivery, steering); the uid is checked only by the
+    /// enqueue transaction. `None` is the ordinary path, unchanged.
+    pub(super) fn send_with_expected(
+        self: &Arc<Self>,
+        params: &Value,
+        sender_of: &dyn Fn(&str) -> Result<store::Sender>,
+        steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
+        expected_uid: Option<&str>,
+    ) -> Result<Value> {
+        self.send_with_human_expected(params, sender_of, steer_caller, None, expected_uid, None)
+    }
+
+    /// The one send body (CAD-1374 + CAD-1412 + CAD-1591): the optional
+    /// verified human (typed, daemon-derived) and the optional expected
+    /// recipient uid are independent derivations — neither is a request
+    /// field, and the recipient uid is never treated as the human
+    /// performer. `thread_send` passes both; every other caller reaches
+    /// this through a wrapper above with `None`/`None` for whichever it
+    /// does not derive.
+    /// CAD-225: `bound_lane` is `(issue, worktree, authorized_until)`,
+    /// derived server-side by `send_issue_followup`. Other paths pass
+    /// `None`; request fields cannot set lane tags or the grant deadline.
+    pub(super) fn send_with_human_expected(
+        self: &Arc<Self>,
+        params: &Value,
+        sender_of: &dyn Fn(&str) -> Result<store::Sender>,
+        steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
+        human: Option<&Value>,
+        expected_uid: Option<&str>,
+        bound_lane: Option<(&str, &str, f64)>,
     ) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
@@ -104,7 +421,7 @@ impl Shared {
             Some(_) => {
                 return Err(Error::rejected(
                     "supersedes must be an array of message ids",
-                ))
+                ));
             }
         };
         // CAD-250: `--nudge` — turnless steering for a live pty pane. The
@@ -153,11 +470,13 @@ impl Shared {
         // CAD-467 wrote `issue`/`worktree` on the message row at send,
         // steer-gated — but the steer gate checks caller-versus-target,
         // never the values, so a PM could mark a send to its own worker
-        // with a forged lane (CAD-378 R6). Now only dispatch paths write
-        // the tags: `dispatch_send` sets them from the lane the daemon
-        // itself resolves, `task_dispatch` from the job's rows. A caller
-        // field is refused outright — silently dropping it would let a
-        // retry pass as untagged and mis-suppress the reported-kickoff
+        // with a forged lane (CAD-378 R6). Now only daemon-derived paths
+        // write the tags: `dispatch_send` sets them from the lane the
+        // daemon itself resolves, `task_dispatch` from the job's rows,
+        // `send_issue_followup` from the lane's latest dispatch tag
+        // through the typed `bound_lane` argument. A caller field is
+        // refused outright — silently dropping it would let a retry
+        // pass as untagged and mis-suppress the reported-kickoff
         // duplicate check, and would hide the forgery attempt.
         if optional_str(params, "issue").is_some() || optional_str(params, "worktree").is_some() {
             let verb = "send --issue/--worktree";
@@ -179,6 +498,19 @@ impl Shared {
                  binds turns at delivery; forged turn references are refused",
             ));
         }
+        // CAD-1591: `expected_recipient_uid` is a typed derivation —
+        // `thread_send` parses, validates and strips it before reaching
+        // this body, so a request still carrying it can only be a
+        // caller-supplied field on another verb. It is refused whole
+        // rather than silently ignored: an agent could otherwise name
+        // the constraint and believe a fence ran that never did.
+        if params.get("expected_recipient_uid").is_some() {
+            return Err(Error::rejected(
+                "send refused: `expected_recipient_uid` is not a request \
+                 field — the recipient constraint is a daemon-typed \
+                 derivation of `thread_send` alone",
+            ));
+        }
         // A pty endpoint pastes literally and fails a body with control
         // characters at delivery; refuse it here so `send` never answers
         // `queued` for a message that cannot be delivered (CAD-218).
@@ -197,7 +529,9 @@ impl Shared {
                 "endpoint",
             ] {
                 if params.get(field).is_some() {
-                    return Err(Error::rejected(format!("send --nudge: '{field}' is not accepted; sender and runtime binding are daemon-derived")));
+                    return Err(Error::rejected(format!(
+                        "send --nudge: '{field}' is not accepted; sender and runtime binding are daemon-derived"
+                    )));
                 }
             }
             if steer.is_steering() {
@@ -338,20 +672,29 @@ impl Shared {
             }
             Some(_) => return Err(Error::rejected("conversation must be a string id")),
         };
-        let app = match (app, conversation) {
+        let (app, home_conversation) = match (app, conversation) {
             (Some(mut app), Some(id)) => {
                 self.verify_conversation_selector(&alias, &app, id)?;
                 app["conversation"] = json!(id);
-                Some(app)
+                (Some(app), None)
             }
-            (None, Some(_)) => {
-                return Err(Error::rejected(
-                    "conversation needs a verified app binding — without one a \
-                     send lands in the home thread",
-                ))
+            (None, Some(id)) => {
+                if !crate::master::is_master(&alias) {
+                    return Err(Error::rejected(
+                        "only the Master can select a Home conversation",
+                    ));
+                }
+                self.prove_home_conversation(Some(id))?;
+                (None, Some(id.to_string()))
             }
-            (app, None) => app,
+            (app, None) => (app, None),
         };
+        // CAD-1168: `thread_send`'s `attachments` — retained-file ids
+        // resolved to their stored metadata rows (existence + size
+        // re-checked server-side, scope bound to the verified app
+        // binding above). The field is `thread_send`'s alone, like
+        // `refs`/`app`: a `send`/`ask` carrying it is refused whole,
+        // before any file is looked at, never silently stripped.
         let sender = sender_of(&alias)?;
         if refs.is_some() && sender != store::Sender::OperatorChat {
             return Err(Error::rejected(
@@ -359,8 +702,60 @@ impl Shared {
                  needs rows; `cadence send` and `agent_send` carry none",
             ));
         }
+        let attachments = match params.get("attachments") {
+            None | Some(Value::Null) => None,
+            Some(_) if sender != store::Sender::OperatorChat => {
+                return Err(Error::rejected(
+                    "attachments is a thread_send field — only the operator's chat \
+                     attaches retained files; `cadence send` and `agent_send` carry none",
+                ));
+            }
+            Some(_) if !crate::master::is_master(&alias) => {
+                return Err(Error::rejected(
+                    "attachments go only to the master (home or app conversation turns) — \
+                     other agents cannot read retained chat files",
+                ));
+            }
+            Some(v) => {
+                let account_id = params
+                    .get("session")
+                    .map(|proof| self.chat_upload_session_account(proof))
+                    .transpose()?
+                    .flatten();
+                let home_thread = if app.is_none() {
+                    Some(match home_conversation.as_deref() {
+                        Some(selected) => selected.to_string(),
+                        None => self.prove_home_conversation(None)?,
+                    })
+                } else {
+                    None
+                };
+                Some(thread_attachments(
+                    self,
+                    v,
+                    app.as_ref(),
+                    account_id.as_deref(),
+                    params.get("session").is_some(),
+                    home_thread.as_deref().unwrap_or_default(),
+                )?)
+            }
+        };
+        let media_refs = match params.get("media_refs") {
+            None | Some(Value::Null) => None,
+            Some(_) if sender != store::Sender::OperatorChat => {
+                return Err(Error::rejected(
+                    "media_refs is a thread_send field — only the operator's chat pins a library image",
+                ));
+            }
+            Some(value) => Some(self.prove_media_refs(value)?),
+        };
         // CAD-1098: app conversations are the master's. Another agent has
         // no per-conversation session, so an app binding to it is refused.
+        if home_conversation.is_some() && sender != store::Sender::OperatorChat {
+            return Err(Error::rejected(
+                "Home conversation is a thread_send-only selector",
+            ));
+        }
         if app.is_some() && !crate::master::is_master(&alias) {
             return Err(Error::rejected(
                 "an app binding is only for the master's chat — other agents \
@@ -412,19 +807,37 @@ impl Shared {
                 "turn_id": stored.turn_id, "delivery": "native_turn_steering", "disposition": stored.result}),
             );
         }
-        let (duplicate, state) = self.store.enqueue_steered(
+        // CAD-1586: a fresh send to a master whose stored launch
+        // configuration provably refuses every launch is refused
+        // `master_unlaunchable` here — after every request check,
+        // before the durable enqueue — so no route can queue a turn no
+        // launch can deliver. Busy, starting, stopping and
+        // offline-but-launchable masters are unaffected.
+        // A retry of an ID that already names a row is decided by the
+        // store's exact-envelope comparison; the refusal is for new sends.
+        if crate::master::is_master(&alias) && !self.store.message_exists(&message)? {
+            self.master_send_preflight(&alias)?;
+        }
+        let (duplicate, state) = self.store.enqueue_steered_for_with_conversation(
             &alias,
+            expected_uid,
             text,
             reply_to.as_deref(),
             &message,
             source,
             task,
-            None,
-            None,
+            bound_lane.map(|(issue, _, _)| issue),
+            bound_lane.map(|(_, worktree, _)| worktree),
             &sender,
             &steer,
             refs.as_ref(),
             app.as_ref(),
+            attachments.as_ref(),
+            home_conversation.as_deref(),
+            human,
+            media_refs.as_ref(),
+            bound_lane.map(|(_, _, until)| until),
+            None,
         )?;
         // Each superseded row's `reply_to` got a notice in the same
         // transaction — wake those recipients like `message cancel` does.
@@ -467,17 +880,31 @@ impl Shared {
                 _ => {
                     return Err(Error::rejected(
                         "app mail inspection requires operator proof",
-                    ))
+                    ));
                 }
             }
         }
         if let caller_rule::Who::Agent(caller) = self.connection_caller(peer_pid)? {
-            if caller != message.alias {
+            if !self.store.agent_reads_message(&message, &caller)? {
                 return Err(Error::rejected(format!(
                     "message_read refused: agent '{caller}' cannot read another \
-                     agent's mail — '{id}' belongs to '{}' (caller rule, CAD-480)",
-                    message.alias
+                     agent's mail (caller rule, CAD-480)"
                 )));
+            }
+        }
+        // CAD-1380 target-side privacy: a member assistant's stored message is
+        // readable only by the operator or that assistant itself. An unproven
+        // caller is refused, never served the body.
+        if self.store.assistant_for_alias(&message.alias)?.is_some() {
+            match self.connection_caller(peer_pid)? {
+                caller_rule::Who::Operator => {}
+                caller_rule::Who::Agent(caller) if caller == message.alias => {}
+                _ => {
+                    return Err(Error::rejected(
+                        "message_read refused: a member assistant's message is private \
+                         to its assistant (CAD-1380 target-side privacy)",
+                    ))
+                }
             }
         }
         let offset = optional_u64(params, "offset").unwrap_or(0) as usize;
@@ -503,6 +930,78 @@ impl Shared {
             "chars_total": total,
             "truncated": offset + text.chars().count() < total,
             "app_context": app_context,
+        }))
+    }
+
+    /// `message list` — ids and state for one recipient. No body, result,
+    /// error, or turn token. An agent lists only its own alias. An
+    /// unproven caller is refused. App-owned rows are included only for
+    /// an operator, and still without their body.
+    pub(super) fn rpc_message_list(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        reject_identity_fields(params, "message_list")?;
+        let to = required_str(params, "to")?;
+        let alias = self.resolve_alias(to)?;
+        let who = self.connection_caller(peer_pid)?;
+        admit_message_list(&who, &alias)?;
+        let states = match params.get("state") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .filter(|state| known_message_state(state))
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            Error::rejected(format!(
+                                "state must be one of {}",
+                                KNOWN_MESSAGE_STATES.join(", ")
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => return Err(Error::rejected("state must be an array of message states")),
+        };
+        let from = optional_str(params, "from");
+        let source = optional_str(params, "source");
+        if from.is_some_and(|value| value.is_empty())
+            || source.is_some_and(|value| value.is_empty())
+        {
+            return Err(Error::rejected(
+                "from and source, when set, must be nonempty",
+            ));
+        }
+        let since = optional_str(params, "since").map(str::to_string);
+        let limit = match optional_u64(params, "limit") {
+            None => MESSAGE_LIST_LIMIT_DEFAULT,
+            Some(n) if (1..=MESSAGE_LIST_LIMIT_MAX).contains(&n) => n as usize,
+            Some(_) => {
+                return Err(Error::rejected(format!(
+                    "limit must be 1 to {MESSAGE_LIST_LIMIT_MAX}"
+                )))
+            }
+        };
+        let include_app = matches!(who, caller_rule::Who::Operator);
+        let page = self.store.message_index(
+            &alias,
+            &store::MessageIndexQuery {
+                states: &states,
+                from,
+                source,
+                since: since.as_deref(),
+                limit,
+                include_app,
+            },
+        )?;
+        Ok(json!({
+            "alias": alias,
+            "messages": page.rows.iter().map(store::MessageIndex::to_json).collect::<Vec<_>>(),
+            "limit": limit,
+            "omitted": page.omitted,
+            "truncated": page.omitted > 0,
         }))
     }
 
@@ -892,7 +1391,7 @@ impl Shared {
                         prior["result"].as_str().unwrap_or("unknown"),
                         prior["by"].as_str().unwrap_or("unknown"),
                     ),
-                )
+                );
             }
             Err(e) => return fail("message", format!("recovery record lookup failed: {e}")),
         }
@@ -976,7 +1475,7 @@ impl Shared {
     /// resolved from the connection caller. Exactly one of the two is a
     /// refusal — a token without its message names nothing, and a message
     /// without its token proves nothing.
-    fn report_target(&self, params: &Value, peer_pid: u32) -> Result<(String, String)> {
+    pub(super) fn report_target(&self, params: &Value, peer_pid: u32) -> Result<(String, String)> {
         let id = optional_str(params, "message");
         let token = optional_str(params, "token");
         match (id, token) {
@@ -1003,7 +1502,7 @@ impl Shared {
     /// operator, and not at all for unproven callers (exact id only —
     /// possession still works, prefix fishing does not). Resolution never
     /// bypasses the token/generation/state gates below (I4).
-    fn resolve_message_id_for(&self, peer_pid: u32, id: &str) -> Result<String> {
+    pub(super) fn resolve_message_id_for(&self, peer_pid: u32, id: &str) -> Result<String> {
         if self.store.message(id)?.is_some() {
             return Ok(id.to_string());
         }
@@ -1133,8 +1632,15 @@ impl Shared {
         reject_identity_fields(params, "message report")?;
         let kind = required_str(params, "kind")?;
         let text = optional_str(params, "text");
+        // CAD-1420: a bootstrap object is an ACK-only field; the caller is
+        // derived from the connection, never from the request.
+        if params.get("bootstrap").is_some() && kind != "ack" {
+            return Err(Error::rejected(
+                "bootstrap is accepted only on a message ack",
+            ));
+        }
         let (id, token) = self.report_target(params, peer_pid)?;
-        let message = self
+        let mut message = self
             .store
             .message(&id)?
             .ok_or_else(|| Error::rejected("Unknown message"))?;
@@ -1146,11 +1652,37 @@ impl Shared {
                 ));
             }
         }
-        let agent = self.store.agent(&message.alias)?;
+        let mut agent = self.store.agent(&message.alias)?;
         if message.turn_id.as_deref() != Some(token.as_str()) {
             return Err(Error::rejected(
                 "Token does not match the message's submission token",
             ));
+        }
+        // A recovered turn is neither stale nor valid until the actor
+        // has proved (or refused) its pane. Park only the exact recovered
+        // message/token, after all caller and identity checks, without
+        // holding the store lock or mutating message state.
+        if self.adoption_pending(&message.alias, &id, &token) {
+            if !self.wait_for_adoption(
+                &message.alias,
+                &id,
+                &token,
+                Instant::now() + Duration::from_secs(20),
+            ) {
+                return Err(Error::rejected(
+                    "Timed out waiting for running-turn re-adoption",
+                ));
+            }
+            message = self
+                .store
+                .message(&id)?
+                .ok_or_else(|| Error::rejected("Unknown message"))?;
+            if message.turn_id.as_deref() != Some(token.as_str()) {
+                return Err(Error::rejected(
+                    "Token does not match the message's submission token",
+                ));
+            }
+            agent = self.store.agent(&message.alias)?;
         }
         if !registry::turn_token_current(
             &agent.provider,
@@ -1195,6 +1727,25 @@ impl Shared {
             let result_text = message.result.as_ref().and_then(|r| r.get("text")).cloned();
             return Ok(json!({"state": message.state, "task": message.task_id,
                              "issue": issue, "result_text": result_text}));
+        }
+        // CAD-1420: a bootstrap ACK validates and applies BEFORE any activity
+        // bump, so a refused profile mutation changes neither activity nor the
+        // ack. An ordinary ACK (no `bootstrap`) takes the unchanged path below.
+        if kind == "ack" {
+            if let Some(bootstrap) = params.get("bootstrap") {
+                let AgentCaller::Agent(alias) = self.agent_caller(peer_pid, "bootstrap ack")?
+                else {
+                    return Err(Error::rejected(
+                        "bootstrap ack refused: it needs the assistant's own connection",
+                    ));
+                };
+                if alias != message.alias {
+                    return Err(Error::rejected(
+                        "bootstrap ack refused: the connection is not the message's assistant",
+                    ));
+                }
+                self.bootstrap_ack(&message, &token, bootstrap)?;
+            }
         }
         // A valid ack/result report is explicit agent activity — it
         // feeds the stall clock for every endpoint kind.
@@ -1277,11 +1828,96 @@ impl Shared {
             other => {
                 return Err(Error::rejected(format!(
                     "Report kind must be ack or result, not '{other}'"
-                )))
+                )));
             }
         }
         self.wake();
         Ok(json!({"state": "reported", "kind": kind}))
+    }
+
+    /// CAD-1420: apply the closed bootstrap object on a stamped assistant ACK.
+    /// Validation and the HTTP-capable reprove run BEFORE any SQLite lock. The
+    /// store then re-checks message/turn/stamp/binding/revision in one fenced
+    /// transaction and only then runs the local profile-file effect. Any
+    /// refusal changes neither profile files nor lifecycle state.
+    fn bootstrap_ack(
+        self: &Arc<Self>,
+        message: &store::Message,
+        token: &str,
+        bootstrap: &Value,
+    ) -> Result<()> {
+        let object = bootstrap
+            .as_object()
+            .ok_or_else(|| Error::rejected("bootstrap must be a JSON object"))?;
+        const FIELDS: [&str; 3] = ["action", "expected_revision", "profile"];
+        if let Some(field) = object.keys().find(|k| !FIELDS.contains(&k.as_str())) {
+            return Err(Error::rejected(format!(
+                "bootstrap refused: field '{field}' is not accepted"
+            )));
+        }
+        let action = required_str(bootstrap, "action")?;
+        if !matches!(action, "update" | "complete" | "skip" | "defer" | "resume") {
+            return Err(Error::rejected("bootstrap action is not recognized"));
+        }
+        let expected_revision = bootstrap
+            .get("expected_revision")
+            .and_then(Value::as_i64)
+            .filter(|r| *r >= 0)
+            .ok_or_else(|| Error::rejected("bootstrap needs a nonnegative expected_revision"))?;
+        let profile = match bootstrap.get("profile") {
+            None => None,
+            Some(value) => Some(bootstrap_files::Profile::parse(
+                value
+                    .as_object()
+                    .ok_or_else(|| Error::rejected("bootstrap profile must be an object"))?,
+            )?),
+        };
+        let stamp = self
+            .store
+            .message_member_authority(&message.id)?
+            .ok_or_else(|| {
+                Error::rejected("bootstrap refused: the message has no member authority")
+            })?;
+        if message.source == "assist_job_event" {
+            return Err(Error::rejected(
+                "bootstrap refused: a job notice cannot update the assistant profile",
+            ));
+        }
+        // HTTP-capable revalidation of the ORIGINAL queued credential, outside
+        // every SQLite lock.
+        self.member_message_reprove(message)?;
+        let expect = store::AssistDispatchExpect {
+            org: stamp.org.clone(),
+            sub: stamp.sub.clone(),
+            assistant_id: stamp.assistant_id.clone(),
+            alias: message.alias.clone(),
+            credential_id: Some(stamp.credential_id.clone()),
+            job: String::new(),
+        };
+        let root = self.assistant_principal_cwd(&stamp.org, &stamp.sub);
+        self.store.assistant_bootstrap_apply(
+            &expect,
+            &message.id,
+            token,
+            store::AssistantBootstrapUpdate {
+                action,
+                expected_revision,
+                look: profile.as_ref().and_then(|p| p.look.as_deref()),
+            },
+            || {
+                if let Some(p) = profile.as_ref() {
+                    bootstrap_files::write_profile(&root, p)?;
+                }
+                Ok(())
+            },
+        )?;
+        // Completion is committed; cleanup is best-effort and never reopens setup.
+        if action == "complete" {
+            if let Err(error) = bootstrap_files::remove_bootstrap(&root) {
+                eprintln!("bootstrap cleanup for {}: {error}", message.alias);
+            }
+        }
+        Ok(())
     }
 
     /// Operator reconcile of an `unknown` message — no turn token, the
@@ -1357,6 +1993,19 @@ impl Shared {
     /// default 30, max 120) bounds how long the answer waits for the
     /// message to settle.
     pub(super) fn rpc_interrupt(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.rpc_interrupt_bound(params, peer_pid, None)
+    }
+
+    /// CAD-1700: `rpc_interrupt`, optionally bound to one message. With
+    /// `expected`, the turn must still be that exact running message when
+    /// the interrupt is about to reach the adapter; otherwise the call is
+    /// refused, so a stale click never stops a newer turn.
+    pub(super) fn rpc_interrupt_bound(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+        expected: Option<&str>,
+    ) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let agent = self.store.agent(&alias)?;
         // Read once: the turn the caller is authorized for is the one
@@ -1437,7 +2086,7 @@ impl Shared {
             thread::sleep(Duration::from_millis(ms));
         }
         // Every call past the caller rule leaves one `interrupt_requested`
-        // — a refusal included (PROTOCOL.md).
+        // — a refusal included.
         let record = |outcome: &str, error: Option<&str>| -> Result<()> {
             let mut payload = json!({"outcome": outcome, "message": message.id,
                                      "turn_id": turn_id});
@@ -1449,6 +2098,20 @@ impl Shared {
             self.store
                 .event_public(&alias, "interrupt_requested", payload)
         };
+        // CAD-1700: a bound stop re-checks the running turn after every point
+        // it could wait (including the test pause above) and before the
+        // adapter is asked, so a turn that changed since the caller named it
+        // is refused and the newer turn is never interrupted.
+        if let Some(expected) = expected {
+            let still = self.store.running_message(&alias)?;
+            if still.as_ref().map(|m| m.id.as_str()) != Some(expected) {
+                let error = format!(
+                    "message {expected} is no longer the master's running turn — nothing was stopped"
+                );
+                record("refused", Some(&error))?;
+                return Err(Error::invalid("turn_not_running", error));
+            }
+        }
         let adapter = self
             .lifecycle
             .lock()
@@ -1528,5 +2191,21 @@ impl Shared {
             "turn_id": turn_id,
             "state": settled.map(|m| m.state),
         }))
+    }
+}
+
+#[cfg(test)]
+mod message_list_admit {
+    use super::admit_message_list;
+    use crate::daemon::caller_rule::Who;
+
+    #[test]
+    fn only_the_operator_or_the_recipient_may_list() {
+        assert!(admit_message_list(&Who::Operator, "worker").is_ok());
+        assert!(admit_message_list(&Who::Agent("worker".into()), "worker").is_ok());
+        let other = admit_message_list(&Who::Agent("peer".into()), "worker").unwrap_err();
+        assert!(other.to_string().contains("cannot list another"), "{other}");
+        let unproven = admit_message_list(&Who::Unproven("no pane".into()), "worker").unwrap_err();
+        assert!(unproven.to_string().contains("unproven"), "{unproven}");
     }
 }

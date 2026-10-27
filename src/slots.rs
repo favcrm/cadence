@@ -48,15 +48,19 @@
 //! until then the file keeps its v1 shape.
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
 
+mod heartbeat;
+mod lease;
+mod persistence;
+mod queue;
 mod strict;
 #[cfg(test)]
 mod strict_tests;
@@ -76,8 +80,15 @@ pub struct SlotConfig {
     pub build_slots: usize,
     /// Concurrent `suite` grants (default 1, minimum 1).
     pub suite_slots: usize,
-    /// `CARGO_BUILD_JOBS` value dispatch injects (default 4).
+    /// `CARGO_BUILD_JOBS` value dispatch injects (default 2).
     pub jobs_per_lane: usize,
+    /// CAD-1268: combined cap on grants across ALL pools (default 2,
+    /// minimum 1). Per-pool limits still apply — a grant needs both —
+    /// so `build`/`test`, `suite` and `check` can never cumulatively
+    /// overcommit one host beyond this budget. This registry's
+    /// aggregate only; coordination across separate daemon
+    /// registries is a follow-up.
+    pub total_slots: usize,
     /// A `(lane, kind)` waiting continuously longer than this outranks
     /// even priority lanes (default 900) — the never-starve bound.
     pub starve_secs: u64,
@@ -114,7 +125,8 @@ impl Default for SlotConfig {
         Self {
             build_slots: 3,
             suite_slots: 1,
-            jobs_per_lane: 4,
+            jobs_per_lane: 2,
+            total_slots: 2,
             starve_secs: 900,
             priority_lanes: Vec::new(),
             max_hold_secs: 7200,
@@ -150,7 +162,7 @@ pub enum SlotKind {
     Test,
     Suite,
     /// CAD-1021: the light pre-push class — fmt, split-map, clippy
-    /// and `check` under `CARGO_BUILD_JOBS=4`. Its own pool so a full
+    /// and `check` under `CARGO_BUILD_JOBS=2`. Its own pool so a full
     /// `build`/`test` wave never starves a lane's pre-push gate.
     Check,
 }
@@ -190,10 +202,11 @@ impl SlotKind {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
 enum Pool {
-    Build,
-    Suite,
-    Check,
+    Build = 0,
+    Suite = 1,
+    Check = 2,
 }
 
 impl Pool {
@@ -206,17 +219,26 @@ impl Pool {
     }
 }
 
-/// The pool a hold blocks queueing into — `holds_other_pool`'s name.
-fn other_pool(pool: Pool) -> Pool {
-    match pool {
-        Pool::Build => Pool::Suite,
-        Pool::Suite => Pool::Build,
-        // A `check` hold blocks no other pool: it is the lane's own
-        // pre-push gate, and must never keep a build off the pool a
-        // suite request waits on (or vice-versa) — so it reports as
-        // having no other pool.
-        Pool::Check => Pool::Check,
-    }
+/// CAD-1268: one reason string for a refused nested acquire — the
+/// message names the held pool and the refused one; they may match.
+fn hold_and_wait_refusal(held: Pool, waiting: Pool) -> Error {
+    Error::rejected(format!(
+        "A caller holding a {} slot cannot queue for {} — \
+         release that hold first (hold-and-wait deadlock guard)",
+        held.as_str(),
+        waiting.as_str(),
+    ))
+}
+
+/// The mirror refusal: the caller's queued waiter is the dependency
+/// that must resolve before any new grant — or any new enqueue.
+fn wait_and_hold_refusal(wanted: Pool, waiting: Pool) -> Error {
+    Error::rejected(format!(
+        "A caller with a queued {} slot request cannot ask for {} — \
+         that queued request must resolve first (wait-then-hold deadlock guard)",
+        waiting.as_str(),
+        wanted.as_str(),
+    ))
 }
 
 struct SlotWait {
@@ -521,14 +543,6 @@ impl Slots {
         }
     }
 
-    /// Where holds persist — the daemon points this at
-    /// `<state>/slots.json`; unit tests leave it unset. The same dir
-    /// is the disk-floor probe's filesystem.
-    pub fn persist_to(&mut self, path: PathBuf) {
-        self.disk_probe_path = path.parent().map(|p| p.to_path_buf());
-        self.persist_path = Some(path);
-    }
-
     /// Inject a resource probe (tests); `None` restores the live probe.
     #[cfg(test)]
     pub(crate) fn use_resources(&mut self, probe: Option<ResourceProbe>) {
@@ -579,1256 +593,28 @@ impl Slots {
         self.held.iter().filter(|h| h.kind.pool() == pool).count()
     }
 
-    /// Grant-order rank: starved `(lane, kind)`s first, then priority
-    /// lanes on test/suite, then plain FIFO — the key is
-    /// (rank, queued_at). Stamps were clamped at ENQUEUE time
-    /// (`stamp_for`), not here — clamping at compare time would
-    /// collapse every starved waiter to the same key and let a
-    /// 901-second waiter tie a two-hour one; raw stamps keep rank 0
-    /// in true FIFO order.
-    fn rank(&self, w: &SlotWait, now: f64) -> (u8, f64) {
-        // CAD-1021 (D5): an unregistered caller queues strictly behind
-        // every registered waiter — below starved, priority and
-        // ordinary alike — so a registered waiter never loses its place
-        // to a caller the daemon could not name.
-        if is_unregistered_lane(&w.lane) {
-            return (3, w.queued_at);
-        }
-        if now - w.queued_at >= self.config.starve_secs as f64 {
-            (0, w.queued_at)
-        } else if matches!(w.kind, SlotKind::Test | SlotKind::Suite)
-            && self.config.priority_lanes.iter().any(|l| l == &w.lane)
-        {
-            (1, w.queued_at)
-        } else {
-            (2, w.queued_at)
-        }
+    /// CAD-1268: the aggregate cap — combined grants across every
+    /// pool. `0` clamps to 1, matching the per-pool capacities.
+    fn total_capacity(&self) -> usize {
+        self.config.total_slots.max(1)
     }
 
-    /// Ranks for the whole queue — computed once per call so position
-    /// and is_next are O(n) scans over O(n) rank evaluations.
-    fn ranks(&self, now: f64) -> Vec<(u8, f64)> {
-        self.waiting.iter().map(|w| self.rank(w, now)).collect()
+    /// Grants admitted need `held_total() < total_capacity()` AND the
+    /// per-pool room — both are checked together at the probe and the
+    /// real grant.
+    fn held_total(&self) -> usize {
+        self.held.len()
     }
 
-    /// How many same-pool waiters outrank entry `idx`.
-    fn outranked(&self, ranks: &[(u8, f64)], idx: usize) -> usize {
-        let pool = self.waiting[idx].kind.pool();
-        ranks
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != idx && self.waiting[*i].kind.pool() == pool)
-            .filter(|(_, r)| **r < ranks[idx])
-            .count()
-    }
-
-    /// Drop dead/recycled/expired holders and dead or silent waiters.
-    /// Holder drops emit `slot_released` with the reap reason (and no
-    /// token — events never carry one); a dead waiter held nothing,
-    /// so it drops silently. Returns what was reaped so `release`
-    /// can answer a just-reaped token softly. Strict holds follow the
-    /// tri-state rule instead ([`Self::reap_strict`]), and strict
-    /// waiters are revalidated against their enrollment here — before
-    /// any caller ranks the queue.
-    fn reap_dead(&mut self, now: f64, events: &mut Vec<SlotEvent>) -> Vec<Reaped> {
-        let mut dead: Vec<Reaped> = Vec::new();
-        self.held.retain(|h| {
-            if h.strict.is_some() {
-                return true;
-            }
-            let gone = !pid_matches(h.pid, h.pid_start);
-            let expired = now - h.acquired_at >= self.config.max_hold_secs as f64;
-            if !gone && !expired {
-                return true;
-            }
-            // `pid_alive` distinguishes a recycled pid (alive, wrong
-            // starttime) from a dead one in the reason.
-            let reason = if expired && !gone {
-                "hold expired"
-            } else if pid_alive(h.pid) {
-                "pid recycled"
-            } else {
-                "holder died"
-            };
-            events.push((
-                h.lane.clone(),
-                "slot_released",
-                json!({"kind": h.kind.as_str(), "pid": h.pid,
-                       "held_secs": (now - h.acquired_at).max(0.0),
-                       "reason": reason}),
-            ));
-            dead.push(Reaped {
-                token: h.token.clone(),
-                lane: h.lane.clone(),
-                kind: h.kind,
-                reason,
-            });
-            false
-        });
-        if !dead.is_empty() {
-            self.persist();
-        }
-        self.expire_enrollments(now, events);
-        self.reap_strict(now, events, &mut dead);
-        // Waiters drop on either abandonment signal: a dead/recycled
-        // pid, or a poll gone silent past the TTL (a fast-failed
-        // --wait-secs 0 caller's pid may still be alive in its parent
-        // — only the silence proves it walked away). A strict waiter
-        // also drops — reported — once its enrollment is revoked,
-        // expired, gone or generation-drifted, or its holder is not
-        // provably alive: the strict check never uses the alive-only
-        // fallback.
-        let (proc, enrollments) = (&self.proc, &self.enrollments);
-        self.waiting.retain(|w| {
-            let Some(b) = &w.strict else {
-                return pid_matches(w.pid, w.pid_start) && now - w.last_poll <= WAITER_TTL_SECS;
-            };
-            let why = match enrollments.iter().find(|e| e.id == b.enrollment_id) {
-                None => Some("enrollment gone"),
-                Some(e) if e.auth != AuthState::Active => Some(e.auth.as_str()),
-                Some(e) if e.owner_generation != b.owner_generation => {
-                    Some("owner generation changed")
-                }
-                Some(_) => match proc.liveness(&b.holder).0 {
-                    Liveness::Alive => None,
-                    Liveness::Dead => Some("waiter died"),
-                    Liveness::Unknown => Some("waiter liveness unknown"),
-                },
-            };
-            if let Some(why) = why {
-                events.push((
-                    w.lane.clone(),
-                    "slot_wait_dropped",
-                    json!({"kind": w.kind.as_str(), "pid": w.pid,
-                           "request_id": w.request_id, "reason": why}),
-                ));
-                return false;
-            }
-            now - w.last_poll <= WAITER_TTL_SECS
-        });
-        self.prune_seniority(now);
-        dead
-    }
-
-    /// Strict holds: tri-state liveness of the exact recorded holder.
-    /// `dead` frees — through the fail-closed writer, so a failed
-    /// write keeps the hold accounted — while `alive` and `unknown`
-    /// retain. Revocation, expiry and `max_hold_secs` never free a
-    /// strict hold (see [`Self::accounting`]).
-    fn reap_strict(&mut self, now: f64, events: &mut Vec<SlotEvent>, dead: &mut Vec<Reaped>) {
-        let mut gone: Vec<(String, &'static str)> = Vec::new();
-        for h in self.held.iter_mut() {
-            if let Some(b) = &mut h.strict {
-                let (liveness, why) = self.proc.liveness(&b.holder);
-                b.liveness = liveness;
-                if liveness == Liveness::Dead {
-                    gone.push((h.token.clone(), why));
-                }
-            }
-        }
-        if gone.is_empty() {
-            return;
-        }
-        let next: Vec<SlotHold> = self
-            .held
-            .iter()
-            .filter(|h| !gone.iter().any(|(t, _)| *t == h.token))
-            .cloned()
-            .collect();
-        let freed: Vec<SlotHold> = self
-            .held
-            .iter()
-            .filter(|h| gone.iter().any(|(t, _)| *t == h.token))
-            .cloned()
-            .collect();
-        if self.commit(self.enrollments.clone(), next).is_err() {
-            return;
-        }
-        for h in freed {
-            let reason = gone
-                .iter()
-                .find(|(t, _)| *t == h.token)
-                .map(|(_, why)| *why)
-                .unwrap_or("holder died");
-            events.push((
-                h.lane.clone(),
-                "slot_released",
-                json!({"kind": h.kind.as_str(), "pid": h.pid,
-                       "held_secs": (now - h.acquired_at).max(0.0),
-                       "reason": reason}),
-            ));
-            dead.push(Reaped {
-                token: h.token,
-                lane: h.lane,
-                kind: h.kind,
-                reason,
-            });
-        }
-    }
-
-    /// Watcher pass (CAD-230b): free every strict hold whose exact
-    /// holder is proven dead — no client call needed. `alive` and
-    /// `unknown` retain, a failed write keeps the hold accounted
-    /// (see [`Self::reap_strict`]). Legacy holds keep their CAD-113
-    /// reap-on-call rule untouched. Freed tokens are remembered
-    /// (bounded) so their holder's `release` still answers softly.
-    pub fn reap_strict_holds(&mut self, now: f64) -> Vec<SlotEvent> {
-        let (mut events, mut dead) = (Vec::new(), Vec::new());
-        self.reap_strict(now, &mut events, &mut dead);
-        self.recent_reaped.extend(dead);
-        let excess = self.recent_reaped.len().saturating_sub(RECENT_REAPED);
-        self.recent_reaped.drain(..excess);
-        events
-    }
-
-    /// Active enrollments past their daemon-capped lifetime become
-    /// `expired`: no new work, holds untouched.
-    fn expire_enrollments(&mut self, now: f64, events: &mut Vec<SlotEvent>) {
-        let due: Vec<usize> = (0..self.enrollments.len())
-            .filter(|i| {
-                let e = &self.enrollments[*i];
-                e.auth == AuthState::Active && now >= e.expires_at
-            })
-            .collect();
-        if due.is_empty() {
-            return;
-        }
-        let mut next = self.enrollments.clone();
-        let mut expired = Vec::new();
-        for i in due {
-            next[i].auth = AuthState::Expired;
-            let e = &next[i];
-            expired.push((
-                e.owner_actor.clone(),
-                "slot_enrollment_expired",
-                json!({"enrollment_id": e.id, "root_pid": e.root.pid}),
-            ));
-        }
-        if self.commit(next, self.held.clone()).is_ok() {
-            events.extend(expired);
-        }
-    }
-
-    /// A `(lane, kind)` episode stays alive while the lane keeps a
-    /// waiter of that kind queued — `seen` tracks its freshest
-    /// `last_poll` — and for `WAITER_TTL_SECS` after the lane's last
-    /// poll, so a caller re-queueing under a new request_id inside
-    /// that window keeps the lane's place. Past the TTL the lane has
-    /// gone quiet: the next request anchors fresh. (The OTHER half
-    /// of the rule lives in `grant`: a served lane's record is
-    /// cleared even when waiters remain.)
-    fn prune_seniority(&mut self, now: f64) {
-        let waiting = &self.waiting;
-        self.seniority.retain(|(lane, kind), s| {
-            let live = waiting
-                .iter()
-                .filter(|w| w.lane == *lane && w.kind == *kind)
-                .map(|w| w.last_poll)
-                .reduce(f64::max);
-            match live {
-                Some(last_poll) => {
-                    s.seen = last_poll;
-                    true
-                }
-                None => now - s.seen <= WAITER_TTL_SECS,
-            }
-        });
-    }
-
-    /// The `queued_at` a NEW waiter takes. Only the lane's eldest
-    /// unserved waiter of a kind inherits the episode anchor — later
-    /// arrivals of a burst stamp their own arrival and queue behind
-    /// it, so a lane cannot multiply one anchor into N front-runners.
-    /// The inherited stamp is clamped to the starvation bound HERE,
-    /// at stamp time: an episode older than `starve_secs` ranks
-    /// starved but never ahead of a genuinely older starved waiter.
-    fn stamp_for(&mut self, lane: &str, kind: SlotKind, now: f64) -> f64 {
-        let key = (lane.to_string(), kind);
-        if self
-            .waiting
-            .iter()
-            .any(|w| w.lane == lane && w.kind == kind)
-        {
-            // Behind the lane's eldest waiter — the anchor is not
-            // yours to carry.
-            return now;
-        }
-        let anchor = self
-            .seniority
-            .get(&key)
-            .map(|s| s.anchor)
-            .unwrap_or(now)
-            .max(now - self.config.starve_secs as f64);
-        self.seniority.insert(key, Seniority { anchor, seen: now });
-        anchor
-    }
-
-    /// What `stamp_for` would answer, without touching the episode —
-    /// a probe is read-only and must never arm an anchor for a lane
-    /// that hasn't actually queued.
-    fn peek_stamp(&self, lane: &str, kind: SlotKind, now: f64) -> f64 {
-        if self
-            .waiting
-            .iter()
-            .any(|w| w.lane == lane && w.kind == kind)
-        {
-            return now;
-        }
-        self.seniority
-            .get(&(lane.to_string(), kind))
-            .map(|s| s.anchor)
-            .unwrap_or(now)
-            .max(now - self.config.starve_secs as f64)
-    }
-
-    /// Atomic best-effort write of the hold registry — a reader never
-    /// sees a torn file, and a write failure is logged, not fatal:
-    /// the in-memory registry stays authoritative either way. The tmp
-    /// file is fsynced before the rename and the directory after it,
-    /// so a crash cannot lose a persisted hold silently. Seniority is
-    /// deliberately not persisted: it measures a wait, and no waiter
-    /// survives a restart — every caller re-polls into a fresh anchor.
-    ///
-    /// This is the legacy writer, but it serializes the WHOLE state:
-    /// once any strict record exists (or the file already is v2) it
-    /// writes the v2 envelope with every enrollment and strict hold,
-    /// so a legacy grant, release or reap can never drop strict state.
-    /// A rejected state file is never overwritten — it is evidence.
-    /// Returns whether the file now matches memory.
-    fn persist(&mut self) -> bool {
-        let Some(path) = self.persist_path.clone() else {
-            return true;
-        };
-        if self.blocked.as_ref().is_some_and(|b| b.preserve_file) {
-            return false;
-        }
-        let v2 =
-            self.v2 || !self.enrollments.is_empty() || self.held.iter().any(|h| h.strict.is_some());
-        let doc = if v2 {
-            Self::v2_doc(&self.enrollments, &self.held, self.state_generation + 1)
-        } else {
-            json!({
-                "version": 1,
-                "holds": self.held.iter().map(SlotHold::legacy_json).collect::<Vec<_>>(),
-            })
-        };
-        match write_atomic(&path, &doc) {
-            Ok(()) => {
-                if v2 {
-                    self.v2 = true;
-                    self.state_generation += 1;
-                }
-                true
-            }
-            Err(e) => {
-                eprintln!("slots: persist {} failed: {e}", path.display());
-                false
-            }
-        }
-    }
-
-    /// The v2 envelope: enrollments, strict holds (each naming its
-    /// enrollment), and every legacy hold under `legacy_holds`.
-    fn v2_doc(enrollments: &[Enrollment], held: &[SlotHold], generation: u64) -> Value {
-        json!({
-            "format": "cadence-slots",
-            "version": 2,
-            "state_generation": generation.to_string(),
-            "enrollments": enrollments.iter().map(Enrollment::to_json).collect::<Vec<_>>(),
-            "holds": held.iter().filter_map(|h| {
-                let b = h.strict.as_ref()?;
-                let mut row = json!({
-                    "token": h.token, "request_id": h.request_id,
-                    "kind": h.kind.as_str(), "lane": h.lane,
-                    "enrollment_id": b.enrollment_id,
-                    "owner_generation": b.owner_generation,
-                    "holder": b.holder.to_json(),
-                    "acquired_epoch": h.acquired_epoch,
-                });
-                // Additive (CAD-230b): absent reads as not exec-bound.
-                if b.exec_bound {
-                    row["exec_bound"] = json!(true);
-                }
-                Some(row)
-            }).collect::<Vec<_>>(),
-            "legacy_holds": held.iter()
-                .filter(|h| h.strict.is_none())
-                .map(SlotHold::legacy_json)
-                .collect::<Vec<_>>(),
-        })
-    }
-
-    /// The fail-closed strict writer. The next state is written FIRST
-    /// and swapped into memory only once the write landed: a failure
-    /// leaves disk and memory exactly as they were — no grant, no free
-    /// — and makes strict admission unavailable until a restart loads
-    /// a good file.
-    ///
-    /// A revoked or expired enrollment is a TOMBSTONE: it stays while
-    /// any hold names it or while its root process is alive or
-    /// unknown, because [`Self::nearest_enrolled_root`] must keep
-    /// seeing that exact root — otherwise its processes would fall
-    /// through to an outer pane's legacy binding. It is pruned only
-    /// once nothing holds under it and its root is proven dead.
-    fn commit(&mut self, enrollments: Vec<Enrollment>, held: Vec<SlotHold>) -> Result<()> {
-        if let Some(b) = &self.blocked {
-            return Err(strict_unavailable(&b.reason));
-        }
-        let enrollments: Vec<Enrollment> = enrollments
-            .into_iter()
-            .filter(|e| {
-                e.auth == AuthState::Active
-                    || held
-                        .iter()
-                        .any(|h| h.enrollment_id() == Some(e.id.as_str()))
-                    || self.proc.liveness(&e.root).0 != Liveness::Dead
-            })
-            .collect();
-        if let Some(path) = self.persist_path.clone() {
-            let generation = self.state_generation + 1;
-            if let Err(e) = write_atomic(&path, &Self::v2_doc(&enrollments, &held, generation)) {
-                let reason = format!("strict state write to {} failed: {e}", path.display());
-                eprintln!("slots: {reason}");
-                self.blocked = Some(Blocked {
-                    reason: reason.clone(),
-                    preserve_file: false,
-                });
-                return Err(strict_unavailable(&reason));
-            }
-            self.v2 = true;
-            self.state_generation = generation;
-        }
-        self.enrollments = enrollments;
-        self.held = held;
-        Ok(())
-    }
-
-    /// The state file itself is unusable: keep it untouched as
-    /// evidence and refuse strict admission.
-    fn reject_file(&mut self, reason: String) {
-        eprintln!("slots: strict admission unavailable — {reason}");
-        self.blocked = Some(Blocked {
-            reason,
-            preserve_file: true,
-        });
-    }
-
-    /// Revalidate persisted holds at daemon start: a hold survives
-    /// only while its recorded process is still the same live
-    /// process. Survivors keep their tokens (in-flight releases and
-    /// re-polls still resolve); the dead are dropped with a named
-    /// reason rather than silently re-granted. Returns the boot-time
-    /// release events for the daemon to emit.
-    ///
-    /// Order (CAD-230): the envelope is validated whole before any of
-    /// it is used — unknown version, malformed JSON or schema, and
-    /// duplicate records reject the file (kept as evidence, strict
-    /// admission unavailable). Then enrollments (expiry, root identity)
-    /// before strict holds (tri-state: alive retains, dead frees,
-    /// unknown stays accounted) before legacy holds (unchanged rules).
-    /// Waiters are never persisted, so none is ever replayed.
-    pub fn restore(&mut self, clk: SlotClock) -> Vec<SlotEvent> {
-        let mut events = Vec::new();
-        let Some(path) = self.persist_path.clone() else {
-            return events;
-        };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return events,
-            Err(e) => {
-                self.reject_file(format!("cannot read {}: {e}", path.display()));
-                return events;
-            }
-        };
-        let Ok(doc) = serde_json::from_str::<Value>(&text) else {
-            self.reject_file(format!("{} is unparsable", path.display()));
-            return events;
-        };
-        let loaded = match (doc.get("format"), doc.get("version")) {
-            (Some(format), Some(version)) if format == "cadence-slots" && version == 2 => {
-                self.restore_v2(&doc, clk, &mut events)
-            }
-            (Some(format), version) => Err(format!(
-                "unknown envelope (format {format}, version {})",
-                version.cloned().unwrap_or(Value::Null)
-            )),
-            (None, Some(version)) if version != 1 => Err(format!("unknown version {version}")),
-            // Anything that is not a well-formed envelope — `{}`,
-            // `null`, `[]`, a non-list `holds` — is malformed state:
-            // kept as evidence, never rewritten, strict blocked.
-            (None, _) if !doc.is_object() || !doc["holds"].is_array() => {
-                Err("not a well-formed v1 envelope (an object with a 'holds' list)".to_string())
-            }
-            // The v1 shape — or a version-less file an older writer
-            // left: the legacy rows, under the unchanged rules.
-            (None, _) => {
-                self.restore_legacy(&doc["holds"], clk, &mut events);
-                Ok(())
-            }
-        };
-        if let Err(why) = loaded {
-            self.reject_file(format!("{}: {why}", path.display()));
-            return events;
-        }
-        // Seniority is never persisted: it measures an unserved wait
-        // and no waiter survives a restart — re-polling callers
-        // anchor fresh. (A stale `seniority` block in an old file is
-        // simply ignored.) A boot rewrite that fails issues no strict
-        // grant until a later restart writes cleanly.
-        if !self.persist() && self.blocked.is_none() {
-            self.blocked = Some(Blocked {
-                reason: format!("boot rewrite of {} failed", path.display()),
-                preserve_file: false,
-            });
-        }
-        events
-    }
-
-    /// Legacy (v1 / `legacy_holds`) rows — the CAD-113 rules exactly:
-    /// the alive-only fallback, per-row skips, dead holders reaped.
-    fn restore_legacy(&mut self, holds: &Value, clk: SlotClock, events: &mut Vec<SlotEvent>) {
-        let (now, wall) = (clk.mono, clk.wall);
-        for h in holds.as_array().cloned().unwrap_or_default() {
-            let (Some(kind), Some(lane), Some(pid)) = (
-                h["kind"].as_str().and_then(|k| SlotKind::parse(k).ok()),
-                h["lane"].as_str(),
-                h["pid"].as_u64().map(|p| p as u32),
-            ) else {
-                continue;
-            };
-            let start = h["pid_start"].as_u64();
-            let held_secs = (wall - h["acquired_epoch"].as_f64().unwrap_or(wall)).max(0.0);
-            if !pid_matches(pid, start) {
-                let reason = if pid_alive(pid) {
-                    "pid recycled"
-                } else {
-                    "holder died"
-                };
-                events.push((
-                    lane.to_string(),
-                    "slot_released",
-                    json!({"kind": kind.as_str(), "pid": pid,
-                           "held_secs": held_secs, "reason": reason}),
-                ));
-                continue;
-            }
-            let Some(token) = h["token"].as_str().map(str::to_string) else {
-                eprintln!(
-                    "slots: dropping persisted hold with no token \
-                     ({lane} {kind:?} pid {pid}) — persist file truncated?"
-                );
-                continue;
-            };
-            self.held.push(SlotHold {
-                token,
-                request_id: h["request_id"].as_str().unwrap_or_default().to_string(),
-                kind,
-                lane: lane.to_string(),
-                pid,
-                pid_start: start,
-                acquired_at: now - held_secs,
-                acquired_epoch: wall - held_secs,
-                strict: None,
-            });
-        }
-    }
-
-    /// Validate the whole v2 envelope, then apply it in order. Any
-    /// schema fault — or a same-root enrollment pair across owners, in
-    /// any authorization state — is an `Err` before anything is applied.
-    fn restore_v2(
-        &mut self,
-        doc: &Value,
-        clk: SlotClock,
-        events: &mut Vec<SlotEvent>,
-    ) -> std::result::Result<(), String> {
-        let (now, wall) = (clk.mono, clk.wall);
-        let generation: u64 = doc["state_generation"]
-            .as_str()
-            .and_then(|g| g.parse().ok())
-            .ok_or("state_generation missing or malformed")?;
-        let list = |key: &str| {
-            doc[key]
-                .as_array()
-                .cloned()
-                .ok_or_else(|| format!("'{key}' missing or not a list"))
-        };
-        let mut enrollments = Vec::new();
-        for e in list("enrollments")? {
-            let parsed = Enrollment::from_json(&e, now, wall)
-                .ok_or_else(|| format!("malformed enrollment {e}"))?;
-            // Ids are unique. A shared root of ONE owner never rejects
-            // the file (CAD-276) — a same-root supersession, which
-            // `strict_caller` resolves deterministically — but across
-            // owners, in any authorization state, the pair has no
-            // lineage: the daemon never writes it (`enroll` refuses a
-            // process enrolled for another owner) and the file is
-            // invalid (CAD-289).
-            if enrollments.iter().any(|o: &Enrollment| o.id == parsed.id) {
-                return Err(format!("duplicate enrollment {}", parsed.id));
-            }
-            if let Some(o) = enrollments.iter().find(|o: &&Enrollment| {
-                o.root == parsed.root && o.owner_actor != parsed.owner_actor
-            }) {
-                return Err(format!(
-                    "enrollments {} and {} share root pid {} across owners ({} / {}) \
-                     — one provider process is enrolled for one owner",
-                    o.id, parsed.id, parsed.root.pid, o.owner_actor, parsed.owner_actor
-                ));
-            }
-            enrollments.push(parsed);
-        }
-        let mut tokens = std::collections::HashSet::new();
-        let mut strict_rows = Vec::new();
-        for h in list("holds")? {
-            let row = (|| {
-                let enrollment_id = h["enrollment_id"].as_str()?.to_string();
-                let lane = enrollments
-                    .iter()
-                    .find(|e| e.id == enrollment_id)?
-                    .owner_actor
-                    .clone();
-                Some((
-                    h["token"].as_str()?.to_string(),
-                    h["request_id"].as_str()?.to_string(),
-                    SlotKind::parse(h["kind"].as_str()?).ok()?,
-                    lane,
-                    StrictBind {
-                        enrollment_id,
-                        owner_generation: h["owner_generation"].as_str()?.to_string(),
-                        holder: ProcIdentity::from_json(&h["holder"])?,
-                        liveness: Liveness::Unknown,
-                        exec_bound: match h.get("exec_bound") {
-                            None => false,
-                            Some(v) => v.as_bool()?,
-                        },
-                    },
-                    h["acquired_epoch"].as_f64()?,
-                ))
-            })()
-            .ok_or_else(|| format!("malformed or unbound strict hold {h}"))?;
-            if !tokens.insert(row.0.clone()) {
-                return Err(format!("duplicate hold token {}", row.0));
-            }
-            strict_rows.push(row);
-        }
-        let legacy = list("legacy_holds")?;
-        for h in &legacy {
-            let ok = h["token"].as_str().is_some()
-                && h["kind"]
-                    .as_str()
-                    .and_then(|k| SlotKind::parse(k).ok())
-                    .is_some()
-                && h["lane"].as_str().is_some()
-                && h["pid"].as_u64().is_some()
-                && h["acquired_epoch"].as_f64().is_some();
-            if !ok {
-                return Err(format!("malformed legacy hold {h}"));
-            }
-            if !tokens.insert(h["token"].as_str().unwrap_or_default().to_string()) {
-                return Err(format!("duplicate hold token {}", h["token"]));
-            }
-        }
-        // Validated — apply: enrollments, then strict holds, then
-        // legacy holds.
-        self.v2 = true;
-        self.state_generation = generation;
-        for e in &mut enrollments {
-            if e.auth == AuthState::Active && wall >= e.expires_epoch {
-                e.auth = AuthState::Expired;
-            }
-            if matches!(e.auth, AuthState::Revoked(_)) {
-                continue;
-            }
-            // A runner's owner is the previous daemon's in-memory
-            // runner record (CAD-230b): it did not survive the restart,
-            // so the enrollment admits nothing more. Its hold stays
-            // accounted under the tri-state rule below until the
-            // process is proven dead — it is never relaunched.
-            if e.runner.is_some() {
-                e.auth = AuthState::Revoked(
-                    "daemon restarted — runner outcome unknown, never relaunched".into(),
-                );
-                continue;
-            }
-            match self.proc.liveness(&e.root).0 {
-                Liveness::Alive => {}
-                Liveness::Dead => {
-                    e.auth = AuthState::Revoked("root process gone at restart".into())
-                }
-                Liveness::Unknown => {
-                    e.auth = AuthState::Revoked("root liveness unknown at restart".into())
-                }
-            }
-        }
-        self.enrollments = enrollments;
-        for (token, request_id, kind, lane, mut bind, acquired_epoch) in strict_rows {
-            let held_secs = (wall - acquired_epoch).max(0.0);
-            let (liveness, why) = self.proc.liveness(&bind.holder);
-            if liveness == Liveness::Dead {
-                events.push((
-                    lane,
-                    "slot_released",
-                    json!({"kind": kind.as_str(), "pid": bind.holder.pid,
-                           "held_secs": held_secs, "reason": why}),
-                ));
-                continue;
-            }
-            bind.liveness = liveness;
-            self.held.push(SlotHold {
-                token,
-                request_id,
-                kind,
-                lane,
-                pid: bind.holder.pid,
-                pid_start: Some(bind.holder.starttime),
-                acquired_at: now - held_secs,
-                acquired_epoch: wall - held_secs,
-                strict: Some(bind),
-            });
-        }
-        self.restore_legacy(&Value::Array(legacy), clk, events);
-        Ok(())
-    }
-
-    /// A hold's identity is (request_id, pid, lane, kind): only the
-    /// exact same caller re-polling adopts the grant — another
-    /// process sharing a natural request id is a different caller.
-    fn find_hold(&self, req: &SlotReq<'_>) -> Option<&SlotHold> {
-        self.held.iter().find(|h| {
-            h.request_id == req.request_id
-                && h.pid == req.pid
-                && h.lane == req.lane
-                && h.kind == req.kind
-                && h.enrollment_id() == req.enrollment_id()
-                // A strict hold is adopted only by its exact recorded
-                // holder — a recycled pid (new starttime) is a
-                // different process and never re-binds it (CAD-230b).
-                && h.strict.as_ref().map(|b| b.holder) == req.strict.as_ref().map(|b| b.holder)
-        })
-    }
-
-    /// The grant itself: hold registration + the `slot_acquired`
-    /// event, shared by the probe and the queueing path. The token is
-    /// minted here — the caller's request_id is queue identity only.
-    /// The event carries NO token: lane event streams are readable by
-    /// any local caller, and token+lane+pid are exactly the inputs a
-    /// release authenticates — publishing all three would hand every
-    /// peer the keys to a live hold.
-    ///
-    /// A strict grant goes through the fail-closed writer: when the
-    /// write fails nothing is granted and the caller is refused.
-    fn grant(
-        &mut self,
-        req: SlotReq<'_>,
-        wait_secs: f64,
-        clk: SlotClock,
-        events: &mut Vec<SlotEvent>,
-    ) -> Result<Value> {
-        let (now, wall) = (clk.mono, clk.wall);
-        let token = format!("slot-{}", Uuid::new_v4().simple());
-        let hold = SlotHold {
-            token: token.clone(),
-            request_id: req.request_id.to_string(),
-            kind: req.kind,
-            lane: req.lane.to_string(),
-            pid: req.pid,
-            pid_start: match &req.strict {
-                Some(b) => Some(b.holder.starttime),
-                None => pid_start(req.pid),
-            },
-            acquired_at: now,
-            acquired_epoch: wall,
-            strict: req.strict.clone(),
-        };
-        if hold.strict.is_some() {
-            let mut next = self.held.clone();
-            next.push(hold);
-            self.commit(self.enrollments.clone(), next)?;
-        } else {
-            self.held.push(hold);
-            self.persist();
-        }
-        events.push((
-            req.lane.to_string(),
-            "slot_acquired",
-            json!({"kind": req.kind.as_str(),
-                   "pool": req.kind.pool().as_str(), "wait_secs": wait_secs,
-                   "pid": req.pid}),
-        ));
-        // Serving this lane ends its unserved wait: the seniority
-        // anchor dies here so a lane that always has "one more
-        // request" queued can never ride an ancient timestamp — its
-        // next enqueue anchors at its own honest arrival.
-        self.seniority.remove(&(req.lane.to_string(), req.kind));
-        Ok(json!({"granted": true, "token": token,
-               "kind": req.kind.as_str(), "wait_secs": wait_secs}))
-    }
-
-    /// Cross-pool deadlock guard: a caller may never QUEUE for one
-    /// pool while holding a slot in the other — otherwise A(holds
-    /// build, waits suite) vs B(holds suite, waits build) is a
-    /// classic hold-and-wait deadlock. The guard keys on `(lane,
-    /// pid)` — the holding *process*: two unrelated shells sharing a
-    /// lane name (e.g. `$USER` when no `CADENCE_ALIAS` is set) never
-    /// block each other. Granting without waiting is always fine: a
-    /// caller that never waits holds no wait-edge.
-    fn holds_other_pool(&self, pool: Pool, lane: &str, pid: u32) -> bool {
-        self.held
-            .iter()
-            .any(|h| h.lane == lane && h.pid == pid && h.kind.pool() != pool)
-    }
-
-    /// Non-blocking acquire: grants a minted token when the pool has
-    /// room and the request leads its effective order, else reports
-    /// the queue position. `request_id` makes client polls sticky —
-    /// a re-poll with the SAME (pid, lane, kind) keeps the original
-    /// place and refreshes `last_poll` (the abandonment signal); a
-    /// re-poll with a different identity is a different caller and
-    /// queues on its own. `probe` answers the same question WITHOUT
-    /// leaving a waiter behind — the `--wait-secs 0` fast-fail.
-    pub fn acquire(
-        &mut self,
-        kind: SlotKind,
-        lane: &str,
-        pid: u32,
-        request_id: &str,
-        probe: bool,
-        clk: SlotClock,
-    ) -> Result<(Value, Vec<SlotEvent>)> {
-        self.acquire_as(kind, lane, pid, request_id, probe, clk, None)
-    }
-
-    /// [`Self::acquire`] under either binding — `strict` carries the
-    /// verified enrollment binding of a strict caller.
-    #[allow(clippy::too_many_arguments)]
-    fn acquire_as(
-        &mut self,
-        kind: SlotKind,
-        lane: &str,
-        pid: u32,
-        request_id: &str,
-        probe: bool,
-        clk: SlotClock,
-        strict: Option<StrictBind>,
-    ) -> Result<(Value, Vec<SlotEvent>)> {
-        let mut events = Vec::new();
-        let now = clk.mono;
-        if pid == 0 {
-            return Err(Error::rejected(
-                "Slot acquire needs the holder's pid — `build-slot run` binds \
-                 the real command; a manual `acquire` passes `--pid $$`",
-            ));
-        }
-        self.reap_dead(now, &mut events);
-        let req = SlotReq {
-            kind,
-            lane,
-            pid,
-            request_id,
-            strict,
-        };
-        let enrollment = req.enrollment_id().map(str::to_string);
-        let same = |w: &SlotWait| {
-            w.request_id == request_id
-                && w.pid == pid
-                && w.lane == lane
-                && w.kind == kind
-                && w.strict.as_ref().map(|b| b.enrollment_id.as_str()) == enrollment.as_deref()
-        };
-        // Idempotent re-poll: the same caller re-asking for its grant
-        // gets the same minted token back. Anything sharing only the
-        // request_id is a different caller — it queues below, never
-        // adopts this hold.
-        if let Some(h) = self.find_hold(&req) {
-            return Ok((
-                json!({"granted": true, "token": h.token,
-                       "kind": h.kind.as_str()}),
-                events,
-            ));
-        }
-        let pool = kind.pool();
-        if probe {
-            // Already queued? A probe is read-only — it reports the
-            // existing waiter's real position, never grants it (a
-            // grant is a mutation) and never re-ranks it fresh.
-            if let Some(idx) = self.waiting.iter().position(same) {
-                let ranks = self.ranks(now);
-                return Ok((
-                    json!({"granted": false, "position": self.outranked(&ranks, idx) + 1,
-                           "wait_secs": (now - self.waiting[idx].queued_at).max(0.0),
-                           "held": self.held_in(pool),
-                           "capacity": self.capacity(pool)}),
-                    events,
-                ));
-            }
-            // A fresh probe grants exactly when an enqueue would —
-            // capacity free and the request next — but never joins
-            // the queue and never touches seniority (`peek_stamp`
-            // only reads).
-            // A fresh probe grants when it leads AND the floors hold —
-            // below floor it reports the resource reason, not a grant.
-            let resource = self.resource_floor(kind);
-            let senior = self.peek_stamp(lane, kind, now);
-            let w = SlotWait {
-                request_id: request_id.to_string(),
-                kind,
-                lane: lane.to_string(),
-                pid,
-                pid_start: req.pid_start(),
-                queued_at: senior,
-                last_poll: now,
-                wait_reason: resource.unwrap_or(WaitReason::Capacity),
-                strict: req.strict.clone(),
-            };
-            self.waiting.push(w);
-            let ranks = self.ranks(now);
-            let idx = self.waiting.len() - 1;
-            let next = self.held_in(pool) < self.capacity(pool)
-                && self.outranked(&ranks, idx) == 0
-                && resource.is_none();
-            let position = self.outranked(&ranks, idx) + 1;
-            self.waiting.pop();
-            self.prune_seniority(now);
-            if next {
-                return Ok((self.grant(req, 0.0, clk, &mut events)?, events));
-            }
-            if self.holds_other_pool(pool, lane, pid) {
-                return Err(Error::rejected(format!(
-                    "A caller holding a {} slot cannot queue for {} — \
-                     release that hold first (hold-and-wait deadlock guard)",
-                    other_pool(pool).as_str(),
-                    pool.as_str(),
-                )));
-            }
-            return Ok((
-                json!({"granted": false, "position": position,
-                       "wait_reason": resource.unwrap_or(WaitReason::Capacity).as_str(),
-                       "held": self.held_in(pool),
-                       "capacity": self.capacity(pool)}),
-                events,
-            ));
-        }
-        let (idx, created) = match self.waiting.iter().position(same) {
-            Some(i) => (i, false),
-            None => {
-                if self.waiting.len() >= MAX_WAITERS {
-                    return Err(Error::rejected(format!(
-                        "Slot queue is full ({MAX_WAITERS} waiting) — try again later"
-                    )));
-                }
-                // A lane's share is bounded too — without it one lane
-                // could fill the whole queue and deny everyone else.
-                if self.waiting.iter().filter(|w| w.lane == lane).count() >= MAX_WAITERS_PER_LANE {
-                    return Err(Error::rejected(format!(
-                        "Lane '{lane}' already has {MAX_WAITERS_PER_LANE} slot \
-                         requests queued — let some grant or die first"
-                    )));
-                }
-                let senior = self.stamp_for(lane, kind, now);
-                self.waiting.push(SlotWait {
-                    request_id: request_id.to_string(),
-                    kind,
-                    lane: lane.to_string(),
-                    pid,
-                    pid_start: req.pid_start(),
-                    queued_at: senior,
-                    last_poll: now,
-                    wait_reason: WaitReason::Capacity,
-                    strict: req.strict.clone(),
-                });
-                (self.waiting.len() - 1, true)
-            }
-        };
-        // The liveness stamp every poll owes — identity fields are
-        // the match key, so a re-poll only refreshes this (and the
-        // episode's last-seen, so gap grace runs from the lane's
-        // real last poll rather than the last reap pass).
-        self.waiting[idx].last_poll = now;
-        if let Some(s) = self.seniority.get_mut(&(lane.to_string(), kind)) {
-            s.seen = s.seen.max(now);
-        }
-
-        let ranks = self.ranks(now);
-        // A grant needs capacity AND the resource floors — a host low on
-        // memory or disk holds the caller in the queue with a reason,
-        // never refuses it for being low.
-        let resource = self.resource_floor(kind);
-        // Refresh the waiter's reason each poll — a grant that ran
-        // into a floor updates it to memory/disk; a resource that
-        // recovered flips it back to capacity.
-        self.waiting[idx].wait_reason = resource.unwrap_or(WaitReason::Capacity);
-        if self.held_in(pool) < self.capacity(pool)
-            && self.outranked(&ranks, idx) == 0
-            && resource.is_none()
-        {
-            let wait_secs = (now - self.waiting[idx].queued_at).max(0.0);
-            // Grant first: a strict grant whose write fails leaves the
-            // caller queued exactly where it was.
-            let granted = self.grant(req, wait_secs, clk, &mut events)?;
-            self.waiting.remove(idx);
-            self.prune_seniority(now);
-            return Ok((granted, events));
-        }
-        // It must wait — but a caller holding the other pool may not
-        // queue at all (the deadlock guard). The forbidden waiter
-        // is removed, never registered.
-        if self.holds_other_pool(pool, lane, pid) {
-            self.waiting.remove(idx);
-            self.prune_seniority(now);
-            return Err(Error::rejected(format!(
-                "A caller holding a {} slot cannot queue for {} — \
-                 release that hold first (hold-and-wait deadlock guard)",
-                other_pool(pool).as_str(),
-                pool.as_str(),
-            )));
-        }
-        let position = self.outranked(&ranks, idx) + 1;
-        let wait_secs = (now - self.waiting[idx].queued_at).max(0.0);
-        let reason = resource.unwrap_or(WaitReason::Capacity).as_str();
-        if created {
-            // First poll and already queueing — tell observers the
-            // wait started (re-polls don't repeat the event).
-            events.push((
-                lane.to_string(),
-                "slot_waited",
-                json!({"request_id": request_id, "kind": kind.as_str(),
-                       "pool": pool.as_str(), "pid": pid,
-                       "wait_reason": reason}),
-            ));
-        }
-        Ok((
-            json!({"granted": false, "position": position,
-                   "wait_secs": wait_secs, "wait_reason": reason,
-                   "held": self.held_in(pool), "capacity": self.capacity(pool)}),
-            events,
-        ))
-    }
-
-    /// Return a held slot. The release must name the holding caller —
-    /// (lane, pid) — so one caller can never release another's hold.
-    /// A foreign token is a named refusal; an unknown token a named
-    /// rejection — EXCEPT a token this very call just reaped, which
-    /// answers softly (`released:false` + the reap reason) to the
-    /// hold's own lane: a cleanup path like `trap 'release $T' EXIT`
-    /// should not hard-fail on a hold the daemon already took back,
-    /// and a foreign lane gets the hard unknown-token refusal so a
-    /// token's existence is never confirmed across lanes.
-    pub fn release(
-        &mut self,
-        token: &str,
-        lane: &str,
-        pid: u32,
-        now: f64,
-    ) -> Result<(Value, Vec<SlotEvent>)> {
-        self.release_as(token, lane, pid, now, None)
-    }
-
-    /// [`Self::release`] under either binding. A strict hold is freed
-    /// only by a verified caller of its own enrollment naming the exact
-    /// recorded holder (pid AND starttime) — through the fail-closed
-    /// writer, so a failed write keeps it held. The two bindings never
-    /// release each other's holds.
-    fn release_as(
-        &mut self,
-        token: &str,
-        lane: &str,
-        pid: u32,
-        now: f64,
-        strict: Option<&StrictCaller>,
-    ) -> Result<(Value, Vec<SlotEvent>)> {
-        let mut events = Vec::new();
-        let reaped = self.reap_dead(now, &mut events);
-        let Some(h) = self.held.iter().find(|h| h.token == token) else {
-            if let Some(r) = reaped
-                .iter()
-                .chain(self.recent_reaped.iter())
-                .find(|r| r.token == token && r.lane == lane)
-            {
-                return Ok((
-                    json!({"released": false, "token": token,
-                           "kind": r.kind.as_str(), "reason": r.reason}),
-                    events,
-                ));
-            }
-            return Err(Error::rejected(format!(
-                "Unknown slot token '{token}' — it was never granted or already released"
-            )));
-        };
-        let exact = match (&h.strict, strict) {
-            (None, None) => true,
-            (Some(b), Some(c)) => {
-                b.enrollment_id == c.enrollment_id
-                    && c.segment.contains(&pid)
-                    && self.proc.identity(pid).is_ok_and(|now| now == b.holder)
-            }
-            _ => false,
-        };
-        if h.lane != lane || h.pid != pid || !exact {
-            return Err(Error::rejected(
-                "Slot token is held by another caller — release must come \
-                 from the holding lane and pid",
-            ));
-        }
-        let idx = self.held.iter().position(|h| h.token == token).unwrap();
-        let h = if self.held[idx].strict.is_some() {
-            let mut next = self.held.clone();
-            let h = next.remove(idx);
-            self.commit(self.enrollments.clone(), next)?;
-            h
-        } else {
-            let h = self.held.remove(idx);
-            self.persist();
-            h
-        };
-        events.push((
-            h.lane.clone(),
-            "slot_released",
-            json!({"kind": h.kind.as_str(), "pid": h.pid,
-                   "held_secs": (now - h.acquired_at).max(0.0),
-                   "reason": "released"}),
-        ));
-        Ok((
-            json!({"released": true, "token": token, "kind": h.kind.as_str()}),
-            events,
-        ))
-    }
-
-    /// Everything `cadence status`, `doctor --host` and the job runner
-    /// need: per-pool capacity and holders, the live queue with wait
-    /// ages, and the resolved config. A status read is also a reap
-    /// pass — a dead holder frees its slot on the next read, not some
-    /// later sweep, so the queue can never jam behind a corpse.
-    /// `caller` is the connection-derived identity: a hold's token
-    /// shows only when the caller IS the holder — same lane and the
-    /// hold's pid on the caller's own chain. Other processes see
-    /// identity only — a token never leaves its owner's view.
-    pub fn status(&mut self, caller: SlotCaller<'_>, now: f64) -> (Value, Vec<SlotEvent>) {
-        let mut events = Vec::new();
-        self.reap_dead(now, &mut events);
-        (self.status_json(caller, now), events)
-    }
-
-    fn status_json(&self, caller: SlotCaller<'_>, now: f64) -> Value {
-        let pool_json = |pool: Pool| {
-            json!({
-                "capacity": self.capacity(pool),
-                "held": self.held.iter()
-                    .filter(|h| h.kind.pool() == pool)
-                    .map(|h| {
-                        let mut j = json!({"kind": h.kind.as_str(),
-                                    "lane": h.lane, "pid": h.pid,
-                                    "unregistered": is_unregistered_lane(&h.lane),
-                                    "age_secs": (now - h.acquired_at).max(0.0)});
-                        if h.lane == caller.lane && caller.pids.contains(&h.pid) {
-                            j["token"] = json!(h.token);
-                        }
-                        self.strict_hold_json(h, now, &mut j);
-                        j
-                    })
-                    .collect::<Vec<_>>(),
-            })
-        };
-        let ranks = self.ranks(now);
-        let mut order: Vec<usize> = (0..self.waiting.len()).collect();
-        order.sort_by_key(|i| (ranks[*i].0, (ranks[*i].1 * 1e6) as i64));
-        json!({
-            "pools": {
-                "build": pool_json(Pool::Build),
-                "suite": pool_json(Pool::Suite),
-                "check": pool_json(Pool::Check),
-            },
-            "waiting": order.iter().map(|i| {
-                let w = &self.waiting[*i];
-                let (rank, _) = ranks[*i];
-                json!({"request_id": w.request_id, "kind": w.kind.as_str(),
-                       "lane": w.lane, "pid": w.pid,
-                       "wait_secs": (now - w.queued_at).max(0.0),
-                       "wait_reason": w.wait_reason.as_str(),
-                       "starved": rank == 0, "priority": rank == 1,
-                       "unregistered": is_unregistered_lane(&w.lane)})
-            }).collect::<Vec<_>>(),
-            "config": {
-                "build_slots": self.config.build_slots,
-                "suite_slots": self.config.suite_slots,
-                "check_slots": self.config.check_slots,
-                "jobs_per_lane": self.config.jobs_per_lane,
-                "starve_secs": self.config.starve_secs,
-                "priority_lanes": self.config.priority_lanes,
-                "max_hold_secs": self.config.max_hold_secs,
-                "slot_mem_min_available_bytes": self.config.slot_mem_min_available_bytes,
-                "slot_mem_min_available_check_bytes": self.config.slot_mem_min_available_check_bytes,
-                "slot_disk_min_free_bytes": self.config.slot_disk_min_free_bytes,
-            },
-            "enrollments": self.enrollments.iter().map(Enrollment::to_json).collect::<Vec<_>>(),
-            "strict": match &self.blocked {
-                None => json!({"available": true,
-                               "state_generation": self.state_generation}),
-                Some(b) => json!({"available": false, "reason": b.reason,
-                                  "reconcile_required": true,
-                                  "state_generation": self.state_generation}),
-            },
-        })
-    }
-
-    /// A strict hold's accounting: `held` inside `max_hold_secs`,
-    /// `expired_pending_reconcile` past it — still occupying its slot,
-    /// because only an exact release or proven death frees one.
-    fn accounting(&self, h: &SlotHold, now: f64) -> &'static str {
-        if now - h.acquired_at >= self.config.max_hold_secs as f64 {
-            "expired_pending_reconcile"
-        } else {
-            "held"
-        }
-    }
-
-    /// Status fields of a hold's binding: `legacy`, or `strict` with
-    /// its enrollment's authorization kept separate from the hold's own
-    /// liveness and accounting, plus `reconcile_required` / `remedy`.
-    fn strict_hold_json(&self, h: &SlotHold, now: f64, j: &mut Value) {
-        let Some(b) = &h.strict else {
-            j["binding"] = json!("legacy");
-            return;
-        };
-        let auth = self
-            .enrollments
-            .iter()
-            .find(|e| e.id == b.enrollment_id)
-            .map(|e| e.auth.as_str())
-            .unwrap_or("revoked");
-        let accounting = self.accounting(h, now);
-        j["binding"] = json!("strict");
-        if b.exec_bound {
-            j["exec_bound"] = json!(true);
-        }
-        j["enrollment_id"] = json!(b.enrollment_id);
-        j["owner_generation"] = json!(b.owner_generation);
-        j["auth_state"] = json!(auth);
-        j["liveness"] = json!(b.liveness.as_str());
-        j["accounting"] = json!(accounting);
-        // `reconcile_required` only where `slot_reconcile` can act — a
-        // holder proven dead whose free has not landed yet, while the
-        // strict writer (which reconcile frees through) is available
-        // (CAD-276). A live or unknown holder is refused by reconcile
-        // whatever the evidence says, and a blocked writer refuses
-        // every strict write, so those name the remedy that does work.
-        let writable = self.blocked.is_none();
-        let remedy = match b.liveness {
-            Liveness::Dead if writable => None,
-            Liveness::Dead => Some(
-                "holder dead but strict state is unwritable — restart the daemon \
-                 once slots.json is writable",
-            ),
-            Liveness::Unknown => Some("liveness unknown — restart the daemon after verifying"),
-            Liveness::Alive if accounting != "held" => {
-                Some("holder alive — release from the holder or stop it")
-            }
-            Liveness::Alive => None,
-        };
-        j["reconcile_required"] = json!(b.liveness == Liveness::Dead && writable);
-        if let Some(remedy) = remedy {
-            j["remedy"] = json!(remedy);
-        }
+    /// Whether a request for `kind` could be served right now: its
+    /// pool has free capacity, the aggregate has room and its kind's
+    /// resource floors hold. Shared by the probe, the real grant and
+    /// cross-pool ranking so eligibility reads identically
+    /// everywhere.
+    fn grantable(&self, kind: SlotKind, resource: Option<WaitReason>) -> bool {
+        resource.is_none()
+            && self.held_in(kind.pool()) < self.capacity(kind.pool())
+            && self.held_total() < self.total_capacity()
     }
 }
 
@@ -2618,28 +1404,6 @@ fn strict_unavailable(reason: &str) -> Error {
     ))
 }
 
-/// Atomic write: tmp file (mode 0600) fsynced before the rename, the
-/// directory after it, so a crash cannot lose or tear a record.
-fn write_atomic(path: &Path, doc: &Value) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .and_then(|mut f| {
-            f.write_all(doc.to_string().as_bytes())?;
-            f.sync_all()
-        })
-        .and_then(|_| std::fs::rename(&tmp, path))?;
-    // The rename is durable only once its directory is.
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
-    }
-    Ok(())
-}
-
 /// Borrowed acquire inputs — `grant`/`find_hold` take them as one
 /// argument.
 struct SlotReq<'a> {
@@ -2729,12 +1493,16 @@ mod probe {
 mod tests {
     use super::*;
 
+    /// These tests exercise the per-pool machinery in isolation, so
+    /// they opt out of CAD-1268's aggregate cap explicitly. Tests for
+    /// the shared budget itself build their own `SlotConfig` below.
     fn slots(build: usize, suite: usize, starve: u64, priority: &[&str]) -> Slots {
         Slots::new(SlotConfig {
             build_slots: build,
             suite_slots: suite,
             starve_secs: starve,
             priority_lanes: priority.iter().map(|s| s.to_string()).collect(),
+            total_slots: 64,
             ..Default::default()
         })
     }
@@ -2794,11 +1562,13 @@ mod tests {
     }
 
     /// Release the current hold whichever lane owns it — the
-    /// contention tests hand the slot between lanes.
+    /// contention tests hand the slot between lanes. The release
+    /// names the hold's recorded lane AND pid: requester children
+    /// own these holds, so `me()` would be a foreign caller.
     fn release_any(s: &mut Slots, now: f64) -> Value {
         let h = &s.held[0];
-        let (token, lane) = (h.token.clone(), h.lane.clone());
-        release(s, &token, &lane, now)
+        let (token, lane, pid) = (h.token.clone(), h.lane.clone(), h.pid);
+        s.release(&token, &lane, pid, now).unwrap().0
     }
 
     /// A real child pid distinct from the test process — killed on drop.
@@ -2856,9 +1626,20 @@ mod tests {
         let b = acquire(&mut s, SlotKind::Build, "dev-1", "r1", 0.0);
         assert_eq!(b["granted"], false, "must not adopt another caller's hold");
         assert_eq!(b["position"], 1);
-        // And a different kind under the same request_id also queues.
-        let c = acquire(&mut s, SlotKind::Test, "dev-1", "r1", 0.0);
-        assert_eq!(c["granted"], false);
+        // A second request identity while the first still queues is
+        // refused outright — one caller, one queued request — even
+        // under the SAME request_id with a different kind.
+        let err = s
+            .acquire(
+                SlotKind::Test,
+                "dev-1",
+                me(),
+                "r1",
+                false,
+                SlotClock::at(0.0, 0.0),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("deadlock guard"), "{err}");
         // A same-identity re-poll still adopts its own hold.
         let a2 = acquire_pid(&mut s, SlotKind::Build, "dev-1", other.pid(), "r1", 0.0);
         assert_eq!(a2["token"], a["token"]);
@@ -3016,9 +1797,13 @@ mod tests {
         acquire(&mut s, SlotKind::Build, "qa-1", "qb", 5.0);
         // dev-2 bursts three more requests at t=10 — on the pre-r4
         // head all three inherited t=0 and pinned qa-1 behind them;
-        // now they stamp their own arrival.
-        for req in ["w2", "w3", "w4"] {
-            acquire(&mut s, SlotKind::Build, "dev-2", req, 10.0);
+        // now they stamp their own arrival. Each burst requester is a
+        // DISTINCT live process: one caller holds at most one queued
+        // request (the wait-then-hold guard), so a lane burst is
+        // always a fan-in of separate callers.
+        let burst: Vec<Child> = (0..3).map(|_| Child::spawn()).collect();
+        for (i, req) in ["w2", "w3", "w4"].iter().enumerate() {
+            acquire_pid(&mut s, SlotKind::Build, "dev-2", burst[i].pid(), req, 10.0);
         }
         release_first(&mut s, "dev-1", 20.0);
         let g = acquire(&mut s, SlotKind::Build, "dev-2", "w1", 20.0);
@@ -3027,7 +1812,7 @@ mod tests {
         let g = acquire(&mut s, SlotKind::Build, "qa-1", "qb", 21.0);
         assert_eq!(g["granted"], true, "qa-1's t=5 beats the t=10 burst");
         release_first(&mut s, "qa-1", 22.0);
-        let g = acquire(&mut s, SlotKind::Build, "dev-2", "w2", 22.0);
+        let g = acquire_pid(&mut s, SlotKind::Build, "dev-2", burst[0].pid(), "w2", 22.0);
         assert_eq!(g["granted"], true, "the burst follows in arrival order");
     }
 
@@ -3142,6 +1927,7 @@ mod tests {
         let mut s = Slots::new(SlotConfig {
             build_slots: 1,
             max_hold_secs: 100,
+            total_slots: 64,
             ..Default::default()
         });
         acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
@@ -3251,12 +2037,17 @@ mod tests {
     fn queue_cap_rejects_overflow() {
         let mut s = slots(1, 1, 900, &[]);
         acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
+        // Each queued request is a distinct live process — one caller
+        // holds at most one queued request.
+        let kids: Vec<Child> = (0..MAX_WAITERS).map(|_| Child::spawn()).collect();
+        let mut next = kids.iter();
         for lane in 0..4 {
             for i in 0..MAX_WAITERS_PER_LANE {
-                let q = acquire(
+                let q = acquire_pid(
                     &mut s,
                     SlotKind::Build,
                     &format!("dev-w{lane}"),
+                    next.next().unwrap().pid(),
                     &format!("w{i}"),
                     0.0,
                 );
@@ -3283,8 +2074,18 @@ mod tests {
     fn per_lane_queue_cap_bounds_one_lanes_share() {
         let mut s = slots(1, 1, 900, &[]);
         acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
-        for i in 0..MAX_WAITERS_PER_LANE {
-            let q = acquire(&mut s, SlotKind::Build, "dev-2", &format!("w{i}"), 0.0);
+        // One caller queues at most one request — the lane's share is
+        // filled by distinct live processes.
+        let kids: Vec<Child> = (0..MAX_WAITERS_PER_LANE).map(|_| Child::spawn()).collect();
+        for (i, kid) in kids.iter().enumerate() {
+            let q = acquire_pid(
+                &mut s,
+                SlotKind::Build,
+                "dev-2",
+                kid.pid(),
+                &format!("w{i}"),
+                0.0,
+            );
             assert_eq!(q["granted"], false);
         }
         let err = s
@@ -3334,7 +2135,11 @@ mod tests {
     fn suite_pool_is_independent() {
         let mut s = slots(1, 1, 900, &[]);
         acquire(&mut s, SlotKind::Suite, "qa-1", "s1", 0.0);
-        let q = acquire(&mut s, SlotKind::Suite, "qa-1", "s2", 0.0);
+        // The second suite request comes from another lane: qa-1's
+        // own process already holds, and under the shared-budget
+        // hold-and-wait guard it could never queue (refused, not
+        // queued) — the queueing caller here is qa-2.
+        let q = acquire(&mut s, SlotKind::Suite, "qa-2", "s2", 0.0);
         assert_eq!(q["granted"], false);
         // Build pool unaffected by a full suite pool.
         let b = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
@@ -3402,26 +2207,39 @@ mod tests {
     fn continuous_requeue_cannot_monopolize_a_pool() {
         let mut s = slots(1, 1, 900, &[]);
         // Lane A holds the only build slot and already keeps two
-        // waiters in flight riding the t=0 anchor.
-        acquire(&mut s, SlotKind::Build, "A", "h", 0.0);
-        acquire(&mut s, SlotKind::Build, "A", "w1", 0.0);
-        acquire(&mut s, SlotKind::Build, "A", "w2", 0.0);
-        // Lane B requests once, a second later.
+        // waiters in flight riding the t=0 anchor. Every lane-A
+        // requester is a DISTINCT live pid: under the hold-and-wait
+        // guard one process may hold OR wait, never both — the holder
+        // and the two waiters are separate children of this test.
+        let holder = Child::spawn();
+        let waiter_a = Child::spawn();
+        let waiter_b = Child::spawn();
+        acquire_pid(&mut s, SlotKind::Build, "A", holder.pid(), "h", 0.0);
+        acquire_pid(&mut s, SlotKind::Build, "A", waiter_a.pid(), "w1", 0.0);
+        acquire_pid(&mut s, SlotKind::Build, "A", waiter_b.pid(), "w2", 0.0);
+        // Lane B requests once, a second later, as this test process.
         acquire(&mut s, SlotKind::Build, "B", "b1", 1.0);
-        let mut a_waiters = vec!["w1".to_string(), "w2".to_string()];
+        let mut a_waiters = vec![
+            ("w1".to_string(), waiter_a.pid()),
+            ("w2".to_string(), waiter_b.pid()),
+        ];
         let mut next = 3u32;
         let mut b_granted_at = None;
         // Every 20s the holder releases; A's waiters poll first
         // (adversarial), B polls once, and A tops back up to two
-        // in-flight requests — the monopolization pattern.
+        // in-flight requests — the monopolization pattern. A granted
+        // waiter's request flips to the holder's pid (the seat is now
+        // its own), so each request's pid stays stable: no pid ever
+        // holds and waits at once, and the three children bound the
+        // live processes the whole run.
         for tick in 1..=45 {
             let t = tick as f64 * 20.0;
             release_any(&mut s, t);
             let mut still = Vec::new();
-            for r in &a_waiters {
-                let g = acquire(&mut s, SlotKind::Build, "A", r, t);
+            for (r, pid) in &a_waiters {
+                let g = acquire_pid(&mut s, SlotKind::Build, "A", *pid, r, t);
                 if !g["granted"].as_bool().unwrap_or(false) {
-                    still.push(r.clone());
+                    still.push((r.clone(), *pid));
                 }
             }
             a_waiters = still;
@@ -3433,8 +2251,20 @@ mod tests {
             while a_waiters.len() < 2 {
                 let r = format!("w{next}");
                 next += 1;
-                acquire(&mut s, SlotKind::Build, "A", &r, t);
-                a_waiters.push(r);
+                // A topped-up request queues under a child that now
+                // neither waits nor holds — a granted waiter's pid
+                // took the hold this tick, so it is busy.
+                let busy: Vec<u32> = a_waiters
+                    .iter()
+                    .map(|(_, p)| *p)
+                    .chain(s.held.iter().map(|h| h.pid))
+                    .collect();
+                let pid = [holder.pid(), waiter_a.pid(), waiter_b.pid()]
+                    .into_iter()
+                    .find(|p| !busy.contains(p))
+                    .unwrap();
+                acquire_pid(&mut s, SlotKind::Build, "A", pid, &r, t);
+                a_waiters.push((r, pid));
             }
         }
         let t = b_granted_at.expect("B never granted — A owned the pool");
@@ -3555,8 +2385,9 @@ mod tests {
         }
         let q = acquire(&mut s, SlotKind::Build, "dev-x", "bx", 0.0);
         assert_eq!(q["granted"], false);
-        // The 4th build waits on capacity; a check slot is free anyway.
-        let c = acquire(&mut s, SlotKind::Check, "dev-x", "c1", 0.0);
+        // The 4th build waits on capacity; a different caller can
+        // still take a free check slot without holding while queued.
+        let c = acquire(&mut s, SlotKind::Check, "dev-y", "c1", 0.0);
         assert_eq!(c["granted"], true, "check granted on its own pool: {c}");
         assert_eq!(c["kind"], "check");
     }
@@ -3569,8 +2400,9 @@ mod tests {
         // Below floor: queued, never refused, reason=memory.
         assert_eq!(r["granted"], false);
         assert_eq!(r["wait_reason"], "memory", "{r}");
-        // The check pool uses its own (lower) floor — still under it.
-        let c = acquire(&mut s, SlotKind::Check, "dev-1", "c1", 0.0);
+        // A different caller tests the check pool's own (lower)
+        // floor without submitting a second queued request.
+        let c = acquire(&mut s, SlotKind::Check, "dev-2", "c1", 0.0);
         assert_eq!(c["granted"], false);
         assert_eq!(c["wait_reason"], "memory", "{c}");
     }
@@ -3695,5 +2527,201 @@ mod tests {
         for w in st["waiting"].as_array().unwrap() {
             assert_eq!(w["wait_reason"], "disk", "{w}");
         }
+    }
+
+    // ---------- CAD-1268: aggregate budget ----------
+
+    /// One scheduler under the shared cap with roomy per-pool limits
+    /// and no resource floors — the aggregate is the only binder.
+    fn budgeted(total: usize) -> Slots {
+        let mut s = Slots::new(SlotConfig {
+            total_slots: total,
+            build_slots: 8,
+            suite_slots: 8,
+            check_slots: 8,
+            ..Default::default()
+        });
+        s.use_resources(Some(generous()));
+        s
+    }
+
+    /// The combined cap binds every pool and the probe alike: with one
+    /// grant held, no second grant lands — a full suite pool does not
+    /// head-of-line block a build waiter either.
+    #[test]
+    fn aggregate_cap_binds_every_pool_and_probe() {
+        let mut s = budgeted(2);
+        let a = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
+        let b = acquire(&mut s, SlotKind::Build, "dev-2", "b2", 0.0);
+        assert_eq!(a["granted"], true);
+        assert_eq!(b["granted"], true);
+        // Third grant — any pool — exceeds the shared budget even
+        // though suite and check have per-pool room.
+        let p = probe(&mut s, SlotKind::Check, "dev-3", "c1", 1.0);
+        assert_eq!(p["granted"], false, "probe obeys the combined cap: {p}");
+        assert_eq!(p["total_held"], 2);
+        assert_eq!(p["total_capacity"], 2);
+        let q = acquire(&mut s, SlotKind::Suite, "dev-3", "s1", 1.0);
+        assert_eq!(q["granted"], false, "acquire obeys the combined cap: {q}");
+        // Saturated suite is irrelevant once a seat frees: release one
+        // build hold and the suite waiter drains into it — a FULL
+        // pool's waiters never block an eligible rival's claim.
+        let mut s = budgeted(1);
+        acquire(&mut s, SlotKind::Suite, "dev-1", "s0", 0.0);
+        acquire(&mut s, SlotKind::Suite, "dev-2", "s1", 0.0); // own pool full
+        let q = acquire(&mut s, SlotKind::Build, "dev-3", "b1", 0.0);
+        assert_eq!(q["granted"], false, "aggregate full: {q}");
+        release_any(&mut s, 1.0);
+        let g = acquire(&mut s, SlotKind::Build, "dev-3", "b1", 2.0);
+        assert_eq!(g["granted"], true, "saturated suite pool cannot block: {g}");
+    }
+
+    /// Zero configured clamps to one, matching the per-pool floors.
+    #[test]
+    fn aggregate_cap_zero_clamps_to_one() {
+        let mut s = budgeted(0);
+        let g = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
+        assert_eq!(g["granted"], true, "clamped to one: {g}");
+        let g = acquire(&mut s, SlotKind::Build, "dev-2", "b2", 0.0);
+        assert_eq!(g["granted"], false);
+    }
+
+    /// The hold-and-wait guard reaches a SAME-POOL hold under the
+    /// shared budget, and re-polling the identical request still
+    /// returns the same minted token.
+    #[test]
+    fn holding_process_cannot_queue_anywhere_but_repolling_is_idempotent() {
+        let mut s = budgeted(2);
+        let g = acquire(&mut s, SlotKind::Build, "dev-1", "r1", 0.0);
+        assert_eq!(g["granted"], true);
+        // Same full identity — the original token back, never queued.
+        let again = acquire(&mut s, SlotKind::Build, "dev-1", "r1", 1.0);
+        assert_eq!(again["token"], g["token"]);
+        // Same process, different request, same pool: queued would be
+        // hold-and-wait once the aggregate binds — refused outright.
+        acquire(&mut s, SlotKind::Build, "dev-2", "r2", 1.0); // cap full
+        let err = s
+            .acquire(
+                SlotKind::Build,
+                "dev-1",
+                me(),
+                "r3",
+                false,
+                SlotClock::at(2.0, 0.0),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("deadlock guard"), "{err}");
+        assert!(s.waiting.is_empty(), "the refused request never queued");
+    }
+
+    /// Status exposes the aggregate next to the pools, and the
+    /// resolved config carries `total_slots` — no token escapes into
+    /// either block.
+    #[test]
+    fn status_reports_aggregate_capacity_without_tokens() {
+        let mut s = budgeted(2);
+        acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
+        let st = s.status(sc("stranger", &[]), 0.0).0;
+        assert_eq!(st["total_capacity"], 2);
+        assert_eq!(st["total_held"], 1);
+        assert_eq!(st["config"]["total_slots"], 2);
+        assert_eq!(st["config"]["jobs_per_lane"], 2);
+        assert!(!st.to_string().contains("slot-"), "no token leaked: {st}");
+    }
+
+    /// Slots restored over a reduced cap keep their holds — they drain
+    /// on release, never revoked — while new work waits.
+    #[test]
+    fn restored_overcap_holds_drain_without_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("slots.json");
+        std::fs::write(
+            &file,
+            json!({"holds": [
+                {"token": "slot-a", "request_id": "ra", "kind": "build",
+                 "lane": "dev-1", "pid": me(), "pid_start": null,
+                 "acquired_epoch": 0.0},
+                {"token": "slot-b", "request_id": "rb", "kind": "suite",
+                 "lane": "dev-2", "pid": me(), "pid_start": null,
+                 "acquired_epoch": 0.0},
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let mut s = budgeted(1);
+        s.persist_to(file);
+        s.restore(SlotClock::at(10.0, 10.0));
+        assert_eq!(s.held.len(), 2, "over-capacity holds are retained");
+        let q = acquire(&mut s, SlotKind::Check, "dev-3", "c1", 11.0);
+        assert_eq!(q["granted"], false, "new work waits while over cap");
+        release(&mut s, "slot-a", "dev-1", 12.0);
+        let q = acquire(&mut s, SlotKind::Check, "dev-3", "c1", 13.0);
+        assert_eq!(q["granted"], false, "still over the reduced cap");
+        release(&mut s, "slot-b", "dev-2", 14.0);
+        let q = acquire(&mut s, SlotKind::Check, "dev-3", "c1", 15.0);
+        assert_eq!(q["granted"], true, "drained to the cap: {q}");
+    }
+
+    /// The wait-then-hold mirror guard: one caller keeps at most one
+    /// request in the queue — a NEW request identity (probe or
+    /// acquire) from a process already waiting is refused before it
+    /// joins or grants, because granting it would mint a holder that
+    /// still waits, and queuing it could never be granted without
+    /// creating the same state. The queued request is untouched and
+    /// grants normally once it leads.
+    #[test]
+    fn queued_caller_cannot_take_a_new_grant_elsewhere() {
+        let mut s = Slots::new(SlotConfig {
+            total_slots: 2,
+            build_slots: 1,
+            ..Default::default()
+        });
+        s.use_resources(Some(generous()));
+        // The only build seat is held, but aggregate capacity remains
+        // available for suite: refusal must come from the caller guard.
+        acquire(&mut s, SlotKind::Build, "dev-9", "b9", 0.0);
+        let w = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
+        assert_eq!(w["granted"], false);
+        // A NEW suite request identity while the build request still
+        // queues — refused BEFORE it joins, probe or acquire alike.
+        let err = s
+            .acquire(
+                SlotKind::Suite,
+                "dev-1",
+                me(),
+                "s1",
+                false,
+                SlotClock::at(1.0, 0.0),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("deadlock guard"), "{err}");
+        // Same for the read-only probe: refused, never granted.
+        let err = s
+            .acquire(
+                SlotKind::Suite,
+                "dev-1",
+                me(),
+                "s2",
+                true,
+                SlotClock::at(1.0, 0.0),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("deadlock guard"), "{err}");
+        // The refusal removed nothing: dev-1's build waiter is alone.
+        assert_eq!(s.waiting.len(), 1);
+        assert_eq!(s.waiting[0].request_id, "b1");
+        assert_eq!(s.waiting[0].kind, SlotKind::Build);
+        assert!(s.held.iter().all(|h| h.kind.pool() != Pool::Suite));
+        // The queued request itself re-polls and grants normally —
+        // only NEW request identities are refused.
+        release_any(&mut s, 2.0);
+        let g = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 3.0);
+        assert_eq!(g["granted"], true, "queued request grants normally: {g}");
+        // A different process in the same lane is not the queued
+        // caller — the guard binds (lane, pid), so it grants freely.
+        let child = Child::spawn();
+        let q = acquire_pid(&mut s, SlotKind::Suite, "dev-1", child.pid(), "s2", 4.0);
+        assert_eq!(q["granted"], true, "other pid in lane is unguarded: {q}");
+        child.reap();
     }
 }

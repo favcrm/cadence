@@ -9,19 +9,20 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 const PASSWORD: &str = "cad1065-synthetic-only-password";
 const SMTP_RIG: &str = r#"
-import base64, json, pathlib, socket, ssl, sys
+import base64, json, os, pathlib, socket, ssl, sys
 root = pathlib.Path(sys.argv[1])
 tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 tls.load_cert_chain(root / "certificate.pem", root / "key.pem")
 listener = socket.socket()
 listener.bind(("127.0.0.1", 0))
 listener.listen(8)
-(root / "port").write_text(str(listener.getsockname()[1]))
+(root / "port.tmp").write_text(str(listener.getsockname()[1]))
+os.replace(root / "port.tmp", root / "port")
 def record(kind):
     with (root / "observed").open("a") as out:
         out.write(kind + "\n")
@@ -137,6 +138,134 @@ impl CredentialReads {
 /// take: `Drop` always runs its teardown before releasing.
 static SMTP_COUNTER_WITNESS: Mutex<()> = Mutex::new(());
 
+/// The synthetic TLS identity every Fixture in this binary serves. It is a
+/// test-only 1-day CA plus a localhost leaf, generated ONCE per test binary
+/// into a private directory and kept as owned PEM bytes. Each fixture gets
+/// its own regular file copies inside its 0700 root (never hardlinks or a
+/// shared mutable file), so a fixture cannot observe or mutate another's
+/// identity. The material is cached in process only: no open filesystem
+/// handles or shared tempdir survive past `prepare`.
+struct TlsMaterial {
+    certificate_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+    ca_pem: Vec<u8>,
+    ca_key_pem: Vec<u8>,
+    request_pem: Vec<u8>,
+}
+
+static TLS_MATERIAL: OnceLock<TlsMaterial> = OnceLock::new();
+
+impl TlsMaterial {
+    /// Generate the CA, leaf request and signed leaf with the exact openssl
+    /// commands the fixture used inline, into a private temporary directory,
+    /// then read the owned bytes back and drop the directory. The commands,
+    /// extensions, day count and serial are unchanged; only the location
+    /// (here, not the fixture root) and the once-per-binary reuse differ.
+    /// The CA identity is shared across this binary's fixtures, which is
+    /// safe because no test asserts a per-fixture CA fingerprint or a
+    /// cross-CA trust boundary.
+    fn get() -> &'static TlsMaterial {
+        TLS_MATERIAL.get_or_init(|| {
+            let dir = tempfile::Builder::new()
+                .prefix("c1065-tls-")
+                .tempdir()
+                .unwrap();
+            let certificate = dir.path().join("certificate.pem");
+            let key = dir.path().join("key.pem");
+            let ca = dir.path().join("ca.pem");
+            let ca_key = dir.path().join("ca-key.pem");
+            let request = dir.path().join("request.pem");
+            let result = reaper::output(
+                Command::new("openssl")
+                    .args([
+                        "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    ])
+                    .args(["-subj", "/CN=CAD1065 synthetic CA"])
+                    .args(["-addext", "basicConstraints=critical,CA:TRUE"])
+                    .arg("-keyout")
+                    .arg(&ca_key)
+                    .arg("-out")
+                    .arg(&ca)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .unwrap();
+            assert!(result.status.success(), "isolated TLS CA setup failed");
+            let result = reaper::output(
+                Command::new("openssl")
+                    .args(["req", "-new", "-newkey", "rsa:2048", "-nodes"])
+                    .args([
+                        "-subj",
+                        "/CN=localhost",
+                        "-addext",
+                        "subjectAltName=DNS:localhost",
+                    ])
+                    .args(["-addext", "basicConstraints=critical,CA:FALSE"])
+                    .args(["-addext", "extendedKeyUsage=serverAuth"])
+                    .arg("-keyout")
+                    .arg(&key)
+                    .arg("-out")
+                    .arg(&request)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .unwrap();
+            assert!(result.status.success(), "isolated TLS request setup failed");
+            let result = reaper::output(
+                Command::new("openssl")
+                    .args([
+                        "x509",
+                        "-req",
+                        "-days",
+                        "1",
+                        "-copy_extensions",
+                        "copy",
+                        "-set_serial",
+                        "2",
+                    ])
+                    .arg("-in")
+                    .arg(&request)
+                    .arg("-CA")
+                    .arg(&ca)
+                    .arg("-CAkey")
+                    .arg(&ca_key)
+                    .arg("-out")
+                    .arg(&certificate)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .unwrap();
+            assert!(result.status.success(), "isolated TLS fixture setup failed");
+            let read = |p: &Path| std::fs::read(p).unwrap();
+            TlsMaterial {
+                certificate_pem: read(&certificate),
+                key_pem: read(&key),
+                ca_pem: read(&ca),
+                ca_key_pem: read(&ca_key),
+                request_pem: read(&request),
+            }
+            // `dir` drops here: no shared tempdir or open handle survives.
+        })
+    }
+
+    /// Write independent regular-file copies of the cached material into
+    /// `dir` under the original fixture filenames, preserving the private
+    /// key's 0600 mode. No hardlinks, no shared file.
+    fn install_into(&self, dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let write = |name: &str, bytes: &[u8], mode: u32| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            std::fs::set_permissions(&p, PermissionsExt::from_mode(mode)).unwrap();
+        };
+        write("certificate.pem", &self.certificate_pem, 0o644);
+        write("key.pem", &self.key_pem, 0o600);
+        write("ca.pem", &self.ca_pem, 0o644);
+        write("ca-key.pem", &self.ca_key_pem, 0o600);
+        write("request.pem", &self.request_pem, 0o644);
+    }
+}
+
 struct Fixture {
     _rig: OwnedChild,
     root: tempfile::TempDir,
@@ -169,72 +298,13 @@ impl Fixture {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = tempfile::Builder::new().prefix("c1065-").tempdir().unwrap();
-        let certificate = root.path().join("certificate.pem");
-        let key = root.path().join("key.pem");
-        let ca = root.path().join("ca.pem");
-        let ca_key = root.path().join("ca-key.pem");
-        let request = root.path().join("request.pem");
-        let result = reaper::output(
-            Command::new("openssl")
-                .args([
-                    "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                ])
-                .args(["-subj", "/CN=CAD1065 synthetic CA"])
-                .args(["-addext", "basicConstraints=critical,CA:TRUE"])
-                .arg("-keyout")
-                .arg(&ca_key)
-                .arg("-out")
-                .arg(&ca)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null()),
-        )
-        .unwrap();
-        assert!(result.status.success(), "isolated TLS CA setup failed");
-        let result = reaper::output(
-            Command::new("openssl")
-                .args(["req", "-new", "-newkey", "rsa:2048", "-nodes"])
-                .args([
-                    "-subj",
-                    "/CN=localhost",
-                    "-addext",
-                    "subjectAltName=DNS:localhost",
-                ])
-                .args(["-addext", "basicConstraints=critical,CA:FALSE"])
-                .args(["-addext", "extendedKeyUsage=serverAuth"])
-                .arg("-keyout")
-                .arg(&key)
-                .arg("-out")
-                .arg(&request)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null()),
-        )
-        .unwrap();
-        assert!(result.status.success(), "isolated TLS request setup failed");
-        let result = reaper::output(
-            Command::new("openssl")
-                .args([
-                    "x509",
-                    "-req",
-                    "-days",
-                    "1",
-                    "-copy_extensions",
-                    "copy",
-                    "-set_serial",
-                    "2",
-                ])
-                .arg("-in")
-                .arg(&request)
-                .arg("-CA")
-                .arg(&ca)
-                .arg("-CAkey")
-                .arg(&ca_key)
-                .arg("-out")
-                .arg(&certificate)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null()),
-        )
-        .unwrap();
-        assert!(result.status.success(), "isolated TLS fixture setup failed");
+        // Material is fetched only after the exclusive witness is held, so a
+        // blocked competing fixture never performs setup work. The cached
+        // bytes are copied into this fixture's own root: each fixture owns
+        // its identity files (0600 on the private key), and the python rig
+        // sees the same private paths as before.
+        let material = TlsMaterial::get();
+        material.install_into(root.path());
         let rig = OwnedChild(
             reaper::spawn(
                 Command::new("python3")
@@ -265,10 +335,10 @@ impl Fixture {
         };
         issue::Pm::init(&fixture.pm()).unwrap();
         assert!(
-            matches!(
-                platform::custody::Custody::open(&fixture.state()).unwrap(),
-                platform::custody::Custody::File(_)
-            ),
+            platform::custody::Custody::open(&fixture.state())
+                .unwrap()
+                .tag()
+                == platform::custody::FILE_TAG,
             "run this owned gate in its isolated File-custody environment"
         );
         let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
@@ -283,7 +353,7 @@ impl Fixture {
             agent_gc: Some(Default::default()),
             report_router: Some(0),
             checkup: Some(0),
-            smtp_test_ca_pem: Some(std::fs::read(ca).unwrap()),
+            smtp_test_ca_pem: Some(material.ca_pem.clone()),
             ..Default::default()
         };
         platform::smtp::attach(&mut opts);
@@ -1191,14 +1261,15 @@ fn cad1065_reply_total_bound_and_utf8_refusal_leave_verifier_usable() {
 #[test]
 fn cad1065_tls_drip_cannot_reset_the_total_operation_budget() {
     let script = r#"
-import pathlib, socket, ssl, sys, time
+import os, pathlib, socket, ssl, sys, time
 root = pathlib.Path(sys.argv[1])
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(root / "certificate.pem", root / "key.pem")
 listener = socket.socket()
 listener.bind(("127.0.0.1", 0))
 listener.listen(8)
-(root / "port").write_text(str(listener.getsockname()[1]))
+(root / "port.tmp").write_text(str(listener.getsockname()[1]))
+os.replace(root / "port.tmp", root / "port")
 while True:
     raw, _ = listener.accept()
     with (root / "observed").open("a") as out:
@@ -1336,10 +1407,9 @@ fn cad1065_libsecret_cleanup_pending_child() {
     let state = root.path().join("state");
     let pm = root.path().join("pm");
     issue::Pm::init(&pm).unwrap();
-    assert!(matches!(
-        platform::custody::Custody::open(&state).unwrap(),
-        platform::custody::Custody::Libsecret(_)
-    ));
+    assert!(
+        platform::custody::Custody::open(&state).unwrap().tag() == platform::custody::LIBSECRET_TAG
+    );
 
     let provider_env = cadence_agent::adapter::ProviderEnv::refusing_providers();
     provider_env.set("CADENCE_PM_DIR", pm.to_str().unwrap());

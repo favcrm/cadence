@@ -1,37 +1,51 @@
+import { canOpenInstall } from "../explorer/installAccess";
 import { useEffect, useMemo, useState } from "react";
 import { resources } from "../../lib/resources";
+import { useTranslate } from "../../lib/locale";
+import { appExplorer, notifyAppsChanged, APPS_CHANGED_EVENT, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
 import { homeNeeds, type HomeNeed } from "../home/needs";
-import { appApprovalChip, appHref, appPurpose, runsSummary } from "./appViewModel";
+import { appApprovalChip, appHref, appPurpose, installedAppHref, installationAppHref, runsSummary, screenInstallHref } from "./appViewModel";
 import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
+import { useInstallations } from "../workspace-apps/useInstallations";
 import { ResourceGate } from "../../ui/ResourceStatus";
 import "./apps.css";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
-import { appExplorer, type HomeInstallation, type FavoritesPayload } from "../workspace-apps/workspaceApps";
+import { appErrorCopy, appLoadErrorCopy, UNVERIFIED_APPS_COPY } from "../explorer/appErrors";
 import type { Viewer } from "../projects/work";
 import { AppGlyph } from "../explorer/shared";
+import AppCover from "../explorer/AppCover";
+import PageState from "../../ui/PageState";
+import { IconApps, IconLock, IconSettings } from "../../ui/icons";
 import "../explorer/explorer.css";
 
 /**
  * The Apps home (CAD-1129, `/apps`): the OS-style landing — a Needs-
  * attention rail, the operator's/member's favorites row, the installed
- * grid and (operator) Recently removed. "Open" opens the app's own
- * page (`/app-installations/<id>`); "Manage" opens its operator tab.
+ * grid and (operator) Recently removed. Cards open the app itself;
+ * an operator's small settings action opens its Manage page.
  *
  * The legacy project-scoped list and the per-project catalog live
  * behind `/apps/<project>/<name>` (unchanged); this screen is the
  * workspace-level home the ticket describes.
  */
-export default function Apps({ project, viewer }: { project: string; viewer: Viewer }) {
+export default function Apps({ viewer }: { viewer: Viewer }) {
+  const t = useTranslate();
   const [revision, setRevision] = useState(0);
   const [q, setQ] = useState("");
   const [sort, setSort] = useState<"recent" | "name" | "attention">("recent");
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  const isOp = viewer.operator && !viewer.readOnly;
+  const isOp = viewer.operator === true && !viewer.readOnly;
+
+  useEffect(() => {
+    const bump = () => setRevision((r) => r + 1);
+    window.addEventListener(APPS_CHANGED_EVENT, bump);
+    return () => window.removeEventListener(APPS_CHANGED_EVENT, bump);
+  }, []);
 
   // CAD-1189: every list here loads with the shared busy backoff, keeps
   // its last good answer on a failed refresh, and never reads an error as
@@ -42,7 +56,8 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
   const [pinned, setPinned] = useState<FavoritesPayload | null>(null);
   useEffect(() => setPinned(null), [favLoad.data]);
   const favs = pinned ?? favLoad.data;
-  const loadError = homeLoad.error ?? favLoad.error;
+  const rawLoadError = homeLoad.error ?? favLoad.error;
+  const loadError = rawLoadError === null ? null : appLoadErrorCopy(rawLoadError, "Your apps didn't load.");
   const retrying = homeLoad.retrying || favLoad.retrying;
   const retryAll = () => { setActionError(null); setRevision((r) => r + 1); };
 
@@ -52,7 +67,9 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
   const projectApps = useQuery(resources.apps);
   const overview = useResource(resources.overview);
   const needs = homeNeeds(overview.data?.needs_me);
-  const projectRows = (projectApps.data ?? []).filter((r) => project === "all" || r.project === project);
+  // Only the operator may read the installation list; others keep the legacy link.
+  const installs = useInstallations(isOp, revision).list;
+  const projectRows = projectApps.data ?? [];
 
   const byId = useMemo(() => {
     const map = new Map<string, HomeInstallation>();
@@ -72,6 +89,24 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
     const ids = favs?.favorites ?? [];
     return ids.map((id) => byId.get(id)).filter((h): h is HomeInstallation => !!h);
   }, [favs, byId]);
+
+  // CAD-1312: a fully-loaded empty workspace drops the header's Explore
+  // CTA — the state panel carries the same action once, next to its copy.
+  const emptyWorkspace = home !== null && live.length === 0 && loadError === null;
+  // When nothing exists on either list — a confirmed-empty project-apps
+  // answer and no workspace apps (live or recently removed) — the screen
+  // becomes one full-page state instead of stacked empty sections. The
+  // sign-in refusal and a load failure get their own honest variants; a
+  // partially loaded screen (stale rows, removed apps to restore, project
+  // rows, a project list still loading or failed) keeps normal sections.
+  const noWorkspaceApps = live.length === 0 && removedList.length === 0;
+  const noProjectApps = projectApps.data != null && projectRows.length === 0;
+  const bareApps =
+    noWorkspaceApps && noProjectApps && (home !== null || loadError !== null);
+
+  const noMatchCopy = t("No installed app matches “{query}” — try another word, or look in Explore.").replace("{query}", () => q);
+  const [noMatchBeforeExplore, noMatchAfterExplore] = noMatchCopy.split(/Explore|「探索」/);
+  const noMatchExploreLabel = noMatchCopy.match(/Explore|「探索」/)?.[0] ?? "Explore";
 
   const items = useMemo(() => {
     const needle = q.trim().toLowerCase();
@@ -98,160 +133,241 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
   const restore = (id: string) => {
     setBusy(id);
     void appExplorer.restore(id)
-      .then(() => setRevision((r) => r + 1))
-      .catch((e: unknown) => setActionError(e instanceof Error ? e.message : "Restore was refused"))
+      .then(notifyAppsChanged)
+      .catch((e: unknown) => setActionError(t(appErrorCopy(e, "Restore didn't finish. Try again in a moment."))))
       .finally(() => setBusy(null));
   };
 
+  // CAD-1438: tiles link the canonical `/apps/<key>` route. For the
+  // operator the verified install list decides uniqueness before the
+  // link is emitted; for members (no list read) the route itself proves
+  // uniqueness — an ambiguous or unsafe key renders no link.
+  const openHref = (installation: HomeInstallation): string | null => {
+    // Only an active install has an app route; an off or removed card must not
+    // offer an Open that lands on "Unknown installation".
+    if (installation.attention.state === "off" || installation.attention.state === "removed") return null;
+    if (installs !== null) return installationAppHref(installs, installation.install_id);
+    return installedAppHref(installation.name);
+  };
+
+  /**
+   * An installed card opens the app itself, not its store page: the
+   * canonical `/apps/<key>` route is the one destination for everyone.
+   * The operator's settings action — access, updates, remove — lives
+   * beside it on `/apps/manage/<install_id>`; members have no manage
+   * page, so they get no icon.
+   */
+  const settingsHref = (h: HomeInstallation): string | null =>
+    isOp ? `/apps/manage/${encodeURIComponent(h.install_id)}` : null;
+
   const attentionRow = (h: HomeInstallation) => {
     const s = h.attention.state;
-    const label = s === "off" ? "Access off" : s === "setup" ? "Finish setup" : s === "update" ? "Update ready" : "Needs attention";
+    const label = t(s === "off" ? "Access off" : s === "setup" ? "Finish setup" : s === "update" ? "Update ready" : "Needs attention");
     return (
       <div key={h.install_id} className="attn-row">
         <AppGlyph name={h.name} icon={h.icon} size="sm" />
         <span className="txt"><b>{h.title}</b> · {h.attention.message ?? label}</span>
         {isOp ? (
-          <Button className="btn-sm" href={s === "off" || s === "update" ? `/apps/manage/${h.install_id}` : `/app-installations/${h.install_id}`}>
-            {s === "off" ? "Manage access" : s === "update" ? "Review update" : "Finish setup"}
+          <Button className="btn-sm" href={(s === "off" || s === "update" ? `/apps/manage/${h.install_id}` : openHref(h)) ?? `/apps/manage/${h.install_id}`}>
+            {t(s === "off" ? "Manage access" : s === "update" ? "Review update" : "Finish setup")}
           </Button>
         ) : (
-          <span className="hint">An admin needs to handle this</span>
+          <span className="hint">{t("An admin needs to handle this")}</span>
         )}
       </div>
     );
   };
 
   return (
-    <main className="apps-home px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="apps">
+    <main className={`apps-home px-4 lg:px-8 min-w-0 ${bareApps ? "flex" : "pt-4 pb-9"}`} aria-label={t("apps")}>
+      {bareApps ? (
+        <PageState
+          title={
+            loadError === UNVERIFIED_APPS_COPY
+              ? t("Sign in to view your apps")
+              : loadError !== null
+                ? t("Apps could not be loaded")
+                : t("No apps installed yet")
+          }
+          icon={loadError === UNVERIFIED_APPS_COPY ? <IconLock size={32} /> : <IconApps size={32} />}
+          actions={
+            loadError !== null && loadError !== UNVERIFIED_APPS_COPY ? (
+              <Button onClick={retryAll}>{t("Retry")}</Button>
+            ) : (
+              <Button className="btn-primary" href="/apps/explore">{t("Explore apps")}</Button>
+            )
+          }
+        >
+          {loadError === UNVERIFIED_APPS_COPY
+            ? `${t(loadError)} ${t("Use Sign in in the status bar.")}`
+            : loadError !== null
+              ? t(loadError)
+              : isOp
+                ? t("Apps add new skills to your workspace — a customer list, social posts and more. Browse what's available and install one in a tap.")
+                : t("Your admin hasn't installed any apps yet. Browse what's available and ask for one.")}
+        </PageState>
+      ) : (
+        <>
       <div className="ohead flex flex-wrap items-center gap-3 mb-2">
-        <h1 className="text-section font-semibold text-ink-100">Apps</h1>
+        <h1 className="text-section font-semibold text-ink-100">{t("Apps")}</h1>
         <span className="grow" />
-        <Button className="btn-primary" href="/apps/explore">Explore apps</Button>
+        {!emptyWorkspace && <Button className="btn-primary" href="/apps/explore">{t("Explore apps")}</Button>}
       </div>
 
       {actionError && <div className="alert fail mb-4" role="alert">{actionError}</div>}
       {loadError !== null && (
-        <div className="card px-4 py-3 mb-4 text-label text-ink-400" role="alert">
-          {loadError} <Button onClick={retryAll}>Retry</Button>
+        <div className="apps-state card mb-4" role="alert">
+          {loadError === UNVERIFIED_APPS_COPY ? (
+            <span className="apps-state-icon text-ink-500" aria-hidden><IconLock size={16} /></span>
+          ) : null}
+          <div className="apps-state-body">
+            <h2 className="apps-state-title">
+              {loadError === UNVERIFIED_APPS_COPY ? t("Sign in to view workspace apps") : t("Apps could not be loaded")}
+            </h2>
+            <p className="apps-state-copy">{loadError === null ? null : t(loadError)}</p>
+          </div>
+          <Button className="btn-sm" onClick={retryAll}>{t("Retry")}</Button>
         </div>
       )}
-      {retrying && <p className="text-label text-ink-400 mb-2" role="status">The workspace is busy. Retrying…</p>}
+      {retrying && <p className="text-label text-ink-400 mb-2" role="status">{t("The workspace is busy. Retrying…")}</p>}
       {home === null ? (
-        loadError === null && !retrying && <p className="text-label text-ink-400" role="status">Loading your apps…</p>
+        loadError === null && !retrying && <p className="text-label text-ink-400" role="status">{t("Loading your apps…")}</p>
       ) : (
         <>
-          {live.length === 0 && loadError === null && (
-            <div className="card px-4 py-8 text-center my-4">
-              <h3 className="text-cardtitle font-medium text-ink-100 mb-1">No apps yet</h3>
-              <p className="text-secondary text-ink-400 mb-4">
-                {isOp
-                  ? "Apps add new skills to your workspace — a customer list, social posts and more. Browse what's available and install one in a tap."
-                  : "Your admin hasn't installed any apps yet. Browse what's available and ask for one."}
-              </p>
-              <Button className="btn-primary btn-lg" href="/apps/explore">Explore apps</Button>
+          {emptyWorkspace && (
+            <div className="apps-state card my-4">
+              <span className="apps-state-icon text-accent" aria-hidden><IconApps size={18} /></span>
+              <div className="apps-state-body">
+                <h2 className="apps-state-title">{t("No apps installed yet")}</h2>
+                <p className="apps-state-copy">
+                  {isOp
+                    ? t("Apps add new skills to your workspace — a customer list, social posts and more. Browse what's available and install one in a tap.")
+                    : t("Your admin hasn't installed any apps yet. Browse what's available and ask for one.")}
+                </p>
+              </div>
+              <Button className="btn-primary" href="/apps/explore">{t("Explore apps")}</Button>
             </div>
           )}
 
           {attention.length > 0 && (
-            <section className="attn" aria-label="Needs attention">
-              <div className="attn-head"><span aria-hidden>⚠</span>{attention.length} {attention.length === 1 ? "app needs" : "apps need"} attention</div>
+            <section className="attn" aria-label={t("Needs attention")}>
+              <div className="attn-head"><span aria-hidden>⚠</span>{attention.length} {t(attention.length === 1 ? "app needs attention" : "apps need attention")}</div>
               {attention.map(attentionRow)}
             </section>
           )}
 
-          <section className="sec" aria-label="Favorites">
+          {!emptyWorkspace && (
+          <section className="sec" aria-label={t("Favorites")}>
             <div className="sechead">
-              <h2>Favorites</h2>
+              <h2>{t("Favorites")}</h2>
+              {live.length > 0 && (
+                <>
+                  <span className="grow" />
+                  <details className="favpick">
+                    <summary>{t("Choose favorites")}</summary>
+                    <div className="favpick-list" role="group" aria-label={t("Choose favorites")}>
+                      {live.map((h) => (
+                        <label key={h.install_id} className="favpick-row">
+                          <input type="checkbox"
+                            checked={favs?.favorites.includes(h.install_id) ?? false}
+                            disabled={favs === null}
+                            onChange={() => pin(h.install_id)} />
+                          <span className="favpick-name">{h.title}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </details>
+                </>
+              )}
             </div>
             {favorites.length > 0 ? (
               <div className="favs">
                 {favorites.map((h) => (
-                  <Link key={h.install_id} href={`/app-installations/${h.install_id}`} className="card fav"
-                    onClick={() => opened(h.install_id)} aria-label={`Open ${h.title}`}>
-                    <AppGlyph name={h.name} icon={h.icon} />
-                    <span className="nm">{h.title}</span>
-                    <span className="ln">{h.tagline}</span>
-                    <button className="star pinned absolute top-2 right-2" aria-label={`Unpin ${h.title}`}
-                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); pin(h.install_id); }}>★</button>
-                  </Link>
+                  <div key={h.install_id} className="card fav">
+                    {(() => {
+                      const href = openHref(h);
+                      return href === null ? (
+                        <span className="open" aria-label={`${t("Open")} ${h.title}`}>
+                          <AppGlyph name={h.name} icon={h.icon} />
+                          <span className="nm">{h.title}</span>
+                          <span className="ln">{t("No unique app page — see Manage")}</span>
+                        </span>
+                      ) : (
+                        <Link href={href} className="open"
+                          onClick={() => opened(h.install_id)} aria-label={`${t("Open")} ${h.title}`}>
+                          <AppGlyph name={h.name} icon={h.icon} />
+                          <span className="nm">{h.title}</span>
+                          <span className="ln">{h.tagline}</span>
+                        </Link>
+                      );
+                    })()}
+                    <button className="star pinned absolute top-2 right-2" aria-label={`${t("Unpin")} ${h.title}`}
+                      onClick={() => pin(h.install_id)}>★</button>
+                  </div>
                 ))}
               </div>
             ) : favs === null ? (
-              <p className="hint">{favLoad.error ? "Favorites could not be loaded." : "Loading favorites…"}</p>
+              <p className="hint">{t(favLoad.error ? "Favorites could not be loaded." : "Loading favorites…")}</p>
             ) : (
               <div className="favempty">
                 <span aria-hidden>★</span>
-                <span>Pin the apps you use every day. Tap the star on any app below and it appears here and in the sidebar.</span>
+                <span>{t("Use Choose favorites to keep everyday apps here and in the sidebar.")}</span>
               </div>
             )}
           </section>
+          )}
 
           {live.length > 0 && (
-            <section className="sec" aria-label="Installed">
+            <section className="sec" aria-label={t("Installed")}>
               <div className="sechead">
-                <h2>Installed</h2>
+                <h2>{t("Installed")}</h2>
                 <span className="chip">{live.length}</span>
                 <span className="grow" />
-                <input className="field" style={{ width: "min(220px,100%)" }} placeholder="Search your apps" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search installed apps" />
-                <select className="field" style={{ width: "auto" }} value={sort} onChange={(e) => setSort(e.target.value as typeof sort)} aria-label="Sort">
-                  <option value="recent">Recently used</option>
-                  <option value="name">Name</option>
-                  <option value="attention">Needs attention first</option>
-                </select>
+                <div className="sec-tools">
+                  <input className="field search" placeholder={t("Search your apps")} value={q} onChange={(e) => setQ(e.target.value)} aria-label={t("Search installed apps")} />
+                  <select className="field sort" value={sort} onChange={(e) => setSort(e.target.value as typeof sort)} aria-label={t("Sort")}>
+                    <option value="recent">{t("Recently used")}</option>
+                    <option value="name">{t("Name")}</option>
+                    <option value="attention">{t("Needs attention first")}</option>
+                  </select>
+                </div>
               </div>
               {items.length === 0 ? (
                 <div className="card px-4 py-5 text-secondary text-ink-400">
-                  No installed app matches “{q}” — try another word, or look in <Link href="/apps/explore">Explore</Link>.
+                  {noMatchBeforeExplore}<Link href="/apps/explore">{noMatchExploreLabel}</Link>{noMatchAfterExplore}
                 </div>
               ) : (
-                <div className="igrid">
-                  {items.map((h) => {
-                    const pinned = favs?.favorites.includes(h.install_id) ?? false;
-                    return (
-                      <Link key={h.install_id} className="card itile" href={`/app-installations/${h.install_id}`}
-                        onClick={() => opened(h.install_id)} aria-label={`Open ${h.title}`}>
-                        <AppGlyph name={h.name} icon={h.icon} size="sm" />
-                        <div className="min-w-0 flex-1">
-                          <div className="nm">{h.title}</div>
-                          <div className="ln">{h.tagline}</div>
-                          {h.project && <div className="ln text-ink-500">Project: {h.project}</div>}
-                          {h.attention.state !== "ok" && (
-                            <div className="mt-1"><span className={`chip ${h.attention.state === "update" ? "info" : h.attention.state === "off" ? "" : "warn"}`}>
-                              {h.attention.state === "update" ? "Update" : h.attention.state === "off" ? "Access off" : h.attention.state === "setup" ? "Finish setup" : "Needs attention"}
-                            </span></div>
-                          )}
-                        </div>
-                        <div className="acts">
-                          <button className={`star ${pinned ? "pinned" : ""}`} aria-pressed={pinned}
-                            aria-label={`${pinned ? "Unpin" : "Pin"} ${h.title}`}
-                            onClick={(e) => { e.preventDefault(); e.stopPropagation(); pin(h.install_id); }}>{pinned ? "★" : "☆"}</button>
-                          {isOp && <Link className="star" href={`/apps/manage/${h.install_id}`} aria-label={`Manage ${h.title}`} onClick={(e) => e.stopPropagation()}>⚙</Link>}
-                        </div>
-                      </Link>
-                    );
-                  })}
+                <div className="apps-grid">
+                  {items.map((h) => (
+                    <InstalledCard key={h.install_id} h={h}
+                      href={openHref(h)}
+                      settingsHref={settingsHref(h)}
+                      onOpen={() => opened(h.install_id)} />
+                  ))}
                 </div>
               )}
-              <Link href="/apps/explore" className="explore-card mt-3">
+              <Link href="/apps/explore" className="explore-card mt-3" aria-label={t("Find more apps")}>
                 <span aria-hidden>⌖</span>
-                <span className="flex-1"><b>Find more apps</b><small className="block">Bookings, reviews, invoices and more, made for small businesses.</small></span>
+                <span className="flex-1"><b>{t("Find more apps")}</b><small className="block">{t("Bookings, reviews, invoices and more, made for small businesses.")}</small></span>
                 <span aria-hidden>→</span>
               </Link>
             </section>
           )}
 
           {isOp && removedList.length > 0 && (
-            <section className="sec" aria-label="Recently removed">
-              <div className="sechead"><h2>Recently removed</h2><span className="chip">{removedList.length}</span></div>
-              <p className="hint mb-2">Removed apps restore for 30 days, then they're deleted for good.</p>
+            <section className="sec" aria-label={t("Recently removed")}>
+              <div className="sechead"><h2>{t("Recently removed")}</h2><span className="chip">{removedList.length}</span></div>
+              <p className="hint mb-2">{t("Removed apps restore for 30 days, then they're deleted for good.")}</p>
               <div className="card p-0 divide-y divide-ink-800">
                 {removedList.map((h) => (
                   <div key={h.install_id} className="rrow flex items-center gap-3 p-3">
                     <AppGlyph name={h.name} icon={h.icon} size="sm" />
-                    <div className="grow"><b>{h.title}</b><small className="block text-ink-500">Removed</small></div>
-                    <Button className="btn-sm" disabled={busy === h.install_id} onClick={() => restore(h.install_id)}>
-                      {busy === h.install_id ? "Restoring…" : "Restore"}
-                    </Button>
+                    <div className="grow"><b>{h.title}</b><small className="block text-ink-500">{t(h.attention.action === "restore" ? "Removed" : "Removed · restore window closed")}</small></div>
+                    {h.attention.action === "restore" && (
+                      <Button className="btn-sm" disabled={busy === h.install_id} onClick={() => restore(h.install_id)}>
+                        {t(busy === h.install_id ? "Restoring…" : "Restore")}
+                      </Button>
+                    )}
                   </div>
                 ))}
               </div>
@@ -259,30 +375,102 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
           )}
         </>
       )}
-      <section className="sec" aria-label="Project apps">
-        <div className="sechead"><h2>Project apps</h2>{projectApps.data && <span className="chip">{projectRows.length}</span>}</div>
-        <ResourceGate
-          state={projectApps}
-          loading="loading apps…"
-          failed="could not load apps"
-          onRetry={() => void resources.apps.invalidate()}
-        />
-        {projectApps.data && projectRows.length === 0 && (
-          <div className="card px-4 py-5 text-secondary text-ink-400">
-            No project apps installed{project === "all" ? "" : ` in ${project}`} —{" "}
-            <code className="num text-ink-300">
-              cadence app install &lt;path|git-url&gt; --project {project === "all" ? "<key>" : project}
-            </code>{" "}
-            puts one here.
-          </div>
-        )}
-        <ul className="space-y-2.5">
-          {projectRows.map((row, i) => (
-            <AppCard key={`${row.project}/${row.name ?? i}`} row={row} needs={needs} showProject={project === "all"} />
-          ))}
-        </ul>
-      </section>
+      {(projectApps.data === null || projectApps.error !== null || projectRows.length > 0 || isOp) && (
+        <section className="sec" aria-label={t("Project apps")}>
+          <div className="sechead"><h2>{t("Project apps")}</h2>{projectApps.data && <span className="chip">{projectRows.length}</span>}</div>
+          <ResourceGate
+            state={projectApps}
+            loading={t("loading apps…")}
+            failed={t("could not load apps")}
+            onRetry={() => void resources.apps.invalidate()}
+          />
+          {projectApps.data && projectRows.length === 0 && (
+            <div className="apps-substate text-label text-ink-500">
+              <p>{t("No project apps installed")}.</p>
+              <details className="apps-substate-install">
+                <summary>{t("Install a project app")}</summary>
+                <code className="num text-ink-300">
+                  cadence app install &lt;path|git-url&gt; --project &lt;key&gt;
+                </code>
+              </details>
+            </div>
+          )}
+          <ul className="space-y-2.5">
+            {projectRows.map((row, i) => (
+              <AppCard key={`${row.project}/${row.name ?? i}`} row={row} installs={installs} needs={needs} />
+            ))}
+          </ul>
+        </section>
+      )}
+        </>
+      )}
     </main>
+  );
+}
+/**
+ * One installed app's gallery card: the card opens the app, and the
+ * operator's small settings action opens its Manage page. Catalogue/
+ * listing fields come from the real `app_home` row — absent fields
+ * leave clean slots, never fixture text.
+ */
+function InstalledCard({ h, href, settingsHref, onOpen }: {
+  h: HomeInstallation;
+  href: string | null;
+  settingsHref: string | null;
+  onOpen: () => void;
+}) {
+  const t = useTranslate();
+  const state = h.attention.state;
+  const statusKey =
+    state === "off" ? "Access off"
+    : state === "setup" ? "Finish setup"
+    : state === "update" ? "Update ready"
+    : state === "attention" ? "Needs attention"
+    : "Installed";
+  const tone = state === "update" ? "info" : state === "setup" || state === "attention" ? "warn" : "";
+  const nameId = `app-card-name-${h.install_id}`;
+  const statusId = `app-card-status-${h.install_id}`;
+  const listing = h.listing;
+  const category = listing?.category;
+  const summary = listing?.tagline ?? h.tagline;
+  const publisher = listing?.publisher?.name;
+  const body = (
+    <>
+      <AppCover name={h.name} title={h.title} category={category ?? ""} />
+      <div className="app-card-copy">
+        {category && <span className="card-category">{category}</span>}
+        <h3 className="app-card-name" id={nameId}>{h.title}</h3>
+        {summary && <p className="app-card-summary">{summary}</p>}
+        {publisher && <span className="card-publisher">{publisher}</span>}
+        {h.project && <span className="card-publisher">{t("Project")}: {h.project}</span>}
+        <div className="card-footer">
+          <span>{h.version ? <>{t("Version")} <b>{h.version}</b></> : t("Installed")}</span>
+          <span className="app-status" id={statusId} data-state={tone}>{t(statusKey)}</span>
+        </div>
+      </div>
+    </>
+  );
+  return (
+    <article className="card app-card">
+      {href === null ? (
+        <div className="app-card-link">
+          {body}
+          <div className="app-card-copy-note">{t("No unique app page — see Manage")}</div>
+        </div>
+      ) : (
+        <Link className="app-card-link" href={href}
+          aria-labelledby={nameId} aria-describedby={statusId}
+          onClick={onOpen}>
+          {body}
+        </Link>
+      )}
+      {settingsHref !== null && (
+        <Link className="app-card-settings" href={settingsHref}
+          aria-label={`${t("Settings")} — ${h.title}`} title={t("Settings")}>
+          <IconSettings size={15} />
+        </Link>
+      )}
+    </article>
   );
 }
 
@@ -301,17 +489,24 @@ function AppIcon({ label }: { label: string }) {
 
 function AppCard({
   row,
+  installs,
   needs,
-  showProject,
 }: {
   row: AppRow;
+  installs: Installation[] | null;
   needs: HomeNeed[];
-  showProject: boolean;
 }) {
-  const approval = appApprovalChip(row);
-  const title = row.title?.trim() || row.name || "App";
+  const t = useTranslate();
+  const approval = appApprovalChip(row, t);
+  const title = row.title?.trim() || row.name || t("App");
   const appName = row.name;
-  const href = appName ? appHref(row.project, appName) : null;
+  const legacyHref = appName ? appHref(row.project, appName) : null;
+  const screenHref = appName ? screenInstallHref(installs, row.project, appName) : null;
+  // A row whose installs are all non-active has no openable page: the legacy
+  // project route lands on "Unknown installation" just the same.
+  const sameName = appName ? (installs ?? []).filter((i) => i.name === appName) : [];
+  const blocked = sameName.length > 0 && sameName.every((i) => !canOpenInstall(i.state, i.removed));
+  const href = blocked ? null : (screenHref ?? legacyHref);
   return (
     <li className="card px-3.5 py-3 min-w-0" data-app={row.name ?? undefined}>
       <div className="app-card-layout">
@@ -327,7 +522,7 @@ function AppCard({
             )}
             <span className={`chip shrink-0 ${approval.cls}`}>{approval.text}</span>
           </div>
-          {showProject && <p className="text-micro text-ink-500 mt-0.5 break-words">Project: {row.project}</p>}
+          <p className="text-micro text-ink-500 mt-0.5 break-words">{t("Project")}: {row.project}</p>
           <p className="text-label text-ink-400 mt-0.5 break-words">{appPurpose(row)}</p>
           <p className="text-micro text-ink-500 mt-1" data-summary>
             {row.error ? (
@@ -335,11 +530,12 @@ function AppCard({
             ) : appName ? (
               <AppActivity project={row.project} name={appName} needs={needs} />
             ) : (
-              "activity unavailable"
+              t("activity unavailable")
             )}
           </p>
         </div>
-        {href && <Button href={href} className="app-card-action" aria-label={`Open ${title} in ${row.project}`}>Open app</Button>}
+        {href && <Button href={href} className="app-card-action" aria-label={`${t("Open")} ${title} ${t("in")} ${row.project}`}>{t("Open app")}</Button>}
+        {screenHref && legacyHref && <Link href={legacyHref} className="text-micro text-ink-500 hover:text-accent">{t("Legacy page")}</Link>}
       </div>
     </li>
   );
@@ -359,8 +555,9 @@ function AppActivity({
   name: string;
   needs: HomeNeed[];
 }) {
+  const t = useTranslate();
   const runs = useQuery(resources.appRuns(`${project}/${name}`));
-  if (runs.status === "failed") return <>activity unavailable</>;
-  if (!runs.data) return <>reading activity…</>;
-  return <>{runsSummary(runs.data, needs) ?? "Nothing running yet"}</>;
+  if (runs.status === "failed") return <>{t("activity unavailable")}</>;
+  if (!runs.data) return <>{t("reading activity…")}</>;
+  return <>{runsSummary(runs.data, needs, t) ?? t("Nothing running yet")}</>;
 }

@@ -97,7 +97,7 @@ def filterset(ids):
 
     `binary_id()` rejects quoted strings and a quoted `test(="...")`
     inside a conjunction silently selects nothing on pinned nextest
-    0.9.145, so both travel unquoted — allowed characters verified
+    0.9.150, so both travel unquoted — allowed characters verified
     against the DSL's bare-argument charset; anything else fails here,
     loudly, and the -E self-check is the second fence.
     """

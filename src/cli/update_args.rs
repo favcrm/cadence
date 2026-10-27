@@ -8,9 +8,10 @@ use super::*;
 /// the flags parse on either side of the subcommand.
 #[derive(clap::Args, Default)]
 pub(crate) struct UpdateTargetArgs {
-    /// Operator identity outside a cadence pane, for example
-    /// `operator:ada`. Required outside a pane; inside one this
-    /// command is refused.
+    /// Operator identity for the audit label, for example
+    /// `operator:ada`. Optional: the operator proof runs either way
+    /// and a bare `cadence update` labels itself from the proven OS
+    /// identity. Inside a pane this command is always refused.
     #[arg(long = "as")]
     pub(super) as_identity: Option<String>,
     /// GitHub repository whose CI built and attested the binary.
@@ -22,6 +23,14 @@ pub(crate) struct UpdateTargetArgs {
     /// Releases directory [default: read off the current link].
     #[arg(long)]
     pub(super) releases_dir: Option<PathBuf>,
+    /// Owned HTTPS release source (CAD-1455): the endpoint's https://
+    /// origin only. The published release is consumed through the
+    /// catalogue and its signed offline evidence instead of live GitHub
+    /// queries; a source failure refuses — there is no silent GitHub
+    /// API fallback. Omit for the default owned catalogue
+    /// (https://api-v2.agenticos.hk, CAD-1479).
+    #[arg(long, value_name = "https://host")]
+    pub(super) release_source: Option<String>,
 }
 
 impl UpdateTargetArgs {
@@ -36,6 +45,7 @@ impl UpdateTargetArgs {
             },
             link: self.link.or(parent.link),
             releases_dir: self.releases_dir.or(parent.releases_dir),
+            release_source: self.release_source.or(parent.release_source),
         }
     }
 }
@@ -50,6 +60,7 @@ pub(crate) struct UpgradeArgs {
     pub(super) repo: String,
     pub(super) link: Option<PathBuf>,
     pub(super) releases_dir: Option<PathBuf>,
+    pub(super) release_source: Option<String>,
 }
 
 pub(crate) struct UpdateArgs {
@@ -67,15 +78,166 @@ pub(crate) struct UpdateArgs {
     pub(super) repo: String,
     pub(super) link: Option<PathBuf>,
     pub(super) releases_dir: Option<PathBuf>,
+    pub(super) release_source: Option<String>,
 }
 
 /// The production [`cadence_agent::update::UpdateHost`]: the daemon for
 /// the drain, the waiters and the health answers; the filesystem for
 /// the releases and the marker.
+/// The update's release source: the owned HTTPS catalogue (the
+/// CAD-1479 default), or the online GitHub route for a non-default
+/// `--repo` — an owned source serves only the pinned default
+/// repository. Both implement `ReleaseSource`; the field type
+/// dispatches between them.
+pub(crate) enum UpdateSource {
+    Gh(cadence_agent::upgrade::Gh),
+    Http(Box<cadence_agent::releases::HttpGh>),
+}
+
+impl UpdateSource {
+    /// CAD-1479: the owned catalogue is the default release source;
+    /// `release_source` (`--release-source`) remains the advanced
+    /// https:// override. A source failure refuses downstream — there
+    /// is no GitHub API fallback. `--repo` keeps its meaning: it names
+    /// which repository's CI builds are trusted. The owned catalogue
+    /// publishes only the pinned default repository's releases, so a
+    /// non-default `--repo` still selects the GitHub route for that
+    /// repository — and combining it with `--release-source` refuses
+    /// rather than silently dropping one of two named trust
+    /// authorities.
+    pub(super) fn new(release_source: Option<&str>, repo: &str) -> Result<Self> {
+        let repo = repo.trim();
+        let default_repo = repo.is_empty() || repo == cadence_agent::upgrade::DEFAULT_REPO;
+        match (release_source, default_repo) {
+            (Some(base), true) => Ok(Self::Http(Box::new(cadence_agent::releases::HttpGh::new(
+                base,
+            )?))),
+            (Some(_), false) => Err(Error::rejected(format!(
+                "--repo {repo} cannot combine with --release-source: the owned catalogue's \
+                 signed evidence binds {} only — pass one trust authority",
+                cadence_agent::upgrade::DEFAULT_REPO
+            ))),
+            (None, true) => {
+                let base = cadence_agent::releases::resolve_base(None)?;
+                Ok(Self::Http(Box::new(cadence_agent::releases::source_for(
+                    &base,
+                    cadence_agent::releases::PROFILE_OPERATOR_HOST,
+                )?)))
+            }
+            (None, false) => Ok(Self::Gh(cadence_agent::upgrade::Gh::new(repo))),
+        }
+    }
+}
+
+impl cadence_agent::upgrade::ReleaseSource for UpdateSource {
+    fn repo(&self) -> &str {
+        match self {
+            Self::Gh(s) => s.repo(),
+            Self::Http(s) => s.repo(),
+        }
+    }
+    fn check_auth(&self) -> Result<()> {
+        match self {
+            Self::Gh(s) => s.check_auth(),
+            Self::Http(s) => s.check_auth(),
+        }
+    }
+    fn latest_green_main(&self) -> Result<Option<cadence_agent::upgrade::Run>> {
+        match self {
+            Self::Gh(s) => s.latest_green_main(),
+            Self::Http(s) => s.latest_green_main(),
+        }
+    }
+    fn published_source(&self) -> Result<Option<String>> {
+        match self {
+            Self::Gh(s) => s.published_source(),
+            Self::Http(s) => s.published_source(),
+        }
+    }
+    fn on_main(&self, sha: &str) -> Result<cadence_agent::upgrade::OnMain> {
+        match self {
+            Self::Gh(s) => s.on_main(sha),
+            Self::Http(s) => s.on_main(sha),
+        }
+    }
+    fn compare(&self, base: &str, head: &str) -> Result<Option<String>> {
+        match self {
+            Self::Gh(s) => s.compare(base, head),
+            Self::Http(s) => s.compare(base, head),
+        }
+    }
+    fn main_runs(&self, sha: &str) -> Result<Vec<cadence_agent::upgrade::Run>> {
+        match self {
+            Self::Gh(s) => s.main_runs(sha),
+            Self::Http(s) => s.main_runs(sha),
+        }
+    }
+    fn merge_group_runs(&self, sha: &str) -> Result<Vec<cadence_agent::upgrade::Run>> {
+        match self {
+            Self::Gh(s) => s.merge_group_runs(sha),
+            Self::Http(s) => s.merge_group_runs(sha),
+        }
+    }
+    fn jobs(&self, run_id: u64) -> Result<Vec<cadence_agent::upgrade::Job>> {
+        match self {
+            Self::Gh(s) => s.jobs(run_id),
+            Self::Http(s) => s.jobs(run_id),
+        }
+    }
+    fn artifact(&self, run_id: u64, name: &str) -> Result<cadence_agent::upgrade::ArtifactState> {
+        match self {
+            Self::Gh(s) => s.artifact(run_id, name),
+            Self::Http(s) => s.artifact(run_id, name),
+        }
+    }
+    fn download(&self, run_id: u64, name: &str, dest: &Path) -> Result<()> {
+        match self {
+            Self::Gh(s) => s.download(run_id, name, dest),
+            Self::Http(s) => s.download(run_id, name, dest),
+        }
+    }
+    fn verify_attestation(&self, binary: &Path, sha: &str) -> Result<String> {
+        match self {
+            Self::Gh(s) => s.verify_attestation(binary, sha),
+            Self::Http(s) => s.verify_attestation(binary, sha),
+        }
+    }
+    fn verify_retained(&self, dir: &Path) -> Result<cadence_agent::upgrade::RetainedProof> {
+        match self {
+            Self::Gh(s) => s.verify_retained(dir),
+            Self::Http(s) => s.verify_retained(dir),
+        }
+    }
+    fn published(&self) -> bool {
+        match self {
+            Self::Gh(s) => s.published(),
+            Self::Http(s) => s.published(),
+        }
+    }
+    fn published_proof(&self, sha: &str) -> Result<cadence_agent::upgrade::RetainedProof> {
+        match self {
+            Self::Gh(s) => s.published_proof(sha),
+            Self::Http(s) => s.published_proof(sha),
+        }
+    }
+    fn merged_titles(&self, base: &str, head: &str) -> Result<Vec<String>> {
+        match self {
+            Self::Gh(s) => s.merged_titles(base, head),
+            Self::Http(s) => s.merged_titles(base, head),
+        }
+    }
+    fn schema_version(&self, sha: &str) -> Result<Option<i64>> {
+        match self {
+            Self::Gh(s) => s.schema_version(sha),
+            Self::Http(s) => s.schema_version(sha),
+        }
+    }
+}
+
 pub(crate) struct RealUpdateHost<'a> {
     pub(super) state_dir: &'a Path,
     pub(super) layout: cadence_agent::upgrade::Layout,
-    pub(super) source: cadence_agent::upgrade::Gh,
+    pub(super) source: UpdateSource,
     pub(super) label: String,
     /// Collect the plain lines for `--json`; `None` prints them as they
     /// happen (the plain form).
@@ -281,6 +443,12 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
             if args[0] == "ui" && args[1] == "start" {
                 cmd.env_remove("CADENCE_ALIAS");
             }
+            // CAD-1251: the board's start proof gets the update's own
+            // health budget, not the interactive 10 s.
+            cmd.env(
+                cadence_agent::ui::START_BUDGET_ENV,
+                cadence_agent::update::HEALTH_TIMEOUT.as_secs().to_string(),
+            );
             let out = cadence_agent::reaper::spawn(&mut cmd)
                 .and_then(|child| child.wait_with_output())
                 .map_err(|e| Error::internal(format!("could not run {}: {e}", binary.display())))?;
@@ -329,6 +497,44 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
     }
     fn board_running(&self) -> bool {
         cadence_agent::ui::detached_pid(self.state_dir).is_some()
+    }
+    /// CAD-1251: `ui start` on the restored build, retried within the
+    /// health budget. An older build ignores the budget variable and
+    /// proves its start within 10 s, stopping a board that is late; each
+    /// retry spawns a fresh one, so a loaded host gets several windows.
+    fn start_board(&self, binary: &Path) -> Result<()> {
+        let began = std::time::Instant::now();
+        let mut last = String::new();
+        while began.elapsed() < cadence_agent::update::HEALTH_TIMEOUT {
+            let mut cmd = Command::new(binary);
+            cmd.arg("--state-dir")
+                .arg(self.state_dir)
+                .args(["ui", "start"])
+                .env_remove("CADENCE_ALIAS")
+                .env(
+                    cadence_agent::ui::START_BUDGET_ENV,
+                    cadence_agent::update::HEALTH_TIMEOUT.as_secs().to_string(),
+                )
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped());
+            let out = cadence_agent::reaper::spawn(&mut cmd)
+                .and_then(|child| child.wait_with_output())
+                .map_err(|e| Error::internal(format!("could not run {}: {e}", binary.display())))?;
+            if out.status.success() {
+                return Ok(());
+            }
+            last = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            self.line(&format!(
+                "warning: `ui start` on the restored build failed after {:.1}s: {last}",
+                began.elapsed().as_secs_f64()
+            ));
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        Err(Error::rejected(format!(
+            "`ui start` did not succeed within {}s: {last}",
+            cadence_agent::update::HEALTH_TIMEOUT.as_secs()
+        )))
     }
     fn progress_log(&self) -> Option<PathBuf> {
         self.progress_log.clone()

@@ -193,10 +193,6 @@ export function kickoffBlock(items: AcceptanceItem[], writeBlock: string | null)
   return writeBlock;
 }
 
-export function askAgentReason(agentCount: number): string | null {
-  return agentCount > 0 ? null : "No lane yet";
-}
-
 export interface PrRef {
   label: string;
   href: string | null;
@@ -208,17 +204,6 @@ export function prRef(refs: Ref[]): PrRef | null {
   const fromUrl = ref.url?.match(/\/pull\/(\d+)/);
   const label = ref.label ?? (fromUrl ? `PR #${fromUrl[1]}` : "PR");
   return { label, href: ref.url ?? null };
-}
-
-/** Branch ref for the lane card. The card truncates it and keeps the full name on `title`. */
-export function laneBranch(refs: Ref[]): string | null {
-  const branch = refs.find((r) => r.kind === "branch");
-  return branch?.label || branch?.path || null;
-}
-
-export function worktreePath(refs: Ref[]): string | null {
-  const wt = refs.find((r) => r.kind === "worktree");
-  return wt?.path ?? wt?.label ?? null;
 }
 
 /** First plain line of the body, for the peek. Titles and this line render as text. */
@@ -237,6 +222,8 @@ export interface KickoffBody {
   provider: string;
   model?: string;
   effort?: string;
+  /** Dispatch to an existing seat; the seat keeps its model/effort. */
+  alias?: string;
   note?: string;
 }
 
@@ -248,6 +235,7 @@ export function kickoffRequest(id: string, body: KickoffBody): { path: string; b
     body: {
       group: body.group,
       provider: body.provider,
+      ...(body.alias ? { alias: body.alias } : {}),
       ...(body.model ? { model: body.model } : {}),
       ...(body.effort ? { effort: body.effort } : {}),
       ...(note ? { note } : {}),
@@ -339,10 +327,90 @@ export function timelineRows(detail: IssueDetail, history: IssueHistoryEntry[]):
   return events;
 }
 
+/**
+ * The reports the overview reads, newest-dated first. Verdicts are an
+ * independent revision-bound review (CAD-431), not the worker's own
+ * statement, so `latest` skips them; `questions` are unanswered.
+ */
+export interface ReportView {
+  /** Newest worker report, or null. Operator answers are not results. */
+  latest: TaskReport | null;
+  /** Newest daemon-filed revision-bound verdict, or null. */
+  verdict: TaskReport | null;
+  /** Question reports nobody answered yet. */
+  questions: TaskReport[];
+}
+
+export function reportView(reports: readonly TaskReport[]): ReportView {
+  const workers = reports.filter((r) =>
+    r.kind === "done" || r.kind === "blocked" || r.kind === "question" || r.error,
+  );
+  const verdicts = reports.filter((r) => r.kind === "verdict");
+  return {
+    latest: workers.length
+      ? workers.reduce((a, b) => timeKey(b.at ?? null) > timeKey(a.at ?? null) ? b : a)
+      : null,
+    verdict: verdicts.length
+      ? verdicts.reduce((a, b) => timeKey(b.at ?? null) > timeKey(a.at ?? null) ? b : a)
+      : null,
+    questions: reports.filter((r) => r.kind === "question" && r.open === true),
+  };
+}
+
+/**
+ * Matching report heads resolve report-time ambiguity, not independently
+ * recorded newer commits. Missing revision proof leaves coverage uncertain.
+ */
+export function verdictStale(verdict: TaskReport, detail: IssueDetail): boolean {
+  const newer = reportView(detail.reports ?? []).latest;
+  const at = timeKey(verdict.at ?? null);
+  if (at !== Number.NEGATIVE_INFINITY &&
+      (detail.commits ?? []).some((c) => c.sha !== verdict.sha && timeKey(c.at) > at)) return true;
+  if (newer?.sha && verdict.sha) return newer.sha !== verdict.sha;
+  return at !== Number.NEGATIVE_INFINITY && !!newer && timeKey(newer.at ?? null) > at;
+}
+
+export interface MergeState {
+  /** "done" merges exist on the default branch, "warn" is a recorded
+   *  not-on-default, "wait" means nothing verifiable yet. */
+  tone: "done" | "warn" | "wait";
+  /** Which recorded signal decided the row — the view translates it. */
+  kind: "merged" | "not_default" | "unknown" | "pr_linked" | "none";
+  /** Commits reachable from the default branch. */
+  count: number;
+  /** Repos the commit scan could not read (`repo (reason)`). */
+  skipped: string[];
+}
+
+/**
+ * Merge state from what the board can actually see. A linked PR is a
+ * link, never a merge claim; `IssueCommit.on_default` is the only
+ * merge signal — `true` counts, `false` is a recorded miss, `null` is
+ * unknown.
+ */
+export function mergeState(detail: IssueDetail, pr: PrRef | null): MergeState {
+  const commits = detail.commits ?? [];
+  const count = commits.filter((c) => c.on_default === true).length;
+  const recordedMiss = commits.some((c) => c.on_default === false);
+  const skipped = (detail.commits_skipped ?? []).map(
+    (s) => `${s.repo} (${s.reason})`,
+  );
+  if (count > 0) return { tone: "done", kind: "merged", count, skipped };
+  if (recordedMiss) return { tone: "warn", kind: "not_default", count, skipped };
+  if (commits.length > 0) return { tone: "wait", kind: "unknown", count, skipped };
+  if (pr) return { tone: "wait", kind: "pr_linked", count, skipped };
+  return { tone: "wait", kind: "none", count, skipped };
+}
+
+/** Deployment refs only prove intent to record one — no deploy signal exists. */
+export function deployRefs(refs: Ref[]): Ref[] {
+  return refs.filter((r) => /deploy|release/i.test(r.kind));
+}
+
 export function laneState(agents: CardAgent[]): string {
   if (agents.length === 0) return "none";
-  const hot = agents.find((a) => a.state === "fenced" || a.state === "attention");
-  if (hot) return hot.state;
+  const hot = agents.find((a) => a.state === "fenced" || a.state === "attention")?.state;
+  if (hot) return hot;
   return agents[0].state || "idle";
 }
 

@@ -1,8 +1,11 @@
+import { streamFixture } from "./streamFixture";
 export {};
 /**
  * CAD-1116: the sidebar Apps item lists the installed apps from the
- * verified installation list on every screen, and the last-used app keeps
- * its sections (and last section) off the app screens. Mounts the real App.
+ * verified installation list on every screen, and the last-used app link
+ * survives leaving the app and a reload. CAD-1519: sections come only from
+ * a mounted screen's declared navigation, so an app that has not declared
+ * any (here: no screen mounts) shows none. Mounts the real App.
  */
 declare function require(name: string): any;
 
@@ -24,17 +27,6 @@ for (const name of ["addEventListener", "removeEventListener"])
   Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
 Object.defineProperty(globalThis, "crypto", { value: require("crypto").webcrypto, configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
-Object.defineProperty(globalThis, "EventSource", {
-  configurable: true,
-  value: class {
-    onopen: null = null;
-    onerror: null = null;
-    constructor() {}
-    addEventListener() {}
-    removeEventListener() {}
-    close() {}
-  },
-});
 const loader = require("module"), originalRequire = loader.prototype.require;
 loader.prototype.require = function (this: unknown, id: string) {
   if (id.endsWith(".css")) return {};
@@ -47,6 +39,7 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const App = (require("../src/App") as typeof import("../src/App")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 
 const mk = (id: string, name: string, title: string) => ({
   install_id: id, title, name, version: "0.1.0",
@@ -59,7 +52,8 @@ let listCalls = 0;
 globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
   const url = new URL(path, "http://localhost");
-  if (path.startsWith("/api/meta")) return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: null });
+  if (url.pathname.endsWith("/stream")) return streamFixture(path);
+  if (path.startsWith("/api/meta")) return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: { id: "nav-session", origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test" } });
   if (path === "/api/issues" || path.startsWith("/api/issues?")) return json({ issues: [] });
   if (path === "/api/projects") return json({ projects: [] });
   if (path === "/api/agents") return json({ daemon: "unreachable", agents: [], totals: null });
@@ -100,39 +94,40 @@ const sections = () => Array.from(host.querySelectorAll('aside nav[aria-label="C
 
 win.localStorage.clear();
 history.pushState(null, "", "/");
-await React.act(async () => { root.render(React.createElement(App)); });
+await React.act(async () => { root.render(React.createElement(LocaleProvider, null, React.createElement(App))); });
 
 // (b) The Apps item lists the installed apps from the API on a non-app
-// screen, each linking to its installation.
+// screen, each linking to its readable app-key route when unique.
 await settle(() => assert(appLink("CRM") && appLink("Social Content"), "installed apps list from the API on Home"));
 assert(listCalls > 0, "the list came from GET /api/app-installations");
-equal(appLink("Social Content")!.getAttribute("href"), "/app-installations/install-soc", "app links to its installation");
+equal(appLink("Social Content")!.getAttribute("href"), "/apps/social-content", "app links to its readable key");
 assert(sections().length === 0, "no sections before any app was used");
 
-// (a) Visit CRM on its Segments section; the sections stay on Settings.
-await go("/app-installations/install-crm?crm=segments");
-await settle(() => assert(sections().length === 3, "CRM sections show on the CRM screen"));
-assert(appLink("CRM")!.getAttribute("aria-current") === "true", "the open app is highlighted");
+// (a) Visit CRM; the host names no sections of its own for it.
+await go("/apps/crm?crm=segments&ctx=crm-context&conversation=crm-conversation&keep=1");
+await settle(() => assert(appLink("CRM")!.getAttribute("aria-current") === "page", "the open app is highlighted as the current page"));
+assert(sections().length === 0, "no host-named sections without a declared screen navigation");
+equal(appLink("Social Content")!.getAttribute("href"), "/apps/social-content?keep=1", "switching apps drops installation-scoped query but preserves unrelated state");
 await go("/settings/email-sending");
 await settle(() => assert(location.pathname.startsWith("/settings"), "on Settings"));
-await settle(() => assert(sections().length === 3, "CRM sections stay visible on Settings"));
+assert(sections().length === 0, "still no host-named sections on Settings");
 
-// (c) The last section is restored: the app link and the Segments row
-// return to Segments, and a fresh mount (reload) remembers it.
-equal(appLink("CRM")!.getAttribute("href"), "/app-installations/install-crm?crm=segments", "app link returns to the last section");
+// (c) The last-used app link survives leaving the app and a reload.
+equal(appLink("CRM")!.getAttribute("href"), "/apps/crm", "app link returns to the app");
 await React.act(async () => { root.unmount(); });
 const root2 = createRoot(host);
 history.pushState(null, "", "/");
-await React.act(async () => { root2.render(React.createElement(App)); });
-await settle(() => assert(sections().length === 3, "sections restored after reload"));
-equal(appLink("CRM")!.getAttribute("href"), "/app-installations/install-crm?crm=segments", "last section survives a reload");
+await React.act(async () => { root2.render(React.createElement(LocaleProvider, null, React.createElement(App))); });
+await settle(() => assert(appLink("CRM"), "apps listed after reload"));
+equal(appLink("CRM")!.getAttribute("href"), "/apps/crm", "app link survives a reload");
 const clicked = appLink("CRM")!;
 await React.act(async () => { clicked.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
-await settle(() => assert(location.search.includes("crm=segments"), "clicking returns to CRM at Segments"));
+await settle(() => assert(location.pathname === "/apps/crm", "clicking returns to CRM"));
 
-// (b) A forged installation in the URL yields no entry and no sections.
+// (b) CAD-1438: a forged installation id on the retired route yields the
+// retired page — no entry, no sections, and no protected read is issued.
 await go("/app-installations/install-forged");
-await settle(() => assert(host.textContent?.includes("unknown installation"), "forged installation refuses"));
+await settle(() => assert(host.textContent?.includes("App link retired"), "forged installation refuses"));
 assert(!appLink("install-forged") && appLinks().length === 2, "forged id adds no app entry");
 assert(sections().length === 0, "forged id shows no sections");
 await React.act(async () => { root2.unmount(); });

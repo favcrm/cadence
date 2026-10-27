@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { useTranslate } from "../lib/localeText";
 import { IconCheck, IconChevron } from "./icons";
 import {
   closedSelect,
@@ -63,6 +64,7 @@ export function Select({
   title,
   ...rest
 }: SelectProps) {
+  const t = useTranslate();
   const ariaLabel = rest["aria-label"];
   const reactId = useId();
   const base = id ?? reactId;
@@ -145,7 +147,8 @@ export function Select({
       if (!trigger || !pop) return;
       const rect = trigger.getBoundingClientRect();
       const gap = 4;
-      const width = Math.max(rect.width, 240);
+      // The popup is never narrower than its trigger, nor wider than the viewport minus an 8px gutter.
+      const width = Math.min(Math.max(rect.width, 160), window.innerWidth - 16);
       const placement = flipPlacement(rect, pop.offsetHeight, window.innerHeight, gap);
       let left = rect.left;
       const maxLeft = window.innerWidth - width - 8;
@@ -216,8 +219,8 @@ export function Select({
                 ref={searchRef}
                 className="select-search"
                 value={model.query}
-                placeholder="Search"
-                aria-label="Search options"
+                placeholder={t("Search")}
+                aria-label={t("Search options")}
                 aria-controls={listId}
                 aria-activedescendant={activeId}
                 onChange={(event) => apply(reduceQuery(modelRef.current, options, event.target.value, value))}
@@ -248,7 +251,7 @@ export function Select({
                 rows
               ) : (
                 <li role="presentation" className="select-empty">
-                  No matches
+                  {t("No matches")}
                 </li>
               )}
             </ul>
@@ -295,7 +298,7 @@ export function Select({
         }}
       >
         <span className={selected ? "select-value" : "select-value select-placeholder"}>
-          {selected?.label ?? placeholder ?? "Select"}
+          {selected?.label ?? placeholder ?? t("Select")}
         </span>
         <IconChevron size={12} className="select-caret" />
       </button>

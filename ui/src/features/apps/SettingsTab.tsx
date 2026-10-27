@@ -4,6 +4,7 @@ import { resources } from "../../lib/resources";
 import { useResource } from "../../lib/useResource";
 import type { AppDetail as AppDetailRow, AppRun, AppWorkflow } from "../../lib/types";
 import Button from "../../ui/Button";
+import { useTranslate } from "../../lib/locale";
 import type { Viewer } from "../projects/work";
 import ApproveApp from "./ApproveApp";
 import {
@@ -30,6 +31,7 @@ export default function SettingsTab({
   viewer: Viewer;
   onApproveRetry: () => void;
 }) {
+  const t = useTranslate();
   const action = primaryAction(app);
   const wf = action?.wf ?? (app.workflows ?? [])[0];
   const slots = usedSlots(app);
@@ -38,35 +40,34 @@ export default function SettingsTab({
       {wf && <TeamEditor app={app} wf={wf} runs={runs} viewer={viewer} />}
       <div className="space-y-3 min-w-0">
       {slots.length > 0 && (
-        <section className="card px-4 py-3.5 min-w-0" aria-label="publishing">
-          <h2 className="text-cardtitle font-medium text-ink-100 mb-2">Publishing</h2>
+        <section className="card px-4 py-3.5 min-w-0" aria-label={t("publishing")}>
+          <h2 className="text-cardtitle font-medium text-ink-100 mb-2">{t("Publishing")}</h2>
           <ul className="space-y-1">
             {slots.map((slot) => (
               <li key={slot} className="text-label text-ink-200">
-                Publishes to: <span className="text-ink-100">{publishTarget(app, slot)}</span>
+                {t("Publishes to:")} <span className="text-ink-100">{publishTarget(app, slot)}</span>
               </li>
             ))}
           </ul>
           <p className="text-micro text-ink-500 mt-2 break-words">
-            Slot binding lives on the installed app — open it under Workspace apps on the
-            Apps screen, then bind a slot in its Settings.
+            {t("Slot binding lives on the installed app — open it under Workspace apps on the Apps screen, then bind a slot in its Settings.")}
           </p>
         </section>
       )}
-      <section className="card px-4 py-3.5 min-w-0" aria-label="app">
-        <h2 className="text-cardtitle font-medium text-ink-100 mb-2">App version</h2>
+      <section className="card px-4 py-3.5 min-w-0" aria-label={t("app")}>
+        <h2 className="text-cardtitle font-medium text-ink-100 mb-2">{t("App version")}</h2>
         <div className="flex flex-wrap items-center gap-2">
           {app.version && <span className="chip bg-ink-800 text-ink-300">v{app.version}</span>}
           {approvalPending(app) && <ApproveApp row={app} viewer={viewer} />}
         </div>
         {approvalPending(app) && (
           <p className="text-micro text-ink-500 mt-2 break-words">
-            {app.approval === "changed" ? "The app changed since its last approval. Review this version before approving it again." : "Review this version before approving it for use."}
+            {app.approval === "changed" ? t("The app changed since its last approval. Review this version before approving it again.") : t("Review this version before approving it for use.")}
           </p>
         )}
         {app.approval === "approved" && !app.error && (
           <p className="text-micro text-ink-500 mt-2 break-words">
-            This version is approved.
+            {t("This version is approved.")}
           </p>
         )}
         {app.error && <p className="text-label text-fail mt-2 break-words" role="alert">{app.error}</p>}
@@ -75,7 +76,7 @@ export default function SettingsTab({
           onClick={onApproveRetry}
           className="mt-2"
         >
-          Check for changes
+          {t("Check for changes")}
         </Button>
       </section>
       </div>
@@ -102,6 +103,7 @@ function TeamEditor({
   runs: AppRun[];
   viewer: Viewer;
 }) {
+  const t = useTranslate();
   const roles = teamInputs(wf);
   const inputs = wf.inputs ?? [];
   const agentsState = useResource(resources.agents);
@@ -156,12 +158,12 @@ function TeamEditor({
   };
 
   return (
-    <section className="card px-4 py-3.5 min-w-0" aria-label="team">
-      <h2 className="text-cardtitle font-medium text-ink-100 mb-2">Team</h2>
+    <section className="card px-4 py-3.5 min-w-0" aria-label={t("team")}>
+      <h2 className="text-cardtitle font-medium text-ink-100 mb-2">{t("Team")}</h2>
       <p className="text-label text-ink-400 mb-2">
-        The default agents for new runs. Changing the team does not require app approval.
+        {t("The default agents for new runs. Changing the team does not require app approval.")}
       </p>
-      {!canEdit && <p className="text-label text-ink-500 mb-3">{viewer.readOnly ? "The team is read-only on this board." : "Sign in as the operator to change the team."}</p>}
+      {!canEdit && <p className="text-label text-ink-500 mb-3">{viewer.readOnly ? t("The team is read-only on this board.") : t("Sign in as the operator to change the team.")}</p>}
       <ul className="space-y-3">
         {roles.map((role) => {
           const spec = inputs.find((i) => i.name === role);
@@ -182,14 +184,14 @@ function TeamEditor({
                 aria-describedby={spec?.ask ? `team-${role}-hint` : undefined}
                 disabled={busy || adding !== null || !canEdit}
               >
-                <option value="">Choose an agent</option>
+                <option value="">{t("Choose an agent")}</option>
                 {candidates.map((a) => (
                   <option key={a.alias} value={a.alias}>
                     {a.alias} — {agentStateWord(a.state)}
                   </option>
                 ))}
                 {value && !candidates.some((a) => a.alias === value) && (
-                  <option value={value}>{value} — saved</option>
+                  <option value={value}>{t("{value} — saved").replace("{value}", () => value)}</option>
                 )}
               </select>
               <Button
@@ -197,21 +199,21 @@ function TeamEditor({
                 onClick={() => addWorker(role)}
                 disabled={busy || adding !== null || !canEdit}
                 className="shrink-0"
-                aria-label={`Add worker for ${appFieldLabel(role)}`}
+                aria-label={`${t("Add worker for")} ${appFieldLabel(role)}`}
                 title={
                   !canEdit
-                    ? "Joining a worker is the operator's."
-                    : "join a new Devin worker for this role"
+                    ? t("Joining a worker is the operator's.")
+                    : t("join a new Devin worker for this role")
                 }
               >
-                {adding === role ? "Joining…" : "Add worker"}
+                {adding === role ? t("Joining…") : t("Add worker")}
               </Button>
               </div>
             </li>
           );
         })}
         {roles.length === 0 && (
-          <li className="text-label text-ink-500">This workflow's steps name no team inputs.</li>
+          <li className="text-label text-ink-500">{t("This workflow's steps name no team inputs.")}</li>
         )}
       </ul>
       {roles.length > 0 && (
@@ -221,11 +223,11 @@ function TeamEditor({
             onClick={save}
             loading={busy}
             disabled={adding !== null || !dirty || !canEdit}
-            title={!canEdit ? "Changing the team requires an editable operator session." : undefined}
+            title={!canEdit ? t("Changing the team requires an editable operator session.") : undefined}
           >
-            {busy ? "Saving…" : "Save team"}
+            {busy ? t("Saving…") : t("Save team")}
           </Button>
-          {note && <span className={`text-label ${failed ? "text-fail" : "text-ink-400"} break-words`} role={failed ? "alert" : "status"}>{note}</span>}
+          {note && <span className={`text-label ${failed ? "text-fail" : "text-ink-400"} break-words`} role={failed ? "alert" : "status"}>{t(note)}</span>}
         </div>
       )}
     </section>

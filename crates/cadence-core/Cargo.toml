@@ -1,0 +1,19 @@
+[package]
+name = "cadence-core"
+version = "0.2.5"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["wasm-abi"]
+wasm-abi = []
+
+[dependencies]
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_yaml = "0.9"

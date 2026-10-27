@@ -1,5 +1,7 @@
 import type { AnchorHTMLAttributes, MouseEvent } from "react";
-import { navigate } from "../lib/useLocation";
+import { activateNavigation, useNavigation } from "../../screen-ui/src/navigation";
+
+export type LinkProps = AnchorHTMLAttributes<HTMLAnchorElement> & { href: string; replace?: boolean };
 
 /**
  * An in-app link: a real `<a href>` (so it can be opened in a new tab or
@@ -10,14 +12,11 @@ export default function Link({
   onClick,
   replace,
   ...rest
-}: AnchorHTMLAttributes<HTMLAnchorElement> & { href: string; replace?: boolean }) {
+}: LinkProps) {
+  const navigation = useNavigation();
   const go = (e: MouseEvent<HTMLAnchorElement>) => {
     onClick?.(e);
-    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
-      return;
-    }
-    e.preventDefault();
-    navigate(href, { replace });
+    activateNavigation(navigation, href, e, { replace });
   };
-  return <a href={href} onClick={go} {...rest} />;
+  return <a href={navigation?.href(href)} onClick={go} {...rest} />;
 }

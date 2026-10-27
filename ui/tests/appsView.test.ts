@@ -43,12 +43,21 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } =
   require("react-dom/client") as typeof import("react-dom/client");
-const AppDetail = (
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
+const AppDetailComponent = (
   require("../src/features/apps/AppDetail") as typeof import("../src/features/apps/AppDetail")
 ).default;
-const Apps = (
+const AppDetail = (props: React.ComponentProps<typeof AppDetailComponent>) =>
+  React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(AppDetailComponent, props) }));
+const AppsComponent = (
   require("../src/features/apps/Apps") as typeof import("../src/features/apps/Apps")
 ).default;
+const Apps = (props: React.ComponentProps<typeof AppsComponent>) =>
+  React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(AppsComponent, props) }));
 const { resources } =
   require("../src/lib/resources") as typeof import("../src/lib/resources");
 const { navigate } =
@@ -169,6 +178,11 @@ function assert(value: unknown, what: string): asserts value {
 const host = document.createElement("div");
 document.body.append(host);
 const root = createRoot(host);
+// Match App's production embedding; SDK controls remain fail-closed by default.
+function renderWithNavigation(children: React.ReactNode) {
+  root.render(React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children })));
+}
 const flush = async () => {
   await React.act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -186,7 +200,7 @@ async function render(
   project = "site",
 ) {
   await React.act(() =>
-    root.render(
+    renderWithNavigation(
       React.createElement(AppDetail, {
         project,
         name: "blog-post",
@@ -356,9 +370,8 @@ async function main() {
     "reading and navigation do not write or approve",
   );
   await React.act(() =>
-    root.render(
+    renderWithNavigation(
       React.createElement(Apps, {
-        project: "all",
         viewer: { readOnly: true, operator: false },
       }),
     ),
@@ -369,17 +382,17 @@ async function main() {
       host.textContent?.includes("Project: campaign"),
     "same-name installations show their project associations",
   );
-  // CAD-1129: the home opens each installation's own page — distinct
-  // install ids, no shared route.
+  // CAD-1438: generated links spell the canonical `/apps/<key>` route;
+  // the route itself proves the key is unique before opening anything.
   const instLinks = Array.from(host.querySelectorAll("a")).filter((a) =>
+    a.getAttribute("href") === "/apps/blog-post",
+  );
+  const legacyLinks = Array.from(host.querySelectorAll("a")).filter((a) =>
     a.getAttribute("href")?.startsWith("/app-installations/"),
   );
   assert(
-    instLinks.length === 2 &&
-      new Set(instLinks.map((a) => a.getAttribute("href"))).size === 2 &&
-      instLinks.some((a) => a.getAttribute("href") === "/app-installations/inst-site") &&
-      instLinks.some((a) => a.getAttribute("href") === "/app-installations/inst-campaign"),
-    "home preserves separate installation routes by install id",
+    instLinks.length === 2 && legacyLinks.length === 0,
+    "home emits the canonical key route and never the retired ID route",
   );
   assert(
     !host.textContent?.includes("New post"),

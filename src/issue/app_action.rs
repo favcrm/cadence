@@ -597,3 +597,69 @@ pub fn parse_str(text: &str) -> Result<Descriptor> {
         serde_json::from_str(text).map_err(|e| fail("$", format!("not valid JSON: {e}")))?;
     parse(&raw)
 }
+
+/* ------------------------------------------------------------------ */
+/* CAD-1415: install-time admission of a declared customer bundle.     */
+/* ------------------------------------------------------------------ */
+
+/// The root bundle file that carries the declarations. Admitted beside
+/// `app.md` and `app-assistant.json`; its bytes are covered by the
+/// installation digest, so a changed declaration needs a new consent.
+pub const FILE: &str = "app-actions.json";
+
+/// The only record kind the host's fixed storage holds today.
+pub const RECORD_KIND: &str = "customer";
+
+/// Legacy adapter: the `CustomerProfile` fields a declaration may
+/// write, with the field type each must declare. Consent, identity,
+/// revision and any other storage column are deliberately absent, so
+/// a declaration cannot name them.
+pub const LEGACY_FIELDS: &[(&str, &str)] = &[
+    ("display_name", "text"),
+    ("email", "text"),
+    ("phone", "text"),
+    ("tags", "tags"),
+    ("source", "text"),
+];
+
+/// Validate `text` as the installed `app-actions.json`. Admission is
+/// stricter than the grammar: the file must name this bundle's `app`,
+/// every action must use the customer record kind and the legacy
+/// adapter's fields and types, and no action id may collide with a
+/// host-registry id (the registry keeps owning those). Fails closed.
+pub fn validate_customer_bundle(text: &str, app: &str) -> Result<Descriptor> {
+    let descriptor = parse_str(text)?;
+    if descriptor.app != app {
+        return Err(Error::rejected(format!(
+            "{FILE} declares a different app name"
+        )));
+    }
+    let registered = crate::app_assistant::registered_ids();
+    for action in &descriptor.actions {
+        if registered.contains(&action.id.as_str()) {
+            return Err(Error::rejected(format!(
+                "{FILE}: action id '{}' is owned by the host registry",
+                action.id
+            )));
+        }
+        if action.record != RECORD_KIND {
+            return Err(Error::rejected(format!(
+                "{FILE}: record kind '{}' is not supported; only '{RECORD_KIND}'",
+                action.record
+            )));
+        }
+        for field in &action.input.fields {
+            let legacy = LEGACY_FIELDS.iter().find(|(id, _)| *id == field.id);
+            match legacy {
+                Some((_, kind)) if *kind == field.field_type => {}
+                _ => {
+                    return Err(Error::rejected(format!(
+                        "{FILE}: field '{}' of action '{}' is not a supported customer field",
+                        field.id, action.id
+                    )))
+                }
+            }
+        }
+    }
+    Ok(descriptor)
+}

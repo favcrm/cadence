@@ -1,7 +1,7 @@
 //! `/api/stream` — server-sent events. One open connection per tab
 //! carries the read model's invalidation frames: `stream_events`
 //! subscribes and writes each frame straight onto the socket until the
-//! client or the watcher drops it.
+//! client, watcher, or live-session validation closes it.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -102,6 +102,12 @@ pub(crate) fn event_resources(name: &str) -> &'static [&'static str] {
         // app's workflow checks resolve to, so apps refetch too.
         "agents" => &["agents", "issue", "overview", "outbox", "apps", "app"],
         "monitoring" => &["overview"],
+        // CAD-818: the Threads view's own invalidation. It names only the
+        // `threads` resource, so no existing stream refetches more.
+        "threads" => &["threads"],
+        // CAD-1700: the master view's own invalidation. It names only the
+        // `master` resource, so no existing stream refetches more.
+        "master" => &["master"],
         _ => &[
             "issues",
             "projects",
@@ -133,11 +139,32 @@ pub(crate) fn stream_hello(entities: bool) -> String {
     format!("event: hello\ndata: {data}\n\n")
 }
 
-pub(crate) fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
+/// One `event: agent` frame for a non-operator: the row rebuilt from the
+/// allowlist. Fail closed - a frame that cannot be parsed and rebuilt is
+/// dropped, never forwarded whole. A delete frame (no row) passes as is.
+fn redact_agent_frame(frame: &str) -> Option<String> {
+    let (head, tail) = frame.split_once("\ndata: ")?;
+    let mut data: Value = serde_json::from_str(tail.trim()).ok()?;
+    if let Some(row) = data.get_mut("agent") {
+        *row = super::member_view::member_agent_row(row);
+    }
+    Some(format!("{head}\ndata: {data}\n\n"))
+}
+
+pub(super) fn stream_events(
+    request: Request,
+    state_dir: &Path,
+    pm_dir: &Path,
+    mut admission: super::operator::ReadAdmission,
+    operator: bool,
+) {
     let entities = request
         .url()
         .split_once('?')
         .is_some_and(|(_, q)| q.split('&').any(|part| part == "entities=1"));
+    if !admission.still_live(state_dir) {
+        return;
+    }
     let mut w = request.into_writer();
     // Join the board's shared watcher before the head goes out: the
     // first subscriber's baseline is taken inside `subscribe`, so the
@@ -168,14 +195,32 @@ pub(crate) fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     // client would never surface without a write.
     let mut ping_at = Instant::now() + Duration::from_secs(15);
     loop {
-        match rx.recv_timeout(Duration::from_secs(15)) {
+        let next = rx.recv_timeout(admission.wait_timeout());
+        if !admission.still_live(state_dir) {
+            return;
+        }
+        match next {
             Ok(f) if &*f == read_model::HEARTBEAT => {}
             Ok(f) => {
                 if !entities && f.starts_with("event: aggregates\n") {
                     continue;
                 }
-                let optimized = entities.then(|| read_model::entity_frame(&f));
-                let bytes = optimized.as_deref().unwrap_or(&f);
+                // CAD-1767: an `agent` row frame carries the running message's
+                // text; a non-operator's copy is redacted first.
+                let redacted;
+                let f: &str = if !operator && f.starts_with("event: agent\n") {
+                    match redact_agent_frame(&f) {
+                        Some(frame) => {
+                            redacted = frame;
+                            &redacted
+                        }
+                        None => continue,
+                    }
+                } else {
+                    &f
+                };
+                let optimized = entities.then(|| read_model::entity_frame(f));
+                let bytes = optimized.as_deref().unwrap_or(f);
                 if !frame(&mut w, bytes.as_bytes()) {
                     return;
                 }

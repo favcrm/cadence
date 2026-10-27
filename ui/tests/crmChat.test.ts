@@ -1,5 +1,6 @@
+import { streamFixture } from "./streamFixture";
 /** CAD-1051 / CAD-1046: the shell chat — rail, markdown, folded steps,
- *  directive cards, context chip and quick prompts. */
+ *  directive cards and the one shared compact composer. */
 declare function require(name: string): any;
 declare const process: { cwd(): string };
 export {};
@@ -19,10 +20,6 @@ for (const name of ["addEventListener", "removeEventListener", "requestAnimation
   Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true, writable: true });
 Object.defineProperty(globalThis, "crypto", { value: require("crypto").webcrypto, configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
-Object.defineProperty(globalThis, "EventSource", {
-  configurable: true,
-  value: class { onopen = null; onerror = null; addEventListener() {} removeEventListener() {} close() {} },
-});
 const loader = require("module"), originalRequire = loader.prototype.require;
 loader.prototype.require = function (this: unknown, id: string) {
   if (id.endsWith(".css")) return {};
@@ -32,13 +29,14 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const AppShell = require("../src/features/app-shell/AppShell").default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const AppShellComponent = require("../src/features/app-shell/AppShell").default;
+const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) => React.createElement(LocaleProvider, null, React.createElement(AppShellComponent, props));
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { matchDirective, hideIds } = require("../src/features/app-shell/chat/directive") as typeof import("../src/features/app-shell/chat/directive");
 const { parseAppChat } = require("../src/features/app-shell/chat/contract") as typeof import("../src/features/app-shell/chat/contract");
-const { chatContext } = require("../src/features/app-shell/chat/Conversation") as typeof import("../src/features/app-shell/chat/Conversation");
 // The descriptor under test is the package's own file, not a copy.
-const crmDescriptor = JSON.parse(require("fs").readFileSync(require("path").join(process.cwd(), "..", "workspace-apps", "crm", "app-chat.json"), "utf8"));
+const crmDescriptor = JSON.parse(require("fs").readFileSync(require("path").join(process.cwd(), "..", "tests", "fixtures", "apps", "crm", "app-chat.json"), "utf8"));
 const crmChat = parseAppChat(crmDescriptor);
 
 const SECRET = ["tok", "en-", "abcdef0123456789"].join("");
@@ -53,10 +51,6 @@ equal(matchDirective("{not json", crmChat), null, "broken JSON is not a directiv
 assert(matchDirective(JSON.stringify({ confirm_token: SECRET }), crmChat)?.kind === "confirmation", "any confirm_token JSON is carded, never shown");
 assert(matchDirective(confirm, null)?.kind === "confirmation", "with no descriptor a token-bearing body is still never printed");
 equal(hideIds("done in ctx-abc-123 now"), "done in this workspace now", "ctx ids hidden");
-equal(chatContext(crmChat, "customers", false)?.label, "Customers", "page chip");
-assert(chatContext(crmChat, "segments", true)?.label.startsWith("Segment"), "record chip names the open record");
-assert((chatContext(crmChat, "campaigns", false)?.prompts.length ?? 0) >= 2 && (chatContext(crmChat, "campaigns", false)?.prompts.length ?? 9) <= 3, "2-3 prompts");
-equal(chatContext(crmChat, null, false), null, "no screen, no chip");
 
 const crm = { install_id: "install-crm", title: "CRM", name: "crm", version: "0.1.0", digest: "d", catalog_generation: "g", approved: true, storage_kind: "workspace", files: [], capabilities: null, connection_slots: [] };
 const ctxs = { contexts: [{ id: "ctx-a", install_id: "install-crm", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } }] };
@@ -77,12 +71,13 @@ let thread: any = {
 const json = (v: unknown) => new Response(JSON.stringify(v), { status: 200, headers: { "Content-Type": "application/json" } });
 globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
+  const url = new URL(path, "http://localhost");
+  if (url.pathname.endsWith("/stream")) return streamFixture(path);
   if (path === "/api/app-installations/install-crm") return json(crm);
   if (path === "/api/app-installations/install-crm/contexts") return json(ctxs);
   if (path.endsWith("/chat-descriptor")) return json({ descriptor: crmDescriptor, digest: crm.digest, app: "crm" });
   if (path.endsWith("/conversations")) return new Response("{}", { status: 404 });
   if (path.startsWith("/api/threads/master")) return json(thread);
-  const url = new URL(path, "http://localhost");
   if (url.pathname === "/api/crm-send/list") return json({ sends: [] });
   if (url.pathname === "/api/crm-send/origin") return json({ unsubscribe_origin: null, stored: false });
   if (url.pathname.endsWith("/records")) return json({ records: [], truncated: false, next_cursor: null });
@@ -110,30 +105,64 @@ const text = () => pane().textContent ?? "";
 assert(host.querySelector('[data-kind="answer"] strong')?.textContent === "VIP customers", "markdown bold renders as <strong>");
 assert(!text().includes("**"), "no raw ** in the chat");
 // Tool steps fold to one line.
-const steps = host.querySelectorAll("[data-chat-steps]");
-equal(steps.length, 1, "tool run folds into one line");
-assert((steps[0].textContent ?? "").includes("2 steps"), "the line counts the steps");
-assert(!text().includes("list_segments") && !text().includes("create_segment"), "no per-step rows");
+// CAD-1431: app chat reuses Home's shared steps group (collapsed head,
+// expandable rows), not a plain one-line summary.
+const steps = host.querySelectorAll('[data-kind="tools"]');
+equal(steps.length, 1, "tool run folds into one shared steps group");
+assert((steps[0].textContent ?? "").includes("2 tool steps"), "the group counts the steps");
+equal(steps[0].getAttribute("data-open"), null, "steps stay collapsed until opened");
+// The step rows sit in the shared collapsed body (CSS grid 0fr); the head
+// carries only the count and the newest step, as on Home.
+assert(steps[0].querySelector(".steps-body") && steps[0].querySelector(".steps-head")?.getAttribute("aria-expanded") === "false", "steps body is the shared collapsed disclosure");
 // Directive card, never raw JSON, token, request id or ctx id.
 assert(host.querySelector('[data-chat-card="directive"]'), "CSV confirm renders as a card");
 for (const bad of [SECRET, "req-9", "confirm_token", "cadence_csv_import", "ctx-a", "{"]) assert(!text().includes(bad), `chat never shows ${bad}`);
 assert(text().includes("Customer import"), "card reads as a human summary");
-// Context chip + quick prompts that fill, not send.
-const chip = host.querySelector("[data-chat-context]");
-assert(chip && (chip.textContent ?? "").includes("Customers"), "chip names the page");
-const prompts = Array.from(chip!.querySelectorAll("button"));
-assert(prompts.length >= 2 && prompts.length <= 3, "two or three quick prompts");
-await click(prompts[0]);
+// CAD-1865: the pane's header copy hands back what the row shows, not what the
+// daemon stored — the internal context id must not survive the copy either.
+{
+  const copied: string[] = [];
+  Object.defineProperty(win.navigator, "clipboard", {
+    value: { writeText: async (t: string) => { copied.push(t); } },
+    configurable: true,
+  });
+  const copy = host.querySelector("[data-chat-header-copy]") as HTMLButtonElement | null;
+  assert(copy !== null, "the pane offers a copy action for its newest answer");
+  await React.act(async () => { copy!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  equal(copied.length, 1, "one clipboard write");
+  assert(copied[0].includes("VIP customers") && copied[0].includes("this workspace"), "the copy carries the projected answer text");
+  assert(!copied[0].includes("ctx-a"), "the copy never carries the internal context id the row hides");
+}
+// CAD-1168/CAD-1174: no default chip or prompt row, one shared compact
+// composer. App Attach stays off until the native capability contract.
+assert(!host.querySelector("[data-chat-context]") && !host.querySelector(".app-chat-prompt"), "no default chip or prompt row");
+equal(host.querySelectorAll('.app-chat-composer[data-density="compact"]').length, 1, "one shared compact composer");
 const box = host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement;
-equal(box.value, prompts[0].textContent, "prompt fills the composer");
+assert(box, "the shared composer has a textbox");
+assert(host.querySelector('button.app-chat-send[aria-label="Send message"]'), "the shared composer has an accessible Send");
+// A real unsent draft through the textbox's own editing path; the old
+// prompt click used to supply this.
+const DRAFT = "Draft retained across navigation";
+await React.act(async () => {
+  Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(box, DRAFT);
+  box.dispatchEvent(new Event("input", { bubbles: true }));
+});
+await flush();
+equal(box.value, DRAFT, "the draft is in the composer");
 await React.act(async () => { navigate("/app-installations/install-crm?ctx=ctx-a&crm=segments"); });
 await flush();
-assert((host.querySelector("[data-chat-context]")?.textContent ?? "").includes("Segments"), "chip follows the page");
+assert(!host.querySelector("[data-chat-context]"), "no context chip after navigation");
+equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement).value, DRAFT, "draft survives navigation to segments");
 await React.act(async () => { navigate("/app-installations/install-crm?ctx=ctx-a&crm=segments&record=seg-1"); });
 await flush();
-assert((host.querySelector("[data-chat-context]")?.textContent ?? "").includes("Segment (open)"), "chip names the open record");
+equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement).value, DRAFT, "draft survives navigation to a record");
 
 // Collapse to a rail; draft and pane survive; waiting dot on new reply.
+// An app page may open collapsed (CAD-1810); this check starts from the pane.
+if (grid().hasAttribute("data-chat-collapsed")) {
+  await click(host.querySelector(".app-chat-rail"));
+  await flush();
+}
 const before = box.value;
 await click(host.querySelector(".app-chat-collapse"));
 assert(grid().hasAttribute("data-chat-collapsed"), "grid collapses");

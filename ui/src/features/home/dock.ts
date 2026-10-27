@@ -29,7 +29,30 @@ export function tailTop(scrollHeight: number, clientHeight: number): number {
   return Math.max(0, scrollHeight - clientHeight);
 }
 
-/** The jump pill's words: the count rides along while there is one. */
-export function jumpLabel(unseen: number): string {
-  return unseen > 0 ? `Jump to latest · ${unseen} new` : "Jump to latest";
+/** The scroller itself resized (window height, a notice mounting above
+ *  it): re-pin only when the reader was pinned to the tail BEFORE the change
+ *  (`pinned` is the flag, not a fresh measurement: a measurement after a
+ *  shrink is already short of the tail). */
+export function repinOnResize(
+  pinned: boolean,
+  prevClientHeight: number,
+  clientHeight: number,
+): boolean {
+  return pinned && prevClientHeight !== clientHeight;
+}
+
+/** The jump pill's words: the count rides along while there is one.
+ *  `t` translates each phrase (default: English), so the two surfaces
+ *  that show this pill — Home and the app-pane chat — share one wording
+ *  and neither is English-only in a translated locale (CAD-1533). */
+export function jumpLabel(unseen: number, t: (english: string) => string = (english) => english): string {
+  const base = t("Jump to latest");
+  return unseen > 0 ? `${base} · ${unseen} ${t("new")}` : base;
+}
+
+/** The jump pill shows while rows arrived unseen (the reader is in
+ *  history) or the tail's own row kept growing; reaching the tail
+ *  clears both (Home's scroll handler), so the pill hides there. */
+export function showJumpPill(unseen: number, activity: boolean): boolean {
+  return unseen > 0 || activity;
 }

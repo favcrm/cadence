@@ -466,23 +466,72 @@ impl BoardUser {
     }
 
     /// The display/audit actor: `Fable Chen <fable@example.com> (board)`,
-    /// printable-ASCII only — it lands in commit `Actor:` trailers.
+    /// printable-ASCII only — it lands in commit `Actor:` trailers — and at
+    /// most [`ACTOR_MAX`] characters, so the record's `"<actor> via board"`
+    /// source fits the store's 200 (CAD-1300). A name with no ASCII
+    /// characters shows the handle. An email over 100 characters keeps its
+    /// first 91, `~` and 8 hex digits of the sha256 of the full email (so
+    /// two long emails stay distinct); the name is cut to the room left.
     pub fn actor(&self) -> String {
         let clean = |raw: &str| -> String {
             raw.chars()
                 .filter(|c| c.is_ascii() && !c.is_ascii_control() && *c != '<' && *c != '>')
-                .take(120)
                 .collect::<String>()
                 .trim()
                 .to_string()
         };
-        let (name, email) = (clean(&self.name), clean(&self.email));
-        match (name.is_empty(), email.is_empty()) {
-            (false, false) => format!("{name} <{email}> (board)"),
-            (false, true) => format!("{name} (board)"),
-            _ => format!("{} (board)", self.handle),
+        let mut email = clean(&self.email);
+        if email.len() > 100 {
+            email = format!("{}~{}", &email[..91], &digest(&self.email)[..8]);
         }
+        let name = match clean(&self.name) {
+            n if n.is_empty() => self.handle.clone(),
+            n => n,
+        };
+        let email_part = if email.is_empty() {
+            String::new()
+        } else {
+            format!(" <{email}>")
+        };
+        let room = ACTOR_MAX - " (board)".len() - email_part.len();
+        let name = name.get(..room).unwrap_or(&name).trim_end();
+        format!("{name}{email_part} (board)")
     }
+}
+
+/// Longest rendered [`BoardUser::actor`]: with `" via board"` it fits the
+/// store's 200-character source limit.
+const ACTOR_MAX: usize = 190;
+
+/// CAD-1374: the platform realm a public session was verified under —
+/// the board's issuer, the company it serves and its public host. Saved
+/// from the same config the assertion was checked against, never re-read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicRealm {
+    pub issuer: String,
+    pub company: String,
+    pub host: String,
+}
+
+/// CAD-1374: a stored public row's identity, with no authority claim.
+/// `revoked` lets a denial be audited against a withdrawn session.
+pub(crate) struct PublicSnapshot {
+    pub hash: String,
+    pub view: SessionView,
+    pub realm: Option<PublicRealm>,
+    pub revoked: bool,
+}
+
+/// The verified platform tenancy a public session was opened under
+/// (CAD-1412): the assertion's `iss` and `company`, which the daemon
+/// checked against the configured board identity before this value
+/// existed. Absent on every legacy or non-public session, so a session
+/// without it can never authorize a human-threads actor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanScope {
+    pub issuer: String,
+    pub organization_id: String,
 }
 
 /// One stored session: the token's hash and what `ui sessions` shows.
@@ -512,6 +561,22 @@ struct Row {
     /// operator's loopback/tailnet sessions.
     #[serde(default)]
     user: Option<BoardUser>,
+    /// CAD-1374: the realm a public row was verified under. `None` on
+    /// legacy public rows and on every local session.
+    #[serde(default)]
+    realm: Option<PublicRealm>,
+    /// CAD-1374: the platform authority of a public row is withdrawn. The
+    /// row keeps its identity until its normal TTL, so a denial can name
+    /// who was refused, but no authority lookup returns it.
+    #[serde(default)]
+    revoked: bool,
+    /// The verified issuer and organization a public session was opened
+    /// under (CAD-1412). Legacy rows deserialize to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<HumanScope>,
+    /// Stable, server-registered upload account. Old sessions remain unbound.
+    #[serde(default)]
+    account_id: Option<String>,
 }
 
 impl Row {
@@ -535,6 +600,33 @@ impl Row {
             expires_at: self.expires_at,
             user_agent: self.user_agent.clone(),
             user: self.user.clone(),
+            scope: self.scope.clone(),
+            account_id: self.account_id.clone(),
+        }
+    }
+}
+
+/// CAD-1374: the safe identity of one session row an audited mutation touches:
+/// the display id, the verified subject and its snapshot role, the realm
+/// company and the origin. Never the token, key, hash, jti or user agent.
+#[derive(Clone, Debug)]
+pub(crate) struct AuditTarget {
+    pub session: String,
+    pub origin: Origin,
+    pub sub: Option<String>,
+    pub role: Option<String>,
+    pub company: Option<String>,
+}
+
+impl Row {
+    /// CAD-1374: this row's safe audit identity (see [`AuditTarget`]).
+    fn audit_target(&self) -> AuditTarget {
+        AuditTarget {
+            session: self.id().to_string(),
+            origin: self.origin,
+            sub: self.user.as_ref().map(|u| u.sub.clone()),
+            role: self.user.as_ref().map(|u| u.role.clone()),
+            company: self.realm.as_ref().map(|r| r.company.clone()),
         }
     }
 }
@@ -551,6 +643,11 @@ pub struct SessionView {
     pub user_agent: String,
     /// The platform-asserted user a `public` session names (CAD-526).
     pub user: Option<BoardUser>,
+    /// The verified tenancy of a scoped public session (CAD-1412).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<HumanScope>,
+    /// Non-secret durable account handle; absent on legacy sessions.
+    pub account_id: Option<String>,
 }
 
 /// A freshly opened session: the token goes to the board once, for its
@@ -559,10 +656,11 @@ pub struct SessionView {
 pub struct Opened {
     pub token: String,
     /// The session's second credential (review round 2, PR #249): the
-    /// page keeps it in `sessionStorage` — scoped to its exact origin,
-    /// port included — and sends it as `X-Cadence-Session` on every
-    /// write. A cookie leaked to another port's listener is worthless
-    /// without it, and a cross-site request cannot set the header.
+    /// page keeps it in this browser's `localStorage` — scoped to its
+    /// exact origin, port included — and sends it as
+    /// `X-Cadence-Session` on every write. A cookie leaked to another
+    /// port's listener is worthless without it, and a cross-site request
+    /// cannot set the header.
     pub key: String,
     pub session: SessionView,
 }
@@ -570,9 +668,10 @@ pub struct Opened {
 #[derive(Serialize, Deserialize, Default)]
 struct SessionsFile {
     sessions: Vec<Row>,
-    /// `sha256(jti)` → the assertion's `exp`: platform assertions are
-    /// single-use (CAD-526); persisted so a restart inside the 60 s
-    /// window cannot reopen a replay. Pruned once `exp` passes.
+    /// `sha256(jti)` → the assertion's acceptance deadline
+    /// (`exp + skew`): platform assertions are single-use (CAD-526);
+    /// persisted so a restart inside the window cannot reopen a replay.
+    /// Pruned once the deadline passes.
     #[serde(default)]
     jtis: HashMap<String, i64>,
 }
@@ -589,12 +688,20 @@ pub struct Auth {
     path: PathBuf,
     sessions: Vec<Row>,
     /// nonce hash → (origin, expires_at)
-    links: HashMap<String, (Origin, i64)>,
+    links: HashMap<String, (Origin, i64, Option<String>)>,
     /// spent nonce hash → when it would have expired (pruned after)
     spent: HashMap<String, i64>,
-    /// seen jti hash → its assertion's `exp` — the authoritative
-    /// single-use memory for platform sign-ins (CAD-526).
+    /// seen jti hash → its acceptance deadline (`exp + skew`) — the
+    /// authoritative single-use memory for platform sign-ins (CAD-526).
     jtis: HashMap<String, i64>,
+}
+
+fn valid_account_id(id: &str) -> bool {
+    id.len() == 36
+        && id.starts_with("acu-")
+        && id[4..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Printable ASCII, bounded — the user agent is shown by `ui sessions`.
@@ -664,10 +771,12 @@ impl Auth {
     fn prune(&mut self, now: i64) -> bool {
         // An expired link is kept one more TTL so its refusal can say
         // "expired" rather than "unknown".
-        self.links.retain(|_, (_, exp)| now <= *exp + LINK_TTL_SECS);
+        self.links
+            .retain(|_, (_, exp, _)| now <= *exp + LINK_TTL_SECS);
         self.spent.retain(|_, exp| now <= *exp + LINK_TTL_SECS);
-        // A jti stays until its assertion's own expiry — then a replay
-        // fails "expired" before the single-use check anyway.
+        // A jti stays through its assertion's acceptance deadline — the
+        // same horizon `verify` uses — so a replay inside the grace still
+        // fails the single-use check.
         self.jtis.retain(|_, exp| now <= *exp);
         let before = self.sessions.len();
         self.sessions.retain(|r| r.live(now));
@@ -688,7 +797,30 @@ impl Auth {
         self.prune(now);
         let nonce = random_credential()?;
         self.links
-            .insert(digest(&nonce), (origin, now + LINK_TTL_SECS));
+            .insert(digest(&nonce), (origin, now + LINK_TTL_SECS, None));
+        Ok(nonce)
+    }
+
+    /// Mint a login link bound to a durable account registered by the
+    /// caller after independent native operator authentication.
+    pub fn mint_for_account(
+        &mut self,
+        origin: Origin,
+        now: i64,
+        account_id: String,
+    ) -> Result<String> {
+        if origin == Origin::Public || account_id.is_empty() {
+            return Err(Error::invalid(
+                "invalid_request",
+                "invalid upload account binding",
+            ));
+        }
+        self.prune(now);
+        let nonce = random_credential()?;
+        self.links.insert(
+            digest(&nonce),
+            (origin, now + LINK_TTL_SECS, Some(account_id)),
+        );
         Ok(nonce)
     }
 
@@ -710,7 +842,7 @@ impl Auth {
         if self.spent.contains_key(&hash) {
             return Err(LinkRefusal::AlreadyUsed);
         }
-        let Some((minted_for, expires)) = self.links.remove(&hash) else {
+        let Some((minted_for, expires, account_id)) = self.links.remove(&hash) else {
             return Err(LinkRefusal::Unknown);
         };
         self.spent.insert(hash, expires);
@@ -720,10 +852,16 @@ impl Auth {
         if minted_for != origin {
             return Err(LinkRefusal::WrongOrigin);
         }
-        Ok(self.create(origin, user_agent, now))
+        Ok(self.create(origin, user_agent, now, account_id))
     }
 
-    fn create(&mut self, origin: Origin, user_agent: &str, now: i64) -> Result<Opened> {
+    fn create(
+        &mut self,
+        origin: Origin,
+        user_agent: &str,
+        now: i64,
+        account_id: Option<String>,
+    ) -> Result<Opened> {
         let token = random_credential()?;
         let key = random_credential()?;
         let row = Row {
@@ -736,6 +874,10 @@ impl Auth {
             user_agent: clean_user_agent(user_agent),
             max_idle_secs: default_idle_secs(),
             user: None,
+            realm: None,
+            revoked: false,
+            scope: None,
+            account_id,
         };
         let session = row.view();
         self.sessions.push(row);
@@ -765,6 +907,17 @@ impl Auth {
         user_agent: &str,
         now: i64,
     ) -> Result<Opened> {
+        self.open_device_account(user, origin, user_agent, now, None)
+    }
+
+    pub fn open_device_account(
+        &mut self,
+        user: BoardUser,
+        origin: Origin,
+        user_agent: &str,
+        now: i64,
+        account_id: Option<String>,
+    ) -> Result<Opened> {
         self.prune(now);
         if origin == Origin::Public {
             return Err(Error::invalid(
@@ -793,6 +946,10 @@ impl Auth {
             user_agent: clean_user_agent(user_agent),
             max_idle_secs: crate::device_login::REMOTE_IDLE_SECS,
             user: Some(user),
+            realm: None,
+            revoked: false,
+            scope: None,
+            account_id,
         };
         let session = row.view();
         self.sessions.push(row);
@@ -815,19 +972,99 @@ impl Auth {
         user_agent: &str,
         now: i64,
     ) -> Result<Option<Opened>> {
-        self.prune(now);
+        self.open_public_row(
+            user,
+            (jti, jti_exp),
+            user_agent,
+            (None, None, None),
+            now,
+            |_| Ok(()),
+        )
+    }
+
+    /// CAD-1374: `open_public` that also saves the platform realm the
+    /// assertion was verified under. The daemon passes the same config it
+    /// checked the assertion against. The row's `scope` (CAD-1412) is
+    /// derived from that typed realm — verified issuer and company,
+    /// never a request field.
+    pub fn open_public_bound(
+        &mut self,
+        user: BoardUser,
+        jti: &str,
+        jti_exp: i64,
+        user_agent: &str,
+        realm: PublicRealm,
+        now: i64,
+    ) -> Result<Option<Opened>> {
+        self.open_public_row(
+            user,
+            (jti, jti_exp),
+            user_agent,
+            (Some(realm), None, None),
+            now,
+            |_| Ok(()),
+        )
+    }
+
+    /// CAD-1374: `open_public_bound` with a durable intent callback. The
+    /// callback sees only the candidate row's safe view and runs BEFORE any
+    /// `Auth` mutation (prune, JTI spend, session replacement, persist). If it
+    /// fails, no session is created and no JTI is spent. The verified
+    /// [`HumanScope`] is derived from the same typed realm.
+    pub(crate) fn open_public_bound_with_intent(
+        &mut self,
+        user: BoardUser,
+        jti: (&str, i64),
+        user_agent: &str,
+        realm: PublicRealm,
+        now: i64,
+        intent: impl FnOnce(&AuditTarget) -> Result<()>,
+    ) -> Result<Option<Opened>> {
+        // Scope derives from the realm `verify` matched against this
+        // board's config — issuer and company, never request params.
+        let scope = HumanScope {
+            issuer: realm.issuer.clone(),
+            organization_id: realm.company.clone(),
+        };
+        self.open_public_row(
+            user,
+            jti,
+            user_agent,
+            (Some(realm), Some(scope), None),
+            now,
+            intent,
+        )
+    }
+
+    fn open_public_row(
+        &mut self,
+        user: BoardUser,
+        (jti, jti_exp): (&str, i64),
+        user_agent: &str,
+        (realm, scope, account_id): (Option<PublicRealm>, Option<HumanScope>, Option<String>),
+        now: i64,
+        intent: impl FnOnce(&AuditTarget) -> Result<()>,
+    ) -> Result<Option<Opened>> {
+        // The verifier may have sampled its clock before a blocking JWKS
+        // fetch. Re-check the acceptance deadline here, under the caller's
+        // Auth lock, so a request that reaches the store after it cannot
+        // open a session even if a concurrent check already pruned the jti.
+        if now > jti_exp {
+            return Err(Error::invalid(
+                "assertion_expired",
+                "the assertion is outside its acceptance window",
+            ));
+        }
         // The authoritative single-use check (contract §4/§9): verified
-        // jtis persist until `exp` — a restart inside the 60 s window
-        // still knows the assertion is spent.
-        if self.jtis.contains_key(&digest(jti)) {
+        // jtis persist through the verifier's acceptance deadline — a
+        // restart inside the 60 s window still knows the assertion is
+        // spent. Non-mutating: a jti is spent while its deadline has not
+        // passed, the set `prune` keeps.
+        if self.jtis.get(&digest(jti)).is_some_and(|exp| now <= *exp) {
             return Ok(None);
         }
         let token = random_credential()?;
-        // One session per `sub` (contract §9): a fresh sign-in ends the
-        // user's earlier one — named users never stack sessions.
-        self.sessions.retain(|r| {
-            !(r.origin == Origin::Public && r.user.as_ref().is_some_and(|u| u.sub == user.sub))
-        });
+        let sub = user.sub.clone();
         let row = Row {
             hash: digest(&token),
             // The cookie alone is the credential on the public surface —
@@ -841,8 +1078,19 @@ impl Auth {
             user_agent: clean_user_agent(user_agent),
             max_idle_secs: default_idle_secs(),
             user: Some(user),
+            realm,
+            revoked: false,
+            scope,
+            account_id,
         };
         let session = row.view();
+        intent(&row.audit_target())?;
+        self.prune(now);
+        // One session per `sub` (contract §9): a fresh sign-in ends the
+        // user's earlier one — named users never stack sessions.
+        self.sessions.retain(|r| {
+            !(r.origin == Origin::Public && r.user.as_ref().is_some_and(|u| u.sub == sub))
+        });
         self.sessions.push(row);
         self.jtis.insert(digest(jti), jti_exp);
         self.persist()?;
@@ -851,6 +1099,37 @@ impl Auth {
             key: String::new(),
             session,
         }))
+    }
+
+    /// The verified human scope of the live public session `token` names
+    /// (CAD-1412), and its named user. `None` for a missing, expired, legacy
+    /// unscoped or non-public session: the human-threads proof fails
+    /// closed on `None`. Cookie-only, like [`Auth::check_public`].
+    pub(crate) fn verified_human_scope(
+        &mut self,
+        token: &str,
+        now: i64,
+    ) -> Result<Option<(HumanScope, BoardUser)>> {
+        if self.prune(now) {
+            self.persist()?;
+        }
+        if !well_formed(token) {
+            return Ok(None);
+        }
+        let hash = digest(token);
+        Ok(self
+            .sessions
+            .iter()
+            .find(|r| {
+                r.origin == Origin::Public
+                    && !r.revoked
+                    && same_credential(&r.hash, &hash)
+                    && r.live(now)
+            })
+            .and_then(|r| match (&r.scope, &r.user) {
+                (Some(scope), Some(user)) => Some((scope.clone(), user.clone())),
+                _ => None,
+            }))
     }
 
     /// The live public session `token` names, touching its idle clock.
@@ -869,7 +1148,7 @@ impl Auth {
         let found = self
             .sessions
             .iter_mut()
-            .find(|r| r.origin == Origin::Public && same_credential(&r.hash, &hash))
+            .find(|r| r.origin == Origin::Public && !r.revoked && same_credential(&r.hash, &hash))
             .map(|row| {
                 if now - row.last_used >= TOUCH_EVERY_SECS {
                     row.last_used = now;
@@ -924,41 +1203,175 @@ impl Auth {
         Ok(found)
     }
 
+    /// Bind a newly issued, still-live session to its registered account
+    /// before its credentials are returned to the board. Existing bindings
+    /// cannot be changed.
+    pub fn bind_account(&mut self, token: &str, account_id: &str) -> Result<SessionView> {
+        if !well_formed(token) || !valid_account_id(account_id) {
+            return Err(Error::rejected("upload account binding is malformed"));
+        }
+        let hash = digest(token);
+        let row = self
+            .sessions
+            .iter_mut()
+            .find(|row| same_credential(&row.hash, &hash))
+            .ok_or_else(|| Error::rejected("new session disappeared before account binding"))?;
+        if row
+            .account_id
+            .as_deref()
+            .is_some_and(|existing| existing != account_id)
+        {
+            return Err(Error::rejected(
+                "session already has another account binding",
+            ));
+        }
+        row.account_id = Some(account_id.to_string());
+        let session = row.view();
+        self.persist()?;
+        Ok(session)
+    }
+
+    /// Resolve the durable account only after the full live session proof
+    /// succeeds. Public sessions use their cookie-only proof; keyed sessions
+    /// require both credentials and the exact request origin.
+    pub fn verified_session(
+        &mut self,
+        token: &str,
+        key: &str,
+        origin: Origin,
+        now: i64,
+    ) -> Result<Option<SessionView>> {
+        if origin == Origin::Public {
+            self.check_public(token, now)
+        } else {
+            self.check(token, key, origin, now)
+        }
+    }
+
     /// End the session `token` names, on any origin. `true` if it existed.
     pub fn revoke_token(&mut self, token: &str) -> Result<bool> {
+        self.revoke_token_with_intent(token, |_| Ok(()))
+    }
+
+    /// CAD-1374: `revoke_token` with a durable intent callback. The callback
+    /// runs only when a row matches, with that row's safe view, BEFORE the
+    /// removal. A failed callback leaves the session in place.
+    pub(crate) fn revoke_token_with_intent(
+        &mut self,
+        token: &str,
+        intent: impl FnOnce(&[AuditTarget]) -> Result<()>,
+    ) -> Result<bool> {
         if !well_formed(token) {
             return Ok(false);
         }
         let hash = digest(token);
-        let before = self.sessions.len();
-        self.sessions.retain(|r| r.hash != hash);
-        let gone = before != self.sessions.len();
-        if gone {
-            self.persist()?;
+        let targets: Vec<AuditTarget> = self
+            .sessions
+            .iter()
+            .filter(|r| r.hash == hash)
+            .map(Row::audit_target)
+            .collect();
+        if targets.is_empty() {
+            return Ok(false);
         }
-        Ok(gone)
+        intent(&targets)?;
+        self.sessions.retain(|r| r.hash != hash);
+        self.persist()?;
+        Ok(true)
     }
 
     /// End every session whose display id is `id`.
     pub fn revoke_id(&mut self, id: &str) -> Result<usize> {
-        let before = self.sessions.len();
-        self.sessions.retain(|r| r.id() != id);
-        let gone = before - self.sessions.len();
-        if gone > 0 {
-            self.persist()?;
+        self.revoke_id_with_intent(id, |_| Ok(()))
+    }
+
+    /// CAD-1374: `revoke_id` with a durable intent callback. It runs only when
+    /// rows match, with exactly those rows, BEFORE the removal.
+    pub(crate) fn revoke_id_with_intent(
+        &mut self,
+        id: &str,
+        intent: impl FnOnce(&[AuditTarget]) -> Result<()>,
+    ) -> Result<usize> {
+        let targets: Vec<AuditTarget> = self
+            .sessions
+            .iter()
+            .filter(|r| r.id() == id)
+            .map(Row::audit_target)
+            .collect();
+        if targets.is_empty() {
+            return Ok(0);
         }
-        Ok(gone)
+        intent(&targets)?;
+        self.sessions.retain(|r| r.id() != id);
+        self.persist()?;
+        Ok(targets.len())
     }
 
     /// End every session and void every unexchanged link.
     pub fn revoke_all(&mut self) -> Result<usize> {
+        self.revoke_all_with_intent(|_| Ok(()))
+    }
+
+    /// CAD-1374: `revoke_all` with a durable intent callback. It runs when a
+    /// session or an unexchanged link is about to be voided (zero sessions
+    /// still voids links), BEFORE any change.
+    pub(crate) fn revoke_all_with_intent(
+        &mut self,
+        intent: impl FnOnce(&[AuditTarget]) -> Result<()>,
+    ) -> Result<usize> {
+        let targets = self.audit_targets();
+        if !targets.is_empty() || !self.links.is_empty() {
+            intent(&targets)?;
+        }
         let gone = self.sessions.len();
         self.sessions.clear();
-        for (hash, (_, exp)) in self.links.drain() {
+        for (hash, (_, exp, _)) in self.links.drain() {
             self.spent.insert(hash, exp);
         }
         self.persist()?;
         Ok(gone)
+    }
+
+    /// End every device-grant session whose subject is not in `keep`, or
+    /// every device session when `keep` is `None`. Device rows are the
+    /// named-user, non-public rows [`Auth::open_device_account`] creates;
+    /// local link and public sessions never match. The callback runs with
+    /// exactly the matched rows before removal.
+    pub(crate) fn revoke_device_sessions_with_intent(
+        &mut self,
+        keep: Option<&[String]>,
+        intent: impl FnOnce(&[AuditTarget]) -> Result<()>,
+    ) -> Result<usize> {
+        let doomed = |r: &Row| {
+            r.user.is_some()
+                && r.origin != Origin::Public
+                && keep.is_none_or(|keep| {
+                    !r.user
+                        .as_ref()
+                        .is_some_and(|u| keep.iter().any(|sub| sub == &u.sub))
+                })
+        };
+        let targets: Vec<AuditTarget> = self
+            .sessions
+            .iter()
+            .filter(|r| doomed(r))
+            .map(Row::audit_target)
+            .collect();
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        intent(&targets)?;
+        let before = self.sessions.len();
+        self.sessions.retain(|r| !doomed(r));
+        let gone = before - self.sessions.len();
+        self.persist()?;
+        Ok(gone)
+    }
+
+    /// CAD-1374: the safe identity of every stored session row, as the
+    /// audited revocations name them.
+    pub(crate) fn audit_targets(&self) -> Vec<AuditTarget> {
+        self.sessions.iter().map(Row::audit_target).collect()
     }
 
     /// Whether a live session with this display `id` exists right now.
@@ -969,7 +1382,7 @@ impl Auth {
         if self.prune(now) {
             self.persist()?;
         }
-        Ok(self.sessions.iter().any(|r| r.id() == id))
+        Ok(self.sessions.iter().any(|r| r.id() == id && !r.revoked))
     }
 
     /// Whether a live row carries this FULL credential hash. `crate`-
@@ -982,7 +1395,10 @@ impl Auth {
         if self.prune(now) {
             self.persist()?;
         }
-        Ok(self.sessions.iter().any(|r| r.hash == hash && r.live(now)))
+        Ok(self
+            .sessions
+            .iter()
+            .any(|r| r.hash == hash && r.live(now) && !r.revoked))
     }
 
     /// The verified row's FULL credential hash for `token` (+ `key` on a
@@ -1013,38 +1429,93 @@ impl Auth {
             .map(|r| r.hash.clone()))
     }
 
-    /// The verified public row's FULL credential hash for `token` — the
-    /// cookie-only public surface has no `key`. `crate`-private.
-    pub(crate) fn public_session_hash(&mut self, token: &str, now: i64) -> Result<Option<String>> {
+    /// CAD-1374: a stored public row's identity by its raw cookie, for a
+    /// denial audit or a fresh authority check. It claims no authority: it
+    /// returns revoked rows too, and does not touch the idle clock.
+    pub(crate) fn public_snapshot(&self, token: &str, now: i64) -> Option<PublicSnapshot> {
         if !well_formed(token) {
-            return Ok(None);
+            return None;
         }
-        let hash = digest(token);
-        Ok(self
-            .sessions
-            .iter()
-            .find(|r| r.origin == Origin::Public && same_credential(&r.hash, &hash) && r.live(now))
-            .map(|r| r.hash.clone()))
+        self.public_snapshot_by_hash(&digest(token), now)
     }
 
-    /// Does a live public session exist whose named member's handle is
-    /// exactly `handle` (CAD-1129)? `member_as` is the board's claim,
-    /// never the credential: this proves the handle names a live public
-    /// session's `member`-role user, so a forged `member_as` cannot
-    /// borrow another person's favorites or request attribution. The
-    /// daemon's caller rule is `board_session_check`-gated — only the
-    /// operator connection and the bearer may call it.
-    pub(crate) fn check_member(&mut self, handle: &str, now: i64) -> Result<bool> {
-        if self.prune(now) {
+    /// CAD-1374: the identity of the single live public row with this session
+    /// reference (its display id). An ambiguous id answers `None`, so a
+    /// reference can never select the wrong row. No authority is claimed.
+    pub(crate) fn public_snapshot_by_session_id(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Option<PublicSnapshot> {
+        let mut matches = self
+            .sessions
+            .iter()
+            .filter(|r| r.origin == Origin::Public && r.id() == id && r.live(now));
+        let row = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(PublicSnapshot {
+            hash: row.hash.clone(),
+            view: row.view(),
+            realm: row.realm.clone(),
+            revoked: row.revoked,
+        })
+    }
+
+    /// CAD-1374: the identity of the public row with this FULL credential
+    /// hash, as [`Auth::public_snapshot`] reads it.
+    pub(crate) fn public_snapshot_by_hash(&self, hash: &str, now: i64) -> Option<PublicSnapshot> {
+        self.sessions
+            .iter()
+            .find(|r| r.origin == Origin::Public && same_credential(&r.hash, hash) && r.live(now))
+            .map(|r| PublicSnapshot {
+                hash: r.hash.clone(),
+                view: r.view(),
+                realm: r.realm.clone(),
+                revoked: r.revoked,
+            })
+    }
+
+    /// CAD-1374: the live public rows whose named member's handle is exactly
+    /// `handle`, as identities. Any role; the caller re-checks authority.
+    pub(crate) fn public_snapshots_for_handle(
+        &self,
+        handle: &str,
+        now: i64,
+    ) -> Vec<PublicSnapshot> {
+        self.sessions
+            .iter()
+            .filter(|r| {
+                r.origin == Origin::Public
+                    && r.live(now)
+                    && r.user.as_ref().is_some_and(|u| u.handle == handle)
+            })
+            .map(|r| PublicSnapshot {
+                hash: r.hash.clone(),
+                view: r.view(),
+                realm: r.realm.clone(),
+                revoked: r.revoked,
+            })
+            .collect()
+    }
+
+    /// CAD-1374: withdraw the platform authority of the live public row
+    /// with this FULL hash. Its identity stays for denial audit until its
+    /// TTL. The caller appends the durable audit intent BEFORE this call,
+    /// so a failed append leaves the row authoritative.
+    pub(crate) fn revoke_public(&mut self, hash: &str, now: i64) -> Result<bool> {
+        let mut changed = false;
+        for row in self.sessions.iter_mut() {
+            if row.origin == Origin::Public && row.hash == hash && row.live(now) && !row.revoked {
+                row.revoked = true;
+                changed = true;
+            }
+        }
+        if changed {
             self.persist()?;
         }
-        Ok(self.sessions.iter().any(|r| {
-            r.origin == Origin::Public
-                && r.live(now)
-                && r.user
-                    .as_ref()
-                    .is_some_and(|u| u.handle == handle && !u.is_operator())
-        }))
+        Ok(changed)
     }
 
     /// The live sessions, oldest first.
@@ -1052,7 +1523,12 @@ impl Auth {
         if self.prune(now) {
             self.persist()?;
         }
-        Ok(self.sessions.iter().map(Row::view).collect())
+        Ok(self
+            .sessions
+            .iter()
+            .filter(|r| !r.revoked)
+            .map(Row::view)
+            .collect())
     }
 }
 
@@ -1096,6 +1572,10 @@ mod tests {
             user_agent: String::new(),
             max_idle_secs: IDLE_SECS,
             user: None,
+            realm: None,
+            revoked: false,
+            scope: None,
+            account_id: None,
         };
         let orig = mk(&"1".repeat(56));
         let collider = mk(&"2".repeat(56));
@@ -1467,10 +1947,75 @@ mod tests {
         assert!(auth.mint(Origin::Public, T0).is_err());
     }
 
+    /// CAD-1643: a spent public assertion is remembered through the
+    /// verifier's acceptance grace (`exp + SKEW_SECS`), not only to the raw
+    /// `exp`, so a replay at the edge of the grace cannot mint a session.
+    #[test]
+    fn a_spent_public_jti_survives_the_acceptance_skew() {
+        let s = state();
+        let mut auth = Auth::load(s.path());
+        let exp = T0 + 60;
+        let deadline = crate::board_identity::accepted_until(exp);
+        assert!(auth
+            .open_public(user("u_skew", "operator"), "jti-skew", deadline, "ua", T0)
+            .unwrap()
+            .is_some());
+        // `verify` still accepts the assertion at exp+30; the replay loses.
+        assert!(auth
+            .open_public(
+                user("u_skew", "operator"),
+                "jti-skew",
+                deadline,
+                "ua",
+                exp + 30
+            )
+            .unwrap()
+            .is_none());
+        // Past the deadline the store refuses before the jti lookup; the
+        // verifier is the guard above it.
+        let late = auth
+            .open_public(
+                user("u_skew", "operator"),
+                "jti-skew",
+                deadline,
+                "ua",
+                exp + 31,
+            )
+            .err()
+            .expect("past the acceptance deadline must refuse");
+        assert_eq!(late.code(), Some("assertion_expired"));
+    }
+
+    /// CAD-1643: a jti pruned by a concurrent check must not let a request
+    /// with a stale clock open a session past the acceptance deadline.
+    #[test]
+    fn a_pruned_jti_cannot_open_past_the_acceptance_deadline() {
+        let s = state();
+        let mut auth = Auth::load(s.path());
+        let exp = T0 + 60;
+        let deadline = crate::board_identity::accepted_until(exp);
+        auth.open_public(user("u_late", "operator"), "jti-late", deadline, "ua", T0)
+            .unwrap()
+            .unwrap();
+        // A concurrent request at exp+31 prunes the spent entry.
+        auth.prune(exp + 31);
+        let late = auth
+            .open_public(
+                user("u_late", "operator"),
+                "jti-late",
+                deadline,
+                "ua",
+                exp + 31,
+            )
+            .err()
+            .expect("past the acceptance deadline must refuse");
+        assert_eq!(late.code(), Some("assertion_expired"));
+    }
+
     /// CAD-526 §4: the `jti` is single-use, and the memory is persisted —
     /// a daemon restart inside the assertion's window still refuses the
-    /// replay. Only its sha256 is stored; once `exp` passes it is
-    /// forgotten (the verifier's own expiry bound is the wall).
+    /// replay. Only its sha256 is stored; once the acceptance deadline
+    /// passes it is forgotten (the verifier's own expiry bound is the wall).
     #[test]
     fn a_spent_jti_stays_spent_across_a_reload() {
         let s = state();
@@ -1493,12 +2038,13 @@ mod tests {
             .open_public(user("u_1", "member"), "jti-9", T0 + 60, "ua", T0 + 1)
             .unwrap()
             .is_none());
-        // Past `exp` the entry is gone — the assertion would fail
-        // verification before this check anyway.
-        assert!(reloaded
+        // Past the acceptance deadline the store refuses; the verifier
+        // rejects there too.
+        let late = reloaded
             .open_public(user("u_1", "member"), "jti-9", T0 + 60, "ua", T0 + 61)
-            .unwrap()
-            .is_some());
+            .err()
+            .expect("past the acceptance deadline must refuse");
+        assert_eq!(late.code(), Some("assertion_expired"));
     }
 
     /// CAD-526 §9: one session per `sub` — a fresh sign-in ends the same
@@ -1624,6 +2170,65 @@ mod tests {
         assert!(auth
             .open_device(user("op_1", "member"), Origin::Tailnet, "ua", T0)
             .is_err());
+    }
+
+    /// CAD-1646: retiring device authority ends only device sessions — a
+    /// removed subject, then the whole flow — never a local link or public
+    /// session.
+    #[test]
+    fn device_authority_retirement_revokes_only_device_sessions() {
+        let s = state();
+        let mut auth = Auth::load(s.path());
+        let op1 = auth
+            .open_device(user("op_1", "operator"), Origin::Tailnet, "ua", T0)
+            .unwrap();
+        let op2 = auth
+            .open_device(user("op_2", "operator"), Origin::Loopback, "ua", T0)
+            .unwrap();
+        let link = opened(&mut auth, Origin::Loopback, T0);
+        let public = auth
+            .open_public(user("member", "member"), "jti-retire", T0 + 60, "ua", T0)
+            .unwrap()
+            .unwrap();
+        // Keep `op_1`: only `op_2`'s device session is retired.
+        let keep = vec!["op_1".to_string()];
+        let mut seen = 0;
+        let revoked = auth
+            .revoke_device_sessions_with_intent(Some(&keep), |targets| {
+                seen = targets.len();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(revoked, 1);
+        assert_eq!(seen, 1);
+        assert!(auth
+            .check(&op1.token, &op1.key, Origin::Tailnet, T0)
+            .unwrap()
+            .is_some());
+        assert!(auth
+            .check(&op2.token, &op2.key, Origin::Loopback, T0)
+            .unwrap()
+            .is_none());
+        assert!(auth
+            .check(&link.token, &link.key, Origin::Loopback, T0)
+            .unwrap()
+            .is_some());
+        assert!(auth.check_public(&public.token, T0).unwrap().is_some());
+        // A clear retires the remaining device session; the rest survives.
+        assert_eq!(
+            auth.revoke_device_sessions_with_intent(None, |_| Ok(()))
+                .unwrap(),
+            1
+        );
+        assert!(auth
+            .check(&op1.token, &op1.key, Origin::Tailnet, T0)
+            .unwrap()
+            .is_none());
+        assert!(auth
+            .check(&link.token, &link.key, Origin::Loopback, T0)
+            .unwrap()
+            .is_some());
+        assert!(auth.check_public(&public.token, T0).unwrap().is_some());
     }
 
     /// CAD-777: rows written before `max_idle_secs` existed keep the

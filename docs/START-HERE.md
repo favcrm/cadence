@@ -19,10 +19,13 @@ verified delivery with routine coordination handled by the system.
 | How do contributors deliver and validate work? | [Contribution guide](../CONTRIBUTING.md), [repository instructions](../AGENTS.md) and the [agent protocol](../skills/cadence/SKILL.md). Native agents read their generated briefing; external agents must not claim a native identity. |
 | What are the task/message contracts? | [RPC vocabulary](../src/proto.rs), [job handlers](../src/daemon/jobs_rpc.rs), [message handlers](../src/daemon/messages_rpc.rs), [native exact-turn steering](NATIVE_MESSAGING.md) and [durable storage](../src/store/mod.rs). Use `cadence job --help` and `cadence message --help` for the installed CLI. |
 | Where are projects, issues and memories? | [Board and tracker](BOARD.md), [issue commands](../src/issue/mod.rs), [worktree operations](../src/worktree.rs) and [memory implementation](../src/memory/mod.rs). |
-| How is company and project knowledge uploaded and retrieved? | [Wiki knowledge guide](guides/wiki-knowledge.md) — source pages, PDF extraction, search, scoped fetches and curated pages. |
+| How is company and project knowledge uploaded and retrieved? | [Wiki knowledge guide](guides/wiki-knowledge.md) — source pages, PDF extraction, search, scoped fetches and curated pages. Members may create, edit, move and delete shared pages under `global/` and `projects/<key>/`, and manage their own `users/<handle>/`. Other private and agent-owned areas stay protected. |
+| How does a hosted org reach this user's local agent? | [Local assignment client](../src/local_assignment.rs) and the [canonical fixture](design/fixtures/hosted-cadence-local-assignment.v1.json). `agent connect --alias <alias> --repo <checkout> --org <hosted>` saves the local target and picks up current work. Keep `agent watch --org <hosted>` running to consume later teammate assignments (`local-agent` remains a hidden alias). `disconnect` stops pickup, not actors. Completion reports the original claim automatically with local `cadence message result` (no `--org`). While that kickoff message is the alias's single running assignment, hosted ticket, wiki, and tool commands pass that binding's `--org` only when the saved login is still the original member and issuer; a binding without those pins cannot retarget. `org switch` stays refused. A worktree alone is not execution. |
+| How do files attach to operator chat? | [Chat attachments guide](guides/chat-attachments.md) — host-custodied uploads, the retained store, read rules and the refusal surface. |
 | How is identity and role policy enforced? | [Caller rules](../src/daemon/caller_rule.rs), [daemon identity](../src/daemon/identity.rs), [HTTP admission](../src/ui.rs), [audit](AUDIT.md) and [risk rules](roles/risk-classes.md). Source policy is not proof of a live deployment. |
 | How do agents act on external platforms? | [Platform contract schemas](../contracts/), [effect handlers](../src/daemon/effect_rpc.rs) and [platform implementation](../src/platform/). Inspect the relevant adapter and its tests before claiming a supported effect. |
 | How does a remote external agent do social management? | [External-agent social guide](guides/external-agents-social.md) — provisioned access, per-run teams, human-only sends, attribution pre-flight, revocation. |
+| How do I run a local app against real AgenticOS? | [Local AgenticOS provider](DEV-CYCLE.md#local-agenticos-provider) — sandbox profile, scopes, binding and device publish. |
 | How do reports reach the team? | [Report intake](../src/issue/report.rs) and [relay implementation](../src/issue/relay.rs). Configuration and an active consumer are separate from enqueue success. |
 | How does local hosted enrollment establish a result destination? | [AgenticOS issuer, service and short-lived browser enrollment contract](REMOTE-AUTH.md), [offline result custody and explicit sender](REMOTE-RESULT-OUTBOX.md) and [enrollment implementation](../src/remote_enrollment.rs). The sender compares the immutable result pin with the bound child record before any board request; browser consent lasts at most five minutes and requires reauthorization. |
 
@@ -50,9 +53,12 @@ versions, not only the short injected summary.
 ## Capability evidence
 
 Durable message/job storage, issue/worktree tools, scoped memory, report intake,
-relay foundations, monitor observations, UI alerts, provider profile display,
-build/test slots and structured review evidence exist in source. This list does
-not certify every adapter, configuration or deployment.
+relay foundations, revisioned task-context delivery for managed issue dispatch
+(`src/context_pack.rs`, pinned at dispatch, opted in per project with
+`agent_delivery: true`), monitor observations, UI alerts,
+provider profile display, build/test slots and structured review evidence exist
+in source. This list does not certify every adapter, configuration or
+deployment.
 
 The bounded acceptance harness was removed in the CAD-1073 clean-slate
 retirement. Its former labels and ticket evidence are preserved in git history;

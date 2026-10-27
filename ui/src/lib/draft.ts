@@ -5,7 +5,12 @@
  * failures — a private-mode tab still reloads, just without the draft.
  */
 
+import { onPrivateSessionReset } from "./privateSession";
+
 const KEY = "cadence.reload.composerDraft";
+onPrivateSessionReset(() => {
+  try { sessionStore()?.removeItem(KEY); } catch { /* Optional reload draft. */ }
+});
 
 export type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 

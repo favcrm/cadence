@@ -1,8 +1,8 @@
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch, privateReadsAllowed, privateSessionGeneration, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import type { WikiVersion } from "./history";
 import type { SearchHit } from "./search";
 import { normalizeListing, normalizePage, normalizeSearch, normalizeHistory } from "./wire";
-import { joinPath } from "./paths";
 
 /**
  * The wiki store's HTTP surface (CAD-580) as this screen reads it. One
@@ -11,7 +11,7 @@ import { joinPath } from "./paths";
  *   GET  /api/wiki/ls?path=       a folder's entries — or one entry's kind
  *   GET  /api/wiki/file?path=     text as JSON; blobs streamed (Range)
  *   PUT  /api/wiki/file           {path, text, if_rev}
- *   POST /api/wiki/upload         multipart, one file per request
+ *   POST /api/wiki/transfer       the durable import job (see transfer.ts)
  *   POST /api/wiki/mkdir|mv|rm    {path}, {from, to}, {path}
  *   GET  /api/wiki/search?q=      full-text search
  *   GET  /api/wiki/history?path=  git log (current daemon has no diff/restore)
@@ -62,6 +62,8 @@ export interface WikiPage {
   size?: number;
   mime?: string | null;
   sha256?: string;
+  /** Set when this page was read with an explicit `at` selector. */
+  historical?: boolean;
 }
 
 export interface WikiSearchResponse {
@@ -145,20 +147,30 @@ export function blobPage(entry: WikiEntry): WikiPage {
   };
 }
 
-function get<T>(url: string): Promise<T> {
-  return fetch(url, { headers: sessionHeaders() }).then(json<T>);
+function get<T>(url: string, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(url, { headers: sessionHeaders() }, op);
+    const value = await json<T>(resp);
+    op.assertCurrent();
+    return value;
+  });
 }
 
-function send<T>(method: "PUT" | "POST", url: string, body: object): Promise<T> {
-  return fetch(url, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: JSON.stringify(body),
-  }).then(json<T>);
+function send<T>(method: "PUT" | "POST", url: string, body: object, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(url, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: JSON.stringify(body),
+    }, op);
+    const value = await json<T>(resp);
+    op.assertCurrent();
+    return value;
+  });
 }
 
 export function lsQuery(path: string): string {
@@ -169,19 +181,23 @@ export function fileQuery(path: string): string {
   return `/api/wiki/file?path=${encodeURIComponent(path)}`;
 }
 
-/** The blob URL for `<img>`/`<video>`/`<iframe>` — the cookie authenticates. */
-export function wikiFileUrl(path: string): string {
-  return fileQuery(path);
-}
-
 /**
- * The raw bytes of a text page for the Download action: the file route
- * answers JSON by default (CAD-580), and `raw=1` asks for the file
- * itself. A contract question is open on CAD-580; if it settles on
- * another flag this is the one place to change.
+ * Blob bytes are fetched with this tab's session header, never by element
+ * URLs. Callers render data: images or local blob: previews/downloads and
+ * must fence their own asynchronous encoding and revoke owned object URLs.
  */
-export function wikiRawUrl(path: string): string {
-  return `${fileQuery(path)}&raw=1`;
+export async function wikiBlob(path: string, signal?: AbortSignal, operation?: PrivateOperation): Promise<Blob> {
+  const generation = privateSessionGeneration();
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(fileQuery(path), { headers: sessionHeaders(), signal }, op);
+    const value = resp.ok ? await resp.blob() : await resp.json().catch(() => null);
+    op.assertCurrent();
+    if (signal?.aborted || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
+      throw new DOMException("The private session changed", "AbortError");
+    }
+    if (!resp.ok) throw wikiErrorFrom(resp.status, value);
+    return value as Blob;
+  }, signal);
 }
 
 export function searchQuery(query: string, type?: string, path?: string): string {
@@ -196,14 +212,6 @@ export function historyQuery(path: string, from?: string, to?: string): string {
   if (from) params.set("from", from);
   if (to) params.set("to", to);
   return `/api/wiki/history?${params.toString()}`;
-}
-
-export function uploadTargetPath(dir: string, filename: string): string {
-  return joinPath(dir, filename);
-}
-
-export function uploadQuery(path: string): string {
-  return `/api/wiki/upload?path=${encodeURIComponent(path)}`;
 }
 
 export const mkdirBody = (path: string) => ({ path });
@@ -224,59 +232,3 @@ export const wiki = {
   restore: (path: string, rev: string) =>
     send<WikiPage>("POST", "/api/wiki/restore", { path, rev }),
 };
-
-/**
- * One upload, with progress (fetch cannot report it). The file part is
- * `file`; the target folder travels in the query and as a `path` field,
- * so either convention the server settles on works. The server's own
- * refusal — size, MIME, secret scan — surfaces as this file's error.
- */
-export interface UploadResult {
-  extraction?: { status: string; reason?: string; path?: string };
-}
-
-export function uploadFile(
-  dir: string,
-  file: File,
-  onProgress?: (percent: number) => void,
-): Promise<UploadResult> {
-  return new Promise((resolve, reject) => {
-    const path = uploadTargetPath(dir, file.name);
-    const form = new FormData();
-    form.append("path", path);
-    form.append("file", file, file.name);
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", uploadQuery(path));
-    xhr.setRequestHeader("X-Cadence-Board", "1");
-    for (const [key, value] of Object.entries(sessionHeaders())) xhr.setRequestHeader(key, value);
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable && onProgress) onProgress((e.loaded / e.total) * 100);
-    };
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        let body: UploadResult = {};
-        try {
-          body = JSON.parse(xhr.responseText) as UploadResult;
-        } catch {
-          body = {};
-        }
-        if ((body as UploadResult & { conflict?: string }).conflict === "if_rev") {
-          reject(wikiErrorFrom(409, { ...body, error: "This file changed during upload", code: "conflict" }));
-          return;
-        }
-        onProgress?.(100);
-        resolve(body);
-        return;
-      }
-      let body: unknown = null;
-      try {
-        body = JSON.parse(xhr.responseText);
-      } catch {
-        body = null;
-      }
-      reject(wikiErrorFrom(xhr.status, body));
-    };
-    xhr.onerror = () => reject(new WikiError("upload failed — connection lost", 0));
-    xhr.send(form);
-  });
-}

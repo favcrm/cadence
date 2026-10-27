@@ -1,3 +1,6 @@
+import type * as EvidenceModule from "../src/features/issues/Evidence";
+import type * as SessionKeyModule from "../src/lib/sessionKey";
+import type * as PrivateSessionModule from "../src/lib/privateSession";
 export {};
 /** Real Setup and shared stores: loading, readiness, project refresh and copy feedback. */
 declare function require(name: string): any;
@@ -16,6 +19,8 @@ for (const name of [
   "MouseEvent",
   "location",
   "history",
+  "FileReader",
+  "sessionStorage",
 ])
   Object.defineProperty(globalThis, name, {
     value: name === "window" ? win : win[name],
@@ -40,8 +45,11 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } =
   require("react-dom/client") as typeof import("react-dom/client");
-const IssuePage = require("../src/features/issues/IssuePage")
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const IssuePageComponent = require("../src/features/issues/IssuePage")
   .default as typeof import("../src/features/issues/IssuePage").default;
+const IssuePage = (props: React.ComponentProps<typeof IssuePageComponent>) =>
+  React.createElement(LocaleProvider, null, React.createElement(IssuePageComponent, props));
 const { resources } =
   require("../src/lib/resources") as typeof import("../src/lib/resources");
 type Detail = import("../src/lib/types").IssueDetail;
@@ -60,7 +68,7 @@ const detail = (id: string): Detail => ({
   blocked: false,
   created: "2026-09-26T00:00:00Z",
   rev: "r1",
-  counts: { comments: 0, artifacts: 0, refs: 0 },
+  paths: [], tags: [], work: { type: "task", type_source: "implicit", weight: 1 },
   checks: { done: 0, total: 1 },
   frontmatter: {},
   body: "Goal text.\n\n## Acceptance\n- [ ] Unique criterion",
@@ -466,6 +474,105 @@ async function run() {
       !text().includes("Checks, verdicts, and the merge queue show up"),
       "Empty PR does not promise unsupported data",
     );
+  }
+  if (scenario === "all" || scenario === "evidence") {
+    const { Evidence } = require("../src/features/issues/Evidence") as typeof EvidenceModule;
+    const { setSessionKey } = require("../src/lib/sessionKey") as typeof SessionKeyModule;
+    const { allowPrivateReads } = require("../src/lib/privateSession") as typeof PrivateSessionModule;
+    const originalFetch = globalThis.fetch;
+    const originalCreate = URL.createObjectURL;
+    const originalRevoke = URL.revokeObjectURL;
+    const created: string[] = [];
+    const revoked: string[] = [];
+    const requests: { path: string; init?: RequestInit; resolve: (response: Response) => void }[] = [];
+    URL.createObjectURL = () => {
+      const url = `blob:http://localhost/artifact-${created.length}`;
+      created.push(url);
+      return url;
+    };
+    URL.revokeObjectURL = (url) => { revoked.push(url); };
+    globalThis.fetch = (input, init) => new Promise<Response>((resolve) => {
+      requests.push({ path: String(input), init, resolve });
+    });
+    allowPrivateReads();
+    setSessionKey("artifact-session-secret");
+    const artifactResponse = (mime: string) => {
+      const response = new Response(null, { headers: { "Content-Type": mime } });
+      // happy-dom's FileReader consumes its own Blob implementation.
+      response.blob = async () => new win.Blob(["artifact bytes"], { type: mime }) as Blob;
+      return response;
+    };
+    const renderEvidence = async (issue: string) => {
+      await React.act(async () => root.render(React.createElement(Evidence, {
+        id: issue,
+        images: [{ name: "screen shot.png", size: 14 }],
+        files: [{ name: "report.html", size: 14 }],
+        readOnly: true,
+        onWrite: () => {},
+        onError: () => {},
+      })));
+      await flush();
+    };
+    try {
+      await renderEvidence("CAD-1");
+      assert(requests.length === 2, "Evidence fetches each artifact through the private transport");
+      for (const request of requests) {
+        assert(new Headers(request.init?.headers).get("X-Cadence-Session") === "artifact-session-secret", "Artifact reads carry the tab session header");
+        assert(request.init?.credentials === "same-origin", "Artifact reads retain the existing cookie");
+        assert(!request.path.includes("artifact-session-secret") && !request.path.includes("?"), "Artifact URLs never carry credentials");
+      }
+      assert(requests[0].path === "/api/issues/CAD-1/artifacts/screen%20shot.png", "Artifact filenames remain encoded in the private request");
+      assert(host.querySelector('[role="status"]'), "Pending artifact reads have accessible loading status");
+      assert(!host.querySelector("a[href], img[src]"), "No browser element navigates to the private file route");
+      await React.act(async () => {
+        requests[0].resolve(artifactResponse("image/png"));
+        requests[1].resolve(artifactResponse("application/octet-stream"));
+      });
+      await flush();
+      const image = host.querySelector("img");
+      assert(image !== null, "Authenticated screenshot bytes mount a preview image");
+      assert(image.src.startsWith("data:image/png;") && image.alt === "screen shot.png", "Screenshots retain CSP-compatible previews and their accessible filename");
+      const imageLink = image.closest("a");
+      assert(imageLink?.href.startsWith("blob:") && imageLink.target === "_blank" && !imageLink.hasAttribute("download"), "Only raster screenshot blobs retain inline view");
+      const download = host.querySelector('a[download="report.html"]');
+      assert(download?.getAttribute("href")?.startsWith("blob:") && download.textContent === "report.html" && !download.hasAttribute("target"), "Active attachments download authenticated bytes with the original filename");
+
+      await renderEvidence("CAD-2");
+      assert(created.every((url) => revoked.includes(url)), "Navigating between issues revokes every previous object URL");
+      assert(!host.querySelector("img, a[href]"), "New issue never displays the previous issue's bytes");
+      await React.act(async () => {
+        requests[2].resolve(artifactResponse("image/svg+xml"));
+        requests[3].resolve(new Response(null, { status: 503 }));
+      });
+      await flush();
+      assert(!host.querySelector("img"), "Unexpected active image MIME never becomes a preview");
+      assert(host.querySelector('a[download="screen shot.png"]'), "Unexpected active image MIME downloads instead of opening inline");
+      assert(host.querySelector('[role="alert"]')?.textContent?.includes("report.html"), "Failed reads identify the attachment accessibly");
+      const retry = host.querySelector('button[aria-label="Retry report.html"]');
+      await click(retry);
+      assert(Number(requests.length) === 5, "Retry fetches the failed attachment again");
+      await React.act(async () => requests[4].resolve(artifactResponse("text/plain")));
+      await flush();
+      assert(host.querySelector('a[download="report.html"]'), "Retry restores a usable attachment download");
+
+      await renderEvidence("CAD-3");
+      const countBeforeUnmount = created.length;
+      await React.act(async () => root.render(null));
+      assert(requests[5].init?.signal?.aborted && requests[6].init?.signal?.aborted, "Unmount aborts pending artifact reads");
+      await React.act(async () => {
+        requests[5].resolve(artifactResponse("image/png"));
+        requests[6].resolve(artifactResponse("text/plain"));
+      });
+      await flush();
+      assert(created.length === countBeforeUnmount, "Late responses cannot create URLs after their effect is disposed");
+      assert(created.every((url) => revoked.includes(url)), "Unmount leaves no owned artifact object URLs");
+    } finally {
+      await React.act(async () => root.render(null));
+      globalThis.fetch = originalFetch;
+      URL.createObjectURL = originalCreate;
+      URL.revokeObjectURL = originalRevoke;
+      setSessionKey(null);
+    }
   }
   await React.act(async () => root.unmount());
   await win.happyDOM.close();

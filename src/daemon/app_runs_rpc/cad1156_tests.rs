@@ -192,7 +192,7 @@ impl Fx {
 
     fn install_social(&self, connection: &str) -> (String, String) {
         let source = format!(
-            "{}/workspace-apps/social-content",
+            "{}/tests/fixtures/apps/social-content",
             env!("CARGO_MANIFEST_DIR")
         );
         let installed = self.op("app_workspace_install", json!({"source": source}));
@@ -243,6 +243,17 @@ impl Fx {
             );
             let taken = checked(store.message(&taken.id), "turn reread failed")
                 .unwrap_or_else(|| panic!("claimed turn missing"));
+            if step == 1 {
+                let artifact = run["artifacts"][0]["id"].as_str().unwrap();
+                checked(
+                    store.app_artifact_with_digest(
+                        artifact,
+                        Some((&taken.id, taken.turn_id.as_deref().unwrap())),
+                        bundle,
+                    ),
+                    "guarded dependency fetch failed",
+                );
+            }
             let reply = json!({"turn_id": taken.turn_id, "text": reply.to_string()});
             checked(
                 store.finish(&taken, "completed", &reply, None),
@@ -621,5 +632,43 @@ fn smtp_leak_screen_diagnostic_boolean_only() {
     assert!(
         !secret_preview,
         "password-only screen must permit this clean preview"
+    );
+}
+
+/// CAD-1258: the release provider call and read-back run with the PM lock
+/// free (accept executes through the real `app_effect_decide`).
+#[test]
+fn cad1258_release_provider_call_runs_outside_the_pm_lock() {
+    let fx = Fx::new(None);
+    let connection = fx.enroll_smtp("leg-1258");
+    let (install, bundle) = fx.install_social(&connection);
+    let (run, artifact_id) = fx.publication_run(&install, &bundle, "r-1258");
+    let staged = fx.op(
+        "app_effect_stage",
+        json!({"run_id":run,"artifact_id":artifact_id,
+        "slot":"publication","request_id":"rel-1258","title":"Sprint notes — public"}),
+    );
+    let pm_dir = fx.dir.path().join("pm");
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let log = seen.clone();
+    crate::issue::lockseam::set_hook(Some(Box::new(move |point| {
+        let free = crate::issue::Pm::at(&pm_dir)
+            .unwrap()
+            .try_lock()
+            .unwrap()
+            .is_some();
+        assert!(free, "PM lock held during {point}");
+        log.borrow_mut().push(point.to_string());
+    })));
+    let decided = fx.call(
+        "app_effect_decide",
+        json!({"effect_id":staged["effect"]["effect_id"],"digest":staged["effect"]["digest"],
+        "decision":"accept"}),
+    );
+    crate::issue::lockseam::set_hook(None);
+    assert!(decided.is_ok(), "accept must execute through the real RPC");
+    assert_eq!(
+        *seen.borrow(),
+        ["app-release-provider-call", "app-release-before-record"]
     );
 }

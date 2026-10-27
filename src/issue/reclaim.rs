@@ -52,6 +52,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
+use crate::issue::process_use::{self, ProcessUseProbe};
 use crate::issue::{board, finish, write, Pm};
 
 /// Default idle window for `target/` reclaim — `[host]
@@ -243,8 +244,6 @@ fn reclaim_target(lane: &Path, cargo_target: Option<&str>) -> Result<Option<Path
 /// daemon enumeration, a registered agent whose cwd is bound to it, or
 /// a live/unknown message or task bound to it (finish's in-use
 /// evaluation). Re-run against a fresh `view` right before the delete.
-type ProcessUseProbe = finish::ProcessUseProbe;
-
 fn live_reason_with_process_probe(
     view: &finish::DaemonView,
     state_dir: &Path,
@@ -296,7 +295,7 @@ fn blocked_reason(
         lane,
         idle,
         cap,
-        &finish::process_use_under,
+        &process_use::process_use_under,
     )
 }
 
@@ -339,7 +338,13 @@ pub fn run(pm: &Pm, state_dir: &Path, actor: &str) -> Result<Value> {
 /// (`pm.yaml [host] reclaim_target_idle_secs`, default 6 h). Tests pass a
 /// short window instead of aging a fixture for hours.
 pub fn run_with_idle(pm: &Pm, state_dir: &Path, actor: &str, idle_secs: u64) -> Result<Value> {
-    run_with_process_probe(pm, state_dir, actor, idle_secs, &finish::process_use_under)
+    run_with_process_probe(
+        pm,
+        state_dir,
+        actor,
+        idle_secs,
+        &process_use::process_use_under,
+    )
 }
 
 /// Test-only process-scan inputs for exercising the real target-reclaim path.
@@ -370,18 +375,20 @@ pub fn run_with_idle_test_process_use(
     test_process_use: ReclaimTestProcessUse,
 ) -> Result<Value> {
     let probe = move |lane: &Path| match &test_process_use {
-        ReclaimTestProcessUse::CompleteNoUse => Ok(finish::ProcessUse {
+        ReclaimTestProcessUse::CompleteNoUse => Ok(process_use::ProcessUse {
             cwd: Vec::new(),
             fd: Vec::new(),
             enumeration_error: None,
+            excused: Vec::new(),
         }),
-        ReclaimTestProcessUse::Incomplete(reason) => Ok(finish::ProcessUse {
+        ReclaimTestProcessUse::Incomplete(reason) => Ok(process_use::ProcessUse {
             cwd: Vec::new(),
             fd: Vec::new(),
             enumeration_error: Some(reason.clone()),
+            excused: Vec::new(),
         }),
         ReclaimTestProcessUse::ScanProcRoot(proc_root) => {
-            finish::process_use_under_from_proc_root(lane, proc_root)
+            process_use::process_use_under_from_proc_root(lane, proc_root)
         }
     };
     run_with_process_probe(pm, state_dir, actor, idle_secs, &probe)
@@ -706,7 +713,7 @@ fn reclaim_lane_detailed(
         pm,
         idle,
         actor,
-        process_use_probe: &finish::process_use_under,
+        process_use_probe: &process_use::process_use_under,
     };
     reclaim_lane_with_context(&context, issue, lane)
 }
@@ -929,6 +936,7 @@ mod tests {
             repos: vec![crate::issue::project::Repo {
                 path: Some(repo.display().to_string()),
                 remote: None,
+                base: None,
             }],
             components: Vec::new(),
             tags: Vec::new(),
@@ -936,6 +944,8 @@ mod tests {
             build: None,
             memory: None,
             intake: None,
+            id: None,
+            policy: None,
         };
         std::fs::write(
             project_dir.join("project.yaml"),
@@ -1069,6 +1079,10 @@ mod tests {
         std::fs::create_dir_all(lane.join("src")).unwrap();
         std::fs::write(lane.join("src/keep.rs"), b"work").unwrap();
         age(&lane, 7 * 3600);
+        let proc_root = tmp.0.join("proc");
+        std::fs::create_dir_all(&proc_root).unwrap();
+        seed_synthetic_proc_view(&proc_root);
+        let _proc_root = process_use::use_process_proc_root_for_test(proc_root);
         for forged in [lane.clone(), lane.join("src")] {
             let r = reclaim(&tmp, &lane, forged.to_str());
             assert!(!matches!(r, Ok(Some(_))), "{} reclaimed", forged.display());
@@ -1201,7 +1215,7 @@ mod tests {
         age(&lane, 7 * 3600);
         let proc_root = tmp.0.join("proc");
         std::fs::create_dir_all(proc_root.join("4294967294")).unwrap();
-        let _proc_root = finish::use_process_proc_root_for_test(proc_root);
+        let _proc_root = process_use::use_process_proc_root_for_test(proc_root);
         let front = issue_with(&lane, None).front;
         let idle = Duration::from_secs(6 * 3600);
         let reason = blocked_reason(&down_view(), &no_daemon(), &front, &lane, idle, WALK_CAP)
@@ -1333,7 +1347,7 @@ mod tests {
         let proc_root = tmp.0.join("proc");
         std::fs::create_dir_all(&proc_root).unwrap();
         seed_synthetic_proc_view(&proc_root);
-        let _proc_root = finish::use_process_proc_root_for_test(proc_root.clone());
+        let _proc_root = process_use::use_process_proc_root_for_test(proc_root.clone());
         PLANT_PROC_ROOT.with(|root| *root.borrow_mut() = Some(proc_root));
         PLANT_ARMED.with(|a| a.set(true));
         let bytes = reclaim(&tmp, &lane, None);

@@ -1,9 +1,19 @@
 [package]
 name = "cadence-agent"
-version = "0.1.0-beta.2"
+version = "0.3.3"
 edition = "2021"
+# CAD-1727: `tests/*.rs` are modules of the one `suite` target below, not
+# one linked executable each. 109 executables cost 15.74 GiB per lane and
+# every `src/` change relinked all of them; sccache cannot cache `test`
+# crates (only rlib/metadata outputs). nextest still runs each test in its
+# own process, so isolation and suite-lock rules are unchanged.
+autotests = false
 license = "MIT"
 description = "Local controller coordinating coding agents across terminals"
+
+[workspace]
+members = ["crates/cadence-core"]
+resolver = "2"
 
 [lib]
 name = "cadence_agent"
@@ -45,15 +55,10 @@ name = "cadence-enrolled-recipient"
 path = "src/bin/cadence-enrolled-recipient/main.rs"
 
 [features]
-# Embed the built `ui/` SPA into the binary. Requires `pnpm build` inside
+# Embed the built `ui/` SPA into the binary. Requires `bun run build` inside
 # `ui/` first; without the feature `cadence ui run --dist <dir>` serves
 # the same files from disk.
 ui = []
-# CAD-433: build the MVP journey test (`tests/e2e_mvp.rs`). It needs a
-# release built and packed by `scripts/e2e/mvp.sh`, Node and Chrome, so
-# it is its own opt-in target — never part of `cargo test` or the PR
-# suite; CI runs it nightly and on every `v*` tag.
-e2e = []
 # CAD-482/CAD-848: test-only caller-identity and process-scan seams.
 # Fixture daemons honor explicit `test_caller` assertions; isolated reclaim
 # and review tests can inject proc roots. The compile_error! in
@@ -67,7 +72,78 @@ test-seam = []
 # .cadence/native-fixture-public-root-v1.txt — no env/argv/request key path.
 native-fixture-admission = []
 
+# CAD-1568: manual cross-repository CLI/runtime acceptance. The ignored
+# packaged-CLI scenario drives a `cargo build --features test-seam` binary
+# against real AOS test handlers; never part of ordinary `cargo test`.
+cli-runtime-test = ["test-seam"]
+
+# CAD-1727: the one integration-test binary; the remaining `tests/*.rs`
+# files are its modules. cad1703 keeps its `#![cfg(feature = "test-seam")]`
+# gate as a module attribute, so no required-features entry is needed.
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
+
+# CAD-1727: these checks re-exec `current_exe()` with `--exact <fn>`; the
+# child filter only matches an unprefixed test name, which a module of
+# `suite` no longer has. Keep each as its own declared target instead of
+# editing acceptance checks written by reviewers.
+[[test]]
+name = "cad1065_operator_gate"
+path = "tests/cad1065_operator_gate.rs"
+[[test]]
+name = "cad1158_lease_off_smtp_refusal"
+path = "tests/cad1158_lease_off_smtp_refusal.rs"
+[[test]]
+name = "cad1158_smtp_startup"
+path = "tests/cad1158_smtp_startup.rs"
+[[test]]
+name = "cad1191_concurrent_start_acceptance"
+path = "tests/cad1191_concurrent_start_acceptance.rs"
+[[test]]
+name = "cad1196_finish_host_acceptance"
+path = "tests/cad1196_finish_host_acceptance.rs"
+[[test]]
+name = "cad1210_test_binary_guard_acceptance"
+path = "tests/cad1210_test_binary_guard_acceptance.rs"
+[[test]]
+name = "cad1236_host_requirements_acceptance"
+path = "tests/cad1236_host_requirements_acceptance.rs"
+[[test]]
+name = "cad1244_builtin_upgrade_acceptance"
+path = "tests/cad1244_builtin_upgrade_acceptance.rs"
+[[test]]
+name = "cad1425_client_update_refusal_acceptance"
+path = "tests/cad1425_client_update_refusal_acceptance.rs"
+[[test]]
+name = "cad1377_reconcile_acceptance"
+path = "tests/cad1377_reconcile_acceptance.rs"
+[[test]]
+name = "cad1508_binding_carry_acceptance"
+path = "tests/cad1508_binding_carry_acceptance.rs"
+[[test]]
+name = "cad1534_lane_base_acceptance"
+path = "tests/cad1534_lane_base_acceptance.rs"
+[[test]]
+name = "cad1676_seat_dispatch_acceptance"
+path = "tests/cad1676_seat_dispatch_acceptance.rs"
+[[test]]
+name = "cad848_deletion_refusal"
+path = "tests/cad848_deletion_refusal.rs"
+[[test]]
+name = "cad848_reclaim_enumeration_refusal"
+path = "tests/cad848_reclaim_enumeration_refusal.rs"
+# CAD-1739: the hosted app acceptance needs the caller-identity seam. Without
+# the entry `autotests = false` hides the file from `scripts/result-test-args`,
+# and without `required-features` a default `cargo test` lane would link a
+# target whose guard body only panics.
+[[test]]
+name = "cad1739_hosted_app_public_acceptance"
+path = "tests/cad1739_hosted_app_public_acceptance.rs"
+required-features = ["test-seam"]
+
 [dependencies]
+cadence-core = { path = "crates/cadence-core" }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 # Frozen app/agent identity receipts must survive production JSON reads.
@@ -88,7 +164,7 @@ tiny_http = "0.12"
 qrcode = { version = "0.14.1", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tungstenite = "0.26"
+tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tempfile = "3"
 toml = "0.8"
 # CAD-109 secret scan: the vendored gitleaks rule pack is RE2 syntax, which
@@ -113,6 +189,16 @@ webpki-roots = { version = "1" }
 # Decode retained CDN bytes before issuing an image asset receipt.
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 ammonia = "4"
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# CAD-1423: P-256 point check for push subscription keys (already in the lock).
+p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+# CAD-1128: dedicated encrypted-SQLite custody — XChaCha20-Poly1305
+# envelope (RustCrypto AEAD, alloc-only) over zeroized key handling.
+# `ring` above stays the JWS verifier; no second crypto stack is
+# introduced for custody.
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 
 # CAD-1073: the legacy e2e target was retired with the suite; the
 # safety-floor binary in tests/ is autodiscovered and needs no entry.
@@ -136,6 +222,11 @@ incremental = false
 # 6.2 GB target dir. Line tables keep panic locations and backtrace
 # file:line while cutting that to ~3.2 GB and ~3.0 GB.
 debug = "line-tables-only"
+
+# CAD-1367: cached dependencies run faster in image-heavy acceptance tests.
+# Keep the workspace crate at O0 and retain test debug assertions.
+[profile.test.package."*"]
+opt-level = 1
 
 # CAD-1103: PR/merge-queue gate profile. Used ONLY by the ci.yml `build` and
 # `ui` jobs, which prove "compiles, links, no test seam, migration rehearsal",

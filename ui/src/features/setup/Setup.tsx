@@ -16,7 +16,8 @@ import {
   type SetupReport,
   type Tone,
 } from "./checks";
-import { recheckSetup, setupResource, SETUP_ON_HOST } from "./setupApi";
+import { recheckSetup, setupResource, SETUP_HOSTED, SETUP_ON_HOST } from "./setupApi";
+import { useTranslate } from "../../lib/locale";
 import "./setup.css";
 
 type StepId = "environment" | "agents" | "master" | "project";
@@ -80,6 +81,7 @@ function readiness(
 }
 
 function CopyFix({ command }: { command: string }) {
+  const t = useTranslate();
   const [result, setResult] = useState<{
     command: string;
     copied: boolean;
@@ -91,7 +93,7 @@ function CopyFix({ command }: { command: string }) {
         <code className="num">{command}</code>
         <Button
           size="sm"
-          aria-label={`Copy command: ${command}`}
+          aria-label={`${t("Copy command")}: ${command}`}
           onClick={async () => {
             try {
               if (!navigator.clipboard)
@@ -103,14 +105,14 @@ function CopyFix({ command }: { command: string }) {
             }
           }}
         >
-          {outcome?.copied ? "Copied" : "Copy"}
+          {outcome?.copied ? t("Copied") : t("Copy")}
         </Button>
       </div>
       <p className="setup-copy-feedback" role="status">
         {outcome
           ? outcome.copied
-            ? "Command copied."
-            : "Copy unavailable. Select and copy the command."
+            ? t("Command copied.")
+            : t("Copy unavailable. Select and copy the command.")
           : null}
       </p>
     </div>
@@ -118,11 +120,11 @@ function CopyFix({ command }: { command: string }) {
 }
 
 function CheckList({ checks }: { checks: SetupCheck[] }) {
+  const t = useTranslate();
   if (checks.length === 0)
     return (
       <div className="card setup-empty" role="status">
-        No checks were reported for this section. Check again to refresh the
-        host report.
+        {t("No checks were reported for this section. Check again to refresh the host report.")}
       </div>
     );
   return (
@@ -145,6 +147,7 @@ function CheckList({ checks }: { checks: SetupCheck[] }) {
 }
 
 function MasterProviders({ report }: { report: SetupReport }) {
+  const t = useTranslate();
   const offers = report.master?.providers ?? [];
   const files = report.checks.find((c) => c.check === "master");
   if (
@@ -156,8 +159,7 @@ function MasterProviders({ report }: { report: SetupReport }) {
   return (
     <div className="card setup-provider-offers">
       <p className="text-secondary text-ink-400">
-        <span className="font-medium text-ink-200">Choose a provider.</span> Run
-        its command on the host to prepare and start the master.
+        <span className="font-medium text-ink-200">{t("Choose a provider.")}</span> {t("Run its command on the host to prepare and start the master.")}
       </p>
       <ul className="setup-offers">
         {offers.map((o) => {
@@ -208,23 +210,23 @@ function StepBody({
   projectsLoading: boolean;
   retryProjects: () => void;
 }) {
+  const t = useTranslate();
   switch (step) {
     case "environment": {
       const checks = inGroup(report, "environment");
       return (
         <>
-          <h2>Environment</h2>
+          <h2>{t("Environment")}</h2>
           <p className="setup-intro">
-            The host's state, tracker and daemon. Follow a command below for any
-            check that needs attention.
+            {t("The host's state, tracker and daemon. Follow a command below for any check that needs attention.")}
           </p>
           <CheckList checks={checks} />
           {checks.some((check) => !isReady(check)) &&
             !checks.some((check) => check.fix === "cadence setup") && (
               <div className="card setup-help">
                 <p>
-                  Prepare missing essentials with{" "}
-                  <code className="num">cadence setup</code>, then check again.
+                  {t("Prepare missing essentials with")}{" "}
+                  <code className="num">cadence setup</code>, {t("then check again.")}
                 </p>
                 <CopyFix command="cadence setup" />
               </div>
@@ -235,21 +237,20 @@ function StepBody({
     case "agents":
       return (
         <>
-          <h2>Agent CLIs</h2>
+          <h2>{t("Agent CLIs")}</h2>
           <p className="setup-intro">
-            Installed and signed-in CLIs. The master needs one of its supported
-            providers; other CLIs can be used as workers.
+            {t("Installed and signed-in CLIs. The master needs one of its supported providers; other CLIs can be used as workers.")}
           </p>
           {report && (
             <p className="setup-provider-note">
-              Master providers:{" "}
+              {t("Master providers:")}{" "}
               {(
                 report.master?.providers.map((provider) => provider.bin) ?? [
                   ...MASTER_CLIS,
                 ]
               )
                 .map(checkLabel)
-                .join(", ") || "None reported"}
+                .join(", ") || t("None reported")}
               .
             </p>
           )}
@@ -259,10 +260,9 @@ function StepBody({
     case "master":
       return (
         <>
-          <h2>Master agent</h2>
+          <h2>{t("Master agent")}</h2>
           <p className="setup-intro">
-            Choose a supported provider and follow the host's commands to
-            prepare the master.
+            {t("Choose a supported provider and follow the host's commands to prepare the master.")}
           </p>
           {report && <MasterProviders report={report} />}
           <CheckList checks={inGroup(report, "master")} />
@@ -271,25 +271,25 @@ function StepBody({
     case "project":
       return (
         <>
-          <h2>Projects</h2>
+          <h2>{t("Projects")}</h2>
           <p className="setup-intro">
-            Register a repository so the master has a project to work on.
+            {t("Register a repository so the master has a project to work on.")}
           </p>
           {projectsLoading && (
             <p className="setup-inline-status" role="status">
-              Checking projects…
+              {t("Checking projects…")}
             </p>
           )}
           {projectError && (
             <div className="setup-error" role="alert">
               <span>
-                Could not refresh projects — {projectError}.{" "}
+                {t("Could not refresh projects")} — {projectError}.{" "}
                 {projects
-                  ? "Showing the last known list."
-                  : "Project readiness is unknown."}
+                  ? t("Showing the last known list.")
+                  : t("Project readiness is unknown.")}
               </span>
               <Button onClick={retryProjects} disabled={projectsLoading}>
-                Retry projects
+                {t("Retry projects")}
               </Button>
             </div>
           )}
@@ -299,7 +299,7 @@ function StepBody({
                 <>
                   <div className="setup-check-heading">
                     <span>
-                      {projects.length} registered project
+                      {projects.length} {t("registered project")}
                       {projects.length === 1 ? "" : "s"}
                     </span>
                     <Link
@@ -310,7 +310,7 @@ function StepBody({
                         section: "overview",
                       })}
                     >
-                      Open projects
+                      {t("Open projects")}
                     </Link>
                   </div>
                   <ul className="setup-project-list">
@@ -329,22 +329,21 @@ function StepBody({
                       </li>
                     ))}
                   </ul>
-                  <p>Add another repository:</p>
+                  <p>{t("Add another repository:")}</p>
                 </>
               ) : (
                 <>
                   <div className="setup-check-heading">
-                    <span>No projects yet</span>
+                    <span>{t("No projects yet")}</span>
                   </div>
                   <p>
-                    Run this command on the host with your project key and
-                    repository path:
+                    {t("Run this command on the host with your project key and repository path:")}
                   </p>
                 </>
               )}
               <CopyFix command="cadence project new <key> --repo <path>" />
               <p className="setup-project-hint">
-                Then choose Check again to refresh the project list.
+                {t("Then choose Check again to refresh the project list.")}
               </p>
             </div>
           )}
@@ -354,17 +353,30 @@ function StepBody({
 }
 
 function OnHost() {
+  const t = useTranslate();
   return (
     <main className="setup-page">
-      <h1>Setup</h1>
+      <h1>{t("Setup")}</h1>
       <div className="card setup-host" role="status">
-        <h2>Continue on the host</h2>
+        <h2>{t("Continue on the host")}</h2>
         <p>
-          Setup checks inspect the machine running Cadence. Open the board at{" "}
-          <code className="num">127.0.0.1</code> on that machine, or run this
-          command in its terminal.
+          {t("Setup checks inspect the machine running Cadence. Open the board at")}{" "}
+          <code className="num">127.0.0.1</code> {t("on that machine, or run this command in its terminal.")}
         </p>
         <CopyFix command="cadence setup" />
+      </div>
+    </main>
+  );
+}
+
+function Hosted() {
+  const t = useTranslate();
+  return (
+    <main className="setup-page">
+      <h1>{t("Setup")}</h1>
+      <div className="card setup-host" role="status">
+        <h2>{t("Setup is handled for you")}</h2>
+        <p>{t("This workspace is set up for you, so there is nothing to run here.")}</p>
       </div>
     </main>
   );
@@ -378,12 +390,13 @@ export default function Setup({
   settingsHref: string;
   readOnly: boolean | null;
 }) {
+  const t = useTranslate();
   if (readOnly === null)
     return (
       <main className="setup-page">
-        <h1>Setup</h1>
+        <h1>{t("Setup")}</h1>
         <p className="setup-inline-status" role="status">
-          Checking access…
+          {t("Checking access…")}
         </p>
       </main>
     );
@@ -391,6 +404,7 @@ export default function Setup({
 }
 
 function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
+  const t = useTranslate();
   const state = useQuery(setupResource),
     projectsState = useQuery(resources.projects);
   const [step, setStep] = useState<StepId>("environment");
@@ -448,6 +462,7 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
     }
   };
   if (state.error === SETUP_ON_HOST) return <OnHost />;
+  if (state.error === SETUP_HOSTED) return <Hosted />;
   const sectionStates = STEPS.map((section) => sectionReady(section.id));
   const attentionCount = sectionStates.filter(
     (status) => status === "attention",
@@ -457,29 +472,29 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
   ).length;
   const summary = !report
     ? state.error
-      ? "Setup checks unavailable"
-      : "Checking setup…"
+      ? t("Setup checks unavailable")
+      : t("Checking setup…")
     : stale
-      ? "Checks need refreshing"
+      ? t("Checks need refreshing")
       : busy
-        ? "Checking readiness…"
+        ? t("Checking readiness…")
         : projects === null
-          ? "Project readiness is unknown"
+          ? t("Project readiness is unknown")
           : unknownCount > 0
             ? `${unknownCount} section${unknownCount === 1 ? "" : "s"} not checked`
             : attentionCount > 0 && (attentionCount > 1 || projects.length > 0)
               ? `${attentionCount} section${attentionCount === 1 ? " needs" : "s need"} attention`
               : projects.length === 0
-                ? "Add your first project"
-                : "Required checks passed";
+                ? t("Add your first project")
+                : t("Required checks passed");
   const summaryTone: Tone =
     !current || unknownCount > 0 ? "muted" : attentionCount > 0 ? "warn" : "ok";
   return (
     <main className="setup-page">
       <header className="setup-header">
         <div>
-          <h1>Setup</h1>
-          <p>Check readiness, follow the host's commands, then check again.</p>
+          <h1>{t("Setup")}</h1>
+          <p>{t("Check readiness, follow the host's commands, then check again.")}</p>
         </div>
         <div className="setup-actions">
           <Button
@@ -487,38 +502,38 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
             loading={busy}
             onClick={() => void recheck()}
           >
-            Check again
+            {t("Check again")}
           </Button>
-          <Button href={routePath({ screen: "home" })}>Go to Home</Button>
+          <Button href={routePath({ screen: "home" })}>{t("Go to Home")}</Button>
         </div>
       </header>
       <div className="setup-summary" role="status">
         <span className={`chip ${TONE[summaryTone]}`}>{summary}</span>
-        {checkedAt && <span>Last checked {checkedAt}</span>}
+        {checkedAt && <span>{t("Last checked")} {checkedAt}</span>}
         {current && (
           <span>
             {
               STEPS.filter((section) => sectionReady(section.id) === "ready")
                 .length
             }{" "}
-            of {STEPS.length} sections ready
+            {t("of")} {STEPS.length} {t("sections ready")}
           </span>
         )}
       </div>
       {!busy && !stale && report?.ran_now === false && (
         <p className="setup-inline-status" role="status">
-          Recent report reused ({Math.max(1, Math.ceil(report.age_ms / 1000))}s
-          old). The host can check again after its{" "}
-          {Math.max(1, Math.ceil(report.recheck_in_ms / 1000))}s cooldown.
+          {t("Recent report reused")} ({Math.max(1, Math.ceil(report.age_ms / 1000))}s{" "}
+          {t("old")}). {t("The host can check again after its")}{" "}
+          {Math.max(1, Math.ceil(report.recheck_in_ms / 1000))}s {t("cooldown.")}
         </p>
       )}
       {report && visibleError && (
         <div className="setup-error" role="alert">
-          <span>Showing last known observations. {visibleError}</span>
+          <span>{t("Showing last known observations.")} {visibleError}</span>
         </div>
       )}
       <div className="setup-layout">
-        <nav aria-label="Setup sections">
+        <nav aria-label={t("Setup sections")}>
           <ol>
             {STEPS.map((section, position) => {
               const status = sectionReady(section.id);
@@ -540,18 +555,18 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
                     </span>
                     <span className="setup-section-body">
                       <span className="setup-section-title">
-                        {section.title}
+                        {t(section.title)}
                       </span>
-                      <span className="setup-section-hint">{section.hint}</span>
+                      <span className="setup-section-hint">{t(section.hint)}</span>
                       <span
                         className="setup-section-status"
                         data-state={current ? status : "unknown"}
                       >
                         {busy
-                          ? "Checking…"
+                          ? t("Checking…")
                           : stale
-                            ? "Last known"
-                            : LABEL[status]}
+                            ? t("Last known")
+                            : t(LABEL[status])}
                       </span>
                     </span>
                   </button>
@@ -560,7 +575,7 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
             })}
           </ol>
           <p className="setup-detect-note">
-            Checks only inspect the host. Commands run in your terminal.
+            {t("Checks only inspect the host. Commands run in your terminal.")}
           </p>
         </nav>
         <section id={panelId} className="setup-panel">
@@ -570,8 +585,8 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
               role={state.error ? "alert" : "status"}
             >
               {state.error
-                ? `Could not run setup checks — ${state.error}. Choose Check again to retry.`
-                : "Checking this machine… Agent CLIs can take a few seconds."}
+                ? `${t("Could not run setup checks")} — ${state.error}. ${t("Choose Check again to retry.")}`
+                : t("Checking this machine… Agent CLIs can take a few seconds.")}
             </div>
           )}
           {(report || step === "project") && (
@@ -592,22 +607,22 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
               disabled={index === 0}
               onClick={() => choose(STEPS[index - 1].id)}
             >
-              Back
+              {t("Back")}
             </Button>
             {index < STEPS.length - 1 ? (
               <Button
                 onClick={() => choose(STEPS[index + 1].id)}
-              >{`Next: ${STEPS[index + 1].title}`}</Button>
+              >{`${t("Next:")} ${t(STEPS[index + 1].title)}`}</Button>
             ) : (
               <Button variant="primary" href={routePath({ screen: "home" })}>
-                Go to Home
+                {t("Go to Home")}
               </Button>
             )}
           </footer>
           <p className="setup-settings-note">
-            Provider and model defaults are in{" "}
+            {t("Provider and model defaults are in")}{" "}
             <Link className="lnk" href={settingsHref}>
-              Settings
+              {t("Settings")}
             </Link>
             .
           </p>

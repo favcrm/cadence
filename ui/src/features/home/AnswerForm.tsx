@@ -1,23 +1,21 @@
 import { useWriteBlock } from "../auth/WriteGate";
 import { useState } from "react";
-import { api, ApiError } from "../../lib/api";
+import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
-import type { HomeNeed } from "./needs";
+import { plainFailure, type HomeNeed } from "./needs";
 import Button from "../../ui/Button";
+import { ReasonBlock } from "./PermissionCard";
+import { useTranslate } from "../../lib/locale";
 
-/** The one next action of a question: answer it, as the operator. */
-export default function AnswerForm({
-  need,
-  readOnly,
-  onDone,
-}: {
-  need: HomeNeed & { action: { type: "answer" } };
-  readOnly: boolean;
-  onDone: (text: string) => void;
-}) {
-  const { issue, report, options, impact, body } = need.action;
-  const block = useWriteBlock(readOnly);
-  const [text, setText] = useState("");
+/** What a blocked action says: one plain line, no command. */
+export const READ_ONLY_COPY = "You're viewing read-only.";
+
+/** Answer a question as the operator: one send, shared by the form and the card's Yes/No. */
+export function useAnswer(
+  need: HomeNeed & { action: { type: "answer" } },
+  onDone: (text: string) => void,
+) {
+  const { issue, report } = need.action;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const send = (answer: string) => {
@@ -34,27 +32,46 @@ export default function AnswerForm({
         void resources.issue(issue).invalidate();
         onDone(answer);
       })
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      .catch((e: unknown) => setError(plainFailure(e)))
       .finally(() => setBusy(false));
   };
+  return { send, busy, error };
+}
+
+/** The one next action of a question: answer it, as the operator. */
+export default function AnswerForm({
+  need,
+  readOnly,
+  onDone,
+}: {
+  need: HomeNeed & { action: { type: "answer" } };
+  readOnly: boolean;
+  onDone: (text: string) => void;
+}) {
+  const { options, impact, body } = need.action;
+  const block = useWriteBlock(readOnly);
+  const t = useTranslate();
+  const [text, setText] = useState("");
+  const { send, busy, error } = useAnswer(need, onDone);
   return (
     <div className="mt-2 space-y-2">
-      {need.summary && <p className="text-label text-ink-300 break-words">{need.summary}</p>}
-      {impact && <p className="text-micro text-ink-500 break-words">Impact: {impact}</p>}
-      {body && (
+      {/* The title is a short label; the whole summary is read here. */}
+      {need.summary && <ReasonBlock reason={need.summary} label={t("Master's summary:")} />}
+      {(body || impact) && (
         <details>
-          <summary className="text-micro text-ink-500 cursor-pointer">the question in full</summary>
-          <pre className="mt-1 whitespace-pre-wrap break-words text-micro text-ink-400">{body}</pre>
+          <summary className="text-micro text-ink-500 cursor-pointer">{t("the question in full")}</summary>
+          {impact && <p className="mt-1 text-micro text-ink-500 break-words">{t("Impact:")} {impact}</p>}
+          {body && <pre className="mt-1 whitespace-pre-wrap break-words text-micro text-ink-400">{body}</pre>}
         </details>
       )}
-      {readOnly ? (
-        <p className="text-micro text-ink-500">{block} Or answer with `cadence report file --kind answer`.</p>
+      {block ? (
+        <p className="text-micro text-ink-500">{t(READ_ONLY_COPY)}</p>
       ) : (
         <>
           {options.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
               {options.map((o) => (
-                <Button key={o} size="sm" disabled={busy} onClick={() => send(o)} title={`answer: ${o}`}>
+                <Button key={o} size="sm" disabled={busy} onClick={() => send(o)} title={`${t("answer")}: ${o}`}>
                   {o}
                 </Button>
               ))}
@@ -65,11 +82,11 @@ export default function AnswerForm({
             onChange={(e) => setText(e.target.value)}
             rows={2}
             className="field w-full text-secondary"
-            placeholder="Or write an answer…"
-            aria-label={`answer ${issue}`}
+            placeholder={t("Or write an answer…")}
+            aria-label={t("your answer")}
           />
           <Button variant="primary" size="sm" disabled={busy} loading={busy} onClick={() => send(text)}>
-            {busy ? "Filing…" : "Send answer"}
+            {busy ? t("Sending…") : t("Send answer")}
           </Button>
         </>
       )}
@@ -81,4 +98,3 @@ export default function AnswerForm({
     </div>
   );
 }
-

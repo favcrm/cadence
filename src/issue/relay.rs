@@ -481,7 +481,7 @@ fn iso_now() -> String {
 }
 
 fn validate_project_key(key: &str) -> Result<()> {
-    model::check_key(key).map(|_| ())
+    Ok(model::check_key(key).map(|_| ())?)
 }
 
 pub fn validate_repo(repo: &str) -> Result<()> {

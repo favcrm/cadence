@@ -8,6 +8,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{blobs_dir, ls, read, rm, vault_dir, write, Caller, ABSENT};
@@ -15,6 +16,36 @@ use crate::error::Result;
 use crate::issue::Pm;
 
 const EXTRACT_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct QuotedSourcePath<'a>(#[serde(borrow)] std::borrow::Cow<'a, str>);
+
+/// The generated page's frontmatter, and only that frontmatter.
+pub(crate) struct ExtractionHeader<'a> {
+    pub source_path: std::borrow::Cow<'a, str>,
+    pub sha256: &'a str,
+    pub status: &'a str,
+}
+
+/// Parse the canonical generated-sidecar header. A marker in the body is
+/// not provenance. `None` means this page does not carry that header.
+pub(crate) fn extraction_header(text: &str) -> Option<ExtractionHeader<'_>> {
+    let rest = text.strip_prefix("---\nkind: extracted-source\nsource_path: ")?;
+    let (quoted, rest) = rest.split_once('\n')?;
+    let quoted: QuotedSourcePath<'_> = serde_json::from_str(quoted).ok()?;
+    let rest = rest.strip_prefix("source_sha256: ")?;
+    let (sha256, rest) = rest.split_once('\n')?;
+    let rest = rest.strip_prefix("extraction_status: ")?;
+    let (status, rest) = rest.split_once('\n')?;
+    if !rest.starts_with("---\n") {
+        return None;
+    }
+    Some(ExtractionHeader {
+        source_path: quoted.0,
+        sha256,
+        status,
+    })
+}
 
 fn pdf_text(source: &Path) -> std::result::Result<String, String> {
     let (output, bounds) = crate::proc::run_bounded_limited(
@@ -41,14 +72,24 @@ fn pdf_text(source: &Path) -> std::result::Result<String, String> {
 /// A manually authored page at the reserved name is never overwritten.
 pub fn pdf(pm: &Pm, caller: &Caller, path: &str, sha256: &str) -> Result<Value> {
     let sidecar = format!("{path}.extracted.md");
+    let source = read(pm, caller, path)?;
+    if source["kind"] != "blob" || source["sha256"].as_str() != Some(sha256) {
+        return Ok(json!({"status":"conflict","path":sidecar,
+                         "reason":"the raw source changed before extraction"}));
+    }
     let quoted_path = serde_json::to_string(path)?;
     let current = read(pm, caller, &sidecar).ok();
-    let marker = format!("source_path: {quoted_path}\n");
     if let Some(page) = &current {
         let old = page["text"].as_str().unwrap_or("");
-        if !old.starts_with("---\nkind: extracted-source\n") || !old.contains(&marker) {
-            return Ok(json!({"status":"conflict","path":sidecar,
-                             "reason":"a page at the extraction path was not generated from this source"}));
+        // Same-source reimport may carry an older hash. Any other header,
+        // including a foreign source with this path quoted only in the body,
+        // is a manual page and is left untouched.
+        match extraction_header(old) {
+            Some(header) if header.source_path == path => {}
+            _ => {
+                return Ok(json!({"status":"conflict","path":sidecar,
+                                 "reason":"a page at the extraction path was not generated from this source"}));
+            }
         }
     }
     let blob = blobs_dir(&vault_dir(pm)?).join(sha256);
@@ -61,6 +102,12 @@ pub fn pdf(pm: &Pm, caller: &Caller, path: &str, sha256: &str) -> Result<Value> 
         Ok(text) => ("indexed", text, None),
         Err(why) => ("failed", String::new(), Some(why)),
     };
+    // A slow or resumed extraction must not replace a newer source's sidecar.
+    // The sidecar's own CAS below also protects concurrent derived-page writes.
+    if read(pm, caller, path)?["rev"] != source["rev"] {
+        return Ok(json!({"status":"conflict","path":sidecar,
+                         "reason":"the raw source changed during extraction"}));
+    }
     let name = path.rsplit('/').next().unwrap_or(path);
     let page = format!(
         "---\nkind: extracted-source\nsource_path: {quoted_path}\nsource_sha256: {sha256}\nextraction_status: {status}\n---\n\n# Source text: {name}\n\n{body}\n"
@@ -95,9 +142,8 @@ pub fn pdf_result(pm: &Pm, caller: &Caller, path: &str, sha256: &str) -> Value {
 pub fn remove_generated(pm: &Pm, caller: &Caller, source: &str) -> Result<()> {
     let sidecar = format!("{source}.extracted.md");
     if let Ok(page) = read(pm, caller, &sidecar) {
-        let marker = format!("source_path: {}\n", serde_json::to_string(source)?);
         if page["text"].as_str().is_some_and(|text| {
-            text.starts_with("---\nkind: extracted-source\n") && text.contains(&marker)
+            extraction_header(text).is_some_and(|header| header.source_path == source)
         }) {
             rm(pm, caller, &sidecar)?;
         }
@@ -139,13 +185,16 @@ pub fn relocate_tree(pm: &Pm, caller: &Caller, from: &str, to: &str) -> Result<V
             let Some(text) = page["text"].as_str() else {
                 continue;
             };
+            let Some(header) = extraction_header(text) else {
+                continue;
+            };
+            if header.source_path != old_source {
+                continue;
+            }
             let old_prefix = format!(
                 "---\nkind: extracted-source\nsource_path: {}\n",
                 serde_json::to_string(&old_source)?
             );
-            if !text.starts_with(&old_prefix) {
-                continue;
-            }
             let new_prefix = format!(
                 "---\nkind: extracted-source\nsource_path: {}\n",
                 serde_json::to_string(source)?

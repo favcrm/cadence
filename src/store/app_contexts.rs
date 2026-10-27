@@ -253,9 +253,13 @@ impl Store {
                     let runs = tx.query_vec("SELECT id FROM app_runs WHERE install_id=? AND context_id=? AND state IN ('awaiting_approval','approved','running')",
                         params![install,id],|r|r.get::<_,String>(0))?;
                     for run in runs {
-                        self.app_run_invalidate_in(&tx, &run)?;
+                        self.app_run_invalidate_in(&tx, &run, "run context was updated or archived")?;
                     }
                     Self::app_effect_invalidate_in(&tx, install, Some(id), None, None)?;
+                    if config.is_some() {
+                        // CAD-1328: the operator's own save re-pins this context's bindings.
+                        Self::app_bindings_repin_context_in(&tx, install, id)?;
+                    }
                     Self::event(
                         &tx,
                         Self::DAEMON_STREAM,

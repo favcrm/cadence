@@ -1,0 +1,16 @@
+{
+  "version": "hosted-cadence-local-assignment.v1",
+  "origin": "selected workspace board audience",
+  "base": "/__platform/hosted-cadence/:organizationId/local-assignments",
+  "routes": ["POST base", "GET base", "POST base/:assignmentId/claim", "POST base/:assignmentId/report", "POST base/:assignmentId/reassign"],
+  "forbidden_new_surfaces": ["local-agents", "presence", "tool-exchange", "lane token issuer", "hosted fallback"],
+  "create": {"version":"hosted-cadence-local-assignment.v1","organization_id":"ws_synthetic","idempotency_key":"synthetic_create_01","issue_id":"SYN-1","action":"dispatch","execution":"local","target":"user_target","identity_kind":"local_worker"},
+  "assignment": {"version":"hosted-cadence-local-assignment.v1","assignment_id":"hla_00000000-0000-4000-8000-000000000001","organization_id":"ws_synthetic","issue_id":"SYN-1","action":"dispatch","execution":"local","state":"queued","generation":1,"claim_id":null,"target":"user_target","created_by_subject_id":"user_caller","client_agent_id":null,"guidance":null,"reported_head_sha":null,"text":null},
+  "claim": {"version":"hosted-cadence-local-assignment.v1","organization_id":"ws_synthetic","expected_generation":1,"client_agent_id":"local_selected_actor"},
+  "claim_response_extension": {"references":{"issue_id":"SYN-1"}},
+  "report": {"version":"hosted-cadence-local-assignment.v1","organization_id":"ws_synthetic","expected_generation":1,"claim_id":"hlc_00000000-0000-4000-8000-000000000002","state":"result","text":"Synthetic result","reported_head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "reassign": {"version":"hosted-cadence-local-assignment.v1","organization_id":"ws_synthetic","expected_generation":1,"operation_id":"synthetic_move_01","target":"user_target"},
+  "cancel": {"version":"hosted-cadence-local-assignment.v1","organization_id":"ws_synthetic","expected_generation":1,"operation_id":"synthetic_cancel_01","cancel":true},
+  "list": {"version":"hosted-cadence-local-assignment.v1","assignments":[]},
+  "invariants": ["waiting without target; queued with member target; running only after local claim", "blocked remains live and resumes with the same claim", "replaying a claim with another client_agent_id is fenced", "reassignment increments generation and fences old claim", "same operation_id with changed body conflicts", "only result/failed/cancelled end a live assignment", "no API result custody claim beyond actual stored text/revision", "client resolves actual issue/comments/wiki context via existing read APIs", "local dispatch reaches an actual local agent; a worktree alone is not execution", "existing device code/token consent serves provider/publish lanes, never a new hct exchange"]
+}

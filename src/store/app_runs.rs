@@ -14,6 +14,139 @@ pub const RUN_ARTIFACT_BYTES: usize = 1024 * 1024;
 /// CAD-1123 R4: the stream that keeps each app run's approval record.
 /// Not an agent alias and not the pruned daemon stream, so it survives.
 pub const APP_RUN_APPROVAL_STREAM: &str = "app-run-approvals";
+
+/// CAD-1374: a domain-specific HUMAN receipt. `None` (autonomous or local
+/// operator) returns the legacy payload unchanged. The helper never copies
+/// params, inputs, cookies or hashes.
+fn human_receipt(
+    payload: Value,
+    human: Option<&Value>,
+    operation: &str,
+    action: &str,
+    resource: &str,
+    outcome: &str,
+) -> Value {
+    match human {
+        Some(human) => canonical_receipt(
+            payload,
+            human.clone(),
+            human["company"].clone(),
+            operation,
+            action,
+            resource,
+            outcome,
+        ),
+        None => payload,
+    }
+}
+
+/// CAD-1374: the canonical receipt frame every app-run owner audit row carries.
+/// `request_id` and `correlation_id` are the mutation's one server operation
+/// UUID, and `causation_id` is null. `revision_or_digest` is the existing
+/// snapshot or install digest from the payload. The reason is the action.
+fn canonical_receipt(
+    mut payload: Value,
+    human: Value,
+    company: Value,
+    operation: &str,
+    action: &str,
+    resource: &str,
+    outcome: &str,
+) -> Value {
+    let revision = payload
+        .get("snapshot_digest")
+        .or_else(|| payload.get("digest"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("schema_version".into(), json!(1));
+        map.insert("request_id".into(), json!(operation));
+        map.insert("correlation_id".into(), json!(operation));
+        map.insert("causation_id".into(), Value::Null);
+        map.insert("company".into(), company);
+        map.insert("human".into(), human);
+        map.insert("action".into(), json!(action));
+        map.insert("resource".into(), json!(resource));
+        map.insert("outcome".into(), json!(outcome));
+        map.insert("reason".into(), json!(action));
+        map.insert("revision_or_digest".into(), revision);
+    }
+    payload
+}
+
+/// CAD-1374: the receipt for one dispatched step. `acting` is the manual owner
+/// who clicked, or null for an automatic advance (`actor_kind` "system"). The
+/// sealed approver is kept as `initiating_human` and is never credited as the
+/// executing human. With neither a sealed approver nor an actor (legacy) no
+/// human is invented and the payload stays unchanged.
+fn dispatch_receipt(
+    mut payload: Value,
+    initiating: Option<&Value>,
+    acting: Option<&Value>,
+    operation: &str,
+    resource: &str,
+    outcome: &str,
+) -> Value {
+    let Some(company) = acting.or(initiating).map(|h| h["company"].clone()) else {
+        return payload;
+    };
+    let (actor_kind, human) = match acting {
+        Some(acting) => ("human", acting.clone()),
+        None => ("system", Value::Null),
+    };
+    if let Some(map) = payload.as_object_mut() {
+        map.insert(
+            "initiating_human".into(),
+            initiating.cloned().unwrap_or(Value::Null),
+        );
+        map.insert("actor_kind".into(), json!(actor_kind));
+    }
+    canonical_receipt(
+        payload,
+        human,
+        company,
+        operation,
+        "app_run_step_dispatched",
+        resource,
+        outcome,
+    )
+}
+
+/// CAD-1374: the human a stored approval recorded. Missing or null is a
+/// genuine legacy approval. A present value must be a complete canonical
+/// human (`sub`, `company`, `session` non-empty strings, a `role` of
+/// `operator` or `member`, and a nullable `display`). Anything else fails
+/// closed: no partial proof is ever read as legacy.
+fn approval_human(recorded: Option<&Value>) -> Result<Value> {
+    let Some(human) = recorded.and_then(|v| v.get("human")) else {
+        return Ok(Value::Null);
+    };
+    if human.is_null() {
+        return Ok(Value::Null);
+    }
+    let text = |key: &str| {
+        human[key]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::internal("approval human binding is malformed"))
+    };
+    text("sub")?;
+    text("company")?;
+    text("session")?;
+    if !matches!(human["role"].as_str(), Some("operator" | "member")) {
+        return Err(Error::internal("approval human binding is malformed"));
+    }
+    if !human["display"].is_null() && !human["display"].is_string() {
+        return Err(Error::internal("approval human binding is malformed"));
+    }
+    Ok(json!({
+        "sub": human["sub"],
+        "company": human["company"],
+        "session": human["session"],
+        "role": human["role"],
+        "display": human["display"],
+    }))
+}
 pub fn artifact_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
@@ -241,11 +374,16 @@ CREATE TABLE IF NOT EXISTS app_run_reviews(
  artifact_digest TEXT NOT NULL, reviewer TEXT NOT NULL, message_id TEXT UNIQUE NOT NULL,
  decision TEXT NOT NULL CHECK(decision IN ('approve','revise')), rationale TEXT NOT NULL,
  PRIMARY KEY(run_id,step_id), FOREIGN KEY(run_id,step_id) REFERENCES app_run_steps(run_id,step_id));
+CREATE TABLE IF NOT EXISTS app_run_artifact_fetches(
+ artifact_id TEXT NOT NULL REFERENCES app_run_artifacts(id),
+ message_id TEXT NOT NULL, turn_hash TEXT NOT NULL, created REAL NOT NULL,
+ PRIMARY KEY(artifact_id,message_id,turn_hash));
 ";
 
 pub struct LocalRunProvenance<'a> {
     pub selected_source: Option<(&'a str, &'a str)>,
     pub input_origins: &'a BTreeMap<String, String>,
+    pub human: Option<&'a Value>,
 }
 
 impl Store {
@@ -272,7 +410,32 @@ impl Store {
         Ok(())
     }
     pub fn app_capability_decide(&self, id: &str, digest: &str, approve: bool) -> Result<Value> {
-        self.app_capability_decide_audited(id, digest, approve, json!({}))
+        self.app_capability_decide_as(id, digest, approve, None)
+    }
+    /// CAD-1374: the install approval or revocation, stamped with the verified
+    /// human when the owner's board made it. Same transaction as before.
+    pub fn app_capability_decide_as(
+        &self,
+        id: &str,
+        digest: &str,
+        approve: bool,
+        human: Option<&Value>,
+    ) -> Result<Value> {
+        let operation = uuid::Uuid::new_v4().to_string();
+        let (action, outcome) = if approve {
+            ("app_install_capability_approved", "approved")
+        } else {
+            ("app_install_capability_revoked", "revoked")
+        };
+        let audit = human_receipt(
+            json!({"digest":digest}),
+            human,
+            &operation,
+            action,
+            &format!("install:{id}"),
+            outcome,
+        );
+        self.app_capability_decide_audited(id, digest, approve, audit)
     }
     /// CAD-1119: installing or updating an app is the operator's consent.
     /// The operator install/upgrade path records the approval of exactly
@@ -400,9 +563,15 @@ impl Store {
             LocalRunProvenance {
                 selected_source: None,
                 input_origins: &BTreeMap::new(),
+                human: None,
             },
         )
     }
+    /// Internal legacy callers keep this signature: the runs it
+    /// records carry NO `creator` member, which reads as unknown
+    /// attribution — never a claimed operator. Only the native daemon
+    /// creation path supplies a daemon-verified creator, through
+    /// `app_run_create_attributed`.
     pub fn app_run_create_with_capabilities(
         &self,
         request: LocalRunRequest<'_>,
@@ -412,10 +581,41 @@ impl Store {
         quotes: &BTreeMap<String, crate::platform::AppCapabilityQuote>,
         provenance: LocalRunProvenance<'_>,
     ) -> Result<Value> {
+        self.app_run_create_attributed(
+            request,
+            context,
+            binding,
+            capabilities,
+            quotes,
+            provenance,
+            None,
+        )
+    }
+    /// CAD-1365: the creator-bearing creation path. `creator` is the
+    /// daemon-verified actor json (`{kind:"operator"}` or
+    /// `{kind:"user",id:<sub>}`) frozen INSIDE the snapshot before
+    /// `material_digest`, so the digest covers it and it can never be
+    /// mutated after creation. `None` leaves the member absent — the
+    /// honest unknown attribution of the internal legacy callers.
+    /// There is no creator setter: the only way a creator lands is a
+    /// verified argument at creation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn app_run_create_attributed(
+        &self,
+        request: LocalRunRequest<'_>,
+        context: Option<&super::app_contexts::ContextProof>,
+        binding: Option<&super::app_bindings::BindingProof>,
+        capabilities: &BTreeMap<String, super::app_bindings::BindingProof>,
+        quotes: &BTreeMap<String, crate::platform::AppCapabilityQuote>,
+        provenance: LocalRunProvenance<'_>,
+        creator: Option<&Value>,
+    ) -> Result<Value> {
         let LocalRunProvenance {
             selected_source,
             input_origins,
+            human,
         } = provenance;
+        let operation = uuid::Uuid::new_v4().to_string();
         let LocalRunRequest {
             install_id,
             bundle_digest,
@@ -651,6 +851,12 @@ impl Store {
                         snapshot["workflow"]["capability_slots"] = json!(workflow.capability_slots);
                         snapshot["source"] = source;
                     }
+                    // CAD-1365: freeze the verified creator inside
+                    // the snapshot BEFORE the digest covers it —
+                    // attribution, never authorization.
+                    if let Some(creator) = creator {
+                        snapshot["creator"] = creator.clone();
+                    }
                     let digest = material_digest(&snapshot);
                     if let Some((id, existing)) = tx
                         .query_opt(
@@ -712,7 +918,7 @@ impl Store {
                         &tx,
                         Self::DAEMON_STREAM,
                         "app_run_created",
-                        json!({"run_id":id,"install_id":install_id,"snapshot_digest":digest,"actor":"operator"}),
+                        human_receipt(json!({"run_id":id,"install_id":install_id,"snapshot_digest":digest,"actor":"operator"}), human, &operation, "app_run_created", &format!("app-run:{id}"), "created"),
                     )?;
                     Self::app_run_show_in(&*tx, &id)
         })
@@ -745,11 +951,19 @@ impl Store {
             )
             .optional()?
         {
-            let by = serde_json::from_str::<Value>(&payload)
-                .ok()
-                .and_then(|v| v["by"].as_str().map(str::to_string))
+            // CAD-1374: an unreadable approval payload is a refusal, never a
+            // silent legacy downgrade. Only a missing human is a legacy approval.
+            let recorded: Value = serde_json::from_str(&payload)
+                .map_err(|_| Error::internal("approval record is unreadable"))?;
+            if !recorded.is_object() {
+                return Err(Error::internal("approval record is unreadable"));
+            }
+            let by = recorded["by"]
+                .as_str()
+                .map(str::to_string)
                 .unwrap_or_else(|| "operator".into());
-            value["approval"] = json!({"by": by, "at": at as i64});
+            let human = approval_human(Some(&recorded))?;
+            value["approval"] = json!({"by": by, "at": at as i64, "human": human});
         }
         if let Some((kind, reason, step_id)) = conn
             .query_row(
@@ -767,7 +981,11 @@ impl Store {
         {
             value["failure"] = json!({"kind":kind,"reason":reason,"step_id":step_id});
         }
-        value["steps"]=Value::Array(conn.query_vec("SELECT step_id,task_id,state,message_id FROM app_run_steps WHERE run_id=? ORDER BY step_id",[id],|r|Ok(json!({"step_id":r.get::<_,String>(0)?,"task_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"message_id":r.get::<_,Option<String>>(3)?})))?);
+        // CAD-1142: surface the step's failure reason. `app_step_failed_in`
+        // records the cause on the bound task's `error`; project it onto the
+        // step so the board and screen show *why* a step failed instead of a
+        // bare `state: failed` (Demo s1 runs failed with no reason anywhere).
+        value["steps"]=Value::Array(conn.query_vec("SELECT s.step_id,s.task_id,s.state,s.message_id,t.error FROM app_run_steps s LEFT JOIN tasks t ON t.id=s.task_id WHERE s.run_id=? ORDER BY s.step_id",[id],|r|{let mut step=json!({"step_id":r.get::<_,String>(0)?,"task_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"message_id":r.get::<_,Option<String>>(3)?});if let Some(reason)=r.get::<_,Option<String>>(4)?.filter(|reason|!reason.trim().is_empty()){step["reason"]=json!(reason);}Ok(step)})?);
         value["artifacts"]=Value::Array(conn.query_vec("SELECT id,step_id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? ORDER BY step_id",[id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"step_id":r.get::<_,String>(1)?,"digest":r.get::<_,String>(2)?,"media_type":r.get::<_,String>(3)?,"size":r.get::<_,i64>(4)?})))?);
         value["reviews"]=Value::Array(conn.query_vec("SELECT step_id,artifact_digest,reviewer,decision,rationale,asset_receipt_id,asset_digest FROM app_run_reviews WHERE run_id=?",[id],|r|{
             let mut review=json!({"step_id":r.get::<_,String>(0)?,"artifact_digest":r.get::<_,String>(1)?,"reviewer":r.get::<_,String>(2)?,"decision":r.get::<_,String>(3)?,"rationale":r.get::<_,String>(4)?});
@@ -812,6 +1030,17 @@ impl Store {
         cancel: bool,
         current_bundle: Option<&str>,
     ) -> Result<Value> {
+        self.app_run_decide_as(id, digest, cancel, current_bundle, None)
+    }
+    pub fn app_run_decide_as(
+        &self,
+        id: &str,
+        digest: Option<&str>,
+        cancel: bool,
+        current_bundle: Option<&str>,
+        human: Option<&Value>,
+    ) -> Result<Value> {
+        let operation = uuid::Uuid::new_v4().to_string();
         self.write_tx(|conn| {
 
                     let tx = &mut *conn;
@@ -850,7 +1079,7 @@ impl Store {
                             &tx,
                             APP_RUN_APPROVAL_STREAM,
                             "app_run_approved",
-                            json!({"run_id":id,"digest":run["snapshot_digest"],"by":"operator"}),
+                            human_receipt(json!({"run_id":id,"digest":run["snapshot_digest"],"by":"operator"}), human, &operation, "app_run_approved", &format!("app-run:{id}"), "approved"),
                             Some(id),
                             None,
                         )?;
@@ -863,7 +1092,7 @@ impl Store {
                         } else {
                             "app_run_execution_approved"
                         },
-                        json!({"run_id":id,"digest":run["snapshot_digest"],"actor":"operator"}),
+                        human_receipt(json!({"run_id":id,"digest":run["snapshot_digest"],"actor":"operator"}), human, &operation, if cancel { "app_run_cancelled" } else { "app_run_approved" }, &format!("app-run:{id}"), if cancel { "cancelled" } else { "approved" }),
                     )?;
                     Self::app_run_show_in(&tx, id)
         })
@@ -1271,12 +1500,116 @@ impl Store {
         })
     }
 
+    /// CAD-1778: the fallback for `app_run_host_step_failed` when the run's
+    /// persisted snapshot cannot be read. It checks only raw columns (the run
+    /// is running and approved, the step is dispatched) and never parses the
+    /// snapshot, so an unreadable run still ends with a durable failure.
+    pub fn app_run_host_step_failed_unreadable(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        kind: &str,
+        reason: &str,
+    ) -> Result<()> {
+        if !matches!(kind, "refused" | "uncertain") || reason.is_empty() || reason.len() > 1024 {
+            return Err(Error::rejected("host failure record is invalid"));
+        }
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let task_id: String = tx
+                .query_row(
+                    "SELECT s.task_id FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id WHERE s.run_id=? AND s.step_id=? AND s.state='dispatched' AND r.state='running' AND r.approved_digest IS NOT NULL",
+                    params![run_id, step_id],
+                    |r| r.get(0),
+                )
+                .map_err(|_| Error::rejected("host step is not dispatched"))?;
+            let now = now();
+            tx.execute(
+                "INSERT INTO app_run_failures(run_id,step_id,kind,reason,created) VALUES(?,?,?,?,?)",
+                params![run_id, step_id, kind, reason, now],
+            )?;
+            tx.execute(
+                "UPDATE app_run_steps SET state='failed' WHERE run_id=? AND step_id=? AND state='dispatched'",
+                params![run_id, step_id],
+            )?;
+            tx.execute(
+                "UPDATE tasks SET state='failed',error=?,updated=? WHERE id=?",
+                params![reason, now, task_id],
+            )?;
+            tx.execute(
+                "UPDATE app_runs SET state='failed',approved_digest=NULL,updated=? WHERE id=? AND state='running'",
+                params![now, run_id],
+            )?;
+            tx.execute(
+                "UPDATE jobs SET state='failed',updated=? WHERE id=?",
+                params![now, run_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// CAD-1258: a worker capability call that reached the provider but could
+    /// not retain its result (or failed after the claim) fails the run with a
+    /// durable reason. The claim stays, so nothing is ever sent twice.
+    pub fn app_run_call_failed(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        kind: &str,
+        reason: &str,
+    ) -> Result<()> {
+        if !matches!(kind, "refused" | "uncertain") || reason.is_empty() || reason.len() > 1024 {
+            return Err(Error::rejected("capability failure record is invalid"));
+        }
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            // Raw column, not `app_run_show_in`: the failure must record even
+            // when the persisted snapshot is what could not be read.
+            let state: String = tx.query_row(
+                "SELECT state FROM app_runs WHERE id=?",
+                [run_id],
+                |r| r.get(0),
+            )?;
+            if state != "running" {
+                return Ok(());
+            }
+            tx.execute(
+                "INSERT INTO app_run_failures(run_id,step_id,kind,reason,created) VALUES(?,?,?,?,?)",
+                params![run_id, step_id, kind, reason, now()],
+            )?;
+            // The failed call's own step is terminal even though its worker
+            // message is still running (invalidate keeps that association).
+            tx.execute(
+                "UPDATE app_run_steps SET state='failed' WHERE run_id=? AND step_id=? AND state='dispatched'",
+                params![run_id, step_id],
+            )?;
+            self.app_run_invalidate_in(&tx, run_id, reason)
+        })
+    }
+
     pub fn app_run_dispatch(&self, id: &str, current_bundle: &str) -> Result<Value> {
+        self.app_run_dispatch_as(id, current_bundle, None, None)
+    }
+    /// CAD-1374: `approved_by` is the human the caller fenced the approval
+    /// under (`None` for a local or legacy approval). It must still be the
+    /// latest approval inside this transaction, so a swapped approval cannot
+    /// reuse a proof checked for the earlier one.
+    pub fn app_run_dispatch_as(
+        &self,
+        id: &str,
+        current_bundle: &str,
+        approved_by: Option<&Value>,
+        acting: Option<&Value>,
+    ) -> Result<Value> {
+        let operation = uuid::Uuid::new_v4().to_string();
         self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let run = Self::app_run_show_in(&tx, id)?;
                     Self::app_current_in(&tx, &run, current_bundle)?;
+                    if run["approval"]["human"] != approved_by.cloned().unwrap_or(Value::Null) {
+                        return Err(Error::gate_coded("approval_changed", "the run approval changed since its owner was checked; dispatch is refused"));
+                    }
                     if !matches!(run["state"].as_str(), Some("approved" | "running"))
                         || run["approved_digest"] != run["snapshot_digest"]
                     {
@@ -1315,14 +1648,14 @@ impl Store {
                         // without a message — the daemon runs it
                         // in-process for the operator's own click.
                         if step.kind == "capability" {
-                            tx.execute("UPDATE tasks SET state='dispatched',revision=1,updated=? WHERE id=? AND state='draft'",params![now(),task_id])?;
-                            tx.execute("UPDATE app_run_steps SET state='dispatched' WHERE run_id=? AND step_id=? AND state='pending'",params![id,step_id])?;
                             Self::event(
                                 &tx,
                                 Self::DAEMON_STREAM,
                                 "app_run_step_dispatched",
-                                json!({"run_id":id,"step_id":step_id,"host":true}),
+                                dispatch_receipt(json!({"run_id":id,"step_id":step_id,"host":true,"snapshot_digest":run["snapshot_digest"]}), approved_by, acting, &operation, &format!("app-run:{id}/step:{step_id}/outcome"), "prepared"),
                             )?;
+                            tx.execute("UPDATE tasks SET state='dispatched',revision=1,updated=? WHERE id=? AND state='draft'",params![now(),task_id])?;
+                            tx.execute("UPDATE app_run_steps SET state='dispatched' WHERE run_id=? AND step_id=? AND state='pending'",params![id,step_id])?;
                             continue;
                         }
                         let worker = self.agent_in(&tx, &step.assignee)?;
@@ -1347,14 +1680,25 @@ impl Store {
                             "source":run["snapshot"]["source"],
                             "capability_slots":run["snapshot"]["workflow"]["capability_slots"],
                             "required_asset_slot":run["snapshot"]["workflow"]["required_asset_slot"],
-                            "result_contract":"Return exactly one complete JSON envelope as your final text, with no prose, heading, or Markdown fence. It must have schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with cadence app run artifact using the active message/turn token. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
+                            "result_contract":"Return exactly one complete JSON envelope as your final text, with no prose, heading, or Markdown fence. It must have schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with the active message and turn token. An approve is refused unless this turn successfully fetched that dependency; revise does not require the fetch. Managed Codex: call MCP self, then MCP app_run_artifact with the dependency artifact_id and that response's exact id as message and turn_id as token. Other providers: cadence app run artifact ID --message MSG --token TOKEN. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
                         let body = envelope.to_string();
                         if body.len() > super::ENQUEUE_BYTES {
                             return Err(Error::rejected(
                                 "encoded app kickoff exceeds transport byte limit",
                             ));
                         }
-                        self.enqueue_tx(
+                        // CAD-1374: the dispatch receipt is written in this
+                        // transaction BEFORE the enqueue, so a failed enqueue rolls
+                        // it back too. The sealed approver is the queue initiator;
+                        // the sender stays unattributed and the executing worker
+                        // is the assignee, unchanged.
+                        Self::event(
+                            &tx,
+                            Self::DAEMON_STREAM,
+                            "app_run_step_dispatched",
+                            dispatch_receipt(json!({"run_id":id,"step_id":step_id,"message_id":message,"snapshot_digest":run["snapshot_digest"],"assignee":step.assignee}), approved_by, acting, &operation, &format!("app-run:{id}/step:{step_id}/outcome"), "dispatched"),
+                        )?;
+                        self.enqueue_tx_human(
                             &tx,
                             &step.assignee,
                             &body,
@@ -1368,15 +1712,11 @@ impl Store {
                             super::Priority::Normal,
                             None,
                             None,
+                            None,
+                            approved_by,
                         )?;
                         tx.execute("UPDATE tasks SET state='dispatched',revision=1,dispatch_message=?,updated=? WHERE id=? AND state='draft'",params![message,now(),task_id])?;
                         tx.execute("UPDATE app_run_steps SET state='dispatched',message_id=? WHERE run_id=? AND step_id=? AND state='pending'",params![message,id,step_id])?;
-                        Self::event(
-                            &tx,
-                            Self::DAEMON_STREAM,
-                            "app_run_step_dispatched",
-                            json!({"run_id":id,"step_id":step_id,"message_id":message,"snapshot_digest":run["snapshot_digest"],"assignee":step.assignee}),
-                        )?;
                     }
                     tx.execute(
                         "UPDATE app_runs SET state='running',updated=? WHERE id=?",
@@ -1386,15 +1726,23 @@ impl Store {
         })
     }
     /// Authority loss is terminal; existing artifacts and turn receipts remain
-    /// immutable. This never retries uncertain provider work.
-    pub fn app_run_invalidate(&self, id: &str) -> Result<()> {
+    /// immutable. This never retries uncertain provider work. `reason` hints
+    /// at the cause; only its safe classification (`app_reason_class`) is
+    /// persisted on the failed steps — arbitrary error text interpolated
+    /// from transport or provider output can carry credentials.
+    pub fn app_run_invalidate(&self, id: &str, reason: &str) -> Result<()> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
-            self.app_run_invalidate_in(&tx, id)?;
+            self.app_run_invalidate_in(&tx, id, reason)?;
             Ok(())
         })
     }
-    pub(super) fn app_run_invalidate_in(&self, tx: &impl super::StoreConn, id: &str) -> Result<()> {
+    pub(super) fn app_run_invalidate_in(
+        &self,
+        tx: &impl super::StoreConn,
+        id: &str,
+        reason: &str,
+    ) -> Result<()> {
         let changed = tx.execute("UPDATE app_runs SET state='failed',approved_digest=NULL,updated=? WHERE id=? AND state IN ('awaiting_approval','approved','running')", params![now(), id])?;
         if changed != 0 {
             tx.execute(
@@ -1406,7 +1754,13 @@ impl Store {
             // already closes material/dispatch authority; erasing the step
             // association would roll back the transport's terminal receipt.
             tx.execute("UPDATE app_run_steps SET state='failed' WHERE run_id=? AND state IN ('pending','dispatched') AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.id=app_run_steps.message_id AND m.state='running')", [id])?;
-            tx.execute("UPDATE tasks SET state='failed',error='app authority or assignment is no longer current',updated=? WHERE id IN (SELECT task_id FROM app_run_steps WHERE run_id=? AND state='failed')", params![now(), id])?;
+            // CAD-1142: `reason` reaches here from a dispatch/binding
+            // rejection's `Display` — free text, possibly interpolated
+            // with provider output. Persist only its safe class; the
+            // classified string is still human-readable and names the
+            // authority kind (binding/price/assignment/context).
+            let reason = app_reason_class(reason);
+            tx.execute("UPDATE tasks SET state='failed',error=?,updated=? WHERE id IN (SELECT task_id FROM app_run_steps WHERE run_id=? AND state='failed')", params![reason, now(), id])?;
             tx.execute("UPDATE messages SET state='failed',error='app submission authorization changed',completed=? WHERE source='app_run_dispatch' AND state IN ('queued','submitting') AND id IN (SELECT message_id FROM app_run_steps WHERE run_id=?)",params![now(),id])?;
             Self::event(
                 tx,
@@ -1430,22 +1784,35 @@ impl Store {
         turn: Option<(&str, &str)>,
         current_bundle: &str,
     ) -> Result<Value> {
-        let turn =
+        let (message, token) =
             turn.ok_or_else(|| Error::rejected("worker artifact fetch requires an assigned turn"))?;
-        self.app_artifact_read(id, Some(turn), Some(current_bundle))
+        // The existing worker guards and the byte, digest, and bounds checks
+        // run in this sealed write. The receipt commits only after they pass;
+        // a refusal rolls it back with them.
+        self.write_tx(|tx| {
+            let value =
+                self.app_artifact_read_in(tx, id, Some((message, token)), Some(current_bundle))?;
+            tx.execute(
+                "INSERT INTO app_run_artifact_fetches(artifact_id,message_id,turn_hash,created) VALUES(?,?,?,?) ON CONFLICT(artifact_id,message_id,turn_hash) DO NOTHING",
+                params![id, message, artifact_digest(token.as_bytes()), now()],
+            )?;
+            Ok(value)
+        })
     }
     /// Caller proof is supplied by the daemon's operator-only route. Audit
-    /// access is distinct from current execution or installation authority.
+    /// access is distinct from current execution or installation authority
+    /// and does not record a worker fetch receipt.
     pub fn app_artifact_for_operator(&self, id: &str) -> Result<Value> {
-        self.app_artifact_read(id, None, None)
+        let conn = self.conn();
+        self.app_artifact_read_in(&conn, id, None, None)
     }
-    fn app_artifact_read(
+    fn app_artifact_read_in(
         &self,
+        conn: &impl super::StoreConn,
         id: &str,
         turn: Option<(&str, &str)>,
         current_bundle: Option<&str>,
     ) -> Result<Value> {
-        let conn = self.conn();
         let (run_id, producer_step, digest, media_type, bytes): (
             String,
             String,
@@ -1460,10 +1827,10 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| Error::rejected("artifact unavailable"))?;
-        let run = Self::app_run_show_in(&conn, &run_id)?;
+        let run = Self::app_run_show_in(conn, &run_id)?;
         if let Some((message, token)) = turn {
             Self::app_current_in(
-                &conn,
+                conn,
                 &run,
                 current_bundle.ok_or_else(|| {
                     Error::rejected("worker fetch requires current installation proof")
@@ -1475,17 +1842,17 @@ impl Store {
                 ));
             }
             let msg = self
-                .message_in(&conn, message)?
+                .message_in(conn, message)?
                 .filter(|m| m.state == "running" && m.turn_id.as_deref() == Some(token))
                 .ok_or_else(|| Error::rejected("artifact needs an active assigned turn"))?;
             let spec:String=conn.query_row("SELECT spec FROM app_run_steps WHERE run_id=? AND message_id=? AND state='dispatched'",params![run_id,message],|r|r.get(0)).optional()?.ok_or_else(||Error::rejected("artifact is not a dependency of this turn"))?;
             let step: LocalStep =
                 serde_json::from_str(&spec).map_err(|e| Error::internal(e.to_string()))?;
-            let generation = self.agent_in(&conn, &msg.alias)?.generation;
+            let generation = self.agent_in(conn, &msg.alias)?.generation;
             let assigned = &run["snapshot"]["assignments"][&step.id];
             if step.assignee != msg.alias
                 || material_digest(&Self::app_binding_identity(
-                    &self.agent_in(&conn, &msg.alias)?,
+                    &self.agent_in(conn, &msg.alias)?,
                 )) != assigned["identity_digest"].as_str().unwrap()
                 || !step.dependencies.contains(&producer_step)
                 || !local_token_current(
@@ -1607,6 +1974,65 @@ fn extract_single_json_object(text: &str) -> Option<&str> {
     Some(&text[start..end])
 }
 
+/// CAD-1142 reason privacy. A step's persisted reason — projected as
+/// `steps[].reason` on run reads and carried by the `app_run_failed` /
+/// `app_run_invalidated` daemon-stream payloads — is readable by any
+/// `agent_events` caller (`Rule::Read`, including Unproven). Provider
+/// error text (`messages.error`, `result.error`, managed Pi's verbatim
+/// `errorMessage`) may carry credentials or prose, so it is never
+/// copied onto those surfaces. Instead a free-text detail is classified
+/// onto this bounded allowlist of Cadence-authored classes: the class
+/// still names the real failure kind (binding, price, assignment,
+/// context), while the raw detail stays on operator-only surfaces (the
+/// message row and authorized run reads). An unrecognized detail
+/// degrades to the generic authority-loss class — the class may be less
+/// specific, but no provider string can escape through it.
+pub(super) fn app_reason_class(detail: &str) -> &'static str {
+    let lower = detail.to_lowercase();
+    if lower.contains("binding") || lower.contains("receipt") {
+        "run binding receipt is no longer current"
+    } else if lower.contains("price") || lower.contains("quote") {
+        "capability price could not be confirmed"
+    } else if lower.contains("context") {
+        "run context was updated or archived"
+    } else if lower.contains("connection") {
+        "capability connection receipt is stale or unavailable"
+    } else if lower.contains("assignment") || lower.contains("identity") {
+        "registered assignment identity or group changed"
+    } else if lower.contains("approval") || lower.contains("digest") || lower.contains("bundle") {
+        "run execution approval is absent or stale"
+    } else {
+        "app authority or assignment is no longer current"
+    }
+}
+
+/// CAD-1142 reason privacy: classify how a worker's turn ended into a
+/// bounded human-readable class. `status` is already restricted to the
+/// terminal allowlist by `finish_in`/`reconcile`, so interpolating it
+/// is safe; `detail` names only whether the provider reported error
+/// prose at all, never the prose itself.
+pub(crate) fn app_worker_turn_reason(status: &str, detail: bool) -> String {
+    match (status, detail) {
+        ("failed", true) => "worker turn failed: provider error".to_string(),
+        ("interrupted", _) => "worker turn was interrupted".to_string(),
+        ("unknown", _) => {
+            "worker turn outcome is uncertain; inspect authorized run surfaces".to_string()
+        }
+        (other, true) => format!("worker turn {other}: provider error"),
+        (other, false) => format!("worker turn {other} without producing material"),
+    }
+}
+
+/// CAD-1142 reason privacy: the bounded class an app-owned turn's
+/// uncertain-outcome fence publishes on the public surfaces — the
+/// worker's `attention` event and the agent row's `error`. The raw
+/// provider account stays on the operator-private message row (app
+/// mail inspection already requires operator proof); this class is
+/// the only text Unproven and Agent readers ever see.
+pub(crate) fn app_uncertain_turn_reason() -> String {
+    app_worker_turn_reason("unknown", true)
+}
+
 /// Pi sometimes surrounds its final material envelope with explanatory
 /// prose, either bare or inside one standalone `json` fence. Accept exactly
 /// one complete, bounded envelope in either form amid brace-free prose;
@@ -1679,6 +2105,15 @@ impl Store {
                 )
                 .map(|_| true);
         }
+        // CAD-1778: a worker call that failed after its claim already marked
+        // its own step failed (`app_run_call_failed`); the message that owns
+        // it may still close.
+        if state == "failed"
+            && message_id.as_deref() == Some(&message.id)
+            && message.source == "app_run_dispatch"
+        {
+            return Ok(true);
+        }
         // Reconciliation is transport history only, never material authority.
         if state != "dispatched"
             || message_id.as_deref() != Some(&message.id)
@@ -1694,14 +2129,26 @@ impl Store {
         let worker = self.agent_in(tx, &message.alias)?;
         let task = self.task_in(tx, task_id)?;
         if status != "completed" {
+            // CAD-1142: the step's reason names what actually ended the
+            // worker's turn (provider error, interruption, uncertain
+            // outcome), not a bare "failed" — as a bounded
+            // classification, never the provider's own words. The
+            // message's `error`/`result.error` carries provider prose
+            // verbatim and may hold credentials; it stays on the
+            // operator-only message row while the step records only the
+            // class (see `app_reason_class` above).
+            let detail = message
+                .error
+                .as_deref()
+                .filter(|e| !e.trim().is_empty())
+                .is_some()
+                || result
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .is_some_and(|e| !e.trim().is_empty());
+            let reason = app_worker_turn_reason(status, detail);
             return self
-                .app_step_failed_in(
-                    tx,
-                    &run_id,
-                    &step_id,
-                    task_id,
-                    "app turn did not produce successful material",
-                )
+                .app_step_failed_in(tx, &run_id, &step_id, task_id, &reason)
                 .map(|_| true);
         }
         let AppCompletionProof::ActiveEndpoint { turn_id } = proof else {
@@ -1876,7 +2323,15 @@ impl Store {
                             },
                             _ => false,
                         };
-                        if digest==artifact_sha256 && producer!=message.alias && asset_valid {
+                        // Approve names this artifact, this reviewer message,
+                        // and the hash of the turn token completing now.
+                        // Revise stays a recorded decision without that read.
+                        let fetched = decision != "approve" || tx.query_row(
+                            "SELECT 1 FROM app_run_artifact_fetches WHERE artifact_id=?1 AND message_id=?2 AND turn_hash=?3",
+                            params![id, message.id, artifact_digest(token.as_bytes())],
+                            |_| Ok(()),
+                        ).optional()?.is_some();
+                        if digest==artifact_sha256 && producer!=message.alias && asset_valid && fetched {
                             tx.execute("INSERT INTO app_run_reviews(run_id,step_id,artifact_id,artifact_digest,reviewer,message_id,decision,rationale,asset_receipt_id,asset_digest) VALUES(?,?,?,?,?,?,?,?,?,?)",params![run_id,step_id,id,digest,message.alias,message.id,decision,rationale,asset_receipt_id,asset_sha256])?;
                             Self::event(tx,Self::DAEMON_STREAM,"app_run_step_reviewed",json!({"run_id":run_id,"step_id":step_id,"artifact_digest":digest,"reviewer":message.alias,"decision":decision}))?;
                             valid=decision=="approve";
@@ -1943,6 +2398,10 @@ impl Store {
             "UPDATE app_run_steps SET state='failed' WHERE run_id=? AND step_id=?",
             params![run, step],
         )?;
+        // CAD-1142: callers pass classified or Cadence-literal reasons;
+        // bound defensively so no caller can grow an unbounded string on
+        // the projected step reason or the daemon-stream payload.
+        let reason: String = reason.chars().take(256).collect();
         tx.execute(
             "UPDATE tasks SET state='failed',error=?,updated=? WHERE id=?",
             params![reason, now(), task],

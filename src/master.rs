@@ -1,7 +1,7 @@
 //! The master agent (CAD-339): one per install, alias `master`, a
 //! managed Claude or Pi session (CAD-322; Codex waits for a read-only
 //! sandbox) the daemon starts from the agent files `agents/master/
-//! SOUL.md` and `AGENT.md`.
+//! IDENTITY.md`, `SOUL.md` and `AGENT.md`.
 //!
 //! **Where the files live.** CAD-338 (the agent filesystem) is not
 //! implemented yet, so this uses the smallest location its design
@@ -11,10 +11,12 @@
 //! The repo carries the default templates (`agents/master/`); the
 //! daemon installs any that are missing on `master start`.
 //!
-//! **One writer.** SOUL.md and AGENT.md change only through
+//! **One writer.** IDENTITY.md, SOUL.md and AGENT.md change only through
 //! [`write_file`] (`cadence master edit`, daemon RPC `agent_file_write`),
-//! which the daemon runs for the proven operator only — an agent, the
-//! master included, is refused before anything is written. Each write
+//! or IDENTITY.md/SOUL.md through the bounded [`write_identity`]
+//! (`master_identity_set`), which the daemon runs for the proven operator
+//! only — an agent, the master included, is refused before anything is
+//! written. Each write
 //! (and each install) records the files' digest in the state dir;
 //! `master start` refuses files whose digest does not match — an edit
 //! made around the writer is caught at the next launch instead of
@@ -103,11 +105,13 @@ pub const ALIAS: &str = "master";
 /// place.
 pub const PROVIDERS: &[&str] = &["claude", "pi"];
 /// The agent files the briefing is built from, in briefing order.
-pub const FILES: [&str; 2] = ["SOUL.md", "AGENT.md"];
+pub const FILES: [&str; 3] = ["IDENTITY.md", "SOUL.md", "AGENT.md"];
 /// Size caps from the agent-filesystem design record (characters).
+pub const IDENTITY_MAX_CHARS: usize = 1_000;
 pub const SOUL_MAX_CHARS: usize = 4_000;
 pub const AGENT_MAX_CHARS: usize = 20_000;
 
+const IDENTITY_TEMPLATE: &str = include_str!("../agents/master/IDENTITY.md");
 const SOUL_TEMPLATE: &str = include_str!("../agents/master/SOUL.md");
 const AGENT_TEMPLATE: &str = include_str!("../agents/master/AGENT.md");
 
@@ -117,6 +121,15 @@ const AGENT_TEMPLATE: &str = include_str!("../agents/master/AGENT.md");
 /// Never a bare `Bash(cadence *)`: `cadence build-slot run -- <argv>`
 /// execs anything (review round 1, C1).
 pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
+    // CAD-1432: read-only command discovery. `help` with no argument
+    // lists only the paths this profile may run; `help <path>` renders
+    // clap usage for one admitted path. The Pi guard admits only a
+    // path that is itself on this allowlist — flags, argument values
+    // and unknown/disallowed paths refuse inside the guard, so
+    // `cadence help` can never describe a command the master cannot
+    // run, and admitting help never admits the verb it describes.
+    "Bash(cadence help)",
+    "Bash(cadence help *)",
     "Bash(cadence issue ls)",
     "Bash(cadence issue ls *)",
     "Bash(cadence issue show *)",
@@ -157,6 +170,18 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "Bash(cadence wiki search *)",
     "Bash(cadence wiki history *)",
     "Bash(cadence wiki put *)",
+    // CAD-1168: the retained chat attachments the master's turn was
+    // sent — bounded text reads. The daemon resolves the live turn and
+    // checks the id is on its envelope; this lets the master invoke it.
+    "Bash(cadence attachment read *)",
+    // CAD-1726: put a canvas artifact on the live turn. The daemon binds
+    // the scope to that turn and refuses every other caller.
+    "Bash(cadence artifact put *)",
+    // CAD-1752: propose hiring a catalogue role for the operator to review.
+    // The daemon binds it to the live turn; it registers nothing.
+    "Bash(cadence agent propose-hire *)",
+    // CAD-1772: the catalogue's role ids, so a proposal names a real one.
+    "Bash(cadence agent roles)",
     // CAD-615: ask the operator to approve one plain command. The
     // decision verbs are not here — the master cannot approve itself.
     "Bash(cadence master ask-permission *)",
@@ -189,6 +214,25 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     // campaign before the operator applies it.
     "Bash(cadence app content assistant-proposals *)",
     "Bash(cadence app content assistant-proposal-show *)",
+    // CAD-1586: the bounded Settings > Agents namespace. Every verb is
+    // admitted to the *tool* guard so a granted operation is actually
+    // invocable; authority lives entirely daemon-side — a mutation or
+    // grant decision with no bound settings grant refuses there, so a
+    // broader tool stem cannot widen what an agent may do. The legacy
+    // approved-argv path still never covers settings mutations or
+    // grant verbs (master_perm NEVER list, unchanged).
+    "Bash(cadence settings agents)",
+    "Bash(cadence settings agents *)",
+    // The master's own diagnosis and the granted recovery resume —
+    // `master status` reads only (its daemon op refuses a free agent
+    // read anyway; a designated management agent's exact grant opens
+    // it), `master resume` carries no authority without the bound
+    // `master.resume` settings grant. Neither delegates: argv approval
+    // still cannot mint either (master_perm NEVER list).
+    "Bash(cadence master status)",
+    "Bash(cadence master status *)",
+    "Bash(cadence master resume)",
+    "Bash(cadence master resume *)",
 ];
 
 /// CAD-1098 Gate 1: which tool profile a master session launches with.
@@ -208,12 +252,50 @@ pub enum Profile {
 /// profile has no `issue`, `plan`, `report`, `wiki`, `agent`, `master`,
 /// `overview`, `status`, `thread` or `project` verb — and no health verb:
 /// the `health` RPC returns fleet metadata an app turn does not need.
+/// It also has no `help` (CAD-1432): a scoped turn's daemon-written
+/// reference is complete, so help and `--help` probing stay refused.
+/// `attachment read` is in BOTH (CAD-1168): an app conversation's turn
+/// reads the file its own message carried — the read binds to the live
+/// turn daemon-side, and the envelope is the only place an id comes from.
 pub fn allowed_tools(profile: Profile) -> Vec<&'static str> {
     CLAUDE_ALLOWED_TOOLS
         .iter()
         .copied()
-        .filter(|t| profile == Profile::Home || t.starts_with("Bash(cadence app "))
+        .filter(|t| {
+            profile == Profile::Home
+                || t.starts_with("Bash(cadence app ")
+                || *t == "Bash(cadence attachment read *)"
+                || *t == "Bash(cadence artifact put *)"
+        })
         .collect()
+}
+
+/// The command paths (stems after `cadence`, e.g. `issue ls`,
+/// `wiki put`) `cadence help <path>` may describe for `profile` —
+/// every allowlisted stem except `help` itself, plus each of their
+/// parent paths (`issue`, `app`, `attachment`, …). A path a profile
+/// cannot run is never a help path for it.
+pub fn help_paths(profile: Profile) -> Vec<String> {
+    let stems: Vec<String> = allowed_tools(profile)
+        .iter()
+        .filter_map(|t| t.strip_prefix("Bash(cadence "))
+        .filter_map(|t| t.strip_suffix(')'))
+        .map(|t| t.strip_suffix(" *").unwrap_or(t).to_string())
+        .filter(|s| s != "help")
+        .collect();
+    let mut paths = stems.clone();
+    for stem in &stems {
+        let toks: Vec<&str> = stem.split_whitespace().collect();
+        for i in 1..toks.len() {
+            let parent = toks[..i].join(" ");
+            if !paths.contains(&parent) {
+                paths.push(parent);
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 /// Defense in depth only (CAD-1098 I6): an app session's environment
@@ -246,37 +328,67 @@ pub fn clear_tmp(state_dir: &Path) -> std::io::Result<()> {
     first_err.map_or(Ok(()), Err)
 }
 
-/// CAD-1009: the argument shape of each scoped verb, keyed by the
-/// allowlist stem after `cadence app `. The per-turn reference
+/// CAD-1009: the daemon RPC and argument shape of each scoped verb, keyed
+/// by the allowlist stem after `cadence app `. The per-turn reference
 /// ([`scoped_verb_reference`]) is built by walking
 /// [`CLAUDE_ALLOWED_TOOLS`], so a verb allowlisted without a row here
 /// (or a row whose verb left the allowlist) fails
-/// `scoped_reference_tracks_the_allowlist` rather than drifting.
-pub const SCOPED_VERB_SHAPES: &[(&str, &str)] = &[
+/// `scoped_reference_tracks_the_allowlist` rather than drifting. The RPC
+/// names the declaration the verb needs ([`crate::app_assistant::scoped_need`],
+/// CAD-1518), so the reference offers exactly what the daemon admits.
+pub const SCOPED_VERB_SHAPES: &[(&str, &str, &str)] = &[
     (
         "audience segment-assistant-save",
+        "app_segment_assistant_save",
         "--segment-id seg-<slug of the name: lowercase a-z0-9-, never `new`> --name \"<exact human name, spaces kept>\" --predicates P [--expected-revision R]",
     ),
-    ("audience segment-assistant-ls", ""),
-    ("audience segment-assistant-show", "--segment-id S"),
-    ("audience segment-assistant-preview", "--segment-id S"),
+    ("audience segment-assistant-ls", "app_segment_assistant_list", ""),
+    (
+        "audience segment-assistant-show",
+        "app_segment_assistant_show",
+        "--segment-id S",
+    ),
+    (
+        "audience segment-assistant-preview",
+        "app_segment_assistant_preview",
+        "--segment-id S",
+    ),
     (
         "record csv-assistant-import",
+        "app_record_csv_assistant_import",
         "--request-id R --confirm-token C",
     ),
-    ("record csv-assistant-preview", "--csv F"),
-    ("assistant actions", ""),
+    (
+        "record csv-assistant-preview",
+        "app_record_csv_assistant_preview",
+        "--csv F",
+    ),
+    ("assistant actions", "app_assistant_actions", ""),
     (
         "assistant invoke",
+        "app_assistant_invoke",
         "--action-id A --operation-id O --input F",
     ),
-    ("assistant operation-show", "--operation-id O"),
+    (
+        "assistant operation-show",
+        "app_assistant_operation_show",
+        "--operation-id O",
+    ),
     (
         "content assistant-draft",
+        "app_content_assistant_draft",
         "--campaign-id C --proposal-id P --draft F",
     ),
-    ("content assistant-proposals", "[--campaign-id C]"),
-    ("content assistant-proposal-show", "--proposal-id P"),
+    (
+        "content assistant-proposals",
+        "app_content_assistant_proposals",
+        "[--campaign-id C]",
+    ),
+    (
+        "content assistant-proposal-show",
+        "app_content_assistant_proposal_show",
+        "--proposal-id P",
+    ),
 ];
 
 /// One example rule per supported predicate field (value shown is a
@@ -301,14 +413,29 @@ pub fn scoped_verb_stems() -> Vec<&'static str> {
 /// with its token. `install`/`context`/`message_id`/`token` are the
 /// real values (the caller passes the adapter's slot for `token`);
 /// `tmp` is the master's private temp dir. Verbs come from
-/// [`CLAUDE_ALLOWED_TOOLS`]; nothing outside it is named.
+/// [`CLAUDE_ALLOWED_TOOLS`]; nothing outside it is named. CAD-1518: only
+/// the verbs `declared` admits are listed, and an installation that
+/// declares none gets no block at all.
 pub fn scoped_verb_reference(
     install: &str,
     context: &str,
     message_id: &str,
     token: &str,
     tmp: &Path,
-) -> String {
+    declared: &crate::app_assistant::Declared,
+) -> Option<String> {
+    let verbs: Vec<(&str, &str)> = scoped_verb_stems()
+        .into_iter()
+        .filter_map(|stem| {
+            let (_, rpc, args) = SCOPED_VERB_SHAPES.iter().find(|(s, _, _)| *s == stem)?;
+            crate::app_assistant::scoped_need(rpc)
+                .is_some_and(|need| declared.admits(need))
+                .then_some((stem, *args))
+        })
+        .collect();
+    if verbs.is_empty() {
+        return None;
+    }
     let mut out = format!(
         "[Scoped chat turn — message \"{message_id}\", turn token \"{token}\". \
          Turn-only; never repeat the token.\n\
@@ -316,24 +443,30 @@ pub fn scoped_verb_reference(
          Form: `cadence app <verb> {install} --context-id {context} <args> --message {message_id} --token {token}`\n\
          Verbs (verb: args):\n"
     );
-    for stem in scoped_verb_stems() {
-        let args = SCOPED_VERB_SHAPES
-            .iter()
-            .find(|(s, _)| *s == stem)
-            .map_or("(see AGENT.md)", |(_, a)| *a);
+    for (stem, args) in verbs {
         out.push_str(&format!("{stem}: {args}\n"));
     }
-    out.push_str(&format!(
-        "Predicates P: {}/preds.json; JSON rules array, AND, op eq|ne per field:\n",
-        tmp.display()
-    ));
-    for (field, value) in PREDICATE_EXAMPLES {
+    if declared.admits(crate::app_assistant::ScopedNeed::Action("segments.save")) {
         out.push_str(&format!(
-            "[{{\"field\": \"{field}\", \"op\": \"eq\", \"value\": \"{value}\"}}]\n"
+            "Predicates P: {}/preds.json; JSON rules array, AND, op eq|ne per field:\n",
+            tmp.display()
         ));
+        for (field, value) in PREDICATE_EXAMPLES {
+            out.push_str(&format!(
+                "[{{\"field\": \"{field}\", \"op\": \"eq\", \"value\": \"{value}\"}}]\n"
+            ));
+        }
+    }
+    if declared.admits(crate::app_assistant::ScopedNeed::Action(
+        "media.refine.prepare",
+    )) {
+        out.push_str(
+            "Inspect only the attached retained image. If media.refine.prepare is listed, \
+             prepare pinned asset_id, revision, sha256 and operator instructions; do not invent.\n",
+        );
     }
     out.push_str("[end scoped chat turn]");
-    out
+    Some(out)
 }
 
 /// The only built-in tool the master's Claude session has (`--tools`):
@@ -485,6 +618,30 @@ pub const CONFINE_SYSTEM_READ: &[&str] = &[
     "/proc/sys/kernel/pid_max",
 ];
 
+/// CAD-1287: where systemd-resolved keeps the stub `/etc/resolv.conf`
+/// points at on stock Ubuntu; `/etc` alone does not cover it.
+const RESOLVED_DIR: &str = "/run/systemd/resolve";
+
+/// The resolver directory the master may also read: exactly
+/// [`RESOLVED_DIR`], and only when `resolv_conf` is a symlink whose
+/// canonical target is inside it. A regular file, any other target, a
+/// dangling link or any resolution error grants nothing.
+fn resolver_read(resolv_conf: &Path) -> Option<PathBuf> {
+    let meta = std::fs::symlink_metadata(resolv_conf).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    resolver_grant(&std::fs::canonicalize(resolv_conf).ok()?)
+}
+
+fn resolver_grant(canonical: &Path) -> Option<PathBuf> {
+    let dir = Path::new(RESOLVED_DIR);
+    let inside = canonical.starts_with(dir)
+        && canonical != dir
+        && canonical.components().all(|c| c != Component::ParentDir);
+    inside.then(|| dir.to_path_buf())
+}
+
 /// Device files the master's process tree may use — not `/dev` whole
 /// (`/dev/shm` holds other processes' shared memory), and no pty: the
 /// managed master talks over pipes.
@@ -546,6 +703,7 @@ pub struct ConfineInputs {
 /// sandbox does not restrict.
 pub fn confinement(inputs: &ConfineInputs) -> crate::confine::Policy {
     let mut read: Vec<PathBuf> = CONFINE_SYSTEM_READ.iter().map(PathBuf::from).collect();
+    read.extend(resolver_read(Path::new("/etc/resolv.conf")));
     let mut write: Vec<PathBuf> = CONFINE_SYSTEM_WRITE.iter().map(PathBuf::from).collect();
     if let Some(home) = &inputs.home {
         read.extend(inputs.home_read.iter().map(|p| home.join(p)));
@@ -1178,6 +1336,7 @@ fn check_slug(slug: &str) -> Result<()> {
 /// truncated.
 pub fn check_file(name: &str, text: &str) -> Result<()> {
     let cap = match name {
+        "IDENTITY.md" => IDENTITY_MAX_CHARS,
         "SOUL.md" => SOUL_MAX_CHARS,
         "AGENT.md" => AGENT_MAX_CHARS,
         "permissions.yaml" => {
@@ -1223,8 +1382,12 @@ fn real_dir(pm_dir: &Path, slug: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn default_template(slug: &str, name: &str) -> Option<&'static str> {
+/// The file `install_defaults` writes when `name` is missing —
+/// `master status` resolves would-be prefs against the same templates
+/// without installing anything.
+pub(crate) fn default_template(slug: &str, name: &str) -> Option<&'static str> {
     match (slug, name) {
+        (ALIAS, "IDENTITY.md") => Some(IDENTITY_TEMPLATE),
         (ALIAS, "SOUL.md") => Some(SOUL_TEMPLATE),
         (ALIAS, "AGENT.md") => Some(AGENT_TEMPLATE),
         _ => None,
@@ -1289,8 +1452,8 @@ pub fn install_defaults(pm: &Pm, actor: &str) -> Result<Vec<String>> {
     Ok(missing.iter().map(|s| s.to_string()).collect())
 }
 
-/// Replace one agent file — the only writer of SOUL.md and AGENT.md.
-/// The daemon calls it for the proven operator only. Validated and
+/// Replace one agent file — the only writer of IDENTITY.md, SOUL.md and
+/// AGENT.md. The daemon calls it for the proven operator only. Validated and
 /// secret-scanned before anything is written; one tracker commit.
 pub fn write_file(pm: &Pm, slug: &str, name: &str, text: &str, actor: &str) -> Result<Value> {
     check_file(name, text)?;
@@ -1331,6 +1494,56 @@ pub fn write_file(pm: &Pm, slug: &str, name: &str, text: &str, actor: &str) -> R
     Ok(out)
 }
 
+/// Remove one agent file through the same lock and tracker commit as
+/// [`write_file`]. The master slug is refused: those files are the
+/// running master's briefing, not a settings profile.
+pub fn remove_file(pm: &Pm, slug: &str, name: &str, actor: &str) -> Result<Value> {
+    if slug == ALIAS {
+        return Err(Error::rejected(
+            "agents/master is the master briefing — settings cannot remove it",
+        ));
+    }
+    if !FILES.contains(&name) {
+        return Err(Error::rejected(format!(
+            "'{name}' is not an agent file — one of {}",
+            FILES.join(", ")
+        )));
+    }
+    let dir = real_dir(&pm.dir, slug)?;
+    let _lock = pm.lock()?;
+    let path = dir.join(name);
+    if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{} is a symlink — refusing to remove through it",
+            path.display()
+        )));
+    }
+    let before = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({"agent": slug, "file": name, "removed": false}));
+        }
+        Err(e) => {
+            return Err(Error::rejected(format!(
+                "cannot read {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    std::fs::remove_file(&path)?;
+    if let Err(e) = crate::issue::write::commit(
+        pm,
+        std::slice::from_ref(&path),
+        &format!("agents/{slug}: remove {name}"),
+        &[],
+        actor,
+    ) {
+        let _ = std::fs::write(&path, &before);
+        return Err(e);
+    }
+    Ok(json!({"agent": slug, "file": name, "removed": true}))
+}
+
 /// Read the agent's files in [`FILES`] order, refusing symlinks and
 /// files over their caps. `all` requires every file; otherwise a
 /// missing one is skipped.
@@ -1355,6 +1568,202 @@ pub fn read_files(pm_dir: &Path, slug: &str, all: bool) -> Result<Vec<(String, S
         out.push((name.to_string(), text));
     }
     Ok(out)
+}
+
+/// The workspace coordinator's committed identity: its display name and agreed
+/// tone from the protected files, plus the content revision a write fences on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub name: Option<String>,
+    pub tone: Option<String>,
+    /// sha256 over IDENTITY.md+SOUL.md; opaque, changes on every applied write.
+    pub revision: String,
+}
+
+/// Read one master file, refusing a symlink and a file over its cap. `None`
+/// only when the file is genuinely absent (an install from before
+/// IDENTITY.md existed, or a never-installed `agents/master`).
+fn read_one(pm_dir: &Path, slug: &str, name: &str) -> Result<Option<String>> {
+    let dir = real_dir(pm_dir, slug)?;
+    let path = dir.join(name);
+    let meta = path.symlink_metadata();
+    if meta.as_ref().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{} is a symlink — agent files are never read through links",
+            path.display()
+        )));
+    }
+    match meta {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(Error::rejected(format!(
+                "cannot read {}: {e}",
+                path.display()
+            )))
+        }
+        Ok(_) => {}
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| Error::rejected(format!("cannot read {}: {e}", path.display())))?;
+    check_file(name, &text)?;
+    Ok(Some(text))
+}
+
+/// The revision of the identity files and effective avatar: length-prefixed
+/// so no distinct set of values can concatenate alike.
+pub fn identity_revision(identity_text: &str, soul_text: &str, look: &str) -> String {
+    digest(&format!(
+        "{}:{identity_text}|{}:{soul_text}|{}:{look}",
+        identity_text.len(),
+        soul_text.len(),
+        look.len()
+    ))
+}
+
+/// Read the effective workspace identity. A missing file is unset; a
+/// malformed managed section or a refused read is an error, never a silent
+/// unset.
+pub fn read_identity(pm_dir: &Path, look: &str) -> Result<Identity> {
+    let identity = read_one(pm_dir, ALIAS, "IDENTITY.md")?.unwrap_or_default();
+    let soul = read_one(pm_dir, ALIAS, "SOUL.md")?.unwrap_or_default();
+    identity_from_sources(&identity, &soul, look)
+}
+
+/// Read only verified source bytes for UI and per-turn context. Unlike the
+/// launch check, this never trusts-once or updates the protected baseline.
+pub fn read_verified_identity(state_dir: &Path, pm_dir: &Path, look: &str) -> Result<Identity> {
+    let identity = read_one(pm_dir, ALIAS, "IDENTITY.md")?.unwrap_or_default();
+    let soul = read_one(pm_dir, ALIAS, "SOUL.md")?.unwrap_or_default();
+    let agent = read_one(pm_dir, ALIAS, "AGENT.md")?.unwrap_or_default();
+    if let Some(reason) = tampered_sources(
+        state_dir,
+        ALIAS,
+        [
+            ("IDENTITY.md", identity.as_str()),
+            ("SOUL.md", soul.as_str()),
+            ("AGENT.md", agent.as_str()),
+        ],
+    ) {
+        return Err(Error::invalid("agent_files_changed", reason));
+    }
+    identity_from_sources(&identity, &soul, look)
+}
+
+fn identity_from_sources(identity: &str, soul: &str, look: &str) -> Result<Identity> {
+    Ok(Identity {
+        name: crate::managed_section::value(identity, "name")?,
+        tone: crate::managed_section::value(soul, "tone")?,
+        revision: identity_revision(identity, soul, look),
+    })
+}
+
+/// Write the workspace identity through the same protected-writer path as
+/// [`write_file`]: bounded managed sections, secret scan, one tracker commit
+/// for both files, rollback on a failed commit. `expected_revision` is
+/// re-checked under the writer lock, so a stale editor never overwrites a
+/// newer identity. `None` leaves a field untouched; an empty value clears it.
+pub fn write_identity(
+    pm: &Pm,
+    expected_revision: &str,
+    look: &str,
+    name: Option<&str>,
+    tone: Option<&str>,
+    actor: &str,
+) -> Result<Identity> {
+    let dir = real_dir(&pm.dir, ALIAS)?;
+    let _lock = pm.lock()?;
+    std::fs::create_dir_all(&dir)?;
+    // Fence on what `read_identity` reports — the RAW files, where a missing
+    // file is empty — then seed a missing target from its template only for
+    // the new text. Substituting the template before the comparison would
+    // make a never-installed IDENTITY.md look stale to its own projection.
+    let identity_raw = read_one(&pm.dir, ALIAS, "IDENTITY.md")?;
+    let soul_raw = read_one(&pm.dir, ALIAS, "SOUL.md")?;
+    let current = identity_revision(
+        identity_raw.as_deref().unwrap_or(""),
+        soul_raw.as_deref().unwrap_or(""),
+        look,
+    );
+    if current != expected_revision {
+        return Err(Error::rejected(format!(
+            "master identity revision is stale (current {current}) — reload the \
+             identity and retry"
+        )));
+    }
+    let identity_before = identity_raw.unwrap_or_else(|| IDENTITY_TEMPLATE.to_string());
+    let soul_before = soul_raw.unwrap_or_else(|| SOUL_TEMPLATE.to_string());
+    let mut staged: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+    let apply = (|| -> Result<()> {
+        let mut stage = |next: String, file: &str| -> Result<()> {
+            check_file(file, &next)?;
+            crate::secret::guard(&format!("agents/{ALIAS}/{file}"), &next)?;
+            let path = dir.join(file);
+            let before = std::fs::read(&path).ok();
+            write_atomic(&path, &next)?;
+            staged.push((path, before));
+            Ok(())
+        };
+        if let Some(name) = name {
+            let next = crate::managed_section::set(
+                &identity_before,
+                "name",
+                &crate::managed_section::line("name", name),
+            )?;
+            stage(next, "IDENTITY.md")?;
+        }
+        if let Some(tone) = tone {
+            let next = crate::managed_section::set(
+                &soul_before,
+                "tone",
+                &crate::managed_section::line("tone", tone),
+            )?;
+            stage(next, "SOUL.md")?;
+        }
+        if !staged.is_empty() {
+            let paths: Vec<PathBuf> = staged.iter().map(|(path, _)| path.clone()).collect();
+            crate::issue::write::commit(
+                pm,
+                &paths,
+                &format!("agents/{ALIAS}: set identity"),
+                &[],
+                actor,
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = apply {
+        for (path, before) in staged {
+            match before {
+                Some(old) => {
+                    let _ = std::fs::write(&path, old);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        return Err(e);
+    }
+    read_identity(&pm.dir, look)
+}
+
+/// Record only the identity sources explicitly changed by the protected writer;
+/// an unrelated source must retain its baseline for the post-write check.
+pub fn record_identity(
+    state_dir: &Path,
+    pm_dir: &Path,
+    name_changed: bool,
+    tone_changed: bool,
+) -> Result<()> {
+    for (name, changed) in [("IDENTITY.md", name_changed), ("SOUL.md", tone_changed)] {
+        if !changed {
+            continue;
+        }
+        if let Some(text) = read_one(pm_dir, ALIAS, name)? {
+            record(state_dir, ALIAS, name, &digest(&text))?;
+        }
+    }
+    Ok(())
 }
 
 /// sha256 of one file's text.
@@ -1423,6 +1832,41 @@ pub fn verify(state_dir: &Path, slug: &str, files: &[(String, String)]) -> Resul
     Ok(())
 }
 
+/// The read-only half of [`verify`] (CAD-1586): `Some(reason)` when a
+/// file's current digest contradicts the recorded baseline — the same
+/// refusal `verify` raises — without the trust-once recording `verify`
+/// performs. `master status` reports drift; it never records.
+pub fn tampered_file(state_dir: &Path, slug: &str, files: &[(String, String)]) -> Option<String> {
+    tampered_sources(
+        state_dir,
+        slug,
+        files
+            .iter()
+            .map(|(name, text)| (name.as_str(), text.as_str())),
+    )
+}
+
+fn tampered_sources<'a>(
+    state_dir: &Path,
+    slug: &str,
+    files: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<String> {
+    let all = load_records(state_dir);
+    for (name, text) in files {
+        match all[slug][name]["digest"].as_str() {
+            Some(known) if known != digest(text) => {
+                return Some(format!(
+                    "agents/{slug}/{name} changed outside `cadence master edit` — \
+                     `master start` refuses to brief the master from it. Review it, \
+                     then re-save it as the operator: `cadence master edit {name} --file <path>`"
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Longest escalation summary the operator is shown.
 pub const ESCALATION_SUMMARY_MAX: usize = 4_000;
 
@@ -1459,12 +1903,12 @@ pub fn record_escalation(state_dir: &Path, key: &str, record: Value) -> Result<(
     Ok(())
 }
 
-/// The briefing text: SOUL.md then AGENT.md, verbatim and byte-stable
-/// (the prefix caches), under one heading naming their source.
+/// The briefing text: IDENTITY.md, SOUL.md then AGENT.md, verbatim and
+/// byte-stable (the prefix caches), under one heading naming their source.
 pub fn compose(files: &[(String, String)]) -> String {
     let mut out = String::from(
-        "# Master briefing\n\nBuilt by the daemon from agents/master/ (SOUL.md, AGENT.md). \
-         Only the operator changes these files.\n",
+        "# Master briefing\n\nBuilt by the daemon from agents/master/ (IDENTITY.md, SOUL.md, \
+         AGENT.md). Only the operator changes these files.\n",
     );
     for (name, text) in files {
         out.push_str(&format!("\n<!-- agents/master/{name} -->\n"));
@@ -1476,6 +1920,44 @@ pub fn compose(files: &[(String, String)]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn resolver_grant_only_for_systemd_resolved_targets() {
+        let dir = Some(PathBuf::from("/run/systemd/resolve"));
+        for ok in [
+            "/run/systemd/resolve/stub-resolv.conf",
+            "/run/systemd/resolve/resolv.conf",
+        ] {
+            assert_eq!(super::resolver_grant(Path::new(ok)), dir, "{ok}");
+        }
+        for no in [
+            "/run/NetworkManager/resolv.conf",
+            "/run/systemd/resolve",
+            "/run/systemd/resolved/x",
+            "/run/systemd",
+            "/etc/x",
+            "../etc/x",
+            "/run/systemd/resolve/../../x",
+        ] {
+            assert_eq!(super::resolver_grant(Path::new(no)), None, "{no}");
+        }
+    }
+
+    #[test]
+    fn resolver_read_fails_closed() {
+        let t = tempfile::tempdir().unwrap();
+        let file = t.path().join("resolv.conf");
+        std::fs::write(&file, "nameserver 1.1.1.1\n").unwrap();
+        let other = t.path().join("other.conf");
+        std::os::unix::fs::symlink(&file, &other).unwrap();
+        let dangling = t.path().join("dangling.conf");
+        std::os::unix::fs::symlink(t.path().join("missing"), &dangling).unwrap();
+        for p in [&file, &other, &dangling, &t.path().join("absent")] {
+            assert_eq!(super::resolver_read(p), None, "{p:?}");
+        }
+    }
+
     #[test]
     fn pi_private_config_is_independent_of_confinement() {
         let state = tempfile::tempdir().unwrap();
@@ -1585,6 +2067,38 @@ mod tests {
         }
     }
 
+    /// CAD-1432: `cadence help` is allowlisted for Home only, and its
+    /// admitted paths are exactly the profile's own stems plus their
+    /// parents — never `help` itself, and nothing for an app session
+    /// beyond `attachment`/`app` paths (an app turn gets no help rules,
+    /// so its `cadence help …` is refused before this is consulted).
+    #[test]
+    fn help_paths_follow_the_profile_allowlist() {
+        let home = help_paths(Profile::Home);
+        assert!(home.contains(&"issue ls".to_string()));
+        assert!(home.contains(&"issue".to_string()));
+        assert!(home.contains(&"project new".to_string()));
+        assert!(home.contains(&"wiki put".to_string()));
+        // CAD-1752: the master may propose a hire; an app session may not.
+        assert!(home.contains(&"agent propose-hire".to_string()));
+        assert!(home.contains(&"agent roles".to_string()));
+        assert!(home.contains(&"app audience segment-assistant-ls".to_string()));
+        assert!(home.contains(&"app".to_string()));
+        assert!(!home.iter().any(|p| p == "help" || p.starts_with("help ")));
+        // Every stem contributes its path; a parent of nothing is absent.
+        assert!(!home.contains(&"nonexistent".to_string()));
+        let app = help_paths(Profile::App);
+        assert!(
+            app.iter().all(|p| p == "app"
+                || p.starts_with("app ")
+                || p == "attachment"
+                || p.starts_with("attachment ")
+                || p == "artifact"
+                || p.starts_with("artifact ")),
+            "{app:?}"
+        );
+    }
+
     /// CAD-1009: the scoped-chat section of AGENT.md matches what the
     /// daemon delivers and what the segment grammar accepts — the
     /// block it quotes opens exactly like `scoped_verb_reference`,
@@ -1600,8 +2114,15 @@ mod tests {
         );
         // The block's opener and rules are quoted verbatim, and the
         // section says the per-turn block is authoritative.
-        let block =
-            scoped_verb_reference("<install>", "<ctx>", "<msg>", "<token>", Path::new("/t"));
+        let block = scoped_verb_reference(
+            "<install>",
+            "<ctx>",
+            "<msg>",
+            "<token>",
+            Path::new("/t"),
+            &everything_declared(),
+        )
+        .unwrap();
         for line in block.lines().take(3) {
             assert!(AGENT_TEMPLATE.contains(line), "{line}");
         }
@@ -1621,6 +2142,19 @@ mod tests {
         }
     }
 
+    /// An installation that declares every registered action and the CSV
+    /// attachment: the full reference.
+    fn everything_declared() -> crate::app_assistant::Declared {
+        crate::app_assistant::Declared {
+            actions: crate::app_assistant::registered_ids()
+                .iter()
+                .map(|id| id.to_string())
+                .collect(),
+            attachments: ["csv-import".to_string()].into(),
+            ..Default::default()
+        }
+    }
+
     fn sample_reference() -> String {
         scoped_verb_reference(
             "inst-1",
@@ -1628,7 +2162,9 @@ mod tests {
             "msg-1",
             "pi-1-fake-tok",
             Path::new("/s/master/tmp"),
+            &everything_declared(),
         )
+        .unwrap()
     }
 
     /// CAD-1009: the per-turn reference is built from the allowlist, so
@@ -1643,16 +2179,16 @@ mod tests {
         assert!(stems.len() >= 9, "{stems:?}");
         let text = sample_reference();
         for stem in &stems {
-            let (_, args) = SCOPED_VERB_SHAPES
+            let (_, _, args) = SCOPED_VERB_SHAPES
                 .iter()
-                .find(|(s, _)| s == stem)
+                .find(|(s, _, _)| s == stem)
                 .unwrap_or_else(|| panic!("allowlisted `{stem}` has no shape row"));
             assert!(
                 text.contains(&format!("{stem}: {args}\n")),
                 "{stem}\n{text}"
             );
         }
-        for (stem, _) in SCOPED_VERB_SHAPES {
+        for (stem, _, _) in SCOPED_VERB_SHAPES {
             assert!(
                 stems.contains(stem),
                 "shape row `{stem}` is not allowlisted"

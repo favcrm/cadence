@@ -12,6 +12,7 @@ use super::effects;
 use super::messages::{Message, FENCING_UNKNOWN_SQL};
 use super::platform;
 use super::threads;
+use super::topics;
 use super::StoreConn;
 use super::{Store, BUSY_TIMEOUT};
 
@@ -32,6 +33,42 @@ pub(super) fn before_migration_for_test(hook: impl FnOnce(&Path) + 'static) {
 pub(super) fn open_migration_for_test(path: &Path) -> Result<Store> {
     Store::open_inner(path, None, false, false, super::seal::OpenMode::Legacy)
         .map(|(store, _)| store)
+}
+
+fn validate_chat_file_owner_shape(conn: &Connection) -> Result<()> {
+    let columns = {
+        let mut stmt = conn.prepare("PRAGMA table_info(chat_files)")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (name, declared_type) in [
+        ("user_id", "TEXT"),
+        ("thread_id", "TEXT"),
+        ("location_version", "INTEGER"),
+    ] {
+        if let Some((_, actual_type, not_null, default, primary_key)) =
+            columns.iter().find(|(column, ..)| column == name)
+        {
+            if !actual_type.eq_ignore_ascii_case(declared_type)
+                || *not_null != 0
+                || default.is_some()
+                || *primary_key != 0
+            {
+                return Err(Error::rejected(format!(
+                    "chat_files.{name} has an unsupported schema shape"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Read-only open of the daemon store from another process, with the
@@ -160,6 +197,16 @@ impl Store {
         Ok((store, outcome.expect("open_adopting always recovers")))
     }
 
+    /// Open the primary store for a manual execution-disabled state dir
+    /// (CAD-1163) without restart recovery. Same gate, preflight, seal and
+    /// schema guards as `open_adopting`; only the recovery sweep is
+    /// skipped, so pending runner, CRM, image and nudge rows stay inert.
+    /// The outcome is the default: nothing was fenced, adopted or claimed.
+    pub(crate) fn open_unrecovered(path: &Path) -> Result<(Self, RecoveryOutcome)> {
+        let (store, _) = Self::open_inner(path, None, true, false, super::seal::OpenMode::Legacy)?;
+        Ok((store, RecoveryOutcome::default()))
+    }
+
     /// Open a live database for a side write that must not run restart
     /// recovery. `app remove` uses this to revoke derived grants while
     /// the daemon still holds the store — recovery would fence the
@@ -242,6 +289,9 @@ impl Store {
             )?;
             let version: i64 =
                 conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?;
+            // Refuse malformed attachment ownership before committing the
+            // bootstrap or executing any historical migration.
+            validate_chat_file_owner_shape(&bootstrap)?;
             if version < 1 {
                 conn.execute_batch(
                     "CREATE TABLE IF NOT EXISTS agents(
@@ -251,6 +301,9 @@ impl Store {
                     instructions TEXT, thread_id TEXT, session_id TEXT,
                     model TEXT, effort TEXT, pid INTEGER,
                     state TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+                    gc_keep INTEGER NOT NULL DEFAULT 0,
+                    archived_at REAL, archived_by TEXT, archive_reason TEXT,
+                    lifecycle_rev INTEGER NOT NULL DEFAULT 0,
                     error TEXT, created REAL NOT NULL, updated REAL NOT NULL);
                  CREATE TABLE IF NOT EXISTS messages(
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -258,7 +311,8 @@ impl Store {
                     body TEXT NOT NULL, reply_to TEXT, source TEXT NOT NULL,
                     state TEXT NOT NULL DEFAULT 'queued',
                     turn_id TEXT, result TEXT, error TEXT,
-                    created REAL NOT NULL, started REAL, completed REAL);
+                    created REAL NOT NULL, started REAL, completed REAL,
+                    stall_secs INTEGER);
                  CREATE INDEX IF NOT EXISTS msg_queue ON messages(alias,state,seq);
                  CREATE TABLE IF NOT EXISTS events(
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -960,6 +1014,452 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=33", [])?;
                 tx.commit()?;
             }
+            if version < 34 {
+                // CAD-1246: `events` carries only `events_job(job_id, seq)`,
+                // so every per-alias `WHERE alias=? AND kind=?` lookup
+                // full-scans it. `events_alias_kind(alias, kind, seq)` turns
+                // those into point index seeks; `seq` rides the index so the
+                // ORDER BY seq readers get a sorted scan. Index only — no
+                // row is read or rewritten; `IF NOT EXISTS` lets a
+                // half-applied store converge on reopen.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS events_alias_kind ON events(alias, kind, seq);",
+                )?;
+                tx.execute("UPDATE schema_version SET version=34", [])?;
+                tx.commit()?;
+            }
+            if version < 35 {
+                // CAD-1177: standalone (non-run) tool invocation receipts.
+                // A new pair of tables only; no existing row is touched.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::app_tools::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=35", [])?;
+                tx.commit()?;
+            }
+            if version < 36 {
+                // CAD-1282: CAD-1171 added `app_run_failures` to `app_runs::SCHEMA`
+                // after the `version < 20` block that creates it had shipped, so
+                // a store already past v20 never got the table. Never add DDL to a
+                // shipped migration block: a new version reaches stores already at
+                // the current one. Same DDL as `app_runs::SCHEMA`, idempotent.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS app_run_failures(
+ run_id TEXT PRIMARY KEY REFERENCES app_runs(id), step_id TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('refused','uncertain')), reason TEXT NOT NULL,
+ created REAL NOT NULL);",
+                )?;
+                tx.execute("UPDATE schema_version SET version=36", [])?;
+                tx.commit()?;
+            }
+            if version < 37 {
+                // CAD-1168 slice 2: retained chat attachments — one row
+                // per (sha256, scope, context_id); bytes live
+                // content-addressed in `<workspace>/.cadence/chat-files/`,
+                // never in the table. New table only; nothing is moved or
+                // rewritten, and a missing table on reopen converges.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::chat_files::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=37", [])?;
+                tx.commit()?;
+            }
+            // CAD-1280: two read indexes, deliberately NOT a schema bump. A
+            // bump makes every older binary refuse the store (`rollout.rs`:
+            // "database schema N is newer than this binary's schema"), so a
+            // rollback would need a backup restore. A plain index changes no
+            // row and no table; an older binary ignores it and keeps
+            // maintaining it on write. `IF NOT EXISTS` runs on every open,
+            // so a store a downgrade touched converges again. Names are
+            // reserved: a later schema step must not reuse them differently.
+            //  * `msg_state` turns `inflight_messages` (`state IN
+            //    ('running','submitted')`) from a scan of every message
+            //    ever stored into a seek.
+            //  * `tasks_assignee` serves `tasks_for_assignee`,
+            //    `assignee_tasks_bound` (`agent show`); `state` rides the
+            //    index so terminal rows are skipped without a table fetch.
+            //    The fleet read `open_task_ids_by_assignee` may still scan
+            //    tasks; no index speedup is claimed for that single pass.
+            {
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS msg_state ON messages(state);
+                     CREATE INDEX IF NOT EXISTS tasks_assignee ON tasks(assignee, state);",
+                )?;
+                tx.commit()?;
+            }
+            if version < 38 {
+                // CAD-819: the durable participant identity and the
+                // daemon-derived sender/recipient/origin on each message.
+                // Column adds are skipped when present, and the uid backfill
+                // and index run in the same transaction, so a half-applied
+                // v38 converges on reopen. Old message rows stay NULL: they
+                // render as an unknown sender, never inferred from events.
+                let agent_columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(agents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let message_columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(messages)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                if !agent_columns.iter().any(|c| c == "uid") {
+                    tx.execute_batch("ALTER TABLE agents ADD COLUMN uid TEXT")?;
+                }
+                for column in [
+                    "sender_uid",
+                    "recipient_uid",
+                    "sender",
+                    "recipient",
+                    "origin",
+                ] {
+                    if !message_columns.iter().any(|c| c == column) {
+                        tx.execute_batch(&format!(
+                            "ALTER TABLE messages ADD COLUMN {column} TEXT"
+                        ))?;
+                    }
+                }
+                tx.execute_batch(
+                    "UPDATE agents SET uid='agt-' || lower(hex(randomblob(16))) WHERE uid IS NULL;
+                     CREATE UNIQUE INDEX IF NOT EXISTS agents_uid ON agents(uid);
+                     CREATE INDEX IF NOT EXISTS messages_conversation
+                       ON messages(sender_uid, recipient_uid, seq);",
+                )?;
+                tx.execute("UPDATE schema_version SET version=38", [])?;
+                tx.commit()?;
+            }
+            if version < 39 {
+                // CAD-810: topics, subscriptions and the shared transcript.
+                // New objects only, `IF NOT EXISTS`, one transaction: a
+                // half-applied v39 converges on reopen.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(topics::SCHEMA_V39)?;
+                tx.execute("UPDATE schema_version SET version=39", [])?;
+                tx.commit()?;
+            }
+            if version < 40 {
+                // CAD-1393: company document templates (versions and their
+                // drafts). New tables only; nothing existing is rewritten.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::business_templates::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=40", [])?;
+                tx.commit()?;
+            }
+            if version < 41 {
+                // CAD-1380/AOS-216: member personal-assistant bindings.
+                // One row per verified (org, member sub) → daemon-owned
+                // agent alias + principal-scoped conversation. The daemon
+                // binds a relayed `member_as` to this row; a request field
+                // never sets it. `authority_rev` is the platform
+                // membership/authority revision the binding last proved
+                // against — effect-time revalidation reads it. New table
+                // only; nothing moved or rewritten.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS assistants(
+                    org TEXT NOT NULL, sub TEXT NOT NULL,
+                    assistant_id TEXT NOT NULL,
+                    alias TEXT NOT NULL,
+                    conversation_id TEXT,
+                    state TEXT NOT NULL DEFAULT 'active',
+                    authority_rev TEXT,
+                    created REAL NOT NULL, updated REAL NOT NULL,
+                    PRIMARY KEY (org, sub));
+                 CREATE UNIQUE INDEX IF NOT EXISTS assistants_alias
+                    ON assistants(org, assistant_id);
+                 CREATE TABLE IF NOT EXISTS job_subscribers(
+                    job TEXT NOT NULL, org TEXT NOT NULL, sub TEXT NOT NULL,
+                    assistant_id TEXT NOT NULL, created REAL NOT NULL,
+                    PRIMARY KEY (job, org, sub));
+                 CREATE TABLE IF NOT EXISTS assist_requests(
+                    org TEXT NOT NULL, sub TEXT NOT NULL,
+                    request_key TEXT NOT NULL, job TEXT NOT NULL,
+                    created REAL NOT NULL,
+                    PRIMARY KEY (org, sub, request_key));",
+                )?;
+                tx.execute("UPDATE schema_version SET version=41", [])?;
+                tx.commit()?;
+            }
+            if version < 42 {
+                // CAD-1380/AOS-216: a member job request carries its
+                // title/body/acceptance + the authorization provenance a
+                // deferred commit re-proves (the issuing credential and
+                // the authority revision it was minted under). The
+                // deferred consumer re-proves THIS credential, not the
+                // member's latest — a queued request keeps its recorded
+                // provenance. Plus one deduplicated unresolved stall
+                // check per (job, revision).
+                // Column-checked like every additive ALTER above: a
+                // half-applied or version-rolled-back store converges
+                // instead of erroring on a duplicate column.
+                let assist_columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(assist_requests)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                for (column, definition) in [
+                    ("title", "title TEXT"),
+                    ("body", "body TEXT"),
+                    ("acceptance", "acceptance TEXT"),
+                    ("credential_id", "credential_id TEXT"),
+                    ("authority_rev", "authority_rev TEXT"),
+                    ("state", "state TEXT NOT NULL DEFAULT 'requested'"),
+                ] {
+                    if !assist_columns.iter().any(|c| c == column) {
+                        tx.execute_batch(&format!(
+                            "ALTER TABLE assist_requests ADD COLUMN {definition}"
+                        ))?;
+                    }
+                }
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS assist_stall_checks(
+                    job TEXT NOT NULL, revision INTEGER NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'open',
+                    created REAL NOT NULL, resolved REAL,
+                    PRIMARY KEY (job, revision));",
+                )?;
+                tx.execute("UPDATE schema_version SET version=42", [])?;
+                tx.commit()?;
+            }
+            if version < 43 {
+                // CAD-1380/AOS-216: an assist job is shared only when its
+                // OWNING member explicitly says so — `member_job_share`
+                // writes one row per job; `member_job_subscribe` requires
+                // it, so a second member's subscription rides an
+                // authenticated owner grant, never org membership alone.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS assist_job_shares(
+                    job TEXT PRIMARY KEY, org TEXT NOT NULL,
+                    shared_by TEXT NOT NULL, created REAL NOT NULL);",
+                )?;
+                tx.execute("UPDATE schema_version SET version=43", [])?;
+                tx.commit()?;
+            }
+            if version < 44 {
+                // CAD-1412: human principals, rooms, membership and read
+                // markers. New objects only, `IF NOT EXISTS`, one transaction.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::human_threads::SCHEMA_V44)?;
+                tx.execute("UPDATE schema_version SET version=44", [])?;
+                tx.commit()?;
+            }
+            if version < 45 {
+                // CAD-1365: the workspace media catalog - metadata-only
+                // tables (id/title/kind/state/revision/creator/timestamps;
+                // no locators, secrets, prompts or bytes). New tables only;
+                // no existing row is read or rewritten, and `IF NOT EXISTS`
+                // converges a half-applied store on reopen.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::app_media::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=45", [])?;
+                tx.commit()?;
+            }
+            if version < 46 {
+                // CAD-1337: authenticated upload ownership/location follows
+                // the main v41-v45 migrations. Existing attachment rows stay
+                // legacy/null; no bytes or ownership are migrated.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                validate_chat_file_owner_shape(&tx)?;
+                tx.execute_batch(super::chat_files::ACCOUNT_SCHEMA)?;
+                let columns: Vec<String> = tx
+                    .prepare("PRAGMA table_info(chat_files)")?
+                    .query_map([], |row| row.get(1))?
+                    .collect::<rusqlite::Result<_>>()?;
+                for (name, sql) in [
+                    ("user_id", "ALTER TABLE chat_files ADD COLUMN user_id TEXT"),
+                    (
+                        "thread_id",
+                        "ALTER TABLE chat_files ADD COLUMN thread_id TEXT",
+                    ),
+                    (
+                        "location_version",
+                        "ALTER TABLE chat_files ADD COLUMN location_version INTEGER",
+                    ),
+                ] {
+                    if !columns.iter().any(|column| column == name) {
+                        tx.execute(sql, [])?;
+                    }
+                }
+                tx.execute_batch(
+                    "DROP INDEX IF EXISTS chat_files_sha_scope;
+                     CREATE UNIQUE INDEX IF NOT EXISTS chat_files_sha_scope_legacy
+                       ON chat_files(sha256, scope, context_id)
+                       WHERE user_id IS NULL AND thread_id IS NULL;
+                     CREATE UNIQUE INDEX IF NOT EXISTS chat_files_sha_owner_thread
+                       ON chat_files(sha256, scope, context_id, user_id, thread_id)
+                       WHERE user_id IS NOT NULL AND thread_id IS NOT NULL;",
+                )?;
+                tx.execute("UPDATE schema_version SET version=46", [])?;
+                tx.commit()?;
+            }
+            if version < 47 {
+                // CAD-1423: notification preferences, push device consents
+                // and private notification intents. New objects only.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::human_threads::SCHEMA_V45)?;
+                tx.execute("UPDATE schema_version SET version=47", [])?;
+                tx.commit()?;
+            }
+            if version < 48 {
+                // CAD-1420: one-time assistant bootstrap lifecycle on the
+                // binding row itself. `bootstrap_revision` is the
+                // compare-and-set counter the ACK write checks; the state
+                // and template version are authoritative, so file presence
+                // never drives injection. Column-checked like v42 so a
+                // half-applied store converges. Runs after the v47
+                // notification tables so a main47 store migrates forward.
+                let assistant_columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(assistants)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                for (column, definition) in [
+                    (
+                        "bootstrap_state",
+                        "bootstrap_state TEXT NOT NULL DEFAULT 'pending'",
+                    ),
+                    (
+                        "bootstrap_template_version",
+                        "bootstrap_template_version INTEGER NOT NULL DEFAULT 1",
+                    ),
+                    (
+                        "bootstrap_revision",
+                        "bootstrap_revision INTEGER NOT NULL DEFAULT 0",
+                    ),
+                ] {
+                    if !assistant_columns.iter().any(|c| c == column) {
+                        tx.execute_batch(&format!(
+                            "ALTER TABLE assistants ADD COLUMN {definition}"
+                        ))?;
+                    }
+                }
+                tx.execute("UPDATE schema_version SET version=48", [])?;
+                tx.commit()?;
+            }
+            if version < 49 {
+                // CAD-914: resumable wiki transfer jobs and per-entry progress.
+                // New tables only; v48 assistant bootstrap remains unchanged.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::wiki_transfers::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=49", [])?;
+                tx.commit()?;
+            }
+            if version < 50 {
+                // CAD-1482: retained image lineage; existing catalog and
+                // original provenance remain unchanged.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::app_media::SCHEMA_V50)?;
+                tx.execute("UPDATE schema_version SET version=50", [])?;
+                tx.commit()?;
+            }
+            if version < 51 {
+                // CAD-792: one receipt per successful worker dependency fetch.
+                // v20 already shipped `app_runs::SCHEMA`, so a store past that
+                // block never runs DDL added there. This idempotent create is
+                // what those stores apply. Fresh opens that already created the
+                // table from SCHEMA converge here.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS app_run_artifact_fetches(
+ artifact_id TEXT NOT NULL REFERENCES app_run_artifacts(id),
+ message_id TEXT NOT NULL, turn_hash TEXT NOT NULL, created REAL NOT NULL,
+ PRIMARY KEY(artifact_id,message_id,turn_hash));",
+                )?;
+                tx.execute("UPDATE schema_version SET version=51", [])?;
+                tx.commit()?;
+            }
+            if version < 52 {
+                // CAD-1548: Pi policy and profile text beside model_defaults.
+                // Keep the v51 artifact-fetch migration independent.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::settings_authority::SCHEMA_V52)?;
+                super::settings_authority::lift_embedded_authority(&tx)?;
+                tx.execute("UPDATE schema_version SET version=52", [])?;
+                tx.commit()?;
+            }
+            if version < 53 {
+                // CAD-804: an explicit keep for the agent-gc paths. Column-
+                // checked like v42/v48 so a half-applied store converges;
+                // existing rows default to sweepable.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(agents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                if !columns.iter().any(|c| c == "gc_keep") {
+                    tx.execute_batch(
+                        "ALTER TABLE agents ADD COLUMN gc_keep INTEGER NOT NULL DEFAULT 0",
+                    )?;
+                }
+                tx.execute("UPDATE schema_version SET version=53", [])?;
+                tx.commit()?;
+            }
+            if version < 54 {
+                // CAD-1239: the archive marker, its writer, a monotonic
+                // revision for compare-and-set, and the retention triggers.
+                // Column-checked so a half-applied store converges; existing
+                // rows are unarchived and start at revision 0.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(agents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                for (column, definition) in [
+                    ("archived_at", "archived_at REAL"),
+                    ("archived_by", "archived_by TEXT"),
+                    ("archive_reason", "archive_reason TEXT"),
+                    ("lifecycle_rev", "lifecycle_rev INTEGER NOT NULL DEFAULT 0"),
+                ] {
+                    if !columns.iter().any(|c| c == column) {
+                        tx.execute_batch(&format!("ALTER TABLE agents ADD COLUMN {definition}"))?;
+                    }
+                }
+                tx.execute_batch(
+                    "CREATE TRIGGER IF NOT EXISTS agents_lifecycle_rev
+                       AFTER UPDATE OF state,enabled,endpoint,archived_at,gc_keep ON agents
+                       FOR EACH ROW BEGIN
+                         UPDATE agents SET lifecycle_rev=lifecycle_rev+1 WHERE alias=OLD.alias;
+                       END;
+                     CREATE TRIGGER IF NOT EXISTS agents_archived_no_delete
+                       BEFORE DELETE ON agents WHEN OLD.archived_at IS NOT NULL
+                       BEGIN SELECT RAISE(ABORT,'archived'); END;",
+                )?;
+                tx.execute("UPDATE schema_version SET version=54", [])?;
+                tx.commit()?;
+            }
+            if version < 55 {
+                // v55: CAD-1353 — the stall budget chosen by
+                // `job dispatch --stall-secs` belongs to that kickoff
+                // message, not the shared job default. A later dispatch
+                // must not retune an earlier task's watch.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(messages)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                if !columns.iter().any(|column| column == "stall_secs") {
+                    tx.execute_batch("ALTER TABLE messages ADD COLUMN stall_secs INTEGER")?;
+                }
+                tx.execute("UPDATE schema_version SET version=55", [])?;
+                tx.commit()?;
+            }
+            if version < 56 {
+                // CAD-1726: agent canvas artifact versions. New table only;
+                // bytes live content-addressed under `<state>/artifacts/`.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::artifacts::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=56", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(
@@ -1469,6 +1969,12 @@ impl Store {
             .unwrap()
             .remove(alias)
             .filter(|v| !v.is_empty())
+    }
+
+    /// Snapshot recovery candidates before actors consume them. The daemon
+    /// keeps this independent copy until each actor's pane proof settles.
+    pub fn adoption_snapshot(&self) -> std::collections::HashMap<String, Vec<AdoptEntry>> {
+        self.adoptions.lock().unwrap().clone()
     }
 
     /// The endpoint facts a hot restart needs per pty alias — recorded

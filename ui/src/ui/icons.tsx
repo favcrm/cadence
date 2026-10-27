@@ -6,9 +6,11 @@ import { HugeiconsIcon } from "@hugeicons/react";
 import type { ComponentProps, CSSProperties } from "react";
 import {
   Alert02Icon,
+  Comment01Icon,
   ArrowDown01Icon,
   ArrowRight01Icon,
   Cancel01Icon,
+  CheckListIcon,
   CircleArrowUp01Icon,
   ContrastIcon,
   ConnectIcon,
@@ -17,11 +19,13 @@ import {
   File01Icon,
   Folder01Icon,
   Home01Icon,
+  InformationCircleIcon,
   KanbanIcon,
   MailSend01Icon,
   Menu01Icon,
   Moon02Icon,
   MoreHorizontalIcon,
+  PinIcon,
   Pulse01Icon,
   RefreshIcon,
   Robot01Icon,
@@ -29,6 +33,7 @@ import {
   Settings02Icon,
   SquareLock01Icon,
   Sun01Icon,
+  Task01Icon,
   Tick02Icon,
   Upload01Icon,
 } from "@hugeicons/core-free-icons";
@@ -63,6 +68,16 @@ function Glyph({
 export const IconHome = ({ size = 15, ...rest }: IconProps = {}) => (
   <Glyph icon={Home01Icon} size={size} {...rest} />
 );
+
+/** My work — issues assigned to the current human. */
+export const IconMyWork = ({ size = 15, ...rest }: IconProps = {}) => (
+  <Glyph icon={Task01Icon} size={size} {...rest} />
+);
+
+/** Empty personal queue — no assigned checks to inspect. */
+export const IconChecklist = ({ size = 15, ...rest }: IconProps = {}) => (
+  <Glyph icon={CheckListIcon} size={size} {...rest} />
+);
 /** Projects — the kanban board. */
 export const IconProjects = ({ size = 15, ...rest }: IconProps = {}) => (
   <Glyph icon={KanbanIcon} size={size} {...rest} />
@@ -74,6 +89,10 @@ export const IconApps = ({ size = 15, ...rest }: IconProps = {}) => (
 /** Agents — panes, models and their bound work. */
 export const IconAgents = ({ size = 15, ...rest }: IconProps = {}) => (
   <Glyph icon={Robot01Icon} size={size} {...rest} />
+);
+/** Threads — agent, operator and group conversations (CAD-818). */
+export const IconThreads = ({ size = 15, ...rest }: IconProps = {}) => (
+  <Glyph icon={Comment01Icon} size={size} {...rest} />
 );
 /** Outbox — published local items. */
 export const IconOutbox = ({ size = 15, ...rest }: IconProps = {}) => (
@@ -98,6 +117,10 @@ export const IconChevron = ({ size = 10, ...rest }: IconProps = {}) => (
 /** Tree disclosure; the row rotates it when the folder is open. */
 export const IconCaret = ({ size = 10, ...rest }: IconProps = {}) => (
   <Glyph icon={ArrowRight01Icon} size={size} {...rest} />
+);
+/** Pin a row to the top of its list. */
+export const IconPin = ({ size = 12, ...rest }: IconProps = {}) => (
+  <Glyph icon={PinIcon} size={size} {...rest} />
 );
 /** Close a drawer or a panel. */
 export const IconClose = ({ size = 12, ...rest }: IconProps = {}) => (
@@ -164,4 +187,9 @@ export const IconUpdate = ({ size = 18, ...rest }: IconProps = {}) => (
 /** Daemon connection — paired plugs, distinct from activity and refresh. */
 export const IconConnection = ({ size = 18, ...rest }: IconProps = {}) => (
   <Glyph icon={ConnectIcon} size={size} {...rest} />
+);
+
+/** Assistant details / About — an information affordance, not a warning. */
+export const IconInfo = ({ size = 14, ...rest }: IconProps = {}) => (
+  <Glyph icon={InformationCircleIcon} size={size} {...rest} />
 );

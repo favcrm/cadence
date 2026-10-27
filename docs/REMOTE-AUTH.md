@@ -1,29 +1,54 @@
 # AgenticOS issuer sign-in and hosted enrollment (CAD-539, CAD-717, CAD-729)
 
-CAD-539 authenticates a named principal with an AgenticOS issuer. It does
-**not** connect issue, message or team commands to hosted Cadence. Those commands
-still use the local daemon. Successful authentication reports
-`hosted_cadence: not_configured`; do not treat it as remote connectivity.
+Ordinary `cadence login` establishes the remote CLI/wiki session described in
+**Hosted login and remote org transport** below. Current workspace members do
+not need an owner-only login for routine collaboration. That session is not a
+provider billing or publishing credential.
 
-The protocol is pinned to AOS-49 draft PR 62, head
-`5c19a64ce1a530ba6728ceb49cd39fc41bff1300`. That PR has device API routes and a
-consent mockup; its web approval page is absent and the routes are not merged
-into AgenticOS main. These commands therefore require an explicitly configured
-issuer with that contract deployed before real sign-in is possible.
+For the practical local-daemon/hosted-workspace setup, teammate wiki/ticket
+collaboration, explicit FYI registration and app lifecycle boundaries, start with
+[Hosted workspace](guides/hosted-workspace.md). The credential details below
+remain separate from agent registration or package consent.
 
-## Browser or device sign-in
+The separate CAD-539 provider credential import (`--token-stdin`) does not
+connect issue, message or team commands to hosted Cadence. Its
+`hosted_cadence: not_configured` result describes that provider import, not an
+ordinary hosted-org login. Source support is not deployment evidence; the
+chosen issuer must serve the matching contract.
+
+## Provider-adapter and publishing consent
+
+Normal image-enabled apps use the signed-in funded-account media flow; that
+path does not require `provider.draft`. The optional legacy external-adapter
+and publisher setup commands below request separate financial consent:
 
 ```sh
-cadence login --issuer https://your-agenticos-api.example --org ws_company
+cadence --org <slug> local-agent tool --lane provider.draft
+cadence --org <slug> local-agent tool --lane publish.send
 ```
 
-The CLI requests `read draft`, prints the verification URL and user code,
-opens the browser, and polls the issuer. `--no-open` prints the same URL/code
-for completion on another device. No browser cookies are copied. Consent must
-approve the exact workspace ID supplied with `--org`; a different organization
-fails before persistence. Denial, expiry, slow-down and pending states follow
-the device contract. There is no automatic retry after an ambiguous failed
-exchange; restart login rather than reusing an uncertain one-time grant.
+These use the existing device consent endpoints, not a new token issuer.
+Success means `credential_saved`, with activation `not_checked`: neither
+command claims that a tool, connection or sender is already usable. The raw
+token file and a separate issuer/workspace/expiry binding stay private.
+
+For legacy draft tools, the response supplies a `connection create`
+argument vector and `stdin_file` for the **local operator**. That existing
+scoped-token path accepts the `agenticos_external` provider and its canonical
+workspace account; ordinary `platform enroll` is not that path. An unsupported
+legacy account is reported as `config_required` before financial consent;
+ordinary CLI/wiki collaboration is unaffected. Configure the external provider
+door for the issuer, enroll or rotate the credential through native custody,
+then select the connection in the authorized app. Existing custody policy,
+descriptor checks, app authority and budgets remain; no worker grants are
+created and there is no missing-enrollment token fallback.
+
+A publish grant writes the private credential file without registering a
+sender. If not already configured, publishing needs its explicit door URL and
+credential-file configuration. The command does not restart the daemon, send,
+spend or replace the CLI login. Standing publishing authorization still applies.
+Generic device lanes remain owner-approved financial authorization, not an
+additional owner requirement for ordinary CLI/wiki collaboration.
 
 ## Existing token and unattended verification
 
@@ -68,39 +93,75 @@ token or terminate remote sessions. Device credentials currently expire after
 30 days; the protocol has no refresh token or token expiry introspection field.
 For imported tokens, expiry is unknown locally and checked by the issuer.
 
-## Remote org transport (CAD-1019)
+## Hosted login and remote org transport (CAD-1019, CAD-1329)
 
-`cadence login --issuer <api-origin> --org <workspace-id> --slug <slug>`
-runs the hosted-cadence owner-consent device grant (PKCE, `hcd_` device
-code, `hct_` bridge credential) and records an org whose connection is
-`Remote { endpoint: https://<slug>.cadencecloud.app, org_id }` — slug,
-endpoint and org id all come from the issuer's verified grant, never
-derived from each other. Login never moves the saved default: without
-`--use` the org is recorded but the existing destination (ambient local
-on a fresh machine) stays selected; pass `--use` to make the remote org
-the default. The `hct_` is stored at
-`$XDG_CONFIG_HOME/cadence/remote-auth/cli-<slug>.json` (0600) and is
-bound to the org id and endpoint it was issued for — it is never sent
-to another host.
+For a first login, run `cadence login`. The CLI opens the trusted hosted
+AgenticOS portal, where you choose a workspace and approve access.
 
-### First login on a fresh machine
+To create a workspace, run `cadence register` (optionally with `--name`
+and `--slug` to prefill the browser form). It starts the same hosted device
+grant, opens the AgenticOS registration page, and waits while you complete
+email OTP, workspace terms and owner consent. After registration the page
+continues to the consent screen, and the CLI saves the credential and
+records the new remote org exactly like `cadence login`. The terminal never
+asks for an OTP, password, API key or payment detail. Use `--use` to select
+the new workspace as the saved default, `--no-open` to print the
+registration URL instead of opening a browser, and `--json` for
+machine-readable success or failure state.
+
+To preselect a workspace, use `cadence login <slug>`; the issuer verifies
+that selection and returns the authoritative workspace ID and slug. The
+CLI validates the returned slug and canonical audience before recording
+the remote org and credential. Re-running `cadence login <slug>` after the
+workspace was recreated or its ID rotated replaces the stored endpoint and
+workspace ID for that slug; the browser approval is the intent, so no manual
+edit of the org registry is needed. A `local` connection with the same name
+is never overwritten. If the new credential cannot be written, the previous
+binding is restored. `cadence auth logout` revokes the session but does not
+remove an org binding; a verified re-login replaces it. Use
+`cadence login --use` (or
+`cadence login <slug> --use`) to make it the saved default; without
+`--use`, the current default is unchanged. `--no-open` prints the approval
+URL and code without opening a browser.
+
+An owner or current member can approve ordinary collaboration. Both the portal
+and explicit org login request `cli.read`, `cli.write`, `wiki.read` and
+`wiki.write`; saved renewal retains the consented set. `--web` requests its
+separate CLI plus Publish Web set and does not silently add wiki consent.
+
+The default issuer is the compiled exact HTTPS origin
+`https://api-v2.agenticos.hk`; no issuer or workspace files are needed on
+a fresh HOME. If a `trusted-issuer` pin already exists, it must match that
+origin or login refuses without overwriting it. A custom issuer is an
+advanced override: pass `--issuer <origin>` and establish its exact origin
+in a private `trusted-issuer` file under the credential directory first.
+The CLI never creates or replaces that pin. A mismatched issuer, symlink,
+or unsafe permissions refuse.
+
+The explicit legacy bound flow remains available as
+`cadence login --issuer <origin> --org <workspace-id> --slug <slug>`; it
+requires an existing issuer pin. The legacy `--token-stdin` flow also
+requires explicit `--issuer` and `--org`. Browser login uses PKCE and
+short-lived device codes; denial, expiry, mismatched identity or audience
+refuse before recording the org or credential. Org records use the
+verified workspace slug and canonical `https://<slug>.cadencecloud.app`
+endpoint. Credentials are stored at
+`$XDG_CONFIG_HOME/cadence/remote-auth/cli-<slug>.json` (0600), bound to
+the verified workspace ID and endpoint, and never sent to another host.
+
+### Advanced custom issuer trust
 
 The credential directory is created by login itself (0700, owner-only).
-The operator then establishes the independent issuer pin before any
-request goes out: login refuses with an actionable message until the
-exact issuer origin sits in a 0600 `trusted-issuer` file inside that
-directory. The CLI never creates the pin — it is the operator's own
-trust decision:
+Custom issuers require an independent exact-origin pin in a private
+`trusted-issuer` file before any request goes out. The CLI never creates
+or replaces this pin:
 
 ```sh
-cadence login --issuer https://your-agenticos-api.example --org ws_company --slug company
-# → refused: "Trusted issuer pin is missing. Create it yourself, then retry: …"
-#   (the refusal prints the exact pin path — on this host it is
-#   ${XDG_CONFIG_HOME:-$HOME/.config}/cadence/remote-auth/trusted-issuer,
-#   or the --auth-dir you passed)
+cadence login --issuer https://your-agenticos-api.example
+# → refused with the exact trusted-issuer pin path
 printf '%s\n' 'https://your-agenticos-api.example' > "${XDG_CONFIG_HOME:-$HOME/.config}/cadence/remote-auth/trusted-issuer"
 chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/cadence/remote-auth/trusted-issuer"
-cadence login --issuer https://your-agenticos-api.example --org ws_company --slug company
+cadence login --issuer https://your-agenticos-api.example
 # → device code prompt; approve in the browser
 ```
 
@@ -128,20 +189,150 @@ audience and live bearer before any runtime is resolved or woken; the
 container independently re-verifies the envelope before dispatching the
 verb. `verb` is one of a fixed allowlist — `status`, `agent_list`,
 `agent_show`, `issue_ls`, `issue_show`, `issue_history`, `message_read`,
-`message_inbox`, `issue_new`, `issue_comment`, `issue_set` — and
+`message_inbox`, `team_list`, `team_invites`, `issue_new`, `issue_comment`,
+`issue_set`, `team_invite`, `team_revoke_invite`, `team_set_role`,
+`team_remove`, `project_policy`, `message_send` — and
 `arguments` is a strict per-verb payload. Any
 other command is refused locally and never sent.
 
 A sleeping company answers `503 {"state":"waking","retry_after_s":N}`
 plus `Retry-After`; the CLI waits and retries inside `--wake-timeout`
 (default 120 s), printing `waking <org>… (Ns)` on stderr while stdout
-stays JSON. The budget lapses into exit 75 (`busy`). `wake_failed`, an
-unavailable remote, a redirect, or a refused credential (`401`/`403`)
-end the command with a `cadence login` hint — there is never a fallback
-to local or another org, and no token is ever printed. Operator-only
+stays JSON. The budget lapses into exit 75 (`busy`). There is never a
+fallback to local or another org, and no token is ever printed. Operator-only
 and every unlisted verb stay refused remotely; the remote path carries
 no operator proof, and the hosted `issue_set` verb accepts no `force`
 field — the `status=done` evidence gate has no remote override.
+
+### Refusal categories and next action (CAD-1434)
+
+Authorize, cli/wiki call and blob upload share one decoder. It reads the AOS
+gateway envelope `{ok:false,error:{code,reason?}}` and shows only allowlisted
+values, never raw server text, a token or a private path. Renewal is a
+separate adapter: the issuer answers `{error:"<code>"}`, so renewal reads its
+own shape (see the renewal rows below). The two are intentionally not merged.
+
+The gateway's real refusal shapes (AOS-243):
+
+- A policy outcome is `401` with `error.code: "unauthorized"` and a proven
+  `error.reason`: `scope_not_granted`, `grant_narrowed` or `binding_mismatch`.
+- The Cadence container's own envelope gate answers `403` with
+  `error.code: "insufficient_scope"` when the signed grant does not cover the
+  action or the target path. This is the path denial. See the layers below.
+- `envelope_invalid` is a structural, expired or legacy envelope. It is not a
+  proven session loss.
+- A `401 unauthorized` with no reason means the bearer did not resolve, but the
+  server cannot say whether it expired or was revoked.
+- `503` means waking or unavailable. Without JSON, the HTTP status still
+  classifies the refusal: `401` is uncertain, `403` is authorization, and any
+  other `5xx` is availability. No server reason or correlation is inferred.
+- One exception: a dispatched mutation verb whose answer is lost, or that
+  answers with a bare `5xx`, is `outcome_unknown` and not availability. The
+  platform records a membership write and its receipt in the same batch, so a
+  `5xx` can follow a write that already committed. This covers `message_send`
+  and the four team mutations (`team_invite`, `team_revoke_invite`,
+  `team_set_role`, `team_remove`); the two team reads commit nothing and stay
+  availability. A `5xx` carrying the platform's own state marker is not a
+  bare one, and a refusal raised by the board's gate before the verb ran is
+  decided before anything was written, so neither is ambiguous.
+- A `503` whose safe `error.code` is `mutation_outcome_uncertain` or
+  `invite_email_uncertain` is the platform stating that a mutation may already
+  have committed. It is its own category, not availability.
+
+| Category | When | Next action |
+| --- | --- | --- |
+| `authorization` | `401` with an allowlisted policy reason (`scope_not_granted`, `grant_narrowed`, `binding_mismatch`); `403` with `insufficient_scope` (container path or scope denial); or any `403` with `forbidden` or no safe code | Not a login problem. Read-only diagnosis (below): check the workspace role and target path. Not retried |
+| `authentication` | A terminal session code: `invalid_token`, `invalid_grant`, `session_expired`, `session_revoked`, `lineage_terminal` | `cadence login` again, once. The only case that names login as the known remedy |
+| `uncertain` | `401` with no reason, `envelope_invalid`, or a non-JSON `401` | Not confirmed expiry or revocation. Run the read-only diagnosis before any login. Not retried |
+| `outcome_unknown` | The platform's `mutation_outcome_uncertain` or `invite_email_uncertain`; or a lost answer or a bare `5xx` on a dispatched mutation verb (`message_send`, `team_invite`, `team_revoke_invite`, `team_set_role`, `team_remove`) | The action may have committed. Reconcile with a read for the same explicit `--org` — `team list` or `team invites` for a team mutation, `message_read` for a send — then decide. Never replay the mutation with a fresh envelope first. Not retried |
+| `availability` | any other `5xx` (except a dispatched mutation verb — that is `outcome_unknown`), or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
+| `unknown` | Any other answer. A `400`/`409`/`413`/`422` keeps its safe code, such as `payload_too_large` | Report the status and code. Not retried |
+
+### Where a write or upload is refused (AOS-243)
+
+A wiki write or blob upload is refused at one of two layers. Neither needs a
+new login, and neither is retried.
+
+1. **Gateway admission** (AOS, before any byte is forwarded). It verifies the
+   envelope signature, issuer, audience and organization; that the action's
+   scope is granted; that the bearer still resolves to the same live
+   credential; and that the signed grant is still inside the live ceiling. A
+   refusal is `401` with a proven `reason` (for example `scope_not_granted`), or
+   a generic `401 unauthorized` when the bearer does not resolve. After argument
+   validation, it also checks every normalized target against the action's
+   signed prefixes **before any runtime wake**: both move legs and the combined
+   upload directory/filename. An out-of-prefix target is `403 insufficient_scope`;
+   a malformed path is `400`. Root enumeration remains available under a narrow
+   grant, with entries filtered by the container.
+2. **Container enforcement** (the Cadence container, before any daemon
+   mutation). `src/ui/wiki_envelope.rs` checks the requested path against the
+   signed grant (`contains` for reads and writes, `contains_file` for uploads,
+   checked before the body is buffered). A path outside the grant, or an action
+   the grant does not cover, is `403 insufficient_scope`. The container then
+   relays only a verified `users/` or `operator` identity to the daemon. The
+   daemon's own `wiki::allowed` ACL runs last, under that attribution.
+
+So a path denial appears as `403 insufficient_scope`, not as a gateway `401`.
+Authorization is the category: check the granted scope, current membership and
+target path. Routine shared wiki and issue work does not require an owner role.
+Another user's private pages and agent-owned areas remain protected.
+
+A board refusal also names its hop and a request id, for example
+`(hop board, request 0b2e1f4a-…)`. The id is a fresh UUID per refusal, used to
+correlate a report with the board's log. It is not a token or an identity. Only
+the board hop is named; a refusal from the container or the daemon is shown
+without a hop, never attributed to one.
+
+Renewal (`/v1/hosted-cadence/cli-session/renew`) has its own reader. Only the
+issuer's `invalid_token` (401) and `invalid_grant` (400) ask for a fresh login.
+Any other answer keeps the saved login and the pending operation for a later
+retry, with no consent prompt.
+
+A mutation whose outcome is unknown — a dropped connection after dispatch, a
+`5xx` after forward, or the platform's own `mutation_outcome_uncertain` /
+`invite_email_uncertain` — is never replayed automatically. Reconcile with a
+read (`issue show`, `wiki ls`, `team list`, `team invites`) before repeating
+the write.
+
+### Hosted credential status (CAD-1434)
+
+`cadence org list` and `cadence org inspect` are local-only: they make no
+network call. For a remote org the `credential` object reports what this
+machine holds, and `live_verified` is always `false`:
+
+- `no_credential`: nothing stored; run `cadence login`.
+- `renewable`: a renewable CLI session is stored and not yet past its idle or
+  absolute expiry. The next command renews the short access token automatically.
+- `access_valid_until_expiry`: a legacy login with a valid access token and no
+  renewable session; it expires without renewal.
+- `reauthentication_required`: the stored session is past its idle or absolute
+  expiry, or the access token expired with no renewable session.
+- `invalid_local_credential`: the file cannot be read or validated. This is a
+  local problem, not proof that the server revoked it.
+- `unavailable`: the local store cannot be inspected (for example a permission
+  error). Only a missing file is `no_credential`; a stat failure is never
+  reported as absence.
+
+The `credential` object carries scope names, access expiry, session idle and
+absolute expiry (kept even when the session has expired), whether a renewal is
+pending, and two local observations: `stored_at` (when this machine last wrote
+the credential file) and `observed_at` (when the status was read). These are
+local facts only. They are not a server renewal result and prove no renewal
+health; `live_verified` stays `false`. Renewal health is `unknown` until a command
+observes a renewal result, and it is never inferred from a file timestamp. It
+never carries a bearer or refresh token. `login_status` keeps its legacy values
+(`local_peer_authority`, `not_connected`) for compatibility; it reads
+`credential_saved` when a credential exists, instead of always `not_connected`.
+
+### Access token lifetime and renewal model (CAD-1434)
+
+Access tokens are deliberately short-lived (about 5 minutes). A command renews
+the token through the saved renewable CLI session when it is within 60 seconds
+of expiry, under a per-org lock with a persisted pending operation. A valid
+session therefore survives many access expirations and idle gaps while its idle
+and absolute expiry have not passed. Terminal session loss asks for one login;
+a transient renewal failure keeps the saved login for a later retry. The access
+token TTL is not extended to work around refusals.
 
 ### Remote ticket writes (CAD-1179)
 
@@ -161,7 +352,7 @@ Refusals happen locally, before a byte is sent: `issue new` without
 `--id`/`--status`; `issue comment` with `--author` or `--kind`; `issue
 set` without `--if-rev`, with an empty revision, with `--force`, or
 naming more than one ticket. `--file` bodies are read client-side (`-` = stdin) and
-bounded by the 32 KB cap — never remote paths. `message send`, `issue
+bounded by the 32 KB cap — never remote paths. `issue
 edit/attach`, provider verbs and operator verbs are not on the wire.
 
 `issue set` is compare-and-swap: send the `rev` from `issue show`
@@ -182,6 +373,145 @@ operational concern outside this client feature.
 Each collaborating writer enrolls independently: a separate
 `XDG_CONFIG_HOME` (or separate account/machine) per identity, its own
 `cadence login` grant — credentials are never copied between homes.
+
+### Remote message send (CAD-1568)
+
+`cadence send` (and its `message send` form) enqueue a durable coordination
+message to the hosted **master**, for a verified human workspace owner.
+This is not generic container execution. The recipient fence is the
+canonical `master` agent only: any other recipient spelling is a typed
+refusal, and the daemon resolves the exact `master` agent row — another
+worker's session or thread id that happens to spell `master` is never
+substituted, and no refusal silently reroutes or enqueues elsewhere.
+The selected row's UID is checked inside the enqueue transaction; removing
+or replacing that recipient before enqueue refuses the send rather than
+allowing a later generic lookup to redirect it.
+Personal assistants require separate assistant authority and local workers
+use the `local-agent`/local-assignment plane; neither is a remote-send recipient.
+Generic member-to-member `send` and the local-worker follow-up journey remain
+refused on this transport. Explicit directory-addressed FYIs use the separate
+[`agent notify` flow](guides/hosted-workspace.md#a-teammates-own-agent-collaboration-flow);
+they store notices, not execution instructions. Agent/service envelopes cannot
+inherit their parent human's messaging or private readback authority.
+Roll out the matching native-server authorization guard before exposing
+the upgraded CLI to a hosted workspace. A CLI upgrade alone does not
+establish these sender-ownership and private-readback guarantees.
+This feature does not authorize a production rollout.
+
+```sh
+cadence login acme                                            # approve your own hosted grant
+cadence --org acme wiki put global/docs/kit.md --file kit.md  # stage inputs in the wiki
+cadence --org acme send master --message ask-42 --text \
+  "Please coordinate review of the staged kit — see global/docs/kit.md."
+cadence --org acme message read ask-42     # your message: body + state + result
+```
+
+The wiki staging step requires an existing `wiki.write` grant; `cli.write`
+alone permits sending a message, not writing wiki pages. Use already-staged
+inputs when the login has only CLI scopes.
+
+`--message <id>` is **required** on a remote send: it is the caller-chosen
+stable id (identifier grammar, never `sys-*`) the send is deduplicated
+and reconciled under. The send binds the recipient's Home
+`message_conversation` at enqueue: a first-ever send creates the master's
+Home thread transactionally with the durable message, and every later
+send to it reports the same `conversation`. The successful reply is the
+complete enqueue receipt — the echoed stable `message` id, the canonical
+`alias` (`master`), the lifecycle `state`, the `duplicate` bool, the
+immutable `workspace_id` (the workspace ID verified at login, not the
+slug), the authenticated human's canonical `sender_subject`, the `cli-*`
+display `sender`, and the stored `conversation`. That receipt proves
+durable enqueue only — it is never the delivery, execution or result of
+the message, which remain `message read`'s report.
+
+A `2xx` answer without that complete correlated receipt — missing,
+malformed, or bound to another message, alias, workspace or subject — is
+`unknown`, exactly like a lost reply: reconcile by the stable `--message`
+id. It is never reported as a success and never replayed. `message read
+<id>` returns your own sent message's body plus `state`, sanitized
+`result`, `error` and `awaiting_report`, with the same `workspace_id`,
+`sender_subject`, `sender`, `alias` and `conversation` binding the send
+receipt carried. Absent and foreign message IDs return the same
+`not_found` refusal. Browser member-chat messages are not CLI-owned.
+
+`--ready`/`--force`, `--nudge`, `--priority`/`--supersedes`, `--reply-to`
+and `--task` are local-endpoint and routing surfaces: they refuse before
+a request, they are not dropped. `--file` bodies are read client-side
+(`-` = stdin) under the message enqueue cap; an oversized body is
+refused whole, never truncated.
+
+Remote refusals carry bounded codes, never raw server text:
+`recipient_class_unsupported` (any target other than `master`),
+`not_permitted` (not a human owner for master chat/passive inbox inspection,
+or not a human principal for CLI message readback),
+`message_id_conflict` (a `--message` id already used with different
+content or owned by another principal — reconcile or choose a fresh id),
+`rejected` (for example a reserved `sys-` id),
+`insufficient_scope` (login lacks the operation's `cli.*` scope),
+`invalid_request` (missing/empty body or id at the request boundary),
+`not_found` (no CLI message visible to this human under that id).
+
+If a send's outcome is lost (timeout, dropped connection, 5xx after the
+call, or a 2xx whose receipt is not the complete correlated one above),
+do not guess: run `cadence message read <id> --org <org>` using the
+original human login and workspace. `not_found` does not prove that no
+other principal owns the ID. After reconciling the destination and identity,
+retry with the **same** `--message` id: the same principal/id/content does
+not enqueue another message. This is enqueue dedupe, not exactly-once
+downstream effects. Never blindly resubmit under a different ID.
+
+Developer acceptance uses an isolated native daemon, the real AgenticOS
+hosted handlers and durable stores, and the synthetic provider. Point at
+an API checkout containing the native-forwarder and TLS-bridge test helpers
+with its dependencies installed:
+
+The `cli-runtime-test` feature is an explicit manual-harness opt-in.
+Ordinary `test-seam` CI retains the CLI tests in their original binary
+target and still runs the new daemon ownership/refusal acceptance checks.
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 \
+  cadence --state-dir "$HOME/.local/state/cadence" build-slot run build -- \
+  cargo build --locked --features test-seam --bin cadence
+
+CAD1568_AOS_API_DIR=/absolute/path/to/agenticos-v2/apps/api \
+  CAD1568_CLI="$PWD/target/debug/cadence" \
+  CARGO_BUILD_JOBS=2 CARGO_PROFILE_TEST_DEBUG=0 \
+  cadence --state-dir "$HOME/.local/state/cadence" build-slot run test -- \
+  cargo test --locked --features cli-runtime-test --lib \
+    cad1568_real_hosted_message_roundtrip_and_refusals \
+    -- --ignored --test-threads 1 --nocapture
+```
+
+Use the local admission broker's actual state directory above. Unlike
+`--org local`, this does not export a local instance binding into the
+tested CLI process; no caller identity variables are cleared.
+
+The fixture launches that debug executable through its real entry point,
+parser and dispatch for login, wiki staging/reference, send and exact-result
+readback. The library no longer borrows the binary's CLI modules. The
+`test-seam` build adds only an explicitly armed private-CA/loopback transport
+for these subprocesses; certificate-chain, hostname, signed-envelope and
+authority checks remain enabled. Release builds reject `test-seam`.
+The scenario requires an external coordinator and refuses a real parent
+`CADENCE_ALIAS` before constructing isolated synthetic-persona environments;
+never unset a managed identity to run it.
+
+The acceptance takes its evidence from the runtime's own store and from the
+fixture peer's record of the requests that reached the hosted boundary
+(method, path and status only). A refusal is therefore attributed to the
+hop that produced it — the local credential pin, the board's own scope,
+live-membership and authorization checks (which name themselves with
+`error.hop = "board"` and, when known, a reason), or the container's own
+guards (which answer with their own typed codes) — and a no-enqueue claim
+is backed by the durable rows the runtime holds, not by another principal's
+read error.
+
+This is not an installed release CLI or a deployed workspace. The controller
+primes CLI and wiki JWKS caches over verified disposable TLS; fresh
+handler-thread JWKS fetching and real master commissioning/model policy are
+not proved. Production messaging runtimes, credentials and providers are not
+exercised.
 
 ## Issuer-bound service enrollment (CAD-717)
 
@@ -330,8 +660,45 @@ anything.
 
 ## Remaining cloud contract
 
-Browser-based hosted consent, assignment delivery, active-channel revocation,
-durable sleep-safe application witness, and actual hosted Cadence command
-transport remain dependencies. Current device `read/draft/send` scopes belong
-to the issuer contract; they do not grant Cadence operator privileges. No board
-cookie authentication or assertion guard is weakened by this increment.
+The legacy enrollment flows above do not replace the current
+[hosted workspace bridge](guides/hosted-workspace.md). Its matching issuer,
+directory/event transport and native domain owners must be rolled out together;
+source support is not deployment evidence. Device `read/draft/send` scopes do not
+grant Cadence operator privileges, and no board cookie/assertion guard is weakened.
+
+### Read-only diagnosis before repeated login (CAD-1434)
+
+Diagnose a hosted refusal in this order. Each step is read-only and none
+requires another login:
+
+1. `cadence org inspect <org>`: read `credential.state`, the scopes, the access
+   expiry and the session idle/absolute expiry. `no_credential` or
+   `reauthentication_required` means login is a real option. `renewable` only
+   says a renewal can be attempted; it does not prove the server accepts the
+   session, so it is not a health check.
+2. Read the **already captured** safe error's HTTP status, `category`, `reason`
+   and hop/request ID, if present. Do not re-run a write or upload to obtain
+   diagnostics. `authorization` means check the workspace role and target path
+   (a login does not change it); `authentication` names one fresh login as a
+   remedy outside this read-only diagnosis; `uncertain` does not prove expiry;
+   `outcome_unknown` means the mutation may have committed, so reconcile with a
+   read for the same explicit `--org` before repeating it; `availability` means
+   wait, not replay an uncertain mutation; `unknown` means
+   report the safe status and code. Do not blindly repeat login.
+3. Record the captured safe error, org endpoint and client revision
+   (`cadence --version`) on the ticket. Keep any already known issuer, gateway
+   and daemon revisions separate; unknown versions remain unknown. Do not paste
+   a token, the credential file or a raw response body.
+4. Wiki writes and uploads: inspect the workspace role and intended target path
+   using existing read-only evidence. A refused path is not a reason to try
+   another shared root. If outcome reconciliation needs a new inspection, use
+   only an explicitly read-only command such as `issue show` or `wiki ls`,
+   within your existing permissions. A dropped connection or missing
+   acknowledgment does not prove that the write did not land. Stop if these
+   reads cannot reconcile the outcome; do not retry the write or upload.
+
+Any fresh small **test write** is outside this read-only production diagnosis.
+It requires an authorized isolated workspace and explicit operator authorization,
+only after any prior uncertain outcome has been reconciled. It is not a
+production retry, an authority change or a prerequisite for collecting diagnosis
+evidence.

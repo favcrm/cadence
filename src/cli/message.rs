@@ -11,9 +11,18 @@ pub(crate) enum MessageAction {
     /// There are no email-style `--to`, `--subject`, `--body` or `--cc`
     /// flags.
     ///
+    /// On a remote org (`--org <slug>`) the supported form is the durable
+    /// enqueue only: `--message <id>` is required, and `--ready`/`--force`,
+    /// `--nudge`, `--priority`/`--supersedes`, `--reply-to` and `--task`
+    /// refuse. Read the outcome with `cadence message read <id> --org <slug>`.
+    ///
     /// Multi-topic reports: open the body with a `SUBJECT: <topic>`
     /// line (a single-line pty body leads with `SUBJECT: <topic> —`)
     /// so the recipient can scan topics; there is no subject field.
+    ///
+    /// `cadence send` is the canonical spelling; this stays as a hidden
+    /// alias for one release.
+    #[command(hide = true)]
     Send {
         /// Agent alias or provider-native id.
         alias: String,
@@ -53,7 +62,9 @@ pub(crate) enum MessageAction {
         #[command(flatten)]
         steer: SteerArgs,
     },
-    /// Send and wait for the turn's terminal state.
+    /// Send and wait for the turn's terminal state. `cadence send --wait`
+    /// is the canonical spelling; this stays as a hidden alias.
+    #[command(hide = true)]
     Ask {
         alias: String,
         #[arg(long, conflicts_with = "file")]
@@ -113,6 +124,10 @@ pub(crate) enum MessageAction {
         /// Read the note from a file (`-` reads stdin, capped at 4 MiB).
         #[arg(long)]
         file: Option<PathBuf>,
+        /// CAD-1420: a bounded bootstrap JSON object read from a file
+        /// (`-` reads stdin). Never passed as an argv value.
+        #[arg(long = "bootstrap-file")]
+        bootstrap_file: Option<PathBuf>,
     },
     /// Report the result of a submitted PTY message; completes it and
     /// routes to `reply_to` when set. With no message id and no `--token`,
@@ -163,6 +178,38 @@ pub(crate) enum MessageAction {
         #[arg(long)]
         sha: Option<String>,
     },
+    /// List one recipient's messages. No body and no turn token —
+    /// `message read` fetches the text. Unfinished rows are always
+    /// included unless `--state` says otherwise; `--limit` caps the
+    /// newest terminal rows (1–50, default 20). An agent may name only
+    /// its own alias. `ls` is the same command.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Recipient alias. Same as `--to`.
+        #[arg(value_name = "ALIAS", conflicts_with = "to")]
+        alias: Option<String>,
+        /// Recipient alias.
+        #[arg(long)]
+        to: Option<String>,
+        /// Sender label: `operator`, or the sending agent's alias.
+        #[arg(long)]
+        from: Option<String>,
+        /// Delivery source, such as `user`, `worker_result`, or `nudge`.
+        #[arg(long)]
+        source: Option<String>,
+        /// Message state. Repeatable, or comma-separated.
+        #[arg(long, value_delimiter = ',')]
+        state: Vec<String>,
+        /// Newest terminal rows to include (default 20, maximum 50).
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Terminal rows after this message id or unix timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// Accepted for list-grammar parity. Output is always JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Cancel a still-`queued` message — it is never delivered. A
     /// `reply_to` gets one `worker_notice` so a waiter isn't left
     /// hanging. Refused once a turn is claimed or terminal — a running
@@ -178,6 +225,79 @@ pub(crate) enum MessageAction {
         #[arg(long)]
         reason: Option<String>,
     },
+}
+
+pub(super) fn list_params(
+    alias: Option<String>,
+    to: Option<String>,
+    from: Option<String>,
+    source: Option<String>,
+    state: Vec<String>,
+    limit: Option<u64>,
+    since: Option<String>,
+) -> Result<Value> {
+    let to = match (alias, to) {
+        (Some(alias), None) | (None, Some(alias)) => alias,
+        (None, None) => {
+            return Err(Error::usage(
+                "message list needs a recipient — `message ls <alias>` or \
+                 `message ls --to <alias>`",
+            ))
+        }
+        (Some(_), Some(_)) => {
+            return Err(Error::usage(
+                "message list takes the recipient once, as `<alias>` or `--to`",
+            ))
+        }
+    };
+    if to.is_empty() {
+        return Err(Error::usage("message list needs a nonempty recipient"));
+    }
+    const STATES: &[&str] = &[
+        "queued",
+        "submitting",
+        "running",
+        "completed",
+        "failed",
+        "interrupted",
+        "cancelled",
+        "unknown",
+        "available",
+        "refused",
+    ];
+    for name in &state {
+        if !STATES.contains(&name.as_str()) {
+            return Err(Error::usage(format!(
+                "message list --state '{name}' is unknown — one of {}",
+                STATES.join(", ")
+            )));
+        }
+    }
+    if let Some(n) = limit {
+        if !(1..=50).contains(&n) {
+            return Err(Error::usage("message list --limit must be from 1 to 50"));
+        }
+    }
+    let mut params = json!({"to": to, "limit": limit.unwrap_or(20)});
+    if let Some(from) = from {
+        if from.is_empty() {
+            return Err(Error::usage("message list --from must be nonempty"));
+        }
+        params["from"] = json!(from);
+    }
+    if let Some(source) = source {
+        if source.is_empty() {
+            return Err(Error::usage("message list --source must be nonempty"));
+        }
+        params["source"] = json!(source);
+    }
+    if !state.is_empty() {
+        params["state"] = json!(state);
+    }
+    if let Some(since) = since {
+        params["since"] = json!(since);
+    }
+    Ok(params)
 }
 
 pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
@@ -196,6 +316,23 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
         } => send_message(
             &state_dir, &alias, text, file, message, reply_to, ready, force, task, nudge, steer,
         )?,
+        MessageAction::List {
+            alias,
+            to,
+            from,
+            source,
+            state,
+            limit,
+            since,
+            json: _,
+        } => (
+            client::rpc_relay(
+                &state_dir,
+                "message_list",
+                list_params(alias, to, from, source, state, limit, since)?,
+            )?,
+            false,
+        ),
         MessageAction::Read {
             message,
             offset,
@@ -213,6 +350,7 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             token,
             text,
             file,
+            bootstrap_file,
         } => {
             if message.is_some() != token.is_some() {
                 return Err(Error::rejected(
@@ -222,6 +360,12 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             }
             let text = read_result_body(text, file, false)?;
             let mut params = json!({"kind": "ack", "text": text});
+            if let Some(path) = bootstrap_file {
+                let raw = read_body_capped(None, Some(path), 64 << 10)?;
+                let object: Value = serde_json::from_str(&raw)
+                    .map_err(|_| Error::rejected("bootstrap file must be a JSON object"))?;
+                params["bootstrap"] = object;
+            }
             if let Some(m) = message {
                 params["message"] = json!(m);
             }

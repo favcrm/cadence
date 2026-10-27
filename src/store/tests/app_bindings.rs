@@ -623,3 +623,76 @@ fn cad1119_store_migrate_refuses_a_widened_receipt_with_a_valid_proof() {
     let next = s.app_binding_migrate("install-a", &proof, &moved).unwrap();
     assert_eq!(next.revision, 2);
 }
+
+#[test]
+fn cad1328_context_update_re_pins_only_the_context_of_its_own_bindings() {
+    use crate::store::app_bindings::{binding_drift, BindingDrift};
+    use crate::store::app_contexts::ContextConfig;
+    let (_dir, s) = store();
+    let context = |name: &str, request: &str| {
+        let row = s
+            .app_context_create(
+                "install-a",
+                &ContextConfig::new(name, Default::default()).unwrap(),
+                request,
+            )
+            .unwrap()["context"]
+            .clone();
+        let pin = json!({"id":row["id"],"install_id":"install-a",
+            "revision":row["revision"],"digest":row["digest"]});
+        (row["id"].as_str().unwrap().to_string(), pin)
+    };
+    let bind = |context: &(String, Value), slot: &str, request: &str| {
+        let config = json!({"schema":1,"install_id":"install-a","context":context.1,
+            "connection_id":"conn-1","connection_revision":4,"registration_digest":"r"});
+        s.app_binding_create("install-a", Some(&context.0), slot, &config, request)
+            .unwrap()["binding"]
+            .clone()
+    };
+    let mine = context("Mine", "ctx-mine");
+    let other = context("Other", "ctx-other");
+    let a = bind(&mine, "source", "bind-a");
+    let b = bind(&mine, "publication", "bind-b");
+    let foreign = bind(&other, "source", "bind-c");
+    s.app_binding_revoke("install-a", b["id"].as_str().unwrap(), 1)
+        .unwrap();
+
+    let saved = s
+        .app_context_update(
+            "install-a",
+            &mine.0,
+            1,
+            &ContextConfig::new("Mine renamed", Default::default()).unwrap(),
+        )
+        .unwrap();
+    let show = |id: &Value| {
+        s.app_binding_show("install-a", id.as_str().unwrap())
+            .unwrap()["binding"]
+            .clone()
+    };
+    let moved = show(&a["id"]);
+    assert_eq!(moved["revision"], 2);
+    assert_eq!(moved["config"]["context"]["revision"], 2);
+    assert_eq!(
+        moved["config"]["context"]["digest"],
+        saved["context"]["digest"]
+    );
+    // Everything but the context pin is as stored, so a changed connection
+    // still needs the operator.
+    let mut same = moved["config"].clone();
+    same["context"] = a["config"]["context"].clone();
+    assert_eq!(same, a["config"]);
+    assert_eq!(
+        binding_drift(&moved["config"], &moved["config"]),
+        BindingDrift::Same
+    );
+    let mut changed = moved["config"].clone();
+    changed["connection_revision"] = json!(5);
+    assert!(matches!(
+        binding_drift(&moved["config"], &changed),
+        BindingDrift::NeedsConfirm(_)
+    ));
+    // A revoked binding and another context's binding are left alone.
+    assert_eq!(show(&b["id"])["config"], b["config"]);
+    assert_eq!(show(&foreign["id"]), foreign);
+}

@@ -1,19 +1,25 @@
-//! `cadence project new` (CAD-358): register a repo as a project and
-//! seed its `PROJECT.md` — goal, the staffing `agents:` map
-//! (docs/design/AGENT-FILESYSTEM.md), the default stages and empty
-//! milestones (docs/design/WORK-MODEL.md) — in one tracker commit.
+//! `cadence project new`: create a project, optionally register a repo and
+//! seed its `PROJECT.md` — goal, staffing, default stages and empty
+//! milestones — in one tracker commit.
 //!
 //! The write runs in the daemon (`project_new` RPC), which decides who
 //! the caller is; this module is the tracker side and trusts the actor
-//! it is handed. `project.yaml` gets only the keys `project add` already
-//! writes (`key`, `prefix`, `repos`) — it is `deny_unknown_fields`, and
-//! an older binary would refuse a new key. The seeded gate keys equal
+//! it is handed.
+//!
+//! `project.yaml` is `deny_unknown_fields`. A new project therefore now
+//! records `id` and `policy` (AOS-274): an older Cadence refuses to parse
+//! such a project rather than silently ignoring a policy that hides its
+//! content. That refusal is the intended fail-closed behavior, not a
+//! regression. New projects are created workspace-visible only; the
+//! explicit visibility choice (and any private policy) is set by the
+//! visibility verb once the isolation gate passes.
+//!
+//! The seeded gate keys equal
 //! the defaults, so no `approve-work` step is needed.
 //!
-//! Idempotent: a second run with the same key and repo changes nothing.
-//! Every refusal — a different repo for an existing key, a repo another
-//! project owns, the reserved key `agents`, an invalid key or prefix, a
-//! path that is not a git checkout — happens before anything is written.
+//! Idempotent: a second run with the same key and mode changes nothing.
+//! Repo-less projects cannot seed repository-local goal or staffing values.
+//! Refusals happen before anything is written.
 
 use std::path::{Path, PathBuf};
 
@@ -21,10 +27,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::{model, project, work, write, Pm};
-
-/// Keys a project may never take: `<pm>/agents/` holds the agent files
-/// (AGENT-FILESYSTEM.md; the master's `agents/master/`, CAD-339).
-pub const RESERVED_KEYS: &[&str] = &["agents"];
+use cadence_core::issue::{check_new_key, check_prefix, derive_prefix};
 
 /// Staffing seeded when the caller names none: one session each.
 pub const DEFAULT_AGENTS: &[(&str, u32)] = &[("pm", 1), ("dev", 1), ("qa", 1)];
@@ -36,8 +39,8 @@ pub const MAX_SESSIONS: u32 = 16;
 #[derive(Clone, Debug, Default)]
 pub struct Request {
     pub key: String,
-    /// Absolute path inside the repo's checkout (the CLI resolves it).
-    pub repo: PathBuf,
+    /// Absolute path inside the repo's checkout (the CLI resolves it), if registered.
+    pub repo: Option<PathBuf>,
     /// Issue id prefix; derived from the key when absent.
     pub prefix: Option<String>,
     /// The goal paragraph seeded into PROJECT.md.
@@ -50,48 +53,7 @@ pub struct Request {
 
 /// A project key `project new` accepts: well formed and not reserved.
 pub fn check_key(key: &str) -> Result<()> {
-    model::check_key(key)?;
-    if RESERVED_KEYS.contains(&key) {
-        return Err(Error::rejected(format!(
-            "Project key '{key}' is reserved — <pm>/{key}/ holds the agent files"
-        )));
-    }
-    Ok(())
-}
-
-/// `CADENCE` → valid; an issue prefix is 1-8 uppercase letters/digits
-/// starting with a letter.
-pub fn check_prefix(prefix: &str) -> Result<()> {
-    let ok = !prefix.is_empty()
-        && prefix.len() <= 8
-        && prefix
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-        && prefix.starts_with(|c: char| c.is_ascii_uppercase());
-    if ok {
-        Ok(())
-    } else {
-        Err(Error::rejected(format!(
-            "Invalid prefix '{prefix}' — uppercase letters/digits starting with a letter"
-        )))
-    }
-}
-
-/// The key's first three letters/digits, uppercased (`reminders` →
-/// `REM`); a key that starts with a digit needs `--prefix`.
-fn derive_prefix(key: &str) -> Result<String> {
-    let prefix: String = key
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(3)
-        .collect::<String>()
-        .to_ascii_uppercase();
-    check_prefix(&prefix).map_err(|_| {
-        Error::rejected(format!(
-            "Cannot derive an issue prefix from '{key}' — pass --prefix"
-        ))
-    })?;
-    Ok(prefix)
+    Ok(check_new_key(key)?)
 }
 
 /// `pm=1,dev=4` or repeated `slug=n` → an ordered, de-duplicated map.
@@ -205,7 +167,16 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
         }
         None => None,
     };
-    let agents = parse_agents(&req.agents)?;
+    if req.repo.is_none() && (req.goal.is_some() || !req.agents.is_empty()) {
+        return Err(Error::rejected(
+            "--goal and --agent require --repo; they seed repository-local PROJECT.md",
+        ));
+    }
+    let agents = if req.repo.is_some() {
+        parse_agents(&req.agents)?
+    } else {
+        Vec::new()
+    };
     if let Some(goal) = &req.goal {
         crate::secret::guard_with(
             &format!("project {key}: goal"),
@@ -213,75 +184,85 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
             &crate::secret::Allowlist::default(),
         )?;
     }
-    if !req.repo.is_absolute() {
-        return Err(Error::rejected(format!(
-            "Repo path '{}' must be absolute",
-            req.repo.display()
-        )));
-    }
-    let not_git = || {
-        Error::rejected(format!(
-            "{} is not a git repo with a checkout — `git init` it first",
-            req.repo.display()
-        ))
-    };
-    let canonical = req.repo.canonicalize().map_err(|_| not_git())?;
-    // cadence's own directories are never a project's repo. The tracker:
-    // cwd resolution would read it as that project and its lanes would
-    // be worktrees of the tracker. The daemon's state dir: its database,
-    // sockets and agent homes. Compared canonically, so a symlink cannot
-    // hide either, and checked on the path before git is asked.
-    let mut own: Vec<(&str, PathBuf)> = vec![("the tracker", pm.dir.clone())];
-    own.extend(guarded.iter().map(|(n, p)| (*n, p.to_path_buf())));
-    let own: Vec<(&str, PathBuf)> = own
-        .into_iter()
-        .map(|(n, p)| (n, p.canonicalize().unwrap_or(p)))
-        .collect();
-    let refuse_own = |name: &str, dir: &Path| {
-        Err(Error::rejected(format!(
-            "{} is {name} ({}), inside it or contains it — a project's repo \
+    let identity = if let Some(repo) = &req.repo {
+        if !repo.is_absolute() {
+            return Err(Error::rejected(format!(
+                "Repo path '{}' must be absolute",
+                repo.display()
+            )));
+        }
+        let not_git = || {
+            Error::rejected(format!(
+                "{} is not a git repo with a checkout — `git init` it first",
+                repo.display()
+            ))
+        };
+        let canonical = repo.canonicalize().map_err(|_| not_git())?;
+        // cadence's own directories are never a project's repo. The tracker:
+        // cwd resolution would read it as that project and its lanes would
+        // be worktrees of the tracker. The daemon's state dir: its database,
+        // sockets and agent homes. Compared canonically, so a symlink cannot
+        // hide either, and checked on the path before git is asked.
+        let mut own: Vec<(&str, PathBuf)> = vec![("the tracker", pm.dir.clone())];
+        own.extend(guarded.iter().map(|(n, p)| (*n, p.to_path_buf())));
+        let own: Vec<(&str, PathBuf)> = own
+            .into_iter()
+            .map(|(n, p)| (n, p.canonicalize().unwrap_or(p)))
+            .collect();
+        let refuse_own = |name: &str, dir: &Path| {
+            Err(Error::rejected(format!(
+                "{} is {name} ({}), inside it or contains it — a project's repo \
              must be its own checkout; nothing written",
-            req.repo.display(),
-            dir.display()
-        )))
+                repo.display(),
+                dir.display()
+            )))
+        };
+        if let Some((name, dir)) = own.iter().find(|(_, d)| canonical.starts_with(d)) {
+            return refuse_own(name, dir);
+        }
+        let (root, remote) = project::repo_identity(&canonical).ok_or_else(not_git)?;
+        if let Some((name, dir)) = own
+            .iter()
+            .find(|(_, d)| root.starts_with(d) || d.starts_with(&root))
+        {
+            return refuse_own(name, dir);
+        }
+        Some((root, remote))
+    } else {
+        None
     };
-    if let Some((name, dir)) = own.iter().find(|(_, d)| canonical.starts_with(d)) {
-        return refuse_own(name, dir);
-    }
-    let (root, remote) = project::repo_identity(&canonical).ok_or_else(not_git)?;
-    if let Some((name, dir)) = own
-        .iter()
-        .find(|(_, d)| root.starts_with(d) || d.starts_with(&root))
-    {
-        return refuse_own(name, dir);
-    }
 
     let _lock = pm.lock()?;
     let projects = project::list(&pm.dir)?;
-    if let Some(other) = projects.iter().find(|p| {
-        p.key != key
-            && p.repos
-                .iter()
-                .any(|r| same_repo(r, &root, remote.as_deref()))
-    }) {
-        return Err(Error::rejected(format!(
-            "{} is already project '{}' — one repo, one project",
-            root.display(),
-            other.key
-        )));
+    if let Some((root, remote)) = &identity {
+        if let Some(other) = projects.iter().find(|p| {
+            p.key != key
+                && p.repos
+                    .iter()
+                    .any(|r| same_repo(r, root, remote.as_deref()))
+        }) {
+            return Err(Error::rejected(format!(
+                "{} is already project '{}' — one repo, one project",
+                root.display(),
+                other.key
+            )));
+        }
     }
     let existing = projects.iter().find(|p| p.key == key);
     if let Some(p) = existing {
-        if !p
-            .repos
-            .iter()
-            .any(|r| same_repo(r, &root, remote.as_deref()))
-        {
+        let same_mode = match &identity {
+            Some((root, remote)) => p
+                .repos
+                .iter()
+                .any(|r| same_repo(r, root, remote.as_deref())),
+            None => p.repos.is_empty(),
+        };
+        if !same_mode {
             let known: Vec<&str> = p.repos.iter().filter_map(|r| r.path.as_deref()).collect();
             return Err(Error::rejected(format!(
-                "Project '{key}' exists with a different repo ({}) — nothing written",
+                "Project '{key}' exists with a different repo mode ({}) — nothing written",
                 if known.is_empty() {
-                    "none".to_string()
+                    "no repo".to_string()
                 } else {
                     known.join(", ")
                 }
@@ -317,21 +298,32 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
     }
     let manifest = work::config_file(&pm.dir, key);
     // A PROJECT.md already there is the project's own — never replaced.
-    let write_manifest = match manifest.symlink_metadata() {
-        Ok(m) if m.is_file() => false,
-        Ok(_) => {
-            return Err(Error::rejected(format!(
-                "{} is not a regular file — nothing written",
-                manifest.display()
-            )))
+    let write_manifest = if identity.is_some() {
+        match manifest.symlink_metadata() {
+            Ok(m) if m.is_file() => false,
+            Ok(_) => {
+                return Err(Error::rejected(format!(
+                    "{} is not a regular file — nothing written",
+                    manifest.display()
+                )));
+            }
+            Err(_) => true,
         }
-        Err(_) => true,
+    } else {
+        false
     };
     let write_yaml = existing.is_none();
     if !write_yaml && !write_manifest {
+        if let Some((root, _)) = &identity {
+            return Ok(json!({
+                "project": key, "prefix": prefix, "path": dir,
+                "repo": root, "changed": false, "committed": false,
+            }));
+        }
         return Ok(json!({
-            "project": key, "prefix": prefix, "path": dir,
-            "repo": root, "changed": false, "committed": false,
+            "project": key, "prefix": prefix, "path": dir, "repo": null,
+            "manifest": null, "agents": {}, "seeded": false,
+            "changed": false, "committed": false,
         }));
     }
 
@@ -345,16 +337,27 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
             let yaml = serde_yaml::to_string(&project::Project {
                 key: key.to_string(),
                 prefix: prefix.clone(),
-                repos: vec![project::Repo {
-                    path: Some(root.to_string_lossy().to_string()),
-                    remote: remote.clone(),
-                }],
+                repos: identity
+                    .as_ref()
+                    .map(|(root, remote)| {
+                        vec![project::Repo {
+                            path: Some(root.to_string_lossy().to_string()),
+                            remote: remote.clone(),
+                            base: None,
+                        }]
+                    })
+                    .unwrap_or_default(),
                 components: vec![],
                 tags: vec![],
                 default_owner: None,
                 build: None,
                 memory: None,
                 intake: None,
+                // AOS-274: identity is minted once, and every project
+                // records an explicit policy. Only workspace-visible is
+                // created until the isolation gate passes.
+                id: Some(project::new_id()),
+                policy: Some(project::ProjectPolicy::workspace_visible()),
             })
             .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
             let file = dir.join("project.yaml");
@@ -392,8 +395,10 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
         Ok(foreign) => foreign,
     };
     let mut out = json!({
-        "project": key, "prefix": prefix, "path": dir, "repo": root,
-        "remote": remote, "manifest": manifest,
+        "project": key, "prefix": prefix, "path": dir,
+        "repo": identity.as_ref().map(|(root, _)| root),
+        "remote": identity.as_ref().and_then(|(_, remote)| remote.as_ref()),
+        "manifest": identity.as_ref().map(|_| manifest),
         "agents": agents.iter().map(|(s, n)| (s.clone(), json!(n))).collect::<serde_json::Map<_, _>>(),
         "seeded": write_manifest, "changed": true, "committed": true, "actor": actor,
     });
@@ -452,7 +457,7 @@ mod tests {
     fn req(key: &str, repo: &Path) -> Request {
         Request {
             key: key.into(),
-            repo: repo.to_path_buf(),
+            repo: Some(repo.to_path_buf()),
             ..Request::default()
         }
     }

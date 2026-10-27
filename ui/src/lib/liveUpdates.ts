@@ -1,8 +1,8 @@
 import { invalidatedBy, type ResourceName } from "./cache";
 import type { SseEvent } from "./sse";
 
-/** One trailing batch for legacy resource invalidations; entity patches are
- * synchronous, so a later fetch cannot silently overwrite newer data.
+/** Master changes invalidate immediately; other legacy resource invalidations
+ * share a trailing batch. Entity patches apply synchronously.
  */
 export class LiveUpdates {
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -49,7 +49,16 @@ export class LiveUpdates {
       if (event.type === "agent_meta") this.queue("lane");
       return;
     }
-    for (const key of invalidatedBy(event.data)) this.queue(key);
+    for (const key of invalidatedBy(event.data)) {
+      // CAD-1773: an agent row moves on every daemon event (`event_cursor`),
+      // and the `agents` frame names `apps` for the app detail's checks. The
+      // installed-app list (`GET /api/apps`) holds no agent state, so an
+      // agent change must not refetch it once a second; installs still
+      // arrive on the `issues` frame.
+      if (key === "apps" && event.type === "agents") continue;
+      if (key === "master") this.opts.invalidate(key);
+      else this.queue(key);
+    }
   };
   private queue(key: ResourceName | string) {
     this.pending.add(key);

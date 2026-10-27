@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { resources } from "../../lib/resources";
 import { useMaybeResource, useQuery, useResource } from "../../lib/useResource";
 import { useHref } from "../../lib/useLocation";
+import { useTranslate } from "../../lib/locale";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import SectionTabs from "../../ui/SectionTabs";
@@ -54,6 +55,7 @@ function AppPage({
   onHome,
 }: AppDetailProps) {
   const key = `${project}/${name}`;
+  const t = useTranslate();
   const state = useQuery(resources.app(key));
   const app = state.data;
   const [running, setRunning] = useState<string | null>(null);
@@ -90,7 +92,7 @@ function AppPage({
   }, [want, app]);
 
   const action = app ? primaryAction(app) : null;
-  const approval = app ? appApprovalChip(app) : null;
+  const approval = app ? appApprovalChip(app, t) : null;
   // Installation approval lives in Settings; this strip is for run decisions.
   const needsRows = app ? appNeeds(app, runs, needs, pending).filter(n => n.kind !== "approve") : [];
   const ready = app ? isReadyToRun(app) : false;
@@ -99,14 +101,14 @@ function AppPage({
     <>
       <main className="apps-workspace px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={`app ${key}`}>
         <Link href="/apps" className="lnk text-label">
-          ← All apps
+          {t("← All apps")}
         </Link>
         <div className="flex flex-wrap items-start gap-3 mt-2 mb-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-section font-semibold text-ink-100">
               {app?.title?.trim() || name}
             </h1>
-            <p className="text-micro text-ink-500 mt-0.5">Project: {project}</p>
+            <p className="text-micro text-ink-500 mt-0.5">{t("Project:")} {project}</p>
             {app && <p className="text-body text-ink-400 mt-1 break-words">{appPurpose(app)}</p>}
             <div className="flex flex-wrap items-center gap-2 mt-1.5">
               {approval && app?.approval !== "approved" && (
@@ -129,13 +131,13 @@ function AppPage({
         {app && !ready && (
           <section
             className="app-setup card px-4 py-3 min-w-0 mb-3"
-            aria-label="setup required"
+            aria-label={t("setup required")}
           >
             <div className="min-w-0">
-              <h2 className="text-label font-medium text-ink-100">Setup required</h2>
+              <h2 className="text-label font-medium text-ink-100">{t("Setup required")}</h2>
               <p className="text-label text-ink-400 mt-0.5 break-words">{notReady}</p>
             </div>
-            {tab !== "settings" && <Button href={settingsHref}>Open settings</Button>}
+            {tab !== "settings" && <Button href={settingsHref}>{t("Open settings")}</Button>}
           </section>
         )}
         <ResourceGate
@@ -148,15 +150,15 @@ function AppPage({
         {app && needsRows.length > 0 && (
           <section
             className="card px-4 py-3 min-w-0 mb-3 border-warn/40"
-            aria-label="needs you"
+            aria-label={t("needs you")}
           >
-            <div className="slabel mb-1.5">needs you</div>
+            <div className="slabel mb-1.5">{t("needs you")}</div>
             <ul className="space-y-1.5">
               {needsRows.map((n, i) => (
                 <li key={`${n.kind}-${i}`} className="flex flex-wrap items-center gap-2 min-w-0">
                   <span className="text-label text-ink-200 min-w-0 break-words flex-1">{n.text}</span>
-                  <Link href="/" className="lnk text-label shrink-0" title="open Needs you">
-                    {n.kind === "release" ? "Release →" : "Answer →"}
+                  <Link href="/" className="lnk text-label shrink-0" title={t("open Needs you")}>
+                    {n.kind === "release" ? `${t("Release")} →` : `${t("Answer")} →`}
                   </Link>
                 </li>
               ))}
@@ -167,7 +169,7 @@ function AppPage({
         {app && (
           <>
             <div className="-mx-4 lg:-mx-8 mb-4">
-              <SectionTabs label="App" tabs={[
+              <SectionTabs label={t("App")} tabs={[
                 {label:"Posts",href:appPath,on:tab === "posts"},
                 {label:"Settings",href:settingsHref,on:tab === "settings"},
                 {label:"How it works",href:`${appPath}?tab=how`,on:tab === "how"},

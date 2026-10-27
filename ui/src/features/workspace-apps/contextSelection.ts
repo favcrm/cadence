@@ -1,4 +1,21 @@
+import { onPrivateSessionReset } from "../../lib/privateSession";
+
 const key = (installId: string) => `cadence.workspace-app.context.${installId}`;
+
+onPrivateSessionReset(() => {
+  const prefix = "cadence.workspace-app.context.";
+  try {
+    const storage = window.sessionStorage;
+    for (let index = storage.length - 1; index >= 0; index -= 1) {
+      const saved = storage.key(index);
+      if (!saved?.startsWith(prefix)) continue;
+      storage.removeItem(saved);
+      emitContext(saved.slice(prefix.length), null);
+    }
+  } catch {
+    // Storage is optional; the private tree also discards its current frame.
+  }
+});
 
 export function rememberedContext(installId: string): string | null {
   try { return window.sessionStorage.getItem(key(installId)); }
@@ -40,10 +57,26 @@ export function forgetContext(installId: string): void {
   emitContext(installId, null);
 }
 
-export function initialContext(installId: string, activeIds: string[]): string {
-  const remembered = rememberedContext(installId);
-  if (remembered !== null && (remembered === "" || activeIds.includes(remembered))) return remembered;
-  const selected = activeIds.length === 1 ? activeIds[0] : "";
-  rememberContext(installId, selected);
-  return selected;
+/** Resolve a remembered selection against the live context list. Pure:
+ *  no storage access — the scope owner reads/persists/announces around
+ *  this call. Fail-closed: a remembered value that no longer names an
+ *  active context resolves to THAT stale value (the caller's binding
+ *  check then refuses "not active"), never silently broadened — until
+ *  the operator makes an explicit pick. Fresh no-selection (null) and
+ *  explicit "" stay as before. */
+export function initialContext(remembered: string | null, activeIds: string[]): string {
+  if (remembered !== null) return remembered;
+  return activeIds.length === 1 ? activeIds[0] : "";
+}
+
+/** A private screen has no context picker, so a lone active context is
+ *  the workspace's company and is the selection over a fresh or
+ *  explicitly-empty remembered choice. A remembered NONEMPTY id is
+ *  returned verbatim — even when stale (fail-closed refusal, never an
+ *  auto-retarget to a different live context; the operator recovers by
+ *  picking). Pure like {@link initialContext}. */
+export function screenContext(remembered: string | null, activeIds: string[]): string {
+  if (remembered === null) return activeIds.length === 1 ? activeIds[0] : "";
+  if (remembered === "") return activeIds.length === 1 ? activeIds[0] : "";
+  return remembered;
 }

@@ -1,6 +1,8 @@
 import { ApiError } from "../../lib/api";
+import { errorMessage } from "../../lib/apiError";
 import { hostErrorText } from "./shared/hostErrors";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import { assertRecordId, assertScope, type HostScope } from "./hostActions";
 
 /**
@@ -63,46 +65,40 @@ function assertClean(body: Record<string, unknown>, allowed: readonly string[], 
 
 const part = encodeURIComponent;
 
-async function post<T>(path: string, body: Record<string, unknown>): Promise<T> {
-  const resp = await fetch(path, {
-    method: "POST",
-    credentials: "same-origin",
-    cache: "no-store",
-    headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
-    body: JSON.stringify(body),
+async function post<T>(path: string, body: Record<string, unknown>, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+      body: JSON.stringify(body),
+    }, op);
+    const value = await resp.json().catch(() => null);
+    op.assertCurrent();
+    if (!resp.ok) {
+      throw new ApiError(errorMessage(value, `${resp.status} ${resp.statusText}`.trim()), resp.status);
+    }
+    if (value === null) throw new ApiError("The server returned an invalid send receipt", 502);
+    return value as T;
   });
-  const value = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    const serverError = (value as { error?: unknown } | null)?.error;
-    throw new ApiError(
-      typeof serverError === "string" && serverError !== ""
-        ? serverError
-        : `${resp.status} ${resp.statusText}`.trim(),
-      resp.status,
-    );
-  }
-  if (value === null) throw new ApiError("The server returned an invalid send receipt", 502);
-  return value as T;
 }
 
-async function get<T>(path: string): Promise<T> {
-  const resp = await fetch(path, {
-    credentials: "same-origin",
-    cache: "no-store",
-    headers: { ...sessionHeaders() },
+async function get<T>(path: string, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { ...sessionHeaders() },
+    }, op);
+    const value = await resp.json().catch(() => null);
+    op.assertCurrent();
+    if (!resp.ok) {
+      throw new ApiError(errorMessage(value, `${resp.status} ${resp.statusText}`.trim()), resp.status);
+    }
+    if (value === null) throw new ApiError("The server returned an invalid send receipt", 502);
+    return value as T;
   });
-  const value = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    const serverError = (value as { error?: unknown } | null)?.error;
-    throw new ApiError(
-      typeof serverError === "string" && serverError !== ""
-        ? serverError
-        : `${resp.status} ${resp.statusText}`.trim(),
-      resp.status,
-    );
-  }
-  if (value === null) throw new ApiError("The server returned an invalid send receipt", 502);
-  return value as T;
 }
 
 export const sendPaths = {
@@ -630,10 +626,10 @@ export const sendClient = {
       const ok =
         trimmed.length > 0 &&
         trimmed.length <= 200 &&
-        (/^https:\/\//.test(trimmed) || /^http:\/\//.test(trimmed)) &&
+        (trimmed.startsWith("https://") || trimmed.startsWith("http://")) &&
         !/[?#@]/.test(rest) &&
         (slashAt === -1 || rest.slice(slashAt) === "/") &&
-        (/^https:\/\//.test(trimmed)
+        (trimmed.startsWith("https://")
           ? rest.replace(/\/$/, "").length > 0
           : /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?\/?$/.test(trimmed));
       if (!ok) {

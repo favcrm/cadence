@@ -265,10 +265,7 @@ impl Shared {
     }
 
     fn provider_catalog(&self) -> Result<Vec<Value>> {
-        let policy = match self.pm_dir() {
-            Ok(dir) => crate::pi_policy::read(&dir)?,
-            Err(_) => None,
-        };
+        let policy = self.stored_pi_policy()?;
         let mut providers = Vec::new();
         let mut seen: Vec<&str> = Vec::new();
         for spec in crate::adapter::registry::SPECS {
@@ -278,22 +275,25 @@ impl Shared {
             seen.push(spec.provider);
             let takes_model = spec.launch_params.contains(&"model");
             let takes_effort = spec.launch_params.contains(&"effort");
-            let models = if spec.provider == "pi" {
-                let empty: &[String] = &[];
-                json!(policy
-                    .as_ref()
-                    .map(|p| p.models.allow_for("worker"))
-                    .unwrap_or(empty))
-            } else if takes_model {
-                Value::Null
-            } else {
-                json!([])
-            };
+            let models =
+                if crate::adapter::registry::pi_family_managed(spec.provider, spec.endpoint_kind) {
+                    let empty: &[String] = &[];
+                    json!(policy
+                        .as_ref()
+                        .map(|p| p.models.allow_for("worker"))
+                        .unwrap_or(empty))
+                } else if takes_model {
+                    Value::Null
+                } else {
+                    json!([])
+                };
             let efforts: &[&str] = if !takes_effort {
                 &[]
+            } else if crate::adapter::registry::pi_family_managed(spec.provider, spec.endpoint_kind)
+            {
+                crate::adapter::registry::PI_EFFORTS
             } else {
                 match spec.provider {
-                    "pi" => crate::adapter::registry::PI_EFFORTS,
                     "claude" => crate::adapter::registry::CLAUDE_EFFORTS,
                     "codex" => crate::adapter::registry::CODEX_EFFORTS,
                     _ => &[],
@@ -726,6 +726,7 @@ impl Shared {
                 "operator",
                 &self.state_dir,
                 Some(&lane.group),
+                issue::dispatch::DispatchOrigin::Explicit,
             )
         });
         let mut out = match dispatched {

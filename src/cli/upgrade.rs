@@ -26,7 +26,11 @@ pub(super) fn run_upgrade(state_dir: &Path, args: UpgradeArgs) -> Result<i32> {
         }
     };
     let layout = upgrade::Layout::detect(args.link, args.releases_dir)?;
-    let source = upgrade::Gh::new(&args.repo);
+    // CAD-1479: the owned catalogue is the default release source;
+    // `--release-source` is the advanced https:// override, and a
+    // non-default `--repo` still selects the GitHub route — see
+    // `UpdateSource::new`.
+    let source = UpdateSource::new(args.release_source.as_deref(), &args.repo)?;
     let mut report = upgrade::run(
         &source,
         &layout,
@@ -101,6 +105,7 @@ pub(super) fn run(
     repo: String,
     link: Option<PathBuf>,
     releases_dir: Option<PathBuf>,
+    release_source: Option<String>,
 ) -> Result<i32> {
     run_upgrade(
         &state_dir,
@@ -114,6 +119,7 @@ pub(super) fn run(
             repo,
             link,
             releases_dir,
+            release_source,
         },
     )
 }

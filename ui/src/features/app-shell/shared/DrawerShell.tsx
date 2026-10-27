@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import Button from "../../../ui/Button";
+import { useTranslate } from "../../../lib/localeText";
 import { useDrawerClose } from "./useDrawerClose";
 
 /**
@@ -12,6 +13,9 @@ import { useDrawerClose } from "./useDrawerClose";
  *    (opens upward, destructive item last and red), secondary buttons,
  *    one primary on the right. While editing it becomes Cancel / Save.
  * The scrim dims the outlet only: the left chat pane stays usable.
+ * `scrim="board"` (CAD-1216, the Home review drawer) is opt-in: the scrim
+ * covers the whole board, a `kicker` sits above the title and `foot`
+ * replaces the footer's slots; phones get a bottom sheet.
  * Escape closes an open menu first, then cancels an edit, then the
  * drawer; focus returns through `useDrawerClose`.
  */
@@ -30,6 +34,10 @@ export type DrawerEdit = {
 export interface DrawerShellProps {
   kind: string;
   label: string;
+  /** Small accent line above the title (board scrim). */
+  kicker?: ReactNode;
+  /** `board` dims the whole board, not only the outlet. Default `outlet`. */
+  scrim?: "outlet" | "board";
   title: string;
   subtitle?: ReactNode;
   avatar?: ReactNode;
@@ -49,13 +57,18 @@ export interface DrawerShellProps {
   primary?: ReactNode;
   /** Footer text when the viewer has no actions (read-only view). */
   note?: ReactNode;
+  /** Replaces the footer's menu / note / secondary / primary slots. */
+  foot?: ReactNode;
   onClose: () => void;
+  /** Frame-local scrim edge. When supplied, no host outlet is measured. */
+  geometry?: { left: number };
 }
 
 /** Left edge of the outlet, so the scrim never dims the chat pane. */
-function useScrimLeft(): number {
+function useScrimLeft(explicitLeft: number | undefined): number {
   const [left, setLeft] = useState(0);
   useLayoutEffect(() => {
+    if (explicitLeft !== undefined) return;
     const measure = () => {
       const outlet = document.querySelector(".app-shell-outlet");
       // Below 1024px the chat is a closed sheet, so the scrim spans all.
@@ -64,11 +77,12 @@ function useScrimLeft(): number {
     measure();
     window.addEventListener("resize", measure);
     return () => window.removeEventListener("resize", measure);
-  }, []);
-  return left;
+  }, [explicitLeft]);
+  return explicitLeft ?? left;
 }
 
 function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open: boolean; setOpen: (v: boolean) => void }) {
+  const t = useTranslate();
   const wrap = useRef<HTMLDivElement | null>(null);
   const trigger = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
@@ -94,7 +108,7 @@ function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open:
         ref={trigger}
         type="button"
         className="btn btn-sm btn-icon"
-        aria-label="More actions"
+        aria-label={t("More actions")}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen(!open)}
@@ -102,7 +116,7 @@ function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open:
         ⋯
       </button>
       {open && (
-        <div className="crm-drawer-pop" role="menu" aria-label="More actions">
+        <div className="crm-drawer-pop" role="menu" aria-label={t("More actions")}>
           {items.map((item) => (
             <button
               key={item.key}
@@ -128,7 +142,7 @@ function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open:
 }
 
 export default function DrawerShell(props: DrawerShellProps) {
-  const { kind, label, title, subtitle, avatar, pills, warning, tabs, tab: tabProp, onTab, edit, state, menu, secondary, primary, note, onClose } = props;
+  const { kind, label, kicker, scrim = "outlet", title, subtitle, avatar, pills, warning, tabs, tab: tabProp, onTab, edit, state, menu, secondary, primary, note, foot, onClose } = props;
   const headRef = useRef<HTMLHeadingElement | null>(null);
   const [tabState, setTabState] = useState(tabs[0]?.id ?? "");
   const tab = tabProp ?? tabState;
@@ -138,7 +152,8 @@ export default function DrawerShell(props: DrawerShellProps) {
   };
   const [menuOpen, setMenuOpen] = useState(false);
   const { closing, requestClose, onTransitionEnd } = useDrawerClose(onClose);
-  const scrimLeft = useScrimLeft();
+  const t = useTranslate();
+  const scrimLeft = useScrimLeft(props.geometry?.left);
   const editing = edit != null;
 
   // Land on the heading so a deep link (no opener) still has a place.
@@ -163,13 +178,15 @@ export default function DrawerShell(props: DrawerShellProps) {
     setTab(next.id);
     document.getElementById(`crm-tab-${kind}-${next.id}`)?.focus();
   };
-  const hasFooter = state == null && (editing || (menu?.length ?? 0) > 0 || secondary != null || primary != null || note != null);
+  const hasFooter = state == null && (editing || foot != null || (menu?.length ?? 0) > 0 || secondary != null || primary != null || note != null);
+  const board = scrim === "board";
 
   return (
     <>
       <div
         className="crm-drawer-scrim"
-        style={{ left: scrimLeft }}
+        style={{ left: board ? 0 : scrimLeft }}
+        data-scrim={board ? "board" : undefined}
         data-closing={closing || undefined}
         onClick={requestClose}
         aria-hidden="true"
@@ -180,6 +197,7 @@ export default function DrawerShell(props: DrawerShellProps) {
         aria-modal="false"
         aria-label={label}
         data-drawer={kind}
+        data-scrim={board ? "board" : undefined}
         data-mode={editing ? "edit" : "view"}
         data-closing={closing || undefined}
         onTransitionEnd={onTransitionEnd}
@@ -188,13 +206,14 @@ export default function DrawerShell(props: DrawerShellProps) {
           <div className="crm-drawer-id">
             {avatar != null && <span className="crm-drawer-avatar" aria-hidden="true">{avatar}</span>}
             <div className="crm-drawer-titles">
+              {kicker != null && <div className="crm-drawer-kicker">{kicker}</div>}
               <h3 ref={headRef} className="crm-drawer-title" tabIndex={-1}>
                 {title}
               </h3>
               {subtitle != null && <div className="crm-drawer-sub">{subtitle}</div>}
               {pills != null && <div className="crm-drawer-pills">{pills}</div>}
             </div>
-            <button type="button" className="btn btn-sm btn-ghost btn-icon" onClick={requestClose} aria-label={`Close ${label.toLowerCase()}`}>
+            <button type="button" className="btn btn-sm btn-ghost btn-icon" onClick={requestClose} aria-label={`${t("Close")} ${label.toLowerCase()}`}>
               ✕
             </button>
           </div>
@@ -202,7 +221,7 @@ export default function DrawerShell(props: DrawerShellProps) {
             <p className="crm-drawer-warn" data-testid="drawer-warning">{warning}</p>
           )}
           {state == null && !editing && tabs.length > 1 && (
-            <div className="crm-drawer-tabs" role="tablist" aria-label={`${label} sections`}>
+            <div className="crm-drawer-tabs" role="tablist" aria-label={`${label} ${t("sections")}`}>
               {tabs.map((t, i) => (
                 <button
                   key={t.id}
@@ -237,12 +256,14 @@ export default function DrawerShell(props: DrawerShellProps) {
               <>
                 <span className="crm-drawer-spacer" />
                 <Button size="sm" variant="ghost" onClick={edit.onCancel} disabled={edit.pending}>
-                  Cancel
+                  {t("Cancel")}
                 </Button>
                 <button type="submit" form={edit.formId} className="btn btn-sm btn-primary" disabled={edit.pending} aria-busy={edit.pending || undefined}>
-                  {edit.pending ? "Saving…" : (edit.saveLabel ?? "Save")}
+                  {edit.pending ? t("Saving…") : (edit.saveLabel ?? t("Save"))}
                 </button>
               </>
+            ) : foot != null ? (
+              foot
             ) : (
               <>
                 {menu != null && menu.length > 0 && <OverflowMenu items={menu} open={menuOpen} setOpen={setMenuOpen} />}

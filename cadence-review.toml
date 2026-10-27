@@ -16,7 +16,7 @@
 
 # Run once in the review checkout before gating. The UI clippy gate needs
 # the UI built (the `ui` cargo feature embeds ui/dist); node_modules is
-# linked from the main checkout so pnpm build reuses its store.
+# linked from the main checkout so the build reuses installed dependencies.
 prepare = [
     "cd ui && ln -sfn ../../../../ui/node_modules node_modules",
     "cd ui && node_modules/.bin/vite build",
@@ -32,14 +32,15 @@ gates = [
     "python3 scripts/check-review-recipe",
     "python3 scripts/test-review-recipe",
     "cargo fmt --all -- --check",
-    "cd ui && node_modules/.bin/tsc --noEmit",
-    "cd ui && pnpm test",
+    "cd ui && bun run typecheck",
+    "cd ui && bun run lint",
+    "cd ui && bun run test",
     "cargo clippy --all-targets --locked -- -D warnings",
     "cargo clippy --all-targets --locked --features test-seam -- -D warnings",
     "cargo clippy --all-targets --locked --features ui -- -D warnings",
     # CAD-1073: the test_seam gate's target was retired; the safety floor
-    # is the executable check.
-    "cargo test --locked --test safety_floor -- --test-threads 2",
+    # is the executable check. CAD-1727: it is a module of the one suite.
+    "cargo test --locked --test suite safety_floor:: -- --test-threads 2",
 ]
 
 # One review baseline under the existing host-wide slot. The complete
@@ -49,15 +50,16 @@ gates = [
 suite_scope = "review-baseline"
 # CAD-1073: the board_* split targets were retired with the suite.
 # lib/bins and the safety floor are the residual baseline.
-full_suite = "scripts/cadence-nextest --locked --features test-seam --lib --bins --test safety_floor --test-threads 2"
+full_suite = "scripts/cadence-nextest --locked --features test-seam --lib --bins --test suite --test-threads 2"
 
 # Diff paths that count as test files — `fn` items added under these
 # are the PR's new tests.
 test_globs = ["tests/**"]
 
-# How one test runs alone — {test} = fn name, {file} = diff path,
-# {target} = file stem (cargo's --test <stem>). Substitutions arrive
-# single-quoted — do not quote them again here.
+# How one test runs alone — {test} = the test name (module-qualified for a
+# file `tests/suite.rs` lists), {file} = diff path, {target} = the cargo
+# target: the file stem, or `suite` for a suite module. Substitutions
+# arrive single-quoted — do not quote them again here.
 test_command = "scripts/cadence-nextest --features test-seam --test {target} -- {test} --exact"
 
 # Optional (CAD-799): how a `src/` unit test runs alone when no file

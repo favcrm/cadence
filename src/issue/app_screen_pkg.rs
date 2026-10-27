@@ -46,6 +46,19 @@ pub struct ScreenPackage {
     pub app: String,
     /// The declared remote image sets (host-listed names only).
     pub remote_images: Vec<String>,
+    /// The validated contract (`app-screens/v1` read-only or
+    /// `app-screens/v2` which may carry tool declarations).
+    pub contract: String,
+    /// The `may` bridge methods the validated declaration opted into
+    /// (empty on v1 / a v2 with none).
+    pub may: Vec<String>,
+    /// The `host_contract` the validated declaration pinned (`None` when
+    /// the screen declared none — a read-only mount).
+    pub host_contract: Option<String>,
+    /// Declared logical tool alias → declared capability slot (v2 only).
+    pub tools: BTreeMap<String, String>,
+    pub operations: Vec<app_screen_decl::ScreenOperation>,
+    pub navigation: Option<app_screen_decl::ScreenNavigation>,
 }
 
 /// `true` when `tag` is a legal screen tag (the bundle's tag grammar).
@@ -99,7 +112,105 @@ pub fn tags_in(files: &BTreeMap<String, String>) -> Result<Vec<String>> {
     Ok(tags)
 }
 
-/// Re-prove one screen package against the live bundle snapshot.
+/// CAD-1543: an install is eligible for host SMTP custody only when one
+/// of its integrity-checked screen packages, declared for `app`, lists
+/// `smtp.bind`. Any scan or parse failure reads as not declared.
+pub fn declares_smtp_custody(files: &BTreeMap<String, String>, app: &str) -> bool {
+    tags_in(files).is_ok_and(|tags| {
+        tags.iter().any(|tag| {
+            extract(files, tag).is_ok_and(|pkg| {
+                pkg.app == app
+                    && pkg
+                        .operations
+                        .contains(&app_screen_decl::ScreenOperation::SmtpBind)
+            })
+        })
+    })
+}
+
+/// CAD-1562: an install is eligible for the hosted WhatsApp door only
+/// when one of its integrity-checked screen packages, declared for `app`,
+/// lists a `whatsapp.*` operation. Any scan or parse failure reads as not
+/// declared.
+pub fn declares_whatsapp_door(files: &BTreeMap<String, String>, app: &str) -> bool {
+    tags_in(files).is_ok_and(|tags| {
+        tags.iter().any(|tag| {
+            extract(files, tag)
+                .is_ok_and(|pkg| pkg.app == app && pkg.operations.iter().any(|op| op.is_whatsapp()))
+        })
+    })
+}
+
+/// CAD-1827: how one installed bundle relates to the campaign-work contract.
+///
+/// Discovery must never read a failed inspection as "not a source": a
+/// package that *declares* the contract but cannot be inspected is a
+/// participating source with an unavailable outcome, while a package that
+/// simply does not require the contract is valid non-participation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CampaignWorkSource {
+    /// The manifest requires the contract and a live screen package declares
+    /// `campaign-work.show` for the same app: a usable source.
+    Served,
+    /// The manifest is readable and does not require the contract at this
+    /// major: a valid non-source that discovery omits entirely.
+    NotDeclared,
+    /// The manifest requires the contract, but the package could not be
+    /// inspected (unreadable declaration, failed integrity, or no package
+    /// serving the operation). The reason is a bounded plain line; no
+    /// recorded values are implied.
+    Unavailable(&'static str),
+}
+
+/// Classify one installed bundle for campaign-work discovery. Every failure
+/// after the manifest proves participation is `Unavailable`, never
+/// `NotDeclared`: a broken source stays visible instead of disappearing from
+/// an otherwise successful list.
+pub fn campaign_work_source(files: &BTreeMap<String, String>) -> CampaignWorkSource {
+    let metadata = match files
+        .get("app.md")
+        .map(|text| crate::issue::app::parse_manifest(text))
+    {
+        Some(Ok(metadata)) => metadata,
+        _ => {
+            return CampaignWorkSource::Unavailable("installation manifest is unreadable");
+        }
+    };
+    if metadata
+        .requires
+        .contracts
+        .get(crate::issue::app_campaign_work::CONTRACT_NAME)
+        .map(Vec::as_slice)
+        != Some(&[crate::issue::app_campaign_work::CONTRACT_MAJOR][..])
+    {
+        return CampaignWorkSource::NotDeclared;
+    }
+    let tags = match tags_in(files) {
+        Ok(tags) => tags,
+        Err(_) => return CampaignWorkSource::Unavailable("screen package set is unreadable"),
+    };
+    for tag in &tags {
+        match extract(files, tag) {
+            Ok(pkg)
+                if pkg.app == metadata.app
+                    && pkg
+                        .operations
+                        .contains(&app_screen_decl::ScreenOperation::CampaignWorkShow) =>
+            {
+                return CampaignWorkSource::Served;
+            }
+            Ok(_) => {}
+            // A declared package that fails integrity is a source we cannot
+            // inspect; reporting it keeps the inventory truthful.
+            Err(_) => {
+                return CampaignWorkSource::Unavailable("a screen package failed integrity");
+            }
+        }
+    }
+    CampaignWorkSource::Unavailable("no screen package declares campaign-work.show")
+}
+
+/// Re-prove one screen package against the live bundle snapshot./// Re-prove one screen package against the live bundle snapshot.
 ///
 /// Collects the `screens/<tag>/` members from `files`, refuses when the
 /// `screens.json` declaration is absent, then runs
@@ -143,12 +254,68 @@ pub fn extract(files: &BTreeMap<String, String>, tag: &str) -> Result<ScreenPack
     }
     let checked = app_screen_decl::validate_map(&manifest, &assets)
         .map_err(|e| Error::rejected(format!("screen package '{tag}' failed integrity: {e}")))?;
+    // Only the new multi-script mode needs metadata. Legacy extraction
+    // fixtures without app.md retain their existing admission behavior.
+    if checked.startup().is_some() {
+        let metadata = crate::issue::app::parse_manifest(
+            files
+                .get("app.md")
+                .ok_or_else(|| Error::rejected("startup requires app.md metadata"))?,
+        )?;
+        if metadata.app != checked.app()
+            || metadata
+                .requires
+                .contracts
+                .get("screen-startup")
+                .map(Vec::as_slice)
+                != Some(&[1][..])
+        {
+            return Err(Error::rejected(
+                "startup requires matching app.md and needs.requires.contracts.screen-startup: [1]",
+            ));
+        }
+    }
+    // CAD-1827: the campaign work operations are served only under the
+    // contract the manifest declares — the same pairing the startup
+    // feature uses. A package that lists the operations without requiring
+    // `crm-campaign-work` refuses here, instead of mounting a screen whose
+    // work actions would be inert.
+    if checked
+        .operations()
+        .iter()
+        .any(|operation| operation.is_campaign_work())
+    {
+        let metadata = crate::issue::app::parse_manifest(
+            files
+                .get("app.md")
+                .ok_or_else(|| Error::rejected("campaign work requires app.md metadata"))?,
+        )?;
+        if metadata.app != checked.app()
+            || metadata
+                .requires
+                .contracts
+                .get(crate::issue::app_campaign_work::CONTRACT_NAME)
+                .map(Vec::as_slice)
+                != Some(&[crate::issue::app_campaign_work::CONTRACT_MAJOR][..])
+        {
+            return Err(Error::rejected(
+                "campaign-work operations require matching app.md and \
+                 needs.requires.contracts.crm-campaign-work: [1]",
+            ));
+        }
+    }
     Ok(ScreenPackage {
         tag: tag.to_string(),
         manifest,
         assets,
         app: checked.app().to_string(),
         remote_images: checked.remote_images().to_vec(),
+        contract: checked.contract().to_string(),
+        may: checked.may().to_vec(),
+        host_contract: checked.host_contract().map(str::to_string),
+        tools: checked.tools().clone(),
+        operations: checked.operations().to_vec(),
+        navigation: checked.navigation().cloned(),
     })
 }
 
@@ -268,5 +435,192 @@ mod tests {
         ] {
             assert!(extract(&with(bad.clone()), "a").is_err(), "admitted {bad}");
         }
+    }
+
+    fn decl_v2(assets: &[(&str, &str)], extra: serde_json::Value) -> String {
+        let mut decl: serde_json::Value = serde_json::from_str(&decl(assets)).unwrap();
+        decl["contract"] = json!("app-screens/v2");
+        decl["host_contract"] = json!("screen-actions.v1");
+        decl["may"] = json!(["tools.invoke"]);
+        for (k, v) in extra.as_object().unwrap() {
+            decl[k] = v.clone();
+        }
+        decl.to_string()
+    }
+
+    #[test]
+    fn cad1177_v2_declares_bounded_tool_alias_to_slot_map() {
+        let js = "x";
+        let good = bundle_with(
+            "a",
+            &decl_v2(
+                &[("client.js", js)],
+                json!({"tools": {"instagram.read": "source", "image.generate": "image"}}),
+            ),
+            &[("client.js", js)],
+        );
+        let pkg = extract(&good, "a").unwrap();
+        assert_eq!(pkg.contract, "app-screens/v2");
+        assert_eq!(pkg.may, vec!["tools.invoke".to_string()]);
+        assert_eq!(pkg.tools["instagram.read"], "source");
+        assert_eq!(pkg.tools["image.generate"], "image");
+
+        let with = |extra: serde_json::Value| {
+            bundle_with(
+                "a",
+                &decl_v2(&[("client.js", js)], extra),
+                &[("client.js", js)],
+            )
+        };
+        // An undeclared/bad alias grammar refuses.
+        assert!(extract(&with(json!({"tools":{"Instagram.Read":"source"}})), "a").is_err());
+        assert!(extract(
+            &with(json!({"tools":{"no_dots_ok_underscore":"source"}})),
+            "a"
+        )
+        .is_err());
+        // A slot that isn't a tag refuses.
+        assert!(extract(&with(json!({"tools":{"a.b":"not a slot!"}})), "a").is_err());
+        // An unknown may-method refuses.
+        assert!(extract(
+            &with(json!({"tools":{"a.b":"source"},"may":["tools.invoke","http.proxy"]})),
+            "a"
+        )
+        .is_err());
+        // An unknown host contract refuses.
+        assert!(extract(
+            &with(json!({"tools":{"a.b":"source"},"host_contract":"http.proxy"})),
+            "a"
+        )
+        .is_err());
+        // tools/host_contract under v1 refuses (read-only stays read-only).
+        let mut v1: serde_json::Value = serde_json::from_str(&decl(&[("client.js", js)])).unwrap();
+        v1["tools"] = json!({"a.b":"source"});
+        v1["may"] = json!(["tools.invoke"]);
+        let v1files = bundle_with("a", &v1.to_string(), &[("client.js", js)]);
+        assert!(extract(&v1files, "a").is_err());
+    }
+
+    fn decl_records(assets: &[(&str, &str)], operations: &[&str]) -> String {
+        let mut decl: serde_json::Value = serde_json::from_str(&decl(assets)).unwrap();
+        decl["contract"] = json!("app-screens/v2");
+        decl["host_contract"] = json!("screen-records.v1");
+        decl["may"] = json!(["records.call", "records.slot"]);
+        decl["operations"] = json!(operations);
+        decl.to_string()
+    }
+
+    fn declared_manifest(contracts: &str) -> String {
+        format!(
+            "---\napp: crm\ntitle: t\nversion: '1'\nneeds:\n  requires:\n    \
+             contracts: {contracts}\n---\n\nG\n"
+        )
+    }
+
+    #[test]
+    fn cad1827_campaign_work_operations_pair_with_the_declared_contract() {
+        let js = "x";
+        let paired =
+            declared_manifest("{app-screens: [1], screen-records: [1], crm-campaign-work: [1]}");
+        let unpaired = declared_manifest("{app-screens: [1], screen-records: [1]}");
+        let wrong_major =
+            declared_manifest("{app-screens: [1], screen-records: [1], crm-campaign-work: [2]}");
+        let with = |metadata: &str, operations: &[&str], decl_app: Option<&str>| {
+            let mut declaration = decl_records(&[("client.js", js)], operations);
+            if let Some(app) = decl_app {
+                let mut value: serde_json::Value = serde_json::from_str(&declaration).unwrap();
+                value["app"] = json!(app);
+                declaration = value.to_string();
+            }
+            let mut files = bundle_with("a", &declaration, &[("client.js", js)]);
+            files.insert("app.md".to_string(), metadata.to_string());
+            files
+        };
+        let ops = ["campaign-work.show", "campaign-work.save"];
+        let pkg = extract(&with(&paired, &ops, None), "a").unwrap();
+        assert_eq!(
+            pkg.operations,
+            vec![
+                app_screen_decl::ScreenOperation::CampaignWorkShow,
+                app_screen_decl::ScreenOperation::CampaignWorkSave,
+            ]
+        );
+        // Show is a read; save is a direct write, never a host confirmation.
+        assert!(app_screen_decl::ScreenOperation::CampaignWorkShow.is_screen_read());
+        assert!(!app_screen_decl::ScreenOperation::CampaignWorkSave.is_screen_read());
+        assert!(!app_screen_decl::ScreenOperation::CampaignWorkShow.is_slot());
+        assert!(!app_screen_decl::ScreenOperation::CampaignWorkSave.is_slot());
+        assert!(app_screen_decl::ScreenOperation::CampaignWorkSave.is_campaign_work());
+
+        // The operations without the declared contract refuse: a host would
+        // otherwise mount a screen whose work actions cannot run.
+        assert!(extract(&with(&unpaired, &ops, None), "a").is_err());
+        // The contract at another major is not this host's contract.
+        assert!(extract(&with(&wrong_major, &ops, None), "a").is_err());
+        // A package cannot claim the pairing under a foreign app tag.
+        assert!(extract(&with(&paired, &ops, Some("other")), "a").is_err());
+        // A package with no campaign operation needs no contract.
+        let plain = extract(&with(&unpaired, &["records.list"], None), "a").unwrap();
+        assert_eq!(
+            plain.operations,
+            vec![app_screen_decl::ScreenOperation::RecordsList]
+        );
+        // An unknown operation still refuses at parse time.
+        assert!(extract(&with(&paired, &["campaign-work.send"], None), "a").is_err());
+    }
+
+    #[test]
+    fn cad1827_campaign_work_source_is_a_three_way_classification() {
+        let js = "x";
+        let ops = ["campaign-work.show", "campaign-work.save"];
+        let manifest = |with_contract: bool| {
+            let mut list = String::from("app-screens: [1], screen-records: [1]");
+            if with_contract {
+                list.push_str(", crm-campaign-work: [1]");
+            }
+            declared_manifest(&format!("{{{list}}}"))
+        };
+        let bundle = |metadata: &str, declaration: &str, body: &str| {
+            let mut files = bundle_with("a", declaration, &[("client.js", body)]);
+            files.insert("app.md".to_string(), metadata.to_string());
+            files
+        };
+        let paired = decl_records(&[("client.js", js)], &ops);
+
+        assert_eq!(
+            campaign_work_source(&bundle(&manifest(true), &paired, js)),
+            CampaignWorkSource::Served
+        );
+        // Valid non-participation: the manifest never required the contract.
+        assert_eq!(
+            campaign_work_source(&bundle(&manifest(false), &paired, js)),
+            CampaignWorkSource::NotDeclared
+        );
+        // A declared source whose asset bytes no longer match its digest is
+        // unavailable, not a non-source.
+        assert_eq!(
+            campaign_work_source(&bundle(&manifest(true), &paired, "tampered")),
+            CampaignWorkSource::Unavailable("a screen package failed integrity")
+        );
+        // Declared, but no package serves the operation.
+        let plain = decl_records(&[("client.js", js)], &["records.list"]);
+        assert_eq!(
+            campaign_work_source(&bundle(&manifest(true), &plain, js)),
+            CampaignWorkSource::Unavailable("no screen package declares campaign-work.show")
+        );
+        // Declared with no screen package at all.
+        let mut bare = BTreeMap::new();
+        bare.insert("app.md".to_string(), manifest(true));
+        assert_eq!(
+            campaign_work_source(&bare),
+            CampaignWorkSource::Unavailable("no screen package declares campaign-work.show")
+        );
+        // An unreadable manifest cannot be called a non-source.
+        let mut no_manifest = bundle_with("a", &paired, &[("client.js", js)]);
+        no_manifest.insert("app.md".to_string(), "not a manifest".to_string());
+        assert_eq!(
+            campaign_work_source(&no_manifest),
+            CampaignWorkSource::Unavailable("installation manifest is unreadable")
+        );
     }
 }

@@ -256,6 +256,38 @@ fn smtp_malformed_typed_stage_refuses_before_rows_without_raw_byte_fallback() {
 }
 
 #[test]
+fn execute_false_decides_without_claiming_or_running() {
+    let fx = Fx::new(BoundaryAdapter::new(false));
+    let connection = fx.enroll_smtp("boundary", PASSWORD);
+    let (params, _request) = material(&fx, &connection, "Reviewed caption");
+    let staged = fx.op("app_effect_stage", params);
+    let id = required(
+        staged["effect"]["effect_id"].as_str(),
+        "staged effect handle missing",
+    );
+    let decided = fx.op(
+        "app_effect_decide",
+        json!({"effect_id":id,
+        "digest":staged["effect"]["digest"],"decision":"accept","execute":false}),
+    );
+    assert_eq!(decided["effect"]["state"], "decided");
+    let row = required(
+        checked(
+            fx.shared.store.effect_by_id(id),
+            "decided effect observation failed",
+        ),
+        "decided effect missing",
+    );
+    assert_eq!(row.state, "decided");
+    assert!(row.outcome.is_none());
+    assert_eq!(
+        fx.adapter.count(),
+        0,
+        "execute:false must not call the provider"
+    );
+}
+
+#[test]
 fn smtp_malformed_typed_accept_retains_prior_decision_without_claim_call_or_outcome() {
     let fx = Fx::corrupting_after_decision(BoundaryAdapter::new(false));
     let connection = fx.enroll_smtp("boundary", PASSWORD);

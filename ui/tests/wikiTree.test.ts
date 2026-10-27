@@ -49,8 +49,8 @@ equal(targetDir("projects/cadence/notes.md", "page"), "projects/cadence", "a pag
 
 // ---- lock rules (CAD-580's allowlist, mirrored for the badge) -------------
 
-equal(operatorOnly("global"), true, "global/ is operator-only");
-equal(operatorOnly("global/glossary.md"), true, "so is anything under it");
+equal(operatorOnly("global"), false, "global/ is writable by a board member");
+equal(operatorOnly("global/glossary.md"), false, "a global page is not operator-only");
 equal(operatorOnly("agents/master/profile"), true, "an agent's profile is operator-only");
 equal(operatorOnly("agents/master/memory"), true, "the memory view is read-only");
 equal(operatorOnly("agents/swe-1/knowledge"), false, "own knowledge is writable");
@@ -59,7 +59,8 @@ equal(operatorOnly("users/operator/notes.md"), false, "users/ is a rule the serv
 
 equal(isLocked({ path: "global", locked: false }), false, "the server's flag wins when it says writable");
 equal(isLocked({ path: "projects/cadence/notes.md", locked: true }), true, "the server's flag wins when locked");
-equal(isLocked({ path: "global/x.md" }), true, "the rule is the fallback");
+equal(isLocked({ path: "global/x.md" }), false, "global has no operator-only fallback");
+equal(isLocked({ path: "agents/master/memory/x.md" }), true, "the rule is the fallback");
 equal(isLocked({ path: "agents/master/profile/SOUL.md", read_only: true }), true, "read_only reads as locked");
 equal(isLocked({ path: "agents/swe-1/knowledge/x.md" }), false, "own folder is not locked");
 
@@ -106,7 +107,7 @@ const badge = treeRows(children, new Set(["", "agents", "agents/master"]));
 const locked = badge.filter((r) => r.locked).map((r) => r.path);
 equal(
   locked,
-  ["agents/master/memory", "agents/master/profile", "global"],
+  ["agents/master/memory", "agents/master/profile"],
   "the lock badge marks the read-only rows",
 );
 equal(badge.find((r) => r.path === "agents/master/knowledge")?.locked, false, "knowledge/ has no badge");

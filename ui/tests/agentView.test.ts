@@ -1,7 +1,10 @@
 import {
   agentCategory,
+  agentHoldsWorkButDead,
+  agentMatchesFilter,
   agentMatchesSearch,
   agentStatus,
+  lifecycleOf,
 } from "../src/features/agents/agentView";
 import { issueIndex } from "../src/lib/scope";
 import type { Agent, IssueCard } from "../src/lib/types";
@@ -12,6 +15,8 @@ const base: Agent = {
   endpoint_kind: "pty",
   state: "idle",
   group: "team-pm",
+  group_root: false,
+  tasks: [],
   running: 0,
   queued: 0,
   unknown: 0,
@@ -31,6 +36,17 @@ equal(
   "stopped",
   "stopped worker remains discoverable",
 );
+// A stopped master holding queued mail is "Dead — holding work" and must
+// also count under Stopped: row state and tab count share one classification.
+const deadHolding = { ...base, state: "stopped", queued: 1 };
+equal(category(deadHolding), "stopped", "stopped with queued mail");
+equal(lifecycleOf(deadHolding), "dead-holding", "dead-holding row");
+equal(agentMatchesFilter(deadHolding, "stopped"), true, "Stopped tab counts it");
+equal(agentMatchesFilter(deadHolding, "working"), false, "not working");
+equal(category({ state: "idle", dead: true }), "idle", "dead idle, no work");
+equal(category({ state: "busy", dead: true }), "working", "dead busy, no work");
+equal(agentMatchesFilter({ ...base, state: "idle", dead: true }, "current"), true, "dead idle stays Current");
+equal(category({ state: "stopped", running: 1 }), "working", "running outranks stopped");
 equal(
   category({ state: "starting" }),
   "working",
@@ -88,6 +104,78 @@ equal(
   "blocked overrides running",
 );
 
+// CAD-1320: a dead endpoint still bound to work is the board's critical
+// signal — not live, but not releasable either.
+const holding = (fields: Partial<Agent>) =>
+  agentHoldsWorkButDead({ ...base, ...fields });
+equal(holding({}), false, "idle agent holds nothing");
+equal(
+  holding({ dead: true, queued: 2 }),
+  true,
+  "dead endpoint with undelivered mail",
+);
+equal(
+  holding({
+    state: "stopped",
+    tasks: [{ task: "t", issue: "DEMO-1", task_state: "running", job: "j", job_state: "running" }],
+  }),
+  true,
+  "stopped agent still owns a task",
+);
+equal(holding({ fenced: true, on: ["DEMO-1"] }), true, "fence keeps the claim");
+equal(holding({ state: "stopped" }), false, "stopped with nothing held");
+equal(
+  holding({ dead: true }),
+  false,
+  "dead with no work is just dead",
+);
+equal(holding({ queued: 2 }), false, "a live agent's queue is its own");
+
+const lifecycle = (fields: Partial<Agent>) =>
+  lifecycleOf({ ...base, ...fields });
+equal(
+  lifecycle({ dead: true, queued: 1 }),
+  "dead-holding",
+  "dead with work ranks first",
+);
+equal(
+  lifecycle({ state: "idle", on: ["DEMO-1"] }),
+  "idle-holding",
+  "live agent parked on a claim",
+);
+equal(
+  lifecycle({ provider: "inbox", inbox: true, queued: 40 }),
+  "stale-inbox",
+  "mailbox with unread mail",
+);
+equal(
+  lifecycle({ provider: "inbox", inbox: true }),
+  "normal",
+  "empty mailbox is ordinary",
+);
+equal(lifecycle({ running: 1 }), "active", "running evidence is working");
+equal(lifecycle({}), "normal", "plain idle is ordinary");
+equal(
+  agentMatchesFilter({ ...base, dead: true, queued: 1 }, "current"),
+  true,
+  "dead-holding stays on the current board",
+);
+equal(
+  agentMatchesFilter({ ...base, dead: true, queued: 1 }, "holding"),
+  true,
+  "holding filter catches dead work",
+);
+equal(
+  agentMatchesFilter({ ...base, state: "idle", on: ["DEMO-1"] }, "holding"),
+  true,
+  "holding filter catches a parked claim",
+);
+equal(
+  agentMatchesFilter({ ...base }, "holding"),
+  false,
+  "holding filter passes plain idle",
+);
+
 const index = issueIndex([
   {
     id: "DEMO-12",
@@ -121,6 +209,7 @@ equal(
           issue: "DEMO-1",
           title: "Account settings",
           task_state: "running",
+          job_state: "running",
           job: "j1",
         },
       ],

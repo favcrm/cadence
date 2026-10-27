@@ -7,18 +7,81 @@
 //! `enroll` takes them, hands them to [`custody`], and records a
 //! fingerprint; every result, event and refusal carries handles only.
 
+pub mod account_media;
 pub mod adapter;
 pub mod agenticos;
 pub mod agenticos_external;
+pub mod agenticos_web;
 pub mod connections;
 pub mod custody;
 pub mod deployments;
+pub(crate) mod encrypted_config;
+mod encrypted_fs;
+pub(crate) use encrypted_fs::Directories as ControlledDirectories;
+/// CAD-1128: the encrypted-SQLite custody vault. `pub(crate)` — the
+/// manager and its key material are daemon-internal; no public
+/// platform/custody re-export exposes them.
+pub(crate) mod encrypted_sqlite;
 pub mod hosted_email;
+pub mod hosted_whatsapp;
 pub mod local;
 pub mod smtp;
 pub mod smtp_internal;
 
-pub use adapter::{AppArtifactError, AppCapabilityError, PlatformAdapter};
+pub use adapter::{
+    AppArtifactError, AppCapabilityError, ImageFailure, ImageReason, ImageSettle, PlatformAdapter,
+};
+
+/// One reviewed adapter tool, as registered at daemon startup.
+#[derive(Clone, Debug)]
+pub struct ToolInventoryEntry {
+    pub platform: String,
+    pub tool: String,
+    /// Whether the generic `platform_call` gate can execute it.
+    pub direct: bool,
+}
+
+static INVENTORY: std::sync::Mutex<Vec<ToolInventoryEntry>> = std::sync::Mutex::new(Vec::new());
+
+/// Snapshot every registered adapter's reviewed table, sorted so the CLI,
+/// the MCP server and the managed Codex allowlist all derive the same names.
+pub fn record_inventory(
+    platforms: &std::collections::HashMap<String, std::sync::Arc<dyn PlatformAdapter>>,
+) {
+    let mut rows = Vec::new();
+    for (platform, adapter) in platforms {
+        for decl in &adapter.table().tools {
+            rows.push(ToolInventoryEntry {
+                platform: platform.clone(),
+                tool: decl.tool.clone(),
+                direct: adapter.direct_call(&decl.tool),
+            });
+        }
+    }
+    rows.sort_by(|left, right| {
+        left.platform
+            .cmp(&right.platform)
+            .then_with(|| left.tool.cmp(&right.tool))
+    });
+    *INVENTORY.lock().unwrap_or_else(|error| error.into_inner()) = rows;
+}
+
+pub fn inventory() -> Vec<ToolInventoryEntry> {
+    INVENTORY
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+/// A saved AgenticOS web login is a verified account source even though it
+/// has no custody-enrolled credential row: `platform grant` and the project
+/// default accept it, and the adapter resolves the same saved login.
+pub fn saved_login_account(platform: &str, account: &str) -> bool {
+    platform == "agenticos-web"
+        && crate::remote_cli::account_image_targets()
+            .map(|targets| targets.iter().any(|target| target.org == account))
+            .unwrap_or(false)
+}
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -90,7 +153,9 @@ pub struct AppCapabilityAsset {
 use crate::error::{Error, Result};
 use crate::store::{Grant, Store};
 
-pub use custody::{Custody, Key};
+pub(crate) use custody::{Custody, Key};
+
+pub(crate) use crate::daemon::custody_rpc::CustodyWitness;
 
 pub struct OpDeadline {
     end: std::time::Instant,
@@ -611,7 +676,18 @@ pub fn require_grant(
 /// match the recorded fingerprint so a custody/record tear (a crash
 /// between the custody write and the record write at rotate) refuses
 /// instead of proxying stale bytes.
-pub fn load_credential(
+/// Missing enrollment is the only custody result a lane credential may
+/// replace. Fingerprint and custody tears stay their own errors.
+pub(crate) fn credential_enrollment_missing(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Rejected(message) if message.contains("no credential is enrolled")
+    )
+}
+
+/// Refuses encrypted custody records. Supported consumers require a fresh
+/// `CustodyWitness` and `load_credential_witnessed`.
+pub(crate) fn load_credential(
     store: &Store,
     custody: &Custody,
     platform: &str,
@@ -640,6 +716,29 @@ pub fn load_credential(
     Ok(bytes)
 }
 
+/// The witnessed encrypted read — the ONLY way an encrypted record's
+/// bytes leave custody. `expected` carries the live core identity the
+/// caller resolved (connection_id/provider/account/revision/exchange
+/// plus the workspace and the configured key id); `read_exact`
+/// authenticates the stored row against exactly that before any
+/// plaintext returns. The core fingerprint is still checked after
+/// decrypt, so a torn vault/core pair refuses.
+pub(crate) fn load_credential_witnessed(
+    store: &Store,
+    custody: &Custody,
+    witness: &CustodyWitness<'_>,
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    witness.validate(store)?;
+    let bytes = custody.load_encrypted(witness)?;
+    if crate::secret::fingerprint(&bytes) != witness.record().fingerprint {
+        return Err(Error::invalid(
+            "integrity_failure",
+            "custody fingerprint mismatch",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Belt-and-braces: a serialized result, event payload or error text
 /// must never contain `secret` or a fragment of eight or more characters.
 /// Callers check before the value leaves
@@ -647,17 +746,87 @@ pub fn load_credential(
 /// names only where the leak would have surfaced.
 pub fn refuse_leak(what: &str, text: &str, secret: &[u8]) -> Result<()> {
     let secret = String::from_utf8_lossy(secret);
-    let characters: Vec<_> = secret.chars().collect();
-    let carries_secret = !secret.is_empty() && text.contains(secret.as_ref());
-    let carries_fragment = characters
-        .windows(8)
-        .any(|fragment| text.contains(&fragment.iter().collect::<String>()));
-    if carries_secret || carries_fragment {
+    if carries_credential(&secret, text) {
         return Err(Error::internal(format!(
             "{what} would carry the enrolled credential — withheld"
         )));
     }
     Ok(())
+}
+
+/// `true` when `text` carries the whole secret or any eight-character
+/// window of it. Windows are borrowed slices of `secret`, so a long
+/// credential costs no per-fragment allocation; both byte ends come
+/// from `char_indices`, so multi-byte characters stay intact.
+fn carries_credential(secret: &str, text: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    if text.contains(secret) {
+        return true;
+    }
+    secret
+        .char_indices()
+        .zip(secret.char_indices().skip(7))
+        .any(|((start, _), (end, last))| text.contains(&secret[start..end + last.len_utf8()]))
+}
+
+/// Structural companion to [`refuse_leak`] for decoded JSON. Serializing
+/// first would escape the punctuation a raw credential can contain, so
+/// this walks object keys, string values and scalar text directly with
+/// the same whole-secret + eight-character semantics and no exemptions.
+pub(crate) fn refuse_json_leak(what: &str, value: &Value, secret: &[u8]) -> Result<()> {
+    let secret = String::from_utf8_lossy(secret);
+    if secret.is_empty() {
+        return Ok(());
+    }
+    let mut scratch = String::new();
+    if json_carries(&secret, value, &mut scratch)? {
+        return Err(Error::internal(format!(
+            "{what} would carry the enrolled credential — withheld"
+        )));
+    }
+    Ok(())
+}
+
+/// Recursive decoded-value walk behind [`refuse_json_leak`]. One scratch
+/// String is reused for numeric scalar text; a formatting failure is a
+/// fixed non-revealing internal error, never an ignored result.
+fn json_carries(secret: &str, value: &Value, scratch: &mut String) -> Result<bool> {
+    match value {
+        Value::String(text) => Ok(carries_credential(secret, text)),
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if carries_credential(secret, key) {
+                    return Ok(true);
+                }
+                if json_carries(secret, value, scratch)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Value::Array(items) => {
+            for value in items {
+                if json_carries(secret, value, scratch)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Value::Number(number) => {
+            use std::fmt::Write as _;
+            scratch.clear();
+            write!(scratch, "{number}")
+                .map_err(|_| Error::internal("JSON metadata screen could not format a scalar"))?;
+            Ok(carries_credential(secret, scratch))
+        }
+        Value::Bool(boolean) => Ok(carries_credential(
+            secret,
+            if *boolean { "true" } else { "false" },
+        )),
+        Value::Null => Ok(carries_credential(secret, "null")),
+    }
 }
 
 #[cfg(test)]

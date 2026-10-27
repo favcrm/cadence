@@ -6,8 +6,7 @@ use super::*;
 
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
-use std::io::BufReader;
-use std::io::Write;
+use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -266,13 +265,154 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
         return;
     };
     let mut writer = match stream.try_clone() {
-        Ok(w) => w,
+        Ok(w) => BufWriter::new(w),
         Err(_) => return,
     };
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let Ok(line) = line else { break };
         let _peer_scope = PeerUidScope::enter(peer.uid);
+        // CAD-1365: `app_media_original` is the one binary reply — the
+        // usual result line (a CLOSED transfer header) followed by
+        // exactly `bytes` raw octets and connection close. The method
+        // still passes the peer check, the test-seam scope and
+        // `Shared::master_policy` before any work; a refusal before the
+        // header is an ordinary `proto::err` line with no binary tail,
+        // and once the header has started a write failure closes the
+        // connection — a JSON error is never appended to partial bytes.
+        let framed_method = serde_json::from_str::<Value>(&line)
+            .ok()
+            .as_ref()
+            .and_then(|frame| frame.get("method"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if framed_method.as_deref() == Some("app_media_inspect") {
+            let mut header_started = false;
+            if writer.get_ref().set_nonblocking(true).is_err() {
+                break;
+            }
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let outcome = serde_json::from_str::<Value>(&line)
+                .map_err(|_| Error::rejected("Request must be one JSON object per line"))
+                .and_then(|frame| {
+                    let params = frame.get("params").cloned().unwrap_or(json!({}));
+                    let _scope = crate::test_seam::scope_frame(shared.seam.as_ref(), &frame)?;
+                    shared.master_policy("app_media_inspect", &params, peer.pid)?;
+                    if shared.execution_mode.fenced()
+                        && !crate::backup::portable_fence::allows("app_media_inspect")
+                    {
+                        return Err(crate::backup::portable_fence::fence_refusal(
+                            "app_media_inspect",
+                        ));
+                    }
+                    shared.rpc_app_media_inspect_stream(
+                        &params,
+                        peer.pid,
+                        |header, bytes, delivery| {
+                            let mut line = proto::ok(header.clone()).to_string();
+                            line.push('\n');
+                            write_media_guarded(
+                                |socket, chunk| delivery.with_current(|| socket.write(chunk)),
+                                writer.get_mut(),
+                                line.as_bytes(),
+                                deadline,
+                                &mut header_started,
+                            )?;
+                            write_media_guarded(
+                                |socket, chunk| delivery.with_current(|| socket.write(chunk)),
+                                writer.get_mut(),
+                                bytes,
+                                deadline,
+                                &mut header_started,
+                            )
+                        },
+                    )
+                });
+            match outcome {
+                Ok(()) => break,
+                Err(_) if header_started => break,
+                Err(error) => {
+                    let mut frame = proto::err(&error).to_string();
+                    frame.push('\n');
+                    let _ = client::write_bounded(
+                        writer.get_ref().as_raw_fd(),
+                        frame.as_bytes(),
+                        deadline,
+                    );
+                    break;
+                }
+            }
+        }
+        let is_original = framed_method.as_deref() == Some("app_media_original");
+        if is_original {
+            let mut header_started = false;
+            // This connection ends with the reply and no further request
+            // is read, so the flag shared with the reader is safe. Every
+            // later write is one guarded nonblocking send.
+            if writer.get_ref().set_nonblocking(true).is_err() {
+                break;
+            }
+            let outcome = serde_json::from_str::<Value>(&line)
+                .map_err(|_| Error::rejected("Request must be one JSON object per line"))
+                .and_then(|frame| {
+                    let params = frame.get("params").cloned().unwrap_or(json!({}));
+                    let _scope = crate::test_seam::scope_frame(shared.seam.as_ref(), &frame)?;
+                    shared.master_policy("app_media_original", &params, peer.pid)?;
+                    // Same portable-execution fence `Shared::dispatch` applies;
+                    // this binary branch does not go through `dispatch`.
+                    if shared.execution_mode.fenced()
+                        && !crate::backup::portable_fence::allows("app_media_original")
+                    {
+                        return Err(crate::backup::portable_fence::fence_refusal(
+                            "app_media_original",
+                        ));
+                    }
+                    // The byte delivery runs against ONE absolute
+                    // deadline in the existing artifact bound.
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    shared.rpc_app_media_original_stream(
+                        &params,
+                        peer.pid,
+                        |header, bytes, delivery| {
+                            let mut line = proto::ok(header.clone()).to_string();
+                            line.push('\n');
+                            write_media_guarded(
+                                |socket, chunk| delivery.with_current(|| socket.write(chunk)),
+                                writer.get_mut(),
+                                line.as_bytes(),
+                                deadline,
+                                &mut header_started,
+                            )?;
+                            write_media_guarded(
+                                |socket, chunk| delivery.with_current(|| socket.write(chunk)),
+                                writer.get_mut(),
+                                bytes,
+                                deadline,
+                                &mut header_started,
+                            )
+                        },
+                    )
+                });
+            match outcome {
+                Ok(()) => break,
+                Err(_error) if header_started => break,
+                Err(error) => {
+                    // A refusal before the header is one ordinary
+                    // `proto::err` line under the same absolute bound —
+                    // never a second frame and never binary — then the
+                    // connection closes like the success path.
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    let mut frame = proto::err(&error).to_string();
+                    frame.push('\n');
+                    let _ = client::write_bounded(
+                        writer.get_ref().as_raw_fd(),
+                        frame.as_bytes(),
+                        deadline,
+                    );
+                    break;
+                }
+            }
+        }
         let response = serde_json::from_str::<Value>(&line)
             .map_err(|_| Error::rejected("Request must be one JSON object per line"))
             .and_then(|frame| {
@@ -292,10 +432,54 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
             Ok(result) => proto::ok(result),
             Err(error) => proto::err(&error),
         };
-        if writeln!(writer, "{frame}").is_err() {
+        // Value's formatter emits small fragments; coalesce socket writes,
+        // but flush each frame so a caller need not close or send again.
+        if writeln!(writer, "{frame}")
+            .and_then(|()| writer.flush())
+            .is_err()
+        {
             break;
         }
     }
+}
+
+/// One governed image reply segment on a nonblocking socket. Each
+/// chunk passes its authority guard, so authority is
+/// re-proven before every write. `WouldBlock` waits outside every guard
+/// for at most 100ms (a cancellation point) under the absolute deadline,
+/// then the authority is checked again. `sent` is set on the first byte.
+fn write_media_guarded(
+    mut send: impl FnMut(&mut UnixStream, &[u8]) -> Result<std::io::Result<usize>>,
+    writer: &mut UnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+    sent: &mut bool,
+) -> Result<()> {
+    const CHUNK: usize = 64 * 1024;
+    const WAIT: Duration = Duration::from_millis(100);
+    while !bytes.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(Error::internal("media original delivery deadline reached"));
+        }
+        let chunk = &bytes[..bytes.len().min(CHUNK)];
+        match send(writer, chunk)? {
+            Ok(0) => return Err(Error::internal("media original socket closed mid-write")),
+            Ok(n) => {
+                *sent = true;
+                bytes = &bytes[n..];
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                client::poll_deadline(
+                    writer.as_raw_fd(),
+                    libc::POLLOUT,
+                    (Instant::now() + WAIT).min(deadline),
+                )?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 /// The second socket lives outside the private state directory, so
@@ -415,12 +599,10 @@ pub(super) fn hosted_config(opts: &ServeOptions) -> Result<crate::lease::Hosted>
         return Ok(hosted.clone());
     }
     let pm_dir = match opts.provider_env.var("CADENCE_PM_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        Some(dir) if !dir.is_empty() => crate::home::guard_tracker(PathBuf::from(dir))?,
         _ => crate::issue::default_dir()?,
     };
-    crate::doctor::host::read_hosted_overrides(&pm_dir)
-        .map(|o| o.unwrap_or_default())
-        .map_err(Error::internal)
+    crate::lease::read_hosted(&pm_dir).map(|o| o.unwrap_or_default())
 }
 
 /// The SIGTERM flush bound — the held lease's `flush_timeout`, else
@@ -549,6 +731,10 @@ pub(super) fn resolve_slot_config(opts: &ServeOptions) -> SlotConfig {
         }
         if let Some(v) = o.suite_slots {
             c.suite_slots = v as usize;
+        }
+        // CAD-1268: the aggregate budget over every pool.
+        if let Some(v) = o.total_slots {
+            c.total_slots = v as usize;
         }
         if let Some(v) = o.jobs_per_lane {
             c.jobs_per_lane = v as usize;
@@ -803,13 +989,107 @@ pub(crate) fn write_recovery_record(
     }
 }
 
+/// CAD-1247: one start-up line per provider command this daemon would
+/// fail to exec — pi first (CAD-1247's incident: a minimal service
+/// PATH left `pi` unresolvable and every pi agent fenced with only a
+/// provider log saying why). Resolved against the daemon's own PATH
+/// exactly as the adapter's `execvp` would; a warning only — a daemon
+/// whose workload never touches the provider must still start. The
+/// verdict is also recorded under the state dir so `doctor --host`
+/// reads the daemon's resolution rather than re-probing on the
+/// operator shell's PATH; a failed write logs and never fails startup.
+fn warn_unresolved_provider_commands(state_dir: &Path, env: &ProviderEnv) {
+    let path = std::env::var("PATH").ok();
+    let outcome = crate::adapter::pi::resolve_pi_launch_command(env, path.as_deref());
+    if let Err(reason) = &outcome {
+        eprintln!("provider pi: {reason}; set CADENCE_PI_COMMAND");
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = json!({
+        "pid": std::process::id(),
+        "starttime": crate::peer::proc_starttime(std::process::id()),
+        "pi": {
+            "resolved": outcome.as_ref().ok(),
+            "reason": outcome.as_ref().err().cloned(),
+            "path": path,
+        },
+        "at": at,
+    });
+    if let Err(e) = write_file_atomic(
+        &state_dir.join(crate::doctor::PROVIDER_COMMANDS_FILE),
+        &record.to_string(),
+    ) {
+        eprintln!("provider-commands: could not record resolution: {e}");
+    }
+}
+
 /// Relaunch enabled actors at daemon start; fenced ones land in
 /// `attention` instead.
 pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
+    warn_unresolved_provider_commands(&shared.state_dir, &shared.provider_env);
     // Inbox rows are durable mailboxes — enabled or not, they own no
     // actor and keep their pseudo-endpoint across restarts.
     for agent in shared.store.agents()? {
-        if !agent.enabled || !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+        if !agent.enabled {
+            // A disabled sandbox must not start new cloud work, but any
+            // claimable delivery left over from before the stop is settled
+            // (replay-and-stop when a create was attempted, interrupt when
+            // it was not). The stop request is durable before the spawn.
+            if agent.provider == "sandbox" && agent.endpoint_kind == "sandbox" {
+                for message in shared.store.messages(&agent.alias)? {
+                    if !matches!(message.state.as_str(), "queued" | "unknown")
+                        || message.source != "job_dispatch"
+                    {
+                        continue;
+                    }
+                    if shared.store.request_cloud_stop(&message.id).is_err() {
+                        continue;
+                    }
+                    let Some(task_id) = message.task_id.clone() else {
+                        continue;
+                    };
+                    let shared = Arc::clone(shared);
+                    let message_id = message.id.clone();
+                    std::thread::spawn(move || {
+                        if let Err(error) = shared.run_cloud_dispatch(&task_id, &message_id) {
+                            eprintln!("cloud sandbox recovery {task_id} failed: {error}");
+                        }
+                    });
+                }
+            }
+            // No actor can prove these recovered panes; release any
+            // matching report waiter to fail closed against recovery state.
+            shared.adoptions_settle(&agent.alias);
+            continue;
+        }
+        if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+            // A sandbox runner has no host actor: its queued job kickoffs
+            // are consumed by the daemon itself. Resume each claimable
+            // kickoff after a restart; the same kickoff id re-enters the
+            // original remote job.
+            if agent.provider == "sandbox" && agent.endpoint_kind == "sandbox" {
+                for message in shared.store.messages(&agent.alias)? {
+                    if !matches!(message.state.as_str(), "queued" | "unknown")
+                        || message.source != "job_dispatch"
+                    {
+                        continue;
+                    }
+                    let Some(task_id) = message.task_id.clone() else {
+                        continue;
+                    };
+                    let shared = Arc::clone(shared);
+                    let message_id = message.id.clone();
+                    std::thread::spawn(move || {
+                        if let Err(error) = shared.run_cloud_dispatch(&task_id, &message_id) {
+                            eprintln!("cloud sandbox recovery {task_id} failed: {error}");
+                        }
+                    });
+                }
+            }
+            shared.adoptions_settle(&agent.alias);
             continue;
         }
         // A fenced agent stays registered but must never churn on a
@@ -863,6 +1143,9 @@ pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
                 "relaunch_skipped",
                 json!({"reason": reason}),
             );
+            // The recovery candidate was discarded with the fence; no
+            // actor will perform its adoption proof on this start.
+            shared.adoptions_settle(&agent.alias);
             continue;
         }
         shared.launch_actor(&agent.alias)?;
@@ -1022,5 +1305,57 @@ mod hot_restart_marker_tests {
         let marker = hot.marker.expect("the marker still parses");
         assert!(marker.stale.is_none(), "fresh marker adopts");
         assert_eq!(marker.failed.as_deref(), Some("drain exploded"));
+    }
+
+    /// A blank command refuses the in-process fixture before store creation.
+    #[cfg(feature = "test-seam")]
+    #[test]
+    fn a_blank_command_refuses_before_the_store_opens() {
+        let dir = dir_with("old-run", r#"{"instance":"old-run","at":1,"entries":[]}"#);
+        let opts = crate::daemon::ServeOptions {
+            test_seam: true,
+            ..crate::daemon::ServeOptions::default()
+        };
+        opts.provider_env.set("CADENCE_CLAUDE_COMMAND", "");
+        let err = crate::daemon::Shared::new(dir.path(), &opts)
+            .err()
+            .expect("a blank provider command must refuse an armed fixture")
+            .to_string();
+        assert!(err.contains("CADENCE_CLAUDE_COMMAND"), "{err}");
+        assert!(
+            !dir.path().join("cadence.sqlite3").exists(),
+            "the seal must refuse before the store file is created"
+        );
+        assert!(
+            dir.path().join(SHUTDOWN_FILE).exists(),
+            "the constructor must preserve the existing marker"
+        );
+    }
+
+    /// Exercise the actual startup path: refusal must precede
+    /// `hot_restart_begin`, preserving both restart evidence files.
+    #[cfg(feature = "test-seam")]
+    #[test]
+    fn a_blank_command_preserves_restart_evidence_on_serve() {
+        let marker = r#"{"instance":"old-run","at":1,"entries":[]}"#;
+        let dir = dir_with("old-run", marker);
+        let opts = crate::daemon::ServeOptions {
+            test_seam: true,
+            ..crate::daemon::ServeOptions::default()
+        };
+        opts.provider_env.set("CADENCE_CLAUDE_COMMAND", "");
+        let err = crate::daemon::serve_with(dir.path(), opts)
+            .expect_err("a blank command must refuse before the daemon starts")
+            .to_string();
+        assert!(err.contains("CADENCE_CLAUDE_COMMAND"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(SHUTDOWN_FILE)).unwrap(),
+            marker
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(INSTANCE_FILE)).unwrap(),
+            "old-run"
+        );
+        assert!(!dir.path().join("cadence.sqlite3").exists());
     }
 }

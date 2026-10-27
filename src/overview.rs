@@ -20,11 +20,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::mpsc::{channel, Receiver};
+#[cfg(test)]
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use serde_json::{json, Value};
 
@@ -32,13 +34,19 @@ use crate::adapter::registry;
 use crate::client;
 use crate::inbox;
 use crate::issue::line_times::LineTimes;
-use crate::issue::{self, board, claim, project, report};
+use crate::issue::{board, project};
 
+mod assembly;
+#[cfg(test)]
+mod cad1751_budget_acceptance;
 mod commands;
 mod github;
 mod github_cache;
 mod main_ci;
 mod monitoring;
+mod needs_merge;
+mod sources;
+
 pub use commands::{
     cmd_agent_answer, cmd_agent_attach, cmd_agent_respond, cmd_agent_resume, cmd_agent_show,
     cmd_agent_unfence, cmd_delivery_decline, cmd_delivery_merge, cmd_delivery_sync, cmd_inbox,
@@ -47,16 +55,21 @@ pub use commands::{
 };
 use github::{build_repo_match, compute_drift, gh_repo, git_text, GH_TIMEOUT};
 #[cfg(test)]
+use github_cache::github_bounded;
+#[cfg(test)]
 use github_cache::github_bounded_notify;
 #[cfg(test)]
 use github_cache::write_cache;
-use github_cache::{cache_file, github, github_bounded, read_cache};
+use github_cache::{cache_file, github, read_cache};
 use main_ci::main_ci_view;
-#[allow(unused_imports)] // Preserve the existing crate-visible type path.
-pub(crate) use main_ci::MainCiAlerts;
 #[cfg(test)]
 use main_ci::{classify_main_ci, main_ci_alerts, CiState, ShaCi};
 pub use monitoring::monitoring;
+use needs_merge::{merge_by_subject, sort_needs};
+#[cfg(test)]
+use sources::probe_agent;
+pub use sources::{daemon_sources, DaemonSources, Reuse};
+use sources::{AgentProbe, DaemonView};
 
 /// Git identity baked in by build.rs — `unknown` when git or a repo
 /// was absent at build time, which every consumer reads as "cannot
@@ -89,8 +102,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The per-agent probe pass starts no probe past this budget; agents
 /// it never reached become one `degraded` note.
 const PROBE_BUDGET: Duration = Duration::from_secs(4);
-/// Concurrent per-agent probes.
-const PROBE_WORKERS: usize = 8;
 /// The board waits this long on a gh refresh before serving the last
 /// cache; the refresh keeps running and lands for the next request.
 const GH_BOARD_WAIT: Duration = Duration::from_millis(1500);
@@ -247,6 +258,7 @@ impl Audience {
             "merge_decision"
             | "review_escalated"
             | "review_unstaffed"
+            | "unattended_held"
             | "auto_merge_on"
             | "delivery_unreadable"
             // CAD-449: a merged ticket the merge could not mark done.
@@ -378,7 +390,116 @@ fn item(
     }
 }
 
+/// CAD-1219: display-only text caps (characters).
+const SHORT_TITLE_MAX: usize = 50;
+const WHY_MAX: usize = 140;
+
+/// Invisible characters: Unicode format (Cf) plus default-ignorable code
+/// points (combining grapheme joiner, Hangul fillers, variation selectors).
+fn strip_invisible(raw: &str) -> String {
+    use std::sync::OnceLock;
+    static INVISIBLE: OnceLock<regex::Regex> = OnceLock::new();
+    INVISIBLE
+        .get_or_init(|| {
+            regex::Regex::new(r"[\p{Cf}\p{Default_Ignorable_Code_Point}]")
+                .expect("valid Unicode categories")
+        })
+        .replace_all(raw, "")
+        .into_owned()
+}
+
+/// Lookalikes of the letters of "cadence" (c, a, d, e, n) folded to ASCII
+/// before the `cadence` check, so a homoglyph spelling is refused too.
+fn fold_lookalikes(lower: &str) -> String {
+    lower
+        .chars()
+        .map(|c| match c {
+            // NFKC turns Greek lunate sigma (U+03F2/U+03F9) into sigma (U+03C2/U+03C3).
+            '\u{441}' | '\u{3F2}' | '\u{3C2}' | '\u{3C3}' | '\u{217D}' | '\u{1D04}' => 'c',
+            '\u{430}' | '\u{251}' | '\u{3B1}' => 'a',
+            '\u{501}' | '\u{217E}' => 'd',
+            '\u{435}' => 'e',
+            '\u{578}' => 'n',
+            c => c,
+        })
+        .collect()
+}
+
+/// Make `raw` safe to show as a card's plain-words text: NFKC-folded
+/// (so fullwidth lookalikes become their ASCII form), whitespace and
+/// newlines collapsed, control and format characters dropped, clipped to
+/// `max` characters on a char boundary. Anything that reads as a
+/// command (a backtick, `$(`, `${`, the word `cadence` anywhere, also
+/// spelled with lookalike letters) yields
+/// `None`, so the field is omitted rather than shown. Never returns an
+/// empty string.
+fn display_text(raw: &str, max: usize) -> Option<String> {
+    use unicode_normalization::UnicodeNormalization;
+    let spaced: String = strip_invisible(raw)
+        .nfkc()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' | '\u{2800}' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect();
+    let joined = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    // A markdown heading marker is not part of the words.
+    let text = joined.trim_start_matches('#').trim_start().to_string();
+    if text.is_empty()
+        || text.contains('`')
+        || text.contains("$(")
+        || text.contains("${")
+        || fold_lookalikes(&text.to_lowercase()).contains("cadence")
+    {
+        return None;
+    }
+    if text.chars().count() <= max {
+        return Some(text);
+    }
+    let clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+    Some(format!("{}…", clipped.trim_end()))
+}
+
+/// [`display_text`] limited to the first sentence — for `why`.
+fn display_sentence(raw: &str, max: usize) -> Option<String> {
+    let text = display_text(raw, usize::MAX)?;
+    let end = text
+        .char_indices()
+        .find(|&(i, c)| {
+            matches!(c, '.' | '!' | '?')
+                && text[i + c.len_utf8()..].starts_with(' ')
+                && !{
+                    let head = text[..i].to_lowercase();
+                    head.ends_with("e.g") || head.ends_with("i.e")
+                }
+        })
+        .map_or(text.len(), |(i, c)| i + c.len_utf8());
+    display_text(&text[..end], max)
+}
+
 impl Item {
+    /// CAD-1219: optional plain-words `short_title` and `why` for a To do
+    /// card. Display text only — nothing reads them back. A field whose
+    /// source is missing or fails [`display_text`] is left out.
+    fn set_display(&mut self, short_title: Option<&str>, why: Option<&str>) {
+        if let Some(t) = short_title.and_then(|t| display_text(t, SHORT_TITLE_MAX)) {
+            self.json["short_title"] = json!(t);
+        }
+        // A reason that only repeats the title adds nothing.
+        if let Some(w) = why
+            .and_then(|w| display_sentence(w, WHY_MAX))
+            .filter(|w| self.json["short_title"].as_str() != Some(w))
+        {
+            self.json["why"] = json!(w);
+        }
+    }
+
+    fn with_display(mut self, short_title: Option<&str>, why: Option<&str>) -> Self {
+        self.set_display(short_title, why);
+        self
+    }
+
     /// Name the row's subject: `agent`, `issue`, `pr`, `repo`,
     /// `deploy`, `tracker` or `report`.
     fn about(mut self, kind: &'static str, id: &str) -> Self {
@@ -473,11 +594,40 @@ fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
                     )
                     .about("issue", id)
                     .for_agent(&rec.worker)
+                    .owned_by(Some("operator"))
                     .since(Some(rec.since)),
                 );
             }
         }
         let row = match rec.state {
+            _ if rec.unattended_hold && !rec.state.terminal() => {
+                let mut held = item(
+                    17,
+                    "unattended_held",
+                    &format!(
+                        "{id}: {}",
+                        rec.note
+                            .as_deref()
+                            .unwrap_or("unattended work needs operator verification")
+                    ),
+                    age,
+                    &rec.project,
+                    pr,
+                    "cadence delivery ls",
+                )
+                .about("issue", id)
+                .for_agent(&rec.worker)
+                .owned_by(Some("operator"))
+                .since(Some(rec.since))
+                .with_display(
+                    Some("Unattended work needs your decision"),
+                    rec.note.as_deref(),
+                );
+                if let Some(turn) = rec.unattended_turn.as_deref() {
+                    held.json["unattended_turn"] = json!(turn);
+                }
+                Some(held)
+            }
             crate::delivery::State::Passed if rec.merge_ready() => {
                 let v = rec
                     .verdict
@@ -591,61 +741,6 @@ pub(crate) fn delivery_sync_row(title: &str, subject: &str, since: i64, now: i64
         .unwrap_or(Value::Null)
 }
 
-/// Urgency order: kind rank ascending, then oldest first inside a kind.
-fn sort_needs(needs: &mut [Item]) {
-    needs.sort_by(|a, b| a.rank.cmp(&b.rank).then(b.age.cmp(&a.age)));
-}
-
-/// One row per subject (CAD-252): rows naming the same agent, issue or
-/// PR collapse into the most severe one (lowest rank; ties keep emit
-/// order), which lists every cause most severe first under `causes`.
-/// `kind`/`cause` stay the primary cause, so a consumer that predates
-/// `causes` still reads one sensible row. The CLI and the board both
-/// render this merged list — the merge lives here and nowhere else.
-fn merge_by_subject(items: Vec<Item>) -> Vec<Item> {
-    let mut order: Vec<(&'static str, String)> = Vec::new();
-    let mut groups: HashMap<(&'static str, String), Vec<Item>> = HashMap::new();
-    for it in items {
-        if !groups.contains_key(&it.subject) {
-            order.push(it.subject.clone());
-        }
-        groups.entry(it.subject.clone()).or_default().push(it);
-    }
-    order
-        .into_iter()
-        .filter_map(|key| {
-            let mut group = groups.remove(&key)?;
-            group.sort_by_key(|i| i.rank);
-            let causes: Vec<Value> = group
-                .iter()
-                .map(|i| {
-                    json!({
-                        "cause": i.json["kind"], "title": i.json["title"],
-                        "age": i.age, "command": i.json["command"],
-                        "audience": i.json["audience"], "since": i.since,
-                    })
-                })
-                .collect();
-            let mut agents: Vec<String> = group.iter().flat_map(|i| i.agents.clone()).collect();
-            agents.sort();
-            agents.dedup();
-            // The row is for whoever its most urgent cause is for — a
-            // team primary with an escalated cause is the operator's.
-            let urgent = group.iter().min_by_key(|i| i.audience)?;
-            let (audience, reason) = (urgent.audience, urgent.json["audience_reason"].clone());
-            let mut primary = group.into_iter().next()?;
-            primary.json["causes"] = json!(causes);
-            primary.agents = agents;
-            if primary.audience != audience {
-                primary.audience = audience;
-                primary.json["audience"] = json!(audience.as_str());
-                primary.json["audience_reason"] = reason;
-            }
-            Some(primary)
-        })
-        .collect()
-}
-
 /// Row scope for `cadence overview --project/--group` (CAD-252).
 #[derive(Clone, Debug, Default)]
 pub struct Scope {
@@ -737,240 +832,6 @@ fn unscoped(view: Result<Value, String>) -> Value {
 /// screen narrowed instead of failing.
 fn degraded(source: &str, subject: &str, detail: impl Into<String>) -> Value {
     json!({"source": source, "subject": subject, "detail": detail.into()})
-}
-
-/// What one agent's probes returned. A mailbox (no actor) needs none —
-/// its `agent_list` row carries the backlog and health.
-#[derive(Clone, Default)]
-struct AgentProbe {
-    show: Option<Value>,
-    requests: Vec<Value>,
-    /// A running/submitted turn, a busy pane, or a probe that could not
-    /// tell — any of them holds the drift restart back.
-    holds_drift: bool,
-    /// The daemon predates `agent_probe`.
-    probe_unknown: bool,
-    /// The probe budget ran out before this agent was reached.
-    unprobed: bool,
-    degraded: Vec<Value>,
-}
-
-/// One daemon RPC under the overview's bounds: the per-call timeout,
-/// clipped to what is left of the pass's deadline.
-fn bounded_rpc(
-    state_dir: &Path,
-    method: &str,
-    params: Value,
-    timeout: Duration,
-    deadline: Instant,
-) -> Result<Value, String> {
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left < Duration::from_millis(50) {
-        return Err("overview probe budget spent".to_string());
-    }
-    let bound = left.min(timeout);
-    client::rpc_timeout(state_dir, method, params, bound).map_err(|e| {
-        let text = e.to_string();
-        // A read timeout surfaces as EAGAIN/"timed out" — name the bound.
-        if text.contains("os error 11") || text.contains("timed out") {
-            format!("no answer within {}ms", bound.as_millis())
-        } else {
-            text
-        }
-    })
-}
-
-/// Show, pending requests and (for an idle pty pane) the pane probe of
-/// one agent, each bounded.
-fn probe_agent(state_dir: &Path, a: &Value, timeout: Duration, deadline: Instant) -> AgentProbe {
-    let alias = a["alias"].as_str().unwrap_or_default();
-    let provider = a["provider"].as_str().unwrap_or_default();
-    let kind = a["endpoint_kind"].as_str().unwrap_or_default();
-    let mut p = AgentProbe::default();
-    // A mailbox has no pane and no requests: its `agent_list` row
-    // carries the backlog. Only rows that predate the `inbox` block
-    // (an older daemon) need the show read for the queued count.
-    let mailbox = !registry::has_actor(provider, kind);
-    if mailbox && a["inbox"]["queued"].is_i64() {
-        return p;
-    }
-    if deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(50) {
-        p.unprobed = true;
-        // A mailbox never holds a restart back.
-        p.holds_drift = !mailbox;
-        return p;
-    }
-    let rpc = |method: &str| {
-        let params = if method == "agent_show" {
-            json!({"alias": alias, "active_only": true})
-        } else {
-            json!({"alias": alias})
-        };
-        bounded_rpc(state_dir, method, params, timeout, deadline)
-    };
-    match rpc("agent_show") {
-        Ok(v) => p.show = Some(v),
-        Err(e) => p.degraded.push(degraded("agent_show", alias, e)),
-    }
-    if mailbox {
-        return p;
-    }
-    match rpc("agent_requests") {
-        Ok(v) => p.requests = v["requests"].as_array().cloned().unwrap_or_default(),
-        Err(e) if e.contains("Unknown method") => {}
-        Err(e) => p.degraded.push(degraded("agent_requests", alias, e)),
-    }
-    // Drift is only actionable when everything is idle: any running or
-    // submitted message, or any busy pty pane, holds it back — and so
-    // does a show that never answered.
-    let busy_turn = p.show.as_ref().is_none_or(|show| {
-        show["messages"].as_array().is_some_and(|ms| {
-            ms.iter().any(|m| {
-                matches!(
-                    m["state"].as_str().unwrap_or_default(),
-                    "running" | "submitted"
-                )
-            })
-        })
-    });
-    if busy_turn {
-        p.holds_drift = true;
-    } else if kind == "pty" && a["endpoint"].is_string() {
-        match rpc("agent_probe") {
-            Ok(v) if v["idle"].as_bool().unwrap_or(false) => {}
-            Ok(_) => p.holds_drift = true,
-            // "Unknown method" — a daemon that predates the RPC; any
-            // other failure reads as busy, conservatively.
-            Err(e) if e.contains("Unknown method") => p.probe_unknown = true,
-            Err(e) => {
-                p.holds_drift = true;
-                p.degraded.push(degraded("agent_probe", alias, e));
-            }
-        }
-    }
-    p
-}
-
-/// Probe every agent on [`PROBE_WORKERS`] threads — the daemon answers
-/// each connection on its own thread, so the pass costs the slowest
-/// probes, not their sum. No probe starts past `opts.probe_budget`.
-fn probe_agents(state_dir: &Path, agents: &[Value], opts: &Options) -> Vec<AgentProbe> {
-    let deadline = Instant::now() + opts.probe_budget;
-    let next = AtomicUsize::new(0);
-    let slots: Vec<Mutex<Option<AgentProbe>>> = agents.iter().map(|_| Mutex::new(None)).collect();
-    std::thread::scope(|s| {
-        for _ in 0..PROBE_WORKERS.min(agents.len()) {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(a) = agents.get(i) else {
-                    break;
-                };
-                let p = probe_agent(state_dir, a, opts.probe_timeout, deadline);
-                *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
-            });
-        }
-    });
-    slots
-        .into_iter()
-        .map(|slot| {
-            slot.into_inner()
-                .unwrap_or_else(|e| e.into_inner())
-                .unwrap_or_default()
-        })
-        .collect()
-}
-
-/// The daemon's half of the screen: reachability, build identity, the
-/// agent rows and their probes.
-#[derive(Clone)]
-struct DaemonView {
-    reachable: bool,
-    info: Option<Value>,
-    agents: Vec<Value>,
-    probes: Vec<AgentProbe>,
-    degraded: Vec<Value>,
-}
-
-fn daemon_view(state_dir: &Path, opts: &Options) -> DaemonView {
-    let t = opts.probe_timeout;
-    let mut view = DaemonView {
-        // Reachability comes from `health` — a pre-daemon_info daemon
-        // answers it, so an old build never reads as "unreachable"
-        // while `agent list` works. `daemon_info` only carries the id.
-        reachable: client::rpc_timeout(state_dir, "health", json!({}), t).is_ok(),
-        info: None,
-        agents: Vec::new(),
-        probes: Vec::new(),
-        degraded: Vec::new(),
-    };
-    if !view.reachable {
-        return view;
-    }
-    view.info = client::rpc_timeout(state_dir, "daemon_info", json!({}), t).ok();
-    match client::rpc_timeout(state_dir, "agent_list", json!({}), t) {
-        Ok(v) => view.agents = v["agents"].as_array().cloned().unwrap_or_default(),
-        Err(e) => view.degraded.push(degraded(
-            "agent_list",
-            "",
-            format!("agent rows missing — {e}"),
-        )),
-    }
-    view.probes = probe_agents(state_dir, &view.agents, opts);
-    let unprobed: Vec<&str> = view
-        .agents
-        .iter()
-        .zip(&view.probes)
-        .filter(|(_, p)| p.unprobed)
-        .filter_map(|(a, _)| a["alias"].as_str())
-        .collect();
-    if !unprobed.is_empty() {
-        view.degraded.push(degraded(
-            "agent_probe_budget",
-            "",
-            format!(
-                "{} agent(s) not probed within {:.1}s: {}",
-                unprobed.len(),
-                opts.probe_budget.as_secs_f64(),
-                unprobed.join(", ")
-            ),
-        ));
-    }
-    for p in &mut view.probes {
-        view.degraded.append(&mut p.degraded);
-    }
-    view
-}
-
-/// The daemon-side sources of one build — the agent probes and the
-/// monitoring block. The board's read model (CAD-325) keeps the last
-/// pass and rebuilds the screen from it when only the tracker moved.
-#[derive(Clone)]
-pub struct DaemonSources {
-    daemon: DaemonView,
-    monitoring: Value,
-}
-
-/// Probe the daemon and read the monitors, concurrently.
-pub fn daemon_sources(state_dir: &Path, opts: &Options) -> DaemonSources {
-    std::thread::scope(|s| {
-        let daemon = s.spawn(|| daemon_view(state_dir, opts));
-        let monitoring = s.spawn(|| monitoring(state_dir));
-        DaemonSources {
-            daemon: daemon.join().expect("overview daemon probe panicked"),
-            monitoring: monitoring
-                .join()
-                .expect("overview monitoring read panicked"),
-        }
-    })
-}
-
-/// What a long-lived caller hands a build instead of re-reading it: the
-/// indexed tracker's views and a recent daemon pass. Status and claim
-/// times need no hand-off — [`LineTimes`] is cached per tracker HEAD
-/// (CAD-403).
-pub struct Reuse<'a> {
-    pub views: &'a [board::View],
-    pub sources: &'a DaemonSources,
 }
 
 /// Wall time the tracker line times may take to load per build (a cold
@@ -1511,913 +1372,8 @@ fn overview_from(
     opts: &Options,
     reuse: Option<Reuse<'_>>,
 ) -> Result<Value, String> {
-    let now = now_epoch();
-    let pm = issue::Pm::at(pm_dir).ok();
-    let projects = pm
-        .as_ref()
-        .map(|pm| project::list(&pm.dir).unwrap_or_default())
-        .unwrap_or_default();
-    if let Some(key) = opts.scope.project.as_deref() {
-        if !projects.iter().any(|p| p.key == key) {
-            let known: Vec<&str> = projects.iter().map(|p| p.key.as_str()).collect();
-            return Err(if known.is_empty() {
-                format!(
-                    "unknown project '{key}' — no tracker projects under {}",
-                    pm_dir.display()
-                )
-            } else {
-                format!("unknown project '{key}' — known: {}", known.join(", "))
-            });
-        }
-    }
-    let mut slugs = Vec::new();
-    let mut slug_project: HashMap<String, String> = HashMap::new();
-    let mut repo_paths: Vec<(PathBuf, String)> = Vec::new();
-    // Slug → the declared local clone its first-parent log comes from.
-    let mut slug_clone: HashMap<String, PathBuf> = HashMap::new();
-    for p in &projects {
-        for r in &p.repos {
-            let path = r.path.as_deref().map(|path| {
-                let path = project::expand_home(path);
-                path.canonicalize().unwrap_or(path)
-            });
-            if let Some(remote) = &r.remote {
-                let norm = project::normalize_remote(remote);
-                if let Some(slug) = norm.strip_prefix("github.com/") {
-                    slug_project.insert(slug.to_string(), p.key.clone());
-                    slugs.push(slug.to_string());
-                    if let Some(path) = &path {
-                        slug_clone
-                            .entry(slug.to_string())
-                            .or_insert_with(|| path.clone());
-                    }
-                }
-            }
-            if let Some(path) = path {
-                repo_paths.push((path, p.key.clone()));
-            }
-        }
-    }
-    slugs.sort();
-    slugs.dedup();
-
-    // ---- the three sources, concurrently (what `reuse` lacks) ----
-    let reused = reuse.as_ref();
-    let (fresh_sources, (gh_repos, gh_state), fresh_views) = std::thread::scope(|s| {
-        let sources = reused
-            .is_none()
-            .then(|| s.spawn(|| daemon_sources(state_dir, opts)));
-        let gh = s.spawn(|| {
-            if opts.cache_only {
-                github_repos_cached(state_dir, &slugs)
-            } else {
-                github_bounded(state_dir, &slugs, opts.gh_wait, opts.gh_cache_secs, gh_repo)
-            }
-        });
-        // Local files only — the notes index keeps it one pass.
-        let tracker = reused.is_none().then(|| {
-            s.spawn(|| {
-                pm.as_ref().map(|pm| {
-                    let issues = board::load_all(&pm.dir, None).unwrap_or_default();
-                    board::views(&pm.config.notes_dir(), issues)
-                })
-            })
-        });
-        (
-            sources.map(|h| h.join().expect("overview daemon sources panicked")),
-            gh.join().expect("overview gh refresh panicked"),
-            tracker.and_then(|h| h.join().expect("overview tracker read panicked")),
-        )
-    });
-    let sources = match (reused, &fresh_sources) {
-        (Some(r), _) => r.sources,
-        (None, Some(fresh)) => fresh,
-        (None, None) => unreachable!("sources are gathered unless reused"),
-    };
-    let daemon = &sources.daemon;
-    let monitoring_view = sources.monitoring.clone();
-    let views: Option<&[board::View]> = match reused {
-        Some(r) => pm.as_ref().map(|_| r.views),
-        None => fresh_views.as_deref(),
-    };
-    let mut degraded_notes = daemon.degraded.clone();
-    if !slugs.is_empty() {
-        if let Some(e) = gh_state["error"].as_str() {
-            degraded_notes.push(degraded("github", "", e));
-        }
-    }
-    let members = match opts.scope.group.as_deref() {
-        Some(root) => Some(group_members(daemon, root)?),
-        None => None,
-    };
-
-    // ---- daemon rows ----
-    let mut needs: Vec<Item> = Vec::new();
-    let mut panes_idle = daemon.reachable;
-    // An old daemon without `agent_probe` cannot confirm a pane is idle
-    // — the drift row must say so instead of vanishing quietly.
-    let mut probes_unknown = false;
-    for (a, probe) in daemon.agents.iter().zip(&daemon.probes) {
-        let project = agent_project(a, &repo_paths);
-        needs.extend(agent_items(a, probe, &project, now));
-        needs.extend(master_login_item(a, state_dir, &project, now));
-        panes_idle &= !probe.holds_drift;
-        probes_unknown |= probe.probe_unknown;
-    }
-    if daemon.reachable {
-        needs.extend(platform_effect_items(state_dir, now, opts.probe_timeout));
-    }
-    needs.extend(relay_attention_items(state_dir, now));
-
-    // ---- tracker rows ----
-    // Lowercased headRefName of every open PR — an issue in review
-    // counts as "has a PR" when a `cadence/<id-lowercase>-…` branch is
-    // open, even without an explicit `pr` ref.
-    let mut open_pr_branches: Vec<String> = Vec::new();
-    for data in gh_repos.values() {
-        for pr in data["prs"].as_array().cloned().unwrap_or_default() {
-            if let Some(head) = pr["headRefName"].as_str() {
-                open_pr_branches.push(head.to_lowercase());
-            }
-        }
-    }
-    // `cadence/<id-lowercase>-` branch prefix → (issue id, owner): a
-    // PR row belongs to the issue's owner for `--group`.
-    let mut branch_issue: Vec<(String, String, Option<String>)> = Vec::new();
-    let mut projects_out = Vec::new();
-    if let (Some(pm), Some(views)) = (&pm, views) {
-        let mut status_of: HashMap<String, String> = HashMap::new();
-        for v in views {
-            status_of.insert(v.issue.front.id.clone(), v.status.clone());
-            branch_issue.push((
-                crate::worktree::layout::issue_branch_prefix(&v.issue.front.id),
-                v.issue.front.id.clone(),
-                v.issue.front.owner.clone(),
-            ));
-        }
-        let view_of: HashMap<&str, &board::View> = views
-            .iter()
-            .map(|v| (v.issue.front.id.as_str(), v))
-            .collect();
-        let line_times = LineTimes::load(&pm.dir, STATUS_CLOCK_BUDGET).ok();
-        let mut clock = StatusClock::new(line_times.as_ref());
-        let mut intake: Vec<Item> = Vec::new();
-        let mut backlog_stale: Vec<Item> = Vec::new();
-        let escalations = crate::master::escalations(state_dir);
-        // CAD-484: a next-action row hides only when its lane is
-        // provably not at rest — the daemon answered and the lane is
-        // busy, queued or working. An unreachable daemon or an
-        // unlisted alias cannot disprove the flag, so the row stands.
-        let lane_working: HashMap<String, bool> = daemon
-            .agents
-            .iter()
-            .zip(&daemon.probes)
-            .filter_map(|(a, p)| {
-                let alias = a["alias"].as_str()?;
-                let queued = a["inbox"]["queued"]
-                    .as_i64()
-                    .or_else(|| p.show.as_ref().and_then(|s| s["queued"].as_i64()))
-                    .unwrap_or(0);
-                Some((
-                    alias.to_string(),
-                    a["state"].as_str() != Some("idle") || p.holds_drift || queued > 0,
-                ))
-            })
-            .collect();
-        for v in views {
-            let id = v.issue.front.id.as_str();
-            let project = v.issue.project.as_str();
-            let owner = v.issue.front.owner.as_deref().unwrap_or_default();
-            let age = parse_iso(&v.issue.front.created)
-                .map(|c| now - c)
-                .unwrap_or(0);
-            let branch_prefix = crate::worktree::layout::issue_branch_prefix(id);
-            let open_pr = v
-                .issue
-                .front
-                .refs
-                .iter()
-                .any(|r| r.kind == "pr" && r.closed != Some(true))
-                || open_pr_branches
-                    .iter()
-                    .any(|b| b.starts_with(&branch_prefix));
-            let gate_tag = v
-                .issue
-                .front
-                .tags
-                .iter()
-                .any(|t| matches!(t.as_str(), "plan-ready" | "parked" | "idea-stale"));
-            if v.status == "review" && !open_pr && !gate_tag {
-                needs.push(
-                    item(
-                        70,
-                        "review_no_pr",
-                        &format!("{id} in review with no open PR"),
-                        age,
-                        project,
-                        None,
-                        &cmd_issue_show(id),
-                    )
-                    .about("issue", id)
-                    .for_agent(owner)
-                    .owned_by(Some(owner))
-                    .since(clock.since(v)),
-                );
-            }
-            let unblocked = !v.issue.front.blocked_by.is_empty()
-                && v.issue
-                    .front
-                    .blocked_by
-                    .iter()
-                    .all(|b| status_of.get(b).map(String::as_str) == Some("done"));
-            if !matches!(v.status.as_str(), "done" | "dropped") && unblocked {
-                // Unblocked when the last blocker reached done; one
-                // blocker without a clock leaves the row without one.
-                let since = v
-                    .issue
-                    .front
-                    .blocked_by
-                    .iter()
-                    .map(|b| view_of.get(b.as_str()).and_then(|bv| clock.since(bv)))
-                    .collect::<Option<Vec<i64>>>()
-                    .and_then(|ts| ts.into_iter().max());
-                needs.push(
-                    item(
-                        80,
-                        "blocked_ready",
-                        &format!("{id} unblocked — blockers all done"),
-                        age,
-                        project,
-                        None,
-                        &cmd_issue_set_ready(id),
-                    )
-                    .about("issue", id)
-                    .for_agent(owner)
-                    .owned_by(Some(owner))
-                    .since(since),
-                );
-            }
-            // CAD-339 Needs-you: a plan waiting for the operator's
-            // decision, and every open question the master escalated —
-            // with the master's summary, the question and its options.
-            if let Some(plan) = v
-                .issue
-                .front
-                .plan
-                .as_ref()
-                .filter(|p| p.state == "proposed")
-            {
-                let since = parse_iso(&plan.proposed_at);
-                let mut row = item(
-                    25,
-                    "plan",
-                    &format!(
-                        "{id} plan proposed by {} — {} ({} tickets)",
-                        plan.proposed_by,
-                        v.issue.front.title,
-                        plan.tickets.len()
-                    ),
-                    since.map_or(age, |t| now - t),
-                    project,
-                    None,
-                    &format!("cadence plan show {id} && cadence plan approve {id}"),
-                )
-                .about("issue", id)
-                .since(since);
-                row.json["plan"] = json!({"epic": id, "proposed_by": plan.proposed_by,
-                                          "tickets": plan.tickets});
-                needs.push(row);
-            }
-            // Only the daemon's escalation record puts a question here —
-            // a report file never can (review round 1, I3); reports are
-            // parsed only for tickets that have one.
-            let escalated_here = escalations.keys().any(|k| k.starts_with(&format!("{id}/")));
-            let open = if escalated_here {
-                issue::task_report::open_questions(&v.issue.dir, id)
-            } else {
-                vec![]
-            };
-            for q in open {
-                let key = format!("{id}/{}", q["name"].as_str().unwrap_or_default());
-                let Some(up) = escalations.get(&key).and_then(Value::as_object) else {
-                    continue;
-                };
-                let since = q["at"].as_str().and_then(parse_iso);
-                let mut row = item(
-                    20,
-                    "question",
-                    &format!(
-                        "{id} question from {} — {}",
-                        q["agent"].as_str().unwrap_or_default(),
-                        q["impact"].as_str().unwrap_or_default()
-                    ),
-                    since.map_or(age, |t| now - t),
-                    project,
-                    None,
-                    &format!(
-                        "cadence issue show {id}  # answer: cadence report file --task {id} \
-                         --kind answer (answers: {})",
-                        q["name"].as_str().unwrap_or_default()
-                    ),
-                )
-                .about(
-                    "report",
-                    &format!("{id}/{}", q["name"].as_str().unwrap_or_default()),
-                )
-                .for_agent(q["agent"].as_str().unwrap_or_default())
-                .since(since);
-                row.json["question"] = json!({
-                    "issue": id, "report": q["name"], "agent": q["agent"],
-                    "options": q["options"], "impact": q["impact"], "body": q["body"],
-                });
-                row.json["summary"] = up.get("summary").cloned().unwrap_or(Value::Null);
-                row.json["escalated_by"] = up.get("by").cloned().unwrap_or(Value::Null);
-                needs.push(row);
-            }
-            // CAD-477: a blocked report the checkup escalated is the
-            // operator's to unblock — one row while it is still the
-            // issue's open state; a newer `done` report or a done
-            // issue clears it.
-            if escalated_here {
-                let reports = issue::task_report::list(&v.issue.dir, id);
-                for b in reports
-                    .iter()
-                    .filter(|r| r["kind"].as_str() == Some("blocked"))
-                {
-                    let name = b["name"].as_str().unwrap_or_default();
-                    let Some(up) = escalations
-                        .get(&format!("{id}/{name}"))
-                        .and_then(Value::as_object)
-                    else {
-                        continue;
-                    };
-                    if !issue::task_report::blocked_open(&reports, b, &v.status) {
-                        continue;
-                    }
-                    let since = b["at"].as_str().and_then(parse_iso);
-                    let mut row = item(
-                        20,
-                        "blocked",
-                        &format!(
-                            "{id} blocked — {} reports it cannot proceed",
-                            b["agent"].as_str().unwrap_or_default()
-                        ),
-                        since.map_or(age, |t| now - t),
-                        project,
-                        None,
-                        &format!("cadence issue show {id}"),
-                    )
-                    .about("report", &format!("{id}/{name}"))
-                    .for_agent(b["agent"].as_str().unwrap_or_default())
-                    .since(since);
-                    row.json["blocked"] = json!({
-                        "issue": id, "report": name, "agent": b["agent"], "body": b["body"],
-                    });
-                    row.json["summary"] = up.get("summary").cloned().unwrap_or(Value::Null);
-                    row.json["escalated_by"] = up.get("by").cloned().unwrap_or(Value::Null);
-                    needs.push(row);
-                }
-            }
-            // CAD-484: the checkup's one Needs-you when an idle lane
-            // had no safe next step. The record is keyed
-            // `{issue}/next-action`; the row hides the moment the lane
-            // provably works again — a queued kickoff, a running turn,
-            // a busy pane — and never needs a record delete.
-            if let Some(up) = escalations
-                .get(&format!("{id}/next-action"))
-                .and_then(Value::as_object)
-                .filter(|u| u["kind"].as_str() == Some("next_action"))
-            {
-                let agent = up["agent"].as_str().unwrap_or_default();
-                if !lane_working.get(agent).copied().unwrap_or(false) {
-                    let since = up["at"].as_str().and_then(parse_iso);
-                    let mut row = item(
-                        20,
-                        "next_action",
-                        &format!(
-                            "{id} — {} is idle with no safe next step — {}",
-                            agent,
-                            up["summary"].as_str().unwrap_or_default()
-                        ),
-                        since.map_or(age, |t| now - t),
-                        project,
-                        None,
-                        &format!("cadence issue show {id}"),
-                    )
-                    .about("issue", id)
-                    .for_agent(agent)
-                    .since(since);
-                    row.json["next_action"] = json!({"issue": id, "agent": agent});
-                    row.json["summary"] = up.get("summary").cloned().unwrap_or(Value::Null);
-                    row.json["escalated_by"] = up.get("by").cloned().unwrap_or(Value::Null);
-                    needs.push(row);
-                }
-            }
-            // CAD-139: the idea pipeline stops here. The operator
-            // approves, rejects, or parks; nothing else is dispatched.
-            if v.status == "review" && v.issue.front.tags.iter().any(|t| t == "plan-ready") {
-                needs.push(
-                    item(
-                        20,
-                        "idea_plan",
-                        &format!(
-                            "idea plan ready for your decision — {id} {}",
-                            v.issue.front.title
-                        ),
-                        age,
-                        project,
-                        None,
-                        &format!("cadence idea decide {id} approve"),
-                    )
-                    .about("issue", id)
-                    .since(clock.since(v)),
-                );
-            }
-            if v.status == "backlog"
-                && v.issue.front.tags.iter().any(|t| t == "idea")
-                && v.issue.front.duplicate_of.is_some()
-            {
-                let other = v.issue.front.duplicate_of.as_deref().unwrap_or("");
-                needs.push(
-                    item(
-                        20,
-                        "idea_duplicate",
-                        &format!("{id} looks like {other} — decide whether to keep it"),
-                        age,
-                        project,
-                        None,
-                        &format!("cadence issue show {id}"),
-                    )
-                    .about("issue", id)
-                    .since(clock.since(v)),
-                );
-            }
-            // CAD-812: a `backlog`/`ready` leaf the groom pass flagged
-            // `needs-triage` — the requirement may have drifted. Surfaces
-            // under `blocked_ready` (a flag, not a pick gate): oldest
-            // first, for the owner to re-confirm or re-scope. Collected
-            // and capped like intake so a pile of stale tickets cannot
-            // bury real work.
-            if matches!(v.status.as_str(), "backlog" | "ready")
-                && v.issue.front.tags.iter().any(|t| t == "needs-triage")
-            {
-                let since = v.issue.front.last_groomed_at.as_deref().and_then(parse_iso);
-                backlog_stale.push(
-                    item(
-                        82,
-                        "backlog_stale",
-                        &format!("{id} needs-triage — groom flagged drift"),
-                        age,
-                        project,
-                        None,
-                        &cmd_issue_show(id),
-                    )
-                    .about("issue", id)
-                    .for_agent(owner)
-                    .owned_by(Some(owner))
-                    .since(since),
-                );
-            }
-            // `cadence report` intake: a backlog-tagged row surfaces
-            // until triage moves it off backlog — the effective status
-            // (notes-derived counts too) is what clears it.
-            if v.status == "backlog" && v.issue.front.tags.iter().any(|t| t == "intake") {
-                let kind_tag = v
-                    .issue
-                    .front
-                    .kind
-                    .as_deref()
-                    .or_else(|| {
-                        v.issue
-                            .front
-                            .tags
-                            .iter()
-                            .find(|t| *t != "intake")
-                            .map(String::as_str)
-                    })
-                    .unwrap_or("intake");
-                intake.push(
-                    item(
-                        85,
-                        "intake",
-                        &format!("{id} {kind_tag} report — {}", v.issue.front.title),
-                        age,
-                        project,
-                        None,
-                        &format!("cadence report show {id}"),
-                    )
-                    .about("issue", id)
-                    .for_agent(owner)
-                    .owned_by(Some(owner)),
-                );
-            }
-        }
-        // Cap the intake block — hundreds of untriaged reports must not
-        // bury real work. Oldest first, then one summary row.
-        intake.sort_by_key(|i| std::cmp::Reverse(i.age));
-        let intake_extra = intake
-            .len()
-            .checked_sub(report::NEEDS_ME_CAP)
-            .filter(|n| *n > 0);
-        if intake_extra.is_some() {
-            intake.truncate(report::NEEDS_ME_CAP);
-        }
-        // Clocks only for the rows that surface — one read each.
-        for it in &mut intake {
-            let since = view_of
-                .get(it.subject.1.as_str())
-                .and_then(|v| clock.since(v));
-            it.set_since(since);
-        }
-        if let Some(extra) = intake_extra {
-            intake.push(
-                item(
-                    85,
-                    "intake",
-                    &format!("… {extra} more intake reports"),
-                    0,
-                    "",
-                    None,
-                    "cadence report ls",
-                )
-                .about("report", "intake-overflow"),
-            );
-        }
-        // Cap the stale-backlog block the same way — oldest first, one
-        // summary row past the cap.
-        backlog_stale.sort_by_key(|i| std::cmp::Reverse(i.age));
-        let stale_extra = backlog_stale
-            .len()
-            .checked_sub(report::NEEDS_ME_CAP)
-            .filter(|n| *n > 0);
-        if stale_extra.is_some() {
-            backlog_stale.truncate(report::NEEDS_ME_CAP);
-        }
-        if let Some(extra) = stale_extra {
-            backlog_stale.push(
-                item(
-                    82,
-                    "backlog_stale",
-                    &format!("… {extra} more stale backlog items"),
-                    0,
-                    "",
-                    None,
-                    "cadence issue ls --project <p>",
-                )
-                .about("issue", "backlog-stale-overflow"),
-            );
-        }
-        needs.extend(backlog_stale);
-        needs.extend(intake);
-        needs.extend(delivery_items(state_dir, now));
-        if !clock.skipped.is_empty() {
-            degraded_notes.push(degraded(
-                "tracker_status_time",
-                "",
-                format!(
-                    "{} issue(s) past the status-time budget — those rows escalate by owner only",
-                    clock.skipped.len()
-                ),
-            ));
-        }
-        // CAD-383: in-flight claims per project, with their age.
-        let claim_clock = claim::Clock::new(line_times.as_ref());
-        // CAD-378: the review loop's recorded PR per issue, for lanes
-        // whose tracker carries no `pr` ref.
-        let delivery_prs: std::collections::BTreeMap<String, String> =
-            crate::delivery::records(state_dir)
-                .into_values()
-                .filter(|r| !r.state.terminal())
-                .filter_map(|r| r.pr.map(|pr| (r.issue, pr)))
-                .collect();
-        for p in &projects {
-            if opts.scope.project.as_deref().is_some_and(|k| k != p.key) {
-                continue;
-            }
-            let mut open_by_status = serde_json::Map::new();
-            let mut oldest_review: Option<i64> = None;
-            let mut claims: Vec<Value> = Vec::new();
-            for v in views.iter().filter(|v| v.issue.project == p.key) {
-                if matches!(v.status.as_str(), "done" | "dropped") {
-                    continue;
-                }
-                let front = &v.issue.front;
-                if matches!(v.status.as_str(), "doing" | "review")
-                    && !claim::holders(front).is_empty()
-                {
-                    let since = claim_clock.since(&p.key, front);
-                    let mut row = claim::row(&p.key, front, since, now);
-                    row["status"] = json!(v.status);
-                    claims.push(row);
-                }
-                let n = open_by_status
-                    .get(&v.status)
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
-                open_by_status.insert(v.status.clone(), json!(n + 1));
-                if v.status == "review" {
-                    let age = parse_iso(&v.issue.front.created)
-                        .map(|c| now - c)
-                        .unwrap_or(0);
-                    oldest_review = Some(oldest_review.map_or(age, |o| o.max(age)));
-                }
-            }
-            // CAD-378: open lanes, the code areas they plan or change,
-            // and overlaps (the board's overlay); a lane with a PR that
-            // changes an area owned by someone else is a Needs-you row
-            // until the owner's PM or the operator acks it.
-            let (areas, areas_error) = issue::areas::load_or_error(&pm.dir, &p.key);
-            let project_issues: Vec<&issue::board::Issue> = views
-                .iter()
-                .filter(|v| v.issue.project == p.key)
-                .map(|v| &v.issue)
-                .collect();
-            let lanes = issue::areas::open_lanes(state_dir, &project_issues, &delivery_prs);
-            let acks = issue::areas::acks(state_dir);
-            let has_pr = |l: &issue::areas::Lane| {
-                let prefix = crate::worktree::layout::issue_branch_prefix(&l.issue);
-                open_pr_branches.iter().any(|b| b.starts_with(&prefix))
-            };
-            for need in issue::areas::ack_needs(&areas, &lanes, &acks, has_pr) {
-                let owner = need.area.pm.clone();
-                let mut row = item(
-                    28,
-                    "area_ack",
-                    &need.title(),
-                    0,
-                    &need.project,
-                    need.pr.as_deref(),
-                    &issue::areas::cmd_ack(&need.issue, &need.area.name),
-                )
-                .about("issue", &need.issue)
-                .for_agent(owner.as_deref().unwrap_or_default())
-                .owned_by(Some(owner.as_deref().unwrap_or(inbox::OPERATOR)));
-                row.json["area"] = json!({
-                    "issue": need.issue, "area": need.area.name, "owner": need.area.owner(),
-                    "pm": need.area.pm, "files": need.files, "pr": need.pr,
-                    "worker": need.worker,
-                });
-                needs.push(row);
-            }
-            projects_out.push(json!({
-                "key": p.key,
-                "open_by_status": open_by_status,
-                "oldest_review_age": oldest_review,
-                "claims": claims,
-                "lanes": issue::areas::overlay(&areas, &lanes),
-                "areas": areas.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
-                "areas_error": areas_error,
-            }));
-        }
-        // Tracker behind its upstream — local refs only, never a fetch.
-        if let Ok(behind) = git_text(
-            &pm.dir,
-            &[
-                "rev-list".into(),
-                "--count".into(),
-                "HEAD..@{upstream}".into(),
-            ],
-        ) {
-            if let Ok(n) = behind.trim().parse::<i64>() {
-                if n > 0 {
-                    needs.push(
-                        item(
-                            110,
-                            "tracker_behind",
-                            &format!("tracker {n} commit(s) behind upstream"),
-                            0,
-                            "",
-                            None,
-                            CMD_ISSUE_SYNC,
-                        )
-                        .about("tracker", "pm"),
-                    );
-                }
-            }
-        }
-    }
-
-    // ---- GitHub rows: merge-ready, verdict-less, main CI ----
-    let mut main_ci: Vec<Value> = Vec::new();
-    for (slug, data) in &gh_repos {
-        let project = slug_project.get(slug).cloned().unwrap_or_default();
-        for pr in data["prs"].as_array().cloned().unwrap_or_default() {
-            let n = pr["number"].as_i64().unwrap_or(0);
-            let title = pr["title"].as_str().unwrap_or("");
-            let url = pr["url"].as_str().map(str::to_string);
-            let rollup = pr["statusCheckRollup"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let age = pr["updatedAt"]
-                .as_str()
-                .and_then(parse_iso)
-                .map(|u| now - u)
-                .unwrap_or(0);
-            let head_ref = pr["headRefName"].as_str().unwrap_or("").to_lowercase();
-            let owner = branch_issue
-                .iter()
-                .find(|(prefix, _, _)| head_ref.starts_with(prefix.as_str()))
-                .and_then(|(_, _, owner)| owner.clone())
-                .unwrap_or_default();
-            let subject = format!("{slug}#{n}");
-            // Rollup times for this head (CAD-253): a CheckRun's
-            // `completedAt`, a status context's `startedAt`.
-            let (first_check, last_check) = rollup_span(&rollup);
-            match verdict_state(&rollup).as_deref() {
-                Some("SUCCESS") if checks_green(&rollup) => {
-                    // The verdict binds this head — a push after it
-                    // makes the copied command refuse instead of
-                    // merging an unreviewed head.
-                    let head = pr["headRefOid"].as_str().unwrap_or("");
-                    needs.push(
-                        item(
-                            10,
-                            "merge",
-                            &format!("PR #{n} {title} — verdict pass, checks green"),
-                            age,
-                            &project,
-                            url.as_deref(),
-                            &format!(
-                                "gh pr merge {n} --repo {slug} --squash --admin --match-head-commit {head}"
-                            ),
-                        )
-                        .about("pr", &subject)
-                        .for_agent(&owner)
-                        .owned_by(Some(&owner))
-                        // Merge-ready once the last check or verdict landed.
-                        .since(last_check),
-                    );
-                }
-                Some("SUCCESS") | Some("FAILURE") | Some("ERROR") => {}
-                _ => needs.push(
-                    item(
-                        60,
-                        "pr_no_verdict",
-                        &format!("PR #{n} {title} — no verdict"),
-                        age,
-                        &project,
-                        url.as_deref(),
-                        &format!("gh pr view {n} --repo {slug}"),
-                    )
-                    .about("pr", &subject)
-                    .for_agent(&owner)
-                    .owned_by(Some(&owner))
-                    // Verdict-less since this head's first check started;
-                    // a head with no checks yet has no clock.
-                    .since(first_check),
-                ),
-            }
-        }
-        let clone = slug_clone.get(slug).map(PathBuf::as_path);
-        let (view, rows) = main_ci_view(slug, &project, data, clone, now);
-        if let Some(e) = view["error"].as_str() {
-            degraded_notes.push(degraded("github_ci", slug, e));
-        }
-        if !view.is_null() && opts.scope.project.as_deref().is_none_or(|k| k == project) {
-            main_ci.push(view);
-        }
-        needs.extend(rows);
-    }
-    main_ci.sort_by(|a, b| a["slug"].as_str().cmp(&b["slug"].as_str()));
-
-    // ---- deploy drift: is what we merged actually running ----
-    let info = daemon.info.clone();
-    let mut drift = if !daemon.reachable {
-        json!({"matched": false, "reason": "daemon unreachable — cannot tell"})
-    } else if info.is_none() {
-        // Reachable but predates `daemon_info` — the build commit is
-        // unreadable, so drift is unknowable, never zero.
-        json!({
-            "matched": false,
-            "reason": "daemon build unknown (daemon predates daemon_info) — restart to enable drift",
-        })
-    } else {
-        match build_repo_match(&projects) {
-            None => json!({
-                "matched": false,
-                "build_commit": info.as_ref().map(|i| i["build_commit"].clone()).unwrap_or(json!("unknown")),
-                "reason": "no tracker repo matches the build — cannot tell",
-            }),
-            Some((key, repo)) => {
-                let build = info
-                    .as_ref()
-                    .and_then(|i| i["build_commit"].as_str())
-                    .unwrap_or("unknown");
-                let mut d = compute_drift(&repo, build);
-                d["matched"] = json!(true);
-                d["project"] = json!(key);
-                d
-            }
-        }
-    };
-    if drift["known"].as_bool().unwrap_or(false) && drift["count"].as_i64().unwrap_or(0) > 0 {
-        if panes_idle {
-            let n = drift["count"].as_i64().unwrap_or(0);
-            let project = drift["project"].as_str().unwrap_or("");
-            needs.push(
-                item(
-                    50,
-                    "drift",
-                    &format!("{n} merged commit(s) not running — all panes idle"),
-                    0,
-                    project,
-                    None,
-                    CMD_UPGRADE_LATEST_MAIN,
-                )
-                .about("deploy", project),
-            );
-        } else {
-            // Held back, but say why — a busy pane is different from
-            // a daemon that cannot answer `agent_probe` at all.
-            drift["held"] = json!(if probes_unknown {
-                "cannot tell whether panes are idle — daemon predates agent_probe"
-            } else {
-                "a pane is busy — restart only when idle"
-            });
-        }
-    }
-
-    // CAD-615: a pending permission request is the operator's to decide.
-    for req in crate::master_perm::board_requests(state_dir, now).unwrap_or_default() {
-        let age = (now - req.created).max(0);
-        let command = req.argv.join(" ");
-        let title = if req.decision_label.is_empty() {
-            format!(
-                "master wants to run: {command} — risk {}",
-                match req.risk {
-                    crate::master_perm::Risk::Low => "low",
-                    crate::master_perm::Risk::Medium => "medium",
-                    crate::master_perm::Risk::High => "high",
-                }
-            )
-        } else {
-            format!("{} — {command}", req.decision_label)
-        };
-        let mut row = item(
-            if req.status == "pending" { 15 } else { 40 },
-            "master_permission",
-            &title,
-            age,
-            "",
-            None,
-            &format!("cadence master allow-once {}", req.id),
-        )
-        .about("permission", &req.id)
-        .since(Some(req.created));
-        row.json["permission"] = crate::master_perm::request_json(&req);
-        row.json["reason"] = json!(req.reason);
-        needs.push(row);
-    }
-
-    classify_needs(
-        &mut needs,
-        &Owners::new(daemon.reachable, &daemon.agents),
-        now,
-        ESCALATE_AFTER_SECS,
-    );
-    let mut needs = scope_rows(
-        merge_by_subject(needs),
-        opts.scope.project.as_deref(),
-        members.as_deref(),
-    );
-    sort_needs(&mut needs);
-    // CAD-574: the operator's dismissals suppress their subjects for
-    // every reader of this build — a snooze's clock is judged here.
-    let dismissed = crate::needs_dismiss::dismissed(state_dir);
-    if !dismissed.is_empty() {
-        needs.retain(|i| {
-            !crate::needs_dismiss::row_suppressed(
-                &json!({"subject": {"kind": i.subject.0, "id": i.subject.1.as_str()},
-                        "since": i.since, "age": i.age}),
-                &dismissed,
-                now,
-            )
-        });
-    }
-    let daemon_json = match info {
-        Some(mut i) => {
-            i["reachable"] = json!(daemon.reachable);
-            i
-        }
-        None if daemon.reachable => json!({
-            "reachable": true,
-            "info": "daemon predates daemon_info — build identity unreadable",
-        }),
-        None => json!({"reachable": false}),
-    };
-    Ok(json!({
-        "needs_me": needs.iter().map(|i| i.json.clone()).collect::<Vec<_>>(),
-        "drift": drift,
-        "projects": projects_out,
-        "github": gh_state,
-        "main_ci": main_ci,
-        "daemon": daemon_json,
-        "monitoring": monitoring_view,
-        "degraded": degraded_notes,
-        "scope": {"project": opts.scope.project, "group": opts.scope.group},
-        "generated_at": now,
-    }))
+    let snapshot = sources::collect(state_dir, pm_dir, opts, reuse)?;
+    assembly::assemble(state_dir, opts, snapshot)
 }
 
 // ---------- shared with `cadence session` ----------
@@ -2468,6 +1424,62 @@ pub(crate) fn checks_green_pub(rollup: &[Value]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CAD-1219: the display fields clip, strip and refuse command text.
+    #[test]
+    fn display_text_clips_strips_and_refuses_commands() {
+        assert_eq!(
+            display_text("  Send\n\temail\u{7}  to   212 customers ", 50).as_deref(),
+            Some("Send email to 212 customers")
+        );
+        let long = "é".repeat(80);
+        let clipped = display_text(&long, SHORT_TITLE_MAX).unwrap();
+        assert_eq!(clipped.chars().count(), SHORT_TITLE_MAX);
+        assert!(clipped.ends_with('…'));
+        for bad in [
+            "run `rm -rf x` now",
+            "cadence issue set X status=done",
+            "Cadence  go",
+            "Cadence  issue list",
+            "cadence confine off",
+            "cadence daemon stop",
+            "cadence resume worker-1",
+            "\u{3F2}adence stop x",
+            "\u{3F9}adence stop x",
+            "\u{2800}\u{2800}",
+            "run cadence --state-dir x",
+            "c\u{430}dence issue set X",
+            "echo $(id)",
+            "  \n\u{0} ",
+            "cadence\u{200B} issue set X status=done",
+            "please run: cadence issue set X",
+            "echo ${HOME}",
+            "run \u{FF40}id\u{FF40}",
+        ] {
+            assert_eq!(display_text(bad, 50), None, "{bad:?}");
+        }
+        assert_eq!(
+            display_text("\u{202E}Send\u{200B} mail\u{2066}", 50).as_deref(),
+            Some("Send mail")
+        );
+        for (raw, want) in [
+            ("a\u{13430}b\u{1BCA0}c\u{34F}d\u{3164}e", "abcde"),
+            ("## Heading words", "Heading words"),
+        ] {
+            assert_eq!(display_text(raw, 50).as_deref(), Some(want), "{raw:?}");
+        }
+        assert_eq!(
+            display_sentence("Uses tools, e.g. git. Then more.", WHY_MAX).as_deref(),
+            Some("Uses tools, e.g. git.")
+        );
+        assert_eq!(
+            display_sentence("It sends mail. Then more words follow.", WHY_MAX).as_deref(),
+            Some("It sends mail.")
+        );
+        let mut row = item(1, "plan", "t", 0, "", None, "c");
+        row.set_display(Some("cadence plan approve X"), Some(""));
+        assert!(row.json.get("short_title").is_none() && row.json.get("why").is_none());
+    }
 
     #[test]
     fn iso_parses() {
@@ -3819,6 +2831,7 @@ mod tests {
             repos: vec![project::Repo {
                 path: Some(repo.to_string_lossy().into()),
                 remote: Some("git@github.com:favcrm/cadence.git".into()),
+                base: None,
             }],
             components: vec![],
             tags: vec![],
@@ -3826,6 +2839,8 @@ mod tests {
             build: None,
             memory: None,
             intake: None,
+            id: None,
+            policy: None,
         };
         // Path match against BUILD_ROOT (this crate's checkout) never
         // hits the temp clone — remote match does when remote differs…
@@ -3846,6 +2861,7 @@ mod tests {
             repos: vec![project::Repo {
                 path: Some("/definitely/not/the/build".into()),
                 remote: Some("git@example.com:other/repo.git".into()),
+                base: None,
             }],
             components: vec![],
             tags: vec![],
@@ -3853,6 +2869,8 @@ mod tests {
             build: None,
             memory: None,
             intake: None,
+            id: None,
+            policy: None,
         };
         assert!(build_repo_match(&[other]).is_none());
     }

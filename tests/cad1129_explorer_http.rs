@@ -319,17 +319,14 @@ fn check_route_refuses_everything_but_a_clean_operator_source() {
     assert!(!catalog_exists(&fx), "a refused check created the catalog");
 
     // positive controls: the clean operator body answers the install digest
-    // and still writes nothing; a built-in answers too.
+    // and still writes nothing; a second fixture source answers too.
     let (status, text) = fx.http("operator", route, &good);
     assert_eq!(status, 200, "{text}");
     let body: Value = serde_json::from_str(&text).unwrap();
     let rpc = fx.op("app_workspace_install_check", json!({"source": src}));
     assert_eq!(body["digest"], rpc["digest"]);
-    let (status, text) = fx.http(
-        "operator",
-        route,
-        &json!({"source": "builtin:crm"}).to_string(),
-    );
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/apps/crm");
+    let (status, text) = fx.http("operator", route, &json!({"source": fixture}).to_string());
     assert_eq!(status, 200, "{text}");
     assert!(serde_json::from_str::<Value>(&text).unwrap()["digest"]
         .as_str()
@@ -339,14 +336,15 @@ fn check_route_refuses_everything_but_a_clean_operator_source() {
     assert!(!catalog_exists(&fx), "the check created the catalog");
 }
 
-/// `builtin:` is a check-only source: the generic install RPC and route do
-/// not resolve it, and it never smuggles a path.
+/// `builtin:` is the retired source form (CAD-1422): the install RPC and
+/// the install-check RPC both refuse it, and it never smuggles a path.
 #[test]
 fn builtin_source_form_is_check_only() {
     let fx = Fx::start();
     let before = fx.tree();
     for source in [
         "builtin:crm",
+        "builtin:social-content",
         "builtin:",
         "builtin:../../etc",
         "builtin:nope",
@@ -359,6 +357,8 @@ fn builtin_source_form_is_check_only() {
         assert!(r.is_err(), "install accepted {source}: {r:?}");
     }
     for source in [
+        "builtin:crm",
+        "builtin:social-content",
         "builtin:",
         "builtin:../../etc",
         "builtin:nope",
@@ -372,25 +372,37 @@ fn builtin_source_form_is_check_only() {
         );
         assert!(r.is_err(), "check accepted {source}: {r:?}");
     }
+    // the refusal is the retired-catalog refusal, not a transport vet.
+    let e = fx
+        .rpc(
+            Asserted::Operator,
+            "app_workspace_install_check",
+            json!({"source": "builtin:crm"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("built-in catalog"), "{e}");
     assert_eq!(fx.tree(), before);
 }
 
-/// The built-in install route needs the checked `expected_digest`, over the
-/// RPC and over HTTP. Missing, stale, malformed, wrong-type and
-/// other-bundle digests are refused with nothing written; agents and
-/// unauthenticated callers are refused by the route class.
+/// The catalog install route is retired (CAD-1422): every body is
+/// refused over the RPC and over HTTP — the route class (operator-only)
+/// and the retired-catalog refusal both stand. Refusals write nothing;
+/// agents and unauthenticated callers are refused by the route class.
 #[test]
 fn builtin_install_route_requires_the_checked_digest() {
     let fx = Fx::start();
     let route = "/api/app-catalog/install";
-    let check = fx.op(
-        "app_workspace_install_check",
-        json!({"source": "builtin:crm"}),
-    );
+    // A real checked digest from a fixture install-check stands in for
+    // the historical `builtin:` check digest: the retired route refuses
+    // well-formed and malformed bodies alike.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/apps/crm");
+    let check = fx.op("app_workspace_install_check", json!({"source": fixture}));
     let good = check["digest"].as_str().unwrap().to_string();
     let other = fx.op(
         "app_workspace_install_check",
-        json!({"source": "builtin:social-content"}),
+        json!({"source": Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/apps/social-content")}),
     )["digest"]
         .as_str()
         .unwrap()
@@ -457,15 +469,15 @@ fn builtin_install_route_requires_the_checked_digest() {
     }
     assert_eq!(fx.tree(), before);
 
-    // positive control, then replay and a second install refuse.
+    // CAD-1422: even the once-valid body is refused — the catalog is
+    // retired and nothing installs through this route.
     let (status, text) = fx.http("operator", route, &body);
-    assert_eq!(status, 200, "{text}");
-    let out: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(out["digest"], json!(good));
-    let installed = fx.tree();
-    let (status, _) = fx.http("operator", route, &body);
-    assert!(status >= 400, "a second install of one app was accepted");
-    assert_eq!(fx.tree(), installed);
+    assert!(
+        status >= 400,
+        "retired catalog install was accepted: {text}"
+    );
+    assert!(text.contains("built-in catalog"), "{text}");
+    assert_eq!(fx.tree(), before);
 }
 
 /// Every operator-only explorer write refuses an agent over HTTP with no
@@ -565,10 +577,11 @@ fn board_refuses_agent_peers_on_the_explorer_routes_itself() {
         "/api/app-requests",
     ] {
         let (status, text) = fx.get("agent:writer", route);
-        assert_eq!(status, 403, "GET {route}: {text}");
-        assert!(
-            text.contains(board),
-            "GET {route} not refused by the board gate: {text}"
+        assert_eq!(status, 401, "GET {route}: {text}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap()["code"],
+            "operator_session_required",
+            "GET {route} not refused by the private read gate: {text}"
         );
     }
     for (route, body) in [

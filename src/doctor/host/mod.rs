@@ -159,13 +159,20 @@ pub struct HostOverrides {
     /// CAD-113 build slots — read by the daemon's slot service, not by
     /// `Thresholds`. `build_slots` bounds concurrent build+test grants
     /// (default 3), `suite_slots` the full-suite pool (default 1),
+    /// `total_slots` (CAD-1268) caps grants across ALL pools combined
+    /// (default 2, clamped to 1) — the per-pool limits still apply —
     /// `jobs_per_lane` is the `CARGO_BUILD_JOBS` dispatch injects
-    /// (default 4), `starve_secs` is the never-starve bound (default
+    /// (default 2), `starve_secs` is the never-starve bound (default
     /// 900), `priority_lanes` are aliases whose test/suite requests
     /// outrank ordinary ones (the reviewer lane), `max_hold_secs`
     /// reaps a forgotten hold (default 7200).
     pub build_slots: Option<u64>,
     pub suite_slots: Option<u64>,
+    /// CAD-1268: combined grants this daemon's slot registry admits at
+    /// once (default 2, minimum 1) — bounds one registry's shared
+    /// budget, not the whole host (independent daemons and the test
+    /// queue are outside it).
+    pub total_slots: Option<u64>,
     /// CAD-1021: concurrent `check` grants (default 2) — the lane's
     /// pre-push pool, admitted only via a kind=check recipe.
     pub check_slots: Option<u64>,
@@ -489,41 +496,6 @@ pub(crate) fn read_host_overrides(
     })
 }
 
-/// `pm.yaml [hosted]` — the CAD-538 hosted-lifecycle table (`lease`,
-/// `lease_ttl_secs`, `lease_renew_secs`, `flush_timeout_secs`; see
-/// `crate::lease`). Same contract as [`read_host_overrides`]: `Ok(None)`
-/// when absent, `Err` naming the culprit when present but unusable —
-/// a daemon that asked to lease never starts unleased on a typo.
-pub(crate) fn read_hosted_overrides(
-    pm_dir: &Path,
-) -> std::result::Result<Option<crate::lease::Hosted>, String> {
-    let Ok(text) = std::fs::read_to_string(pm_dir.join("pm.yaml")) else {
-        return Ok(None);
-    };
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str(&text).map_err(|e| format!("pm.yaml is not valid YAML: {e}"))?;
-    let Some(hosted) = yaml.get("hosted") else {
-        return Ok(None);
-    };
-    serde_yaml::from_value(hosted.clone())
-        .map(Some)
-        .map_err(|e| {
-            let culprit = hosted.as_mapping().and_then(|m| {
-                m.iter().find_map(|(k, v)| {
-                    let mut one = serde_yaml::Mapping::new();
-                    one.insert(k.clone(), v.clone());
-                    serde_yaml::from_value::<crate::lease::Hosted>(serde_yaml::Value::Mapping(one))
-                        .is_err()
-                        .then(|| k.as_str().unwrap_or("?").to_string())
-                })
-            });
-            match culprit {
-                Some(key) => format!("pm.yaml [hosted] {key}: {e}"),
-                None => format!("pm.yaml [hosted]: {e}"),
-            }
-        })
-}
-
 /// Resolved `[host]` thresholds — shared by `Scan::host` and the
 /// daemon's WAL watcher so both read one config table.
 pub(crate) fn host_thresholds(pm_dir: Option<&Path>) -> Thresholds {
@@ -543,6 +515,7 @@ pub fn run(scan: &Scan) -> Value {
     let checks = [
         check_disk(scan),
         check_provider_state(scan),
+        check_provider_commands(scan),
         check_cadence_store(scan),
         check_pipes(scan),
         check_memory(scan),
@@ -685,7 +658,7 @@ use pipes::{check_pipes, scan_pipes, PipeStats};
 #[allow(unused_imports)]
 use processes::check_processes;
 #[allow(unused_imports)]
-use provider_state::{check_provider_state, store_level};
+use provider_state::{check_provider_commands, check_provider_state, store_level};
 #[allow(unused_imports)]
 use sessions::{check_sessions, MAX_METRIC_PIDS};
 #[allow(unused_imports)]

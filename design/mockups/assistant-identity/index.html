@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Cadence — Assistant identity design review</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="tokens.css">
+  <link rel="stylesheet" href="kit.css">
+  <link rel="stylesheet" href="preview.css">
+  <script>
+    try { const theme=localStorage.getItem('cadence-theme'); if(theme==='light'||theme==='dark') document.documentElement.dataset.theme=theme; } catch {}
+  </script>
+</head>
+<body>
+<!-- Review draft, not accepted product design or integration evidence.
+Source: design/mockups/assistant-identity/ in CAD-1817 lane. Related: CAD-1817 / CAD-1818.
+References: user-provided Mac screenshot, design/kit.html, canonical generated tokens.css/kit.css.
+Real owners approximated: Home.tsx, MemberChat.tsx, ThreadView.tsx, shared chat Conversation/Composer, Button, sidebar, About drawer.
+Intentional differences: actor name + explicit ownership, optional read-only About panel, contextual query disclosure, external review controls.
+Only synthetic Fieldwork/Avery/campaign data. No APIs, real auth, provider calls, dispatch or persistent profile storage.
+Profile/conversation changes are in-memory only; reload or Reset discards them. Theme alone follows existing cadence-theme preference.
+Publish target recorded on CAD-1817 after verification. -->
+<svg class="sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1Z"/></symbol>
+  <symbol id="i-work" viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="15" rx="2"/><path d="M8 6V3h8v3M3 12h18m-11 0v3h4v-3"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-8 8H4l-2 2v-10a9 9 0 0 1 19 0Z"/><path d="M7 9h9m-9 5h6"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M12 5C8 2 4 3 2 4v16c3-2 6-1 10 1m0-16c4-3 8-2 10-1v16c-3-2-6-1-10 1Zm0 0v16"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 5h7l2 3h9v12H3Z"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="m9 3-1 3-3 1-2 4 2 2v4l3 1 2 3h4l2-3 3-1v-4l2-2-2-4-3-1-1-3Z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-people" viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/><path d="M1 22v-4a7 7 0 0 1 14 0v4m2-19a4 4 0 0 1 0 8m3 11v-4a7 7 0 0 0-3-5"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M12 20V4m-6 6 6-6 6 6"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 4v16M4 12h16"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10v.2"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 4v3"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 1v3m0 16v3M1 12h3m16 0h3M4 4l2 2m12 12 2 2M4 20l2-2M18 6l2-2"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7a9 9 0 1 0 1 8M20 2v6h-6"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+  <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 2v20M2 12h20M5 5l14 14M5 19 19 5"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="m10 14 4-4m-6 7-1 1a4 4 0 0 1-6-6l5-5a4 4 0 0 1 6 0m0 10a4 4 0 0 0 6 0l5-5a4 4 0 0 0-6-6l-1 1"/></symbol>
+</defs></svg>
+
+<header class="reviewbar" aria-label="Design review controls">
+  <div class="review-intro"><span class="review-label" data-i18n="review">DESIGN PREVIEW</span><span class="review-title" data-i18n="reviewTitle">An assistant that feels like yours.</span></div>
+  <div class="review-controls">
+    <div class="phase-switch" role="group" aria-label="Phase"><button id="phase1" aria-pressed="true" data-i18n="phase1">01 Identity</button><button id="phase2" aria-pressed="false" data-i18n="phase2">02 Coordination</button></div>
+    <label class="scene-control"><span class="sr-only" data-i18n="sceneLabel">Preview scene</span><select id="scene" aria-label="Preview scene"></select></label>
+    <button class="review-icon" id="locale" aria-label="Switch to Traditional Chinese">繁中</button>
+    <button class="review-icon" id="theme" aria-label="Toggle color theme"><svg class="ico"><use href="#i-sun"/></svg></button>
+    <button class="review-icon" id="reset" aria-label="Reset preview"><svg class="ico"><use href="#i-refresh"/></svg></button>
+  </div>
+  <div class="review-note"><span class="draft-dot"></span><span id="sceneNote"></span><span class="simulation" data-i18n="simulation">Interactive mockup · sample data · changes reset on reload</span></div>
+</header>
+
+<div class="shell">
+  <aside class="side" id="sidebar" aria-label="Main navigation">
+    <a class="brand" href="#home" id="brandHome"><img src="icon.svg" alt="" width="24" height="24"><span>cadence <small>board</small></span></a>
+    <div class="workspace-select"><span class="workspace-avatar">F</span><div><strong>Fieldwork</strong><small data-i18n="workspace">Workspace</small></div><svg class="ico"><use href="#i-chevron"/></svg></div>
+    <nav class="nav">
+      <button class="navlink" data-nav="home" aria-current="page"><svg class="ico"><use href="#i-home"/></svg><span data-i18n="home">Home</span></button>
+      <button class="navlink" data-nav="work"><svg class="ico"><use href="#i-work"/></svg><span data-i18n="myWork">My work</span></button>
+      <button class="navlink" data-nav="threads"><svg class="ico"><use href="#i-chat"/></svg><span data-i18n="threads">Threads</span></button>
+      <button class="navlink" data-nav="projects"><svg class="ico"><use href="#i-folder"/></svg><span data-i18n="projects">Projects</span></button>
+      <button class="navlink" data-nav="knowledge"><svg class="ico"><use href="#i-book"/></svg><span data-i18n="knowledge">Knowledge</span></button>
+    </nav>
+    <div class="side-label slabel" data-i18n="apps">APPS</div>
+    <nav class="nav">
+      <button class="navlink" data-nav="crm"><svg class="ico"><use href="#i-grid"/></svg><span>CRM</span></button>
+      <button class="navlink" data-nav="social"><svg class="ico"><use href="#i-grid"/></svg><span>Social Content</span></button>
+    </nav>
+    <div class="side-label slabel" data-i18n="workspace">WORKSPACE</div>
+    <nav class="nav"><button class="navlink" data-nav="agents"><svg class="ico"><use href="#i-people"/></svg><span data-i18n="agents">Agents</span></button><button class="navlink" data-nav="settings"><svg class="ico"><use href="#i-settings"/></svg><span data-i18n="settings">Settings</span></button></nav>
+    <footer class="side-foot"><span class="user-avatar">AL</span><div><strong>Avery Lin</strong><small data-i18n="owner">Workspace owner</small></div><svg class="ico"><use href="#i-chevron"/></svg></footer>
+  </aside>
+  <div class="main">
+    <header class="topbar"><button class="icon-button mobile-menu" id="mobileMenu" aria-label="Open navigation" aria-expanded="false"><svg class="ico"><use href="#i-menu"/></svg></button><div class="breadcrumb"><span>Fieldwork</span><svg class="ico"><use href="#i-chevron"/></svg><strong id="crumb">Home</strong></div><div class="topbar-right"><span class="private-note"><svg class="ico"><use href="#i-lock"/></svg><span id="topScope"></span></span><span class="account-initial">A</span></div></header>
+    <div class="mobile-app-tabs" id="mobileAppTabs" role="group" aria-label="App panels" hidden><button id="mobileAssistant" aria-pressed="true">Nova</button><button id="mobileWorkspace" aria-pressed="false" data-i18n="overview">Overview</button></div>
+    <main class="body no-rail" id="productBody">
+      <section class="chat-workspace" id="chatWorkspace" aria-label="Assistant conversation">
+        <header class="assistant-header"><div class="assistant-avatar"><svg class="ico"><use href="#i-spark"/></svg></div><div class="identity-heading"><div class="name-line"><h1 id="assistantName">Assistant</h1><span class="live-dot" aria-label="Available"></span></div><p id="scopeText"></p></div><div class="header-actions"><button class="icon-button" id="newChat" aria-label="New conversation"><svg class="ico"><use href="#i-plus"/></svg></button><button class="icon-button" id="about" aria-label="About your assistant" aria-expanded="false" aria-controls="profilePanel"><svg class="ico"><use href="#i-info"/></svg></button></div></header>
+        <div class="context-line" id="contextLine" hidden><span class="context-tag">CRM</span><svg class="ico"><use href="#i-chevron"/></svg><span data-i18n="springCampaign">Spring collection</span><span class="context-divider"></span><span data-i18n="contextOnly">This campaign context</span></div>
+        <div class="conversation-scroll" id="conversationScroll"><div class="conversation" id="messages" role="log" aria-label="Conversation" aria-live="polite"></div></div>
+        <div class="composer-wrap"><div id="inlineError" class="inline-error" role="alert" hidden></div><form class="composer card" id="composerForm"><label class="sr-only" for="message" id="composerLabel">Message your assistant</label><textarea id="message" rows="2" maxlength="500" placeholder="Message your assistant…"></textarea><div class="composer-bottom"><span class="composer-context"><svg class="ico"><use href="#i-lock"/></svg><span id="composerScope"></span></span><button class="send-button" id="send" aria-label="Send message" type="submit"><svg class="ico"><use href="#i-arrow"/></svg></button></div></form><div class="composer-caption"><span data-i18n="keyboardHint">Enter to send · Shift + Enter for a new line</span><span id="profileStatus"></span></div></div>
+      </section>
+      <aside class="profile-panel" id="profilePanel" hidden aria-label="Assistant details"><div class="panel-header"><h2 data-i18n="aboutTitle">About your assistant</h2><button class="icon-button" id="closeProfile" aria-label="Close assistant details"><svg class="ico"><use href="#i-close"/></svg></button></div><div class="profile-inner"><div class="profile-symbol"><svg class="ico"><use href="#i-spark"/></svg></div><h3 id="profileName"></h3><p id="profileOwnership"></p><dl><div><dt data-i18n="displayName">Display name</dt><dd id="detailName"></dd></div><div><dt data-i18n="personality">Personality</dt><dd id="detailTone"></dd></div><div><dt data-i18n="callsYou">Calls you</dt><dd>Avery</dd></div><div><dt data-i18n="belongsTo">Belongs to</dt><dd id="detailOwner"></dd></div></dl><div class="profile-tip"><svg class="ico"><use href="#i-chat"/></svg><div><strong data-i18n="changeInChat">Change it in conversation.</strong><p data-i18n="changeTip">Ask me to change my name or how I communicate. Your conversations stay with you.</p></div></div><button class="btn edit-workspace" id="editWorkspace" hidden data-i18n="editWorkspace">Edit workspace identity</button><p class="profile-footnote" id="profileFootnote"></p></div></aside>
+      <section class="app-outlet" id="crmPanel" hidden aria-label="CRM campaign"><div class="app-heading"><div><span class="slabel">CRM / <span data-i18n="campaigns">CAMPAIGNS</span></span><h2 data-i18n="springCampaign">Spring collection</h2><p data-i18n="campaignDesc">A thoughtful introduction to the new collection.</p></div><span class="badge plain" data-i18n="draft">Draft</span></div><nav class="app-outlet-tabs" aria-label="Campaign sections"><button class="app-outlet-tab" data-app-tab="overview" data-on data-i18n="overview">Overview</button><button class="app-outlet-tab" data-app-tab="audience" data-i18n="audience">Audience</button><button class="app-outlet-tab" data-app-tab="email" data-i18n="email">Email</button></nav><div id="appContent"></div><div class="app-note"><svg class="ico"><use href="#i-lock"/></svg><span data-i18n="appNote">Chat uses your access to this campaign. Approval is still required before sending.</span></div></section>
+    </main>
+  </div>
+</div>
+<div class="mobile-scrim" id="mobileScrim" hidden></div>
+<div class="toast card ok" id="toast" role="status" hidden></div>
+<dialog id="workspaceDialog" class="identity-dialog"><form id="workspaceForm"><div class="panel-header"><h2 data-i18n="editWorkspace">Edit workspace identity</h2><button class="icon-button" type="button" id="closeDialog" aria-label="Close"><svg class="ico"><use href="#i-close"/></svg></button></div><div class="dialog-content"><p class="operator-note" data-i18n="operatorNote">Operator-only edit · applies to the workspace coordinator, not your personal assistant.</p><label for="workspaceName" data-i18n="displayName">Display name</label><input id="workspaceName" class="field" maxlength="80" required><label for="workspaceTone" data-i18n="personality">Personality</label><textarea id="workspaceTone" class="field" rows="3" maxlength="240"></textarea><p class="muted" data-i18n="operatorGuard">Changing identity never changes the coordinator’s permissions.</p></div><div class="dialog-footer"><button class="btn" id="cancelDialog" type="button" data-i18n="cancel">Cancel</button><button class="btn btn-acc" type="submit" data-i18n="saveIdentity">Save identity</button></div></form></dialog>
+<script src="preview.js"></script>
+</body>
+</html>

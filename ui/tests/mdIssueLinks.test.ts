@@ -13,7 +13,7 @@ function equal(actual: unknown, expected: unknown, what: string): void {
   if (a !== e) throw new Error(`${what}: expected ${e}, got ${a}`);
 }
 
-const render = (text: string) => renderToStaticMarkup(createElement(Md, { text }));
+const render = (text: string) => renderToStaticMarkup(createElement(Md, { text, onOpen: () => undefined }));
 const linked = (html: string) => html.includes('class="lnk num"');
 
 // Prose id is linked.
@@ -74,6 +74,12 @@ const good = anchor("issue:CAD-12", (id) => opened.push(id)) as El;
 equal(good.type, "button", "valid id renders a button");
 good.props.onClick();
 equal(opened, ["CAD-12"], "valid id reaches onOpen");
+
+// No handler: the id is plain text, never a dead button.
+const noHandler = Md({ text: "x" }) as unknown as El;
+const plain = noHandler.props.components.a({ href: "issue:CAD-12", children: "x" }) as El;
+equal(plain.type, "span", "issue id without a handler renders text");
+equal(plain.props.children, "x", "issue id text is kept");
 for (const bad of ["issue:javascript:alert(1)", "issue:", "issue:cad-12", "issue:CAD-12/../x", "issue:CAD-12 ", "issue:A-1", "issue:../CAD-12", "issue:xCAD-12", "issue:CAD-1234567890"]) {
   const el = anchor(bad, (id) => opened.push(id)) as El;
   equal(el.type === "button" || el.type === "a", false, `${bad}: no button or anchor`);

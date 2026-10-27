@@ -19,6 +19,8 @@ import {
   reduceFrame,
   settlePending,
   threadItems,
+  threadRuns,
+  itemMessage,
   type ThreadState,
 } from "../src/features/home/thread";
 import { composerBlock, masterStatus } from "../src/features/home/master";
@@ -285,7 +287,7 @@ async function main() {
     equal(masterStatus(agents([{ alias: "master", state: "stopped" }]), false).kind, "stopped", "stopped");
     equal(masterStatus(agents([{ alias: "master", state: "idle" }]), false), { kind: "running", state: "idle" }, "running");
     equal(
-      masterStatus({ daemon: "unreachable", agents: [], totals: null } as AgentsPayload, false).kind,
+      masterStatus({ daemon: "unreachable", agents: [], totals: null, by_issue: {}, refresh_error: false, snapshot_age_secs: 0, stale: false } as AgentsPayload, false).kind,
       "offline",
       "daemon down",
     );
@@ -316,4 +318,96 @@ main().catch((e) => {
   s = addPending(s, "ui-9", "PR #187 has had no verdict — what should we do?", 20, refs);
   equal([s.pending.length, s.pending[0].refs?.length], [1, 1], "retry keeps refs");
   s = discardPending(s, "ui-9");
+}
+
+// The worker-transcript render grouping: contiguous agent items paint as one
+// turn. `threadItems` stays the flat contract (the canvas feed, the working
+// state, plan anchors and the window all read it), so the grouping is pure.
+{
+  const s = mergePage(null, {
+    thread: { id: "t1" },
+    entries: [
+      entry(1, "operator", "message", "show the board", { message: "m1" }),
+      entry(2, "agent", "thinking", "Reading.", { message: "m1" }),
+      entry(3, "agent", "assistant_text", "Board read.", { message: "m1" }),
+      entry(4, "agent", "tool_call", "Bash: cadence board read", { message: "m1" }),
+      entry(5, "agent", "artifact", "", {
+        message: "m1",
+        payload: { id: "art-a", version: 1, kind: "csv", title: "Board", bytes: 10 },
+      }),
+      entry(6, "agent", "tool_result", "2 issues", { message: "m1" }),
+      entry(7, "agent", "turn_result", "Two issues.", { message: "m1" }),
+      entry(8, "agent", "artifact", "", {
+        message: "m1",
+        payload: { id: "art-b", version: 1, kind: "md", title: "Notes", bytes: 10 },
+      }),
+      entry(9, "agent", "thinking", "Next turn.", { message: "m2" }),
+      entry(10, "agent", "turn_result", "Second answer.", { message: "m2" }),
+      entry(11, "system", "message", "note"),
+    ],
+  });
+  const items = threadItems(s);
+  equal(
+    items.map((i) => i.type),
+    ["operator", "thinking", "commentary", "tools", "artifact", "answer", "artifact", "thinking", "answer", "system"],
+    "grouping does not change the flat items",
+  );
+  const runs = threadRuns(items);
+  equal(
+    runs.map((r) => [r.turn, r.key]),
+    [[false, "e1"], [true, "e2"], [true, "e9"], [false, "e11"]],
+    "one run per turn; every other item is its own row",
+  );
+  const first = runs[1];
+  equal(
+    first.turn ? first.items.map((i) => i.key) : null,
+    ["e2", "e3", "e4", "e5", "e7", "e8"],
+    "the turn keeps its reasoning, tool run, answer and cards",
+  );
+  const second = runs[2];
+  equal(second.turn ? second.items.map((i) => i.type) : null, ["thinking", "answer"], "a turn after an answer starts fresh");
+  equal(
+    runs.flatMap((r) => (r.turn ? r.items : [r.item])).map((i) => i.key),
+    items.map((i) => i.key),
+    "grouping loses and reorders nothing",
+  );
+  equal(threadRuns([]), [], "no items, no runs");
+  // A card on its own is not a turn: it keeps the plain card row.
+  const cards = threadItems(
+    mergePage(null, {
+      thread: { id: "t2" },
+      entries: [
+        entry(1, "agent", "artifact", "", { payload: { id: "art-x", version: 1, kind: "md", title: "X", bytes: 1 } }),
+      ],
+    }),
+  );
+  equal(threadRuns(cards).map((r) => r.turn), [false], "an artifact-only run is not a turn");
+  // A hire proposal stays in its render run so Home can keep the existing
+  // flat card row instead of inventing a trace-only turn.
+  const hired = threadItems(
+    mergePage(null, {
+      thread: { id: "t3" },
+      entries: [
+        entry(1, "operator", "message", "hire someone", { message: "m3" }),
+        entry(2, "agent", "thinking", "Consider the team.", { message: "m3" }),
+        entry(3, "agent", "hire_proposal", "Hire Ana", { message: "m3" }),
+      ],
+    }),
+  );
+  const hiredRuns = threadRuns(hired);
+  equal(hiredRuns.map((r) => r.turn), [false, true], "hire: one render run with the proposal");
+  equal(
+    hiredRuns[1].turn ? hiredRuns[1].items.map((i) => i.type) : null,
+    ["thinking", "hire"],
+    "hire: the proposal stays in the turn",
+  );
+
+  // The operator turn id an item belongs to.
+  equal(
+    [itemMessage(items[0]), itemMessage(items[3]), itemMessage(items[5])],
+    ["m1", "m1", "m1"],
+    "items name their operator turn",
+  );
+  const pending = threadItems(addPending(s, "ui-p", "hi", 1));
+  equal(itemMessage(pending[pending.length - 1]), "ui-p", "a pending row names its message");
 }

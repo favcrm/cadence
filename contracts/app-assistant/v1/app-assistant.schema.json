@@ -2,11 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://cadence.local/contracts/app-assistant/v1/app-assistant.schema.json",
   "title": "Cadence app assistant descriptor",
+  "$comment": "Shape only. The host registry (src/app_assistant.rs, registered_ids and registered_action) owns the valid action ids and each id's input_schema, effect and confirmation; the installer (src/issue/app_assistant.rs) refuses an unknown id or any field that differs from the registry.",
   "type": "object",
   "additionalProperties": false,
   "required": ["contract", "actions"],
   "properties": {
     "contract": {"const": "app-assistant/v1"},
+    "app": {"type": "string", "description": "When present, must equal the manifest's app."},
     "actions": {
       "type": "array",
       "minItems": 1,
@@ -16,11 +18,12 @@
         "additionalProperties": false,
         "required": ["id", "description", "input_schema", "effect", "confirmation"],
         "properties": {
-          "id": {"type": "string", "enum": ["customers.search", "customers.show", "segments.list", "segments.show", "segments.preview", "segments.save", "campaigns.list", "campaigns.show", "campaigns.create_draft", "email.draft", "customer.tags.update"]},
+          "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"},
           "description": {"type": "string", "minLength": 1, "maxLength": 240},
           "input_schema": {"type": "object"},
-          "effect": {"enum": ["read", "draft", "write"]},
-          "confirmation": {"enum": ["none", "permission"]}
+          "effect": {"enum": ["read", "draft", "proposal", "write"]},
+          "confirmation": {"enum": ["none", "permission_required"]},
+          "availability": {"type": "string"}
         }
       }
     }

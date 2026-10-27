@@ -3,7 +3,9 @@
 This inventory was taken during the reduced-gate window; CAD-1102 ended that
 window and made the current gate permanent. Required branch checks observed at the start of CAD-1088 are **fmt,
 clippy, test, build, ui**; neither `test-shard` nor `test-once` is required.
-No branch/ruleset settings are changed by this cleanup.
+No branch/ruleset settings are changed by this cleanup. The last three rows
+were added when those workflows landed (CAD-1455, CAD-1506, CAD-1475); the
+rest of the table records the CAD-1088 snapshot.
 
 | Workflow | Triggers | Current role |
 | --- | --- | --- |
@@ -13,27 +15,48 @@ No branch/ruleset settings are changed by this cleanup.
 | `clean-install.yml` | Filtered PR, dispatch | Installer fixtures retired; native installation dispatch scaffolding remains |
 | `handover.yml` | PR, main push | Shell syntax/shellcheck active; fixture echoes are retirement notices |
 | `obsolete-merge-groups.yml` | Queue ref deletion, filtered PR | Active stale-run janitor; old contract fixture retired |
-| `stress.yml` | Dispatch | Dormant legacy suite consumer; restore its inputs before use |
-| `mutation.yml` | Dispatch | Legacy integration-target mutation scaffold; not proof for a deleted target |
-| `test-feedback.yml` | Dispatch | Dormant legacy feedback/replay consumer |
-| `ci-selection-benchmark.yml` | Dispatch | Dormant full-versus-selected integration benchmark |
-| `nextest-shard-benchmark.yml` | Dispatch | Dormant shard/inventory benchmark |
+| `stress.yml` | Dispatch | Manual flake loop over a nextest filterset; runs against the live suite |
+| `mutation.yml` | Dispatch | Manual guard-removal proof; takes a live cargo test target and test name |
+| `ci-selection-benchmark.yml` | Dispatch | Manual full-versus-selected integration benchmark |
+| `nextest-shard-benchmark.yml` | Dispatch | Manual shard/inventory benchmark |
+| `promotion-completion.yml` | `staging` run completion on main | Binds a promoted candidate's signed receipt to the finished upstream run and attests a small completion receipt; it never approves, rebuilds or deploys (CAD-1455) |
+| `release-mirror.yml` | Dispatch | Manual retry that copies an already published release into the owned release store; no build, retag or byte replacement (CAD-1506) |
+| `release-visibility.yml` | Dispatch on main | Operator-owned private→public flip of one published catalogue record after the `production` environment approval; never writes artifacts, deletes or withdraws (CAD-1475) |
 
 Dormant dispatch files/scripts are retained as rebuild scaffolding in this
 increment, not deleted or advertised as working checks. Do not dispatch them
 as evidence that the retired suite passes. A separate decision should select
-which to rebuild or archive rather than leaving five misleading manual tools
+which to rebuild or archive rather than leaving misleading manual tools
 indefinitely. `cadence-nextest` itself is still live in the review recipe.
+
+## Archived in the deep test audit
+
+The dormant `test-feedback` workflow and its `scripts/test-feedback.py` were
+archived: both allowlisted cases named cargo test targets (`backup_rollout`,
+`threads`) that CAD-1073 deleted, so the workflow could not have run. The
+`scripts/split-integration-tests` and `scripts/split-board-tests` generators
+were archived for the same reason — their source suites (`tests/integration.rs`,
+`tests/board.rs`) are gone, so neither could regenerate anything. The
+`e2e` Cargo feature and `scripts/e2e/mvp.sh` went with the MVP journey they
+existed for (`tests/e2e_mvp.rs`, `tests/e2e/`). `scripts/split-map-sync` and
+`scripts/shard-weights` stay: they are inert until a reviewed inventory
+restoration supplies their inputs, and `AGENTS.md` still names the split
+manifests as retired rather than deleted.
 
 ## Bounded simplification implemented here
 
 - Add trusted-base PR feedback selection. Isolated docs: no Rust or UI
   compilation, including no cross-builds. Isolated UI source: UI validation
   and embedded build; unrelated default Rust clippy/floor/build commands are
-  not applicable. All shared/config/workflow/script/mixed/unknown changes:
-  full validation. Classifier missing or failing: full validation. Required
-  contexts remain and say when commands were not run; merge-group, main,
-  tags and dispatch always keep real full gates. This PR adds the policy
+  not applicable. Edits confined to pre-existing independent top-level
+  `tests/<name>.rs` targets narrow the `test-shards` matrix's integration
+  selection only (lib/bins suites and every zero-target guard unchanged).
+  The required `test` check is the aggregate: it merges every shard's
+  junit and re-runs the coverage guard (CAD-1480). All
+  shared/config/workflow/script/mixed/unknown changes: full validation.
+  Classifier missing or failing: full validation. Required contexts remain
+  and say when commands were not run; merge-group, main, tags and dispatch
+  always keep real full gates. This PR adds the policy
   for later PRs: its base lacks the classifier, so bootstrap is full.
 - Fold the echo-only shard runner and separate doctest runner into required
   `test`. Run doctests and the four-test floor as separate blocking steps

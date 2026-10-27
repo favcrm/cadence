@@ -12,15 +12,26 @@ export const SIGN_IN_COMMAND = "cadence ui login";
 
 export const READ_ONLY_REASON = "The board is read-only — the server refuses every write.";
 
-/** Why writes are disabled for this client, or null when they are not. */
+/** Why writes are disabled for this client, or null when they are not.
+ *  `meta === null` means the access check has no answer yet (still
+ *  checking, or the check itself could not be confirmed) — the caller
+ *  supplies its own checking/unavailable line; this stays a gate, never
+ *  a grant. */
 export function writeBlock(meta: Meta | null): string | null {
   if (!meta) return null;
   if (meta.read_only) return READ_ONLY_REASON;
+  // CAD-1193: `signed_in: null` — the daemon could not answer the
+  // session check inside the metadata bound. Writes stay gated with an
+  // honest unavailable reason: unknown is not signed-out, and it is
+  // never a silent pass.
+  if (meta.signed_in === null) {
+    return "The board could not confirm this session — retry in a moment.";
+  }
   // An older server that reports no `operator` field predates sessions.
   if (meta.signed_in === false) {
     const cmd = meta.login_hint ?? SIGN_IN_COMMAND;
     if (meta.tab_signed_out) {
-      return `This tab is not signed in — each tab signs in on its own. Run ${cmd} and open the new link in this tab.`;
+      return `This browser isn’t signed in — run ${cmd} and open the new link here.`;
     }
     return `Sign in with ${cmd} to act as the operator.`;
   }
@@ -33,9 +44,28 @@ export function writeBlock(meta: Meta | null): string | null {
 export function kickoffBlock(meta: Meta | null): string | null {
   const writes = writeBlock(meta);
   if (writes) return writes;
+  if (meta?.operator === null) {
+    return "Kick off is the operator's decision — the board could not confirm whether this session may dispatch. It is re-checking; retry in a moment.";
+  }
   if (meta?.operator !== true) {
     return "Kick off is the operator's decision — this session is not the operator's.";
   }
+  return null;
+}
+
+/** The reason a non-operator session is refused hiring and job edits. */
+export const OPERATOR_HIRE_REASON = "Only the operator can hire.";
+
+/** Why hiring (and editing an agent's job) is disabled, or null when this
+ *  session may. Both go over operator-only routes, so a signed-in member
+ *  (`operator: false`) passes [`writeBlock`] but is still refused. */
+export function hireBlock(meta: Meta | null): string | null {
+  const writes = writeBlock(meta);
+  if (writes) return writes;
+  if (meta?.operator === null) {
+    return "Only the operator can hire — the board could not confirm whether this session is the operator's. It is re-checking; retry in a moment.";
+  }
+  if (meta?.operator !== true) return OPERATOR_HIRE_REASON;
   return null;
 }
 

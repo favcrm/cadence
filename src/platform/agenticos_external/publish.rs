@@ -183,6 +183,16 @@ pub fn valid_digest(raw: &str) -> bool {
             .all(|b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// The one digest form the publish path freezes and compares: bare
+/// 64-hex (callers validate with `valid_digest`), exactly what the door, the import receipt and
+/// `SendBinding::validate` speak. Custody (`app_tool_results.asset_digest`)
+/// keeps `sha256:<hex>`; an effect staged before CAD-1304 froze that form
+/// and cannot be rewritten (its digest covers the frozen authority), so
+/// every read side strips the prefix before comparing.
+pub fn bare_digest(raw: &str) -> &str {
+    raw.strip_prefix("sha256:").unwrap_or(raw)
+}
+
 pub fn valid_media_key(raw: &str) -> bool {
     (1..=200).contains(&raw.len())
         && raw
@@ -289,8 +299,16 @@ pub fn media_key_authorizes_connection(media_key: &str, connection: &str, digest
 
 // ---------- frozen send binding ----------
 
+/// Source authority for an exact frozen send. A standalone draft is never
+/// disguised as a fabricated app run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationSource {
+    Run { run_id: String },
+    SocialDraft { draft_id: String, revision: i64 },
+}
+
 /// The exact frozen binding one stable key names: one destination, one
-/// caption digest, one image digest, one approved Cadence run/effect.
+/// caption digest, one image digest, and a real typed authority source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendBinding {
     pub key: String,
@@ -299,7 +317,7 @@ pub struct SendBinding {
     pub toolkit: Toolkit,
     pub caption_digest: String,
     pub image_digest: Option<String>,
-    pub cadence_run_id: String,
+    pub source: PublicationSource,
     pub cadence_effect_id: String,
     pub grant_id: String,
 }
@@ -335,8 +353,16 @@ impl SendBinding {
                 ));
             }
         }
-        if self.cadence_run_id.is_empty() || self.cadence_run_id.len() > 120 {
-            return Err(Refusal::new("bad_run", "Cadence run identity is invalid"));
+        match &self.source {
+            PublicationSource::Run { run_id } if run_id.is_empty() || run_id.len() > 120 => {
+                return Err(Refusal::new("bad_run", "Cadence run identity is invalid"));
+            }
+            PublicationSource::SocialDraft { draft_id, revision }
+                if draft_id.is_empty() || draft_id.len() > 120 || *revision < 1 =>
+            {
+                return Err(Refusal::new("bad_draft", "social draft source is invalid"));
+            }
+            _ => {}
         }
         if self.cadence_effect_id.is_empty() || self.cadence_effect_id.len() > 120 {
             return Err(Refusal::new(
@@ -424,7 +450,7 @@ impl SendGrant {
                 "send grant has no uses left",
             ));
         }
-        if now_epoch < self.not_before_epoch || now_epoch > self.expires_at_epoch {
+        if now_epoch < self.not_before_epoch || now_epoch >= self.expires_at_epoch {
             return Err(Refusal::new(
                 "grant_window",
                 "send grant is outside its validity window",
@@ -694,6 +720,73 @@ impl Default for FakePublishLedger {
     }
 }
 
+/// CAD-1291: the owner's standing publish grant for one destination, as the
+/// hosted door lists it. The owner mints it once on AgenticOS (company,
+/// connection, destination and toolkit scoped, no content digests,
+/// revocable); Cadence never mints one. Each post is still approved
+/// by the Cadence operator and re-checked here; AgenticOS re-checks the
+/// destination, company and revocation at preflight and send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundGrant {
+    pub id: String,
+    pub connection_id: String,
+    pub destination_id: String,
+    pub toolkit: String,
+    pub revoked: bool,
+}
+
+impl FoundGrant {
+    /// Strict wire parse: anything but a standing grant record is refused.
+    pub fn from_wire(wire: &serde_json::Value) -> Option<Self> {
+        let text = |field: &str| wire.get(field)?.as_str().map(str::to_owned);
+        if text("kind")? != "standing" {
+            return None;
+        }
+        Some(Self {
+            id: text("id").filter(|id| valid_grant_id(id))?,
+            connection_id: text("connectionId")?,
+            destination_id: text("destinationId")?,
+            toolkit: text("toolkit")?,
+            revoked: !wire.get("revokedAt")?.is_null(),
+        })
+    }
+}
+
+/// The one account the approved post goes to.
+#[derive(Debug, Clone)]
+pub struct GrantWant<'a> {
+    pub connection_id: &'a str,
+    pub destination_id: &'a str,
+    pub toolkit: &'a str,
+}
+
+/// Pick the live standing grant for exactly this destination. No grant, a
+/// grant for another account or a revoked one never authorizes: the approved post stays unsent.
+pub fn select_grant(found: &[FoundGrant], want: &GrantWant<'_>) -> Result<String, Refusal> {
+    let own: Vec<&FoundGrant> = found
+        .iter()
+        .filter(|grant| {
+            grant.connection_id == want.connection_id
+                && grant.destination_id == want.destination_id
+                && grant.toolkit == want.toolkit
+        })
+        .collect();
+    if own.is_empty() {
+        return Err(Refusal::new(
+            "grant_required",
+            "the owner has not allowed Cadence to publish to this account in AgenticOS",
+        ));
+    }
+    let live: Vec<&&FoundGrant> = own.iter().filter(|grant| !grant.revoked).collect();
+    if live.is_empty() {
+        return Err(Refusal::new(
+            "grant_revoked",
+            "the owner revoked publishing to this account in AgenticOS",
+        ));
+    }
+    Ok(live[0].id.clone())
+}
+
 /// Daemon-side dispatch observation: the party that speaks to the provider
 /// door, so posted reports verify against evidence the daemon itself
 /// observed — never operator-supplied JSON alone. Production leaves the
@@ -714,6 +807,14 @@ pub trait PublishSender: Send + Sync {
     /// ambiguity instead of claiming a row it cannot send.
     fn preflight(&self, _binding: &SendBinding) -> Preflight {
         Preflight::Approved
+    }
+    /// CAD-1291: list the owner's standing grants for one destination. The
+    /// default refuses, so a sender with no hosted door can never invent one.
+    fn find_grant(&self, _destination_id: &str) -> Result<Vec<FoundGrant>, Refusal> {
+        Err(Refusal::new(
+            "grant_required",
+            "this sender cannot look up an owner grant",
+        ))
     }
 }
 
@@ -875,6 +976,15 @@ mod tests {
     }
 
     #[test]
+    fn bare_digest_accepts_the_custody_form_and_the_wire_form() {
+        let hex = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        assert!(!valid_digest(&format!("sha256:{hex}")));
+        assert_eq!(bare_digest(&format!("sha256:{hex}")), hex);
+        assert_eq!(bare_digest(hex), hex);
+        assert!(valid_digest(bare_digest(&format!("sha256:{hex}"))));
+    }
+
+    #[test]
     fn caption_digest_is_utf8_not_utf16_length_prefixed() {
         // Pinned rule: digest input is UTF-8 bytes of the exact caption.
         assert_eq!(caption_digest_of("hello"), sha256_hex("hello".as_bytes()));
@@ -918,5 +1028,98 @@ mod tests {
             "con_harbour_ig",
             &digest_value
         ));
+    }
+    // ---- CAD-1291: select the owner's standing grant for this destination ----
+
+    fn grant_wire() -> serde_json::Value {
+        serde_json::json!({"id":"dpq_standing_001","kind":"standing","workspaceId":"ws_a",
+            "connectionId":"con_ig","destinationId":"1784","toolkit":"instagram",
+            "dailyCap":20,"remainingToday":20,"revokedAt": serde_json::Value::Null})
+    }
+
+    fn want() -> GrantWant<'static> {
+        GrantWant {
+            connection_id: "con_ig",
+            destination_id: "1784",
+            toolkit: "instagram",
+        }
+    }
+
+    #[test]
+    fn standing_grant_selected_only_for_its_own_destination() {
+        let grant = FoundGrant::from_wire(&grant_wire()).unwrap();
+        // Positive control.
+        assert_eq!(
+            select_grant(std::slice::from_ref(&grant), &want()).unwrap(),
+            "dpq_standing_001"
+        );
+        assert_eq!(
+            select_grant(&[], &want()).unwrap_err().code,
+            "grant_required"
+        );
+        for other in [
+            GrantWant {
+                destination_id: "9999",
+                ..want()
+            },
+            GrantWant {
+                connection_id: "con_other",
+                ..want()
+            },
+            GrantWant {
+                toolkit: "facebook",
+                ..want()
+            },
+        ] {
+            assert_eq!(
+                select_grant(std::slice::from_ref(&grant), &other)
+                    .unwrap_err()
+                    .code,
+                "grant_required"
+            );
+        }
+    }
+
+    #[test]
+    fn revoked_standing_grant_is_never_selected() {
+        let mut revoked = grant_wire();
+        revoked["revokedAt"] = serde_json::json!("2026-10-09T00:10:00.000Z");
+        let revoked = FoundGrant::from_wire(&revoked).unwrap();
+        assert_eq!(
+            select_grant(std::slice::from_ref(&revoked), &want())
+                .unwrap_err()
+                .code,
+            "grant_revoked"
+        );
+        // A live grant beside a revoked one still selects.
+        let live = FoundGrant::from_wire(&grant_wire()).unwrap();
+        assert!(select_grant(&[revoked, live], &want()).is_ok());
+    }
+
+    #[test]
+    fn only_well_formed_standing_records_parse() {
+        let mut per_post = grant_wire();
+        per_post["kind"] = serde_json::json!("post");
+        let mut bad_id = grant_wire();
+        bad_id["id"] = serde_json::json!("grant");
+        let mut no_revoked = grant_wire();
+        no_revoked.as_object_mut().unwrap().remove("revokedAt");
+        for wire in [per_post, bad_id, no_revoked] {
+            assert!(FoundGrant::from_wire(&wire).is_none(), "{wire}");
+        }
+    }
+
+    #[test]
+    fn a_sender_without_a_hosted_door_cannot_find_a_grant() {
+        struct Plain;
+        impl PublishSender for Plain {
+            fn execute(&self, _: &SendBinding) -> Result<LedgerOutcome, Refusal> {
+                unreachable!()
+            }
+            fn status(&self, _: &str) -> Result<LedgerOutcome, Refusal> {
+                unreachable!()
+            }
+        }
+        assert_eq!(Plain.find_grant("1784").unwrap_err().code, "grant_required");
     }
 }

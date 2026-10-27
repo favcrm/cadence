@@ -15,14 +15,16 @@ moduleLoader.prototype.require = function (this: unknown, id: string) {
   return originalRequire.apply(this, arguments);
 };
 const React = require("react") as typeof import("react");
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const Board = (require("../src/features/projects/Board") as typeof import("../src/features/projects/Board")).default;
+const BoardComponent = (require("../src/features/projects/Board") as typeof import("../src/features/projects/Board")).default;
+const Board = (props: React.ComponentProps<typeof BoardComponent>) => React.createElement(LocaleProvider, null, React.createElement(BoardComponent, props));
 const { NO_FILTERS } = require("../src/lib/filters") as typeof import("../src/lib/filters");
 function assert(value: unknown, what: string): asserts value { if (!value) throw new Error(what); }
 const card = (id: string, title: string, status: string): IssueCard => ({
   id, title, status, project: "cadence", status_source: "file", priority: "P2",
   blocked_by: [], relates: [], refs: [], container: false, ready: true, blocked: false,
-  created: "2026-09-27", rev: "fixture", counts: { comments: 0, artifacts: 0, refs: 0 },
+  created: "2026-09-27", rev: "fixture", counts: { comments: 0, artifacts: 0, refs: 0 }, paths: [], tags: [], work: { type: "task", type_source: "implicit", weight: 1 },
   checks: { done: 0, total: 0 },
 });
 const active = card("CAD-1", "Active task", "doing");

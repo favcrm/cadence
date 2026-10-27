@@ -1,0 +1,14 @@
+{
+  "input": {
+    "v": 1,
+    "op": "app.manifest.preflight",
+    "input": {
+      "manifest": "---\nname: demo\nneeds:\n  requires:\n    core: \">=0.2.0\"\n---\nbody\n"
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "app.manifest.preflight",
+    "value": {}
+  }
+}

@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -33,488 +32,40 @@ use crate::worktree;
 
 /// How many trailing lines of a failing step's output the report keeps.
 const TAIL_LINES: usize = 40;
-/// Config file `run` reads from the base branch head (never the PR tree
-/// or the reviewer's working tree).
-pub const CONFIG_FILE: &str = "cadence-review.toml";
-/// Required and optional keys, named when the config file is absent.
-const CONFIG_KEYS: &str = "Required keys: prepare, gates, full_suite, test_globs, \
-     test_command, stress_pattern; optional: test_command_lib, [timeouts] \
-     prepare_secs gate_secs stress_secs full_secs test_secs git_secs gh_secs";
 
 // ---------------------------------------------------------------------------
-// Config
+// Config — schema, defaults and validation live in `review::config`.
 // ---------------------------------------------------------------------------
 
-/// `stress_pattern` accepts a single string or a list of strings; a new
-/// test is stressed when its name or added body contains any of them.
-#[derive(Clone, Debug, Default)]
-pub struct Patterns(pub Vec<String>);
+mod config;
 
-impl<'de> Deserialize<'de> for Patterns {
-    fn deserialize<D>(d: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum OneOrMany {
-            One(String),
-            Many(Vec<String>),
-        }
-        Ok(match OneOrMany::deserialize(d)? {
-            OneOrMany::One(s) => Patterns(vec![s]),
-            OneOrMany::Many(v) => Patterns(v),
-        })
-    }
-}
+use config::{backend_label, result_format_label, safe_rel_path, CONFIG_KEYS};
+pub use config::{
+    Patterns, ResultFormat, ReviewBackend, ReviewConfig, RunnerConfig, SuiteScope, Timeouts,
+    CONFIG_FILE,
+};
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct Timeouts {
-    /// Per `prepare` command [default 900].
-    #[serde(default = "t_prepare")]
-    pub prepare_secs: u64,
-    /// Per `gates` command [default 1800].
-    #[serde(default = "t_gate")]
-    pub gate_secs: u64,
-    /// Per single stress run [default 900].
-    #[serde(default = "t_stress")]
-    pub stress_secs: u64,
-    /// The `full_suite` command [default 3600].
-    #[serde(default = "t_full")]
-    pub full_secs: u64,
-    /// Per isolated `test_command` run [default 900].
-    #[serde(default = "t_test")]
-    pub test_secs: u64,
-    /// Per git operation [default 300].
-    #[serde(default = "t_git")]
-    pub git_secs: u64,
-    /// Per `gh` call [default 60].
-    #[serde(default = "t_gh")]
-    pub gh_secs: u64,
-}
+// ---------------------------------------------------------------------------
+// Pure diff/output analysis — public names remain available from review.
+// ---------------------------------------------------------------------------
 
-/// The subprocess backend used for the full suite and isolated reruns.
-/// Keeping this explicit prevents a nextest suite from being adjudicated by
-/// a cargo child with different process and retry semantics.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ReviewBackend {
-    #[default]
-    Cargo,
-    Nextest,
-}
-
-/// Machine-readable result format emitted by the configured backend.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ResultFormat {
-    #[default]
-    Cargo,
-    Junit,
-}
-
-fn default_result_path() -> String {
-    "target/nextest/cadence/junit.xml".into()
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct RunnerConfig {
-    /// Backend used by both `full_suite` and `test_command`.
-    #[serde(default)]
-    pub backend: ReviewBackend,
-    /// How an individual command proves what ran and what failed.
-    #[serde(default)]
-    pub result_format: ResultFormat,
-    /// Repo-relative report path written by a structured backend.
-    #[serde(default = "default_result_path")]
-    pub result_path: String,
-}
-
-impl Default for RunnerConfig {
-    fn default() -> Self {
-        Self {
-            backend: ReviewBackend::Cargo,
-            result_format: ResultFormat::Cargo,
-            result_path: default_result_path(),
-        }
-    }
-}
-
-fn t_prepare() -> u64 {
-    900
-}
-fn t_gate() -> u64 {
-    1800
-}
-fn t_stress() -> u64 {
-    900
-}
-fn t_full() -> u64 {
-    3600
-}
-fn t_test() -> u64 {
-    900
-}
-fn t_git() -> u64 {
-    300
-}
-fn t_gh() -> u64 {
-    60
-}
-
-impl Default for Timeouts {
-    fn default() -> Self {
-        Self {
-            prepare_secs: t_prepare(),
-            gate_secs: t_gate(),
-            stress_secs: t_stress(),
-            full_secs: t_full(),
-            test_secs: t_test(),
-            git_secs: t_git(),
-            gh_secs: t_gh(),
-        }
-    }
-}
-
-/// Coverage of the configured review suite; CI remains responsible for
-/// the complete merge-group inventory when a recipe chooses a baseline.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum SuiteScope {
-    #[default]
-    Full,
-    ReviewBaseline,
-}
-
-impl SuiteScope {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Full => "Full suite",
-            Self::ReviewBaseline => "Review baseline",
-        }
-    }
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::ReviewBaseline => "review-baseline",
-        }
-    }
-}
-
-/// `cadence-review.toml` — every step the verb performs is data here.
-#[derive(Clone, Debug, Deserialize)]
-pub struct ReviewConfig {
-    /// Commands run once in the review checkout before gating (build
-    /// steps, dependency links).
-    pub prepare: Vec<String>,
-    /// Ordered quality gates; the first failure stops the sequence.
-    pub gates: Vec<String>,
-    /// Configured suite, run once. Legacy key retained for consumers.
-    pub full_suite: String,
-    /// Describe coverage honestly; older recipes retain full-suite semantics.
-    #[serde(default)]
-    pub suite_scope: SuiteScope,
-    /// Diff paths that count as test files (`*`/`**`/`?` globs).
-    pub test_globs: Vec<String>,
-    /// How one test runs alone; `{test}` = fn name, `{file}` = diff
-    /// path, `{target}` = file stem (cargo `--test <target>`).
-    pub test_command: String,
-    /// Optional (CAD-799): how a unit test whose file sits outside
-    /// `test_globs` runs alone — a `src/` unit test has no `--test
-    /// <stem>` target, only a module-qualified name like
-    /// `rollout::tests::x`. `{test}` substitutes that full name.
-    /// Absent means an unlocatable test stays `inconclusive`, the
-    /// pre-CAD-799 behavior.
-    #[serde(default)]
-    pub test_command_lib: Option<String>,
-    /// Substrings marking a new test as "waits on daemon state" —
-    /// matched tests are stressed `--stress` times each.
-    #[serde(default)]
-    pub stress_pattern: Patterns,
-    #[serde(default)]
-    pub timeouts: Timeouts,
-    /// Optional runner contract. The default preserves the historical cargo
-    /// text path; nextest activation must opt into a structured report.
-    #[serde(default)]
-    pub runner: RunnerConfig,
-}
-
-impl ReviewConfig {
-    /// Load `<root>/cadence-review.toml` from disk; a missing file names
-    /// the required keys so a fresh repo can write one without guessing.
-    /// `run` never reads the working tree — see `config_at_base`.
-    pub fn load(root: &Path) -> Result<Self> {
-        let path = root.join(CONFIG_FILE);
-        if !path.is_file() {
-            return Err(Error::rejected(format!(
-                "no {CONFIG_FILE} at {} — `cadence review` reads its steps \
-                 from that file. {CONFIG_KEYS}",
-                root.display()
-            )));
-        }
-        let text = std::fs::read_to_string(&path)?;
-        Self::parse(&text, &path.display().to_string())
-    }
-
-    /// Parse and validate config text; `origin` (a path, or
-    /// `<sha>:cadence-review.toml`) names the source in every error.
-    pub fn parse(text: &str, origin: &str) -> Result<Self> {
-        let cfg: ReviewConfig = toml::from_str(text)
-            .map_err(|e| Error::rejected(format!("{origin} is not valid TOML: {e}")))?;
-        if cfg.gates.is_empty() {
-            return Err(Error::rejected(format!(
-                "{origin}: `gates` must name at least one command"
-            )));
-        }
-        if cfg.test_globs.is_empty() {
-            return Err(Error::rejected(format!(
-                "{origin}: `test_globs` must name at least one pattern"
-            )));
-        }
-        if !cfg.test_command.contains("{test}") {
-            return Err(Error::rejected(format!(
-                "{origin}: `test_command` must contain a {{test}} placeholder"
-            )));
-        }
-        if let Some(lib) = &cfg.test_command_lib {
-            if !lib.contains("{test}") {
-                return Err(Error::rejected(format!(
-                    "{origin}: `test_command_lib` must contain a {{test}} placeholder"
-                )));
-            }
-        }
-        if cfg.runner.result_format == ResultFormat::Junit
-            && !safe_rel_path(&cfg.runner.result_path)
-        {
-            return Err(Error::rejected(format!(
-                "{origin}: runner.result_path must be a safe repo-relative path"
-            )));
-        }
-        if cfg.runner.backend == ReviewBackend::Nextest {
-            if cfg.runner.result_format != ResultFormat::Junit {
-                return Err(Error::rejected(format!(
-                    "{origin}: nextest requires runner.result_format = 'junit'"
-                )));
-            }
-            let isolation_cmds = std::iter::once(&cfg.test_command)
-                .chain(cfg.test_command_lib.iter())
-                .collect::<Vec<_>>();
-            if !command_mentions_nextest(&cfg.full_suite)
-                || !isolation_cmds.iter().all(|c| command_mentions_nextest(c))
-            {
-                return Err(Error::rejected(format!(
-                    "{origin}: nextest backend requires full_suite and every test_command to use scripts/cadence-nextest"
-                )));
-            }
-            if !isolation_cmds
-                .iter()
-                .all(|c| c.contains("--exact") && c.contains("--"))
-            {
-                return Err(Error::rejected(format!(
-                    "{origin}: nextest test commands must use an exact libtest filter after '--'"
-                )));
-            }
-        }
-        Ok(cfg)
-    }
-}
-
-fn command_mentions_nextest(command: &str) -> bool {
-    command.split_whitespace().any(|part| {
-        part.trim_matches(|c| c == '\'' || c == '"')
-            .ends_with("cadence-nextest")
-    })
-}
-
-fn backend_label(backend: ReviewBackend) -> &'static str {
-    match backend {
-        ReviewBackend::Cargo => "cargo",
-        ReviewBackend::Nextest => "nextest",
-    }
-}
-
-fn result_format_label(format: ResultFormat) -> &'static str {
-    match format {
-        ResultFormat::Cargo => "cargo-text",
-        ResultFormat::Junit => "junit",
-    }
-}
+mod analysis;
+pub use analysis::{
+    extract_failed_tests, glob_match, parse_new_tests, schema_migration_hit, suite_modules,
+    test_command, NewTest,
+};
 
 // ---------------------------------------------------------------------------
 // Flake ledger and host load
 // ---------------------------------------------------------------------------
 
-/// `<state>/reviews/flakes.jsonl` — one line per sighting of a test that
-/// failed in the full run but passed alone on the gated tree and on the
-/// base. The ledger is the quarantine: no attribute in the code.
-pub const FLAKE_LEDGER: &str = "flakes.jsonl";
-/// Distinct PR heads a flake needs sightings on before it stops
-/// blocking — repeated reviews of one head never qualify on their own.
-pub const KNOWN_FLAKE_HEADS: usize = 3;
-const FLAKE_WINDOW_SECS: i64 = 14 * 24 * 60 * 60;
-const FLAKE_LOCK_WAIT: Duration = Duration::from_secs(5);
+mod flakes;
 
-/// What the ledger holds for one `(repo, test)` after a sighting.
-#[derive(Debug, PartialEq)]
-pub struct Sightings {
-    /// Every historical sighting, this one included.
-    pub total: u64,
-    /// Distinct nonempty heads dated within the last 14 days.
-    pub heads: usize,
-}
-
-impl Sightings {
-    pub fn known_flake(&self) -> bool {
-        self.heads >= KNOWN_FLAKE_HEADS
-    }
-}
-
-/// Append `entry` (`repo`, `test`, `head`, …) and return the sightings
-/// of its `(repo, test)` now on record. The read and the append happen
-/// under an exclusive `flock` on the ledger, so concurrent reviews see
-/// exact counts; each line is one `write_all`, so appends never fuse.
-/// Malformed lines are skipped.
-fn normalize_flake_repo(repo: &str) -> Result<String> {
-    let repo = repo.trim();
-    let slug = repo
-        .strip_prefix("https://github.com/")
-        .or_else(|| repo.strip_prefix("http://github.com/"))
-        .or_else(|| repo.strip_prefix("git@github.com:"))
-        .unwrap_or(repo)
-        .trim_end_matches('/');
-    let slug = slug.strip_suffix(".git").unwrap_or(slug);
-    let parts: Vec<_> = slug.split('/').collect();
-    if parts.len() != 2
-        || parts.iter().any(|part| {
-            part.is_empty()
-                || *part == "."
-                || *part == ".."
-                || !part
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
-        })
-    {
-        return Err(Error::rejected(
-            "flake repo must be owner/name or a GitHub repository URL",
-        ));
-    }
-    Ok(slug.to_ascii_lowercase())
-}
-
-fn lock_flake_file(file: &std::fs::File, wait: Duration) -> Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let deadline = Instant::now() + wait;
-    loop {
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::WouldBlock
-            && error.kind() != std::io::ErrorKind::Interrupted
-        {
-            return Err(error.into());
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::rejected(
-                "timed out waiting for the flake ledger lock",
-            ));
-        }
-        std::thread::sleep(
-            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
-        );
-    }
-}
-
-fn ledger_entries(text: &str) -> Vec<Value> {
-    text.lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|row| row["test"].as_str().is_some())
-        .collect()
-}
-
-fn flake_sightings(rows: &[Value], entry: &Value, now: i64) -> Sightings {
-    let repo = entry["repo"]
-        .as_str()
-        .and_then(|r| normalize_flake_repo(r).ok());
-    let matching: Vec<_> = rows
-        .iter()
-        .filter(|row| {
-            row["test"] == entry["test"]
-                && (row.get("repo").is_none()
-                    || row["repo"].is_null()
-                    || row["repo"]
-                        .as_str()
-                        .and_then(|r| normalize_flake_repo(r).ok())
-                        .is_some_and(|r| Some(r) == repo))
-        })
-        .collect();
-    let heads: BTreeSet<_> = matching
-        .iter()
-        .filter(|row| {
-            row["at"]
-                .as_str()
-                .and_then(time::parse_iso)
-                .is_some_and(|at| at >= now - FLAKE_WINDOW_SECS && at <= now)
-        })
-        .filter_map(|row| row["head"].as_str().filter(|head| !head.is_empty()))
-        .collect();
-    Sightings {
-        total: matching.len() as u64,
-        heads: heads.len(),
-    }
-}
-
-/// Read historical sightings without creating or modifying the ledger.
-/// Test matching is exact; stale and undated records remain visible.
-pub fn read_flakes(ledger: &Path, test: Option<&str>) -> Result<Vec<Value>> {
-    let text = match std::fs::read_to_string(ledger) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
-    Ok(ledger_entries(&text)
-        .into_iter()
-        .filter(|row| test.is_none_or(|test| row["test"].as_str() == Some(test)))
-        .collect())
-}
-
-pub fn print_flakes(state_dir: PathBuf, test: Option<String>) -> Result<()> {
-    for row in read_flakes(
-        &state_dir.join("reviews").join(FLAKE_LEDGER),
-        test.as_deref(),
-    )? {
-        println!("{}", serde_json::to_string(&row)?);
-    }
-    Ok(())
-}
-
-pub fn record_flake(ledger: &Path, entry: &Value) -> Result<Sightings> {
-    use std::io::{Read, Write};
-    let mut entry = entry.clone();
-    let repo = entry["repo"]
-        .as_str()
-        .ok_or_else(|| Error::rejected("flake entry requires repo"))?;
-    entry["repo"] = json!(normalize_flake_repo(repo)?);
-    if entry["test"].as_str().is_none_or(str::is_empty) {
-        return Err(Error::rejected("flake entry requires a nonempty test"));
-    }
-    if let Some(dir) = ledger.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .append(true)
-        .create(true)
-        .open(ledger)?;
-    lock_flake_file(&file, FLAKE_LOCK_WAIT)?;
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    let mut rows = ledger_entries(&text);
-    rows.push(entry.clone());
-    let seen = flake_sightings(&rows, &entry, time::now_epoch());
-    file.write_all(format!("{}\n", serde_json::to_string(&entry)?).as_bytes())?;
-    Ok(seen)
-}
+#[cfg(test)]
+use flakes::{flake_sightings, lock_flake_file, normalize_flake_repo, FLAKE_WINDOW_SECS};
+pub use flakes::{
+    print_flakes, read_flakes, record_flake, Sightings, FLAKE_LEDGER, KNOWN_FLAKE_HEADS,
+};
 
 /// The first lines of `test`'s panic in a full-suite output — enough to
 /// tell two sightings apart without storing the whole log.
@@ -1183,286 +734,29 @@ fn set_failure_reports(report: &mut Value, comparisons: &[Value]) {
     report["isolated"] = json!(comparisons);
 }
 
-// ---------------------------------------------------------------------------
-// Pure helpers — unit-tested without IO
-// ---------------------------------------------------------------------------
-
-/// `*`/`**`/`?` glob match: `*` stays inside a path component, `**`
-/// crosses directories, `?` is one non-`/` character.
-pub fn glob_match(pattern: &str, path: &str) -> bool {
-    glob_rec(pattern.as_bytes(), path.as_bytes())
-}
-
-fn glob_rec(p: &[u8], s: &[u8]) -> bool {
-    if p.is_empty() {
-        return s.is_empty();
-    }
-    match p[0] {
-        b'*' if p.get(1) == Some(&b'*') => {
-            // `**/`: also try matching zero directories.
-            if p.get(2) == Some(&b'/') && glob_rec(&p[3..], s) {
-                return true;
-            }
-            for i in 0..=s.len() {
-                if glob_rec(&p[2..], &s[i..]) {
-                    return true;
-                }
-            }
-            false
-        }
-        b'*' => {
-            for i in 0..=s.len() {
-                if glob_rec(&p[1..], &s[i..]) {
-                    return true;
-                }
-                if i < s.len() && s[i] == b'/' {
-                    break;
-                }
-            }
-            false
-        }
-        b'?' => !s.is_empty() && s[0] != b'/' && glob_rec(&p[1..], &s[1..]),
-        c => !s.is_empty() && s[0] == c && glob_rec(&p[1..], &s[1..]),
-    }
-}
-
-/// A `fn` item added under `test_globs` in the PR diff, with the added
-/// lines that follow it (its body, for the stress-pattern match).
-#[derive(Clone, Debug)]
-pub struct NewTest {
-    pub name: String,
-    pub file: String,
-    pub body: String,
-}
-
-/// Parse a unified diff (`git diff --unified=0 <merge-base> <head>`)
-/// for `fn` items added under files matching `globs`, then keep those
-/// whose name or added body contains any `patterns` substring (an
-/// empty pattern list keeps every new test). A `fn` only counts as a
-/// test when an added `#[test]`/`#[tokio::test]` attribute precedes it —
-/// helpers like `fn review_fixture` are not tests and stressing them
-/// would run zero tests.
-pub fn parse_new_tests(diff: &str, globs: &[String], patterns: &[String]) -> Vec<NewTest> {
-    let mut file = String::new();
-    let mut file_ok = false;
-    let mut tests: Vec<NewTest> = Vec::new();
-    let mut cur: Option<usize> = None;
-    // Contiguous added `#[...]` lines immediately before the next `fn`.
-    let mut attrs: Vec<String> = Vec::new();
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("+++ b/") {
-            file = rest.trim().to_string();
-            file_ok = globs.iter().any(|g| glob_match(g, &file));
-            cur = None;
-            attrs.clear();
-            continue;
-        }
-        if line.starts_with("+++")
-            || line.starts_with("diff ")
-            || line.starts_with("index ")
-            || line.starts_with("Binary")
-        {
-            // `+++ /dev/null` (deleted file) and every other header
-            // clears the file match too.
-            file.clear();
-            file_ok = false;
-            cur = None;
-            attrs.clear();
-            continue;
-        }
-        if !file_ok {
-            continue;
-        }
-        if let Some(added) = line.strip_prefix('+') {
-            if let Some(name) = added_fn_name(added) {
-                if attrs.iter().any(|a| is_test_attr(a)) {
-                    tests.push(NewTest {
-                        name,
-                        file: file.clone(),
-                        body: String::new(),
-                    });
-                    cur = Some(tests.len() - 1);
-                } else {
-                    cur = None;
-                }
-                attrs.clear();
-            } else {
-                if let Some(i) = cur {
-                    tests[i].body.push_str(added);
-                    tests[i].body.push('\n');
-                }
-                let t = added.trim();
-                if t.starts_with("#[") {
-                    attrs.push(t.to_string());
-                } else if !t.is_empty() {
-                    attrs.clear();
-                }
-            }
-        } else {
-            // Context/removal/hunk boundary: the fn's added block ends.
-            cur = None;
-            attrs.clear();
-        }
-    }
-    tests.retain(|t| {
-        patterns.is_empty()
-            || patterns.iter().any(|p| {
-                !p.is_empty() && (t.name.contains(p.as_str()) || t.body.contains(p.as_str()))
-            })
-    });
-    tests
-}
-
-/// `#[test]` or `#[tokio::test]` (with or without arguments).
-fn is_test_attr(line: &str) -> bool {
-    let t = line.trim();
-    t == "#[test]" || t.starts_with("#[tokio::test")
-}
-
-/// `fn name(` out of an added diff line — accepts `fn`, `pub fn`,
-/// `pub(crate) fn`, `async fn` and leading whitespace.
-fn added_fn_name(added: &str) -> Option<String> {
-    let t = added.trim_start();
-    let t = t
-        .strip_prefix("pub(crate) ")
-        .or_else(|| t.strip_prefix("pub "))
-        .unwrap_or(t);
-    let t = t.strip_prefix("async ").unwrap_or(t);
-    let rest = t.strip_prefix("fn ")?;
-    let name: String = rest
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
-}
-
-/// Cargo-style failure extraction: `test <name> ... FAILED` lines plus
-/// the indented `failures:` summary block.
-pub fn extract_failed_tests(output: &str) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    let mut in_block = false;
-    for line in output.lines() {
-        let t = line.trim();
-        if t == "failures:" {
-            in_block = true;
-            continue;
-        }
-        if in_block {
-            if t.is_empty() {
-                continue;
-            }
-            if line.starts_with("    ") {
-                names.push(t.to_string());
-                continue;
-            }
-            in_block = false;
-        }
-        if let Some(rest) = t.strip_prefix("test ") {
-            if let Some((name, _)) = rest.split_once(" ... FAILED") {
-                names.push(name.trim().to_string());
-            }
-        }
-    }
-    names.sort();
-    names.dedup();
-    names
-}
-
-/// Added-line heuristic for a schema migration: `ALTER TABLE <name>`
-/// or a bump of the store's `schema_version` table. Word-boundary aware
-/// so code that merely mentions the phrases — like this detector —
-/// doesn't trip it.
-pub fn schema_migration_hit(diff: &str) -> Vec<String> {
-    // Built at runtime so this file's own diff doesn't read as a hit.
-    let sv_ops: Vec<String> = ["update", "into", "from", "exists"]
-        .iter()
-        .map(|op| format!("{op} schema_version"))
-        .collect();
-    let mut hits = Vec::new();
-    for line in diff.lines() {
-        let Some(added) = line.strip_prefix('+') else {
-            continue;
-        };
-        if added.starts_with('+') {
-            continue; // the +++ header line
-        }
-        let low = added.to_lowercase();
-        if phrase_then_word(&low, "alter table")
-            || set_version_bump(&low)
-            || sv_ops.iter().any(|p| low.contains(p))
-        {
-            hits.push(added.trim().to_string());
-        }
-    }
-    hits.sort();
-    hits.dedup();
-    hits
-}
-
-/// `needle` appears followed by whitespace then an identifier char.
-fn phrase_then_word(s: &str, needle: &str) -> bool {
-    s.match_indices(needle).any(|(i, _)| {
-        s[i + needle.len()..]
-            .trim_start()
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_alphanumeric() || c == '_')
-            .unwrap_or(false)
-    })
-}
-
-/// `set version` then `=` then a digit — the store's version bump idiom.
-fn set_version_bump(s: &str) -> bool {
-    s.match_indices("set version").any(|(i, _)| {
-        s[i + "set version".len()..]
-            .trim_start()
-            .strip_prefix('=')
-            .and_then(|r| r.trim_start().chars().next())
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-    })
-}
-
-/// The isolated-test command for one test: `{test}` `{file}` `{target}`
-/// substitution (`{target}` is the file stem — cargo's `--test <stem>`).
-/// Every value is single-quoted: the names come from diff and test
-/// output the PR controls, so the template must not pre-quote.
-pub fn test_command(template: &str, test: &NewTest) -> String {
-    let stem = Path::new(&test.file)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    template
-        .replace("{test}", &sh_quote(&test.name))
-        .replace("{file}", &sh_quote(&test.file))
-        .replace("{target}", &sh_quote(&stem))
-}
-
-fn sh_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 /// The isolated command for a failing test name (CAD-799): the
-/// `--test <stem>` template when the test's file is known, else the
+/// `--test <target>` template when the test's file is known, else the
 /// recipe's `test_command_lib` — a `src/` unit test has no test file
-/// under `test_globs`, only a module-qualified name. `None` means the
+/// under `test_globs`, only a module-qualified name. A test in a suite
+/// module substitutes the `suite` target (CAD-1727). `None` means the
 /// test cannot be isolated at all; the row stays `inconclusive`.
-fn isolated_command(cfg: &ReviewConfig, name: &str, file: Option<String>) -> Option<String> {
+fn isolated_command(
+    cfg: &ReviewConfig,
+    name: &str,
+    file: Option<String>,
+    suite: &[String],
+) -> Option<String> {
     let nt = |file: String| NewTest {
         name: name.to_string(),
         file,
         body: String::new(),
     };
     match file.filter(|f| safe_rel_path(f)) {
-        Some(file) => Some(test_command(&cfg.test_command, &nt(file))),
+        Some(file) => Some(test_command(&cfg.test_command, &nt(file), suite)),
         None => cfg
             .test_command_lib
             .as_deref()
-            .map(|t| test_command(t, &nt(String::new()))),
+            .map(|t| test_command(t, &nt(String::new()), &[])),
     }
 }
 
@@ -1473,15 +767,6 @@ fn valid_test_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
-}
-
-/// A repo-relative path with no traversal and no shell metacharacters.
-fn safe_rel_path(p: &str) -> bool {
-    !p.is_empty()
-        && !p.starts_with('/')
-        && !p.split('/').any(|c| c == "..")
-        && p.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '/'))
 }
 
 /// `(passed, failed)` totals from `test result:` summary lines, or
@@ -1570,14 +855,29 @@ fn lock_slug(slug: &str, root: &Path) -> String {
 /// `git grep -l 'fn <name>'` in the tree, filtered to `globs` — locates
 /// a failing test that did not come from the PR's own new tests (a
 /// pre-existing test the suite saw fail).
+///
+/// A suite test's name is module-qualified (`<module>::<fn>`), so grep for
+/// the bare `fn` and prefer the file whose stem is the first module segment
+/// (CAD-1727). Without this a suite failure is never located and falls to
+/// the lib template, where no `--test <stem>` target exists.
 fn find_test_file(dir: &Path, name: &str, globs: &[String], git_secs: u64) -> Option<String> {
-    let out = git_status(dir, &["grep", "-l", &format!("fn {name}")], git_secs).ok()?;
-    out.stdout
+    let bare = name.rsplit("::").next().unwrap_or(name);
+    let module = name.split("::").next().unwrap_or("");
+    let suite = suite_modules(dir);
+    let out = git_status(dir, &["grep", "-l", &format!("fn {bare}")], git_secs).ok()?;
+    let matches: Vec<&str> = out
+        .stdout
         .lines()
         .map(str::trim)
-        .filter(|f| !f.is_empty())
-        .find(|f| globs.iter().any(|g| glob_match(g, f)))
-        .map(str::to_string)
+        .filter(|f| !f.is_empty() && globs.iter().any(|g| glob_match(g, f)))
+        .collect();
+    if suite.iter().any(|m| m == module) {
+        let want = format!("tests/{module}.rs");
+        if let Some(f) = matches.iter().find(|f| **f == want) {
+            return Some((*f).to_string());
+        }
+    }
+    matches.first().map(|f| (*f).to_string())
 }
 
 /// An `{unknown}` isolated result for the report — the test was never
@@ -1616,482 +916,11 @@ fn unknown_full_suite_row(step: &Step) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Review worktree
+// Review-owned checkout lifecycle
 // ---------------------------------------------------------------------------
 
-/// Tool-owned detached checkout. Ownership, exact SHA and lifecycle state
-/// live in the repository ledger so an interrupted review is inventoryable.
-const REVIEW_TOOL: &str = "cadence review";
-
-struct MergeResultState {
-    base_sha: String,
-    merge_head: Option<String>,
-    tree_sha: String,
-}
-
-struct ReviewTree {
-    root: PathBuf,
-    dir: PathBuf,
-    owner: String,
-    pinned_sha: String,
-    keep: bool,
-    retention_reason: Option<String>,
-    merge_result: Option<MergeResultState>,
-    release_guard: Option<worktree::lifecycle::ReleaseGuard>,
-    git_secs: u64,
-}
-
-impl ReviewTree {
-    /// Create a detached, exact-SHA checkout. Existing paths are inventory-only
-    /// until explicitly adopted; this command never reuses an unknown tree.
-    fn checkout(
-        root: &Path,
-        name: &str,
-        sha: &str,
-        base_sha: Option<&str>,
-        keep: bool,
-        git_secs: u64,
-    ) -> Result<Self> {
-        let root = worktree::main_root(root)?;
-        let dir = worktree::layout::worktree_dir(&root, name);
-        let owner = std::env::var("CADENCE_ALIAS").unwrap_or_else(|_| "cadence-review".into());
-        let recovery = worktree::lifecycle::recoverable_record(
-            &root,
-            &dir,
-            "review",
-            REVIEW_TOOL,
-            None,
-            None,
-        )?;
-        if let Some(record) = &recovery {
-            if record.owner != owner {
-                return Err(Error::rejected(format!(
-                    "review checkout {} is owned by '{}', not '{}'; inventory it before recovery",
-                    dir.display(),
-                    record.owner,
-                    owner
-                )));
-            }
-            if record.pinned_sha != sha {
-                return Err(Error::rejected(format!(
-                    "review checkout {} is owned at pinned SHA {}, not {}; inventory and retain the existing checkout",
-                    dir.display(), record.pinned_sha, sha
-                )));
-            }
-            if dir.exists() {
-                Self::verify_recovery(&root, &dir, sha, git_secs)?;
-            } else if !matches!(record.state.as_str(), "preparing" | "setup-failed") {
-                return Err(Error::rejected(format!(
-                    "review checkout {} is recorded as {} but is missing; inventory it before retrying",
-                    dir.display(), record.state
-                )));
-            }
-        } else if dir.exists() {
-            return Err(Error::rejected(format!(
-                "review checkout {} already exists without a recoverable lifecycle record — inventory it and explicitly adopt it before reuse",
-                dir.display()
-            )));
-        }
-        worktree::ensure_cadence_ignored(&root)?;
-        let mut record = worktree::lifecycle::new_record(worktree::lifecycle::CheckoutSpec {
-            repo: &root,
-            purpose: "review",
-            tool: REVIEW_TOOL,
-            owner: &owner,
-            path: &dir,
-            branch: None,
-            pinned_sha: sha,
-            issue: None,
-        });
-        record.base_sha = base_sha.map(str::to_string);
-        worktree::lifecycle::begin(&root, record.clone())?;
-        if !dir.exists() {
-            if let Err(e) = git(
-                &root,
-                &["worktree", "add", "--detach", &dir.to_string_lossy(), sha],
-                git_secs,
-            ) {
-                let _ = worktree::lifecycle::transition(
-                    &root,
-                    &dir,
-                    "setup-failed",
-                    Some(&e.to_string()),
-                );
-                return Err(e);
-            }
-        }
-        // Activation failure leaves the linked checkout and pending record
-        // intact; recovery must not infer permission to remove it.
-        worktree::lifecycle::activate(&root, record)?;
-        Ok(Self {
-            root,
-            dir,
-            owner,
-            pinned_sha: sha.to_string(),
-            // Errors before the report is durable preserve the tree for
-            // recovery. Successful completion opts into release explicitly.
-            keep: true,
-            retention_reason: Some(if keep {
-                "review --keep requested".into()
-            } else {
-                "review interrupted or failed; preserve for recovery".into()
-            }),
-            merge_result: None,
-            release_guard: None,
-            git_secs,
-        })
-    }
-
-    fn verify_recovery(root: &Path, dir: &Path, sha: &str, git_secs: u64) -> Result<()> {
-        let meta = std::fs::symlink_metadata(dir)?;
-        if !meta.is_dir()
-            || meta.file_type().is_symlink()
-            || dir.canonicalize()? != crate::issue::finish::lexical_path(dir)
-        {
-            return Err(Error::rejected(format!(
-                "review checkout {} is not a real canonical directory",
-                dir.display()
-            )));
-        }
-        if worktree::main_root(dir)?.canonicalize()? != root.canonicalize()? {
-            return Err(Error::rejected(format!(
-                "review checkout {} belongs to another Git common directory",
-                dir.display()
-            )));
-        }
-        let listed = git(root, &["worktree", "list", "--porcelain"], git_secs)?;
-        if !listed
-            .lines()
-            .any(|line| line == format!("worktree {}", dir.display()))
-        {
-            return Err(Error::rejected(format!(
-                "review checkout {} is not registered by git worktree list",
-                dir.display()
-            )));
-        }
-        let head = git(dir, &["rev-parse", "--verify", "HEAD^{commit}"], git_secs)?;
-        let branch = git_status(
-            dir,
-            &["symbolic-ref", "--quiet", "--short", "HEAD"],
-            git_secs,
-        )?;
-        if head != sha || branch.timed_out || branch.status != Some(1) {
-            return Err(Error::rejected(format!(
-                "review checkout {} does not match detached pinned SHA {sha}: {}",
-                dir.display(),
-                branch.stderr.trim()
-            )));
-        }
-        let status = git(
-            dir,
-            &["status", "--porcelain", "--untracked-files=all"],
-            git_secs,
-        )?;
-        if !status.is_empty() {
-            return Err(Error::rejected(format!(
-                "review checkout {} is dirty — retain it for recovery",
-                dir.display()
-            )));
-        }
-        Ok(())
-    }
-
-    fn begin_release_guard(&mut self) -> Result<()> {
-        if self.release_guard.is_none() {
-            self.release_guard = Some(worktree::lifecycle::begin_review_release(
-                &self.root,
-                &self.dir,
-                REVIEW_TOOL,
-                &self.owner,
-                &self.pinned_sha,
-                "review completed",
-            )?);
-        }
-        Ok(())
-    }
-
-    /// Restore a successfully gated no-commit merge to the pinned PR head
-    /// before normal release. The held release guard has already validated
-    /// exact active ownership and keeps retention/removal serialized. Only abort
-    /// the merge when the index still equals the recorded merge tree, the
-    /// worktree has no extra changes, and no live process can be using it.
-    fn restore_merge_result(&mut self) -> Result<()> {
-        let Some(merge) = self.merge_result.as_ref() else {
-            return Ok(());
-        };
-        if self.release_guard.is_none() {
-            return Err(Error::rejected(
-                "review merge-result restoration requires its held release guard",
-            ));
-        }
-        let meta = std::fs::symlink_metadata(&self.dir)?;
-        if !meta.is_dir()
-            || meta.file_type().is_symlink()
-            || self.dir.canonicalize()? != crate::issue::finish::lexical_path(&self.dir)
-            || worktree::main_root(&self.dir)?.canonicalize()? != self.root
-        {
-            return Err(Error::rejected(
-                "review checkout identity changed before merge-result restoration",
-            ));
-        }
-        let registered =
-            crate::issue::finish::git(&self.root, &["worktree", "list", "--porcelain"])?;
-        if !registered
-            .lines()
-            .any(|line| line == format!("worktree {}", self.dir.display()))
-        {
-            return Err(Error::rejected(
-                "review checkout is no longer registered before merge-result restoration",
-            ));
-        }
-        let head =
-            crate::issue::finish::git(&self.dir, &["rev-parse", "--verify", "HEAD^{commit}"])?;
-        if head != merge.base_sha {
-            return Err(Error::rejected(format!(
-                "review merge-result HEAD moved from base {} to {head}",
-                merge.base_sha
-            )));
-        }
-        let merge_head = git_status(
-            &self.dir,
-            &["rev-parse", "--quiet", "--verify", "MERGE_HEAD^{commit}"],
-            self.git_secs,
-        )?;
-        match (
-            &merge.merge_head,
-            merge_head.status,
-            merge_head.stdout.trim(),
-        ) {
-            (Some(expected), Some(0), actual) if expected == actual => {}
-            (None, Some(1), _) => {}
-            (Some(expected), _, actual) => {
-                return Err(Error::rejected(format!(
-                    "review MERGE_HEAD changed from recorded {expected} to {actual}"
-                )))
-            }
-            (None, status, _) => {
-                return Err(Error::rejected(format!(
-                    "review unexpectedly has MERGE_HEAD (git status {status:?})"
-                )))
-            }
-        }
-        let index_tree = crate::issue::finish::git(&self.dir, &["write-tree"])?;
-        if index_tree != merge.tree_sha {
-            return Err(Error::rejected(
-                "review merge-result index changed; retaining checkout",
-            ));
-        }
-        let unstaged = git_status(&self.dir, &["diff", "--quiet", "--"], self.git_secs)?;
-        if unstaged.timed_out || unstaged.status != Some(0) {
-            return Err(Error::rejected(
-                "review merge-result worktree changed; retaining checkout",
-            ));
-        }
-        let untracked =
-            crate::issue::finish::git(&self.dir, &["ls-files", "--others", "--exclude-standard"])?;
-        if !untracked.is_empty() {
-            return Err(Error::rejected(
-                "review merge-result has untracked files; retaining checkout",
-            ));
-        }
-        match crate::issue::finish::process_use_under(&self.dir) {
-            Ok(uses)
-                if uses.enumeration_error.is_none()
-                    && uses.cwd.is_empty()
-                    && uses.fd.is_empty() => {}
-            Ok(uses) => {
-                return Err(Error::rejected(format!(
-                    "review checkout has live or unknown process use; retaining checkout ({:?})",
-                    uses.enumeration_error
-                )))
-            }
-            Err(error) => {
-                return Err(Error::rejected(format!(
-                    "cannot enumerate review checkout process use; retaining checkout ({error})"
-                )))
-            }
-        }
-        if merge.merge_head.is_some() {
-            crate::issue::finish::git(&self.dir, &["merge", "--abort"])?;
-        }
-        let head =
-            crate::issue::finish::git(&self.dir, &["rev-parse", "--verify", "HEAD^{commit}"])?;
-        let status = crate::issue::finish::git(
-            &self.dir,
-            &["status", "--porcelain", "--untracked-files=all"],
-        )?;
-        if head != merge.base_sha || !status.is_empty() {
-            return Err(Error::rejected(
-                "review merge-result did not restore a clean base; retaining checkout",
-            ));
-        }
-        crate::issue::finish::git(&self.dir, &["checkout", "--detach", &self.pinned_sha])?;
-        let head =
-            crate::issue::finish::git(&self.dir, &["rev-parse", "--verify", "HEAD^{commit}"])?;
-        let status = crate::issue::finish::git(
-            &self.dir,
-            &["status", "--porcelain", "--untracked-files=all"],
-        )?;
-        let branch = git_status(
-            &self.dir,
-            &["symbolic-ref", "--quiet", "--short", "HEAD"],
-            self.git_secs,
-        )?;
-        if head != self.pinned_sha || !status.is_empty() || branch.status != Some(1) {
-            return Err(Error::rejected(
-                "review checkout did not return to its clean detached pinned head; retaining checkout",
-            ));
-        }
-        self.merge_result = None;
-        Ok(())
-    }
-
-    fn owns(&self) -> bool {
-        worktree::lifecycle::owns(
-            &self.root,
-            &self.dir,
-            REVIEW_TOOL,
-            &self.owner,
-            &self.pinned_sha,
-        )
-        .unwrap_or(false)
-    }
-
-    fn release_refusal(&self) -> Option<String> {
-        match std::fs::symlink_metadata(&self.dir) {
-            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
-            Ok(_) => return Some("review checkout path is not a real directory".into()),
-            Err(e) => return Some(format!("cannot inspect review checkout path: {e}")),
-        }
-        let checkout_root = match worktree::main_root(&self.dir) {
-            Ok(root) => match root.canonicalize() {
-                Ok(root) => root,
-                Err(e) => return Some(format!("cannot resolve review Git common directory: {e}")),
-            },
-            Err(e) => return Some(format!("cannot verify review checkout identity: {e}")),
-        };
-        if checkout_root != self.root {
-            return Some("review checkout belongs to a different Git common directory".into());
-        }
-        let listed =
-            match crate::issue::finish::git(&self.root, &["worktree", "list", "--porcelain"]) {
-                Ok(listed) => listed,
-                Err(e) => return Some(format!("cannot enumerate registered worktrees: {e}")),
-            };
-        if !listed
-            .lines()
-            .any(|line| line == format!("worktree {}", self.dir.display()))
-        {
-            return Some("review checkout is no longer registered at its owned path".into());
-        }
-        let head =
-            match crate::issue::finish::git(&self.dir, &["rev-parse", "--verify", "HEAD^{commit}"])
-            {
-                Ok(head) => head,
-                Err(e) => return Some(format!("cannot verify pinned review HEAD: {e}")),
-            };
-        if head != self.pinned_sha {
-            return Some(format!(
-                "HEAD moved from pinned {} to {head}",
-                self.pinned_sha
-            ));
-        }
-        match crate::issue::finish::git(
-            &self.dir,
-            &["status", "--porcelain", "--untracked-files=all"],
-        ) {
-            Ok(status) if !status.is_empty() => {
-                return Some("review checkout has uncommitted changes".into())
-            }
-            Err(e) => return Some(format!("cannot inspect review checkout dirt: {e}")),
-            _ => {}
-        }
-        match crate::issue::finish::process_use_under(&self.dir) {
-            Ok(uses) if uses.enumeration_error.is_some() => Some(format!(
-                "cannot fully enumerate live process use: {}",
-                uses.enumeration_error
-                    .as_deref()
-                    .unwrap_or("unknown enumeration failure")
-            )),
-            Ok(uses) if !uses.cwd.is_empty() || !uses.fd.is_empty() => Some(format!(
-                "live process use remains (cwd pids: {:?}, open-fd pids: {:?})",
-                uses.cwd, uses.fd
-            )),
-            Err(e) => Some(format!("cannot enumerate live process use: {e}")),
-            _ => None,
-        }
-    }
-}
-
-impl Drop for ReviewTree {
-    fn drop(&mut self) {
-        if self.keep {
-            let reason = self
-                .retention_reason
-                .as_deref()
-                .unwrap_or("review explicitly retained");
-            if let Some(mut release) = self.release_guard.take() {
-                if let Err(e) = release.retained(reason) {
-                    tracing::warn!(event = "review_checkout_retention_record_failed", path = %self.dir.display(), error = %e);
-                }
-            } else if self.owns() {
-                if let Err(e) =
-                    worktree::lifecycle::transition(&self.root, &self.dir, "retained", Some(reason))
-                {
-                    tracing::warn!(event = "review_checkout_retention_record_failed", path = %self.dir.display(), error = %e);
-                }
-            }
-            return;
-        }
-        let Some(mut release) = self.release_guard.take() else {
-            let reason =
-                "review completed without its pre-acquired release guard; preserve checkout";
-            if self.owns() {
-                let _ = worktree::lifecycle::transition(
-                    &self.root,
-                    &self.dir,
-                    "retained",
-                    Some(reason),
-                );
-            }
-            tracing::warn!(event = "review_checkout_release_record_failed", path = %self.dir.display(), reason);
-            return;
-        };
-        if let Some(reason) = self.release_refusal() {
-            let _ = release.retained(&reason);
-            tracing::warn!(event = "review_checkout_release_refused", path = %self.dir.display(), reason = %reason);
-            return;
-        }
-        let mut cmd = Command::new("git");
-        cmd.arg("-C")
-            .arg(&self.root)
-            .args(["worktree", "remove"])
-            .arg(&self.dir);
-        let result = run_bounded(&mut cmd, Duration::from_secs(self.git_secs));
-        let failure = match result {
-            Ok(out) if out.status.success() && !self.dir.exists() => {
-                if let Err(e) = release.released("review completed") {
-                    tracing::warn!(event = "review_checkout_release_record_failed", path = %self.dir.display(), error = %e);
-                }
-                None
-            }
-            Ok(out) => Some(format!(
-                "git worktree remove failed: {}{}",
-                String::from_utf8_lossy(&out.stderr).trim(),
-                if self.dir.exists() {
-                    " (checkout still exists)"
-                } else {
-                    ""
-                }
-            )),
-            Err(e) => Some(format!("git worktree remove failed: {e}")),
-        };
-        if let Some(reason) = failure {
-            let _ = release.cleanup_failed(&reason);
-            tracing::warn!(event = "review_checkout_release_failed", path = %self.dir.display(), reason = %reason);
-        }
-    }
-}
+mod workspace;
+use workspace::{MergeResultState, ReviewTree};
 
 // ---------------------------------------------------------------------------
 // The pipeline
@@ -2417,8 +1246,7 @@ pub fn run(opts: &Options) -> Result<i32> {
                     "review merge command for pinned head {head_sha} onto base {base_sha} failed ({command_error}; {unmerged_state}; {merge_head_state}); preserve for explicit owner inspection and recovery"
                 )
             };
-            tree.keep = true;
-            tree.retention_reason = Some(reason.clone());
+            tree.set_retention(Some(reason.clone()));
             return Err(Error::rejected(format!(
                 "review checkout {} retained after {reason}; no gates ran on the incomplete merge tree",
                 tree.dir.display()
@@ -2511,8 +1339,9 @@ pub fn run(opts: &Options) -> Result<i32> {
         }
 
         // Stress each matched new test N times in isolation.
+        let suite = suite_modules(&tree.dir);
         for nt in &new_tests {
-            let cmd = test_command(&cfg.test_command, nt);
+            let cmd = test_command(&cfg.test_command, nt, &suite);
             let mut failures = 0u32;
             let mut runs = Vec::new();
             let mut unknown = 0u32;
@@ -2634,6 +1463,8 @@ pub fn run(opts: &Options) -> Result<i32> {
             }
         }
         let base_result_path = runner_result_path(&base_tree.dir, &cfg.runner);
+        let suite = suite_modules(&tree.dir);
+        let suite_base = suite_modules(&base_tree.dir);
         for name in &failures_to_check {
             // Names come from test output the PR controls — validate
             // before they reach a shell, and never execute a bad one.
@@ -2657,7 +1488,9 @@ pub fn run(opts: &Options) -> Result<i32> {
             // CAD-799: a name with no `tests/` file is a `src/` unit
             // test — `test_command_lib` isolates it by name when the
             // recipe declares one; otherwise it stays inconclusive.
-            let Some(cmd) = isolated_command(&cfg, name, file) else {
+            let cmd_gated = isolated_command(&cfg, name, file.clone(), &suite);
+            let cmd_base = isolated_command(&cfg, name, file, &suite_base);
+            let (Some(cmd_gated), Some(cmd_base)) = (cmd_gated, cmd_base) else {
                 comparisons.push(json!({
                     "test": name, "in_run": "fail",
                     "result": "unknown",
@@ -2671,7 +1504,7 @@ pub fn run(opts: &Options) -> Result<i32> {
             };
             let on_gated = run_step_with_result(
                 "compare-gated",
-                &cmd,
+                &cmd_gated,
                 &tree.dir,
                 &env(gated_tree),
                 t.test_secs,
@@ -2683,7 +1516,7 @@ pub fn run(opts: &Options) -> Result<i32> {
             } else {
                 let on_base = run_step_with_result(
                     "compare-base",
-                    &cmd,
+                    &cmd_base,
                     &base_tree.dir,
                     &env("base"),
                     t.test_secs,
@@ -2742,7 +1575,7 @@ pub fn run(opts: &Options) -> Result<i32> {
                 base_side["reason"] = json!(r);
             }
             let mut row = json!({
-                "test": name, "cmd": cmd,
+                "test": name, "cmd": cmd_gated,
                 "in_run": "fail",
                 "result": gated,
                 "gated": gated_side.clone(),
@@ -2756,23 +1589,17 @@ pub fn run(opts: &Options) -> Result<i32> {
             }
             comparisons.push(row);
         }
-        if opts.keep {
-            base_tree.keep = true;
-            base_tree.retention_reason = Some("review --keep requested".into());
+        let retention_reason = if opts.keep {
+            Some("review --keep requested".into())
         } else {
             match base_tree.begin_release_guard() {
-                Ok(()) => {
-                    base_tree.keep = false;
-                    base_tree.retention_reason = None;
-                }
-                Err(error) => {
-                    base_tree.keep = true;
-                    base_tree.retention_reason = Some(format!(
-                        "comparison base checkout retained because its release guard could not be acquired: {error}"
-                    ));
-                }
+                Ok(()) => None,
+                Err(error) => Some(format!(
+                    "comparison base checkout retained because its release guard could not be acquired: {error}"
+                )),
             }
-        }
+        };
+        base_tree.set_retention(retention_reason);
         drop(base_tree);
     }
     // A failed full suite without a named testcase is still evidence that
@@ -2951,7 +1778,16 @@ pub fn run(opts: &Options) -> Result<i32> {
     report["duration_ms"] = json!(started.elapsed().as_millis());
 
     // Reports under the state dir — never inside the repo.
-    let stamp = time::basic(time::now_epoch());
+    let report_epoch = time::now_epoch();
+    #[cfg(feature = "test-seam")]
+    let report_epoch = std::env::var("CADENCE_TEST_REVIEW_REPORT_EPOCH")
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .expect("invalid review report test epoch")
+        })
+        .unwrap_or(report_epoch);
+    let stamp = time::basic(report_epoch);
     let base_name = format!(
         "review-{}-pr{}-{}",
         lock_slug(&slug, &root),
@@ -3001,8 +1837,7 @@ pub fn run(opts: &Options) -> Result<i32> {
     report["report_md"] = json!(md_path.to_string_lossy());
     std::fs::write(&md_path, render_markdown(&report))?;
     std::fs::write(&json_path, serde_json::to_string_pretty(&report)?)?;
-    tree.keep = opts.keep || !artifacts_recorded || merge_restore_error.is_some();
-    tree.retention_reason = if opts.keep {
+    tree.set_retention(if opts.keep {
         Some("review --keep requested".into())
     } else if !artifacts_recorded {
         Some("receipt artifact declarations failed; preserve checkout for recovery".into())
@@ -3010,7 +1845,7 @@ pub fn run(opts: &Options) -> Result<i32> {
         merge_restore_error
             .as_ref()
             .map(|error| format!("review release/restoration failed: {error}"))
-    };
+    });
 
     if opts.json {
         println!("{}", crate::output::json_text(&report)?);
@@ -3760,7 +2595,7 @@ index 555..666 100644
         // Substitutions arrive shell-quoted — the template must not
         // pre-quote.
         assert_eq!(
-            test_command("cargo test --test {target} {test}", &nt),
+            test_command("cargo test --test {target} {test}", &nt, &[]),
             "cargo test --test 'daemon' 'x'"
         );
     }
@@ -4198,10 +3033,10 @@ test_command_lib = "cargo test --lib --bins -- {test} --exact"
 "#;
         let cfg = ReviewConfig::parse(toml, "t").unwrap();
 
-        let cmd = isolated_command(&cfg, "t::x", Some("tests/daemon.rs".into())).unwrap();
+        let cmd = isolated_command(&cfg, "t::x", Some("tests/daemon.rs".into()), &[]).unwrap();
         assert_eq!(cmd, "cargo test --test 'daemon' -- 't::x'");
 
-        let cmd = isolated_command(&cfg, "rollout::tests::x", None).unwrap();
+        let cmd = isolated_command(&cfg, "rollout::tests::x", None, &[]).unwrap();
         assert_eq!(
             cmd,
             "cargo test --lib --bins -- 'rollout::tests::x' --exact"
@@ -4209,11 +3044,48 @@ test_command_lib = "cargo test --lib --bins -- {test} --exact"
 
         let no_lib: ReviewConfig =
             ReviewConfig::parse(&toml.replace("test_command_lib", "unused_lib"), "t").unwrap();
-        assert!(isolated_command(&no_lib, "rollout::tests::x", None).is_none());
+        assert!(isolated_command(&no_lib, "rollout::tests::x", None, &[]).is_none());
         // An unsafe relative path is never executed — falls to the
         // lib template, not to `--test <stem>`.
-        let cmd = isolated_command(&cfg, "x", Some("../escape.rs".into())).unwrap();
+        let cmd = isolated_command(&cfg, "x", Some("../escape.rs".into()), &[]).unwrap();
         assert_eq!(cmd, "cargo test --lib --bins -- 'x' --exact");
+    }
+
+    /// CAD-1727: a test in a suite module runs the `suite` target with its
+    /// module-qualified name; a standalone target keeps its stem.
+    #[test]
+    fn isolated_command_routes_suite_modules() {
+        let toml = r#"
+prepare = []
+gates = ["true"]
+full_suite = "x"
+test_globs = ["tests/**"]
+test_command = "cargo test --test {target} -- {test}"
+"#;
+        let cfg = ReviewConfig::parse(toml, "t").unwrap();
+        let suite = vec!["daemon".to_string()];
+
+        let cmd =
+            isolated_command(&cfg, "daemon::x", Some("tests/daemon.rs".into()), &suite).unwrap();
+        assert_eq!(cmd, "cargo test --test 'suite' -- 'daemon::x'");
+
+        let nt = NewTest {
+            name: "x".into(),
+            file: "tests/daemon.rs".into(),
+            body: String::new(),
+        };
+        assert_eq!(
+            test_command(&cfg.test_command, &nt, &suite),
+            "cargo test --test 'suite' -- 'daemon::x'"
+        );
+
+        let cmd = isolated_command(&cfg, "x", Some("tests/standalone.rs".into()), &suite).unwrap();
+        assert_eq!(cmd, "cargo test --test 'standalone' -- 'x'");
+
+        // A base tree before the suite target keeps the file stem and the
+        // bare test name, so the same failure still runs there.
+        let cmd = isolated_command(&cfg, "daemon::x", Some("tests/daemon.rs".into()), &[]).unwrap();
+        assert_eq!(cmd, "cargo test --test 'daemon' -- 'x'");
     }
 
     #[test]
@@ -4483,7 +3355,7 @@ test_command_lib = "cargo test --lib --bins -- {test} --exact"
     fn runner_refusal_is_its_own_blocked_reason() {
         let r = json!({"merge": {}, "prepare": [], "gates": [], "open_pr_conflicts": [],
             "full_suite": {"outcome": "fail", "tail": ["",
-                "cadence-nextest: pinned cargo-nextest 0.9.145 is not installed"]},
+                "cadence-nextest: pinned cargo-nextest 0.9.150 is not installed"]},
             "failures": [{"source": "full_suite", "result": "unknown",
                 "reason": "JUnit report x unavailable"}],
             "stress": [{"test": "t", "runs": 5, "failures": 0, "unknown": 5}]});

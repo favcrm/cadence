@@ -162,9 +162,11 @@ async function main() {
   assert(document.activeElement === heading, "deep-linked drawer returns focus to the outlet heading, not body");
 
   // Reduced motion and layout fixes are in the sheet.
-  const css = fs.readFileSync(require("path").join(process.cwd(), "src/features/app-shell/crm-drawer.css"), "utf8");
+  const nativeCss = fs.readFileSync(require("path").join(process.cwd(), "src/features/app-shell/shared/drawer.css"), "utf8");
+  assert(nativeCss.includes('@import "../../../../screen-ui/src/drawer.css";'), "native drawer imports the shared drawer styles");
+  const css = fs.readFileSync(require("path").join(process.cwd(), "screen-ui/src/drawer.css"), "utf8") + nativeCss;
   assert(/prefers-reduced-motion: reduce\)[^]*crm-drawer-scrim[^]*animation: none/.test(css), "scrim honours reduced motion");
-  assert(/\.crm-drawer \{[^}]*\n\s*animation: none;\n\s*transition: none;/.test(css), "drawer honours reduced motion");
+  assert(/\.crm-drawer\s*\{[^}]*\banimation:\s*none;\s*transition:\s*none;/.test(css), "drawer honours reduced motion");
   assert(/\.crm-field \.select-trigger \{\s*min-width: 0;/.test(css) || /\.crm-field \.select,\s*\.crm-field \.select-trigger \{\s*min-width: 0;/.test(css), "selects shrink to their column");
   assert(/\.crm-field-row \{\s*align-items: end;/.test(css), "hinted fields align with their row");
 

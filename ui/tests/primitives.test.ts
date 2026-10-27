@@ -199,7 +199,14 @@ function computedButton(css: string): { justifyContent: string; lineHeight: stri
 }
 
 for (const file of [join(root, "src/styles.css"), join(root, "../design/kit.css")]) {
-  const css = readFileSync(file, "utf8");
+  let css = readFileSync(file, "utf8");
+  if (file === join(root, "src/styles.css")) {
+    for (const member of ["controls.css", "base.css"]) {
+      assert(css.includes(`@import "../screen-ui/src/${member}";`), `native styles import ${member}`);
+    }
+    css = readFileSync(join(root, "screen-ui/src/controls.css"), "utf8")
+      + readFileSync(join(root, "screen-ui/src/base.css"), "utf8") + css;
+  }
   const computed = computedButton(css);
   equal(computed.justifyContent, "center", `${file} justify-content`);
   equal(computed.lineHeight, "1", `${file} line-height`);
@@ -208,7 +215,9 @@ for (const file of [join(root, "src/styles.css"), join(root, "../design/kit.css"
 }
 
 const buttonSource = readFileSync(join(root, "src/ui/Button.tsx"), "utf8");
-assert(buttonSource.includes("activateButtonHref(href, event, navigate"), "href Button calls navigate");
+assert(buttonSource.includes("activateNavigation(navigation, href, event"), "href Button uses the supplied navigation adapter");
+const navigationSource = readFileSync(join(root, "screen-ui/src/navigation.tsx"), "utf8");
+assert(navigationSource.includes("activateButtonHref(href, event, adapter.navigate"), "navigation adapter calls the existing href activation guard");
 const selectSource = readFileSync(join(root, "src/ui/Select.tsx"), "utf8");
 assert(selectSource.includes("optionBadgeText"), "the listbox renders the badge string");
 assert(selectSource.includes("reduceOutside"), "click-outside uses the closer");

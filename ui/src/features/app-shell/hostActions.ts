@@ -1,5 +1,7 @@
 import { ApiError } from "../../lib/api";
+import { errorMessage } from "../../lib/apiError";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 
 /**
  * Typed host action client for installed-App record screens (CAD-802).
@@ -124,21 +126,24 @@ export function updatePath(scope: HostScope, recordId: string): string {
   return `${recordPath(scope, recordId)}/update`;
 }
 
-async function request<T>(path: string, body?: Record<string, unknown>): Promise<T> {
-  const response = await fetch(path, {
-    method: body === undefined ? "GET" : "POST",
-    credentials: "same-origin",
-    cache: "no-store",
-    headers:
-      body === undefined
-        ? sessionHeaders()
-        : { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+async function request<T>(path: string, body?: Record<string, unknown>, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const response = await privateFetch(path, {
+      method: body === undefined ? "GET" : "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers:
+        body === undefined
+          ? sessionHeaders()
+          : { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    }, op);
+    const value = await response.json().catch(() => null);
+    op.assertCurrent();
+    if (!response.ok) throw new ApiError(errorMessage(value, `${response.status} ${response.statusText}`), response.status);
+    if (value === null) throw new ApiError("The server returned an invalid app receipt", 502);
+    return value as T;
   });
-  const value = await response.json().catch(() => null);
-  if (!response.ok) throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status);
-  if (value === null) throw new ApiError("The server returned an invalid app receipt", 502);
-  return value as T;
 }
 
 function asRecord(value: unknown): HostRecord {

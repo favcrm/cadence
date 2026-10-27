@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import {
@@ -7,9 +7,16 @@ import {
   type HomeInstallation,
   type Installation,
   type RemovePreview,
+  type UpgradeProposal,
+  notifyAppsChanged,
 } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
-import { AppGlyph } from "./shared";
+import { useInstallations } from "../workspace-apps/useInstallations";
+import { installationAppHref } from "../apps/appViewModel";
+import { AppGlyph, useModal } from "./shared";
+import { appErrorCopy, appLoadErrorCopy, isUnchangedUpgradeError } from "./appErrors";
+import { Loading, Notice } from "../app-shell/shared/States";
+import { useTranslate } from "../../lib/locale";
 import "./explorer.css";
 
 /**
@@ -20,6 +27,7 @@ import "./explorer.css";
  * second layer.
  */
 export default function ManageApp({ installId, viewer }: { installId: string; viewer: Viewer }) {
+  const t = useTranslate();
   const [inst, setInst] = useState<Installation | null>(null);
   const [home, setHome] = useState<HomeInstallation | null>(null);
   const [preview, setPreview] = useState<RemovePreview | null>(null);
@@ -27,17 +35,35 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
   const [removing, setRemoving] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const [checking, setChecking] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [upgradeSource, setUpgradeSource] = useState("");
+  const [upgradeProposal, setUpgradeProposal] = useState<{
+    installId: string;
+    source: string;
+    expectedDigest: string;
+    expectedGeneration: string;
+    receipt: UpgradeProposal;
+  } | null>(null);
+  const currentInstallId = useRef(installId);
+  currentInstallId.current = installId;
+  const checkRequest = useRef(0);
+  const applyRequest = useRef(0);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const isOp = viewer.operator && !viewer.readOnly;
-
+  const isOp = viewer.operator === true && !viewer.readOnly;
+  const [reread, setReread] = useState(0);
+  // CAD-1438: "Open its page" spells the canonical `/apps/<key>` route,
+  // resolved against the verified install list; ambiguous or unsafe
+  // keys get no link instead of the retired ID route.
+  const installs = useInstallations(viewer.operator === true, reread).list;
   useEffect(() => {
+    if (!isOp) return;
     const controller = new AbortController();
     setError(null);
     void workspaceApps.detail(installId, controller.signal)
       .then((d) => { if (!controller.signal.aborted) setInst(d); })
-      .catch((e: unknown) => { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : "Could not load the install"); });
+      .catch((e: unknown) => { if (!controller.signal.aborted) setError(appLoadErrorCopy(e, "Could not load the app. Try again in a moment.")); });
     void appExplorer.home(controller.signal)
       .then((h) => {
         if (controller.signal.aborted) return;
@@ -45,45 +71,57 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       })
       .catch(() => {});
     return () => controller.abort();
-  }, [installId]);
+  }, [installId, reread, isOp]);
 
+  useEffect(() => {
+    if (!inst) return;
+    // CAD-1422: a `builtin:` source is retired — there is no embedded
+    // upstream to prefill. Git installs keep their recorded URL.
+    const source = inst.source?.kind === "git" ? inst.source.url ?? "" : "";
+    setUpgradeSource(source);
+    setUpgradeProposal(null);
+  }, [inst]);
+
+  if (viewer.operator === null) {
+    return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9" aria-label={t("manage app")}>
+      {viewer.access === "unavailable" ? (
+        <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
+          {t("Access could not be confirmed. Retry the access check before acting.")}
+        </Notice>
+      ) : <Loading>{t("Checking whether this session can act…")}</Loading>}
+    </main>;
+  }
   if (!isOp) {
     return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9">
       <div className="card px-4 py-5">
-        <h2 className="font-medium text-ink-100 mb-1">Manage is the operator's</h2>
-        <p className="text-label text-ink-400">Ask an admin to change access, updates or remove.</p>
+        <h2 className="font-medium text-ink-100 mb-1">{t("Manage is the operator's")}</h2>
+        <p className="text-label text-ink-400">{t("Ask an admin to change access, updates or remove.")}</p>
       </div>
     </main>;
   }
   if (error) {
     return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9">
       <div className="card px-4 py-5" role="alert">
-        <h2 className="font-medium text-ink-100 mb-1">Couldn't load the app</h2>
-        <p className="text-label text-ink-400 mb-3">{error}</p>
-        <Link href="/apps" className="btn">Back to Apps</Link>
+        <h2 className="font-medium text-ink-100 mb-1">{t("Couldn't load the app")}</h2>
+        <p className="text-label text-ink-400 mb-3">{t(error)}</p>
+        <Link href="/apps" className="btn">{t("Back to Apps")}</Link>
       </div>
     </main>;
   }
   if (!inst) {
-    return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9"><p className="text-label text-ink-400" role="status">Loading…</p></main>;
+    return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9"><p className="text-label text-ink-400" role="status">{t("Loading…")}</p></main>;
   }
 
-  const removed = home?.attention.state === "removed";
-  const off = home?.attention.state === "off" || inst.approved === false;
+  // The record's own mark is authoritative; the home row only agrees with it.
+  const removed = inst.removed != null || home?.attention.state === "removed";
+  const restorable = inst.restore_after == null || Date.now() / 1000 <= inst.restore_after;
+  const off = !removed && (home?.attention.state === "off" || inst.approved === false);
   const updateReady = home?.attention.state === "update";
-
-  const checkUpdate = () => {
-    setChecking(true); setNotice(null);
-    void appExplorer.updateCheck(installId)
-      .then((r) => setNotice(r.has_update ? `An update is ready (${r.digest.slice(0, 14)}…).` : "Up to date."))
-      .catch((e: unknown) => setNotice(e instanceof Error ? e.message : "The check didn't finish"))
-      .finally(() => setChecking(false));
-  };
 
   const openRemove = () => {
     void appExplorer.removePreview(installId)
       .then(setPreview)
-      .catch((e: unknown) => setNotice(e instanceof Error ? e.message : "Could not preview remove"));
+      .catch((e: unknown) => setNotice(appErrorCopy(e, "Couldn't work out what removing would take. Try again in a moment.")));
     setRemoveOpen(true);
   };
   const doRemove = () => {
@@ -94,50 +132,138 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       expected_digest: preview.digest,
       request_id: `rm-${Date.now()}`,
     })
-      .then(() => { setRemoveOpen(false); setNotice("Removed — it's under Recently removed for 30 days."); setInst({ ...inst, approved: false }); })
-      .catch((e: unknown) => setNotice(e instanceof Error ? e.message : "Remove didn't finish"))
+      .then(() => {
+        const now = Math.floor(Date.now() / 1000);
+        setRemoveOpen(false);
+        setNotice("Removed — it's under Recently removed for 30 days.");
+        setInst({ ...inst, approved: false, removed: now, restore_after: now + 30 * 24 * 3600 });
+        setHome((h) => h && { ...h, attention: { state: "removed", message: "Removed — restore within 30 days.", action: "restore", count: 0 } });
+        notifyAppsChanged();
+      })
+      .catch((e: unknown) => { setRemoveOpen(false); setNotice(appErrorCopy(e, "Remove didn't finish. Nothing was removed.")); setReread((n) => n + 1); })
       .finally(() => setRemoving(false));
   };
   const restore = () => {
     setRestoring(true); setNotice(null);
     void appExplorer.restore(installId)
-      .then(() => setNotice("Restored — it's live again."))
-      .catch((e: unknown) => setNotice(e instanceof Error ? e.message : "Restore was refused"))
+      .then(() => {
+        setNotice("Restored — it's live again.");
+        setInst({ ...inst, removed: null, restore_after: null });
+        setHome((h) => h && { ...h, attention: { state: "ok", message: null, action: null, count: 0 } });
+        notifyAppsChanged();
+      })
+      .catch((e: unknown) => {
+        setNotice(appErrorCopy(e, "Restore didn't finish. Try again in a moment."));
+        // A refusal means the record is not what the page assumed (the window
+        // closed, or it is already live): read it again rather than guess.
+        setReread((n) => n + 1);
+      })
       .finally(() => setRestoring(false));
   };
 
-  const isGit = typeof inst.source === "object" && inst.source !== null && "kind" in inst.source && (inst.source as { kind?: string }).kind === "git";
+  const checkPackageUpdate = () => {
+    const source = upgradeSource.trim();
+    const requestedInstallId = installId;
+    const request = ++checkRequest.current;
+    const expectedDigest = inst.digest;
+    const expectedGeneration = inst.catalog_generation;
+    const isCurrentRequest = () => currentInstallId.current === requestedInstallId && checkRequest.current === request;
+    setChecking(true); setNotice(null); setUpgradeProposal(null);
+    void workspaceApps.upgradeCheck(requestedInstallId, {
+      source, expected_digest: expectedDigest, expected_generation: expectedGeneration,
+      catalogue_resolution: "manual",
+    })
+      .then((receipt) => {
+        if (isCurrentRequest()) setUpgradeProposal({ installId: requestedInstallId, source, expectedDigest, expectedGeneration, receipt });
+      })
+      .catch((e: unknown) => {
+        if (!isCurrentRequest()) return;
+        setNotice(appErrorCopy(e, "The update check didn't finish. Try again in a moment."));
+        if (!isUnchangedUpgradeError(e)) setReread((n) => n + 1);
+      })
+      .finally(() => { if (isCurrentRequest()) setChecking(false); });
+  };
+  const proposalMatchesCurrent = upgradeProposal != null
+    && upgradeProposal.installId === installId
+    && upgradeProposal.source === upgradeSource.trim()
+    && upgradeProposal.expectedDigest === inst.digest
+    && upgradeProposal.expectedGeneration === inst.catalog_generation;
+  const applyPackageUpdate = () => {
+    if (!proposalMatchesCurrent || !upgradeProposal) return;
+    const { source, receipt, expectedDigest, expectedGeneration } = upgradeProposal;
+    const requestedInstallId = installId;
+    const request = ++applyRequest.current;
+    const isCurrentRequest = () => currentInstallId.current === requestedInstallId && applyRequest.current === request;
+    setApplying(true); setNotice(null);
+    void workspaceApps.upgrade(requestedInstallId, {
+      source,
+      expected_digest: expectedDigest,
+      expected_generation: expectedGeneration,
+      expected_new_digest: receipt.digest,
+      request_id: `upgrade-${crypto.randomUUID()}`,
+      catalogue_resolution: "manual",
+    })
+      .then(async () => {
+        await appExplorer.updateCheck(requestedInstallId).catch(() => undefined);
+        if (!isCurrentRequest()) return;
+        setNotice("Update applied."); setUpgradeProposal(null);
+        notifyAppsChanged(); setReread((n) => n + 1);
+      })
+      .catch((e: unknown) => {
+        if (!isCurrentRequest()) return;
+        setNotice(appErrorCopy(e, "The update wasn't applied. Check the current package and try again."));
+        setReread((n) => n + 1);
+      })
+      .finally(() => { if (isCurrentRequest()) setApplying(false); });
+  };
 
   return (
     <main className="apps-detail px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={`Manage ${inst.title}`}>
-      <Link href="/apps" className="text-label text-ink-400 hover:text-ink-100">← Apps</Link>
+      <Link href="/apps" className="text-label text-ink-400 hover:text-ink-100">{t("← Apps")}</Link>
       <div className="hero mt-3">
         <AppGlyph name={inst.name} size="lg" />
         <div className="min-w-0">
-          <h1>Manage {inst.title}</h1>
+          <h1>{t("Manage {title}").replace("{title}", () => inst.title)}</h1>
           <p className="tag">{inst.summary}</p>
         </div>
       </div>
 
-      {notice && <div className="alert info mt-4" role="status">{notice}</div>}
-      {removed && <div className="alert warn mt-4">Removed. Restore brings it back within its 30-day window.</div>}
+      {notice && <div className="alert info mt-4" role="status">{t(notice)}</div>}
+      {removed && <div className="alert warn mt-4" role="status">{restorable ? t("Removed. Restore brings it back within its 30-day window.") : t("Removed. The 30-day restore window has closed, so it stays removed.")}</div>}
 
       <div className="mgrid mt-5">
         <div className="card mcard">
-          <h3>{updateReady ? "Update ready" : "Up to date"}</h3>
-          <p>Version {inst.version}.</p>
-          {isGit && (
-            <div className="mt-3">
-              <Button className="btn-sm" disabled={checking} onClick={checkUpdate}>{checking ? "Checking…" : "Check now"}</Button>
-            </div>
+          <h3>{t("App package")}</h3>
+          <p>{updateReady ? t("An update is ready to review.") : t("No update is currently flagged.")}</p>
+          <p className="mt-1">{t("Installed version {version}.").replace("{version}", () => inst.version)}</p>
+          {inst.source?.kind === "builtin" && (
+            <p className="hint mt-2">{t("This install came from the retired built-in catalog — name the app's detached repository (a path or Git URL) to update it.")}</p>
           )}
+          <label className="block mt-3 text-label text-ink-400">
+            <span className="block mb-1">{t("App package path or Git URL")}</span>
+            <input className="update-source" type="text" value={upgradeSource}
+              onChange={(event) => { setUpgradeSource(event.target.value); setUpgradeProposal(null); }}
+              placeholder="/absolute/path or Git URL" autoComplete="off" />
+          </label>
+          <div className="mt-3">
+            <Button className="btn-sm" disabled={checking || applying || !upgradeSource.trim()} onClick={checkPackageUpdate}>{checking ? t("Checking…") : t("Check update")}</Button>
+          </div>
+          {proposalMatchesCurrent && upgradeProposal && <div className="mt-3" aria-live="polite">
+            <p>{t("Proposed version {version} · {name}").replace("{version}", () => upgradeProposal.receipt.version).replace("{name}", () => upgradeProposal.receipt.name)}</p>
+            <p className="hint mt-2">{t("New digest:")} <code className="break-all">{upgradeProposal.receipt.digest}</code></p>
+            {(["added", "changed", "removed"] as const).map((kind) => <p className="hint mt-1" key={kind}>{kind}: {upgradeProposal.receipt.structural_diff[kind].join(", ") || "none"}</p>)}
+            {upgradeProposal.receipt.compatibility != null && <CompatibilityLines receipt={upgradeProposal.receipt.compatibility} />}
+            {!!upgradeProposal.receipt.notes?.length && <ul className="hint mt-2">{upgradeProposal.receipt.notes.map((note, index) => <li key={index}>{note}</li>)}</ul>}
+            {!!upgradeProposal.receipt.secret_warnings?.length && <p className="alert warn mt-2">{t("Package validation reported secret warnings; review the source before applying.")}</p>}
+            <div className="mt-3"><Button className="btn-primary btn-sm" disabled={!proposalMatchesCurrent || applying || !!upgradeProposal.receipt.secret_warnings?.length} onClick={applyPackageUpdate}>{applying ? t("Applying…") : t("Apply checked update")}</Button></div>
+          </div>}
         </div>
 
         <div className="card mcard">
-          <h3>Connections and setup</h3>
-          <p>The accounts and helpers {inst.title} uses.</p>
+          <h3>{t("Connections and setup")}</h3>
+          <p>{t("The accounts and helpers {title} uses.").replace("{title}", () => inst.title)}</p>
           {(inst.connection_slots ?? []).length === 0 ? (
-            <p className="hint mt-2">No outside accounts.</p>
+            <p className="hint mt-2">{t("No outside accounts.")}</p>
           ) : (
             <ul className="mt-2">
               {inst.connection_slots.map((s) => (
@@ -146,21 +272,28 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
             </ul>
           )}
           <div className="mt-3">
-            <Link className="btn btn-sm" href={`/app-installations/${inst.install_id}`}>Open its page</Link>
+            {(() => {
+              const href = installationAppHref(installs, inst.install_id);
+              return href === null ? (
+                <span className="text-micro text-ink-500">{t("No unique app page — the app key names more than one installation.")}</span>
+              ) : (
+                <Link className="btn btn-sm" href={href}>{t("Open its page")}</Link>
+              );
+            })()}
           </div>
         </div>
 
         <div className="card mcard">
-          <h3>Access</h3>
+          <h3>{t("Access")}</h3>
           <div className="swrow">
             <div>
-              <p>Let {inst.title} work</p>
-              <p className="hint">{off ? "Off — it can't run or use its connections. Its data is kept." : "On — it can run and use its connections."}</p>
+              <p>{t("Let {title} work").replace("{title}", () => inst.title)}</p>
+              <p className="hint">{removed ? t("Off — the app is removed.") : off ? t("Off — it can't run or use its connections. Its data is kept.") : t("On — it can run and use its connections.")}</p>
             </div>
             <button
               className="switch"
               role="switch"
-              aria-checked={!off}
+              aria-checked={!off && !removed}
               aria-label={`Let ${inst.title} work`}
               onClick={() => setNotice(off ? "Turn on through the app's page — consent is recorded there." : "Turn off through the app's page — consent is revoked there.")}
             />
@@ -170,18 +303,20 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
         <div className="card mcard">
           {removed ? (
             <>
-              <h3>Restore {inst.title}</h3>
-              <p>Removed apps restore within 30 days, with the same data.</p>
-              <div className="mt-3">
-                <Button className="btn-primary btn-sm" disabled={restoring} onClick={restore}>{restoring ? "Restoring…" : "Restore"}</Button>
-              </div>
+              <h3>{t("Restore {title}").replace("{title}", () => inst.title)}</h3>
+              <p>{restorable ? t("Removed apps restore within 30 days, with the same data.") : t("The restore window has closed.")}</p>
+              {restorable && (
+                <div className="mt-3">
+                  <Button className="btn-primary btn-sm" disabled={restoring} onClick={restore}>{restoring ? t("Restoring…") : t("Restore")}</Button>
+                </div>
+              )}
             </>
           ) : (
             <>
-              <h3 className="text-fail">Remove {inst.title}</h3>
-              <p>Takes the app and its data out of this workspace. You'll see exactly what goes before anything is deleted.</p>
+              <h3 className="text-fail">{t("Remove {title}").replace("{title}", () => inst.title)}</h3>
+              <p>{t("Takes the app and its data out of this workspace. You'll see exactly what goes before anything is deleted.")}</p>
               <div className="mt-3">
-                <Button className="btn-danger btn-sm" onClick={openRemove}>Remove app…</Button>
+                <Button className="btn-danger btn-sm" onClick={openRemove}>{t("Remove app…")}</Button>
               </div>
             </>
           )}
@@ -189,25 +324,67 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       </div>
 
       {removeOpen && preview && (
-        <div className="scrim fixed inset-0 bg-black/50 z-50 grid place-items-center p-4" role="presentation" onClick={() => setRemoveOpen(false)}>
-          <div className="modal card p-5 max-w-lg w-full" role="alertdialog" aria-modal="true" aria-labelledby="rmh" onClick={(e) => e.stopPropagation()}>
-            <h2 id="rmh" className="text-cardtitle font-medium text-ink-100 mb-3">Remove {preview.title}?</h2>
-            {preview.personal_data && (
-              <div className="alert warn mb-3">This app holds personal data. Its data is kept for restore.</div>
-            )}
-            <p className="text-label text-ink-400 mb-2">This is taken out of this workspace; its data is kept for 30 days, then deleted for good.</p>
-            {preview.keeps?.data && <p className="text-label text-ink-500 mb-3">Keeps: {preview.keeps.data}</p>}
-            <div className="alert info mb-4">Restorable for 30 days. Bring it back any time from Recently removed on the Apps page.</div>
-            <p className="text-label text-ink-500 mb-4">Only want to pause it? Turn access off from the app's page instead — nothing is removed.</p>
-            <div className="flex gap-2 justify-end">
-              <Button onClick={() => setRemoveOpen(false)}>Cancel</Button>
-              <Button className="btn-danger-solid" disabled={removing} onClick={doRemove}>
-                {removing ? "Removing…" : `Remove ${preview.title}`}
-              </Button>
-            </div>
-          </div>
-        </div>
+        <RemoveDialog preview={preview} removing={removing} onCancel={() => setRemoveOpen(false)} onConfirm={doRemove} />
       )}
     </main>
+  );
+}
+
+/** Render the daemon's compatibility receipt as one readable line per requirement. */
+function CompatibilityLines({ receipt }: { receipt: UpgradeProposal["compatibility"] }) {
+  const t = useTranslate();
+  if (!receipt) return null;
+  if (!receipt.declared) return <p className="hint mt-2">{t("No host requirements declared.")}</p>;
+  if (receipt.status === "unknown") return <p className="hint mt-2">{t("Compatibility could not be determined.")}</p>;
+  if (receipt.checks.length === 0) return <p className="hint mt-2">{t("Compatibility requirements could not be read.")}</p>;
+  return <ul className="hint mt-2" aria-label={t("Package compatibility")}>
+    {receipt.checks.map((check, index) => {
+      if (check.kind === "core") {
+        const required = typeof check.required === "string" ? check.required : check.required.join(", ");
+        return <li key={`core-${index}`}>Needs Cadence {required} — this host {check.host ?? "unknown"} {check.ok ? "✓" : "✗"}</li>;
+      }
+      const required = Array.isArray(check.required) ? check.required : [check.required];
+      const supported = check.supported ?? [];
+      return <li key={`contract-${check.contract ?? index}`}>
+        Needs {check.contract ?? "host contract"} {required.map((major) => `v${major}`).join(", ")} — {check.ok
+          ? "supported ✓"
+          : `not supported (host supports ${supported.length ? supported.map((major) => `v${major}`).join(", ") : "none"}) ✗`}
+      </li>;
+    })}
+  </ul>;
+}
+
+/**
+ * The Remove confirmation: an alertdialog that takes focus, keeps Tab
+ * inside and closes on Escape or Cancel (CAD-1209). Mounted only while
+ * open so its focus handling starts and ends with it.
+ */
+function RemoveDialog({ preview, removing, onCancel, onConfirm }: {
+  preview: RemovePreview; removing: boolean; onCancel: () => void; onConfirm: () => void;
+}) {
+  const t = useTranslate();
+  const ref = useModal<HTMLDivElement>(true, onCancel);
+  return (
+    <div className="scrim fixed inset-0 bg-black/50 z-50 grid place-items-center p-4" role="presentation" onClick={onCancel}>
+      <div ref={ref} tabIndex={-1} className="modal card p-5 max-w-lg w-full" role="alertdialog" aria-modal="true"
+        aria-labelledby="rmh" aria-describedby="rmd" onClick={(e) => e.stopPropagation()}>
+        <h2 id="rmh" className="text-cardtitle font-medium text-ink-100 mb-3">Remove {preview.title}?</h2>
+        <div id="rmd">
+          {preview.personal_data && (
+            <div className="alert warn mb-3">This app holds personal data. Its data is kept for restore.</div>
+          )}
+          <p className="text-label text-ink-400 mb-2">This is taken out of this workspace; its data is kept for 30 days, then deleted for good.</p>
+          {preview.keeps?.data && <p className="text-label text-ink-500 mb-3">Keeps: {preview.keeps.data}</p>}
+          <div className="alert info mb-4">Restorable for 30 days. Bring it back any time from Recently removed on the Apps page.</div>
+          <p className="text-label text-ink-500 mb-4">Only want to pause it? Turn access off from the app's page instead — nothing is removed.</p>
+        </div>
+        <div className="flex gap-2 justify-end">
+          <Button onClick={onCancel}>{t("Cancel")}</Button>
+          <Button className="btn-danger-solid" disabled={removing} onClick={onConfirm}>
+            {removing ? t("Removing…") : t("Remove {title}").replace("{title}", () => preview.title)}
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }

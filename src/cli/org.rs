@@ -12,8 +12,10 @@
 //!   state dir + tracker already are, no cloud identity asserted.
 //! - `--org` beats `CADENCE_ORG` beats the saved `selected`; absent all
 //!   three the resolved org is `local`.
-//! - A managed caller (`CADENCE_ALIAS`) keeps its inherited binding:
-//!   `--org`/registry defaults are refused, never silently merged.
+//! - A managed caller (`CADENCE_ALIAS`) keeps its inherited local daemon
+//!   and never consults the registry. `--org` is accepted only when it
+//!   matches the hosted org on that alias's single running kickoff
+//!   binding; any other selector stays refused. `org switch` stays refused.
 //! - A `switch` mid-command cannot move it: each invocation resolves its
 //!   destination once at startup.
 //! - `Remote` rows persist the issuer-verified endpoint and org id but are
@@ -114,66 +116,127 @@ impl RegistryFile {
         Ok(Self { path, _lock: lock })
     }
     fn read(&self) -> Result<Registry> {
-        let mut file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&self.path)
-        {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Registry::default()),
-            Err(e) => return Err(e.into()),
-        };
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() > 65536 {
-            return Err(Error::rejected(
-                "org registry must be a regular file no larger than 64 KiB",
-            ));
-        }
-        let mut raw = Vec::new();
-        (&mut file).take(65537).read_to_end(&mut raw)?;
-        if raw.len() > 65536 {
-            return Err(Error::rejected("org registry exceeds 64 KiB"));
-        }
-        let registry: Registry = serde_json::from_slice(&raw)
-            .map_err(|_| Error::rejected("invalid org registry; refusing destination selection"))?;
-        for (i, c) in registry.connections.iter().enumerate() {
-            cadence_agent::proto::identifier(&c.selection.org, "org")?;
-            validate_destination(&c.destination)?;
-            if registry.connections[..i]
-                .iter()
-                .any(|p| p.selection == c.selection)
-            {
-                return Err(Error::rejected("duplicate org in registry"));
-            }
-        }
-        if let Some(selected) = &registry.selected {
-            if !registry
-                .connections
-                .iter()
-                .any(|c| &c.selection == selected)
-            {
-                return Err(Error::rejected("selected org is missing"));
-            }
-        }
-        Ok(registry)
+        read_registry(&self.path)
+    }
+    fn read_snapshot(&self) -> Result<(Registry, Option<Vec<u8>>)> {
+        read_registry_raw(&self.path)
     }
     fn write(&self, registry: &Registry) -> Result<()> {
-        let dir = self.path.parent().expect("registry parent");
-        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
         let raw =
             serde_json::to_vec_pretty(registry).map_err(|e| Error::internal(e.to_string()))?;
+        self.write_raw(&raw)
+    }
+    fn write_raw(&self, raw: &[u8]) -> Result<()> {
+        let dir = self.path.parent().expect("registry parent");
         if raw.len() > 65536 {
             return Err(Error::rejected(
                 "org registry exceeds 64 KiB; no configuration changed",
             ));
         }
-        temp.write_all(&raw)?;
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        temp.write_all(raw)?;
         temp.as_file().sync_all()?;
+        // Once persist renames the registry, it is published. A directory
+        // fsync is best-effort: reporting an error here would make login
+        // skip the credential save with the new binding already installed.
+        let dir_handle = File::open(dir).ok();
         temp.persist(&self.path)
             .map_err(|e| Error::internal(e.to_string()))?;
-        File::open(dir)?.sync_all()?;
+        if let Some(dir) = &dir_handle {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
+    /// Put back the exact bytes read before a replacement, including a
+    /// compact registry whose pretty form would exceed the write limit.
+    /// `None` means the file did not exist.
+    fn restore(&self, raw: Option<&[u8]>) -> Result<()> {
+        let Some(raw) = raw else {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            let dir = self.path.parent().expect("registry parent");
+            if let Ok(dir) = File::open(dir) {
+                let _ = dir.sync_all();
+            }
+            return Ok(());
+        };
+        self.write_raw(raw)
+    }
+}
+
+/// The saved default org, if the registry is already there. A missing
+/// file is "no saved org". This does not create the directory, the
+/// registry, or the lock, and it never changes the selection.
+pub(super) fn selected_org_readonly() -> Result<Option<String>> {
+    let path = match RegistryFile::path() {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(read_registry(&path)?.selected.map(|selected| selected.org))
+}
+
+/// Read and validate `orgs.json` at `path` — the body of
+/// `RegistryFile::read` split out so a read-only caller (`cadence
+/// update` routing) shares the exact shape checks without taking the
+/// write lock or creating the lock file.
+fn read_registry(path: &Path) -> Result<Registry> {
+    Ok(read_registry_raw(path)?.0)
+}
+
+/// Read the registry and keep the exact bytes read. The bytes let a failed
+/// credential save restore a compact file that `to_vec_pretty` would refuse
+/// at the write cap.
+fn read_registry_raw(path: &Path) -> Result<(Registry, Option<Vec<u8>>)> {
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Registry::default(), None))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > 65536 {
+        return Err(Error::rejected(
+            "org registry must be a regular file no larger than 64 KiB",
+        ));
+    }
+    let mut raw = Vec::new();
+    (&mut file).take(65537).read_to_end(&mut raw)?;
+    if raw.len() > 65536 {
+        return Err(Error::rejected("org registry exceeds 64 KiB"));
+    }
+    let registry: Registry = serde_json::from_slice(&raw)
+        .map_err(|_| Error::rejected("invalid org registry; refusing destination selection"))?;
+    for (i, c) in registry.connections.iter().enumerate() {
+        cadence_agent::proto::identifier(&c.selection.org, "org")?;
+        validate_destination(&c.destination)?;
+        if registry.connections[..i]
+            .iter()
+            .any(|p| p.selection == c.selection)
+        {
+            return Err(Error::rejected("duplicate org in registry"));
+        }
+    }
+    if let Some(selected) = &registry.selected {
+        if !registry
+            .connections
+            .iter()
+            .any(|c| &c.selection == selected)
+        {
+            return Err(Error::rejected("selected org is missing"));
+        }
+    }
+    Ok((registry, Some(raw)))
 }
 
 fn absolute(path: &Path) -> Result<()> {
@@ -246,19 +309,58 @@ fn select(registry: &Registry, org: Option<&str>) -> Result<Option<Connection>> 
         .find(|c| c.selection.org == org)
         .cloned()
         .map(Some)
-        .ok_or_else(|| Error::rejected("unknown org"))
+        .ok_or_else(|| unknown_org(org, true))
 }
 
+fn unknown_org(org: &str, registered: bool) -> Error {
+    let where_ = if registered {
+        "is not in the org registry"
+    } else {
+        "has no org registry"
+    };
+    Error::rejected(format!(
+        "org '{org}' {where_} — a remote org needs `cadence login` on this host; \
+         run `cadence org list`, pass `--org local` for standalone use, or unset \
+         CADENCE_ORG. An explicit destination never falls back to local state; nothing was sent"
+    ))
+}
+
+/// `login_status` keeps its legacy values for existing consumers: `Local`
+/// stays `local_peer_authority`; `Remote` is no longer always `not_connected`.
+/// The honest, local-only detail is `credential` (see `remote_cli::local_status`):
+/// its `state` says what this machine holds, and `live_verified` is always
+/// `false` because `org list` makes no network call.
 fn view(c: &Connection, selected: bool) -> Value {
-    json!({
+    let (login_status, credential) = match &c.destination {
+        Destination::Local { .. } => ("local_peer_authority", None),
+        Destination::Remote { endpoint, org_id } => {
+            let target = cadence_agent::remote_cli::RemoteTarget {
+                identity: None,
+                org: c.selection.org.clone(),
+                endpoint: endpoint.clone(),
+                org_id: org_id.clone(),
+            };
+            let status = cadence_agent::remote_cli::local_status(&target);
+            // Only a proven absence keeps the legacy `not_connected`. An
+            // unavailable or invalid local store is not "not connected".
+            let legacy = if status["state"] == "no_credential" {
+                "not_connected"
+            } else {
+                "credential_saved"
+            };
+            (legacy, Some(status))
+        }
+    };
+    let mut out = json!({
         "org": c.selection.org,
         "selected": selected,
         "destination": c.destination,
-        "login_status": match c.destination {
-            Destination::Local { .. } => "local_peer_authority",
-            Destination::Remote { .. } => "not_connected",
-        }
-    })
+        "login_status": login_status,
+    });
+    if let Some(credential) = credential {
+        out["credential"] = credential;
+    }
+    out
 }
 
 /// `cadence org …` — no operator proof: a preference, never authority.
@@ -344,10 +446,11 @@ fn ensure_local(state_dir: &Path, tracker_dir: &Path) -> Result<()> {
 
 /// Pure registry mutation for `cadence login` (CAD-1019 slice 1b), unit-tested
 /// without the registry file. `org_name` is the issuer-verified slug and
-/// `endpoint`/`org_id` come only from the verified grant. A stored remote is
-/// never re-pointed, a `local` row is never overwritten, and the new org is
-/// selected only when `use_default` (`--use`) is passed — a bare first
-/// login leaves `selected` unset so ambient local stays the default
+/// `endpoint`/`org_id` come only from the verified grant. A newer verified
+/// grant replaces a stale remote binding for the same slug (a workspace can
+/// be recreated or its id rotated); a `local` row is never overwritten. The
+/// new org is selected only when `use_default` (`--use`) is passed — a bare
+/// first login leaves `selected` unset so ambient local stays the default
 /// (CAD-1125).
 fn apply_record_remote(
     registry: &mut Registry,
@@ -365,21 +468,14 @@ fn apply_record_remote(
     let selection = Selection { org: org.clone() };
     if let Some(existing) = registry
         .connections
-        .iter()
+        .iter_mut()
         .find(|c| c.selection == selection)
     {
-        // Re-login must re-point at the same endpoint + org id — a changed
-        // slug or forged audience refuses, never silently moves the org.
         match &existing.destination {
-            Destination::Remote {
-                endpoint: ep,
-                org_id: oid,
-            } if ep == endpoint && oid == org_id => {}
             Destination::Remote { .. } => {
-                return Err(Error::rejected(
-                    "a different endpoint or org id is already stored for this org; \
-                     remove it first",
-                ));
+                // The grant is issuer-verified and already validated above;
+                // re-login is the operator's replacement intent.
+                existing.destination = destination.clone();
             }
             Destination::Local { .. } => {
                 return Err(Error::rejected(
@@ -412,18 +508,33 @@ fn apply_record_remote(
     ))
 }
 
-/// File-locked wrapper over `apply_record_remote`; returns the stored view.
-pub(super) fn record_remote(
+/// File-locked wrapper over `apply_record_remote`. The registry is written
+/// first and `commit` (the credential save) runs while the registry lock is
+/// still held; a failed commit restores the previous binding. Returns the
+/// stored view.
+pub(super) fn record_remote<F>(
     org_name: &str,
     endpoint: &str,
     org_id: &str,
     use_default: bool,
-) -> Result<Value> {
+    commit: F,
+) -> Result<Value>
+where
+    F: FnOnce() -> Result<()>,
+{
     let file = RegistryFile::open()?;
-    let mut registry = file.read()?;
+    let (mut registry, previous_raw) = file.read_snapshot()?;
     let (connection, selected) =
         apply_record_remote(&mut registry, org_name, endpoint, org_id, use_default)?;
     file.write(&registry)?;
+    if let Err(error) = commit() {
+        if let Err(rollback) = file.restore(previous_raw.as_deref()) {
+            return Err(Error::internal(format!(
+                "credential write failed ({error}); restoring the previous org registry also failed ({rollback})"
+            )));
+        }
+        return Err(error);
+    }
     Ok(view(&connection, selected))
 }
 
@@ -431,37 +542,134 @@ pub(super) fn record_remote(
 /// or a pinned remote destination (CAD-1019 slice 2). `Remote` carries the
 /// issuer-verified endpoint + workspace — never a credential, and never
 /// re-derived after this call.
+#[derive(Debug)]
 pub(super) enum Resolved {
     Local(PathBuf),
     Remote(cadence_agent::remote_cli::RemoteTarget),
 }
 
-/// Resolve this invocation's destination once. `org` is `--org`; a
-/// managed caller keeps its ambient binding and never consults the
-/// registry. `state`/`tracker` are explicit pins — either wins over the
-/// registry and refuses `--org`. Returns [`Resolved`]; a local-org
-/// selection also exports `CADENCE_PM_DIR` so the tracker lands on the
-/// org's root. Never resolves the tracker for a managed, pinned or
-/// ambient caller — those never needed it (the CAD-313 `ui login`
-/// residual runs with no `HOME`).
+fn managed_org_refused() -> Error {
+    Error::rejected("managed callers cannot override their destination with --org")
+}
+
+fn pin_conflict() -> Error {
+    Error::rejected(
+        "--org conflicts with an explicit or inherited local instance binding; \
+         use a clean operator shell",
+    )
+}
+
+/// `action_dispatch` forwards inherited `CADENCE_PM_DIR` as `tracker`.
+/// That is the local daemon's tracker, not a second explicit pin. A
+/// different path still conflicts with `--org`.
+fn tracker_pin_conflicts(tracker: Option<&Path>) -> bool {
+    let Some(tracker) = tracker else {
+        return false;
+    };
+    !matches!(
+        std::env::var_os("CADENCE_PM_DIR"),
+        Some(inherited) if Path::new(&inherited) == tracker
+    )
+}
+
+/// The one executing message, or `None` when there is not exactly one
+/// `running` row with an id. Queued, terminal, and unresolved rows do
+/// not qualify; a second running row is ambiguous.
+fn single_running_message(show: &Value) -> Option<String> {
+    let messages = show.get("messages")?.as_array()?;
+    let mut found = None;
+    for message in messages {
+        if message.get("state").and_then(Value::as_str) != Some("running") {
+            continue;
+        }
+        let id = message.get("id").and_then(Value::as_str)?;
+        if found.is_some() {
+            return None;
+        }
+        found = Some(id.to_string());
+    }
+    found
+}
+
+fn hosted_assignment_target(
+    state_dir: &Path,
+    alias: &str,
+    selector: &str,
+) -> Result<cadence_agent::remote_cli::RemoteTarget> {
+    let show = cadence_agent::client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
+    let Some(message_id) = single_running_message(&show) else {
+        return Err(managed_org_refused());
+    };
+    let bound =
+        cadence_agent::local_assignment::reporting::hosted_binding_target(state_dir, &message_id)?;
+    let Some(bound) = bound else {
+        return Err(managed_org_refused());
+    };
+    if bound.org != selector {
+        return Err(managed_org_refused());
+    }
+    let target = cadence_agent::remote_cli::RemoteTarget {
+        identity: Some(cadence_agent::remote_cli::CliIdentityPin {
+            subject_id: bound.subject_id,
+            issuer: bound.issuer,
+        }),
+        org: bound.org,
+        endpoint: bound.endpoint,
+        org_id: bound.organization_id,
+    };
+    let dir = cadence_agent::remote_auth::auth_dir(None).map_err(|_| {
+        Error::rejected("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    cadence_agent::remote_cli::cli_material(&dir, &target)?;
+    Ok(target)
+}
+
+fn resolve_managed(
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Resolved> {
+    let Some(selector) = org else {
+        return state
+            .map(Resolved::Local)
+            .map(Ok)
+            .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
+    };
+    if state.is_some() || tracker_pin_conflicts(tracker.as_deref()) {
+        return Err(pin_conflict());
+    }
+    let alias = std::env::var("CADENCE_ALIAS").map_err(|_| managed_org_refused())?;
+    if alias.is_empty() {
+        return Err(managed_org_refused());
+    }
+    let state_dir = cadence_agent::client::state_dir()?;
+    let target = hosted_assignment_target(&state_dir, &alias, selector)?;
+    eprintln!("cadence org={} remote={}", target.org, target.endpoint);
+    Ok(Resolved::Remote(target))
+}
+
+/// Resolve this invocation's destination once. `org` is `--org`. A
+/// managed caller keeps its inherited local daemon and never consults
+/// the registry. `--org` is accepted only when the live daemon reports
+/// exactly one running message whose kickoff binding names that org and
+/// whose original member and issuer still match the saved login;
+/// endpoint and organization id come from that binding. A binding with
+/// no member pin stays unavailable. An explicit
+/// `--state-dir`, or a tracker path other than the inherited
+/// `CADENCE_PM_DIR`, still conflicts. For every other caller,
+/// `state`/`tracker` are pins — either wins over the registry and
+/// refuses `--org`. Returns [`Resolved`]; a local-org selection also
+/// exports `CADENCE_PM_DIR` so the tracker lands on the org's root.
+/// Never resolves the tracker for a managed, pinned or ambient caller —
+/// those never needed it (the CAD-313 `ui login` residual runs with no
+/// `HOME`).
 pub(super) fn resolve(
     org: Option<&str>,
     state: Option<PathBuf>,
     tracker: Option<PathBuf>,
 ) -> Result<Resolved> {
-    // A managed caller's inherited binding always wins over a saved
-    // preference — it cannot be retargeted by a default the operator
-    // changed mid-run, and it never reads the registry at all.
     if std::env::var_os("CADENCE_ALIAS").is_some() {
-        if org.is_some() {
-            return Err(Error::rejected(
-                "managed callers cannot override their destination with --org",
-            ));
-        }
-        return state
-            .map(Resolved::Local)
-            .map(Ok)
-            .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
+        return resolve_managed(org, state, tracker);
     }
     // An explicit flag or inherited binding is a pin; it conflicts with
     // `--org` rather than mixing roots.
@@ -477,10 +685,7 @@ pub(super) fn resolve(
         .any(|name| std::env::var_os(name).is_some());
     if pinned {
         if org.is_some() {
-            return Err(Error::rejected(
-                "--org conflicts with an explicit or inherited local instance binding; \
-                 use a clean operator shell",
-            ));
+            return Err(pin_conflict());
         }
         return state
             .map(Resolved::Local)
@@ -495,12 +700,21 @@ pub(super) fn resolve(
         Ok(p) if p.exists() => Some(RegistryFile::open()?),
         _ => None,
     };
-    let selection = match &file {
-        Some(file) => {
+    let selection = match (&file, org) {
+        (None, Some(name)) if name != LOCAL_ORG => return Err(unknown_org(name, false)),
+        (Some(file), _) => {
             let registry = file.read()?;
-            select(&registry, org)?
+            if org == Some(LOCAL_ORG) {
+                registry
+                    .connections
+                    .iter()
+                    .find(|c| c.selection.org == LOCAL_ORG)
+                    .cloned()
+            } else {
+                select(&registry, org)?
+            }
         }
-        None => None,
+        _ => None,
     };
     let Some(conn) = selection else {
         return cadence_agent::client::state_dir().map(Resolved::Local);
@@ -509,27 +723,216 @@ pub(super) fn resolve(
         Destination::Local {
             state_dir,
             tracker_dir,
-        } => {
-            std::env::set_var("CADENCE_STATE_DIR", &state_dir);
-            std::env::set_var("CADENCE_PM_DIR", &tracker_dir);
-            eprintln!(
-                "cadence org={} local={}",
-                conn.selection.org,
-                state_dir.display()
-            );
-            Ok(Resolved::Local(state_dir))
-        }
+        } => local_resolved(&conn.selection.org, state_dir, tracker_dir),
         Destination::Remote { endpoint, org_id } => {
             // The destination is the issuer-verified endpoint recorded at
             // login — `remote_cli` refuses to send this org's credential
             // anywhere else, and there is no local fallback.
             eprintln!("cadence org={} remote={}", conn.selection.org, endpoint);
             Ok(Resolved::Remote(cadence_agent::remote_cli::RemoteTarget {
+                identity: None,
                 org: conn.selection.org,
                 endpoint,
                 org_id,
             }))
         }
+    }
+}
+
+/// Shared `Destination::Local` routing: export the pair so state and
+/// tracker land on the org's roots, then return the state dir.
+fn local_resolved(org: &str, state_dir: PathBuf, tracker_dir: PathBuf) -> Result<Resolved> {
+    std::env::set_var("CADENCE_STATE_DIR", &state_dir);
+    std::env::set_var("CADENCE_PM_DIR", &tracker_dir);
+    eprintln!("cadence org={org} local={}", state_dir.display());
+    Ok(Resolved::Local(state_dir))
+}
+
+/// Which local-maintenance command is resolving, so a remote selector can
+/// name that command. Not a mode framework: only `update` and `dev`.
+#[derive(Clone, Copy)]
+enum LocalMaintenance {
+    Update,
+    Dev,
+}
+
+impl LocalMaintenance {
+    fn remote_rejected(self, name: &str) -> Error {
+        match self {
+            // Kept byte-for-byte with the CAD-1355 update refusal.
+            Self::Update => Error::rejected(format!(
+                "`cadence update` maintains a local install only — org '{name}' \
+                 is remote. Run it on the host whose install you mean to update \
+                 (a local selection such as `CADENCE_ORG=local` works there)."
+            )),
+            Self::Dev => Error::rejected(format!(
+                "`cadence dev` runs a local disposable Cadence only — org '{name}' \
+                 is remote. A saved remote org does not select it. Omit the remote \
+                 `--org`/`CADENCE_ORG`, or choose local (for example `CADENCE_ORG=local`)."
+            )),
+        }
+    }
+
+    /// `update` keeps its pin arm: an explicit root wins and `CADENCE_ORG`
+    /// is not consulted. `dev` still keeps that root, but a remote
+    /// `CADENCE_ORG` beside it is a deliberate selection and must refuse
+    /// instead of being dropped on the floor.
+    fn refuse_remote_env_beside_pins(self) -> bool {
+        matches!(self, Self::Dev)
+    }
+}
+
+fn maintenance_pins(state: Option<&Path>, tracker: Option<&Path>) -> bool {
+    state.is_some()
+        || tracker.is_some()
+        || [
+            "CADENCE_STATE_DIR",
+            "CADENCE_PM_DIR",
+            "CADENCE_HOME",
+            "CADENCE_PROFILE",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+}
+
+/// `Some(name)` when `CADENCE_ORG` names a stored remote connection.
+/// `local`, a local connection, an unknown name, or a missing registry are
+/// not remote. A present but unreadable registry fails closed.
+fn remote_org_env() -> Result<Option<String>> {
+    let Some(name) = std::env::var("CADENCE_ORG").ok() else {
+        return Ok(None);
+    };
+    if name == LOCAL_ORG {
+        return Ok(None);
+    }
+    let registry = match RegistryFile::path() {
+        Ok(path) if path.exists() => read_registry(&path)?,
+        _ => return Ok(None),
+    };
+    Ok(registry
+        .connections
+        .iter()
+        .find(|c| c.selection.org == name)
+        .and_then(|c| match c.destination {
+            Destination::Remote { .. } => Some(name),
+            Destination::Local { .. } => None,
+        }))
+}
+
+/// CAD-1355: `cadence update` is local maintenance — a *saved* remote
+/// default must never route it. This resolves only for the updater:
+/// a managed caller keeps the pre-assignment rule (no `--org`, inherited
+/// local state, no registry), pins behave exactly as [`resolve`], explicit
+/// `--org`/`CADENCE_ORG` selectors stay deliberate (a remote one refuses
+/// with local-only guidance before any transport, credential read or
+/// container wake; a local one keeps the normal local routing), and a
+/// bare invocation ignores the registry's `selected` row entirely — it
+/// binds the canonical `local` connection when one exists, else the
+/// ambient state dir. The registry is only ever read here: no row is
+/// created, selected or switched to make updating work, and the tracker
+/// pin precedence is unchanged. A live hosted assignment does not route
+/// `update`.
+pub(super) fn resolve_update(
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Resolved> {
+    resolve_local_maintenance(LocalMaintenance::Update, org, state, tracker)
+}
+
+/// `cadence dev` (`sandbox` alias) is local maintenance of a disposable
+/// Cadence. Same selector rules as [`resolve_update`], plus: a remote
+/// `CADENCE_ORG` is refused even when a local pin or managed inherited
+/// root is present, so that env is not silently discarded. `--org` on a
+/// pin still conflicts exactly as [`resolve`]; `--org` on a managed caller
+/// is still the managed-caller refusal, before any assignment lookup.
+pub(super) fn resolve_dev(
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Resolved> {
+    resolve_local_maintenance(LocalMaintenance::Dev, org, state, tracker)
+}
+
+fn resolve_local_maintenance(
+    command: LocalMaintenance,
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Resolved> {
+    // Local maintenance never follows a hosted assignment selector.
+    if std::env::var_os("CADENCE_ALIAS").is_some() {
+        if org.is_some() {
+            return Err(managed_org_refused());
+        }
+        if command.refuse_remote_env_beside_pins() {
+            if let Some(name) = remote_org_env()? {
+                return Err(command.remote_rejected(&name));
+            }
+        }
+        return state
+            .map(Resolved::Local)
+            .map(Ok)
+            .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
+    }
+    if maintenance_pins(state.as_deref(), tracker.as_deref()) {
+        // A remote env beside a local pin is deliberate. `--org` is left
+        // to [`resolve`], which refuses the pin conflict before transport.
+        if org.is_none() && command.refuse_remote_env_beside_pins() {
+            if let Some(name) = remote_org_env()? {
+                return Err(command.remote_rejected(&name));
+            }
+        }
+        return resolve(org, state, tracker);
+    }
+    let org_env = std::env::var("CADENCE_ORG").ok();
+    // Read-only: no write lock, no lock file, no created directory — the
+    // updater never mutates the registry to reach its local install.
+    let registry = match RegistryFile::path() {
+        Ok(path) if path.exists() => read_registry(&path)?,
+        _ => Registry::default(),
+    };
+    match org.or(org_env.as_deref()) {
+        // A deliberate selector is honored or refused — never ignored.
+        Some(name) => {
+            let conn = registry
+                .connections
+                .iter()
+                .find(|c| c.selection.org == name)
+                .cloned();
+            match conn.map(|c| c.destination) {
+                Some(Destination::Local {
+                    state_dir,
+                    tracker_dir,
+                }) => local_resolved(name, state_dir, tracker_dir),
+                // `local` is first-class even without a materialized row.
+                None if name == LOCAL_ORG => {
+                    cadence_agent::client::state_dir().map(Resolved::Local)
+                }
+                None => Err(Error::rejected("unknown org")),
+                Some(Destination::Remote { .. }) => Err(command.remote_rejected(name)),
+            }
+        }
+        // No explicit selector: the saved default is a preference for
+        // remote verbs, not for local maintenance — ignore it. Bind the
+        // canonical `local` row when it exists; otherwise the ambient
+        // state dir. Nothing is created, written or switched.
+        None => match registry
+            .connections
+            .iter()
+            .find(|c| c.selection.org == LOCAL_ORG)
+            .cloned()
+        {
+            Some(Connection {
+                selection,
+                destination:
+                    Destination::Local {
+                        state_dir,
+                        tracker_dir,
+                    },
+            }) => local_resolved(&selection.org, state_dir, tracker_dir),
+            _ => cadence_agent::client::state_dir().map(Resolved::Local),
+        },
     }
 }
 
@@ -554,29 +957,405 @@ pub(crate) enum OrgAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
 
     const EP_A: &str = "https://alpha.cadencecloud.app";
     const EP_B: &str = "https://beta.cadencecloud.app";
 
+    static RESOLVE_ENV: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        home: tempfile::TempDir,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn bare() -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let saved = [
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_STATE_HOME",
+                "CADENCE_ALIAS",
+                "CADENCE_ORG",
+                "CADENCE_STATE_DIR",
+                "CADENCE_PM_DIR",
+                "CADENCE_HOME",
+                "CADENCE_PROFILE",
+                "CADENCE_SOCKET",
+            ]
+            .into_iter()
+            .map(|name| {
+                let was = std::env::var_os(name);
+                std::env::remove_var(name);
+                (name, was)
+            })
+            .collect();
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("XDG_CONFIG_HOME", home.path().join("config"));
+            std::env::set_var("XDG_STATE_HOME", home.path().join("xdg-state"));
+            Self { home, saved }
+        }
+        fn expected_state(&self) -> PathBuf {
+            self.home.path().join("xdg-state").join("cadence")
+        }
+        fn registry_path(&self) -> PathBuf {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .unwrap()
+                .join("cadence")
+                .join("orgs.json")
+        }
+        fn write_registry(&self, registry: &Value) {
+            let path = self.registry_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, serde_json::to_vec_pretty(registry).unwrap()).unwrap();
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, was) in self.saved.drain(..) {
+                match was {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn remote_registry(org: &str, endpoint: &str, org_id: &str, selected: bool) -> Value {
+        json!({
+            "selected": selected.then(|| json!({"org": org})),
+            "connections": [{
+                "selection": {"org": org},
+                "destination": {"mode": "remote", "endpoint": endpoint, "org_id": org_id},
+            }],
+        })
+    }
+
     #[test]
-    fn changed_endpoint_or_org_id_is_refused_never_moved() {
-        // A changed slug or forged audience refuses instead of silently
-        // re-pointing the stored remote at another workspace.
+    fn explicit_remote_org_without_a_registry_is_refused_not_local() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::bare();
+        let err = resolve(Some("ghost"), None, None).unwrap_err();
+        assert!(err.to_string().contains("org 'ghost'"), "{err}");
+        std::env::set_var("CADENCE_ORG", "ghost");
+        let err = resolve(None, None, None).unwrap_err();
+        assert!(err.to_string().contains("org 'ghost'"), "{err}");
+    }
+
+    #[test]
+    fn no_org_without_a_registry_still_resolves_local() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let resolved = resolve(None, None, None).unwrap();
+        match resolved {
+            Resolved::Local(dir) => assert_eq!(dir, env.expected_state(), "{dir:?}"),
+            Resolved::Remote(_) => panic!("ambient local resolved remote"),
+        }
+    }
+
+    #[test]
+    fn explicit_local_is_the_built_in_destination() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let resolved = resolve(Some("local"), None, None).unwrap();
+        match resolved {
+            Resolved::Local(dir) => assert_eq!(dir, env.expected_state()),
+            Resolved::Remote(_) => panic!("local resolved remote"),
+        }
+        env.write_registry(&json!({
+            "selected": null,
+            "connections": [{
+                "selection": {"org": "local"},
+                "destination": {
+                    "mode": "local",
+                    "state_dir": "/org/state",
+                    "tracker_dir": "/org/tracker",
+                },
+            }],
+        }));
+        let resolved = resolve(Some("local"), None, None).unwrap();
+        match resolved {
+            Resolved::Local(dir) => assert_eq!(dir, PathBuf::from("/org/state")),
+            Resolved::Remote(_) => panic!("registered local resolved remote"),
+        }
+    }
+
+    #[test]
+    fn explicit_org_names_a_registered_remote() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", false));
+        let resolved = resolve(Some("acme"), None, None).unwrap();
+        match resolved {
+            Resolved::Remote(target) => {
+                assert_eq!(target.org, "acme");
+                assert_eq!(target.endpoint, EP_A);
+                assert_eq!(target.org_id, "ws_alpha");
+            }
+            Resolved::Local(_) => panic!("remote org resolved local"),
+        }
+    }
+
+    #[test]
+    fn unknown_explicit_org_in_a_real_registry_is_refused() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", false));
+        let err = resolve(Some("ghost"), None, None).unwrap_err();
+        assert!(err.to_string().contains("org 'ghost'"), "{err}");
+    }
+
+    #[test]
+    fn cadence_org_env_names_a_registered_remote() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", false));
+        std::env::set_var("CADENCE_ORG", "acme");
+        match resolve(None, None, None).unwrap() {
+            Resolved::Remote(target) => assert_eq!(target.org, "acme"),
+            Resolved::Local(_) => panic!("CADENCE_ORG remote resolved local"),
+        }
+    }
+
+    #[test]
+    fn managed_and_pinned_callers_keep_their_existing_refusals() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", true));
+        std::env::set_var("CADENCE_ALIAS", "worker-1");
+        assert!(resolve(Some("acme"), None, None).is_err());
+        let resolved = resolve(None, None, None).unwrap();
+        assert!(matches!(resolved, Resolved::Local(_)));
+        std::env::remove_var("CADENCE_ALIAS");
+        std::env::set_var("CADENCE_STATE_DIR", "/pinned/state");
+        assert!(resolve(Some("acme"), None, None).is_err());
+        let resolved = resolve(None, None, None).unwrap();
+        match resolved {
+            Resolved::Local(dir) => assert_eq!(dir, PathBuf::from("/pinned/state")),
+            Resolved::Remote(_) => panic!("pinned caller resolved remote"),
+        }
+    }
+
+    #[test]
+    fn changed_endpoint_or_org_id_replaces_the_stale_binding() {
+        // A verified grant for the same slug is authoritative: a recreated
+        // or rotated workspace re-points the stored remote instead of
+        // requiring a manual registry edit.
         let mut registry = Registry::default();
         apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
-        assert!(apply_record_remote(&mut registry, "alpha", EP_B, "ws_alpha", false).is_err());
-        assert!(apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).is_err());
+        apply_record_remote(&mut registry, "alpha", EP_B, "ws_alpha", false).unwrap();
+        assert_eq!(registry.connections.len(), 1);
+        assert_remote(&registry, "alpha", EP_B, "ws_alpha");
+
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).unwrap();
+        assert_eq!(registry.connections.len(), 1);
+        assert_remote(&registry, "alpha", EP_A, "ws_other");
+    }
+
+    #[test]
+    fn identical_relogin_is_idempotent() {
+        let mut registry = Registry::default();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+        assert_eq!(registry.connections.len(), 1);
+        assert_remote(&registry, "alpha", EP_A, "ws_alpha");
+    }
+
+    #[test]
+    fn local_name_collision_is_still_refused() {
+        let mut registry = Registry::default();
+        registry.connections.push(Connection {
+            selection: Selection {
+                org: "alpha".into(),
+            },
+            destination: Destination::Local {
+                state_dir: "/local/state".into(),
+                tracker_dir: "/local/tracker".into(),
+            },
+        });
+        let error = apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false)
+            .expect_err("local row must not be replaced");
+        assert!(
+            error.to_string().contains("exists as a local connection"),
+            "{error}"
+        );
+        assert_eq!(registry.connections.len(), 1);
+        assert!(matches!(
+            registry.connections[0].destination,
+            Destination::Local { .. }
+        ));
+    }
+
+    #[test]
+    fn replacement_leaves_other_orgs_and_the_default_untouched() {
+        let mut registry = Registry::default();
+        apply_record_remote(&mut registry, "beta", EP_B, "ws_beta", true).unwrap();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+
+        let selected =
+            apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).unwrap();
+        assert!(!selected.1, "replacement without --use must not select");
+        assert_eq!(
+            registry.selected.as_ref().map(|s| s.org.as_str()),
+            Some("beta")
+        );
+        assert_remote(&registry, "alpha", EP_A, "ws_other");
+        assert_remote(&registry, "beta", EP_B, "ws_beta");
+    }
+
+    #[test]
+    fn replacing_the_selected_org_keeps_it_selected_and_use_can_move_it() {
+        let mut registry = Registry::default();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", true).unwrap();
+        let replaced =
+            apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).unwrap();
+        assert!(replaced.1, "an already selected org stays selected");
+        assert_eq!(
+            registry.selected.as_ref().map(|s| s.org.as_str()),
+            Some("alpha")
+        );
+
+        apply_record_remote(&mut registry, "beta", EP_B, "ws_beta", false).unwrap();
+        apply_record_remote(&mut registry, "beta", EP_B, "ws_beta2", true).unwrap();
+        assert_eq!(
+            registry.selected.as_ref().map(|s| s.org.as_str()),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn registry_write_succeeds_when_the_config_directory_cannot_be_opened_for_read() {
+        // persist publishes the registry; a write+execute-only config dir
+        // cannot be opened for the fsync, but must not turn a published
+        // binding into a failed login that skips the credential save.
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("alpha", EP_A, "ws_alpha", true));
+        let dir = env.registry_path().parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+        let stored = record_remote("alpha", EP_A, "ws_other", false, || Ok(())).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(stored["destination"]["org_id"], "ws_other");
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(env.registry_path()).unwrap()).unwrap();
+        assert_eq!(raw["connections"][0]["destination"]["org_id"], "ws_other");
+    }
+
+    #[test]
+    fn failed_credential_commit_restores_the_previous_binding() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let previous = remote_registry("alpha", EP_A, "ws_alpha", true);
+        env.write_registry(&previous);
+
+        let error = record_remote("alpha", EP_A, "ws_other", false, || {
+            Err(Error::rejected("credential write refused"))
+        })
+        .expect_err("a failed credential save must fail the login");
+        assert!(
+            error.to_string().contains("credential write refused"),
+            "{error}"
+        );
+
+        let stored: Value =
+            serde_json::from_slice(&std::fs::read(env.registry_path()).unwrap()).unwrap();
+        assert_eq!(stored, previous, "the previous binding must be restored");
+    }
+
+    #[test]
+    fn failed_credential_commit_restores_a_compact_registry_verbatim() {
+        // read_registry accepts a compact file up to 64 KiB, but write
+        // pretty-prints. A compact registry just under the read cap can be
+        // impossible to reserialize; rollback must put the original bytes
+        // back instead of failing after the replacement was published.
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let long_id = format!("ws_{}", "a".repeat(196));
+        let mut compact = None;
+        for endpoint_len in 64_000..=65_400 {
+            let registry = Registry {
+                selected: Some(Selection {
+                    org: "alpha".into(),
+                }),
+                connections: vec![Connection {
+                    selection: Selection {
+                        org: "alpha".into(),
+                    },
+                    destination: Destination::Remote {
+                        endpoint: format!("https://{}.test", "a".repeat(endpoint_len)),
+                        org_id: long_id.clone(),
+                    },
+                }],
+            };
+            let raw = serde_json::to_vec(&registry).unwrap();
+            if raw.len() <= 65536 && serde_json::to_vec_pretty(&registry).unwrap().len() > 65536 {
+                compact = Some(raw);
+                break;
+            }
+        }
+        let compact = compact.expect("no compact registry crosses the pretty-print cap");
+        let path = env.registry_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &compact).unwrap();
+
+        let error = record_remote("alpha", EP_A, "ws_new", false, || {
+            Err(Error::rejected("credential write refused"))
+        })
+        .expect_err("a failed credential save must fail the login");
+        assert!(
+            error.to_string().contains("credential write refused"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            compact,
+            "rollback must restore the compact registry bytes verbatim"
+        );
+    }
+
+    #[test]
+    fn successful_relogin_commits_the_credential_after_replacing() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("alpha", EP_A, "ws_alpha", true));
+        let mut committed = false;
+
+        let stored = record_remote("alpha", EP_A, "ws_other", false, || {
+            committed = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(committed);
+        assert_eq!(stored["destination"]["org_id"], "ws_other");
+        assert_eq!(stored["selected"], true);
+
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(env.registry_path()).unwrap()).unwrap();
+        assert_eq!(raw["connections"][0]["destination"]["org_id"], "ws_other");
+        assert_eq!(raw["connections"][0]["destination"]["endpoint"], EP_A);
+    }
+
+    fn assert_remote(registry: &Registry, org: &str, endpoint: &str, org_id: &str) {
         let stored = registry
             .connections
             .iter()
-            .find(|c| c.selection.org == "alpha")
-            .unwrap();
+            .find(|c| c.selection.org == org)
+            .unwrap_or_else(|| panic!("{org} is missing from the registry"));
         match &stored.destination {
-            Destination::Remote { endpoint, org_id } => {
-                assert_eq!(endpoint, EP_A);
-                assert_eq!(org_id, "ws_alpha");
+            Destination::Remote {
+                endpoint: actual_endpoint,
+                org_id: actual_org_id,
+            } => {
+                assert_eq!(actual_endpoint, endpoint);
+                assert_eq!(actual_org_id, org_id);
             }
-            Destination::Local { .. } => panic!("stored remote changed shape"),
+            Destination::Local { .. } => panic!("{org} is not a remote"),
         }
     }
 
@@ -609,5 +1388,271 @@ mod tests {
         .is_err());
         assert!(registry.connections.is_empty());
         assert!(registry.selected.is_none());
+    }
+
+    fn hosted_message(id: &str, state: &str) -> Value {
+        json!({"id": id, "alias": "worker-1", "state": state})
+    }
+
+    fn managed_state(env: &EnvGuard) -> PathBuf {
+        let dir = env.home.path().join("daemon-state");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("CADENCE_STATE_DIR", &dir);
+        std::env::set_var("CADENCE_ALIAS", "worker-1");
+        dir
+    }
+
+    fn write_login(env: &EnvGuard, subject: &str, issuer: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = env.home.path().join("config/cadence/remote-auth");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("cli-acme.json");
+        let body = json!({
+            "version": "hosted-cadence-auth.v1",
+            "organization_id": "ws_binding",
+            "organization_slug": "acme",
+            "audience": EP_A,
+            "issuer": issuer,
+            "subject_id": subject,
+            "capabilities": ["cli.read", "cli.write"],
+            "access_token": format!("hct_{}", "a".repeat(43)),
+            "expires_at": 4_000_000_000u64,
+        });
+        std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn bind_hosted(dir: &Path, message: &str) {
+        let kickoff = cadence_agent::local_assignment::Kickoff {
+            alias: "worker-1",
+            issue_id: "CAD-1460",
+            assignment_id: "hla_00000000000000000000000000000001",
+            worktree: "/tmp/not-a-checkout",
+            message_id: message,
+            claim_id: "hlc_00000000000000000000000000000001",
+            generation: 4,
+            organization_id: "ws_binding",
+            audience: EP_A,
+            subject_id: Some("user_claimant"),
+            issuer: Some("https://issuer.example/original"),
+        };
+        cadence_agent::local_assignment::reporting::store_kickoff_binding(
+            dir,
+            "acme",
+            EP_A,
+            &kickoff,
+            "hosted kickoff",
+        )
+        .unwrap();
+    }
+
+    fn settle_hosted(dir: &Path, message: &str) {
+        let path = dir
+            .join("hosted-assignments")
+            .join(format!("{message}.bind"));
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["settled"] = json!(true);
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    fn serve_show(dir: &Path, messages: Value, wait_ms: i32) -> std::thread::JoinHandle<()> {
+        use std::io::{BufRead, Write};
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixListener;
+        let socket = dir.join("cadence.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            let fd = listener.as_raw_fd();
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut pollfd, 1, wait_ms) } <= 0 {
+                return;
+            }
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = String::new();
+            let _ = std::io::BufReader::new(stream.try_clone().unwrap()).read_line(&mut request);
+            let accepted = serde_json::from_str::<Value>(&request)
+                .ok()
+                .is_some_and(|frame| {
+                    frame["method"] == "agent_show" && frame["params"]["alias"] == "worker-1"
+                });
+            let reply = if accepted {
+                cadence_agent::proto::ok(json!({
+                    "agent": {"alias": "worker-1"},
+                    "messages": messages,
+                }))
+            } else {
+                json!({"ok": false, "error": {"kind": "rejected", "message": "unexpected agent_show"}})
+            };
+            let _ = writeln!(stream, "{reply}");
+        })
+    }
+
+    fn assert_refused(dir: &Path, messages: Value, org: &str) {
+        let server = serve_show(dir, messages, 3_000);
+        let err = resolve(Some(org), None, None).unwrap_err();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(dir.join("cadence.sock"));
+        assert_eq!(err.kind(), "rejected", "{err}");
+        let text = err.to_string();
+        assert!(!text.to_ascii_lowercase().contains("unset"), "{text}");
+        assert!(!text.contains("unexpected"), "{text}");
+        assert!(!text.contains("Daemon is not reachable"), "{text}");
+    }
+
+    #[test]
+    fn managed_running_binding_uses_that_hosted_org() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let dir = managed_state(&env);
+        std::env::set_var("CADENCE_ORG", "other");
+        std::env::set_var("CADENCE_PM_DIR", "/inherited/pm");
+        env.write_registry(&remote_registry("acme", EP_B, "ws_registry", true));
+        write_login(&env, "user_claimant", "https://issuer.example/original");
+        bind_hosted(&dir, "msg-live");
+        let server = serve_show(
+            &dir,
+            json!([
+                hosted_message("msg-old", "completed"),
+                hosted_message("msg-wait", "queued"),
+                hosted_message("msg-live", "running"),
+            ]),
+            3_000,
+        );
+        let resolved = resolve(Some("acme"), None, Some(PathBuf::from("/inherited/pm"))).unwrap();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(dir.join("cadence.sock"));
+        match resolved {
+            Resolved::Remote(target) => {
+                assert_eq!(target.org, "acme");
+                assert_eq!(target.endpoint, EP_A);
+                assert_eq!(target.org_id, "ws_binding");
+            }
+            Resolved::Local(path) => panic!("live binding resolved local {path:?}"),
+        }
+        match resolve(None, None, Some(PathBuf::from("/inherited/pm"))).unwrap() {
+            Resolved::Local(path) => assert_eq!(path, dir),
+            Resolved::Remote(target) => panic!("omitted --org resolved {}", target.endpoint),
+        }
+    }
+
+    #[test]
+    fn managed_wrong_unbound_ended_and_ambiguous_selectors_are_refused() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let dir = managed_state(&env);
+        env.write_registry(&remote_registry("other", EP_B, "ws_other", true));
+        bind_hosted(&dir, "msg-live");
+        bind_hosted(&dir, "msg-done");
+        assert_refused(
+            &dir,
+            json!([hosted_message("msg-live", "running")]),
+            "other",
+        );
+        assert_refused(
+            &dir,
+            json!([
+                hosted_message("msg-gap", "running"),
+                hosted_message("msg-done", "completed"),
+            ]),
+            "acme",
+        );
+        assert_refused(
+            &dir,
+            json!([hosted_message("msg-done", "completed")]),
+            "acme",
+        );
+        assert_refused(&dir, json!([hosted_message("msg-live", "queued")]), "acme");
+        assert_refused(&dir, json!([hosted_message("msg-live", "unknown")]), "acme");
+        assert_refused(
+            &dir,
+            json!([
+                hosted_message("msg-live", "running"),
+                hosted_message("msg-other", "running"),
+            ]),
+            "acme",
+        );
+        assert_refused(&dir, json!([]), "acme");
+        settle_hosted(&dir, "msg-live");
+        assert_refused(&dir, json!([hosted_message("msg-live", "running")]), "acme");
+    }
+
+    #[test]
+    fn managed_explicit_state_and_foreign_tracker_still_conflict() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let dir = managed_state(&env);
+        bind_hosted(&dir, "msg-live");
+        let err = resolve(Some("acme"), Some(dir.clone()), None).unwrap_err();
+        assert!(err.to_string().contains("conflicts"), "{err}");
+        std::env::set_var("CADENCE_PM_DIR", "/inherited/pm");
+        let err = resolve(Some("acme"), None, Some(PathBuf::from("/other/pm"))).unwrap_err();
+        assert!(err.to_string().contains("conflicts"), "{err}");
+    }
+
+    #[test]
+    fn managed_update_does_not_follow_the_live_hosted_org() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let dir = managed_state(&env);
+        bind_hosted(&dir, "msg-live");
+        write_login(&env, "user_claimant", "https://issuer.example/original");
+        let err = resolve_update(Some("acme"), None, None).unwrap_err();
+        assert_eq!(err.kind(), "rejected", "{err}");
+        let server = serve_show(&dir, json!([hosted_message("msg-live", "running")]), 3_000);
+        let resolved = resolve(Some("acme"), None, None).unwrap();
+        server.join().unwrap();
+        assert!(
+            matches!(resolved, Resolved::Remote(target) if target.org == "acme"
+            && target.endpoint == EP_A
+            && target.org_id == "ws_binding")
+        );
+    }
+
+    #[test]
+    fn managed_caller_still_cannot_switch_org() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", false));
+        std::env::set_var("CADENCE_ALIAS", "worker-1");
+        let err = run(OrgAction::Switch {
+            name: "acme".into(),
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), "rejected", "{err}");
+        let registry: Value =
+            serde_json::from_slice(&std::fs::read(env.registry_path()).unwrap()).unwrap();
+        assert!(registry["selected"].is_null());
+    }
+
+    #[test]
+    fn managed_binding_without_member_or_another_login_cannot_retarget() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let dir = managed_state(&env);
+        bind_hosted(&dir, "msg-live");
+        let path = dir.join("hosted-assignments/msg-live.bind");
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("subject_id");
+        value.as_object_mut().unwrap().remove("issuer");
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        write_login(&env, "user_claimant", "https://issuer.example/original");
+        assert_refused(&dir, json!([hosted_message("msg-live", "running")]), "acme");
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["subject_id"] = json!("user_claimant");
+        value["issuer"] = json!("https://issuer.example/original");
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        write_login(&env, "user_other", "https://issuer.example/later");
+        let server = serve_show(&dir, json!([hosted_message("msg-live", "running")]), 3_000);
+        let err = resolve(Some("acme"), None, None).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(err.kind(), "rejected", "{err}");
     }
 }

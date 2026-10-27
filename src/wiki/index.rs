@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use serde_json::{json, Value};
 
-use super::{allowed, normalize, vault_dir, Caller, Op, SEARCH_CAP, TEXT_CAP};
+use super::{allowed, normalize, normalize_dir, vault_dir, Caller, Op, SEARCH_CAP, TEXT_CAP};
 use crate::error::{Error, Result};
 use crate::issue::Pm;
 
@@ -886,7 +886,7 @@ fn search_with_hook(
     base: &str,
     mut after_hits: impl FnMut(),
 ) -> Result<Value> {
-    let norm = normalize(base)?;
+    let norm = normalize_dir(base)?;
     let segs = if norm.is_empty() {
         Vec::new()
     } else {

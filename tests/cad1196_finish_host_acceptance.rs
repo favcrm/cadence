@@ -6,9 +6,9 @@
 //! started by the test and killed by it. Nothing here touches the real PM,
 //! state dir or daemon.
 //!
-//! * clean lane finishes (the host-specific kernel behaviour: empty PID 2
-//!   ns link, EACCES on other users' processes must not block a non-root
-//!   operator);
+//! * clean lane finishes (the host-specific kernel behaviour: an empty PID 2
+//!   ns link, or EACCES on that root-owned link (CAD-1845), and EACCES on
+//!   other users' processes must not block a non-root operator);
 //! * an own-uid process whose cwd is inside the lane refuses, naming it;
 //! * an own-uid process holding an fd inside (cwd elsewhere) refuses;
 
@@ -323,19 +323,27 @@ fn cad1196_finish_enumeration_on_a_normal_host() {
         return;
     }
 
-    // 1. A clean lane. The kernel behaviour the ticket covers is an EMPTY
-    // `2/ns/pid` link for a non-root reader (Linux 7.0 on this host): there
-    // the lane must finish. Kernels that answer EACCES instead (the CI
-    // runner) cannot be proven complete and must still fail closed, with
-    // that reason, and leave the lane untouched.
-    let pid2_link_is_empty = matches!(
-        fs::read_link("/proc/2/ns/pid"),
-        Ok(target) if target.as_os_str().is_empty()
-    );
+    // 1. A clean lane. The kernel behaviour the tickets cover is a non-root
+    // reader of the root-owned `2/ns/pid` link getting an EMPTY target
+    // (CAD-1196) or EACCES (CAD-1845, Linux 7.0.0-1014 and the CI runner):
+    // there the lane must finish. Any other answer (another errno, an
+    // EACCES on a link the caller owns) cannot be proven complete and must
+    // still fail closed, with that reason, and leave the lane untouched.
+    // The refusals the host cannot produce are driven in
+    // `issue::process_use::tests::cad1845_acceptance`.
+    let pid2_answer_is_excused = match fs::read_link("/proc/2/ns/pid") {
+        Ok(target) => target.as_os_str().is_empty(),
+        Err(error) => {
+            use std::os::unix::fs::MetadataExt;
+            let euid = unsafe { libc::geteuid() };
+            error.raw_os_error() == Some(libc::EACCES)
+                && fs::symlink_metadata("/proc/2/ns/pid").is_ok_and(|meta| meta.uid() != euid)
+        }
+    };
     let clean = Fixture::new();
     let (id, lane, branch) = clean.merged_lane();
     let out = clean.finish(&id, &lane, false);
-    if pid2_link_is_empty {
+    if pid2_answer_is_excused {
         assert!(
             out.status.success(),
             "clean lane must finish: {}",
@@ -393,7 +401,7 @@ fn cad1196_finish_enumeration_on_a_normal_host() {
 
     // Holders gone: where the scan can complete, the same lane now finishes,
     // so the guard (not some unrelated condition) was the sole refusal above.
-    if pid2_link_is_empty {
+    if pid2_answer_is_excused {
         let out = fd_case.finish(&id, &lane, false);
         assert!(
             out.status.success(),

@@ -14,2369 +14,158 @@ use crate::error::{Error, Result};
 use crate::issue::model::{self, Front, Ref};
 use crate::issue::{board, parse, project, time, Pm, PmLock};
 
-/// `Actor:` trailer resolution, in order: an explicit `--author`/`--by`
-/// (`who`), the API actor string (`actor`), `CADENCE_ALIAS`, else
-/// `operator`. The same chain feeds `issue comment`'s author fallback.
-pub(crate) fn actor_who(actor: &str, who: Option<&str>) -> String {
-    who.map(str::to_string)
-        .or_else(|| (!actor.is_empty()).then(|| actor.to_string()))
-        .or_else(|| std::env::var("CADENCE_ALIAS").ok())
-        .filter(|w| !w.is_empty())
-        .unwrap_or_else(|| "operator".to_string())
-}
-
-/// Commit with the actor named when one is given — API writes show as
-/// `CAD-16: set status=review (operator (ui))`; CLI writes pass "" and
-/// keep the bare subject. Every commit also carries trailers after a
-/// blank line: `Issue: <ID>` once per issue the write touches (links
-/// record both ends) and `Actor: <who>` — the truthful actor history
-/// reads instead of the git author. `paths` are exactly the files the
-/// write touched — they are all the commit stages (CAD-454); the
-/// returned list names foreign paths the commit saw but left alone.
-pub(crate) fn commit(
-    pm: &Pm,
-    paths: &[PathBuf],
-    message: &str,
-    ids: &[&str],
-    actor: &str,
-) -> Result<Vec<String>> {
-    commit_who(pm, paths, message, ids, actor, None)
-}
-
-pub(crate) fn commit_who(
-    pm: &Pm,
-    paths: &[PathBuf],
-    message: &str,
-    ids: &[&str],
-    actor: &str,
-    who: Option<&str>,
-) -> Result<Vec<String>> {
-    let full = commit_message(message, ids, actor, who);
-    pm.commit(paths, &full)
-}
-
-fn commit_message(message: &str, ids: &[&str], actor: &str, who: Option<&str>) -> String {
-    let subject = if actor.is_empty() {
-        message.to_string()
-    } else {
-        format!("{message} ({actor})")
-    };
-    let mut trailers = String::new();
-    for id in ids {
-        trailers.push_str(&format!("Issue: {id}\n"));
-    }
-    trailers.push_str(&format!("Actor: {}\n", actor_who(actor, who)));
-    format!("{subject}\n\n{trailers}")
-}
-
-/// [`commit`] through a scoped [`PmLock`]: the commit's paths must
-/// stay inside the lock's admitted paths (see
-/// [`Pm::commit_scoped`]). Callers that took
-/// [`Pm::lock_for_paths`](Pm::lock_for_paths) commit through here.
-pub(crate) fn commit_scoped(
-    pm: &Pm,
-    lock: &PmLock,
-    paths: &[PathBuf],
-    message: &str,
-    ids: &[&str],
-    actor: &str,
-) -> Result<Vec<String>> {
-    commit_who_scoped(pm, lock, paths, message, ids, actor, None)
-}
-
-/// [`commit_who`] through a scoped [`PmLock`].
-pub(crate) fn commit_who_scoped(
-    pm: &Pm,
-    lock: &PmLock,
-    paths: &[PathBuf],
-    message: &str,
-    ids: &[&str],
-    actor: &str,
-    who: Option<&str>,
-) -> Result<Vec<String>> {
-    let full = commit_message(message, ids, actor, who);
-    pm.commit_scoped(lock, paths, &full)
-}
-
-/// Content hash of `issue.md` — the optimistic-concurrency token the
-/// write API calls `if_rev`. FNV-1a: no deps, stable across versions.
-pub fn issue_rev(dir: &Path) -> Result<String> {
-    let bytes = std::fs::read(dir.join("issue.md"))?;
-    Ok(rev_bytes(&bytes))
-}
-
-fn rev_bytes(bytes: &[u8]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("fnv1a:{h:016x}")
-}
-
-/// Optimistic-concurrency check, run under the write lock. Returns a
-/// conflict payload (the route maps it to 409) or None.
-fn check_rev(dir: &Path, if_rev: Option<&str>) -> Result<Option<Value>> {
-    let Some(want) = if_rev else {
-        return Ok(None);
-    };
-    let cur = issue_rev(dir)?;
-    if want != cur {
-        return Ok(Some(json!({"conflict": "if_rev", "current_rev": cur})));
-    }
-    Ok(None)
-}
-
-/// Lint parity at write time: an issue whose status is ready|doing|
-/// review while a blocked_by target is unfinished succeeds but the
-/// response carries this warning.
-pub(crate) fn blocked_warnings(pm: &Pm, id: &str, state_dir: Option<&Path>) -> Result<Vec<String>> {
-    let issues = board::load_all(&pm.dir, None)?;
-    let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
-    let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
-    let Some(v) = views.iter().find(|v| v.issue.front.id == id) else {
-        return Ok(vec![]);
-    };
-    if !(v.blocked && matches!(v.status.as_str(), "ready" | "doing" | "review")) {
-        return Ok(vec![]);
-    }
-    let open: Vec<String> = v
-        .issue
-        .front
-        .blocked_by
-        .iter()
-        .filter(|b| {
-            views
-                .iter()
-                .find(|o| &o.issue.front.id == *b)
-                .map(|o| !matches!(o.status.as_str(), "done" | "dropped"))
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect();
-    Ok(vec![format!(
-        "{id} is {} but still waits on {}",
-        v.status,
-        open.join(", ")
-    )])
-}
-
-/// [`blocked_warnings`] for a write that already committed (CAD-908):
-/// the commit landed, so a failed lookup must not turn the write into
-/// a reported failure — a retry would repeat a comment or attachment.
-/// The failure is printed to stderr and recorded in `post` for the
-/// JSON's `post_commit_warnings`; the warnings list is empty then.
-pub(crate) fn blocked_warnings_best_effort(
-    pm: &Pm,
-    id: &str,
-    state_dir: Option<&Path>,
-    post: &mut Vec<String>,
-) -> Vec<String> {
-    match blocked_warnings(pm, id, state_dir) {
-        Ok(w) => w,
-        Err(e) => {
-            post_commit_warning(post, format!("blocked-by warnings unavailable: {e}"));
-            Vec::new()
-        }
-    }
-}
-
-/// Record one post-commit failure: stderr now, JSON later.
-pub(crate) fn post_commit_warning(post: &mut Vec<String>, message: String) {
-    eprintln!("warning: {message} (the write itself committed)");
-    post.push(message);
-}
-
-/// Fold the post-commit warnings into the write's JSON result —
-/// present only when a post-commit step failed.
-pub(crate) fn attach_post_warnings(out: &mut Value, post: &[String]) {
-    if !post.is_empty() {
-        out["post_commit_warnings"] = json!(post);
-    }
-}
-
-/// `key=value` pairs that set `status=done` — the one test `issue set`
-/// and `issue edit` share for the worktree-open hint.
-pub(crate) fn sets_done(pairs: &[String]) -> bool {
-    pairs.iter().any(|p| {
-        p.split_once('=').is_some_and(|(k, v)| {
-            k.trim().eq_ignore_ascii_case("status") && v.trim().eq_ignore_ascii_case("done")
-        })
-    })
-}
-
-/// Write `text` to `path` atomically (temp file + rename).
-fn atomic_write(path: &Path, text: &str) -> Result<()> {
-    let tmp = path.with_extension("md.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-/// A tracker file's bytes before this write touches it — `None` when
-/// it does not exist. Feeds [`restore_preimage`] when the commit
-/// fails, so a refused write leaves neither an index entry (the
-/// commit unstages its own paths) nor a half-written file (CAD-454).
-pub(crate) fn file_preimage(path: &Path) -> Option<Vec<u8>> {
-    std::fs::read(path).ok()
-}
-
-/// Undo what a write did to `path`: the old bytes go back where they
-/// were; a file this write created is removed.
-pub(crate) fn restore_preimage(path: &Path, prev: Option<Vec<u8>>) {
-    match prev {
-        Some(bytes) => {
-            let _ = std::fs::write(path, bytes);
-        }
-        None => {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-/// Fold the foreign paths a commit saw into the write's JSON result —
-/// `foreign_files` is present only when the tracker held files the
-/// write did not stage.
-pub(crate) fn attach_foreign(out: &mut Value, foreign: &[String]) {
-    if !foreign.is_empty() {
-        out["foreign_files"] = json!(foreign);
-    }
-}
-
-/// Write `bytes` to a new file at `path`, never leaving a partial one
-/// (CAD-908): the bytes go to a hidden temp file in the same directory
-/// first, then a hard link claims `path` — atomic, and it fails with
-/// `AlreadyExists` instead of overwriting, like `create_new`. A failed
-/// write leaves no file at `path`; the temp file is removed either way.
-pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    write_new_seq(path, bytes, || SEQ.fetch_add(1, Ordering::Relaxed))
-}
-
-/// How many temp names [`write_new_seq`] tries before giving up.
-const TEMP_ATTEMPTS: usize = 64;
-
-/// [`write_new`] with the temp sequence injected. A temp name that
-/// already exists (pid reuse after a crash, a planted file) is skipped
-/// — never removed, it is not ours — and the next sequence number is
-/// tried, so a leftover temp can never surface as a false
-/// `AlreadyExists` for `path` (CAD-971).
-fn write_new_seq(path: &Path, bytes: &[u8], mut seq: impl FnMut() -> u64) -> std::io::Result<()> {
-    use std::io::Write;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_default();
-    for _ in 0..TEMP_ATTEMPTS {
-        let tmp = path.with_file_name(format!(".{name}.tmp-{}-{}", std::process::id(), seq()));
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        };
-        // From here the temp is ours: it is removed on every outcome.
-        let staged = file.write_all(bytes).and_then(|()| file.sync_all());
-        drop(file);
-        let claimed = staged.and_then(|()| std::fs::hard_link(&tmp, path));
-        let _ = std::fs::remove_file(&tmp);
-        return claimed;
-    }
-    Err(std::io::Error::other(format!(
-        "no free temp name beside {}",
-        path.display()
-    )))
-}
-
-/// Create a file exclusively; on a name collision try `-2`, `-3`…
-/// before the extension. Returns the created path. The file appears
-/// whole or not at all ([`write_new`]).
-pub(crate) fn create_exclusive(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) => (s.to_string(), format!(".{e}")),
-        None => (name.to_string(), String::new()),
-    };
-    for n in 0..100 {
-        let candidate = if n == 0 {
-            name.to_string()
-        } else {
-            format!("{stem}-{n}{ext}")
-        };
-        let path = dir.join(&candidate);
-        match write_new(&path, bytes) {
-            Ok(()) => return Ok(path),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Err(Error::rejected(format!(
-        "Could not create a unique name for '{name}' under {}",
-        dir.display()
-    )))
-}
-
-/// Locate an issue folder by id. The id's prefix must match the
-/// project's prefix — ids cannot smuggle across projects. Symlinks are
-/// never followed: a linked folder or issue.md does not exist as far
-/// as the writer is concerned.
-pub(crate) fn issue_dir(pm: &Pm, id: &str) -> Result<(project::Project, PathBuf)> {
-    model::check_id(id)?;
-    for project in project::list(&pm.dir)? {
-        let dir = pm.dir.join(&project.key).join(id);
-        if board::is_real_dir(&dir) && board::is_real_file(&dir.join("issue.md")) {
-            return Ok((project, dir));
-        }
-    }
-    Err(Error::rejected(format!(
-        "Unknown issue '{id}' — `cadence issue ls` lists what exists"
-    )))
-}
-
-pub(crate) fn load_front(dir: &Path) -> Result<(Front, String)> {
-    let text = std::fs::read_to_string(dir.join("issue.md"))?;
-    parse::parse_issue(&text)
-}
-
-/// Lint parity for the component field on every write path (`new`,
-/// `set`, HTTP PATCH): the value must be one the issue's project
-/// declares — a project with no component list accepts any.
-fn check_component(project: &project::Project, component: &str) -> Result<()> {
-    if !project.components.is_empty() && !project.components.iter().any(|c| c == component) {
-        return Err(Error::rejected(format!(
-            "Unknown component '{component}' — {} declares: {}",
-            project.key,
-            project.components.join(", ")
-        )));
-    }
-    Ok(())
-}
-
-/// The same rule for tags: well-formed, sorted, de-duplicated, capped —
-/// and, when the project declares a `tags:` list, drawn from it.
-pub(crate) fn check_tags(project: &project::Project, tags: &[String]) -> Result<Vec<String>> {
-    let tags = model::normalize_tags(tags)?;
-    if !project.tags.is_empty() {
-        if let Some(unknown) = tags
-            .iter()
-            .find(|t| !project.tags.contains(t) && !model::system_tag(t))
-        {
-            return Err(Error::rejected(format!(
-                "Unknown tag '{unknown}' — {} declares: {}",
-                project.key,
-                project.tags.join(", ")
-            )));
-        }
-    }
-    Ok(tags)
-}
-
-/// `a,b` → `[a, b]`; blanks between commas are dropped, so `tags=`
-/// clears.
-pub(crate) fn split_tags(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-pub(crate) fn save_front(dir: &Path, front: &Front, body: &str) -> Result<()> {
-    atomic_write(&dir.join("issue.md"), &parse::render(front, body)?)
-}
-
-/// issue acceptance <ID> --from <file> — replace the issue's unique
-/// level-two Acceptance section, or append one when it is absent.
-/// Validation happens before the PM lock and the body is saved atomically
-/// under that lock, so malformed input and duplicate sections leave the
-/// tracker unchanged.
-pub fn set_acceptance(pm: &Pm, id: &str, source: &Path, actor: &str) -> Result<Value> {
-    let input = std::fs::read_to_string(source).map_err(|e| {
-        Error::rejected(format!(
-            "Cannot read acceptance input {}: {e}",
-            source.display()
-        ))
-    })?;
-    let items = parse::parse_acceptance_input(&input)?;
-    let (_project, dir) = issue_dir(pm, id)?;
-    let file = dir.join("issue.md");
-    let lock = pm.lock_for_paths(std::slice::from_ref(&file))?;
-    let (front, body) = load_front(&dir)?;
-    let body = parse::replace_acceptance(&body, &items)?;
-    let prev = file_preimage(&file);
-    save_front(&dir, &front, &body)?;
-    let foreign = match commit_scoped(
-        pm,
-        &lock,
-        std::slice::from_ref(&file),
-        &format!("{id}: acceptance replaced"),
-        &[id],
-        actor,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            restore_preimage(&file, prev);
-            return Err(e);
-        }
-    };
-    let mut out = json!({
-        "id": id,
-        "acceptance": items
-            .iter()
-            .map(parse::AcceptanceItem::to_json)
-            .collect::<Vec<_>>(),
-        "committed": true,
-    });
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// `project add` — create `<pm>/<key>/project.yaml`.
-#[allow(clippy::too_many_arguments)]
-pub fn project_add(
-    pm: &Pm,
-    key: &str,
-    prefix: &str,
-    repos: &[String],
-    components: &[String],
-    tags: &[String],
-    owner: Option<&str>,
-) -> Result<Value> {
-    // `agents` is reserved for the agent files (CAD-358).
-    crate::issue::project_new::check_key(key)?;
-    let tags = model::normalize_tags(tags)?;
-    let prefix = prefix.to_ascii_uppercase();
-    crate::issue::project_new::check_prefix(&prefix)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&pm.dir.join(key)))?;
-    let projects = project::list(&pm.dir)?;
-    if projects.iter().any(|p| p.key == key) {
-        return Err(Error::rejected(format!(
-            "Project '{key}' already exists — edit {} directly",
-            pm.dir.join(key).join("project.yaml").display()
-        )));
-    }
-    if let Some(other) = projects.iter().find(|p| p.prefix == prefix) {
-        return Err(Error::rejected(format!(
-            "Prefix {prefix} is project '{}''s — pass another --prefix",
-            other.key
-        )));
-    }
-    let mut repo_entries = Vec::new();
-    for repo in repos {
-        let path = project::expand_home(repo);
-        let canonical = path.canonicalize().unwrap_or(path.clone());
-        // Store the path as given (~/ keeps it portable); remote is
-        // discovered from the repo's own config.
-        let remote = crate::reaper::output(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&canonical)
-                .args(["config", "--get", "remote.origin.url"]),
-        )
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|r| !r.is_empty())
-        .map(|r| project::normalize_remote(&r));
-        repo_entries.push(project::Repo {
-            path: Some(repo.clone()),
-            remote,
-        });
-    }
-    let project = project::Project {
-        key: key.to_string(),
-        prefix,
-        repos: repo_entries,
-        components: components.to_vec(),
-        tags,
-        default_owner: owner.map(str::to_string),
-        build: None,
-        memory: None,
-        intake: None,
-    };
-    let dir = pm.dir.join(key);
-    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        return Err(Error::rejected(format!(
-            "{key}/ is a symlink — refusing to write outside the PM dir"
-        )));
-    }
-    std::fs::create_dir_all(&dir)?;
-    let yaml = serde_yaml::to_string(&project)
-        .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
-    let yaml_path = dir.join("project.yaml");
-    std::fs::write(&yaml_path, yaml)?;
-    let foreign = match commit_scoped(
-        pm,
-        &lock,
-        std::slice::from_ref(&yaml_path),
-        &format!("project {key} added"),
-        &[],
-        "",
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_file(&yaml_path);
-            return Err(e);
-        }
-    };
-    let mut out = json!({"project": key, "prefix": project.prefix,
-              "path": dir, "committed": true});
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// Allocate the next id under the write lock: `<PREFIX>-<max+1>`.
-pub(crate) fn next_id(dir: &Path, prefix: &str) -> Result<u64> {
-    let mut max = 0u64;
-    for entry in std::fs::read_dir(dir)?.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(n) = name
-            .strip_prefix(&format!("{prefix}-"))
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            max = max.max(n);
-        }
-    }
-    Ok(max + 1)
-}
-
-/// CAD-614: `issue new` always creates a backlog ticket. The master
-/// may not pass `--owner` or `--id` (those are operator overrides);
-/// any caller passing `--status` other than `backlog` is refused.
-/// Refusals name the allowed form.
-pub fn master_issue_new_limits(
-    caller_is_master: bool,
-    owner: Option<&str>,
-    explicit_id: Option<&str>,
-    status: Option<&str>,
-) -> Result<()> {
-    if let Some(status) = status {
-        if status != "backlog" {
-            return Err(Error::rejected(
-                "issue new creates a backlog ticket — omit --status or pass --status backlog. \
-                 The master cannot move status; that stays the operator's `issue set`",
-            ));
-        }
-    }
-    if !caller_is_master {
-        return Ok(());
-    }
-    if owner.is_some() {
-        return Err(Error::rejected(
-            "the master creates backlog tickets without --owner — omit it; the ticket records actor=master",
-        ));
-    }
-    if explicit_id.is_some() {
-        return Err(Error::rejected(
-            "the master does not choose ticket ids — omit --id",
-        ));
-    }
-    Ok(())
-}
-
-/// `issue new` — one folder + issue.md, under the id lock.
-/// `body`, when set, replaces the default title-plus-empty-acceptance
-/// body (CAD-614: the master writes it under `master/tmp` and passes
-/// `--file`).
-#[allow(clippy::too_many_arguments)]
-pub fn new_issue(
-    pm: &Pm,
-    cwd: &Path,
-    project_flag: Option<&str>,
-    title: &str,
-    priority: Option<&str>,
-    parent: Option<&str>,
-    blocked_by: &[String],
-    owner: Option<&str>,
-    component: Option<&str>,
-    tags: &[String],
-    explicit_id: Option<&str>,
-    body: Option<&str>,
-    actor: &str,
-) -> Result<Value> {
-    let project = project::resolve(&pm.dir, project_flag, cwd)?;
-    let priority = priority.unwrap_or("P2");
-    model::check_priority(priority)?;
-    if let Some(id) = explicit_id {
-        model::check_id(id)?;
-        let want = format!("{}-", project.prefix);
-        if !id.starts_with(&want) {
-            return Err(Error::rejected(format!(
-                "--id '{id}' does not match project prefix '{want}'"
-            )));
-        }
-    }
-    if let Some(component) = component {
-        check_component(&project, component)?;
-    }
-    let tags = check_tags(&project, tags)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&pm.dir.join(&project.key)))?;
-    let id = match explicit_id {
-        Some(id) => id.to_string(),
-        None => format!(
-            "{}-{}",
-            project.prefix,
-            next_id(&pm.dir.join(&project.key), &project.prefix)?
-        ),
-    };
-    let dir = pm.dir.join(&project.key).join(&id);
-    if dir.exists() {
-        return Err(Error::rejected(format!(
-            "Issue '{id}' already exists at {}",
-            dir.display()
-        )));
-    }
-    let mut front = Front::new(&id, title, &time::iso(time::now_epoch()));
-    front.priority = priority.to_string();
-    // Owner is intent — `default_owner` stays a project.yaml hint for
-    // later dispatch; it is never stamped onto new issues.
-    front.owner = owner.map(str::to_string);
-    front.component = component.map(str::to_string);
-    front.tags = tags;
-    front.blocked_by = blocked_by.to_vec();
-    for dep in &front.blocked_by {
-        model::check_id(dep)?;
-    }
-    let body = body
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{title}\n\n## Acceptance\n\n"));
-    if let Some(parent) = parent {
-        model::check_id(parent)?;
-        // CAD-360: nothing new is parented to a plan epic.
-        crate::issue::plan::check_parent_change(&pm.dir, &front, Some(parent))?;
-        front.parent = Some(parent.to_string());
-    }
-    std::fs::create_dir_all(dir.join("comments"))?;
-    std::fs::create_dir_all(dir.join("artifacts"))?;
-    save_front(&dir, &front, &body)?;
-    // Structural checks run after the folder exists so failures leave
-    // no half-built issue (the lock serialises the whole write).
-    let issues = board::load_all(&pm.dir, None)?;
-    if let Err(e) = check_structure(&issues, &id) {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err(e);
-    }
-    let foreign = match commit_scoped(
-        pm,
-        &lock,
-        &[dir.join("issue.md")],
-        &format!("{id}: created"),
-        &[&id],
-        actor,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(e);
-        }
-    };
-    let mut out = json!({"id": id, "project": project.key, "path": dir, "committed": true});
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// CAD-359 `plan propose` — the epic (the plan, `plan.state:
-/// proposed`) and one child per ticket in `backlog`, with acceptance,
-/// sizes, suggested agents (`owner`) and `blocked_by` links, all in ONE
-/// tracker commit. Ids are allocated under the lock; any structural
-/// refusal removes every folder this call created.
-pub fn create_plan(
-    pm: &Pm,
-    project_key: &str,
-    doc: &crate::issue::plan::PlanDoc,
-    workflow: Option<&str>,
-    actor: &str,
-) -> Result<Value> {
-    use crate::issue::plan::Dep;
-    let project = project::list(&pm.dir)?
-        .into_iter()
-        .find(|p| p.key == project_key)
-        .ok_or_else(|| {
-            Error::rejected(format!(
-                "Unknown project '{project_key}' — `cadence issue project ls` lists them"
-            ))
-        })?;
-    let proposer = actor_who(actor, None);
-    let root = pm.dir.join(&project.key);
-    let lock = pm.lock_for_paths(std::slice::from_ref(&root))?;
-    let first = next_id(&root, &project.prefix)?;
-    let id_at = |n: u64| format!("{}-{}", project.prefix, first + n);
-    let epic = id_at(0);
-    let ids: Vec<String> = (0..=doc.tickets.len() as u64).map(id_at).collect();
-    let now = time::iso(time::now_epoch());
-
-    let mut epic_front = Front::new(&epic, &doc.title, &now);
-    epic_front.plan = Some(model::Plan {
-        state: "proposed".to_string(),
-        proposed_by: proposer.clone(),
-        proposed_at: now.clone(),
-        decided_by: None,
-        decided_at: None,
-        reason: None,
-        workflow: workflow.map(str::to_string),
-        tickets: ids[1..].to_vec(),
-    });
-    epic_front.item_type = Some("epic".to_string());
-    let mut epic_body = format!("{}\n\n## Goal\n\n{}\n", doc.title, doc.goal);
-    if !doc.non_goals.is_empty() {
-        epic_body.push_str("\n## Non-goals\n\n");
-        for g in &doc.non_goals {
-            epic_body.push_str(&format!("- {g}\n"));
-        }
-    }
-    if !doc.intro.is_empty() {
-        epic_body.push_str(&format!("\n## Plan\n\n{}\n", doc.intro));
-    }
-    let mut files: Vec<(PathBuf, Front, String)> = vec![(root.join(&epic), epic_front, epic_body)];
-    for (n, ticket) in doc.tickets.iter().enumerate() {
-        let id = &ids[n + 1];
-        let mut front = Front::new(id, &ticket.title, &now);
-        front.parent = Some(epic.clone());
-        front.plan_epic = Some(epic.clone());
-        front.size = ticket.size.clone();
-        front.owner = ticket.agent.clone();
-        front.blocked_by = ticket
-            .depends_on
-            .iter()
-            .map(|d| match d {
-                Dep::Ticket(k) => ids[k + 1].clone(),
-                Dep::Issue(i) => i.clone(),
-            })
-            .collect();
-        let mut body = format!("{}\n", ticket.title);
-        if !ticket.description.is_empty() {
-            body.push_str(&format!("\n{}\n", ticket.description));
-        }
-        let body = parse::replace_acceptance(&body, &ticket.acceptance)?;
-        files.push((root.join(id), front, body));
-    }
-    if let Some((dir, _, _)) = files.iter().find(|(dir, _, _)| dir.exists()) {
-        return Err(Error::rejected(format!(
-            "{} already exists — refusing to overwrite it",
-            dir.display()
-        )));
-    }
-    let created = || files.iter().map(|(dir, _, _)| dir);
-    let build = || -> Result<Vec<String>> {
-        for (dir, front, body) in &files {
-            std::fs::create_dir_all(dir.join("comments"))?;
-            std::fs::create_dir_all(dir.join("artifacts"))?;
-            save_front(dir, front, body)?;
-        }
-        let issues = board::load_all(&pm.dir, None)?;
-        for id in &ids {
-            check_structure(&issues, id)?;
-        }
-        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        let paths: Vec<PathBuf> = files
-            .iter()
-            .map(|(dir, _, _)| dir.join("issue.md"))
-            .collect();
-        commit_scoped(
-            pm,
-            &lock,
-            &paths,
-            &format!(
-                "{epic}: plan proposed — {} ({} tickets)",
-                doc.title,
-                doc.tickets.len()
-            ),
-            &refs,
-            actor,
-        )
-    };
-    let foreign = match build() {
-        Ok(foreign) => foreign,
-        Err(e) => {
-            for dir in created() {
-                let _ = std::fs::remove_dir_all(dir);
-            }
-            return Err(e);
-        }
-    };
-    let mut out = json!({
-        "epic": epic,
-        "project": project.key,
-        "title": doc.title,
-        "state": "proposed",
-        "proposed_by": proposer,
-        "tickets": ids[1..],
-        "committed": true,
-    });
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// CAD-360 `plan approve` / `plan reject` — record the operator's
-/// decision on a `proposed` plan (state, who, when, why) and, on
-/// approval, move its `backlog` tickets to `ready` — one commit. The
-/// caller has already proven operator authority (the daemon's
-/// connection-bound check); this only writes.
-pub fn decide_plan(
-    pm: &Pm,
-    epic: &str,
-    approve: bool,
-    by: &str,
-    reason: Option<&str>,
-) -> Result<Value> {
-    let reason = reason.map(str::trim).filter(|r| !r.is_empty());
-    if !approve && reason.is_none() {
-        return Err(Error::rejected("plan reject needs --reason"));
-    }
-    if let Some(reason) = reason {
-        crate::secret::guard(&format!("{epic}: plan reason"), reason)?;
-    }
-    let (project, dir) = issue_dir(pm, epic)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&pm.dir.join(&project.key)))?;
-    let (mut front, body) = load_front(&dir)?;
-    let Some(plan) = front.plan.as_mut() else {
-        return Err(Error::rejected(format!(
-            "{epic} is not a plan — `cadence plan show` needs a proposed plan"
-        )));
-    };
-    if plan.state != "proposed" {
-        return Err(Error::rejected(format!(
-            "plan {epic} is already {} — only a proposed plan is decided",
-            plan.state
-        )));
-    }
-    let state = if approve { "approved" } else { "rejected" };
-    plan.state = state.to_string();
-    plan.decided_by = Some(by.to_string());
-    plan.decided_at = Some(time::iso(time::now_epoch()));
-    plan.reason = reason.map(str::to_string);
-    let decided = plan.clone();
-    let mut ready = vec![];
-    let mut writes = vec![(dir.clone(), front.clone(), body)];
-    if approve {
-        for kid in board::load_all(&pm.dir, Some(&project.key))? {
-            if decided.tickets.contains(&kid.front.id) && kid.front.status == "backlog" {
-                let mut f = kid.front.clone();
-                f.status = "ready".to_string();
-                ready.push(f.id.clone());
-                writes.push((kid.dir.clone(), f, kid.body.clone()));
-            }
-        }
-    }
-    // All or nothing: a failed write or commit restores every file.
-    let originals: Vec<(PathBuf, String)> = writes
-        .iter()
-        .map(|(dir, _, _)| {
-            let file = dir.join("issue.md");
-            std::fs::read_to_string(&file).map(|text| (file, text))
-        })
-        .collect::<std::io::Result<_>>()?;
-    let restore = || {
-        for (file, text) in &originals {
-            let _ = atomic_write(file, text);
-        }
-    };
-    let mut ids: Vec<&str> = vec![epic];
-    ids.extend(ready.iter().map(String::as_str));
-    let subject = if approve {
-        format!(
-            "{epic}: plan approved by {by} ({} tickets ready)",
-            ready.len()
-        )
-    } else {
-        format!("{epic}: plan rejected by {by}")
-    };
-    let paths: Vec<PathBuf> = writes
-        .iter()
-        .map(|(dir, _, _)| dir.join("issue.md"))
-        .collect();
-    let written = writes
-        .iter()
-        .try_for_each(|(dir, front, body)| save_front(dir, front, body))
-        .and_then(|_| commit_who_scoped(pm, &lock, &paths, &subject, &ids, "", Some(by)));
-    let foreign = match written {
-        Ok(f) => f,
-        Err(e) => {
-            restore();
-            return Err(e);
-        }
-    };
-    let mut out = json!({
-        "epic": epic,
-        "project": project.key,
-        "state": state,
-        "decided_by": decided.decided_by,
-        "decided_at": decided.decided_at,
-        "reason": decided.reason,
-        "ready": ready,
-        "committed": true,
-    });
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// Reject shapes lint would flag, at write time: self-links, missing
-/// targets, parent cycles and depth > 2, blocked_by cycles.
-pub(crate) fn check_structure(issues: &[board::Issue], id: &str) -> Result<()> {
-    let by_id: HashMap<&str, &board::Issue> =
-        issues.iter().map(|i| (i.front.id.as_str(), i)).collect();
-    let this = by_id
-        .get(id)
-        .ok_or_else(|| Error::internal("new issue missing from reload"))?;
-    for dep in &this.front.blocked_by {
-        if dep == &this.front.id {
-            return Err(Error::rejected(format!("{id} cannot block itself")));
-        }
-        if !by_id.contains_key(dep.as_str()) {
-            return Err(Error::rejected(format!(
-                "blocked_by target '{dep}' does not exist — \
-                 `cadence issue new \"title\"` creates it first"
-            )));
-        }
-    }
-    // blocked_by cycle: walk targets; a return to id is a cycle.
-    let mut seen = HashSet::new();
-    let mut stack: Vec<&str> = this.front.blocked_by.iter().map(String::as_str).collect();
-    while let Some(cur) = stack.pop() {
-        if cur == id {
-            return Err(Error::rejected(format!(
-                "blocked_by would create a cycle through {id} — \
-                 reorder the dependency instead"
-            )));
-        }
-        if seen.insert(cur) {
-            if let Some(node) = by_id.get(cur) {
-                stack.extend(node.front.blocked_by.iter().map(String::as_str));
-            }
-        }
-    }
-    check_parent(&by_id, this)
-}
-
-/// Parent rules: target exists, not self, no cycle, depth stays ≤ 2.
-fn check_parent(by_id: &HashMap<&str, &board::Issue>, this: &board::Issue) -> Result<()> {
-    let Some(parent) = &this.front.parent else {
-        return Ok(());
-    };
-    let id = this.front.id.as_str();
-    if parent == id {
-        return Err(Error::rejected(format!("{id} cannot be its own parent")));
-    }
-    let Some(parent_issue) = by_id.get(parent.as_str()) else {
-        return Err(Error::rejected(format!(
-            "parent '{parent}' does not exist — create it with \
-             `cadence issue new` first"
-        )));
-    };
-    if parent_issue.front.parent.is_some() {
-        return Err(Error::rejected(format!(
-            "{parent} is itself a sub-issue — depth is two levels; \
-             parent {id} under a root issue instead"
-        )));
-    }
-    if by_id
-        .values()
-        .any(|i| i.front.parent.as_deref() == Some(id))
-    {
-        return Err(Error::rejected(format!(
-            "{id} has children — making it a sub-issue would exceed depth 2"
-        )));
-    }
-    // Cycle guard for hand-edited files (writes can never make one).
-    let mut cur = parent_issue;
-    while let Some(up) = &cur.front.parent {
-        if up == id {
-            return Err(Error::rejected(format!(
-                "parent link would cycle through {id}"
-            )));
-        }
-        match by_id.get(up.as_str()) {
-            Some(next) => cur = next,
-            None => break,
-        }
-    }
-    Ok(())
-}
-
-/// Apply `key=value` pairs to one front in memory; returns the
-/// `key=value` summary tokens. Nothing is written here, so a bulk edit
-/// can validate every issue before it touches a file.
-pub(crate) fn apply_pairs(
-    project: &project::Project,
-    front: &mut Front,
-    pairs: &[String],
-) -> Result<Vec<String>> {
-    let mut changed = Vec::new();
-    for kv in pairs {
-        let (key, value) = kv
-            .split_once('=')
-            .ok_or_else(|| Error::rejected(format!("set pair '{kv}' is not key=value")))?;
-        if key == "stage" || key == "stage_at" {
-            return Err(Error::rejected(
-                "an epic's stage is a gate decision — move it with \
-                 `cadence issue epic stage <EPIC> <stage>`",
-            ));
-        }
-        if !model::SETTABLE.contains(&key) {
-            return Err(Error::rejected(format!(
-                "'{key}' is not settable — one of {}",
-                model::SETTABLE.join(" ")
-            )));
-        }
-        match key {
-            "status" => {
-                model::check_status(value)?;
-                front.status = value.to_string();
-            }
-            "priority" => {
-                model::check_priority(value)?;
-                front.priority = value.to_string();
-            }
-            "title" => {
-                if value.is_empty() {
-                    return Err(Error::rejected("title cannot be empty"));
-                }
-                front.title = value.to_string();
-            }
-            "owner" => front.owner = (!value.is_empty()).then(|| value.to_string()),
-            "component" => {
-                if !value.is_empty() {
-                    check_component(project, value)?;
-                }
-                front.component = (!value.is_empty()).then(|| value.to_string());
-            }
-            "tags" => {
-                front.tags = check_tags(project, &split_tags(value))?;
-                changed.push(format!("tags={}", front.tags.join(",")));
-                continue;
-            }
-            // CAD-378: advisory planned paths; an empty value clears.
-            "paths" => {
-                front.paths = crate::issue::areas::parse_paths(value)?;
-                changed.push(format!("paths={}", front.paths.join(",")));
-                continue;
-            }
-            // CAD-405: an empty value clears each of these.
-            "type" => {
-                if !value.is_empty() {
-                    model::check_type(value)?;
-                }
-                front.item_type = (!value.is_empty()).then(|| value.to_string());
-            }
-            "milestone" => {
-                if !value.is_empty() && !model::valid_tag(value) {
-                    return Err(Error::rejected(format!(
-                        "Invalid milestone '{value}' — 1-32 lowercase letters, digits or hyphens"
-                    )));
-                }
-                front.milestone = (!value.is_empty()).then(|| value.to_string());
-            }
-            "size" => {
-                let size = value.to_ascii_uppercase();
-                if !size.is_empty() && !model::SIZES.iter().any(|(s, _)| *s == size) {
-                    return Err(Error::rejected(format!(
-                        "Unknown size '{value}' — one of S M L"
-                    )));
-                }
-                front.size = (!size.is_empty()).then_some(size);
-            }
-            _ => unreachable!(),
-        }
-        changed.push(format!("{key}={value}"));
-    }
-    Ok(changed)
-}
-
-/// One issue of a bulk edit, loaded and edited in memory.
-pub(crate) struct Staged {
-    pub(crate) id: String,
-    dir: PathBuf,
-    pub(crate) front: Front,
-    body: String,
-}
-
-/// Load every id (each once, in the order given) and run `edit` on its
-/// front; `edit` answers whether it changed anything, and unchanged
-/// issues drop out of the batch. Any unknown id or rejected edit fails
-/// the whole batch before a single file is written. Call under the PM
-/// lock.
-pub(crate) fn stage(
-    pm: &Pm,
-    ids: &[String],
-    mut edit: impl FnMut(&project::Project, &mut Front) -> Result<bool>,
-) -> Result<Vec<Staged>> {
-    let mut staged: Vec<Staged> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-    for id in ids {
-        if !seen.insert(id) {
-            continue;
-        }
-        let (project, dir) = issue_dir(pm, id)?;
-        let (mut front, body) = load_front(&dir)?;
-        let changed = edit(&project, &mut front).map_err(|e| match e {
-            Error::Rejected(m) if ids.len() > 1 => Error::rejected(format!("{id}: {m}")),
-            other => other,
-        })?;
-        if !changed {
-            continue;
-        }
-        staged.push(Staged {
-            id: id.clone(),
-            dir,
-            front,
-            body,
-        });
-    }
-    Ok(staged)
-}
-
-/// Write the staged fronts and make the one commit that names them all
-/// — subject `<ID>[, <ID>…]: <summary>`, one `Issue:` trailer per id.
-/// Only the staged issues' `issue.md` files reach the commit. Returns
-/// the committed ids plus the foreign paths the commit saw; a failed
-/// write or commit restores every file it touched (CAD-454).
-pub(crate) fn commit_staged(
-    pm: &Pm,
-    staged: &[Staged],
-    summary: &str,
-    actor: &str,
-) -> Result<(Vec<String>, Vec<String>)> {
-    commit_staged_inner(pm, None, staged, summary, actor)
-}
-
-/// [`commit_staged`] through a scoped [`PmLock`]: every staged file
-/// must stay inside the lock's admitted paths. Callers that took
-/// [`Pm::lock_for_paths`](Pm::lock_for_paths) commit through here.
-pub(crate) fn commit_staged_scoped(
-    pm: &Pm,
-    lock: &PmLock,
-    staged: &[Staged],
-    summary: &str,
-    actor: &str,
-) -> Result<(Vec<String>, Vec<String>)> {
-    commit_staged_inner(pm, Some(lock), staged, summary, actor)
-}
-
-fn commit_staged_inner(
-    pm: &Pm,
-    lock: Option<&PmLock>,
-    staged: &[Staged],
-    summary: &str,
-    actor: &str,
-) -> Result<(Vec<String>, Vec<String>)> {
-    if staged.is_empty() {
-        return Ok((vec![], vec![]));
-    }
-    let originals: Vec<(PathBuf, Option<Vec<u8>>)> = staged
-        .iter()
-        .map(|s| {
-            let file = s.dir.join("issue.md");
-            let prev = file_preimage(&file);
-            (file, prev)
-        })
-        .collect();
-    let paths: Vec<PathBuf> = originals.iter().map(|(f, _)| f.clone()).collect();
-    let ids: Vec<&str> = staged.iter().map(|s| s.id.as_str()).collect();
-    let written = staged
-        .iter()
-        .try_for_each(|s| save_front(&s.dir, &s.front, &s.body))
-        .and_then(|_| match lock {
-            Some(l) => commit_scoped(
-                pm,
-                l,
-                &paths,
-                &format!("{}: {summary}", ids.join(", ")),
-                &ids,
-                actor,
-            ),
-            None => commit(
-                pm,
-                &paths,
-                &format!("{}: {summary}", ids.join(", ")),
-                &ids,
-                actor,
-            ),
-        });
-    match written {
-        Ok(foreign) => Ok((ids.iter().map(|i| i.to_string()).collect(), foreign)),
-        Err(e) => {
-            for (file, prev) in originals {
-                restore_preimage(&file, prev);
-            }
-            Err(e)
-        }
-    }
-}
-
-/// CAD-756: `status=done` needs evidence — one of: a recorded `ref
-/// pr:`, a worktree ref `finish` already closed, or a review/verdict
-/// artifact in the issue folder. `force` substitutes a recorded
-/// reason (it lands in the commit summary — never silent). The
-/// reconcile sweep and delivery merge path write through
-/// `mark_done_on_merge`, which IS the evidence — they never reach
-/// this gate. Only the close direction is gated: `done` → anything
-/// reopens freely, `dropped` is exempt by design, and a `done` →
-/// `done` rewrite never asked a question it could fail.
-fn check_done_evidence(
-    pm: &Pm,
-    front: &Front,
-    force: Option<&str>,
-    staged_artifacts: &[String],
-) -> Result<()> {
-    if let Some(reason) = force {
-        return if reason.trim().is_empty() {
-            Err(Error::rejected(
-                "--force needs a reason — it is recorded on the commit",
-            ))
-        } else {
-            Ok(())
-        };
-    }
-    if front
-        .refs
-        .iter()
-        .any(|r| r.kind == "pr" || r.kind == "commit")
-    {
-        return Ok(());
-    }
-    if front
-        .refs
-        .iter()
-        .any(|r| r.kind == "worktree" && r.closed == Some(true))
-    {
-        return Ok(());
-    }
-    let (_project, dir) = issue_dir(pm, &front.id)?;
-    let is_verdictish = |name: &str| {
-        let n = name.to_ascii_lowercase();
-        n.starts_with("review") || n.contains("verdict")
-    };
-    // CAD-908: an attachment staged in the same `issue edit` counts,
-    // like a same-edit `--ref pr:` — it lands in the same commit.
-    let verdictish = staged_artifacts.iter().any(|n| is_verdictish(n))
-        || std::fs::read_dir(dir.join("artifacts"))
-            .map(|rd| {
-                rd.flatten().any(|e| {
-                    // CAD-971: only a real artifact counts — a valid
-                    // (allowlisted, non-hidden) name on a regular file,
-                    // never a leftover temp, a symlink or a directory.
-                    let name = e.file_name().to_string_lossy().to_string();
-                    model::valid_artifact_name(&name)
-                        && e.file_type().map(|t| t.is_file()).unwrap_or(false)
-                        && is_verdictish(&name)
-                })
-            })
-            .unwrap_or(false);
-    if verdictish {
-        return Ok(());
-    }
-    Err(Error::rejected(format!(
-        "{}: status=done needs evidence — a `ref pr:`, a closed worktree \
-         ref, or a review/verdict artifact in the issue folder. \
-         `cadence issue reconcile --dry-run` shows the merge classification; \
-         `--force \"<reason>\"` records an override in the commit",
-        front.id
-    )))
-}
-
-/// The gates a `set` runs after its pairs applied, comparing the
-/// edited `front` against `prev` (the front as loaded). Shared by
-/// `issue set` and `issue edit`, so neither can skip one. Returns the
-/// recorded `--force` reason when the done-evidence gate was overridden.
-/// `staged_artifacts` names attachments the same write is about to add
-/// (only `issue edit` has any); they count as done-evidence.
-pub(crate) fn check_set_gates(
-    pm: &Pm,
-    project: &project::Project,
-    prev: &Front,
-    front: &Front,
-    force: Option<&str>,
-    staged_artifacts: &[String],
-) -> Result<Option<String>> {
-    let mut forced = None;
-    if front.status != prev.status {
-        // CAD-360: an unapproved plan's tickets stay in backlog.
-        crate::issue::plan::check_status_write(&pm.dir, front, &front.status)?;
-        if front.status == "done" {
-            check_done_evidence(pm, front, force, staged_artifacts)?;
-            forced = force.map(|r| r.trim().to_string());
-        }
-        // CAD-757: `ready` is the dispatch queue — a blocked ticket
-        // cannot sit in it.
-        if front.status == "ready" {
-            crate::issue::blocked::check_ready(&pm.dir, front)?;
-        }
-    }
-    if front.milestone != prev.milestone {
-        check_milestone(pm, project, front.milestone.as_deref())?;
-    }
-    if front.item_type != prev.item_type {
-        check_type_change(pm, front)?;
-    }
-    Ok(forced)
-}
-
-/// `issue set <ID>… key=value…` — the writable frontmatter fields, on
-/// one issue or several. All-or-nothing: every id and every pair is
-/// validated before any file changes, and the batch is one commit.
-/// `force` is the `--force <reason>` override for the status=done
-/// evidence gate ([`check_done_evidence`]); every other write ignores it.
-pub fn set_fields(
-    pm: &Pm,
-    ids: &[String],
-    pairs: &[String],
-    actor: &str,
-    force: Option<&str>,
-) -> Result<Value> {
-    set_fields_if_rev(pm, ids, pairs, actor, force, None)
-}
-
-/// [`set_fields`] bound to the revision shown — the compare half of
-/// compare-and-swap. The check runs inside the tracker lock, at the
-/// point of write, so a revision move between read and write refuses
-/// instead of landing. A mismatch answers `Ok` with a `conflict`
-/// payload (the route maps it, like `patch_issue`'s); only callers
-/// passing `if_rev` ever see one.
-pub fn set_fields_if_rev(
-    pm: &Pm,
-    ids: &[String],
-    pairs: &[String],
-    actor: &str,
-    force: Option<&str>,
-    if_rev: Option<&str>,
-) -> Result<Value> {
-    if ids.is_empty() || pairs.is_empty() {
-        return Err(Error::rejected(
-            "set needs an id and key=value pairs — e.g. `cadence issue set CAD-16 status=doing`",
-        ));
-    }
-    let dirs: Vec<PathBuf> = ids
-        .iter()
-        .map(|id| issue_dir(pm, id).map(|(_, dir)| dir))
-        .collect::<Result<_>>()?;
-    let lock = pm.lock_for_paths(&dirs)?;
-    if let Some(want) = if_rev {
-        for id in ids {
-            let (_, dir) = issue_dir(pm, id)?;
-            if let Some(conflict) = check_rev(&dir, Some(want))? {
-                let mut out = conflict;
-                out["id"] = serde_json::json!(id);
-                return Ok(out);
-            }
-        }
-    }
-    let mut changed = Vec::new();
-    let mut forced: Option<String> = None;
-    let staged = stage(pm, ids, |project, front| {
-        let prev = front.clone();
-        changed = apply_pairs(project, front, pairs)?;
-        if let Some(reason) = check_set_gates(pm, project, &prev, front, force, &[])? {
-            forced = Some(reason);
-        }
-        Ok(true)
-    })?;
-    let summary = match &forced {
-        Some(r) => format!("set {} (forced: {r})", changed.join(" ")),
-        None => format!("set {}", changed.join(" ")),
-    };
-    let (ids, foreign) = commit_staged_scoped(pm, &lock, &staged, &summary, actor)?;
-    // The post-merge reminder (CAD-94): when this set marks an issue
-    // done while a worktree ref is still open, the CLI prints the
-    // one-line `issue finish` hint for each of these ids.
-    let worktree_open: Vec<&String> = if sets_done(pairs) {
-        staged
-            .iter()
-            .filter(|s| {
-                s.front
-                    .refs
-                    .iter()
-                    .any(|r| r.kind == "worktree" && r.closed != Some(true))
-            })
-            .map(|s| &s.id)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let mut out = json!({"id": ids[0], "ids": ids, "set": changed,
-              "worktree_open": worktree_open, "committed": true});
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// A failed done transaction carries only the status observed while
-/// holding the tracker lock. Before that read, its status is unknown.
-#[derive(Debug)]
-pub struct DoneWriteFailure {
-    pub error: Error,
-    pub from: Option<String>,
-}
-
-impl std::fmt::Display for DoneWriteFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.error, f)
-    }
-}
-
-impl std::error::Error for DoneWriteFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
-    }
-}
-
-/// CAD-449: a merged delivery marks its ticket done — one frontmatter
-/// write and one tracker commit, `<ID>: set status=done — <why>`, whose
-/// `Actor:` trailer is `actor` (the observer and the delivery). A ticket
-/// already `done` or `dropped` is left alone: answers `Some(status)`
-/// and writes nothing. `None` means it was marked done. The plan gate
-/// every status write passes ([`crate::issue::plan::check_status_write`])
-/// applies here too. With `expect`, the ticket is marked only while its
-/// status is still that one — a status changed since (the operator
-/// reopened or moved it) is left alone and answered like `done`.
-///
-/// It never waits for the tracker lock: a busy tracker is an error the
-/// caller may retry only with a previously observed status (the daemon
-/// holds its own lock here). A failed commit
-/// leaves nothing behind — `issue.md` is restored, and the commit
-/// itself unstages the path, so no later write can commit
-/// `status: done` for it.
-pub fn mark_done_on_merge(
-    pm: &Pm,
-    id: &str,
-    why: &str,
-    actor: &str,
-    expect: Option<&str>,
-) -> std::result::Result<Option<String>, DoneWriteFailure> {
-    mark_done_on_merge_waiting(pm, id, why, actor, expect, Duration::ZERO)
-}
-
-/// `mark_done_on_merge` for a CLI caller (CAD-1150): a busy tracker lock
-/// is retried with a short backoff for up to `wait` before it is
-/// reported. The daemon passes no wait and keeps the never-wait rule.
-pub fn mark_done_on_merge_waiting(
-    pm: &Pm,
-    id: &str,
-    why: &str,
-    actor: &str,
-    expect: Option<&str>,
-    wait: Duration,
-) -> std::result::Result<Option<String>, DoneWriteFailure> {
-    let mut from = None;
-    let result = (|| -> Result<Option<String>> {
-        let deadline = Instant::now() + wait;
-        let mut backoff = Duration::from_millis(50);
-        let _lock = loop {
-            if let Some(lock) = pm.try_lock()? {
-                break lock;
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(Error::rejected(
-                    "the tracker is locked by another writer (write lock)",
-                ));
-            }
-            std::thread::sleep(backoff.min(left));
-            backoff = (backoff * 2).min(Duration::from_millis(500));
-        };
-        let (_project, dir) = issue_dir(pm, id)?;
-        let (mut front, body) = load_front(&dir)?;
-        from = Some(front.status.clone());
-        if matches!(front.status.as_str(), "done" | "dropped")
-            || expect.is_some_and(|e| e != front.status)
-        {
-            return Ok(Some(front.status));
-        }
-        crate::issue::plan::check_status_write(&pm.dir, &front, "done")?;
-        front.status = "done".to_string();
-        let file = dir.join("issue.md");
-        let original = std::fs::read(&file)?;
-        let written = save_front(&dir, &front, &body).and_then(|_| {
-            commit(
-                pm,
-                std::slice::from_ref(&file),
-                &format!("{id}: set status=done — {why}"),
-                &[id],
-                actor,
-            )
-        });
-        if let Err(e) = written {
-            let _ = std::fs::write(&file, &original);
-            return Err(e);
-        }
-        Ok(None)
-    })();
-    result.map_err(|error| DoneWriteFailure { error, from })
-}
-
-/// CAD-405: an issue with a plan or children is an epic — an explicit
-/// other type would silently drop it from every epic view.
-fn check_type_change(pm: &Pm, front: &Front) -> Result<()> {
-    let Some(t) = front.item_type.as_deref().filter(|t| *t != "epic") else {
-        return Ok(());
-    };
-    let id = front.id.as_str();
-    let why = if front.plan.is_some() {
-        Some("it carries a plan")
-    } else if board::load_all(&pm.dir, None)?
-        .iter()
-        .any(|i| i.front.parent.as_deref() == Some(id))
-    {
-        Some("it has children")
-    } else {
-        None
-    };
-    match why {
-        Some(why) => Err(Error::rejected(format!(
-            "{id} cannot be type '{t}' — {why}, so it is an epic"
-        ))),
-        None => Ok(()),
-    }
-}
-
-/// CAD-405: a milestone the project's `PROJECT.md` declares — any
-/// well-formed id when it declares none.
-fn check_milestone(pm: &Pm, project: &project::Project, milestone: Option<&str>) -> Result<()> {
-    let Some(m) = milestone else { return Ok(()) };
-    let cfg = crate::issue::work::load_config(&pm.dir, &project.key)?;
-    if !cfg.milestones.is_empty() && !cfg.milestones.iter().any(|d| d.id == m) {
-        return Err(Error::rejected(format!(
-            "Unknown milestone '{m}' — {} declares: {}",
-            project.key,
-            cfg.milestones
-                .iter()
-                .map(|d| d.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-    }
-    Ok(())
-}
-
-/// CAD-405 `issue epic stage` — move an epic to another stage: one
-/// frontmatter write (`stage`, `stage_at`) and one tracker commit whose
-/// `Actor:` trailer is the mover. The move is checked under the PM lock
-/// ([`crate::issue::work::check_move`]: one stage forward, any stage
-/// back), then `authorize` decides who may make it and returns the
-/// actor — the daemon demands the proven operator for a forward move
-/// into one of the project's `operator_stages`. A plan epic's first
-/// forward move is `cadence plan approve`, an approved plan never moves
-/// back before build (the plan owns shape), and a rejected plan never
-/// moves. The gate keys apply only as `approvals` allow
-/// ([`crate::issue::work::effective`]); a malformed `PROJECT.md`
-/// refuses: a gate never guesses.
-pub fn move_stage(
-    pm: &Pm,
-    epic: &str,
-    to: &str,
-    note: Option<&str>,
-    approvals: &crate::issue::work::Approvals,
-    authorize: impl FnOnce(&crate::issue::work::Move) -> Result<String>,
-) -> Result<Value> {
-    use crate::issue::work;
-    let note = match note.map(str::trim).filter(|n| !n.is_empty()) {
-        Some(n) => {
-            crate::secret::guard(&format!("{epic}: stage note"), n)?;
-            Some(crate::issue::claim::clean_text("--note", n)?)
-        }
-        None => None,
-    };
-    let (project, dir) = issue_dir(pm, epic)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
-    let (mut front, body) = load_front(&dir)?;
-    let (cfg, unapproved) = work::effective(
-        &project.key,
-        work::load_config(&pm.dir, &project.key)?,
-        approvals.get(&project.key).map(String::as_str),
-    );
-    let views = board::views(&pm.config.notes_dir(), board::load_all(&pm.dir, None)?);
-    let Some(view) = views.iter().find(|v| v.issue.front.id == epic) else {
-        return Err(Error::internal(format!("{epic} missing from reload")));
-    };
-    let kind = model::item_type(&front, view.container);
-    if kind != "epic" {
-        return Err(Error::rejected(format!(
-            "{epic} is a {kind} — only epics have stages \
-             (`cadence issue set {epic} type=epic` makes it one)"
-        )));
-    }
-    work::plan_allows_moves(&front)?;
-    let cur = work::stage_of(&front, &cfg, view.status == "done");
-    let mv = work::check_move(&cfg, &cur, to, work::floor(&front, &cfg))?;
-    let by = authorize(&mv)?;
-    let at = time::iso(time::now_epoch());
-    front.stage = Some(mv.to.clone());
-    front.stage_at = Some(at.clone());
-    let file = dir.join("issue.md");
-    let original = std::fs::read_to_string(&file)?;
-    let mut subject = format!("{epic}: stage {} → {}", mv.from, mv.to);
-    if let Some(n) = &note {
-        subject.push_str(&format!(" — {n}"));
-    }
-    let written = save_front(&dir, &front, &body).and_then(|_| {
-        commit_who_scoped(
-            pm,
-            &lock,
-            std::slice::from_ref(&file),
-            &subject,
-            &[epic],
-            "",
-            Some(&by),
-        )
-    });
-    let foreign = match written {
-        Ok(f) => f,
-        Err(e) => {
-            // Nothing half-done: the file goes back to what was committed.
-            let _ = atomic_write(&file, &original);
-            return Err(e);
-        }
-    };
-    let mut out = json!({
-        "epic": epic,
-        "project": project.key,
-        "from": mv.from,
-        "to": mv.to,
-        "forward": mv.forward,
-        "needs_operator": mv.needs_operator,
-        "exit_met": mv.forward.then_some(mv.exit),
-        "note": note,
-        "by": by,
-        "at": at,
-        "config_unapproved": unapproved,
-        "committed": true,
-    });
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// `issue tag <ID>… add|rm <tag>…` — add or remove tags on one issue or
-/// several, same all-or-nothing batch as `set`. Adding a tag an issue
-/// already has, or removing one it lacks, leaves that issue unchanged;
-/// a batch that changes nothing is refused.
-pub fn tag_edit(pm: &Pm, ids: &[String], add: bool, tags: &[String], actor: &str) -> Result<Value> {
-    let verb = if add { "add" } else { "rm" };
-    if ids.is_empty() || tags.is_empty() {
-        return Err(Error::rejected(
-            "tag needs ids, add|rm and tags — e.g. `cadence issue tag CAD-16 CAD-17 add ui`",
-        ));
-    }
-    let tags = model::normalize_tags(tags)?;
-    let dirs: Vec<PathBuf> = ids
-        .iter()
-        .map(|id| issue_dir(pm, id).map(|(_, dir)| dir))
-        .collect::<Result<_>>()?;
-    let lock = pm.lock_for_paths(&dirs)?;
-    let staged = stage(pm, ids, |project, front| {
-        let before = front.tags.clone();
-        if add {
-            let mut all = before.clone();
-            all.extend(tags.iter().cloned());
-            front.tags = check_tags(project, &all)?;
-        } else {
-            front.tags.retain(|t| !tags.contains(t));
-        }
-        Ok(front.tags != before)
-    })?;
-    if staged.is_empty() {
-        return Err(Error::rejected(format!(
-            "tag {verb} {} changes nothing — `cadence issue show <ID>` lists tags",
-            tags.join(" ")
-        )));
-    }
-    let tagged: Vec<Value> = staged
-        .iter()
-        .map(|s| json!({"id": s.id, "tags": s.front.tags}))
-        .collect();
-    let (ids, foreign) = commit_staged_scoped(
-        pm,
-        &lock,
-        &staged,
-        &format!("tag {verb} {}", tags.join(" ")),
-        actor,
-    )?;
-    let mut out =
-        json!({"ids": ids, "tag": verb, "tags": tags, "issues": tagged, "committed": true});
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// The HTTP PATCH surface: typed fields instead of `key=value` pairs,
-/// `body` replaces the markdown body (frontmatter untouched), `if_rev`
-/// optimistic concurrency, and a derived status refuses `status`.
-pub struct IssuePatch {
-    pub status: Option<String>,
-    pub priority: Option<String>,
-    /// `Some("")` clears owner.
-    pub owner: Option<String>,
-    /// `Some("")` clears component.
-    pub component: Option<String>,
-    pub title: Option<String>,
-    pub body: Option<String>,
-    /// Replaces the tag list; `Some([])` clears it.
-    pub tags: Option<Vec<String>>,
-}
-
-pub fn patch_issue(
-    pm: &Pm,
-    id: &str,
-    patch: &IssuePatch,
-    if_rev: Option<&str>,
-    actor: &str,
-    state_dir: Option<&Path>,
-) -> Result<Value> {
-    let (project, dir) = issue_dir(pm, id)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
-    if let Some(conflict) = check_rev(&dir, if_rev)? {
-        return Ok(conflict);
-    }
-    if patch.status.is_some() {
-        // A derived status is not file-writable: roll-up containers,
-        // job-bound and note-driven issues refuse with the reason.
-        let issues = board::load_all(&pm.dir, None)?;
-        let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
-        let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
-        let src = views
-            .iter()
-            .find(|v| v.issue.front.id == id)
-            .map(|v| v.status_source)
-            .unwrap_or("file");
-        if src != "file" {
-            return Ok(json!({
-                "id": id,
-                "conflict": "status_derived",
-                "status_source": src,
-                "reason": format!(
-                    "{id} status is derived from {src} — the file field is not authoritative"
-                ),
-            }));
-        }
-    }
-    let (mut front, mut body) = load_front(&dir)?;
-    let before = front.clone();
-    let mut changed = Vec::new();
-    if let Some(v) = &patch.status {
-        model::check_status(v)?;
-        front.status = v.clone();
-        changed.push(format!("status={v}"));
-    }
-    if let Some(v) = &patch.priority {
-        model::check_priority(v)?;
-        front.priority = v.clone();
-        changed.push(format!("priority={v}"));
-    }
-    if let Some(v) = &patch.title {
-        if v.is_empty() {
-            return Err(Error::rejected("title cannot be empty"));
-        }
-        front.title = v.clone();
-        changed.push("title".to_string());
-    }
-    if let Some(v) = &patch.owner {
-        front.owner = (!v.is_empty()).then(|| v.clone());
-        changed.push(format!("owner={v}"));
-    }
-    if let Some(v) = &patch.component {
-        if !v.is_empty() {
-            check_component(&project, v)?;
-        }
-        front.component = (!v.is_empty()).then(|| v.clone());
-        changed.push(format!("component={v}"));
-    }
-    if let Some(v) = &patch.tags {
-        front.tags = check_tags(&project, v)?;
-        changed.push(format!("tags={}", front.tags.join(",")));
-    }
-    if let Some(v) = &patch.body {
-        body = v.clone();
-        changed.push("body".to_string());
-    }
-    if changed.is_empty() {
-        return Err(Error::rejected(
-            "nothing to patch — send at least one field",
-        ));
-    }
-    // CAD-971: the board is never weaker than `issue set` — the same
-    // gates (plan approval, done-evidence, ready/blocked), no `--force`.
-    check_set_gates(pm, &project, &before, &front, None, &[])?;
-    let file = dir.join("issue.md");
-    let prev = file_preimage(&file);
-    save_front(&dir, &front, &body)?;
-    let foreign = match commit_scoped(
-        pm,
-        &lock,
-        std::slice::from_ref(&file),
-        &format!("{id}: set {}", changed.join(" ")),
-        &[id],
-        actor,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            restore_preimage(&file, prev);
-            return Err(e);
-        }
-    };
-    let mut post = Vec::new();
-    let warnings = blocked_warnings_best_effort(pm, id, state_dir, &mut post);
-    let mut out = json!({"id": id, "set": changed, "committed": true, "warnings": warnings});
-    attach_post_warnings(&mut out, &post);
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// One link/unlink applied to `front` in memory — every check `issue
-/// link` makes except the structural one over the whole board. Shared
-/// with `issue edit`.
-pub(crate) fn apply_link(
-    pm: &Pm,
-    front: &mut Front,
-    kind: &str,
-    target: &str,
-    unlink: bool,
-) -> Result<()> {
-    let id = front.id.clone();
-    let id = id.as_str();
-    match kind {
-        "blocked_by" | "relates" => {
-            let list = if kind == "blocked_by" {
-                &mut front.blocked_by
-            } else {
-                &mut front.relates
-            };
-            if unlink {
-                if !list.iter().any(|t| t == target) {
-                    return Err(Error::rejected(format!(
-                        "{id} has no {kind} link to {target} — \
-                         `cadence issue show {id}` lists links"
-                    )));
-                }
-                list.retain(|t| t != target);
-            } else {
-                if target == id {
-                    return Err(Error::rejected(format!("{id} cannot link to itself")));
-                }
-                board::find_issue(&pm.dir, target)?; // must exist
-                if list.iter().any(|t| t == target) {
-                    return Err(Error::rejected(format!(
-                        "{id} already links {kind} {target} — nothing to do"
-                    )));
-                }
-                list.push(target.to_string());
-            }
-        }
-        "parent" | "duplicate_of" => {
-            if kind == "parent" {
-                // CAD-360: a plan ticket keeps its epic; nothing joins
-                // a plan by link.
-                crate::issue::plan::check_parent_change(
-                    &pm.dir,
-                    front,
-                    (!unlink).then_some(target),
-                )?;
-            }
-            let slot = if kind == "parent" {
-                &mut front.parent
-            } else {
-                &mut front.duplicate_of
-            };
-            if unlink {
-                if slot.as_deref() != Some(target) {
-                    return Err(Error::rejected(format!(
-                        "{id} has {kind}={} — not {target}",
-                        slot.as_deref().unwrap_or("none")
-                    )));
-                }
-                *slot = None;
-            } else {
-                if target == id {
-                    return Err(Error::rejected(format!("{id} cannot link to itself")));
-                }
-                board::find_issue(&pm.dir, target)?;
-                *slot = Some(target.to_string());
-            }
-        }
-        _ => unreachable!(),
-    }
-    Ok(())
-}
-
-/// `issue link` / `issue unlink`. `blocked_by`/`relates` are list
-/// fields; `parent`/`duplicate_of` are scalars.
-#[allow(clippy::too_many_arguments)]
-pub fn link(
-    pm: &Pm,
-    id: &str,
-    kind: &str,
-    target: &str,
-    unlink: bool,
-    if_rev: Option<&str>,
-    actor: &str,
-    state_dir: Option<&Path>,
-) -> Result<Value> {
-    model::check_link_kind(kind)?;
-    model::check_id(target)?;
-    let (_project, dir) = issue_dir(pm, id)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
-    if let Some(conflict) = check_rev(&dir, if_rev)? {
-        return Ok(conflict);
-    }
-    let (mut front, body) = load_front(&dir)?;
-    let verb = if unlink { "unlink" } else { "link" };
-    apply_link(pm, &mut front, kind, target, unlink)?;
-    // Structural check before the file is written — a rejected link
-    // leaves the folder untouched.
-    let issues = board::load_all(&pm.dir, None)?;
-    let mut preview: Vec<board::Issue> = issues;
-    if let Some(this) = preview.iter_mut().find(|i| i.front.id == id) {
-        this.front = front.clone();
-    }
-    check_structure(&preview, id)?;
-    let file = dir.join("issue.md");
-    let prev = file_preimage(&file);
-    save_front(&dir, &front, &body)?;
-    let foreign = match commit_scoped(
-        pm,
-        &lock,
-        std::slice::from_ref(&file),
-        &format!("{id}: {verb} {kind} {target}"),
-        &[id, target],
-        actor,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            restore_preimage(&file, prev);
-            return Err(e);
-        }
-    };
-    let mut post = Vec::new();
-    let warnings = blocked_warnings_best_effort(pm, id, state_dir, &mut post);
-    let mut out = json!({"id": id, "link": kind, "target": target,
-              "unlink": unlink, "committed": true, "warnings": warnings});
-    attach_post_warnings(&mut out, &post);
-    // CAD-757: a new blocker on an active issue tells its holders —
-    // by name, best-effort, never blocking the link itself.
-    if kind == "blocked_by" && !unlink {
-        out["blocker_notice"] =
-            crate::issue::blocked::notify_new_blocker(&front, target, state_dir);
-    }
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// A ref as `issue ref` stores it: an http(s) target is a `url`,
-/// anything else a `path`. Shared with `issue edit`.
-pub(crate) fn new_ref(
-    kind: &str,
-    target: &str,
-    label: Option<&str>,
-    worktree: Option<&str>,
-    agent: Option<&str>,
-) -> Ref {
-    let is_url = target.starts_with("http://") || target.starts_with("https://");
-    Ref {
-        kind: kind.to_string(),
-        url: is_url.then(|| target.to_string()),
-        path: (!is_url).then(|| target.to_string()),
-        label: label.map(str::to_string),
-        closed: None,
-        worktree: worktree.map(str::to_string),
-        cargo_target: None,
-        agent: agent.map(str::to_string),
-    }
-}
-
-/// `issue ref <ID> <kind> <url-or-path> [--label x]`. A scheme makes it
-/// `url:`; everything else is a `path:` (previews store publish paths).
-/// `worktree` scopes a `message` ref to the pair it was dispatched
-/// against; other kinds leave it `None`.
-#[allow(clippy::too_many_arguments)]
-pub fn add_ref(
-    pm: &Pm,
-    id: &str,
-    kind: &str,
-    target: &str,
-    label: Option<&str>,
-    worktree: Option<&str>,
-    agent: Option<&str>,
-    if_rev: Option<&str>,
-    actor: &str,
-) -> Result<Value> {
-    model::check_ref_kind(kind)?;
-    model::check_ref_value(target)?;
-    let (_project, dir) = issue_dir(pm, id)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
-    if let Some(conflict) = check_rev(&dir, if_rev)? {
-        return Ok(conflict);
-    }
-    let (mut front, body) = load_front(&dir)?;
-    front
-        .refs
-        .push(new_ref(kind, target, label, worktree, agent));
-    let file = dir.join("issue.md");
-    let prev = file_preimage(&file);
-    save_front(&dir, &front, &body)?;
-    let foreign = match commit_scoped(
-        pm,
-        &lock,
-        std::slice::from_ref(&file),
-        &format!("{id}: ref {kind}"),
-        &[id],
-        actor,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            restore_preimage(&file, prev);
-            return Err(e);
-        }
-    };
-    let mut out = json!({"id": id, "ref": {"kind": kind, "target": target},
-              "committed": true});
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// Mark every open `<kind>` ref naming `target` closed — kept as
-/// history but no longer counted by `issue finish`. A dispatch whose
-/// send failed leaves its pre-recorded `message` ref orphaned;
-/// closing it keeps the attempt's history without letting it read as
-/// a live binding (or a "dispatch recorded during finish" stale
-/// reason) to a concurrent finish.
-pub fn close_ref(pm: &Pm, id: &str, kind: &str, target: &str, actor: &str) -> Result<()> {
-    let (_project, dir) = issue_dir(pm, id)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
-    let (mut front, body) = load_front(&dir)?;
-    let mut hit = false;
-    for r in &mut front.refs {
-        if r.kind == kind && r.path.as_deref() == Some(target) && r.closed != Some(true) {
-            r.closed = Some(true);
-            hit = true;
-        }
-    }
-    if hit {
-        let file = dir.join("issue.md");
-        let prev = file_preimage(&file);
-        save_front(&dir, &front, &body)?;
-        if let Err(e) = commit_scoped(
-            pm,
-            &lock,
-            std::slice::from_ref(&file),
-            &format!("{id}: ref {kind} closed"),
-            &[id],
-            actor,
-        ) {
-            restore_preimage(&file, prev);
-            return Err(e);
-        }
-    }
-    Ok(())
-}
-
-/// The author a comment is recorded under: `--author`, else
-/// `CADENCE_ALIAS`, else `operator` — one derivation for `issue
-/// comment` and `issue edit`, so neither opens a way to forge identity.
-pub(crate) fn comment_author(author: Option<&str>) -> Result<String> {
-    let author = author
-        .map(str::to_string)
-        .or_else(|| std::env::var("CADENCE_ALIAS").ok())
-        .unwrap_or_else(|| "operator".to_string());
-    if author.is_empty()
-        || author.len() > 64
-        || !author
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(Error::rejected(format!(
-            "Bad comment author '{author}' — letters, digits, '-' or '_'"
-        )));
-    }
-    Ok(author)
-}
-
-/// `issue comment <ID> -m|--file` — one create-only file under
-/// `comments/`, named by UTC time + author.
-pub fn add_comment(
-    pm: &Pm,
-    id: &str,
-    body: &str,
-    author: Option<&str>,
-    kind: Option<&str>,
-    if_rev: Option<&str>,
-    actor: &str,
-) -> Result<Value> {
-    let (_project, dir) = issue_dir(pm, id)?;
-    let author_opt = author;
-    let author = comment_author(author_opt)?;
-    if body.trim().is_empty() {
-        return Err(Error::rejected("Comment body is empty — pass -m or --file"));
-    }
-    // CAD-109: a credential-shaped body is refused before anything is
-    // written; warn-only findings ride along in the result.
-    let secret_warnings = crate::secret::guard(&format!("{id}: comment"), body)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
-    if let Some(conflict) = check_rev(&dir, if_rev)? {
-        return Ok(conflict);
-    }
-    let comments = dir.join("comments");
-    if comments.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        return Err(Error::rejected(format!(
-            "{id}: comments/ is a symlink — refusing to write outside the PM dir"
-        )));
-    }
-    std::fs::create_dir_all(&comments)?;
-    let epoch = time::now_epoch();
-    let front = crate::issue::model::CommentFront {
-        author: author.clone(),
-        at: time::iso(epoch),
-        kind: kind.map(str::to_string),
-    };
-    let text = parse::render(&front, body)?;
-    let path = create_exclusive(
-        &comments,
-        &format!("{}-{author}.md", time::basic(epoch)),
-        text.as_bytes(),
-    )?;
-    // A failed commit leaves no comment file behind — an orphan would
-    // sit foreign and uncommitted under the next writer's eye.
-    let foreign = match commit_who_scoped(
-        pm,
-        &lock,
-        std::slice::from_ref(&path),
-        &format!("{id}: comment by {author}"),
-        &[id],
-        actor,
-        author_opt,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_file(&path);
-            return Err(e);
-        }
-    };
-    let mut out = json!({"id": id, "comment": path.file_name().map(|n| n.to_string_lossy().to_string()),
-              "author": author, "committed": true});
-    if !secret_warnings.is_empty() {
-        out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
-    }
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// CAD-383: write `front` and one comment by `author` in a single tracker
-/// commit (`subject` without the id). Call under the PM lock. A failed
-/// commit restores `prev` and removes the comment, so a refusal leaves
-/// the issue as it was.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn commit_front_with_comment(
-    pm: &Pm,
-    dir: &Path,
-    prev: &Front,
-    front: &Front,
-    body: &str,
-    author: &str,
-    kind: &str,
-    text: &str,
-    subject: &str,
-    actor: &str,
-) -> Result<String> {
-    let id = front.id.as_str();
-    crate::issue::claim::check_alias(author, "Claimant")?;
-    // CAD-109: a credential-shaped note or reason is refused here too.
-    crate::secret::guard(&format!("{id}: comment"), text)?;
-    let comments = dir.join("comments");
-    if comments.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        return Err(Error::rejected(format!(
-            "{id}: comments/ is a symlink — refusing to write outside the PM dir"
-        )));
-    }
-    std::fs::create_dir_all(&comments)?;
-    let epoch = time::now_epoch();
-    let meta = model::CommentFront {
-        author: author.to_string(),
-        at: time::iso(epoch),
-        kind: Some(kind.to_string()),
-    };
-    let rendered = parse::render(&meta, text)?;
-    let path = create_exclusive(
-        &comments,
-        &format!("{}-{author}.md", time::basic(epoch)),
-        rendered.as_bytes(),
-    )?;
-    let committed = save_front(dir, front, body).and_then(|_| {
-        commit_who(
-            pm,
-            &[dir.join("issue.md"), path.clone()],
-            &format!("{id}: {subject}"),
-            &[id],
-            actor,
-            Some(author),
-        )
-    });
-    if let Err(e) = committed {
-        let _ = save_front(dir, prev, body);
-        let _ = std::fs::remove_file(&path);
-        return Err(e);
-    }
-    Ok(path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default())
-}
-
-/// Store one already-validated task report (CAD-341) as a create-only
-/// file under `reports/`, named by UTC time + agent. Byte-identical
-/// content already on the ticket is not written twice: the existing
-/// file is returned with `duplicate: true` and nothing is committed.
-pub fn add_report(
-    pm: &Pm,
-    id: &str,
-    front: &crate::issue::task_report::Front,
-    body: &str,
-    actor: &str,
-) -> Result<Value> {
-    use crate::issue::task_report::DIR;
-    let (_project, dir) = issue_dir(pm, id)?;
-    let agent = front.agent.clone().unwrap_or_default();
-    let kind = front.kind.map(|k| k.as_str()).unwrap_or_default();
-    let text = parse::render(front, body)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
-    let reports = dir.join(DIR);
-    if reports.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        return Err(Error::rejected(format!(
-            "{id}: {DIR}/ is a symlink — refusing to write outside the PM dir"
-        )));
-    }
-    std::fs::create_dir_all(&reports)?;
-    let out = |name: &str, duplicate: bool| {
-        json!({"id": id, "report": name, "path": format!("{id}/{DIR}/{name}"),
-               "kind": kind, "agent": agent, "committed": !duplicate,
-               "duplicate": duplicate})
-    };
-    for name in crate::issue::task_report::names(&dir) {
-        if std::fs::read(reports.join(&name)).is_ok_and(|b| b == text.as_bytes()) {
-            return Ok(out(&name, true));
-        }
-    }
-    let path = create_exclusive(
-        &reports,
-        &format!("{}-{agent}.md", time::basic(time::now_epoch())),
-        text.as_bytes(),
-    )?;
-    // A failed commit must not leave the file behind: a retry would hit
-    // the duplicate short-circuit and never commit it.
-    let foreign = match commit_who_scoped(
-        pm,
-        &lock,
-        std::slice::from_ref(&path),
-        &format!("{id}: report {kind} by {agent}"),
-        &[id],
-        actor,
-        Some(&agent),
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_file(&path);
-            return Err(e);
-        }
-    };
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let mut out = out(&name, false);
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// `issue attach <ID> <file>` — copy into `artifacts/` (basename only),
-/// create-only, under `artifact_max_bytes`.
-pub fn attach(pm: &Pm, id: &str, file: &Path) -> Result<Value> {
-    let meta = std::fs::metadata(file)
-        .map_err(|e| Error::rejected(format!("Cannot read {}: {e}", file.display())))?;
-    if !meta.is_file() {
-        return Err(Error::rejected(format!("{} is not a file", file.display())));
-    }
-    if meta.len() > pm.config.artifact_max_bytes {
-        return Err(Error::rejected(format!(
-            "{} is {} bytes — over the {} cap; link it instead: \
-             `cadence issue ref {id} url <location>`",
-            file.display(),
-            meta.len(),
-            pm.config.artifact_max_bytes
-        )));
-    }
-    let name = file
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .ok_or_else(|| Error::rejected("Attachment needs a plain file name"))?;
-    let bytes = std::fs::read(file)?;
-    attach_bytes(pm, id, &name, &bytes, true, "")
-}
-
-/// Attach raw bytes as `artifacts/<name>` — the upload route's path.
-/// Names follow the read grammar so every stored file is fetchable.
-/// With `autorename` a collision becomes `<stem>-N<ext>` (CLI parity);
-/// without it an existing name is a conflict the route maps to 409.
-pub fn attach_bytes(
-    pm: &Pm,
-    id: &str,
-    name: &str,
-    bytes: &[u8],
-    autorename: bool,
-    actor: &str,
-) -> Result<Value> {
-    let (_project, dir) = issue_dir(pm, id)?;
-    if !model::valid_artifact_name(name) {
-        return Err(Error::rejected(format!(
-            "Bad artifact name '{name}' — [A-Za-z0-9._-]{{1,120}}, no leading dot"
-        )));
-    }
-    if bytes.len() as u64 > pm.config.artifact_max_bytes {
-        return Err(Error::rejected(format!(
-            "{name} is {} bytes — over the {} cap; link it instead",
-            bytes.len(),
-            pm.config.artifact_max_bytes
-        )));
-    }
-    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
-    let artifacts = dir.join("artifacts");
-    if artifacts.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        return Err(Error::rejected(format!(
-            "{id}: artifacts/ is a symlink — refusing to write outside the PM dir"
-        )));
-    }
-    std::fs::create_dir_all(&artifacts)?;
-    let path = if autorename {
-        create_exclusive(&artifacts, name, bytes)?
-    } else {
-        let target = artifacts.join(name);
-        match write_new(&target, bytes) {
-            Ok(()) => target,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Ok(json!({"id": id, "conflict": "exists", "artifact": name}));
-            }
-            Err(e) => return Err(e.into()),
-        }
-    };
-    let foreign = match commit_scoped(
-        pm,
-        &lock,
-        std::slice::from_ref(&path),
-        &format!("{id}: attach {name}"),
-        &[id],
-        actor,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_file(&path);
-            return Err(e);
-        }
-    };
-    let mut out = json!({"id": id, "artifact": path.file_name().map(|n| n.to_string_lossy().to_string()),
-              "size": bytes.len(), "committed": true});
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
+mod done;
+mod edit;
+mod new;
+mod plan;
+mod projects;
+mod rev;
+mod stage;
+
+use done::check_done_evidence;
+#[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
+pub(crate) use done::Staged;
+pub(crate) use done::{
+    apply_pairs, commit_staged, commit_staged_scoped, mark_done_on_merge_locked,
+    mark_done_on_merge_waiting_with, stage, RealWait, WaitClock,
+};
+pub use done::{mark_done_on_merge, mark_done_on_merge_waiting, DoneWriteFailure};
+pub use edit::{
+    add_comment, add_ref, add_report, attach, attach_bytes, close_ref, link, patch_issue,
+    set_fields, set_fields_if_rev, tag_edit, IssuePatch,
+};
+pub(crate) use edit::{
+    apply_link, check_set_gates, comment_author, commit_front_with_comment, new_ref, sets_done,
+};
+pub(crate) use new::next_id;
+pub use new::{master_issue_new_limits, new_issue};
+pub(crate) use plan::{check_structure, create_granted_plan, granted_semantics, GrantedPreview};
+pub use plan::{create_plan, decide_plan};
+use projects::check_component;
+pub(crate) use projects::{check_tags, issue_dir, load_front, save_front, split_tags};
+pub use projects::{project_add, set_acceptance, set_project_policy, set_project_remote};
+#[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
+pub(crate) use rev::blocked_warnings;
+use rev::check_rev;
+pub use rev::issue_rev;
+pub(crate) use rev::{
+    actor_who, atomic_write, attach_foreign, attach_post_warnings, blocked_warnings_best_effort,
+    commit, commit_scoped, commit_who, commit_who_scoped, create_exclusive, file_preimage,
+    post_commit_warning, restore_preimage, write_new,
+};
+
+#[cfg(test)]
+use new::lock_for_new_issue_rounds;
+
+#[cfg(test)]
+use rev::{write_new_seq, TEMP_ATTEMPTS};
+pub use stage::move_stage;
+use stage::{check_milestone, check_type_change};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AOS-274: the recorded policy advances by one version per write,
+    /// keeps the minted identity, refuses private until the isolation
+    /// gate passes, and refuses both an unsupported grant and an unknown
+    /// project.
+    #[test]
+    fn setting_a_policy_bumps_the_version_and_refuses_private() {
+        let (_dir, pm) = tracker();
+        let key = "cadence";
+        let before = project::load(&pm.dir.join(key).join("project.yaml")).unwrap();
+        let start = before.policy.as_ref().map(|p| p.version).unwrap_or(0);
+        let id = before.id.clone().expect("creation mints an identity");
+
+        let out =
+            set_project_policy(&pm, key, project::Visibility::WorkspaceVisible, &[], "").unwrap();
+        assert_eq!(out["policy"]["version"], start + 1);
+        assert_eq!(out["policy"]["visibility"], "workspace_visible");
+        let loaded = project::load(&pm.dir.join(key).join("project.yaml")).unwrap();
+        assert_eq!(loaded.id, Some(id), "the identity must not change");
+        assert_eq!(loaded.policy.as_ref().unwrap().version, start + 1);
+
+        // A grant is recorded and the version advances again.
+        let out = set_project_policy(
+            &pm,
+            key,
+            project::Visibility::WorkspaceVisible,
+            &["users/mia".to_string()],
+            "",
+        )
+        .unwrap();
+        assert_eq!(out["policy"]["version"], start + 2);
+        assert_eq!(out["policy"]["members"][0], "users/mia");
+        let before = std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap();
+
+        // Private is refused until the isolation gate passes.
+        set_project_policy(&pm, key, project::Visibility::Private, &[], "").unwrap_err();
+
+        // Reserved grantee kinds and unknown projects are refused.
+        set_project_policy(
+            &pm,
+            key,
+            project::Visibility::WorkspaceVisible,
+            &["agents/dev".to_string()],
+            "",
+        )
+        .unwrap_err();
+        set_project_policy(&pm, "ghost", project::Visibility::WorkspaceVisible, &[], "")
+            .unwrap_err();
+        assert!(!pm.dir.join("ghost").exists());
+
+        // A key that is not the tracker grammar never joins the filesystem,
+        // so it cannot create or edit a project outside this pm dir.
+        for bad in [
+            "../aos274-escape",
+            "cadence/../../aos274-escape",
+            "",
+            "..",
+            "/tmp",
+        ] {
+            set_project_policy(
+                &pm,
+                bad,
+                project::Visibility::WorkspaceVisible,
+                &["users/mia".to_string()],
+                "",
+            )
+            .unwrap_err();
+        }
+        let escape = pm.dir.join("..").join("aos274-escape").join("project.yaml");
+        assert!(!escape.exists(), "traversal key wrote outside the tracker");
+        assert_eq!(
+            std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap(),
+            before,
+            "a refused policy mutation changed the real project"
+        );
+    }
+
+    /// A commit the tracker refuses leaves the record exactly as it was —
+    /// the rule every other writer here follows, which this verb was
+    /// missing: the version had already been bumped on disk when the
+    /// commit failed, so a refused write looked applied.
+    #[test]
+    fn a_policy_write_whose_commit_is_refused_leaves_the_record_alone() {
+        let (_dir, pm) = tracker();
+        let key = "cadence";
+        let path = pm.dir.join(key).join("project.yaml");
+        let before = std::fs::read(&path).unwrap();
+        let hook = failing_hook(&pm);
+
+        assert!(
+            set_project_policy(&pm, key, project::Visibility::WorkspaceVisible, &[], "").is_err(),
+            "the refused commit was reported as a success"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a refused commit left the changed record behind"
+        );
+        assert!(clean(&pm), "a refused policy write left something behind");
+        std::fs::remove_file(hook).unwrap();
+    }
 
     /// CAD-908: a created file is whole, a collision renames, and no
     /// temp file survives either outcome.
@@ -2504,6 +293,25 @@ mod tests {
             && crate::issue::git(&pm.dir, &["status", "--porcelain"]).is_ok_and(|s| s.is_empty())
     }
 
+    /// The tracker's own records are not caller attachments: a copy of a
+    /// correction record onto another ticket must not be writable, or a
+    /// listing would read it as that ticket's reviewed correction.
+    #[test]
+    fn attach_refuses_the_tracker_owned_records() {
+        let (_dir, pm) = tracker();
+        for name in model::RESERVED_ARTIFACT_NAMES {
+            assert!(
+                attach_bytes(&pm, "CAD-1", name, b"{}", true, "t").is_err(),
+                "{name} was accepted as a caller attachment"
+            );
+            let (_project, dir) = issue_dir(&pm, "CAD-1").unwrap();
+            assert!(
+                !dir.join("artifacts").join(name).exists(),
+                "{name} was written to artifacts/"
+            );
+        }
+    }
+
     /// A forced done over several ids keeps its reason in the commit
     /// subject even when a later id was already done (CAD-887 review).
     #[test]
@@ -2577,6 +385,73 @@ mod tests {
         crate::issue::edit::edit(&pm, "CAD-1", &spec, "t", None).unwrap();
     }
 
+    /// CAD-1522: `--unref` removes exactly the named ref, and an
+    /// `--unref` whose target is not there refuses the whole edit — the
+    /// caller asked for a correction that cannot be made, and the other
+    /// parts of the same call must not land either. Before this, a ref
+    /// added by mistake could not be removed at all, and a stale `pr:`
+    /// ref pointing at another open PR makes `issue reconcile` return
+    /// `held(open-pr)` forever (observed on ticket CAD-1514).
+    #[test]
+    fn edit_unref_removes_one_ref_and_refuses_an_absent_target() {
+        let (_tmp, pm) = tracker();
+        let url = |n: u32| format!("https://github.com/favcrm/cadence/pull/{n}");
+        let edit = |spec: crate::issue::edit::EditSpec| {
+            crate::issue::edit::edit(&pm, "CAD-1", &spec, "t", None)
+        };
+        let refs = || -> Vec<String> {
+            let (front, _) = load_front(&pm.dir.join("cadence/CAD-1")).unwrap();
+            front.refs.iter().filter_map(|r| r.url.clone()).collect()
+        };
+        let commits = || -> u32 {
+            crate::issue::git(&pm.dir, &["rev-list", "--count", "HEAD"])
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+
+        edit(crate::issue::edit::EditSpec {
+            refs: vec![format!("pr:{}", url(1)), format!("pr:{}", url(2))],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(refs(), vec![url(1), url(2)]);
+
+        let before = std::fs::read(pm.dir.join("cadence/CAD-1/issue.md")).unwrap();
+        let err = edit(crate::issue::edit::EditSpec {
+            unrefs: vec![format!("pr:{}", url(9))],
+            set: vec!["priority=P0".to_string()],
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("has no pr ref"), "{err}");
+        assert_eq!(
+            refs(),
+            vec![url(1), url(2)],
+            "a refused --unref removed a ref"
+        );
+        assert_eq!(
+            std::fs::read(pm.dir.join("cadence/CAD-1/issue.md")).unwrap(),
+            before,
+            "a refused --unref still wrote the rest of the edit"
+        );
+
+        let commits_before = commits();
+        edit(crate::issue::edit::EditSpec {
+            unrefs: vec![format!("pr:{}", url(1))],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(refs(), vec![url(2)], "the wrong ref was removed");
+        assert_eq!(
+            commits(),
+            commits_before + 1,
+            "removal lands as exactly one tracker commit"
+        );
+    }
+
     #[test]
     fn lint_reports_duplicate_ids_across_project_folders() {
         let (_tmp, pm) = tracker();
@@ -2630,6 +505,249 @@ mod tests {
             head
         );
         assert!(clean(&pm), "refused project add left tracker changes");
+    }
+
+    fn git_with_origin(origin: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        crate::issue::git(dir.path(), &["-c", "init.defaultBranch=main", "init", "-q"]).unwrap();
+        crate::issue::git(dir.path(), &["remote", "add", "origin", origin]).unwrap();
+        dir
+    }
+
+    fn add_with_remote(pm: &Pm, key: &str, prefix: &str, origin: &str) -> tempfile::TempDir {
+        let repo = git_with_origin(origin);
+        project_add(
+            pm,
+            key,
+            prefix,
+            &[repo.path().to_string_lossy().into_owned()],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        repo
+    }
+
+    /// CAD-1870: set-remote is a compare-and-swap on one `repos[].remote`.
+    #[test]
+    fn set_project_remote_updates_one_remote_and_drives_delivery_matching() {
+        let (_dir, pm) = tracker();
+        let _repo = add_with_remote(
+            &pm,
+            "mkt",
+            "MKT",
+            "https://github.com/favcrm/marketing-v2.git",
+        );
+        let yaml = pm.dir.join("mkt").join("project.yaml");
+        let before = project::load(&yaml).unwrap();
+        let id = before.id.clone();
+        let prefix = before.prefix.clone();
+        let path = before.repos[0].path.clone();
+        let policy = before.policy.clone();
+        let cadence_yaml = std::fs::read(pm.dir.join("cadence").join("project.yaml")).unwrap();
+        let new_pr = "https://github.com/agenticos-stack/marketing-v2/pull/1";
+        let old_pr = "https://github.com/favcrm/marketing-v2/pull/1";
+        let other_pr = "https://github.com/acme/other/pull/9";
+        assert!(
+            crate::delivery::project_pr_refusal(&pm.dir, "mkt", old_pr)
+                .unwrap()
+                .is_none(),
+            "the recorded remote should accept the old slug before the update"
+        );
+        assert!(crate::delivery::project_pr_refusal(&pm.dir, "mkt", new_pr)
+            .unwrap()
+            .is_some());
+
+        let out = set_project_remote(
+            &pm,
+            "mkt",
+            "github.com/favcrm/marketing-v2",
+            "github.com/agenticos-stack/marketing-v2",
+            "",
+        )
+        .unwrap();
+        assert_eq!(out["changed"], true);
+        assert_eq!(out["committed"], true);
+        assert_eq!(out["from"], "github.com/favcrm/marketing-v2");
+        assert_eq!(out["to"], "github.com/agenticos-stack/marketing-v2");
+
+        let after = project::load(&yaml).unwrap();
+        assert_eq!(after.id, id);
+        assert_eq!(after.prefix, prefix);
+        assert_eq!(after.policy, policy);
+        assert_eq!(after.repos[0].path, path);
+        assert_eq!(
+            after.repos[0].remote.as_deref(),
+            Some("github.com/agenticos-stack/marketing-v2")
+        );
+        assert_eq!(
+            std::fs::read(pm.dir.join("cadence").join("project.yaml")).unwrap(),
+            cadence_yaml,
+            "an unrelated project.yaml changed"
+        );
+        assert!(
+            crate::delivery::project_pr_refusal(&pm.dir, "mkt", new_pr)
+                .unwrap()
+                .is_none(),
+            "delivery must accept a PR on the new remote"
+        );
+        let unrelated = crate::delivery::project_pr_refusal(&pm.dir, "mkt", other_pr)
+            .unwrap()
+            .expect("unrelated remote must still be refused");
+        assert!(
+            unrelated.contains("not a repo of project mkt"),
+            "{unrelated}"
+        );
+        let old_now = crate::delivery::project_pr_refusal(&pm.dir, "mkt", old_pr)
+            .unwrap()
+            .expect("old slug stops matching; no compatibility shim");
+        assert!(old_now.contains("not a repo of project mkt"), "{old_now}");
+    }
+
+    #[test]
+    fn set_project_remote_refuses_stale_conflict_malformed_and_is_idempotent() {
+        let (_dir, pm) = tracker();
+        let _a = add_with_remote(
+            &pm,
+            "mkt",
+            "MKT",
+            "https://github.com/favcrm/marketing-v2.git",
+        );
+        let _b = add_with_remote(&pm, "other", "OTH", "https://github.com/acme/widgets.git");
+        let yaml = pm.dir.join("mkt").join("project.yaml");
+        let before = std::fs::read(&yaml).unwrap();
+        let head = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+
+        let stale = set_project_remote(
+            &pm,
+            "mkt",
+            "github.com/nobody/missing",
+            "github.com/agenticos-stack/marketing-v2",
+            "",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(stale.contains("no registered remote"), "{stale}");
+
+        let conflict = set_project_remote(
+            &pm,
+            "mkt",
+            "github.com/favcrm/marketing-v2",
+            "github.com/acme/widgets",
+            "",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(conflict.contains("already project 'other'"), "{conflict}");
+
+        for bad in [
+            "",
+            "not-a-repo",
+            "github.com/onlyowner",
+            "github.com/a/b/c",
+            "../escape/x",
+        ] {
+            let err = set_project_remote(&pm, "mkt", bad, "github.com/acme/ok", "")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("malformed"), "{bad}: {err}");
+        }
+
+        let add_err = project_add(&pm, "mkt", "ZZZ", &[], &[], &[], None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            add_err.contains("set-remote") && !add_err.contains("edit "),
+            "{add_err}"
+        );
+
+        let missing = set_project_remote(
+            &pm,
+            "ghost",
+            "github.com/favcrm/marketing-v2",
+            "github.com/agenticos-stack/marketing-v2",
+            "",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("no project 'ghost'"), "{missing}");
+
+        assert_eq!(std::fs::read(&yaml).unwrap(), before);
+        assert_eq!(
+            crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+            head
+        );
+        assert!(clean(&pm), "a refused set-remote left tracker changes");
+
+        let noop = set_project_remote(
+            &pm,
+            "mkt",
+            "https://github.com/favcrm/marketing-v2.git",
+            "github.com/favcrm/marketing-v2",
+            "",
+        )
+        .unwrap();
+        assert_eq!(noop["changed"], false);
+        assert_eq!(noop["committed"], false);
+        assert_eq!(std::fs::read(&yaml).unwrap(), before);
+        assert_eq!(
+            crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+            head
+        );
+
+        let r1 = git_with_origin("https://github.com/dup/one.git");
+        let r2 = git_with_origin("https://github.com/dup/one.git");
+        project_add(
+            &pm,
+            "dupes",
+            "DUP",
+            &[
+                r1.path().to_string_lossy().into_owned(),
+                r2.path().to_string_lossy().into_owned(),
+            ],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        let ambiguous =
+            set_project_remote(&pm, "dupes", "github.com/dup/one", "github.com/dup/two", "")
+                .unwrap_err()
+                .to_string();
+        assert!(ambiguous.contains("more than one"), "{ambiguous}");
+        assert_eq!(std::fs::read(&yaml).unwrap(), before);
+    }
+
+    #[test]
+    fn a_refused_set_remote_commit_leaves_the_record_alone() {
+        let (_dir, pm) = tracker();
+        let _repo = add_with_remote(
+            &pm,
+            "mkt",
+            "MKT",
+            "https://github.com/favcrm/marketing-v2.git",
+        );
+        let path = pm.dir.join("mkt").join("project.yaml");
+        let before = std::fs::read(&path).unwrap();
+        let hook = failing_hook(&pm);
+        assert!(
+            set_project_remote(
+                &pm,
+                "mkt",
+                "github.com/favcrm/marketing-v2",
+                "github.com/agenticos-stack/marketing-v2",
+                "",
+            )
+            .is_err(),
+            "the refused commit was reported as a success"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            clean(&pm),
+            "a refused set-remote write left something behind"
+        );
+        std::fs::remove_file(hook).unwrap();
     }
 
     /// CAD-449: a failed done commit restores `issue.md` and its index
@@ -2694,6 +812,28 @@ mod tests {
         assert!(e.to_string().contains("locked"), "{e}");
         assert!(t.elapsed() < std::time::Duration::from_secs(2));
         drop(held);
+    }
+
+    /// CAD-1600: exhausting the id-allocation retries is CONTENTION,
+    /// not a refusal. The error kind must be `busy` (exit 75, the one
+    /// kind a caller may retry blindly) and not `rejected` (exit 3,
+    /// which reads as "this will never work").
+    #[test]
+    fn an_exhausted_id_allocation_is_busy_not_rejected() {
+        let (_dir, pm) = tracker();
+        let project = crate::issue::project::list(&pm.dir)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.key == "cadence")
+            .unwrap();
+        let e = lock_for_new_issue_rounds(&pm, &project, None, 0)
+            .expect_err("no rounds means no allocation");
+        assert_eq!(e.kind(), "busy", "{e}");
+        assert_eq!(
+            crate::error::exit_code_for_kind(e.kind()),
+            75,
+            "a busy allocation must exit 75"
+        );
     }
 
     /// CAD-449: a comment whose commit fails removes its file and its

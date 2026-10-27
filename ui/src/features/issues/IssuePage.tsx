@@ -22,8 +22,10 @@ import { Activity } from "./Activity";
 import { PrPanel } from "./PrPanel";
 import { Evidence } from "./Evidence";
 import { Fields } from "./Fields";
+import { WorkResult } from "./WorkResult";
 import { Links } from "./Links";
 import { type IssuePageProps as Props } from "./issuePageProps";
+import { useLocale } from "../../lib/locale";
 import { ReadNotice } from "./issuePageShared";
 import {
   acceptanceItems,
@@ -120,6 +122,7 @@ function IssueWorkspace(props: Props) {
           body={detail.body}
           blocked={kickoffWhy}
           groups={pmGroups(props.agents)}
+          seats={seatOptions(props.agents)}
           planHref={props.planHref}
           onClose={() => setKickoff(false)}
           onWrite={props.onWrite}
@@ -128,6 +131,14 @@ function IssueWorkspace(props: Props) {
       )}
     </>
   );
+}
+
+function seatOptions(
+  agents: AgentsPayload | null,
+): { alias: string; provider: string; state: string }[] {
+  return (agents?.agents ?? [])
+    .filter((a) => a.provider !== "inbox" && !a.dead)
+    .map((a) => ({ alias: a.alias, provider: a.provider, state: a.state }));
 }
 
 function pmGroups(agents: AgentsPayload | null): string[] {
@@ -165,6 +176,7 @@ function PageBody({
   blocked: string | null;
   setKickoff: (open: boolean) => void;
 }) {
+  const { t, formatNumber } = useLocale();
   const items = acceptanceItems(detail.body);
   const rows = timelineRows(detail, history.data ?? []);
   const pr = prRef(detail.refs);
@@ -186,6 +198,11 @@ function PageBody({
   const hrefFor = (issueId: string) => {
     const card = issues.find((i) => i.id === issueId);
     return issuePath(card?.project ?? project, issueId);
+  };
+
+  const composeWith = (mode: "ask" | "instruct") => {
+    setCompose(mode);
+    navigate(tabHref("conversation"));
   };
 
   const patch = (body: Parameters<typeof api.patch>[1], verb: string) => {
@@ -211,10 +228,10 @@ function PageBody({
             <span
               className={`chip ${STATUS_CHIP[detail.status] ?? "bg-ink-800 text-ink-300"}`}
             >
-              {detail.status}
+              {t(detail.status)}
             </span>
             <span className="chip bg-ink-800 text-ink-400">
-              {detail.priority}
+              {t(detail.priority)}
             </span>
             {(detail.parent || detail.component) && (
               <span className="chip bg-ink-800 text-ink-400">
@@ -227,17 +244,17 @@ function PageBody({
           <Button
             variant={blocked ? "secondary" : "primary"}
             disabled={!!blocked}
-            title={blocked ?? undefined}
+            title={blocked == null ? undefined : t(blocked)}
             onClick={() => setKickoff(true)}
           >
-            Kick off
+            {t("Kick off")}
           </Button>
           {lane?.lane && (
-            <Button href={tabHref("conversation")}>Ask agent</Button>
+            <Button href={tabHref("conversation")}>{t("Ask agent")}</Button>
           )}
           {pr?.href && (
             <SafeLink className="btn" warnClassName="btn" href={pr.href}>
-              Open pull request
+              {t("Open pull request")}
             </SafeLink>
           )}
         </div>
@@ -254,35 +271,34 @@ function PageBody({
         <div className="grid gap-2 px-4 lg:px-8 pt-1">
           {fenced && (
             <div className="border border-ink-700 border-l-[3px] border-l-fail rounded-lg px-3.5 py-3 bg-fail/10">
-              <strong className="text-ink-100">Agent fenced</strong>
+              <strong className="text-ink-100">{t("Agent fenced")}</strong>
               <p className="text-secondary text-ink-300 mt-1 m-0">
-                A bound agent is fenced or needs attention. Unfence is on the
-                lane card.
+                {t("A bound agent is fenced or needs attention. Unfence is on the lane card.")}
               </p>
             </div>
           )}
           {items.length === 0 && (
             <div className="border border-ink-700 border-l-[3px] border-l-warn rounded-lg px-3.5 py-3 bg-warn/10">
-              <strong className="text-ink-100">Kick off blocked</strong>
-              <p className="text-secondary text-ink-300 mt-1 m-0">{blocked}</p>
+              <strong className="text-ink-100">{t("Kick off blocked")}</strong>
+              <p className="text-secondary text-ink-300 mt-1 m-0">{blocked && t(blocked)}</p>
             </div>
           )}
         </div>
       )}
 
       <SectionTabs
-        label="Issue"
-        tabs={TABS.map((t) => ({
-          label: t.label,
-          href: tabHref(t.id),
-          on: tab === t.id,
+        label={t("Issue")}
+        tabs={TABS.map((tabItem) => ({
+          label: t(tabItem.label),
+          href: tabHref(tabItem.id),
+          on: tab === tabItem.id,
         }))}
       />
 
       <div className="grid xl:grid-cols-[minmax(0,1fr)_340px] items-start">
         <main className="min-w-0 px-4 lg:px-8 py-5 grid gap-4">
           {tab === "overview" && (detail.tags ?? []).includes("plan-ready") && (
-            <section aria-label="Idea decision">
+            <section aria-label={t("Idea decision")}>
               <IdeaCard
                 issue={id}
                 readOnly={readOnly}
@@ -292,12 +308,25 @@ function PageBody({
             </section>
           )}
           {tab === "overview" && (
+            <WorkResult
+              detail={detail}
+              lane={lane}
+              checksDone={done}
+              checksTotal={items.length}
+              blocked={blocked}
+              tabHref={tabHref}
+              onCompose={composeWith}
+              onKickoff={() => setKickoff(true)}
+              onOpen={onOpen}
+            />
+          )}
+          {tab === "overview" && (
             <section className="issue-description grid gap-4">
               {items.length > 0 && (
                 <div className="issue-acceptance-progress">
-                  <span>Acceptance</span>
+                  <span>{t("Acceptance")}</span>
                   <strong className="num">
-                    {done} of {items.length} complete
+                    {formatNumber(done)} {t("of")} {formatNumber(items.length)} {t("complete")}
                   </strong>
                 </div>
               )}
@@ -360,10 +389,7 @@ function PageBody({
               issue={id}
               lane={lane?.lane ?? null}
               providers={lane?.providers ?? []}
-              onCompose={(mode) => {
-                setCompose(mode);
-                navigate(tabHref("conversation"));
-              }}
+              onCompose={composeWith}
               onChanged={reloadLane}
             />
           )}

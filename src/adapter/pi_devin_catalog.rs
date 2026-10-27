@@ -556,24 +556,6 @@ mod tests {
         )
         .is_err());
     }
-    // Operator check: CADENCE_REAL_CATALOG=<copy of the live models.json>
-    // CADENCE_REAL_MODEL=devin/<uid> cargo test --lib real_catalog -- --ignored
-    #[test]
-    #[ignore]
-    fn real_catalog_copy_is_accepted() {
-        let src = std::env::var("CADENCE_REAL_CATALOG").unwrap();
-        let model = std::env::var("CADENCE_REAL_MODEL").unwrap();
-        let bytes = std::fs::read(&src).unwrap();
-        let fetched = serde_json::from_slice::<Value>(&bytes).unwrap()["fetchedAt"]
-            .as_u64()
-            .unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let cache = dir.path().join("cache");
-        std::fs::create_dir(&cache).unwrap();
-        let source = dir.path().join("copy.json");
-        std::fs::write(&source, &bytes).unwrap();
-        seed(&cache, &source, &model, fetched).unwrap();
-    }
     #[test]
     fn padded_valid_catalog_is_accepted_at_the_byte_cap_and_refused_past_it() {
         for (extra, ok) in [(0usize, true), (1, false)] {

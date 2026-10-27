@@ -54,25 +54,44 @@ pub enum MemoryAction {
         /// Explicit slug — else slugified from the fact's first line.
         #[arg(long)]
         id: Option<String>,
+        /// Whether validity is mechanically checkable or a judgement.
+        #[arg(long, default_value = "judgement", value_parser = ["mechanical", "judgement"])]
+        nature: String,
+        /// Company adds policy approval requirements, not cross-project visibility.
+        #[arg(long, default_value = "project", value_parser = ["project", "role", "company"])]
+        audience: String,
+        #[arg(long = "scope-role")]
+        roles: Vec<String>,
+        /// Immutable source reference as JSON; repeatable.
+        #[arg(long = "evidence-ref")]
+        evidence_refs: Vec<String>,
+        /// Declarative check identifier/revisions as JSON, never a command.
+        #[arg(long)]
+        verification_condition: Option<String>,
     },
-    /// Finalize a proposed memory after two distinct native PM/worker reviews
-    /// from non-author, non-contributor endpoints.
+    /// Finalize the exact candidate under its versioned native policy.
     Accept {
         /// Memory slug.
         slug: String,
         /// Project key — needed only when the slug is ambiguous.
         #[arg(long)]
         project: Option<String>,
-        /// Body edits are refused because they invalidate the review digest.
-        #[arg(short = 'm')]
-        text: Option<String>,
+        /// Semantic digest of the candidate actually reviewed.
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        evidence: Option<String>,
     },
-    /// Reject a memory through an authenticated PM endpoint.
+    /// Reject the exact candidate under its native versioned policy.
     Reject {
         /// Memory slug.
         slug: String,
         #[arg(long)]
         project: Option<String>,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        evidence: String,
     },
     /// Submit one native independent PM/worker review. The daemon derives the reviewer
     /// from the Unix socket peer; the digest must be supplied explicitly.
@@ -100,14 +119,67 @@ pub enum MemoryAction {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Finalize a fresh native verify cycle on an accepted memory.
+    /// Complete native revalidation; a policy decision is not a logic check.
     Verify {
         /// Memory slug.
         slug: String,
         #[arg(long)]
         project: Option<String>,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        evidence: Option<String>,
     },
-    /// List memories — a compact table on a TTY, `--json` for agents.
+    /// Attest agent source provenance as the actual operator; not a check result.
+    Classify {
+        slug: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        evidence: String,
+        #[arg(long = "evidence-ref")]
+        evidence_refs: Vec<String>,
+    },
+    /// Withhold an accepted v2 claim pending a fresh policy decision.
+    Revalidate {
+        slug: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        evidence: String,
+    },
+    /// Invalidate a v2 claim without deleting its history.
+    Invalidate {
+        slug: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        evidence: String,
+    },
+    /// Report use/wrong/reread from the assigned current native message turn.
+    Feedback {
+        slug: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        token: String,
+        #[arg(long, value_parser = ["used", "wrong", "reread"])]
+        kind: String,
+        #[arg(long)]
+        evidence: Option<String>,
+    },
+    /// List memories — a compact table on a TTY, JSON when piped or
+    /// `--json` is set.
     /// Value flags repeat and comma-join and match ANY of their values;
     /// different flags AND.
     #[command(after_long_help = crate::filter::GRAMMAR)]
@@ -116,7 +188,7 @@ pub enum MemoryAction {
         /// Project key; repeatable.
         #[arg(long, value_delimiter = ',')]
         project: Vec<String>,
-        /// proposed | accepted | rejected | superseded; repeatable.
+        /// proposed | quarantined | accepted | pending-revalidation | invalidated | rejected | superseded; repeatable.
         #[arg(long, value_delimiter = ',')]
         status: Vec<String>,
         /// rule | gotcha | decision | recipe; repeatable.
@@ -175,6 +247,9 @@ pub enum MemoryAction {
         /// Provider for scope matching (the dispatch target's).
         #[arg(long)]
         provider: Option<String>,
+        /// Assigned role for role-restricted matching; unknown withholds.
+        #[arg(long)]
+        role: Option<String>,
         /// Component axis; repeatable.
         #[arg(long)]
         component: Vec<String>,
@@ -219,6 +294,11 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             from,
             text,
             id,
+            nature,
+            audience,
+            roles,
+            evidence_refs,
+            verification_condition,
         } => {
             let scope = Scope {
                 components: components.clone(),
@@ -235,6 +315,22 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                 .map(std::fs::read_to_string)
                 .transpose()
                 .map_err(|e| Error::rejected(format!("cannot read proposal source: {e}")))?;
+            let evidence_refs: Vec<memory::policy::EvidenceRef> = evidence_refs
+                .iter()
+                .map(|reference| {
+                    serde_json::from_str(reference).map_err(|error| {
+                        Error::rejected(format!("invalid evidence reference: {error}"))
+                    })
+                })
+                .collect::<Result<_>>()?;
+            let verification_condition: Option<memory::policy::VerificationCondition> =
+                verification_condition
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|error| {
+                        Error::rejected(format!("invalid verification condition: {error}"))
+                    })?;
             let out = client::rpc(
                 state_dir,
                 "memory_propose",
@@ -247,6 +343,11 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                     "from": from_text,
                     "text": text,
                     "id": id,
+                    "nature": nature,
+                    "audience": audience,
+                    "roles": roles,
+                    "evidence_refs": evidence_refs,
+                    "verification_condition": verification_condition,
                 }),
             )?;
             crate::issue::cli::print_json(&out);
@@ -255,31 +356,60 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
         MemoryAction::Accept {
             slug,
             project,
-            text,
-        } => {
-            let pm = open_pm()?;
-            let (_, mem) = memory::find(&pm, project.as_deref(), slug)?;
-            let mut params = json!({
-                "project": project,
-                "slug": slug,
-                "operation": "accept",
-                "digest": memory::semantic_digest(&mem),
-            });
-            if let Some(body) = text {
-                params["body"] = json!(body);
-            }
-            let out = client::rpc(state_dir, "memory_finalize", params)?;
-            crate::issue::cli::print_json(&out);
-            Ok(0)
+            digest,
+            evidence,
         }
-        MemoryAction::Reject { slug, project } => {
+        | MemoryAction::Verify {
+            slug,
+            project,
+            digest,
+            evidence,
+        } => {
+            let operation = if matches!(action, MemoryAction::Accept { .. }) {
+                "accept"
+            } else {
+                "verify"
+            };
             let out = client::rpc(
                 state_dir,
                 "memory_finalize",
                 json!({
-                    "project": project,
-                    "slug": slug,
-                    "operation": "reject",
+                    "project": project, "slug": slug, "operation": operation,
+                    "digest": digest, "evidence": evidence,
+                }),
+            )?;
+            crate::issue::cli::print_json(&out);
+            Ok(0)
+        }
+        MemoryAction::Reject {
+            slug,
+            project,
+            digest,
+            evidence,
+        }
+        | MemoryAction::Revalidate {
+            slug,
+            project,
+            digest,
+            evidence,
+        }
+        | MemoryAction::Invalidate {
+            slug,
+            project,
+            digest,
+            evidence,
+        } => {
+            let operation = match action {
+                MemoryAction::Reject { .. } => "reject",
+                MemoryAction::Revalidate { .. } => "revalidate",
+                _ => "invalidate",
+            };
+            let out = client::rpc(
+                state_dir,
+                "memory_finalize",
+                json!({
+                    "project": project, "slug": slug, "operation": operation,
+                    "digest": digest, "evidence": evidence,
                 }),
             )?;
             crate::issue::cli::print_json(&out);
@@ -299,17 +429,47 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             crate::issue::cli::print_json(&out);
             Ok(0)
         }
-        MemoryAction::Verify { slug, project } => {
-            let pm = open_pm()?;
-            let (_, mem) = memory::find(&pm, project.as_deref(), slug)?;
+        MemoryAction::Classify {
+            slug,
+            project,
+            digest,
+            evidence,
+            evidence_refs,
+        } => {
+            let refs: Vec<memory::policy::EvidenceRef> = evidence_refs
+                .iter()
+                .map(|reference| {
+                    serde_json::from_str(reference).map_err(|error| {
+                        Error::rejected(format!("invalid evidence reference: {error}"))
+                    })
+                })
+                .collect::<Result<_>>()?;
             let out = client::rpc(
                 state_dir,
-                "memory_finalize",
+                "memory_classify",
                 json!({
-                    "project": project,
-                    "slug": slug,
-                    "operation": "verify",
-                    "digest": memory::semantic_digest(&mem),
+                    "project": project, "slug": slug, "digest": digest,
+                    "provenance": "agent-verified", "evidence": evidence, "evidence_refs": refs,
+                }),
+            )?;
+            crate::issue::cli::print_json(&out);
+            Ok(0)
+        }
+        MemoryAction::Feedback {
+            slug,
+            project,
+            digest,
+            message,
+            token,
+            kind,
+            evidence,
+        } => {
+            let out = client::rpc(
+                state_dir,
+                "memory_feedback",
+                json!({
+                    "project": project, "slug": slug, "digest": digest,
+                    "message": message, "token": token, "kind": kind, "evidence": evidence,
                 }),
             )?;
             crate::issue::cli::print_json(&out);
@@ -352,7 +512,8 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             json: as_json,
         } => {
             let pm = open_pm()?;
-            crate::filter::fields_need_json(fields, *as_json)?;
+            let as_json = crate::output::json_selected(*as_json);
+            crate::filter::fields_need_json(fields, as_json)?;
             crate::filter::check_set("status", status, memory::STATUSES)?;
             crate::filter::check_set("type", kind, memory::TYPES)?;
             if *stale {
@@ -384,7 +545,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                     )?;
                 }
                 crate::filter::apply_limit(&mut hits, *limit);
-                if *as_json {
+                if as_json {
                     crate::filter::apply_fields(&mut hits, fields)?;
                     crate::issue::cli::print_json(&json!({"stale": hits, "load_errors": errors}));
                 } else if hits.is_empty() {
@@ -424,6 +585,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                 paths: path.clone(),
                 providers: vec![],
                 tags: vec![],
+                roles: Vec::new(),
             };
             let (all, load_errors) = memory::load_all_report(&pm.dir);
             let projects = crate::issue::project::list(&pm.dir).unwrap_or_default();
@@ -480,7 +642,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                 )?;
             }
             crate::filter::apply_limit(&mut rows, *limit);
-            if *as_json {
+            if as_json {
                 crate::filter::apply_fields(&mut rows, fields)?;
                 crate::issue::cli::print_json(&json!({
                     "memories": rows,
@@ -523,6 +685,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             issue,
             project,
             provider,
+            role,
             component,
             path,
             tag,
@@ -540,7 +703,8 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                     comments: vec![],
                     artifacts: vec![],
                 };
-                let mut ctx = memory::issue_ctx(&pm, &issue_obj, provider.as_deref())?;
+                let mut ctx =
+                    memory::issue_ctx(&pm, &issue_obj, provider.as_deref(), role.as_deref())?;
                 ctx.components.extend(component.clone());
                 ctx.paths.extend(path.clone());
                 ctx.tags.extend(tag.clone());
@@ -560,6 +724,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                     paths: path.clone(),
                     providers: provider.clone().into_iter().collect(),
                     tags: tag.clone(),
+                    roles: role.clone().into_iter().collect(),
                 };
                 let (pool, errors) = memory::load_project_report(&pm.dir, &proj.key);
                 let fresh = memory::Freshness::for_project(Some(&proj));
@@ -595,6 +760,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                         "paths": ctx.paths,
                         "providers": ctx.providers,
                         "tags": ctx.tags,
+                        "roles": ctx.roles,
                     },
                     "load_errors": load_errors,
                 }));

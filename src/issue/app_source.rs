@@ -63,7 +63,8 @@
 //! The shape and bounds are the v0 bundle shape `app.rs` enforces:
 //! `app.md` plus flat `workflows/`/`rubrics/`/`templates/` only —
 //! nothing else, no dotfiles, no nested dirs — at most 128 files,
-//! each ≤ 256 KiB (`plan::MAX_PLAN_BYTES`), ≤ 2 MiB aggregate
+//! each ≤ 256 KiB (`plan::MAX_PLAN_BYTES`; a screen JS/CSS ≤ 384 KiB,
+//! `app::MAX_SCREEN_ASSET_BYTES`), ≤ 2 MiB aggregate
 //! (`app::MAX_APP_BYTES`), read through `take(MAX_FILE_BYTES + 1)` so
 //! no unbounded allocation happens before the bound is proved.
 
@@ -80,7 +81,7 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 use crate::error::{Error, Result};
-use crate::issue::{app, model, plan};
+use crate::issue::{app, model};
 
 /// Largest URL a selection may carry, bytes.
 const MAX_URL_BYTES: usize = 2048;
@@ -108,15 +109,18 @@ const TIMEOUT_KILL_CODE: i32 = 137;
 /// CAD-1006's `screens/` (one `<tag>/` subdir per package of flat
 /// `<stem>.<js|css|svg|json>` leaves + `screens.json`) and CAD-1129's
 /// `assets/` (flat `*.svg`). Kept identical by inspection parity.
-const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates", "screens", "assets"];
+const TOP_DIRS: &[&str] = &[
+    "workflows",
+    "rubrics",
+    "templates",
+    "screens",
+    "assets",
+    "storage",
+];
 
 /// Most files a bundle may carry — pinned at `app.rs`'s private
 /// `MAX_FILES`.
 const MAX_FILES: usize = 128;
-
-/// Largest single file — `app.rs` defines its private `MAX_FILE_BYTES`
-/// as exactly this.
-const MAX_FILE_BYTES: u64 = plan::MAX_PLAN_BYTES as u64;
 
 /// Largest bundle, all files together — `app.rs`'s crate-visible cap.
 const MAX_APP_BYTES: u64 = app::MAX_APP_BYTES;
@@ -358,28 +362,57 @@ pub(crate) fn ls_remote(tmp: &Path, url: &str, git_ref: &str) -> Result<String> 
     let out = git_step(tmp, "ls-remote", |cmd| {
         cmd.arg("ls-remote").arg("--").arg(url).arg(git_ref);
     })?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .ok_or_else(|| Error::rejected("ls-remote answered nothing — the ref is unknown"))?;
-    let (sha, name) = line
-        .split_once('\t')
-        .ok_or_else(|| Error::rejected("ls-remote answered an unparseable line"))?;
-    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(Error::rejected("ls-remote answered a non-commit object"));
+    pick_ref(&String::from_utf8_lossy(&out.stdout), git_ref)
+}
+
+/// Choose the commit for exactly `git_ref` from `ls-remote` output.
+fn pick_ref(text: &str, git_ref: &str) -> Result<String> {
+    // `ls-remote <pattern>` matches any ref ENDING in the pattern
+    // (`refs/heads/x/main` for `main`), so pick by exact name: the ref as
+    // typed, `refs/heads/<ref>`, `refs/tags/<ref>` or its peeled `^{}`.
+    let (mut head, mut tag, mut peeled) = (None, None, None);
+    let mut any = false;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        any = true;
+        let (sha, name) = line
+            .split_once('\t')
+            .ok_or_else(|| Error::rejected("ls-remote answered an unparseable line"))?;
+        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::rejected("ls-remote answered a non-commit object"));
+        }
+        let slot = if name == format!("refs/tags/{git_ref}^{{}}") {
+            &mut peeled
+        } else if name == format!("refs/tags/{git_ref}")
+            || name == git_ref && git_ref.starts_with("refs/tags/")
+        {
+            &mut tag
+        } else if name == "HEAD" && git_ref == "HEAD"
+            || name == format!("refs/heads/{git_ref}")
+            || name == git_ref
+        {
+            &mut head
+        } else {
+            continue;
+        };
+        *slot = Some(sha.to_string());
     }
-    // The remote must answer the ref the caller named — never a peeled
-    // or adjacent one.
-    if !name.ends_with(git_ref)
-        && !(git_ref == "HEAD" && name == "HEAD")
-        && !(name == format!("refs/tags/{git_ref}") || name == format!("refs/tags/{git_ref}^{{}}"))
-    {
-        return Err(Error::rejected(format!(
-            "ls-remote resolved '{name}', not '{git_ref}' — refusing to substitute"
-        )));
+    if !any {
+        return Err(Error::rejected(
+            "ls-remote answered nothing — the ref is unknown",
+        ));
     }
-    Ok(sha.to_string())
+    // An annotated tag resolves to the commit it peels to. A branch and a
+    // tag of the same name that disagree are ambiguous: refuse, never pick.
+    let tagged = peeled.or(tag);
+    match (head, tagged) {
+        (Some(h), Some(t)) if h != t => Err(Error::rejected(format!(
+            "'{git_ref}' names both a branch and a tag — refusing to guess"
+        ))),
+        (Some(sha), _) | (None, Some(sha)) => Ok(sha),
+        (None, None) => Err(Error::rejected(format!(
+            "ls-remote resolved no ref named '{git_ref}' — refusing to substitute"
+        ))),
+    }
 }
 
 fn git_step(tmp: &Path, step: &str, args: impl FnOnce(&mut Command)) -> Result<Output> {
@@ -605,18 +638,17 @@ fn read_bounded(dir: &File, name: &[u8], rel: &str) -> Result<String> {
             "bundle entry '{rel}' is not a regular file"
         )));
     }
-    if meta.len() > MAX_FILE_BYTES {
+    let cap = app::file_cap(rel);
+    if meta.len() > cap {
         return Err(Error::rejected(format!(
-            "{rel} is {} bytes — a file is at most {MAX_FILE_BYTES}",
+            "{rel} is {} bytes — a file is at most {cap}",
             meta.len()
         )));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_FILE_BYTES {
-        return Err(Error::rejected(format!(
-            "{rel} is over {MAX_FILE_BYTES} bytes"
-        )));
+    file.take(cap + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(Error::rejected(format!("{rel} is over {cap} bytes")));
     }
     String::from_utf8(bytes).map_err(|_| {
         Error::rejected(format!(
@@ -665,8 +697,8 @@ fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
                 manifest = true;
                 add(dir, &name, text.to_string())?;
             }
-            // CAD-1110: the data-only chat descriptor beside app.md.
-            libc::S_IFREG if text == crate::issue::app_chat::FILE => {
+            // CAD-1110/CAD-1415: the data-only descriptors beside app.md.
+            libc::S_IFREG if app::root_member(text) => {
                 add(dir, &name, text.to_string())?;
             }
             libc::S_IFLNK => {
@@ -813,6 +845,11 @@ fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
                             "bundle entry '{rel}': assets are flat <stem>.svg files"
                         )));
                     }
+                    if top_text == "storage" && !app::bundle_path_ok(&rel) {
+                        return Err(Error::rejected(format!(
+                            "bundle entry '{rel}': storage migrations are flat <tag>.json files"
+                        )));
+                    }
                     add(&sub, &leaf, rel)?;
                 }
                 libc::S_IFDIR => {
@@ -836,4 +873,32 @@ fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
         }
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod ls_remote_exact {
+    //! CAD-1209: `ls-remote <pattern>` matches any ref ENDING in the
+    //! pattern; the resolved commit must come from the exact ref named.
+    use super::pick_ref;
+
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn a_suffix_match_never_stands_in_for_the_named_ref() {
+        let text = format!("{A}\trefs/heads/feature/main\n");
+        assert!(pick_ref(&text, "main").is_err());
+        assert_eq!(pick_ref(&text, "feature/main").unwrap(), A);
+        let both = format!("{A}\trefs/heads/feature/main\n{B}\trefs/heads/main\n");
+        assert_eq!(pick_ref(&both, "main").unwrap(), B);
+    }
+
+    #[test]
+    fn tags_peel_and_an_ambiguous_name_is_refused() {
+        let tag = format!("{A}\trefs/tags/v1\n{B}\trefs/tags/v1^{{}}\n");
+        assert_eq!(pick_ref(&tag, "v1").unwrap(), B);
+        let clash = format!("{A}\trefs/heads/v1\n{B}\trefs/tags/v1\n");
+        assert!(pick_ref(&clash, "v1").is_err());
+        assert_eq!(pick_ref(&format!("{A}\tHEAD\n"), "HEAD").unwrap(), A);
+    }
 }

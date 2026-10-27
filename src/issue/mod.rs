@@ -9,6 +9,7 @@ pub mod app;
 pub mod app_access;
 pub mod app_action;
 pub mod app_assistant;
+pub mod app_campaign_work;
 pub mod app_catalog;
 pub mod app_chat;
 pub mod app_listing;
@@ -19,10 +20,14 @@ pub mod app_view;
 pub mod areas;
 pub mod blocked;
 pub mod board;
+#[cfg(test)]
+mod cad811_screen_startup_acceptance;
 pub mod claim;
 pub mod cli;
+pub mod cloud;
 pub mod context;
 pub mod delivery_policy;
+pub mod delivery_requirements;
 pub mod dispatch;
 pub mod doctor;
 pub mod edit;
@@ -33,16 +38,18 @@ pub mod hooks;
 pub mod idea;
 pub mod line_times;
 pub mod lint;
-mod lockseam;
+pub(crate) mod lockseam;
 pub mod model;
 pub mod notes;
 pub mod parse;
 pub mod plan;
 mod pmlock;
+pub(crate) mod process_use;
 pub mod project;
 pub mod project_new;
 pub mod reclaim;
 pub mod reconcile;
+pub mod recovery;
 pub mod relay;
 pub mod report;
 pub mod retro;
@@ -56,7 +63,7 @@ pub mod work;
 pub mod workflow;
 pub mod write;
 
-pub use pmlock::{LockState, PmLock};
+pub use pmlock::{InterruptionReport, LockState, PmLock};
 
 /// The legacy lock path, kept as the new protocol's fence file.
 const MARKER_LOCK_FILE: &str = ".write.lock";
@@ -67,6 +74,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 
@@ -104,6 +112,26 @@ pub struct PmConfig {
     /// an author's reviews to one reviewer, `never` bars a pair.
     #[serde(default)]
     pub review: crate::delivery::ReviewRules,
+    /// CAD-1218: who may record a merge approval from a remote board.
+    /// Omitted from a fresh pm.yaml, so an operator's own `approvals:`
+    /// block never collides with a written default.
+    #[serde(default, skip_serializing_if = "ApprovalsConfig::is_empty")]
+    pub approvals: ApprovalsConfig,
+}
+
+/// `pm.yaml`'s `approvals:` section (CAD-1218): the tailnet logins the
+/// operator allows to approve a PR head from the board. Absent or empty
+/// means no remote approvals; the loopback board is always allowed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ApprovalsConfig {
+    #[serde(default)]
+    pub tailnet_logins: Vec<String>,
+}
+
+impl ApprovalsConfig {
+    fn is_empty(&self) -> bool {
+        self.tailnet_logins.is_empty()
+    }
 }
 
 /// `pm.yaml`'s `wiki:` section.
@@ -149,6 +177,7 @@ impl Default for PmConfig {
             notes_dir: default_notes_dir(),
             wiki: WikiConfig::default(),
             review: crate::delivery::ReviewRules::default(),
+            approvals: ApprovalsConfig::default(),
         }
     }
 }
@@ -168,6 +197,10 @@ pub struct Pm {
     /// lease's fence trips, and commits carry a `Lease-Epoch:` trailer.
     /// `None` for CLI/local use — nothing there changes.
     lease: Option<crate::lease::PmLease>,
+    /// CAD-1374: canonical human-operation context, set by
+    /// [`Pm::with_activity_receipt`]. When set, each commit carries an
+    /// `Activity-Receipt:` trailer. `None` for every other handle.
+    activity_receipt: Option<serde_json::Value>,
 }
 
 impl Pm {
@@ -188,6 +221,7 @@ impl Pm {
             dir: dir.to_path_buf(),
             config,
             lease: None,
+            activity_receipt: None,
         })
     }
 
@@ -197,6 +231,84 @@ impl Pm {
     /// lease-free.
     pub(crate) fn attach_lease(&mut self, lease: crate::lease::PmLease) {
         self.lease = Some(lease);
+    }
+
+    /// CAD-1374: attach the server-prepared human context for this handle's
+    /// commits. Only the allowlisted canonical fields are stored; a malformed
+    /// context is refused here, before any write.
+    pub(crate) fn with_activity_receipt(mut self, receipt: &serde_json::Value) -> Result<Self> {
+        self.activity_receipt = Some(canonical_receipt(receipt)?);
+        Ok(self)
+    }
+
+    /// CAD-1374: the `Activity-Receipt:` trailer for the staged admitted
+    /// paths. The digest covers the exact staged diff of `rel`, taken before
+    /// the commit; an oversized diff or any serialization failure is an error
+    /// so the commit never happens unrecorded.
+    fn receipt_trailer(&self, rel: &[String]) -> Result<Option<String>> {
+        let Some(context) = &self.activity_receipt else {
+            return Ok(None);
+        };
+        let digest = self.staged_digest(rel)?;
+        let mut receipt = context.clone();
+        let fields = receipt
+            .as_object_mut()
+            .ok_or_else(|| Error::internal("activity receipt is malformed"))?;
+        fields.insert("event_id".into(), uuid::Uuid::new_v4().to_string().into());
+        fields.insert("at".into(), time::now_epoch().into());
+        fields.insert("outcome".into(), "committed".into());
+        fields.insert("digest".into(), digest.into());
+        let line = serde_json::to_string(&receipt)
+            .map_err(|e| Error::internal(format!("activity receipt: {e}")))?;
+        Ok(Some(format!("Activity-Receipt: {line}")))
+    }
+
+    /// CAD-1374: `sha256:<hex>` over the staged admitted diff, streamed in
+    /// fixed chunks so memory is bounded by the buffer, not the diff. Stderr
+    /// is discarded and never echoed. A read or exit failure kills and reaps
+    /// only this child and refuses the commit.
+    fn staged_digest(&self, rel: &[String]) -> Result<String> {
+        use std::io::{ErrorKind, Read};
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(&self.dir)
+            .args(["diff", "--cached", "--binary", "--"])
+            .args(rel)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = crate::reaper::spawn(&mut cmd)
+            .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))?;
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::internal("activity receipt: no staged diff stream"));
+        };
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        let read = loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break Ok(()),
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => break Err(e),
+            }
+        };
+        drop(stdout);
+        if read.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::internal(
+                "activity receipt: staged diff could not be read",
+            ));
+        }
+        let status = child
+            .wait()
+            .map_err(|_| Error::internal("activity receipt: git diff did not exit"))?;
+        if !status.success() {
+            return Err(Error::internal("activity receipt: staged diff failed"));
+        }
+        Ok(format!("sha256:{:x}", hasher.finalize()))
     }
 
     /// The lease gate every tracker write passes: refusal while the
@@ -230,7 +342,7 @@ impl Pm {
         }
         let gitignore = dir.join(".gitignore");
         if !gitignore.exists() {
-            std::fs::write(&gitignore, ".write.lock\n.index/\n")?;
+            std::fs::write(&gitignore, ".write.lock\n.index/\n.cadence/\n")?;
         }
         if !dir.join(".git").exists() {
             git(dir, &["init", "-q"])?;
@@ -249,11 +361,13 @@ impl Pm {
     /// Serialise writers: comments/artifacts are create-only and ids are
     /// allocated under this same lock. A kernel `flock` on a stable file
     /// (see [`pmlock`]); bounded wait. The lock dies with its process.
+    #[track_caller]
     pub fn lock(&self) -> Result<PmLock> {
         self.acquire_default()
     }
 
     /// [`Self::lock`] with a caller-chosen wait.
+    #[track_caller]
     pub fn lock_for(&self, wait: Duration) -> Result<PmLock> {
         self.acquire_for(wait)
     }
@@ -261,8 +375,9 @@ impl Pm {
     /// [`Self::lock`] without the wait: `None` when another writer holds
     /// it. For a caller that must not stall behind a writer (the daemon
     /// under its own lock, CAD-449) and retries later instead.
+    #[track_caller]
     pub fn try_lock(&self) -> Result<Option<PmLock>> {
-        self.acquire(None, None)
+        self.acquire(None, None, false)
     }
 
     /// [`Self::lock`] scoped to `paths`: when a crashed writer left
@@ -273,14 +388,16 @@ impl Pm {
     /// declared paths — use [`Self::commit_scoped`], which enforces
     /// it. `paths` follow [`Self::commit`]'s convention (absolute or
     /// `pm.dir`-relative; outside the tracker is a caller bug).
+    #[track_caller]
     pub fn lock_for_paths(&self, paths: &[PathBuf]) -> Result<PmLock> {
         self.acquire_scoped_default(paths)
     }
 
     /// [`Self::lock_for_paths`] without the wait: `None` when another
     /// writer holds it.
+    #[track_caller]
     pub fn try_lock_for_paths(&self, paths: &[PathBuf]) -> Result<Option<PmLock>> {
-        self.acquire(None, Some(paths))
+        self.acquire(None, Some(paths), false)
     }
 
     /// True when the worktree differs from HEAD.
@@ -433,6 +550,20 @@ impl Pm {
                 foreign_listed(&foreign, foreign_extra)
             )
         };
+        // CAD-1374: the human receipt rides the same commit as the
+        // business change; its digest covers the staged admitted paths.
+        let message = match self.receipt_trailer(&rel) {
+            Ok(Some(trailer)) => {
+                let body = message.trim_end_matches('\n');
+                let joined = body.rsplit('\n').next().is_some_and(|l| l.contains(": "));
+                format!("{body}{}{trailer}\n", if joined { "\n" } else { "\n\n" })
+            }
+            Ok(None) => message,
+            Err(e) => {
+                unstage(&self.dir, &rel);
+                return Err(e);
+            }
+        };
         // CAD-538: the lease epoch rides every commit a leased daemon
         // makes — a reader can order writes across restarts and
         // holdovers. The trailer joins the closing block directly, or
@@ -467,6 +598,17 @@ impl Pm {
         }
         warn_foreign(&self.dir, &foreign, foreign_extra);
         Ok(foreign_out(foreign, foreign_extra))
+    }
+
+    /// The lease epoch this PM's writes carry, when it is leased. A
+    /// recovery commit that cannot go through [`Pm::commit`] still
+    /// names it, so a reader can order its commit against the others
+    /// across a restart or a holdover.
+    pub fn lease_epoch(&self) -> Option<String> {
+        self.lease
+            .as_ref()
+            .and_then(|lease| lease.epoch())
+            .map(|epoch| epoch.to_string())
     }
 
     /// CAD-538 — the tracker half of the SIGTERM flush: commit whatever
@@ -566,8 +708,12 @@ impl Pm {
         }
         let out = String::from_utf8_lossy(&out.stdout);
         let ours: HashSet<&str> = ours.iter().map(String::as_str).collect();
-        let foreign =
-            |p: &str| !ours.contains(p) && p != ".write.lock" && !p.starts_with(".index/");
+        let foreign = |p: &str| {
+            !ours.contains(p)
+                && p != ".write.lock"
+                && !p.starts_with(".index/")
+                && !p.starts_with(".cadence/chat-files/")
+        };
         let mut found = Vec::new();
         let mut extra = 0usize;
         let mut note = |path: &str| {
@@ -899,6 +1045,106 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// CAD-1374: the human-operation actions a receipt may carry (the agreed
+/// 6 issue + 5 wiki canonical names).
+const RECEIPT_ACTIONS: [&str; 11] = [
+    "issue_created",
+    "issue_updated",
+    "issue_link_changed",
+    "issue_ref_added",
+    "issue_comment_added",
+    "issue_artifact_added",
+    "wiki_written",
+    "wiki_blob_uploaded",
+    "wiki_directory_created",
+    "wiki_moved",
+    "wiki_removed",
+];
+const RECEIPT_TEXT_MAX: usize = 256;
+/// Wiki paths allow 4160 bytes at the producer; moves carry two of them.
+const RECEIPT_RESOURCE_MAX: usize = 8192;
+
+/// Select the canonical fields of a server-prepared human context. Any
+/// malformed or unlisted value is refused; no raw payload is kept.
+fn canonical_receipt(raw: &serde_json::Value) -> Result<serde_json::Value> {
+    let malformed = || Error::rejected("activity receipt context is malformed");
+    let obj = raw.as_object().ok_or_else(malformed)?;
+    if obj
+        .get("schema_version")
+        .and_then(serde_json::Value::as_i64)
+        != Some(1)
+    {
+        return Err(malformed());
+    }
+    let text = |v: Option<&serde_json::Value>| -> Result<String> {
+        let s = v
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(malformed)?;
+        if s.is_empty() || s.len() > RECEIPT_TEXT_MAX || s.chars().any(char::is_control) {
+            return Err(malformed());
+        }
+        Ok(s.to_string())
+    };
+    let uuid_field = |v: Option<&serde_json::Value>| -> Result<String> {
+        let s = text(v)?;
+        uuid::Uuid::parse_str(&s)
+            .map(|u| u.to_string())
+            .map_err(|_| malformed())
+    };
+    // causation_id is not inferred from the browser: it must be present and
+    // null (no causing event), and it is emitted as null.
+    if obj.get("causation_id") != Some(&serde_json::Value::Null) {
+        return Err(malformed());
+    }
+    let company = text(obj.get("company"))?;
+    let human = obj
+        .get("human")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(malformed)?;
+    let role = text(human.get("role"))?;
+    if text(human.get("company"))? != company || !matches!(role.as_str(), "operator" | "member") {
+        return Err(malformed());
+    }
+    let resource = obj
+        .get("resource")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| {
+            !s.is_empty() && s.len() <= RECEIPT_RESOURCE_MAX && !s.chars().any(char::is_control)
+        })
+        .ok_or_else(malformed)?
+        .to_string();
+    let action = text(obj.get("action"))?;
+    if !RECEIPT_ACTIONS.contains(&action.as_str()) {
+        return Err(malformed());
+    }
+    let mut human_out = serde_json::json!({
+        "company": company,
+        "sub": text(human.get("sub"))?,
+        "session": text(human.get("session"))?,
+        "role": role,
+    });
+    // Optional display name: kept only when safe, otherwise omitted.
+    if let Some(display) = human.get("display").and_then(serde_json::Value::as_str) {
+        if !display.is_empty()
+            && display.len() <= RECEIPT_TEXT_MAX
+            && !display.chars().any(char::is_control)
+        {
+            human_out["display"] = display.into();
+        }
+    }
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "company": company,
+        "human": human_out,
+        "action": action,
+        "resource": resource,
+        "reason": text(obj.get("reason"))?,
+        "request_id": uuid_field(obj.get("request_id"))?,
+        "correlation_id": uuid_field(obj.get("correlation_id"))?,
+        "causation_id": serde_json::Value::Null,
+    }))
+}
+
 const README: &str = "# ~/pm — the cadence board\n\n\
 One folder per issue: `<project>/<ID>/issue.md` + `comments/` + `artifacts/`.\n\
 Paths never encode title, status or parent. Issues are never deleted — set\n\
@@ -925,6 +1171,30 @@ Paths never encode title, status or parent. Issues are never deleted — set\n\
 #[cfg(test)]
 mod lock_tests;
 
+#[cfg(test)]
+#[path = "cad1177_tools_acceptance.rs"]
+mod cad1177_tools_acceptance;
+
+#[cfg(test)]
+mod cad1298_acceptance;
+
+#[cfg(test)]
+mod cad1298_readiness_acceptance;
+
+#[cfg(test)]
+mod cad1314_acceptance;
+
+#[cfg(test)]
+mod cad1793_acceptance;
+
+#[cfg(test)]
+#[path = "cad1270_screen_decl_acceptance.rs"]
+mod cad1270_screen_decl_acceptance;
+
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) fn set_lock_waiting_observer_for_test(sender: Option<std::sync::mpsc::Sender<()>>) {
+    pmlock::WAITING.with(|observer| *observer.borrow_mut() = sender);
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,24 @@
+{
+  "input": {
+    "v": 1,
+    "op": "issue.validate",
+    "input": {
+      "tags": [
+        "Bad"
+      ]
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "issue.validate",
+    "value": {
+      "valid": false,
+      "refusals": [
+        {
+          "field": "tags",
+          "message": "Invalid tag 'Bad' \u2014 1-32 lowercase letters, digits or hyphens, not starting with a hyphen"
+        }
+      ]
+    }
+  }
+}

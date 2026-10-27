@@ -43,9 +43,11 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } =
   require("react-dom/client") as typeof import("react-dom/client");
+const { seatStatus } = require("../src/features/agents/SeatCard") as typeof import("../src/features/agents/SeatCard");
 const Agents = (
   require("../src/features/agents/Agents") as typeof import("../src/features/agents/Agents")
 ).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 type Agent = import("../src/lib/types").Agent;
 type AgentDetail = import("../src/lib/types").AgentDetail;
 type IssueCard = import("../src/lib/types").IssueCard;
@@ -56,6 +58,8 @@ const base: Agent = {
   role: "Developer",
   state: "idle",
   group: "pm",
+  group_root: false,
+  tasks: [],
   running: 0,
   queued: 0,
   unknown: 0,
@@ -63,6 +67,7 @@ const base: Agent = {
   fenced: false,
   on: [],
 };
+const fresh = { by_issue: {}, refresh_error: false, snapshot_age_secs: 0, stale: false };
 const agents: Agent[] = [
   {
     ...base,
@@ -78,6 +83,7 @@ const agents: Agent[] = [
         title: "Account settings",
         task_state: "running",
         job: "j12",
+        job_state: "running",
       },
     ],
   },
@@ -150,7 +156,7 @@ globalThis.fetch = async (input, init) => {
       tasks: tasks?.map((t) => t.task),
       enabled: true,
       session_id: `session-${alias}`,
-    },
+    } as AgentDetail["agent"],
     queued: a.queued,
     unknown: a.unknown,
     running: [],
@@ -177,13 +183,13 @@ const loaded = <T>(data: T): import("../src/lib/cache").ResourceState<T> => ({
   asOf: Date.now(),
   inFlight: false,
 });
-let project = "all";
 let open: string | null = null;
-let openedIssue: string | null = null;
-let assignmentRetries = 0;
+let tab: import("../src/features/agents/agentTabModel").AgentTab = "overview";
+let recruiting = false;
 let state = loaded<import("../src/lib/types").AgentsPayload>({
   daemon: "reachable",
   agents,
+  ...fresh,
   totals: null,
 });
 let issueState = loaded(issues);
@@ -195,22 +201,28 @@ const flush = async () => {
 async function render() {
   await React.act(() =>
     root.render(
-      React.createElement(Agents, {
+      React.createElement(LocaleProvider, null, React.createElement(Agents, {
         state,
         issues: issueState,
-        project,
         open,
+        tab,
+        recruit: recruiting,
+        ask: false,
+        onAsk: () => {},
         onOpenAgent: (alias) => {
           open = alias;
+          tab = "overview";
         },
-        onOpenIssue: (id) => {
-          openedIssue = id;
+        onTab: (next) => {
+          tab = next;
         },
+        onRecruit: (on) => {
+          recruiting = on;
+        },
+        onOpenIssue: () => {},
         onRetry: () => {},
-        onRetryAssignments: () => {
-          assignmentRetries += 1;
-        },
-      }),
+
+      })),
     ),
   );
   await flush();
@@ -228,7 +240,7 @@ async function click(label: string) {
   await flush();
 }
 function aliases() {
-  return Array.from(host.querySelectorAll(".agents-table .agent-name")).map(
+  return Array.from(host.querySelectorAll(".rc-seats .rc-seat .t")).map(
     (b) => b.textContent,
   );
 }
@@ -250,25 +262,38 @@ async function main() {
     button("Current4").getAttribute("aria-pressed") === "true",
     "Current is the default when the roster contains stopped agents and mailboxes",
   );
-  assert(aliases().join() === "blocked,owner,dev,foreign", "current agents are attention-first without stopped agents or mailboxes");
-  assert(host.textContent?.includes("28 Sep 02:21"), "numeric epoch activity is shown as a date");
   assert(
-    Array.from(host.querySelectorAll(".agents-table tr")).find((row) => row.textContent?.includes("owner"))?.textContent?.includes("No activity recorded"),
-    "invalid activity remains unavailable",
+    aliases().join() === "blocked,owner,dev,foreign",
+    "current agents list attention first, then working, in one flat grid",
+  );
+  // CAD-1772: a plain Idle is grey; the master reads Ready (green) and always leads the roster.
+  assert(seatStatus({ ...base, alias: "idler" }, (x: string) => x).tone === "ink", "plain Idle is the ink tone");
+  assert(seatStatus({ ...base, alias: "master" }, (x: string) => x).text === "Ready", "the master at rest is Ready");
+  state = loaded({ daemon: "reachable", agents: [...agents, { ...base, alias: "master" }], totals: null, ...fresh });
+  await render();
+  assert(aliases()[0] === "master", "the master is always the first seat");
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
+  await render();
+  // CAD-1772: compact seat cards, no stat tiles, no project scope.
+  assert(host.querySelectorAll(".agents-triage-cell").length === 0, "the five stat tiles are gone");
+  assert(host.querySelector(".ag-toolbar .ag-seg") && host.querySelector(".ag-toolbar .ag-search"), "one compact toolbar row");
+  assert(!Array.from(host.querySelectorAll("button")).some((b) => b.textContent?.trim() === "Message"), "seat cards carry no inline Message button");
+  assert(
+    Array.from(host.querySelectorAll(".rc-seat")).find((row) => row.textContent?.includes("owner"))?.textContent?.includes("1 queued"),
+    "the queue rides the status row as the one small badge",
+  );
+  assert(
+    Array.from(host.querySelectorAll(".rc-seat")).find((row) => row.textContent?.includes("dev"))?.textContent?.includes("Working on DEMO-12"),
+    "a working seat names its issue in the one-line status",
+  );
+  assert(
+    Array.from(host.querySelectorAll(".rc-seat")).find((row) => row.textContent?.includes("blocked"))?.textContent?.includes("Attention"),
+    "a fenced seat reads Attention in its status line",
   );
   await click("All6");
   assert(aliases().length === 6, "All keeps stopped workers and mailboxes discoverable");
   await click("Stopped1");
   assert(aliases().join() === "stopped", "stopped agents have an explicit view");
-  await click("Current4");
-  assert(
-    !host.querySelector("[role='button']"),
-    "cards do not wrap nested issue controls in simulated buttons",
-  );
-  assert(
-    host.querySelectorAll(".agents-table th[scope='col']").length === 5,
-    "five semantic columns",
-  );
   await click("Needs attention2");
   assert(
     aliases().join() === "blocked,owner",
@@ -279,7 +304,7 @@ async function main() {
     aliases().join() === "inbox",
     "840 inbox messages do not count as working",
   );
-  await click("Clear filters");
+  await click("Current4");
   await search("SETTINGS");
   assert(aliases().join() === "dev", "task search is case insensitive");
   await search("does not exist");
@@ -287,36 +312,17 @@ async function main() {
     host.textContent?.includes("No agents match these filters."),
     "no match copy is explicit",
   );
-  await click("Clear filters");
-  project = "demo";
+  await search("");
+  // Agents are the team's, not a project's: a project in the URL state does not filter them.
   await render();
-  assert(
-    aliases().join() === "owner,dev",
-    "project keeps exact dispatch and active ownership only",
-  );
-  assert(button("All2"), "counts reflect scoped agents");
-  await click("Working1");
-  assert(
-    aliases().join() === "dev",
-    "state filter cannot leak foreign-project work",
-  );
-  await click("Clear filters");
-  await React.act(() =>
-    host.querySelector<HTMLButtonElement>(".agents-table .lnk")!.click(),
-  );
-  assert(
-    openedIssue === "DEMO-13" && open === null,
-    "issue opens without opening the agent",
-  );
-  project = "all";
-  await render();
-  const trigger = button("Open agent blocked");
-  trigger.focus();
+  assert(aliases().length === 4, "the roster lists the team regardless of project");
+  await click("All6");
   await click("Open agent blocked");
   await render();
   assert(
-    host.querySelector("dialog[open][aria-labelledby='agent-detail-title']"),
-    "native labeled modal opens",
+    host.querySelector("main.agents-page h1")?.textContent === "blocked" &&
+      host.querySelector("[role='tablist']"),
+    "the agent page opens at its alias with its tabs",
   );
   assert(
     host
@@ -324,7 +330,9 @@ async function main() {
       ?.textContent?.includes("Detail unavailable"),
     "detail failure is explicit",
   );
-  const text = host.querySelector("dialog")!.textContent!;
+  tab = "settings";
+  await render();
+  const text = host.querySelector("main.agents-page")!.textContent!;
   for (const evidence of [
     agents[1].recovery!,
     agents[1].resume!,
@@ -347,20 +355,20 @@ async function main() {
   failDetail = false;
   await click("Retry details");
   assert(
-    host.querySelector("dialog")?.textContent?.includes("session-blocked") &&
+    host.querySelector("main.agents-page")?.textContent?.includes("session-blocked") &&
       !host.querySelector("[role='alert']"),
     "retry replaces failure with details",
   );
   await React.act(() =>
-    host
-      .querySelector("dialog")!
-      .dispatchEvent(new Event("cancel", { cancelable: true })),
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    ),
   );
-  assert(open === null, "native Escape cancel invokes close");
+  assert(open === null, "Escape leaves the agent page");
   await render();
   assert(
-    document.activeElement === trigger,
-    "closing returns focus to opening control",
+    button("Open agent blocked") && host.querySelector(".rc-seats"),
+    "leaving the page returns to the roster",
   );
   holdDetail = true;
   await click("Open agent dev");
@@ -372,37 +380,32 @@ async function main() {
     "detail loading is announced",
   );
   open = "stopped";
+  tab = "settings";
   holdDetail = false;
   await render();
   assert(
-    host.querySelector("dialog h2")?.textContent === "stopped",
-    "switching alias resets drawer identity",
+    host.querySelector("main.agents-page h1")?.textContent === "stopped",
+    "switching alias resets the page identity",
   );
   await React.act(async () => releaseDetail!());
   await flush();
   assert(
-    host.querySelector("dialog")?.textContent?.includes("session-stopped") &&
-      !host.querySelector("dialog")?.textContent?.includes("session-dev"),
+    host.querySelector("main.agents-page")?.textContent?.includes("session-stopped") &&
+      !host.querySelector("main.agents-page")?.textContent?.includes("session-dev"),
     "late old detail cannot cross into another alias",
   );
   open = null;
   state = { ...state, status: "stale", error: "Refresh unavailable" };
   await render();
+  await click("Current4");
   assert(
     host.textContent?.includes("stale") && aliases().length === 4,
     "stale payload stays visible",
   );
-  state = loaded({ daemon: "reachable", agents: [agents[3], agents[4]], totals: null });
+  state = loaded({ daemon: "reachable", agents: [agents[3], agents[4]], totals: null, ...fresh });
   await render();
   assert(host.textContent?.includes("No current agents") && aliases().length === 0, "only stopped agents and mailboxes yield a clear current-view empty state");
-  state = loaded({ daemon: "reachable", agents, totals: null });
-  project = "empty-project";
-  await render();
-  assert(
-    !host.textContent?.includes("No agents match these filters."),
-    "empty project differs from no filter match",
-  );
-  project = "demo";
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
   issueState = {
     ...issueState,
     data: null,
@@ -411,31 +414,8 @@ async function main() {
   };
   await render();
   assert(
-    aliases().length === 0 &&
-      host.textContent?.includes("assignments could not be loaded") &&
-      host.textContent?.includes("Assignments unavailable") &&
-      !host.textContent?.includes("No agents bound") &&
-      !host.textContent?.includes("0 in demo") &&
-      !host.querySelector(".agents-tools, .agents-unassigned"),
-    "missing issue index does not guess projects or claim agents are unassigned",
-  );
-  await click("Retry assignments");
-  assert(
-    assignmentRetries === 1,
-    "assignment retry invokes the issue dependency refresh",
-  );
-  issueState = { ...issueState, status: "loading", inFlight: true };
-  await render();
-  assert(
-    host.textContent?.includes("Loading assignments…") &&
-      !host.querySelector(".agents-tools"),
-    "loading assignments does not expose zero counts",
-  );
-  project = "all";
-  await render();
-  assert(
-    aliases().length === 4,
-    "All projects still works without the assignment index",
+    aliases().length === 4 && !host.textContent?.includes("assignments could not be loaded"),
+    "a missing issue index never hides the team: agents are not project-scoped",
   );
   state = { ...state, data: null, status: "loading" };
   await render();

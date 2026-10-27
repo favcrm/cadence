@@ -11,6 +11,38 @@ use super::plans::{Job, Task};
 use super::StoreConn;
 use super::{now, Store};
 
+/// Fallback detail when an unknown fence has no provider account.
+pub(crate) const UNKNOWN_GENERIC_REASON: &str = "Uncertain provider outcome requires review";
+
+/// First sentence of an unknown-outcome hint: look before reconciling.
+pub fn unknown_inspect_lead() -> &'static str {
+    "Inspect the uncertain message and its side effects before reconciling. \
+     A missed render observation does not prove the delivery did not happen."
+}
+
+/// What reconciliation is, and how CLI unfence behaves. No command chain:
+/// CLI unfence already resumes, and dispatch is not authorized here.
+pub fn unknown_recovery_note() -> &'static str {
+    "Reconciliation is an explicit operator decision, not an automatic \
+     interrupted or completed result. The CLI unfence command resumes by \
+     default; do not follow it with a second resume. Pass --no-resume to \
+     reconcile without resuming."
+}
+
+/// CAD-1380 R4: the constant next-action instruction carried by an assist
+/// intent. No member text; the drain delivers it verbatim.
+const ASSIST_NEXT_ACTION: &str =
+    "Review the job's current state and report next steps through the normal worker path.";
+
+/// One recipient of an assist intent before it is written as a payload.
+struct AssistTarget {
+    target: &'static str,
+    alias: Option<String>,
+    org: Option<String>,
+    sub: Option<String>,
+    assistant_id: Option<String>,
+}
+
 pub(super) const UNKNOWN_EVENT_REASON_CHARS: usize = 512;
 
 /// Keep the provider's uncertainty account useful to an operator without
@@ -25,7 +57,7 @@ pub(super) fn unknown_event_reason(error: Option<&str>, result: &Value) -> Strin
                 .and_then(Value::as_str)
                 .filter(|value| !value.trim().is_empty())
         })
-        .unwrap_or(crate::daemon::UNKNOWN_GENERIC_REASON);
+        .unwrap_or(UNKNOWN_GENERIC_REASON);
     let flat: String = reason
         .chars()
         .map(|character| {
@@ -38,7 +70,7 @@ pub(super) fn unknown_event_reason(error: Option<&str>, result: &Value) -> Strin
         .collect();
     let words: Vec<&str> = flat.split_whitespace().collect();
     if words.is_empty() {
-        return crate::daemon::UNKNOWN_GENERIC_REASON.to_string();
+        return UNKNOWN_GENERIC_REASON.to_string();
     }
     let redacted = crate::doctor::host::redact_argv(&words);
     if redacted.chars().count() <= UNKNOWN_EVENT_REASON_CHARS {
@@ -52,8 +84,8 @@ pub(super) fn unknown_event_reason(error: Option<&str>, result: &Value) -> Strin
 fn unknown_event_action(message_id: &str) -> String {
     format!(
         "{} {} Review message {message_id} before choosing an explicit reconcile status.",
-        crate::daemon::unknown_inspect_lead(),
-        crate::daemon::unknown_recovery_note(),
+        unknown_inspect_lead(),
+        unknown_recovery_note(),
     )
 }
 
@@ -561,9 +593,21 @@ impl Store {
             + &payload.to_string()
             + &pointer;
         tx.execute(
-            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
-             VALUES(?,?,?,NULL,'worker_result',?,?)",
-            params![delivery, target, prompt, message.task_id, now()],
+            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created,
+                                  sender_uid,recipient_uid,sender,recipient,origin)
+             VALUES(?,?,?,NULL,'worker_result',?,?,?,?,?,?,?)",
+            params![
+                delivery,
+                target,
+                prompt,
+                message.task_id,
+                now(),
+                self.agent_uid_of_in(tx, &message.alias)?,
+                recipient.uid,
+                message.alias,
+                recipient.alias,
+                message.id
+            ],
         )?;
         Self::event(
             tx,
@@ -710,9 +754,21 @@ impl Store {
             }
         } + &pointer;
         tx.execute(
-            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
-             VALUES(?,?,?,NULL,'worker_notice',?,?)",
-            params![delivery, target, prompt, message.task_id, now()],
+            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created,
+                                  sender_uid,recipient_uid,sender,recipient,origin)
+             VALUES(?,?,?,NULL,'worker_notice',?,?,?,?,?,?,?)",
+            params![
+                delivery,
+                target,
+                prompt,
+                message.task_id,
+                now(),
+                self.agent_uid_of_in(tx, &message.alias)?,
+                self.agent_uid_of_in(tx, target)?,
+                message.alias,
+                recipient.alias,
+                message.id
+            ],
         )?;
         Self::event(
             tx,
@@ -780,6 +836,24 @@ impl Store {
              shows the full record.",
             clipped.join(", ")
         ))
+    }
+
+    /// CAD-1142: true when the alias fences on an app-owned
+    /// (`app_run_dispatch`) unknown — the fence's public text must be
+    /// the bounded class, never the operator-private provider account
+    /// `preferred_unknown_error` would restamp.
+    pub fn has_app_unknown(&self, alias: &str) -> Result<bool> {
+        self.read_tx(|conn| {
+            let count: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL} \
+                     AND source='app_run_dispatch'"
+                ),
+                [alias],
+                |r| r.get(0),
+            )?;
+            Ok(count > 0)
+        })
     }
 
     /// True when the alias has an `unknown` in-flight attempt that must be
@@ -886,6 +960,18 @@ impl Store {
                     "Message '{message_id}' is '{}', not unknown — only an unknown \
                              message can be reconciled",
                     message.state
+                )));
+            }
+            let agent = self.agent_in(&tx, &message.alias)?;
+            if message.source == "job_dispatch"
+                && agent.provider == "sandbox"
+                && agent.endpoint_kind == "sandbox"
+            {
+                return Err(Error::rejected(format!(
+                    "Message '{message_id}' is cloud sandbox work — run \
+                     `cadence agent stop {}` and let the poller stop/reconcile the \
+                     remote; a local reconcile would release an unproven writer",
+                    message.alias
                 )));
             }
             let result = json!({
@@ -1040,6 +1126,13 @@ impl Store {
         {
             return Ok(false);
         }
+        // CAD-1380 R4: an assist-bound job routes ONLY through inert
+        // canonical intents, never the legacy PM queue below. The PM of an
+        // assist job is the assistant, so the legacy path would bypass the
+        // live jobs-scope proof the drain requires.
+        if self.assist_intents_for_transition(tx, job, task, new_state, dedupe)? {
+            return Ok(true);
+        }
         let recipient = self.agent_opt_in(tx, &job.pm_alias)?;
         let Some(recipient) = recipient else {
             self.handoff_unresolved(
@@ -1055,13 +1148,36 @@ impl Store {
             )?;
             return Ok(false);
         };
+        if recipient.archived_at.is_some() {
+            self.handoff_unresolved(
+                tx,
+                Some(&task.id),
+                &job.pm_alias,
+                &delivery,
+                "job_event",
+                &delivery,
+                "recipient_archived",
+                None,
+                None,
+            )?;
+            return Ok(false);
+        }
         let payload = json!({"job": job.id, "task": task.id,
                              "revision": task.revision, "state": new_state});
         let body = format!("Cadence job {}: {note} {payload}", job.id);
         tx.execute(
-            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
-             VALUES(?,?,?,NULL,'job_event',?,?)",
-            params![delivery, job.pm_alias, body, task.id, now()],
+            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created,
+                                  recipient_uid,recipient,sender)
+             VALUES(?,?,?,NULL,'job_event',?,?,?,?,'daemon')",
+            params![
+                delivery,
+                job.pm_alias,
+                body,
+                task.id,
+                now(),
+                recipient.uid,
+                recipient.alias
+            ],
         )?;
         Self::event_scoped(
             tx,
@@ -1075,6 +1191,119 @@ impl Store {
             Some(&job.id),
             Some(&task.id),
         )?;
+        // CAD-810 (additive): when the job has a `job:<id>` topic, its members
+        // also get this event as a turnless topic notice, in this transaction.
+        // The PM notify above is unchanged; a job without a topic is untouched.
+        self.job_topic_fanout_in(tx, job, &delivery, &body)?;
+        Ok(true)
+    }
+
+    /// CAD-1380 R4: write one inert `assist_intent` event per recipient for
+    /// an assist-bound job's transition, in the caller's transaction. Returns
+    /// `false` when the job has no `assist_requests` ledger (ordinary routing
+    /// proceeds unchanged). Metadata only: job/task/revision/state and a
+    /// constant next-action note. No member title, body, acceptance or raw
+    /// verdict text. Targets: the Master (metadata only), the REVISE author
+    /// (`new_state == "revising"`, only the actual assignee), and every
+    /// `job_subscribers` row (owner included). No alias is fabricated. The
+    /// live eligibility check happens in the guarded drain, not here.
+    pub(crate) fn assist_intents_for_transition(
+        &self,
+        tx: &impl super::StoreConn,
+        job: &Job,
+        task: &Task,
+        new_state: &str,
+        dedupe: &str,
+    ) -> Result<bool> {
+        let bound: bool = tx
+            .query_row(
+                "SELECT 1 FROM assist_requests WHERE job=? LIMIT 1",
+                [job.id.as_str()],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !bound {
+            return Ok(false);
+        }
+        let mut targets: Vec<AssistTarget> = vec![AssistTarget {
+            target: "master",
+            alias: Some(crate::master::ALIAS.to_string()),
+            org: None,
+            sub: None,
+            assistant_id: None,
+        }];
+        if new_state == "revising" {
+            if let Some(assignee) = task.assignee.clone() {
+                targets.push(AssistTarget {
+                    target: "author",
+                    alias: Some(assignee),
+                    org: None,
+                    sub: None,
+                    assistant_id: None,
+                });
+            }
+        }
+        let subs: Vec<(String, String, String)> = tx.query_vec(
+            "SELECT org, sub, assistant_id FROM job_subscribers WHERE job=? ORDER BY created",
+            [job.id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        for (org, sub, assistant_id) in subs {
+            targets.push(AssistTarget {
+                target: "subscriber",
+                alias: None,
+                org: Some(org),
+                sub: Some(sub),
+                assistant_id: Some(assistant_id),
+            });
+        }
+        for AssistTarget {
+            target,
+            alias,
+            org,
+            sub,
+            assistant_id,
+        } in targets
+        {
+            let key_src = format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                job.id,
+                task.id,
+                task.revision,
+                new_state,
+                dedupe,
+                target,
+                alias.as_deref().unwrap_or(""),
+                org.as_deref().unwrap_or(""),
+                sub.as_deref().unwrap_or(""),
+                assistant_id.as_deref().unwrap_or(""),
+            );
+            let key = crate::operator_auth::digest(&key_src);
+            let payload = json!({
+                "key": key,
+                "status": "pending",
+                "job": job.id,
+                "task": task.id,
+                "revision": task.revision,
+                "state": new_state,
+                "dedupe": dedupe,
+                "target": target,
+                "alias": alias,
+                "org": org,
+                "sub": sub,
+                "assistant_id": assistant_id,
+                "note": ASSIST_NEXT_ACTION,
+            });
+            tx.execute(
+                "INSERT INTO events(alias,kind,payload,job_id,task_id,at)
+                 SELECT 'daemon','assist_intent',?,?,?,?
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM events WHERE kind='assist_intent'
+                   AND json_extract(payload,'$.key')=?)",
+                params![payload.to_string(), job.id, task.id, now(), key],
+            )?;
+        }
         Ok(true)
     }
 

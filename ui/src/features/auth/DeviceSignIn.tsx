@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { describeRefusal, nextDelaySecs, safeVerificationHref, startDelaySecs } from "./deviceFlow";
 import { pollDeviceSignIn, startDeviceSignIn } from "./session";
 import type { DeviceDisplay } from "./session";
+import { useTranslate } from "../../lib/locale";
 
 type Phase =
   | { kind: "idle" }
@@ -15,6 +16,7 @@ type Phase =
  * feeds the poll calls.
  */
 export default function DeviceSignIn({ onSignedIn }: { onSignedIn: () => void }) {
+  const t = useTranslate();
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const alive = useRef(true);
@@ -36,7 +38,7 @@ export default function DeviceSignIn({ onSignedIn }: { onSignedIn: () => void })
   const poll = (pendingId: string, delaySecs: number, deadline: number) => {
     if (!alive.current) return;
     if (Date.now() >= deadline) {
-      setPhase({ kind: "failed", reason: "The grant expired — start again." });
+      setPhase({ kind: "failed", reason: t("The grant expired — start again.") });
       return;
     }
     timer.current = setTimeout(() => {
@@ -55,8 +57,8 @@ export default function DeviceSignIn({ onSignedIn }: { onSignedIn: () => void })
             kind: "failed",
             reason:
               outcome.kind === "denied"
-                ? "The approval was denied on AgenticOS."
-                : "The grant expired — start again.",
+                ? t("The approval was denied on AgenticOS.")
+                : t("The grant expired — start again."),
           });
         })
         .catch((err: unknown) => {
@@ -85,7 +87,7 @@ export default function DeviceSignIn({ onSignedIn }: { onSignedIn: () => void })
         onClick={begin}
         className="chip bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
       >
-        Sign in with AgenticOS
+        {t("Sign in with AgenticOS")}
       </button>
     );
   }
@@ -100,7 +102,7 @@ export default function DeviceSignIn({ onSignedIn }: { onSignedIn: () => void })
           onClick={begin}
           className="chip bg-accent/10 text-accent hover:bg-accent/20 transition-colors mt-2"
         >
-          Start again
+          {t("Start again")}
         </button>
       </div>
     );
@@ -109,7 +111,7 @@ export default function DeviceSignIn({ onSignedIn }: { onSignedIn: () => void })
   const href = safeVerificationHref(display);
   return (
     <div>
-      <p className="text-label text-ink-400 mb-1">Enter this code on AgenticOS:</p>
+      <p className="text-label text-ink-400 mb-1">{t("Enter this code on AgenticOS:")}</p>
       <p className="num text-lg text-ink-100 select-all">{display.user_code}</p>
       {href ? (
         <a
@@ -118,15 +120,15 @@ export default function DeviceSignIn({ onSignedIn }: { onSignedIn: () => void })
           rel="noopener noreferrer"
           className="text-label text-accent hover:underline inline-block mt-1"
         >
-          Open AgenticOS approval
+          {t("Open AgenticOS approval")}
         </a>
       ) : (
         <p className="text-label text-warn mt-1" aria-live="polite">
-          The issuer sent no usable approval link — enter the code there manually.
+          {t("The issuer sent no usable approval link — enter the code there manually.")}
         </p>
       )}
       <p className="text-label text-ink-400 mt-2" aria-live="polite">
-        Waiting for approval…
+        {t("Waiting for approval…")}
       </p>
     </div>
   );

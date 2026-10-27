@@ -2,12 +2,12 @@
 //! (tiny_http, no async runtime — the daemon is plain threads too)
 //! serving the built SPA plus a JSON API on loopback.
 //!
-//! Reads need no auth; operator authority is a session (CAD-313, ADR
-//! 0004): a `cadence ui login` link exchanged for an HttpOnly cookie plus
-//! a page-held `X-Cadence-Session` key, both of which the daemon checks
-//! on every operator write — [`operator`] says exactly who
-//! is trusted as the operator, and no relay, header or missing pane tie
-//! ever is. The rest is containment: loopback bind, no CORS headers, a
+//! Private reads require a live session; unsigned local browsing is an
+//! explicit persisted policy. Operator authority is a session (CAD-313,
+//! ADR 0004): a `cadence ui login` link exchanged for an HttpOnly cookie
+//! plus a tab-held `X-Cadence-Session` key, checked by the daemon.
+//! [`operator`] defines the stronger caller proof used for writes.
+//! The rest is containment: loopback bind, no CORS headers, a
 //! Host allowlist against DNS rebinding, id grammar checked before any
 //! path is touched, and no file reads outside the PM dir or `--dist`.
 //! Writes are I2: POST/PATCH/DELETE routes must pass four cross-site
@@ -19,19 +19,14 @@
 //! daemon, so the browser cannot become a curator by reaching this route.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::proc::{self, BoundedError};
 
 mod app_assistant;
 mod app_audiences;
@@ -39,34 +34,66 @@ mod app_chat;
 mod app_content;
 mod app_contexts;
 mod app_explorer;
+mod app_media;
 mod app_records;
 mod app_release;
 mod app_runs;
 mod app_screens;
+mod app_social_drafts;
+mod approvals;
 mod apps;
+mod artifacts;
+mod assist_route;
+#[cfg(test)]
+mod board_api_golden;
+mod business_templates;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1337_acceptance;
 mod cli_route;
+#[cfg(all(test, feature = "cli-runtime-test"))]
+pub(crate) use cli_route::prime_jwks_for_test as prime_cli_jwks_for_test;
 mod connections;
 mod crm_send;
 mod crm_smtp;
 pub mod delivery_sync;
+mod endpoints;
 mod home;
+mod human_threads;
 mod lane;
+mod lifecycle;
+mod locale;
 mod login;
+mod member_assist;
+mod member_view;
+mod my_work;
+mod notify_service;
 mod operator;
 mod platform_account;
+mod project_policy;
+pub(crate) mod public_directory;
 mod read_model;
 mod serve;
 mod setup;
 mod social_publish;
 mod stages;
 mod stream;
+mod tailscale;
 mod tailscale_serve;
+#[cfg(all(test, feature = "test-seam"))]
+mod team_assistants_http_refusal;
 mod threads;
+mod topics;
 mod updates;
+mod whatsapp;
 mod wiki;
+mod wiki_envelope;
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) use wiki_envelope::prime_jwks_for_test;
+mod work_conversations;
 mod workflows;
 mod write_path;
 
+pub(crate) use operator::{public_scheme, PUBLIC_COOKIE};
 pub use operator::{route_class, RouteClass, WriteRoute, WRITE_ROUTES};
 pub use serve::serve;
 pub use setup::{read_model_stats, setup_runs};
@@ -74,13 +101,23 @@ pub use setup::{read_model_stats, setup_runs};
 // Re-export the moved sections' shared items so the sibling submodules'
 // `use super::{…}` and the tests' `super::` keep resolving — the public
 // surface of `crate::ui` is unchanged by the split.
+#[cfg(test)]
+pub(crate) use lifecycle::{
+    board_argv_state_dir, pid_file, reap_unready_child, startup_bind_in_use,
+};
+pub use lifecycle::{detached_pid, START_BUDGET_ENV, START_BUDGET_RESTART};
+pub(crate) use lifecycle::{
+    http_get, is_cadence_exe_name, ready_file, start_quiet, startup_failed_file, READY_NONCE_ENV,
+    START_REMAINING_ENV,
+};
 pub(crate) use serve::{
-    agents_payload_from, board_job_list, err_response, json_response, pct_decode,
+    agents_payload_typed, board_job_list, err_response, json_response, pct_decode,
 };
 pub(crate) use stream::{dir_mtime, event_resources, projects_payload, value_fp};
+pub(crate) use tailscale::{ts, ts_self, ts_start_quiet};
 pub(crate) use write_path::{
     agent_roots, busy_response, coded_response, guard_fail, header_value, issue_payloads,
-    parse_json, proxied_actor, read_body, tailnet_proxy, with_agents, write_err, write_guard,
+    parse_json, parse_multipart, proxied_actor, read_body, tailnet_proxy, write_err, write_guard,
     write_reply, HttpResp, JSON_CAP, UI_ACTOR,
 };
 
@@ -107,12 +144,19 @@ pub struct UiFlags {
     /// `https://<name>.ts.net:9450` for a tailnet-shared board.
     #[arg(long = "allow-origin")]
     pub allow_origins: Vec<String>,
-    /// Refuse every write route with 403; the SPA hides edit controls.
+    /// Refuse workspace writes with 403; sign-in remains available.
     #[arg(long, overrides_with = "no_read_only")]
     pub read_only: bool,
     /// Clear a persisted --read-only.
     #[arg(long, overrides_with = "read_only")]
     pub no_read_only: bool,
+    /// Allow unsigned reads on local boards. Writes still require their
+    /// normal session and caller proof; hosted boards never allow this.
+    #[arg(long, overrides_with = "no_allow_anonymous_reads")]
+    pub allow_anonymous_reads: bool,
+    /// Clear a persisted --allow-anonymous-reads.
+    #[arg(long, overrides_with = "allow_anonymous_reads")]
+    pub no_allow_anonymous_reads: bool,
     /// Hosted board: accept protected traffic only on the configured
     /// AgenticOS public Host. `CADENCE_BOARD_PUBLIC_ONLY=1` also enables
     /// this during `cadence setup`; the choice persists in ui.json.
@@ -207,8 +251,8 @@ pub enum UiAction {
     },
     /// Report UI server health and the persisted options.
     Status,
-    /// Print a single-use sign-in link for the board (CAD-313). Board
-    /// writes need the operator's session; this link opens one. Run it
+    /// Print a single-use sign-in link for the board (CAD-313). Private
+    /// reads and operator writes need a session; this link opens one. Run it
     /// from your own shell — agents are refused. The link is valid for
     /// 2 minutes and one browser; the secret it proves never leaves the
     /// state dir.
@@ -296,7 +340,7 @@ pub enum TailscaleAction {
         /// Tailscale https port [default: 9450].
         #[arg(long, default_value_t = 9450)]
         port: u16,
-        /// Make every write route answer 403 — browse-only sharing.
+        /// Refuse workspace writes while retaining sign-in and sign-out.
         #[arg(long)]
         read_only: bool,
     },
@@ -310,23 +354,23 @@ pub enum TailscaleAction {
 /// `cadence ui …`
 pub fn run_cli(state_dir: &Path, action: &UiAction) -> Result<i32> {
     match action {
-        UiAction::Run { flags } => run(state_dir, flags),
+        UiAction::Run { flags } => lifecycle::run(state_dir, flags),
         UiAction::Start {
             flags,
             reset,
             as_identity,
         } => {
             delegate_ui_gate(state_dir, as_identity.as_deref(), "ui_start")?;
-            start(state_dir, flags, *reset)
+            lifecycle::start(state_dir, flags, *reset)
         }
         UiAction::Stop {
             tailscale_off,
             as_identity,
         } => {
             delegate_ui_gate(state_dir, as_identity.as_deref(), "ui_stop")?;
-            stop(state_dir, *tailscale_off)
+            lifecycle::stop(state_dir, *tailscale_off)
         }
-        UiAction::Status => status(state_dir),
+        UiAction::Status => lifecycle::status(state_dir),
         UiAction::Login {
             tailnet,
             rotate,
@@ -339,7 +383,7 @@ pub fn run_cli(state_dir: &Path, action: &UiAction) -> Result<i32> {
             json,
         } => login::sessions(state_dir, revoke.as_deref(), *revoke_all, *json),
         UiAction::DeviceLogin { action } => login::device_login(state_dir, action),
-        UiAction::Tailscale { action } => tailscale_cli(state_dir, action),
+        UiAction::Tailscale { action } => tailscale::tailscale_cli(state_dir, action),
     }
 }
 
@@ -494,6 +538,7 @@ pub struct UiOpts {
     pub allow_hosts: Vec<String>,
     pub allow_origins: Vec<String>,
     pub read_only: bool,
+    pub allow_anonymous_reads: bool,
     pub board_public_only: bool,
     pub tailscale: Option<TailscaleOpts>,
     /// The AgenticOS board-identity configuration (CAD-526).
@@ -514,6 +559,7 @@ pub struct ServeOpts {
     /// Operator `--allow-origin` plus the tailnet https origin.
     pub allow_origins: Vec<String>,
     pub read_only: bool,
+    pub allow_anonymous_reads: bool,
     pub board_public_only: bool,
     /// Tailscale sharing armed: `(dns_name, https_port)` — the trust
     /// rule for `Tailscale-User-*` headers and the `/api/meta` URL.
@@ -772,6 +818,8 @@ pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpt
         } else {
             flags.read_only || persisted.read_only
         },
+        allow_anonymous_reads: !flags.no_allow_anonymous_reads
+            && (flags.allow_anonymous_reads || persisted.allow_anonymous_reads),
         board_public_only: flags.board_public_only
             || persisted.board_public_only
             || env_public_only,
@@ -784,6 +832,16 @@ pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpt
     if eff.board_public_only && eff.board.is_none() {
         return Err(Error::rejected(
             "board public-only mode requires a public board identity",
+        ));
+    }
+    if eff.allow_anonymous_reads
+        && (eff.board_public_only
+            || eff.board.is_some()
+            || eff.tailscale.is_some()
+            || flags.tailscale.is_some())
+    {
+        return Err(Error::rejected(
+            "anonymous reads are local-only — clear --allow-anonymous-reads before configuring a hosted board or tailnet sharing",
         ));
     }
     if eff.tailscale.is_some() {
@@ -1067,6 +1125,7 @@ pub(crate) fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         allow_hosts,
         allow_origins,
         read_only: eff.read_only,
+        allow_anonymous_reads: eff.allow_anonymous_reads,
         board_public_only: eff.board_public_only,
         tailnet,
         tailscaled_socket: None,
@@ -1095,996 +1154,6 @@ pub(crate) fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         // helper; only tests inject a fake.
         update_helper: None,
     })
-}
-
-// ---------- lifecycle (mirrors `daemon start|stop|status`) ----------
-
-pub(crate) fn pid_file(state_dir: &Path) -> PathBuf {
-    state_dir.join("ui.pid")
-}
-
-/// The file a spawned `ui run` writes once its bind has succeeded —
-/// `{pid, nonce}` for the `ui start` that is waiting on it. The nonce
-/// reaches the child only through `CADENCE_UI_READY_NONCE` in its
-/// environment and this file, never over HTTP: any HTTP 200 a foreign
-/// listener answers can no longer stand in for this board's readiness
-/// (CAD-817).
-pub(crate) fn ready_file(state_dir: &Path) -> PathBuf {
-    state_dir.join("ui.ready")
-}
-
-/// `ui start`'s env channel for the readiness nonce. The child writes
-/// it to `ui.ready` after binding; `serve` removes it from the child's
-/// own environment before serving so nothing downstream inherits it.
-pub(crate) const READY_NONCE_ENV: &str = "CADENCE_UI_READY_NONCE";
-
-/// Read `ui.ready`; `Some(pid)` only when it names `nonce` — a stale
-/// or foreign marker is a miss, not a match.
-pub(crate) fn ready_pid(state_dir: &Path, nonce: &str) -> Option<i32> {
-    let text = std::fs::read_to_string(ready_file(state_dir)).ok()?;
-    let v: Value = serde_json::from_str(&text).ok()?;
-    if v["nonce"].as_str()? != nonce {
-        return None;
-    }
-    v["pid"].as_i64().and_then(|p| i32::try_from(p).ok())
-}
-
-/// Is a detached `cadence ui` server alive for this state dir — the
-/// pidfile's pid, identity-checked by [`read_pid`]. `daemon restart
-/// --ui` reads this to decide whether to bounce the board. Not a pure
-/// read: like `read_pid`, it deletes a `ui.pid` that names no board.
-pub fn detached_pid(state_dir: &Path) -> Option<i32> {
-    read_pid(state_dir)
-}
-
-/// The pidfile's pid, but only when it is this state dir's board
-/// (CAD-1081). A live pid is not enough: a `ui.pid` restored into a
-/// new container can name pid 1, another process, or a thread id, and
-/// trusting it skipped the board start and pointed `ui stop` at a
-/// stranger. Anything else is stale.
-///
-/// Side effect: a pid proven not to be the board (`NotBoard`) deletes
-/// `ui.pid` — only if the file still holds what was read, so a
-/// concurrent `ui start` keeps its own. Every caller, `detached_pid`
-/// included, inherits that; an `Unknown` pid leaves the file alone.
-///
-/// Linux only: with no `/proc` (macOS) no pid proves itself, so the
-/// board reads as stopped there — the macOS board is unsupported until
-/// CAD-315.
-pub(crate) fn read_pid(state_dir: &Path) -> Option<i32> {
-    read_pid_in(Path::new("/proc"), state_dir)
-}
-
-fn read_pid_in(proc_root: &Path, state_dir: &Path) -> Option<i32> {
-    let path = pid_file(state_dir);
-    let text = std::fs::read_to_string(&path).ok()?;
-    let pid: i32 = text.trim().parse().ok()?;
-    match board_identity(proc_root, pid, state_dir) {
-        BoardPid::Board => Some(pid),
-        // Unproven either way: not ours to signal, not ours to delete.
-        BoardPid::Unknown => None,
-        BoardPid::NotBoard => {
-            if std::fs::read_to_string(&path).is_ok_and(|now| now == text) {
-                let _ = std::fs::remove_file(&path);
-            }
-            None
-        }
-    }
-}
-
-/// What `/proc` proves about a pidfile's pid. A failed read proves
-/// nothing: only a missing entry (ENOENT/ESRCH) or a field that
-/// contradicts the board is `NotBoard`; every other error is `Unknown`.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum BoardPid {
-    Board,
-    NotBoard,
-    Unknown,
-}
-
-fn proc_read(dir: &Path, name: &str) -> std::result::Result<Vec<u8>, BoardPid> {
-    std::fs::read(dir.join(name)).map_err(|e| gone_or_unknown(&e))
-}
-
-fn gone_or_unknown(e: &std::io::Error) -> BoardPid {
-    if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH) {
-        BoardPid::NotBoard
-    } else {
-        BoardPid::Unknown
-    }
-}
-
-/// Is `pid` (under `proc_root`, `/proc` outside tests) a live
-/// thread-group leader running `cadence … ui run` for `state_dir`?
-/// Stricter than state-bridge.sh `kill_pidfile`, which only looks for
-/// `cadence` in the cmdline: `Tgid` must be the pid itself (a thread id
-/// answers `kill(tid, 0)` too), not a zombie, and the argv must be the
-/// one `start_inner` spawns, for this state dir.
-pub(crate) fn board_identity(proc_root: &Path, pid: i32, state_dir: &Path) -> BoardPid {
-    if pid <= 0 {
-        return BoardPid::NotBoard;
-    }
-    let dir = dir_of(proc_root, pid);
-    let status = match proc_read(&dir, "status") {
-        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
-        Err(v) => return v,
-    };
-    let field = |name: &str| {
-        status
-            .lines()
-            .find_map(|l| l.strip_prefix(name))
-            .map(str::trim)
-    };
-    let real_uid = field("Uid:").and_then(|u| u.split_whitespace().next());
-    let (Some(tgid), Some(state), Some(uid)) = (field("Tgid:"), field("State:"), real_uid) else {
-        return BoardPid::Unknown;
-    };
-    // The board runs as whoever started it — the owner of this state
-    // dir. Never the exe path: an update's recovery stops the board the
-    // previous release binary still runs.
-    let me = unsafe { libc::getuid() }.to_string();
-    if tgid != pid.to_string() || state.starts_with('Z') || uid != me {
-        return BoardPid::NotBoard;
-    }
-    let raw = match proc_read(&dir, "cmdline") {
-        Ok(b) => b,
-        Err(v) => return v,
-    };
-    let argv: Vec<String> = raw
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).into_owned())
-        .collect();
-    let Some(dir) = board_argv_state_dir(&argv) else {
-        return BoardPid::NotBoard;
-    };
-    // A relative `--state-dir` is the board's, read from its own cwd —
-    // never the reader's.
-    let dir = if dir.is_relative() {
-        match std::fs::read_link(dir_of(proc_root, pid).join("cwd")) {
-            Ok(cwd) => cwd.join(dir),
-            Err(e) => return gone_or_unknown(&e),
-        }
-    } else {
-        dir
-    };
-    if same_dir(&dir, state_dir) {
-        BoardPid::Board
-    } else {
-        BoardPid::NotBoard
-    }
-}
-
-fn dir_of(proc_root: &Path, pid: i32) -> PathBuf {
-    proc_root.join(pid.to_string())
-}
-
-/// The file names a cadence binary may run under: `cadence` or
-/// `cadence-<suffix>` (a side-by-side build such as `cadence-new`).
-/// One list for the board identity check and for `dev up|reload
-/// --build`, so a build is refused up front rather than started as a
-/// board `ui stop` could never find again (CAD-1206).
-pub(crate) fn is_cadence_exe_name(name: &str) -> bool {
-    name == "cadence" || name.strip_prefix("cadence-").is_some_and(|s| !s.is_empty())
-}
-
-/// The `--state-dir` of a board argv — `<…/cadence> … --state-dir
-/// <dir> … ui run …`, as `start_inner` has always spawned it — or
-/// `None` for anything else, an argv without `--state-dir` included.
-pub(crate) fn board_argv_state_dir(argv: &[String]) -> Option<PathBuf> {
-    let (exe, args) = argv.split_first()?;
-    if !Path::new(exe)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(is_cadence_exe_name)
-        || !args.windows(2).any(|w| w[0] == "ui" && w[1] == "run")
-    {
-        return None;
-    }
-    args.iter()
-        .position(|a| a == "--state-dir")
-        .and_then(|i| args.get(i + 1).cloned())
-        .or_else(|| {
-            args.iter()
-                .find_map(|a| a.strip_prefix("--state-dir=").map(str::to_string))
-        })
-        .map(PathBuf::from)
-}
-
-fn same_dir(a: &Path, b: &Path) -> bool {
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    canon(a) == canon(b)
-}
-
-/// Tiny blocking GET — enough for health checks without an HTTP client
-/// dependency. `headers` are extra request lines (`Tailscale-User-Login`
-/// for the identity probe). Returns `(status, body)`.
-/// `pub(crate)` for `doctor --host`'s tailnet probe (CAD-509).
-pub(crate) fn http_get(
-    host: &str,
-    port: u16,
-    path: &str,
-    req_host: &str,
-    headers: &[&str],
-) -> Result<(u16, String)> {
-    let mut stream = TcpStream::connect((host, port))
-        .map_err(|e| Error::internal(format!("ui not reachable at {host}:{port}: {e}")))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let mut req = format!("GET {path} HTTP/1.0\r\nHost: {req_host}\r\n");
-    for h in headers {
-        req.push_str(h);
-        req.push_str("\r\n");
-    }
-    req.push_str("\r\n");
-    stream.write_all(req.as_bytes())?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf)?;
-    let text = String::from_utf8_lossy(&buf);
-    let status = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
-    let body = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or_default()
-        .to_string();
-    Ok((status, body))
-}
-
-/// `ui run` — foreground. Flags merge over the persisted options but
-/// never rewrite them: `ui start` owns persistence.
-pub(crate) fn run(state_dir: &Path, flags: &UiFlags) -> Result<i32> {
-    if flags.tailscale.is_some() {
-        // Foreground sandbox runs have no durable sharing custody. Only
-        // the recorded start paths may publish a host-wide mapping.
-        crate::sandbox::refuse_global(
-            "foreground `ui run --tailscale`; use `ui start --tailscale` for recorded sandbox sharing",
-        )?;
-    }
-    let persisted = load_opts_strict(state_dir)?;
-    let (eff, mut so) = resolve_opts(flags, &persisted)?;
-    // CAD-841: `--device-login-*` is a thin client — resolve now so a
-    // partial triple still fails before any bind, but push only once
-    // `serve` owns the port: a failed start must not have already
-    // replaced the live config on this state dir's boards (r1). A
-    // detached `ui start` child resolves no flags and a scrubbed env,
-    // so it never re-pushes.
-    so.device_login_push = resolve_device_login(flags)?;
-    // `ui run --tailscale` is the foreground opt-in path. Resolution
-    // above validates all configuration first; preserve its historical
-    // explicit-sharing behavior without moving map effects back into
-    // the shared resolver.
-    let created = if flags.tailscale.is_some() {
-        let ts = eff.tailscale.as_ref().expect("resolved above");
-        ensure_mapping(&ts.dns_name, ts.https_port, &ts.target)?
-    } else {
-        false
-    };
-    if let Err(e) = serve(state_dir, &crate::issue::default_dir()?, &so) {
-        if created {
-            if let Some(ts) = &eff.tailscale {
-                let _ = remove_mapping(&ts.dns_name, ts.https_port, &ts.target);
-            }
-        }
-        return Err(e);
-    }
-    Ok(0)
-}
-
-/// `ui start` — merge flags over `ui.json`, persist the effective
-/// options, spawn a detached `ui run` that reads them back. A
-/// persisted tailscale block re-ensures its mapping (idempotent; a
-/// foreign mapping on the port is still a hard refusal, an
-/// unreachable tailscaled a warning — the board still serves
-/// loopback).
-pub(crate) fn start(state_dir: &Path, flags: &UiFlags, reset: bool) -> Result<i32> {
-    start_inner(state_dir, flags, reset, false)
-}
-
-/// `ui start` with no stdout — for composed callers (session's
-/// `--fix`) whose own output must stay a single document.
-pub(crate) fn start_quiet(state_dir: &Path, flags: &UiFlags, reset: bool) -> Result<i32> {
-    start_inner(state_dir, flags, reset, true)
-}
-
-pub(crate) fn start_inner(
-    state_dir: &Path,
-    flags: &UiFlags,
-    reset: bool,
-    quiet: bool,
-) -> Result<i32> {
-    std::fs::create_dir_all(state_dir)?;
-    // Resolve a reset against defaults without deleting ui.json first.
-    // A refused security-mode transition must leave the running board's
-    // saved options intact, including its public identity.
-    let recorded = load_opts_strict(state_dir)?;
-    let persisted = if reset {
-        UiOpts::default()
-    } else {
-        recorded.clone()
-    };
-    let (eff, so) = resolve_opts(flags, &persisted)?;
-    if let Some(existing) = recorded.tailscale.as_ref() {
-        let mut recorded_bind = UiOpts {
-            host: eff.host.clone(),
-            port: eff.port,
-            ..UiOpts::default()
-        };
-        recorded_bind.tailscale = Some(existing.clone());
-        validate_share_target(&recorded_bind)?;
-        if reset && flags.tailscale.is_none() {
-            return Err(Error::rejected(
-                "`ui start --reset` cannot discard a persisted tailnet share — stop sharing first",
-            ));
-        }
-        if let Some(requested_port) = flags.tailscale {
-            refuse_share_port_change(Some(existing), requested_port)?;
-        }
-    }
-    // CAD-841 r2: resolve the device-login triple up front — a partial
-    // or invalid triple fails before any side effect (a saved ui.json,
-    // a spawned child). The push it feeds stays late: post-spawn on
-    // the fresh path, live on the running path.
-    let device_login_push = resolve_device_login(flags)?;
-    let running = read_pid(state_dir);
-    if running.is_some() {
-        if eff.board_public_only != recorded.board_public_only {
-            return Err(Error::rejected(
-                "board public-only mode cannot change while the UI is running — stop the UI, then start it with the new mode",
-            ));
-        }
-        // CAD-841: device login is deliberately absent from the
-        // running-change refuses — the daemon owns the config now, and
-        // a `--device-login-*` flag push on an already-running board is
-        // a live `operator_device_login_set`, not a restart.
-        if eff.board_public_only {
-            if eff.board != recorded.board || eff.host != recorded.host || eff.port != recorded.port
-            {
-                return Err(Error::rejected(
-                    "running public-only board identity or bind cannot change — stop the UI, then start it with the new configuration",
-                ));
-            }
-            // A saved true flag is not proof the *running* process loaded
-            // it (an older build could have saved options before noticing
-            // an existing UI). The exact local query is 421 only under
-            // the active hosted gate; ordinary health answers 200.
-            let active = match http_get(
-                &so.host,
-                so.port,
-                "/api/health?public-only-probe=1",
-                &format!("{}:{}", so.host, so.port),
-                &[],
-            ) {
-                Ok((421, body)) => serde_json::from_str::<Value>(&body)
-                    .ok()
-                    .is_some_and(|v| v["error"] == "hosted board requires its public Host"),
-                _ => false,
-            };
-            if !active {
-                return Err(Error::rejected(
-                    "running UI has not proved the board public-only gate — stop the UI and start it again",
-                ));
-            }
-        }
-    }
-    // Validate the exact LocalAPI snapshot and prepare its conditional
-    // update before changing local custody. A genuinely offline GET can
-    // still allow local startup, without claiming the share is verified.
-    let prepared_mapping = if let Some(ts) = &eff.tailscale {
-        match prepare_mapping(&ts.dns_name, ts.https_port, &ts.target) {
-            Ok(plan) => Some(plan),
-            Err(e) if is_ts_offline(&e) => {
-                eprintln!("warning: {e} — tailnet state is unverified; continuing local startup with recorded sharing settings");
-                None
-            }
-            Err(e) => return Err(e),
-        }
-    } else {
-        None
-    };
-    // Persist matching sharing custody before the conditional update.
-    // Once a POST is attempted, failures are never treated as offline.
-    save_opts(state_dir, &eff)?;
-    if let Some(plan) = prepared_mapping {
-        plan.apply()?;
-    }
-    let (host, port) = (so.host.clone(), so.port);
-    // A previous start's marker must not satisfy this one's wait —
-    // clear it before any `running`/`spawn` path can read it.
-    let _ = std::fs::remove_file(ready_file(state_dir));
-    if let Some(pid) = running {
-        // CAD-841: `--device-login-*` is a thin client of
-        // `operator_device_login_set` — pushed from THIS process (it
-        // carries the operator secret; a detached child could never
-        // prove itself). The board is already up: routes read the
-        // daemon's store per request, so this is a live reconfigure.
-        if let Some(triple) = &device_login_push {
-            push_device_login_config(state_dir, triple)?;
-        }
-        let (code, _) = http_get(&host, port, "/api/health", &format!("{host}:{port}"), &[])
-            .unwrap_or((0, String::new()));
-        if !quiet {
-            println!(
-                "{}",
-                crate::output::json_text(&json!({
-                    "state": "already_running", "pid": pid, "health_http": code,
-                    "tailnet_url": eff.tailscale.as_ref().map(|t| t.url()),
-                }))
-                .unwrap_or_default()
-            );
-        }
-        return Ok(0);
-    }
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(state_dir.join("ui.log"))?;
-    let exe = std::env::current_exe()?;
-    let mut command = Command::new(exe);
-    // The detached child re-resolves from `ui.json` — its argv only
-    // pins the bind, everything else is the persisted file's business.
-    // CAD-482: a board is never a caller either — requests assert via
-    // headers, so a `CADENCE_TEST_AS` in this process's env must not
-    // leak into the child (a `daemon restart --ui` under it would
-    // blanket-assert every board→daemon RPC).
-    command.env_remove(crate::test_seam::AS_ENV);
-    // CAD-841: the child must never push a device-login config — the
-    // parent already did (or nobody did). Its argv carries none of the
-    // flags; strip the env fallbacks so an inherited
-    // `CADENCE_DEVICE_LOGIN_*` cannot make it try (a detached child
-    // fails operator proof and would die at startup).
-    command
-        .env_remove("CADENCE_DEVICE_LOGIN_ISSUER")
-        .env_remove("CADENCE_DEVICE_LOGIN_ORG")
-        .env_remove("CADENCE_DEVICE_LOGIN_SUBJECTS");
-    command
-        .arg("--state-dir")
-        // CAD-1081: absolute, so the board's argv names its state dir
-        // from any reader's cwd.
-        .arg(std::path::absolute(state_dir)?)
-        .args(["ui", "run", "--host", &host, "--port"])
-        .arg(port.to_string());
-    if let Some(dist) = &eff.dist {
-        command.arg("--dist").arg(dist);
-    }
-    // Readiness the port cannot fake: a fresh nonce reaches the child
-    // through its environment, and the child lands it in `ui.ready`
-    // only after its own `Server::http` bind succeeds (CAD-817). An
-    // HTTP 200 — whoever answers it — no longer proves our board up.
-    let nonce = crate::operator_auth::random_credential()?;
-    command.env(READY_NONCE_ENV, &nonce);
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log.try_clone()?))
-        .stderr(std::process::Stdio::from(log));
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = crate::reaper::spawn(&mut command)?;
-    std::fs::write(pid_file(state_dir), child.id().to_string())?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if child.try_wait()?.is_some() {
-            // The bind failed (or the child died before it) — the log
-            // line is the why, the port the what.
-            let _ = std::fs::remove_file(pid_file(state_dir));
-            let _ = std::fs::remove_file(ready_file(state_dir));
-            let detail = std::fs::read_to_string(state_dir.join("ui.log"))
-                .unwrap_or_default()
-                .lines()
-                .rev()
-                .find(|l| l.contains("bind") || l.contains("error"))
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let detail = if detail.is_empty() {
-                format!("see {}", state_dir.join("ui.log").display())
-            } else {
-                detail
-            };
-            return Err(Error::rejected(format!(
-                "ui server exited during start — port {port} on {host}: {detail}"
-            )));
-        }
-        if ready_pid(state_dir, &nonce) == Some(child.id() as i32) {
-            // The child bound and reported itself — the health check
-            // now confirms it serves, still not the other way around.
-            if let Ok((200, _)) =
-                http_get(&host, port, "/api/health", &format!("{host}:{port}"), &[])
-            {
-                let _ = std::fs::remove_file(ready_file(state_dir));
-                // CAD-841: only now that the child provably bound and
-                // serves does a `--device-login-*` triple reach the
-                // daemon — a failed spawn changes no live config
-                // (review r1). The child can never push: it is
-                // detached, so this process does it. And if the push
-                // itself fails, the just-spawned board goes down with
-                // its start — `ui start` never leaves a live board the
-                // requested config was refused for (r2).
-                if let Some(triple) = &device_login_push {
-                    if let Err(e) = push_device_login_config(state_dir, triple) {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        let _ = std::fs::remove_file(pid_file(state_dir));
-                        return Err(e);
-                    }
-                }
-                if !quiet {
-                    println!(
-                        "{}",
-                        crate::output::json_text(&json!({
-                            "state": "started", "pid": child.id(),
-                            "url": format!("http://{host}:{port}"),
-                            "tailnet_url": eff.tailscale.as_ref().map(|t| t.url()),
-                            "read_only": eff.read_only,
-                            "gateway": "http://cadence.localhost:18000",
-                            "log": state_dir.join("ui.log"),
-                            // CAD-313: board writes need the operator's session.
-                            "sign_in": "cadence ui login",
-                        }))
-                        .unwrap_or_default()
-                    );
-                }
-                return Ok(0);
-            }
-        }
-        if Instant::now() >= deadline {
-            let _ = std::fs::remove_file(ready_file(state_dir));
-            return Err(Error::internal(
-                "ui server did not prove its own start within 10s",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// SIGTERM the detached server and wait for exit — no output, for
-/// callers (stop, the tailscale verbs) that print their own result.
-pub(crate) fn kill_detached(state_dir: &Path) -> Option<i32> {
-    let pid = read_pid(state_dir)?;
-    unsafe { libc::kill(pid, libc::SIGTERM) };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while unsafe { libc::kill(pid, 0) == 0 } {
-        if Instant::now() >= deadline {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = std::fs::remove_file(pid_file(state_dir));
-    Some(pid)
-}
-
-pub(crate) fn stop(state_dir: &Path, tailscale_off: bool) -> Result<i32> {
-    let recorded = if tailscale_off {
-        let opts = load_opts_strict(state_dir)?;
-        if let Some(share) = opts.tailscale.as_ref() {
-            let mut bind = UiOpts {
-                host: opts.host.clone(),
-                port: opts.port,
-                ..UiOpts::default()
-            };
-            bind.tailscale = Some(share.clone());
-            validate_share_target(&bind)?;
-            crate::sandbox::refuse_global_unless_allowed("`ui stop --tailscale-off`")?;
-        }
-        Some(opts)
-    } else {
-        None
-    };
-    let pid = kill_detached(state_dir);
-    if pid.is_none() {
-        let _ = std::fs::remove_file(pid_file(state_dir));
-    }
-    let _ = std::fs::remove_file(ready_file(state_dir));
-    // --tailscale-off: only ever the mapping cadence recorded — a
-    // foreign one on the same port is left alone and named in the
-    // result.
-    let mut ts_result = Value::Null;
-    if tailscale_off {
-        let mut opts = recorded.expect("loaded before stop effects");
-        if let Some(ts) = opts.tailscale.take() {
-            ts_result = match remove_mapping(&ts.dns_name, ts.https_port, &ts.target) {
-                Ok(true) => json!({"removed": ts.https_port}),
-                Ok(false) => json!({"left_alone": ts.https_port, "why": "mapping already absent"}),
-                Err(e) => {
-                    return Err(Error::rejected(format!(
-                        "{e} — the tailnet record is kept; fix the failure and retry"
-                    )));
-                }
-            };
-            clear_persisted_share(state_dir)?;
-        } else {
-            ts_result = json!({"left_alone": Value::Null, "why": "no recorded mapping"});
-        }
-    }
-    println!(
-        "{}",
-        crate::output::json_text(&json!({
-            "state": "stopped",
-            "pid": pid,
-            "note": if pid.is_none() { Some("no live pid") } else { None },
-            "tailscale_off": ts_result,
-        }))
-        .unwrap_or_default()
-    );
-    Ok(0)
-}
-
-pub(crate) fn status(state_dir: &Path) -> Result<i32> {
-    let pid = read_pid(state_dir);
-    let opts = load_opts(state_dir);
-    let port = opts.port.unwrap_or(3010);
-    let health = pid.and_then(|_| {
-        http_get(
-            "127.0.0.1",
-            port,
-            "/api/health",
-            &format!("127.0.0.1:{port}"),
-            &[],
-        )
-        .ok()
-    });
-    println!(
-        "{}",
-        crate::output::json_text(&json!({
-            "state": if pid.is_some() { "running" } else { "stopped" },
-            "pid": pid,
-            "health": health.map(|(code, body)| json!({
-                "http": code,
-                "body": serde_json::from_str::<Value>(&body).unwrap_or(Value::Null),
-            })),
-            "options": {
-                "port": port,
-                "allow_hosts": opts.allow_hosts,
-                "allow_origins": opts.allow_origins,
-                "read_only": opts.read_only,
-            },
-            "tailnet_url": opts.tailscale.as_ref().map(|t| t.url()),
-            // CAD-526: the public sign-in surface, when configured.
-            "board_url": opts.board.as_ref().map(|b| format!(
-                "{}://{}", operator::public_scheme(&b.host), b.host)),
-            "board_issuer": opts.board.as_ref().map(|b| b.issuer.clone()),
-            "board_company": opts.board.as_ref().map(|b| b.company.clone()),
-            // CAD-841: device login is daemon-owned — report the
-            // daemon's answer (issuer/org only; the allowlist is for
-            // `ui device-login show`), `null` while the daemon is away.
-            "device_login": crate::client::rpc(
-                state_dir, "device_login_config", json!({})).ok(),
-        }))
-        .unwrap_or_default()
-    );
-    Ok(0)
-}
-
-// ---------- tailscale (serve only — never funnel) ----------
-
-/// One bounded, read-only `tailscale` CLI invocation. Serve mutations use
-/// the conditional LocalAPI transport in `tailscale_serve`; `funnel` is never among the args.
-pub(crate) fn ts(args: &[&str]) -> Result<std::process::Output> {
-    tailscale_serve::validate_socket_override()?;
-    let mut cmd = Command::new("tailscale");
-    if let Some(socket) = std::env::var_os("CADENCE_TAILSCALE_SOCKET") {
-        cmd.arg("--socket").arg(socket);
-    }
-    cmd.args(args);
-    proc::run_bounded(&mut cmd, Duration::from_secs(15)).map_err(|e| match e {
-        BoundedError::Spawn(_) => Error::rejected("tailscale is not installed or not on PATH"),
-        other => Error::internal(format!("tailscale {}: {other}", args.join(" "))),
-    })
-}
-
-/// The error a dead/logged-out tailscaled produces — `ui start` warns
-/// and serves loopback rather than refuse outright.
-fn is_ts_offline(e: &Error) -> bool {
-    // Only an actual LocalAPI transport outage retains the historical
-    // loopback-only start fallback. CAS conflicts, missing ETags, malformed
-    // responses, unsupported sockets and ownership refusals are not offline.
-    matches!(e, Error::Rejected(m) if m.contains("tailscale LocalAPI offline:"))
-}
-
-struct TsSelf {
-    dns_name: String,
-}
-
-/// `tailscale status --json` → the node's DNS name, with the three
-/// refusal states the operator can act on named plainly.
-fn ts_self() -> Result<TsSelf> {
-    let out = ts(&["status", "--json"])?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let lower = stderr.to_lowercase();
-        if lower.contains("logged out") {
-            return Err(Error::rejected(
-                "tailscale is logged out — run `tailscale up` first",
-            ));
-        }
-        return Err(Error::rejected(format!(
-            "tailscale status failed: {}",
-            stderr.trim()
-        )));
-    }
-    let v: Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| Error::internal(format!("tailscale status --json: {e}")))?;
-    let state = v["BackendState"].as_str().unwrap_or_default();
-    if state != "Running" {
-        return Err(Error::rejected(format!(
-            "tailscale is not up (BackendState {state:?}) — run `tailscale up` first"
-        )));
-    }
-    let dns = v["Self"]["DNSName"]
-        .as_str()
-        .unwrap_or_default()
-        .trim_end_matches('.')
-        .to_string();
-    if dns.is_empty() {
-        return Err(Error::rejected(
-            "tailscale reports no DNS name — is this node logged in?",
-        ));
-    }
-    let cert_domains = v["CertDomains"].as_array().cloned().unwrap_or_default();
-    if cert_domains.is_empty() {
-        return Err(Error::rejected(
-            "HTTPS certificates are not enabled for this tailnet — enable \
-             them in the admin console (DNS → HTTPS Certificates) first",
-        ));
-    }
-    Ok(TsSelf { dns_name: dns })
-}
-
-/// `tailscale serve status --json` → https port → proxy target.
-/// `Web` keys are `<dns>:<port>` (bare `<dns>` is port 443).
-fn serve_map() -> Result<HashMap<u16, String>> {
-    let out = ts(&["serve", "status", "--json"])?;
-    if !out.status.success() {
-        return Err(Error::rejected(format!(
-            "tailscale serve status failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let v: Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| Error::internal(format!("tailscale serve status --json: {e}")))?;
-    let mut map = HashMap::new();
-    if let Some(web) = v["Web"].as_object() {
-        for (key, entry) in web {
-            let port: u16 = key
-                .rsplit(':')
-                .next()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(443);
-            if let Some(target) = entry["Handlers"]["/"]["Proxy"].as_str() {
-                map.insert(port, target.to_string());
-            }
-        }
-    }
-    Ok(map)
-}
-
-/// Ensure `https:<port>` proxies to `target`: identical mapping is
-/// left alone (returns false), a different one on that port is a hard
-/// refusal — cadence never overwrites somebody else's serve config.
-fn mapping_matches(dns: &str, port: u16, target: &str) -> Result<bool> {
-    tailscale_serve::matches(dns, port, target)
-}
-
-fn prepare_mapping(dns: &str, port: u16, target: &str) -> Result<tailscale_serve::PreparedUpdate> {
-    // Preserve the exact caller hard gate before any LocalAPI connection.
-    crate::sandbox::refuse_global_unless_allowed("`tailscale serve`")?;
-    tailscale_serve::prepare_ensure(dns, port, target)
-}
-
-fn ensure_mapping(dns: &str, port: u16, target: &str) -> Result<bool> {
-    prepare_mapping(dns, port, target)?.apply()
-}
-
-/// Remove the mapping only while it still targets what cadence
-/// recorded — a foreign or absent mapping returns false.
-fn remove_mapping(dns: &str, port: u16, expected: &str) -> Result<bool> {
-    crate::sandbox::refuse_global_unless_allowed("`tailscale serve off`")?;
-    tailscale_serve::remove(dns, port, expected)
-}
-
-// ---------- `ui tailscale …` ----------
-
-fn tailscale_cli(state_dir: &Path, action: &TailscaleAction) -> Result<i32> {
-    match action {
-        TailscaleAction::Start { port, read_only } => ts_start(state_dir, *port, *read_only),
-        TailscaleAction::Stop => ts_stop(state_dir),
-        TailscaleAction::Status => ts_status(state_dir),
-    }
-}
-
-/// `ui tailscale start` — the whole flow: resolve the tailnet
-/// identity, ensure the mapping, persist, (re)start the board so the
-/// new Host/Origin allowlists are live, print the URL.
-fn ts_start(state_dir: &Path, https_port: u16, read_only: bool) -> Result<i32> {
-    ts_start_inner(state_dir, https_port, read_only, false)
-}
-
-/// `ui tailscale start` with no stdout — for composed callers
-/// (session's `--fix`).
-pub(crate) fn ts_start_quiet(state_dir: &Path, https_port: u16, read_only: bool) -> Result<i32> {
-    ts_start_inner(state_dir, https_port, read_only, true)
-}
-
-fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: bool) -> Result<i32> {
-    crate::sandbox::refuse_global_unless_allowed("`ui tailscale start`")?;
-    let mut opts = load_opts_strict(state_dir)?;
-    validate_share_target(&opts)?;
-    refuse_share_port_change(opts.tailscale.as_ref(), https_port)?;
-    let me = ts_self()?;
-    let ui_port = opts.port.unwrap_or(3010);
-    crate::sandbox::refuse_production_port(ui_port)?;
-    let target = format!("http://127.0.0.1:{ui_port}");
-    opts.tailscale = Some(TailscaleOpts {
-        dns_name: me.dns_name.clone(),
-        https_port,
-        target: target.clone(),
-    });
-    if read_only {
-        opts.read_only = true;
-    }
-    // Validate configuration and device-login inputs before saving,
-    // publishing a map, or stopping a running board.
-    let _ = serve_opts(&opts)?;
-    resolve_device_login(&UiFlags::default())?;
-    let mapping_created = !mapping_matches(&me.dns_name, https_port, &target)?;
-    save_opts(state_dir, &opts)?;
-    let was_running = read_pid(state_dir).is_some();
-    if was_running {
-        eprintln!("restarting the board so the tailnet allowlists take effect — brief outage");
-        kill_detached(state_dir);
-    }
-    let code = start_inner(state_dir, &UiFlags::default(), false, true)?;
-    let ts = opts.tailscale.as_ref().expect("set above");
-    if !quiet {
-        println!(
-            "{}",
-            crate::output::json_text(&json!({
-                "state": "sharing",
-                "tailnet_url": ts.url(),
-                "mapping": format!("https:{} → {}", ts.https_port, ts.target),
-                "mapping_created": mapping_created,
-                "board": if was_running { "restarted" } else { "started" },
-                "read_only": opts.read_only,
-            }))
-            .unwrap_or_default()
-        );
-    }
-    Ok(code)
-}
-
-/// `ui tailscale stop` — remove only cadence's mapping, drop the
-/// tailnet options, restart the board local-only when it runs.
-fn ts_stop(state_dir: &Path) -> Result<i32> {
-    let mut opts = load_opts_strict(state_dir)?;
-    if let Some(share) = opts.tailscale.as_ref() {
-        let mut bind = UiOpts {
-            host: opts.host.clone(),
-            port: opts.port,
-            ..UiOpts::default()
-        };
-        bind.tailscale = Some(share.clone());
-        validate_share_target(&bind)?;
-        crate::sandbox::refuse_global_unless_allowed("`ui tailscale stop`")?;
-    }
-    let Some(ts) = opts.tailscale.take() else {
-        println!(
-            "{}",
-            crate::output::json_text(&json!({"state": "not_sharing"})).unwrap_or_default()
-        );
-        return Ok(0);
-    };
-    let removed = remove_mapping(&ts.dns_name, ts.https_port, &ts.target).map_err(|e| {
-        Error::rejected(format!(
-            "{e} — the tailnet record is kept; fix the failure and retry"
-        ))
-    })?;
-    clear_persisted_share(state_dir)?;
-    let was_running = read_pid(state_dir).is_some();
-    if was_running {
-        eprintln!("restarting the board local-only — brief outage");
-        kill_detached(state_dir);
-        start_inner(state_dir, &UiFlags::default(), false, true)?;
-    }
-    println!(
-        "{}",
-        crate::output::json_text(&json!({
-            "state": "stopped_sharing",
-            "mapping_removed": removed,
-            "board": if was_running { "restarted" } else { "not_running" },
-        }))
-        .unwrap_or_default()
-    );
-    Ok(0)
-}
-
-/// `ui tailscale status` — sharing state, the URL, the live mapping,
-/// the identity a test request resolves to, and the QR.
-fn ts_status(state_dir: &Path) -> Result<i32> {
-    let opts = load_opts(state_dir);
-    let Some(ts) = &opts.tailscale else {
-        println!("tailscale sharing: off");
-        return Ok(0);
-    };
-    let url = ts.url();
-    println!("tailscale sharing: on");
-    println!("url:      {url}");
-    match serve_map() {
-        Ok(map) => match map.get(&ts.https_port) {
-            Some(t) if t == &ts.target => {
-                println!("mapping:  https:{} → {}  (live)", ts.https_port, t)
-            }
-            Some(t) => println!(
-                "mapping:  https:{} → {}  (NOT ours — left alone)",
-                ts.https_port, t
-            ),
-            None => println!("mapping:  https:{} absent", ts.https_port),
-        },
-        Err(e) => println!("mapping:  unknown — {e}"),
-    }
-    println!(
-        "mode:     {}",
-        if opts.read_only {
-            "read-only"
-        } else {
-            "writable"
-        }
-    );
-    // The identity probe (CAD-336): a local request shaped like the
-    // proxy's — loopback peer, tailnet Host, a login header — is NOT
-    // the proxy and must resolve to the plain operator. The real login
-    // shows only through the tailnet URL (`<url>/api/meta`).
-    if read_pid(state_dir).is_some() {
-        let ui_port = opts.port.unwrap_or(3010);
-        let host_hdr = format!("{}:{}", ts.dns_name, ts.https_port);
-        let forged = "forged-probe@cadence.invalid";
-        let login_hdr = format!("Tailscale-User-Login: {forged}");
-        match http_get(
-            "127.0.0.1",
-            ui_port,
-            "/api/meta",
-            &host_hdr,
-            &[login_hdr.as_str()],
-        ) {
-            Ok((200, body)) => {
-                let meta = serde_json::from_str::<Value>(&body).unwrap_or_default();
-                let actor = meta["actor"].as_str().unwrap_or_default();
-                let check = meta["tailnet_proof"]["check"].as_str().unwrap_or("?");
-                if actor.contains(forged) {
-                    println!(
-                        "identity: FORGEABLE — a local process posing as the proxy \
-                         resolved to {actor}"
-                    );
-                } else {
-                    println!(
-                        "identity: local forged login ignored ({actor}; refused by \
-                         check {check}); tailnet logins resolve only via {url}/api/meta"
-                    );
-                    println!(
-                        "advice:   `cadence doctor --host` runs the whole tailnet \
-                         proof up front and prints every remedy in order"
-                    );
-                }
-            }
-            Ok((code, _)) => println!("identity: probe answered http {code}"),
-            Err(e) => println!("identity: probe failed — {e}"),
-        }
-    } else {
-        println!("identity: board not running — probe skipped");
-    }
-    match qr_term(&url) {
-        Some(qr) => print!("{qr}"),
-        None => println!("(qr encode failed — the URL above still works)"),
-    }
-    Ok(0)
 }
 
 /// Terminal QR: the `qrcode` crate (pure Rust, no other deps) plus a
@@ -2127,6 +1196,10 @@ fn qr_term(text: &str) -> Option<String> {
     }
     Some(out)
 }
+
+#[cfg(test)]
+#[path = "ui/cad1283_pid_startup_refusal_tests.rs"]
+mod cad1283_pid_startup_refusal_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2206,6 +1279,110 @@ mod tests {
                 .unwrap()
                 .1
                 .board_public_only
+        );
+    }
+
+    #[test]
+    fn anonymous_read_policy_persists_and_explicitly_clears() {
+        let state = tempfile::TempDir::new().unwrap();
+        let flags = UiFlags {
+            allow_anonymous_reads: true,
+            ..Default::default()
+        };
+        let (enabled, serve) = super::resolve_opts(&flags, &UiOpts::default()).unwrap();
+        assert!(serve.allow_anonymous_reads);
+        super::save_opts(state.path(), &enabled).unwrap();
+        let restored = super::load_opts_strict(state.path()).unwrap();
+        assert!(
+            super::resolve_opts(&UiFlags::default(), &restored)
+                .unwrap()
+                .1
+                .allow_anonymous_reads
+        );
+        let (disabled, serve) = super::resolve_opts(
+            &UiFlags {
+                no_allow_anonymous_reads: true,
+                ..Default::default()
+            },
+            &restored,
+        )
+        .unwrap();
+        assert!(!serve.allow_anonymous_reads);
+        super::save_opts(state.path(), &disabled).unwrap();
+        assert!(
+            !super::load_opts_strict(state.path())
+                .unwrap()
+                .allow_anonymous_reads
+        );
+        let mut hosted = restored;
+        hosted.board = Some(super::PublicBoard {
+            host: "acme.board.localhost:3111".to_string(),
+            issuer: "http://api.internal".to_string(),
+            company: "co_1".to_string(),
+            authorize_url: "http://api.internal/v2/board/authorize".to_string(),
+        });
+        assert!(super::resolve_opts(&UiFlags::default(), &hosted).is_err());
+        assert!(super::resolve_opts(
+            &UiFlags {
+                no_allow_anonymous_reads: true,
+                ..Default::default()
+            },
+            &hosted,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn anonymous_reads_refuse_tailnet_sharing() {
+        let persisted = super::UiOpts {
+            port: Some(3120),
+            allow_anonymous_reads: true,
+            tailscale: Some(super::TailscaleOpts {
+                dns_name: "board.tailnet.ts.net".to_string(),
+                https_port: 9450,
+                target: "http://127.0.0.1:3120".to_string(),
+            }),
+            ..Default::default()
+        };
+        let err = super::resolve_opts(&super::UiFlags::default(), &persisted)
+            .err()
+            .expect("anonymous reads with tailnet sharing must be refused");
+        assert!(
+            err.to_string().contains("anonymous reads are local-only"),
+            "unexpected refusal: {err}"
+        );
+
+        // A newly requested share, with no persisted record, is caught too.
+        let flags = super::UiFlags {
+            allow_anonymous_reads: true,
+            tailscale: Some(9450),
+            ..Default::default()
+        };
+        let err = super::resolve_opts(&flags, &super::UiOpts::default())
+            .err()
+            .expect("anonymous reads with a new --tailscale must be refused");
+        assert!(
+            err.to_string().contains("anonymous reads are local-only"),
+            "unexpected refusal: {err}"
+        );
+
+        // Persisted anonymous reads plus a new --tailscale.
+        let persisted_anon = super::UiOpts {
+            allow_anonymous_reads: true,
+            ..Default::default()
+        };
+        let err = super::resolve_opts(
+            &super::UiFlags {
+                tailscale: Some(9450),
+                ..Default::default()
+            },
+            &persisted_anon,
+        )
+        .err()
+        .expect("a new --tailscale with persisted anonymous reads must be refused");
+        assert!(
+            err.to_string().contains("anonymous reads are local-only"),
+            "unexpected refusal: {err}"
         );
     }
 
@@ -2377,7 +1554,7 @@ mod tests {
         std::fs::write(dist.path().join("favicon.svg"), "<svg/>").unwrap();
         std::fs::create_dir(dist.path().join("assets")).unwrap();
         std::fs::write(dist.path().join("assets/index.js"), "js").unwrap();
-        let answer = |path: &str| static_answer_for(Some(dist.path()), path, None);
+        let answer = |path: &str| static_answer_for(Some(dist.path()), path, None, None);
         for route in [
             "/",
             "/projects",
@@ -2393,7 +1570,7 @@ mod tests {
             "/agents/cc.worker-1",
         ] {
             match answer(route) {
-                StaticAnswer::File(name, bytes) => {
+                StaticAnswer::File(name, bytes, None) => {
                     assert_eq!(name, "/index.html", "{route}");
                     assert_eq!(content_type(&name), "text/html; charset=utf-8", "{route}");
                     assert_eq!(bytes, b"<!doctype html>shell", "{route}");
@@ -2402,14 +1579,14 @@ mod tests {
             }
         }
         match answer("/assets/index.js") {
-            StaticAnswer::File(name, bytes) => {
+            StaticAnswer::File(name, bytes, None) => {
                 assert_eq!(name, "/assets/index.js");
                 assert_eq!(bytes, b"js");
             }
             _ => panic!("asset not served"),
         }
         match answer("/favicon.svg") {
-            StaticAnswer::File(_, bytes) => assert_eq!(bytes, b"<svg/>"),
+            StaticAnswer::File(_, bytes, None) => assert_eq!(bytes, b"<svg/>"),
             _ => panic!("favicon not served"),
         }
         for missing in [
@@ -2432,7 +1609,7 @@ mod tests {
         // No build: routes say so instead of serving nothing.
         let empty = tempfile::TempDir::new().unwrap();
         assert!(matches!(
-            static_answer_for(Some(empty.path()), "/projects", None),
+            static_answer_for(Some(empty.path()), "/projects", None, None),
             StaticAnswer::NoBuild
         ));
     }
@@ -2449,8 +1626,9 @@ mod tests {
             Some(dist.path()),
             path,
             accept,
+            None,
         ) {
-            StaticAnswer::File(name, bytes) => {
+            StaticAnswer::File(name, bytes, _) => {
                 let resp = Response::from_data(bytes.clone());
                 assert_eq!(resp.status_code().0, 200, "{path}");
                 assert_eq!(name, "/index.html", "{path}");
@@ -2479,6 +1657,7 @@ mod tests {
                     Some(dist.path()),
                     "/wiki/global/x.md",
                     Some("application/json"),
+                    None,
                 ),
                 StaticAnswer::Missing
             ),
@@ -2486,15 +1665,150 @@ mod tests {
         );
         assert!(
             matches!(
-                static_answer_for(Some(dist.path()), "/api/wiki/file", None),
+                static_answer_for(Some(dist.path()), "/api/wiki/file", None, None),
                 StaticAnswer::Missing
             ),
             "file bytes stay on the API route"
         );
         assert!(matches!(
-            static_answer_for(Some(dist.path()), "/projects/x/logo.png", None),
+            static_answer_for(Some(dist.path()), "/projects/x/logo.png", None, None),
             StaticAnswer::Missing
         ));
+    }
+
+    /// Accept-Encoding picks the build's precompressed sibling when the
+    /// client names its coding, falls back to the raw bytes otherwise,
+    /// and honors refusals: an explicit `q=0` (or a malformed q) beats a
+    /// `*` offer, and `identity;q=0` with no acceptable coded answer is a
+    /// 406 rather than raw bytes the client ruled out.
+    #[test]
+    fn static_files_negotiate_precompressed_siblings() {
+        let dist = tempfile::TempDir::new().unwrap();
+        std::fs::write(dist.path().join("index.html"), "raw-html").unwrap();
+        std::fs::write(dist.path().join("index.html.br"), "coded-html").unwrap();
+        std::fs::write(dist.path().join("index.html.gz"), "gzip-html").unwrap();
+        std::fs::create_dir(dist.path().join("assets")).unwrap();
+        std::fs::write(dist.path().join("assets/index.js"), "raw-js").unwrap();
+        std::fs::write(dist.path().join("assets/index.js.br"), "coded-js").unwrap();
+
+        let file = |path: &str, ae: Option<&str>| -> (String, Vec<u8>, Option<&'static str>) {
+            match static_answer_for(Some(dist.path()), path, None, ae) {
+                StaticAnswer::File(name, bytes, encoding) => (name, bytes, encoding),
+                other => panic!("{path} {ae:?}: expected a file, got {other:?}"),
+            }
+        };
+        // An offered coding answers the sibling bytes under the plain name.
+        assert_eq!(
+            file("/assets/index.js", Some("gzip, deflate, br")),
+            (
+                "/assets/index.js".to_string(),
+                b"coded-js".to_vec(),
+                Some("br")
+            )
+        );
+        assert_eq!(
+            file("/assets/index.js", Some("gzip")),
+            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
+        );
+        assert_eq!(
+            file("/assets/index.js", None),
+            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
+        );
+        // q=0 refuses: explicit beats `*`, malformed q fails closed.
+        assert_eq!(
+            file("/assets/index.js", Some("br;q=0, *;q=0.5")),
+            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
+        );
+        assert_eq!(
+            file("/assets/index.js", Some("br ; q = 0 , gzip")),
+            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
+        );
+        assert_eq!(
+            file("/assets/index.js", Some("br;q=oops, gzip")),
+            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
+        );
+        // Refused identity with an acceptable coded answer serves the code.
+        assert_eq!(
+            file("/", Some("identity;q=0, br")),
+            (
+                "/index.html".to_string(),
+                b"coded-html".to_vec(),
+                Some("br")
+            )
+        );
+        assert!(matches!(
+            static_answer_for(
+                Some(dist.path()),
+                "/assets/index.js",
+                None,
+                Some("identity;q=0"),
+            ),
+            StaticAnswer::NotAcceptable
+        ));
+        // RFC 9110 §12.5.3: `*;q=0` without a more-specific identity
+        // entry excludes the raw file too — and a malformed `*` q
+        // fails closed the same way.
+        for ae in ["*;q=0", "*;q=oops"] {
+            assert!(
+                matches!(
+                    static_answer_for(Some(dist.path()), "/assets/index.js", None, Some(ae),),
+                    StaticAnswer::NotAcceptable
+                ),
+                "{ae} excludes identity"
+            );
+        }
+        // An explicit identity entry overrides `*`, both ways.
+        assert_eq!(
+            file("/assets/index.js", Some("*;q=0, identity;q=0.5")),
+            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
+        );
+        assert_eq!(
+            file("/assets/index.js", Some("*;q=1, identity;q=0")),
+            (
+                "/assets/index.js".to_string(),
+                b"coded-js".to_vec(),
+                Some("br")
+            )
+        );
+        // And with every coding refused, the explicit identity q=0
+        // leaves nothing acceptable.
+        assert!(matches!(
+            static_answer_for(
+                Some(dist.path()),
+                "/assets/index.js",
+                None,
+                Some("*;q=0.5, identity;q=0, br;q=0"),
+            ),
+            StaticAnswer::NotAcceptable
+        ));
+        // A trailing dot is grammatical: `1.` is full weight, `0.` is zero.
+        assert_eq!(
+            file("/assets/index.js", Some("br;q=1.")),
+            (
+                "/assets/index.js".to_string(),
+                b"coded-js".to_vec(),
+                Some("br")
+            )
+        );
+        assert_eq!(
+            file("/assets/index.js", Some("br;q=0.")),
+            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
+        );
+        // Out-of-range, non-finite and over-precise qvalues fail closed
+        // to refusal, never to a positive weight.
+        for ae in [
+            "br;q=nan, gzip",
+            "br;q=inf, gzip",
+            "br;q=-1, gzip",
+            "br;q=2, gzip",
+            "br;q=0.9999, gzip",
+        ] {
+            assert_eq!(
+                file("/assets/index.js", Some(ae)),
+                ("/assets/index.js".to_string(), b"raw-js".to_vec(), None),
+                "{ae} admits nothing"
+            );
+        }
     }
 
     #[test]
@@ -2655,19 +1969,21 @@ mod tests {
     /// so a forged `by`/`actor` never reaches the tracker write.
     #[test]
     fn new_issue_body_is_optional_and_unlisted_fields_refused() {
-        let bare: super::write_path::NewIssueReq = serde_json::from_value(serde_json::json!({
-            "project": "demo", "title": "t",
-        }))
-        .unwrap();
+        let bare: cadence_core::board_api::NewIssueReq =
+            serde_json::from_value(serde_json::json!({
+                "project": "demo", "title": "t",
+            }))
+            .unwrap();
         assert!(bare.body.is_none());
-        let filed: super::write_path::NewIssueReq = serde_json::from_value(serde_json::json!({
-            "project": "demo", "title": "t", "tags": ["intake", "idea"],
-            "body": "t\n\nwhy this matters",
-        }))
-        .unwrap();
+        let filed: cadence_core::board_api::NewIssueReq =
+            serde_json::from_value(serde_json::json!({
+                "project": "demo", "title": "t", "tags": ["intake", "idea"],
+                "body": "t\n\nwhy this matters",
+            }))
+            .unwrap();
         assert_eq!(filed.body.as_deref(), Some("t\n\nwhy this matters"));
         assert!(
-            serde_json::from_value::<super::write_path::NewIssueReq>(serde_json::json!({
+            serde_json::from_value::<cadence_core::board_api::NewIssueReq>(serde_json::json!({
                 "project": "demo", "title": "t", "by": "operator",
             }))
             .is_err()
@@ -2689,5 +2005,35 @@ mod tests {
         for exe in ["/x/a", "/x/cadencex", "/x/sleep", "/x/xcadence"] {
             assert!(super::board_argv_state_dir(&argv(exe)).is_none(), "{exe}");
         }
+    }
+
+    /// CAD-1207: the timeout cleanup stops exactly the child it holds and
+    /// deletes `ui.pid` only while that file still names the child.
+    #[test]
+    fn reap_unready_child_kills_own_child_and_keeps_a_foreign_pidfile() {
+        let dir = tempfile::Builder::new()
+            .prefix("c1207-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let spawn = || {
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap()
+        };
+        let mut ours = spawn();
+        std::fs::write(super::pid_file(dir.path()), ours.id().to_string()).unwrap();
+        let pid = ours.id() as i32;
+        super::reap_unready_child(&mut ours, dir.path());
+        assert!(!super::pid_file(dir.path()).exists());
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child still alive");
+
+        let mut other = spawn();
+        std::fs::write(super::pid_file(dir.path()), "999999").unwrap();
+        super::reap_unready_child(&mut other, dir.path());
+        assert_eq!(
+            std::fs::read_to_string(super::pid_file(dir.path())).unwrap(),
+            "999999"
+        );
     }
 }

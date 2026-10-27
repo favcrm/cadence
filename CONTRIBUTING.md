@@ -25,8 +25,8 @@ briefing; an external session must not borrow a native alias or turn token.
 
 Use a stable Rust toolchain with rustfmt/clippy, Python 3.11+ for script checks
 (the recipe validator uses standard-library `tomllib`), and
-Node 22 with the pnpm version declared in [ui/package.json](ui/package.json).
-Install UI dependencies with `pnpm -C ui install --frozen-lockfile`.
+Node 22 with Bun 1.4.4, as declared in [ui/package.json](ui/package.json).
+Install UI dependencies with `bun install --cwd ui --frozen-lockfile`.
 The [nextest installer](scripts/install-cadence-nextest) and
 [runner](scripts/cadence-nextest) pin and verify the test executable.
 
@@ -38,9 +38,9 @@ python3 -m unittest discover -s scripts -p 'test_check_doc_links.py'
 rtk proxy cargo fmt --all -- --check
 ```
 
-For UI changes, run `pnpm -C ui typecheck`, `pnpm -C ui test:url-state` and
-`pnpm -C ui build`. Despite its name, `test:url-state` covers the compiled
-frontend test directory. Use `pnpm -C ui test` when that alias is available in
+For UI changes, run `bun run --cwd ui typecheck`, `bun run --cwd ui test:url-state` and
+`bun run --cwd ui build`. Despite its name, `test:url-state` covers the compiled
+frontend test directory. Use `bun run --cwd ui test` when that alias is available in
 the checked-out package scripts.
 
 Select the affected Rust test binary and a meaningful filter. For example,
@@ -50,7 +50,9 @@ after admission and isolation are configured:
 rtk proxy cargo test --locked --features test-seam --test daemon <FILTER> -- --test-threads 2
 ```
 
-Set `CARGO_BUILD_JOBS=4`. Keep host-wide sccache enabled; only use the documented
+Set `CARGO_BUILD_JOBS=4`. Keep host-wide sccache enabled (`SCCACHE_DIR`
+forced to `~/.cache/sccache` in `~/.cargo/config.toml` so a lane tmp
+`XDG_CACHE_HOME` cannot steal port 4226); only use the documented
 one-off `RUSTC_WRAPPER=` diagnostic after a strange build failure. Shared model
 changes also require compilation of all affected targets: a narrow behavior
 selection cannot find an incompatible initializer in another test crate.
@@ -77,24 +79,38 @@ every script check is compilation-free.
 
 ## Fixture isolation and test tiers
 
-For ordinary hosted feedback on the retained CAD-663 and CAD-650 cases, dispatch
-the `test-feedback` workflow from `main` with a full lowercase 40-character
-repository commit SHA and the allowlisted case. It runs that exact test once
-using the dispatch main commit's trusted nextest wrapper. A passing assertion
-is green; an assertion failure or invalid feedback is red. The artifact records
-both source SHAs, the actual runner return code, bounded logs and available
-JUnit. Missing or inconsistent reports are invalid feedback, not a diagnosis.
-The pinned profile also retains nonselected skipped cases from the same target;
-only the requested case may execute, and supplied counts must match all entries.
-This route does not retry required CI or replace local build admission; the
-separate mutation workflow still requires a deliberate assertion failure.
+For ordinary hosted feedback on one retained case, run that case through the
+live suite instead: `scripts/cadence-nextest -E 'test(=name)'` locally, or the
+`stress` workflow on ephemeral runners for repeated runs. The former
+`test-feedback` workflow and its CAD-663/CAD-650 allowlist are gone — those two
+cases' cargo test targets were retired with the legacy integration suite, so
+the workflow could not have run. This route does not retry required CI or
+replace local build admission; the separate mutation workflow still requires a
+deliberate assertion failure.
 
 Fixture daemons and boards use a short `/tmp/<lane>` root for HOME, XDG paths
 and TMPDIR: Unix socket paths cannot exceed 107 bytes. Pass through the real
 `RUSTUP_HOME` and `CARGO_HOME` so an isolated HOME can resolve the toolchain.
-Set `CADENCE_SUITE_LOCK` to the host's designated suite lock. Direct nextest
-invocations require it; the runner acquires the lock and prevents nested locking
-by test children. Do not invent a per-lane lock to bypass host serialization.
+For `scripts/run-result-tests` and direct `scripts/cadence-nextest` runs,
+set `CADENCE_SUITE_LOCK` to the host's designated **absolute** suite-lock path.
+Both runners use `scripts/suite-lock-config`; neither invents a per-run path.
+Isolated CI continues to supply its explicit runner-temp lock. On shared hosts,
+all cooperating suites must use the same file; a per-lane lock coordinates
+nothing. Do not delete or replace that file while a caller might hold it.
+
+`CADENCE_SUITE_LOCK_WAIT_SECS` bounds shell-runner acquisition: whole seconds
+from 0 to 86400, default 3600; zero refuses contention immediately. The wrapper
+reports the path/wait limit to stderr and exits 75 if acquisition times out.
+Executed commands retain their own exit status, so exit 75 alone is not proof
+of a lock timeout. The wait setting does not reach Cargo/test commands.
+
+The nextest wrapper owns the flock and prevents nested acquisition/descriptor
+leaks in children. A full `cadence review` owns its lock instead, using the
+review configuration's deadline. Nextest `list` skips the suite lock but still
+needs build admission if it compiles. Plain `cargo test` does **not** acquire
+this flock merely because the variable is set: fully isolated focused Cargo
+checks use build/test admission and fixture isolation, not an implied mutex.
+The suite lock is advisory coordination, separate from admission and identity.
 Use ports 3110–3199 for boards you start and preserve production services.
 
 ## Isolated board development
@@ -110,17 +126,17 @@ export CADENCE_DEV_BOARD_PORT=3117
 export XDG_CONFIG_HOME="$CADENCE_SANDBOX_ROOT/config"
 mkdir -m 700 -p "$XDG_CONFIG_HOME"
 unset CADENCE_TOKEN CADENCE_ISSUER CADENCE_ORG
-npx --yes pnpm@12.2.1 -C ui install --frozen-lockfile
-npx --yes pnpm@12.2.1 -C ui build
+bun install --cwd ui --frozen-lockfile
+bun run --cwd ui build
 # On a shared host, obtain the documented build-slot admission first.
 CARGO_BUILD_JOBS=4 cargo build --locked --features ui
 ./target/debug/cadence sandbox up dev --port "$CADENCE_DEV_BOARD_PORT"
-npx --yes pnpm@12.2.1 -C ui dev --host 127.0.0.1
+bun run --cwd ui dev --host 127.0.0.1
 ```
 
 Open the Vite URL printed by the final command. UI edits reload there without a
 Rust build or cloud deployment; `/api` proxies only to the selected sandbox
-board. The pinned pnpm command refuses a missing or out-of-range
+board. The Vite development command refuses a missing or out-of-range
 `CADENCE_DEV_BOARD_PORT`, including the production port 3010. For Rust edits,
 leave Vite running, then rebuild and restart the sandbox:
 
@@ -147,8 +163,8 @@ Choose tests by the changed contract:
 - CI checks the full test inventory and runs the required suite with `test-seam`.
   Default-feature checks retain real caller-identity coverage; the debug-only
   seam must never appear in release builds. The `ui` feature embeds a previously
-  built SPA. Avoid `--all-features`: `e2e` is an opt-in journey tier with its own
-  release/Node/browser prerequisites.
+  built SPA, so avoid `--all-features`; the retired `e2e` journey tier used to
+  add its own release/Node/browser prerequisites.
 
 Retain real timing budgets and operator-lineage proofs. A new or changed
 enforced rule ships with one independent acceptance check proving the bad

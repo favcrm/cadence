@@ -1,9 +1,11 @@
 import { useWriteBlock } from "../auth/WriteGate";
+import { useTranslate } from "../../lib/locale";
 import { useState } from "react";
-import { api, ApiError } from "../../lib/api";
+import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
 import Button from "../../ui/Button";
+import { plainFailure } from "./needs";
 import { planView, rejectReasonError } from "./plan";
 
 const STATE_CHIP: Record<string, string> = {
@@ -19,6 +21,41 @@ const STATUS_CHIP: Record<string, string> = {
   ready: "text-ink-300",
   dropped: "text-ink-500 line-through",
 };
+
+/**
+ * The plan decision itself: read the epic, approve it, or reject it with
+ * a reason. The card below and the review drawer (CAD-1216) both drive
+ * it, so there is one path to the operator-only plan endpoints.
+ */
+export function usePlanDecision(epic: string, block: string | null, onDecided?: (epic: string, state: string) => void) {
+  const state = useQuery(resources.issue(epic));
+  const [busy, setBusy] = useState<null | "approve" | "reject">(null);
+  const [error, setError] = useState<string | null>(null);
+  const detail = state.data?.id === epic ? state.data : null;
+  const view = detail ? planView(detail, block) : null;
+  const decide = (verb: "approve" | "reject", reason = "", done?: () => void) => {
+    if (verb === "reject") {
+      const why = rejectReasonError(reason);
+      if (why) {
+        setError(why);
+        return;
+      }
+    }
+    setBusy(verb);
+    setError(null);
+    api
+      .decidePlan(epic, verb, verb === "reject" ? reason : undefined)
+      .then((out) => {
+        done?.();
+        void resources.issue(epic).invalidate();
+        void resources.overview.invalidate();
+        onDecided?.(epic, String((out as { state?: unknown }).state ?? verb));
+      })
+      .catch((e: unknown) => setError(plainFailure(e)))
+      .finally(() => setBusy(null));
+  };
+  return { state, detail, view, busy, error, setError, decide };
+}
 
 /**
  * A plan card (CAD-328): the epic's goal, its tickets with size and
@@ -38,65 +75,44 @@ export default function PlanCard({
   onOpenIssue: (id: string) => void;
   onDecided?: (epic: string, state: string) => void;
 }) {
-  const state = useQuery(resources.issue(epic));
-  const [busy, setBusy] = useState<null | "approve" | "reject">(null);
+  const block = useWriteBlock(readOnly);
+  const tr = useTranslate();
+  const { state, detail, view, busy, error, setError, decide: send } = usePlanDecision(epic, block, onDecided);
   const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState("");
-  const [error, setError] = useState<string | null>(null);
-
-  const block = useWriteBlock(readOnly);
-  const detail = state.data?.id === epic ? state.data : null;
-  const view = detail ? planView(detail, block) : null;
 
   if (!detail) {
     return (
       <div className="card px-3.5 py-3 text-label text-ink-500" data-plan-card={epic}>
-        {state.status === "failed" ? `Plan ${epic} could not be read — ${state.error}` : `Loading plan ${epic}…`}
+        {state.status === "failed" ? `${tr("Plan")} ${epic} ${tr("could not be read —")} ${state.error}` : `${tr("Loading plan")} ${epic}…`}
       </div>
     );
   }
   if (!view) {
     return (
       <div className="card px-3.5 py-3 text-label text-ink-500" data-plan-card={epic}>
-        {epic} is not a plan.
+        {epic} {tr("is not a plan.")}
       </div>
     );
   }
 
-  const decide = (verb: "approve" | "reject") => {
-    if (verb === "reject") {
-      const why = rejectReasonError(reason);
-      if (why) {
-        setError(why);
-        return;
-      }
-    }
-    setBusy(verb);
-    setError(null);
-    api
-      .decidePlan(epic, verb, verb === "reject" ? reason : undefined)
-      .then((out) => {
-        setRejecting(false);
-        setReason("");
-        void resources.issue(epic).invalidate();
-        void resources.overview.invalidate();
-        onDecided?.(epic, String((out as { state?: unknown }).state ?? verb));
-      })
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
-      .finally(() => setBusy(null));
-  };
+  const decide = (verb: "approve" | "reject") =>
+    send(verb, reason, () => {
+      setRejecting(false);
+      setReason("");
+    });
 
   return (
-    <section className="card overflow-hidden" data-plan-card={epic} aria-label={`plan ${epic}`}>
+    <section className="card overflow-hidden" data-plan-card={epic} aria-label={`${tr("plan")} ${epic}`}>
       <header className="px-3.5 pt-3 pb-2 flex items-start gap-2 min-w-0">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="slabel">plan</span>
+            <span className="slabel">{tr("plan")}</span>
             <button className="lnk num text-label" onClick={() => onOpenIssue(epic)}>
               {epic}
             </button>
             <span className={`chip ${STATE_CHIP[view.state] ?? "bg-ink-800 text-ink-400"}`}>
-              {view.state === "proposed" ? "awaiting you" : view.state}
+              {view.state === "proposed" ? tr("awaiting you") : view.state}
             </span>
           </div>
           <div className="text-cardtitle font-medium text-ink-100 mt-1 break-words">{view.title}</div>
@@ -115,14 +131,14 @@ export default function PlanCard({
               <div className="text-micro text-ink-500 mt-0.5 flex flex-wrap gap-x-2">
                 <span>
                   {typeof t.acceptance === "number"
-                    ? `${t.acceptance} acceptance ${t.acceptance === 1 ? "check" : "checks"}`
-                    : "acceptance unknown"}
+                    ? `${t.acceptance} ${tr("acceptance")} ${t.acceptance === 1 ? tr("check") : tr("checks")}`
+                    : tr("acceptance unknown")}
                 </span>
                 {t.owner && <span>· {t.owner}</span>}
-                {t.blocked_by && t.blocked_by.length > 0 && <span>· after {t.blocked_by.join(", ")}</span>}
+                {t.blocked_by && t.blocked_by.length > 0 && <span>· {tr("after")} {t.blocked_by.join(", ")}</span>}
               </div>
             </div>
-            <span className="chip bg-ink-800 text-ink-300 num shrink-0" title="size (S=1, M=3, L=8)">
+            <span className="chip bg-ink-800 text-ink-300 num shrink-0" title={tr("size (S=1, M=3, L=8)")}>
               {t.size ?? "M?"}
             </span>
             <span className={`text-micro num shrink-0 w-12 text-right ${STATUS_CHIP[t.status] ?? "text-ink-400"}`}>
@@ -131,16 +147,16 @@ export default function PlanCard({
           </li>
         ))}
         {view.tickets.length === 0 && (
-          <li className="px-3.5 py-2 text-label text-ink-500">No tickets listed.</li>
+          <li className="px-3.5 py-2 text-label text-ink-500">{tr("No tickets listed.")}</li>
         )}
       </ul>
 
       <div className="px-3.5 py-2.5 border-t border-ink-700">
         <div className="flex items-center justify-between text-micro text-ink-500">
           <span>
-            {view.done}/{view.total} done
+            {view.done}/{view.total} {tr("done")}
           </span>
-          <span className="num">{view.percent === null ? "progress unknown" : `${view.percent}%`}</span>
+          <span className="num">{view.percent === null ? tr("progress unknown") : `${view.percent}%`}</span>
         </div>
         <div
           className="h-1.5 rounded bg-ink-800 mt-1.5 overflow-hidden"
@@ -155,7 +171,7 @@ export default function PlanCard({
 
       {view.state === "rejected" && view.reason && (
         <p className="px-3.5 pb-2.5 text-label text-ink-400 break-words">
-          Rejected{view.decidedBy ? ` by ${view.decidedBy}` : ""}: {view.reason}
+          {tr("Rejected")}{view.decidedBy ? ` ${tr("by")} ${view.decidedBy}` : ""}: {view.reason}
         </p>
       )}
 
@@ -165,14 +181,14 @@ export default function PlanCard({
             <>
               {rejecting && (
                 <label className="block">
-                  <span className="slabel">reason (required)</span>
+                  <span className="slabel">{tr("reason (required)")}</span>
                   <textarea
                     value={reason}
                     onChange={(e) => setReason(e.target.value)}
                     rows={2}
                     className="field w-full mt-1 text-secondary"
-                    placeholder="What should change before this plan can go ahead?"
-                    aria-label="rejection reason"
+                    placeholder={tr("What should change before this plan can go ahead?")}
+                    aria-label={tr("rejection reason")}
                   />
                 </label>
               )}
@@ -185,7 +201,7 @@ export default function PlanCard({
                     loading={busy === "approve"}
                     onClick={() => decide("approve")}
                   >
-                    {busy === "approve" ? "Approving…" : "Approve plan"}
+                    {busy === "approve" ? tr("Approving…") : tr("Approve plan")}
                   </Button>
                 )}
                 {rejecting ? (
@@ -197,7 +213,7 @@ export default function PlanCard({
                       loading={busy === "reject"}
                       onClick={() => decide("reject")}
                     >
-                      {busy === "reject" ? "Rejecting…" : "Reject plan"}
+                      {busy === "reject" ? tr("Rejecting…") : tr("Reject plan")}
                     </Button>
                     <Button
                       size="sm"
@@ -206,12 +222,12 @@ export default function PlanCard({
                         setError(null);
                       }}
                     >
-                      Cancel
+                      {tr("Cancel")}
                     </Button>
                   </>
                 ) : (
                   <Button variant="danger" size="sm" disabled={busy !== null} onClick={() => setRejecting(true)}>
-                    Reject…
+                    {tr("Reject…")}
                   </Button>
                 )}
               </div>

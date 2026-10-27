@@ -18,6 +18,7 @@
 //! 256-bit token is the credential — and reveals nothing but a
 //! constant `{"unsubscribed": true}`.
 
+use super::app_screen_services_rpc::ScreenServiceProof;
 use super::crm_smtp_rpc::SenderTransport;
 use super::*;
 use crate::store::app_records::RecordStore;
@@ -111,6 +112,17 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
+        self.rpc_crm_send_with_proof(method, params, peer_pid, None)
+    }
+
+    pub(super) fn rpc_crm_send_with_proof(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+        proof: Option<&ScreenServiceProof>,
+    ) -> Result<Value> {
+        Self::screen_service_method(proof, method)?;
         self.operator_connection(method, params, peer_pid)?;
         let allowed: &[&str] = match method {
             "crm_send_prepare" => &[
@@ -119,6 +131,9 @@ impl Shared {
                 "campaign_id",
                 "audience_freeze_id",
                 "request_id",
+                "base",
+                "exclusion_list_id",
+                "max_recipients",
             ],
             "crm_send_approve" => &["install_id", "context_id", "send_id", "send_digest"],
             "crm_send_show" => &["install_id", "context_id", "send_id"],
@@ -132,6 +147,8 @@ impl Shared {
             ],
             "crm_send_origin_set" => &["unsubscribe_origin"],
             "crm_send_origin_show" => &[],
+            "crm_autonomy_set" => &["mode"],
+            "crm_autonomy_show" => &[],
             _ => return Err(Error::rejected("unknown CRM send method")),
         };
         let fields = params
@@ -141,6 +158,20 @@ impl Shared {
             if !allowed.contains(&key.as_str()) {
                 return Err(Error::rejected(format!("{key} is not a {method} field")));
             }
+            // CAD-1836: prepare carries the audience selection that lets the
+            // send own its freeze. Those two fields are structured, not text.
+            if method == "crm_send_prepare" && key == "base" {
+                if !value.is_object() {
+                    return Err(Error::rejected("base must be an object"));
+                }
+                continue;
+            }
+            if method == "crm_send_prepare" && key == "max_recipients" {
+                if !value.is_i64() {
+                    return Err(Error::rejected("max_recipients must be an integer"));
+                }
+                continue;
+            }
             if !value.is_string()
                 && !(method == "crm_send_origin_set"
                     && key == "unsubscribe_origin"
@@ -149,10 +180,28 @@ impl Shared {
                 return Err(Error::rejected(format!("{key} must be a string")));
             }
         }
+        // The autonomy setting is daemon-global — no installation or
+        // context on the wire. It is operator-only by the connection
+        // proof above; a scoped agent turn cannot raise its own level.
+        if method == "crm_autonomy_set" || method == "crm_autonomy_show" {
+            let execute = || match method {
+                "crm_autonomy_set" => {
+                    let mode = required_str(params, "mode")?;
+                    self.store.crm_autonomy_set(mode, "operator")?;
+                    Ok(json!({"crm_autonomy": self.store.crm_autonomy()?}))
+                }
+                _ => Ok(json!({"crm_autonomy": self.store.crm_autonomy()?})),
+            };
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            return execute();
+        }
         // The origin verbs are daemon-global — no installation or
         // context on the wire.
         if method == "crm_send_origin_set" || method == "crm_send_origin_show" {
-            return match method {
+            let execute = || match method {
                 "crm_send_origin_set" => {
                     let origin = match params.get("unsubscribe_origin") {
                         Some(Value::Null) | None => None,
@@ -167,6 +216,23 @@ impl Shared {
                 }
                 _ => self.crm_send_origin_show(),
             };
+            return if let Some(proof) = proof {
+                self.screen_service_scope(
+                    proof.install(),
+                    proof.context()?,
+                    true,
+                    Some(proof),
+                    execute,
+                )
+            } else {
+                // Serialize native global edits with the screen confirmation
+                // fence; native callers retain the same fields and result.
+                let _custody = self
+                    .platform_custody_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                execute()
+            };
         }
         let install = required_str(params, "install_id")?;
         let context = required_str(params, "context_id")?;
@@ -177,25 +243,38 @@ impl Shared {
                 let request = send_request_id(params)?;
                 crate::proto::identifier(campaign, "campaign ID")?;
                 crate::proto::identifier(freeze, "audience freeze ID")?;
-                self.crm_send_prepare(install, context, campaign, freeze, &request)
+                let base = params.get("base");
+                let exclusion = params.get("exclusion_list_id").and_then(Value::as_str);
+                let max_recipients = params.get("max_recipients").and_then(Value::as_i64);
+                self.crm_send_prepare(
+                    install,
+                    context,
+                    campaign,
+                    freeze,
+                    &request,
+                    base,
+                    exclusion,
+                    max_recipients,
+                    proof,
+                )
             }
             "crm_send_approve" => {
                 let send_id = required_str(params, "send_id")?;
                 let digest = required_str(params, "send_digest")?;
                 crate::proto::identifier(send_id, "send ID")?;
-                self.crm_send_approve(install, context, send_id, digest)
+                self.crm_send_approve(install, context, send_id, digest, proof)
             }
             "crm_send_show" => {
                 let send_id = required_str(params, "send_id")?;
                 crate::proto::identifier(send_id, "send ID")?;
-                self.crm_send_show(install, context, send_id)
+                self.crm_send_show(install, context, send_id, proof)
             }
             "crm_send_list" => {
                 let campaign = params.get("campaign_id").and_then(Value::as_str);
                 if let Some(c) = campaign {
                     crate::proto::identifier(c, "campaign ID")?;
                 }
-                self.crm_send_list(install, context, campaign)
+                self.crm_send_list(install, context, campaign, proof)
             }
             "crm_send_resolve" => {
                 let send_id = required_str(params, "send_id")?;
@@ -206,7 +285,7 @@ impl Shared {
                 if !matches!(resolution, "accepted" | "failed") {
                     return Err(Error::rejected("resolution must be 'accepted' or 'failed'"));
                 }
-                self.crm_send_resolve(install, context, send_id, customer, resolution)
+                self.crm_send_resolve(install, context, send_id, customer, resolution, proof)
             }
             _ => unreachable!(),
         }
@@ -320,6 +399,41 @@ impl Shared {
     /// content at its approved revision, the live audience freeze,
     /// the live sender link and the authority behind it. Drift since
     /// the approve click refuses — never sends stale inputs.
+    /// The refusals that do not need the audience freeze: approved content,
+    /// a live SMTP link under the held authority, and an accepted test send.
+    /// CAD-1836 runs these before the send may write its snapshot, so a
+    /// refused preparation never mutates audience state.
+    fn crm_send_preflight(
+        self: &Arc<Self>,
+        install: &str,
+        context: &str,
+        records: &RecordStore,
+        campaign: &str,
+    ) -> Result<()> {
+        self.crm_send_origin()?;
+        let (_, content_digest) = records.app_content_approved(context, campaign)?;
+        let link = self.store.crm_smtp_link(install, context)?.ok_or_else(|| {
+            Error::rejected("no SMTP sender is bound to this installation and context")
+        })?;
+        if link.state != "live" {
+            return Err(Error::rejected(
+                "SMTP sender binding is revoked; bind it again instead",
+            ));
+        }
+        self.crm_smtp_authority(&link.connection_id, link.auth_revision)?;
+        if !records.app_campaign_test_send_accepted(
+            context,
+            campaign,
+            &content_digest,
+            &link.digest,
+        )? {
+            return Err(Error::rejected(
+                "an SMTP-accepted test send of this exact content and binding is required first",
+            ));
+        }
+        Ok(())
+    }
+
     fn crm_send_facts(
         self: &Arc<Self>,
         install: &str,
@@ -327,6 +441,7 @@ impl Shared {
         records: &RecordStore,
         campaign: &str,
         freeze: &str,
+        custody_held: bool,
     ) -> Result<SendFacts> {
         let origin = self.crm_send_origin()?;
         let (content_revision, content_digest) = records.app_content_approved(context, campaign)?;
@@ -337,10 +452,11 @@ impl Shared {
             ));
         }
         let frozen = records.app_audience_frozen(context, freeze)?;
-        let _custody = self
-            .platform_custody_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _custody = if custody_held {
+            None
+        } else {
+            Some(self.custody_operation()?)
+        };
         let link = self.store.crm_smtp_link(install, context)?.ok_or_else(|| {
             Error::rejected("no SMTP sender is bound to this installation and context")
         })?;
@@ -349,6 +465,7 @@ impl Shared {
                 "SMTP sender binding is revoked; bind it again instead",
             ));
         }
+        self.refuse_encrypted_connection(&link.connection_id)?;
         self.crm_smtp_authority(&link.connection_id, link.auth_revision)?;
         Ok(SendFacts {
             origin,
@@ -361,6 +478,9 @@ impl Shared {
         })
     }
 
+    // The send's inputs are all required to commit one digest; the freeze
+    // selection joined them in CAD-1836.
+    #[allow(clippy::too_many_arguments)]
     fn crm_send_prepare(
         self: &Arc<Self>,
         install: &str,
@@ -368,10 +488,50 @@ impl Shared {
         campaign: &str,
         freeze: &str,
         request_id: &str,
+        base: Option<&Value>,
+        exclusion_list_id: Option<&str>,
+        max_recipients: Option<i64>,
+        proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope(install, context, || {
+        self.crm_smtp_scope_with_proof(install, context, true, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
-            let facts = self.crm_send_facts(install, context, &records, campaign, freeze)?;
+            // CAD-1836: the send owns its audience snapshot. Without a
+            // selection the pre-existing freeze requirement stands exactly as
+            // before (its messages included). With one, refuse anything the
+            // send cannot commit first, then freeze the supplied selection —
+            // the store replays an identical freeze, refreshes a moved one at
+            // the same base, and refuses an id reused for another audience.
+            match (base, max_recipients) {
+                (None, None) => {}
+                (Some(_), None) => {
+                    return Err(Error::rejected(
+                        "max_recipients is required with the audience selection",
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(Error::rejected(
+                        "base is required with max_recipients",
+                    ));
+                }
+                (Some(base), Some(max)) => {
+                    // A selection always freezes; a request that already
+                    // names a send is a replay and may not carry one. The
+                    // complete committed material is therefore never
+                    // re-checked after an audience write: a new snapshot needs
+                    // a new request id, which needs a new approval.
+                    let send_id = format!("send-{request_id}");
+                    if records.app_campaign_send(context, &send_id)?.is_some() {
+                        return Err(Error::rejected(
+                            "request id is already used; a new confirmation needs a new request id",
+                        ));
+                    }
+                    self.crm_send_preflight(install, context, &records, campaign)?;
+                    let base = crate::store::app_audiences::AudienceBase::parse(base)
+                        .map_err(|_| Error::rejected("audience base is invalid"))?;
+                    records.app_audience_prepare(context, freeze, &base, exclusion_list_id, max)?;
+                }
+            }
+            let facts = self.crm_send_facts(install, context, &records, campaign, freeze, proof.is_some())?;
             if (facts.frozen_member_ids.len() as i64) > facts.max_recipients {
                 return Err(Error::rejected(
                     "frozen audience exceeds its max_recipients ceiling",
@@ -473,8 +633,9 @@ impl Shared {
         context: &str,
         send_id: &str,
         given_digest: &str,
+        proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope(install, context, || {
+        self.crm_smtp_scope_with_proof(install, context, true, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
             let send = records
                 .app_campaign_send(context, send_id)?
@@ -504,6 +665,7 @@ impl Shared {
                 &records,
                 &send.campaign_id,
                 &send.audience_freeze_id,
+                proof.is_some(),
             )?;
             if facts.content_revision != send.content_revision
                 || facts.content_digest != send.content_digest
@@ -593,8 +755,9 @@ impl Shared {
         install: &str,
         context: &str,
         send_id: &str,
+        proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope(install, context, || {
+        self.crm_smtp_scope_with_proof(install, context, false, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
             let send = records
                 .app_campaign_send(context, send_id)?
@@ -614,8 +777,9 @@ impl Shared {
         install: &str,
         context: &str,
         campaign: Option<&str>,
+        proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope(install, context, || {
+        self.crm_smtp_scope_with_proof(install, context, false, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
             let sends = records.app_campaign_sends(context, campaign)?;
             let mut out = Vec::with_capacity(sends.len());
@@ -643,8 +807,9 @@ impl Shared {
         send_id: &str,
         customer_id: &str,
         resolution: &str,
+        proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope(install, context, || {
+        self.crm_smtp_scope_with_proof(install, context, false, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
             if records.app_campaign_send(context, send_id)?.is_none() {
                 return Err(Error::rejected(
@@ -672,6 +837,22 @@ impl Shared {
         })
     }
 
+    /// Read-only admission under C, checking both the frozen target and
+    /// the current link. A changed link must not turn a legacy queued row
+    /// into a route to an encrypted sender before its later proof fails.
+    fn refuse_encrypted_campaign_sender(
+        &self,
+        install: &str,
+        context: &str,
+        connection_id: &str,
+    ) -> Result<()> {
+        self.refuse_encrypted_connection(connection_id)?;
+        if let Some(link) = self.store.crm_smtp_link(install, context)? {
+            self.refuse_encrypted_connection(&link.connection_id)?;
+        }
+        Ok(())
+    }
+
     /// One worker per live send: the registry refuses a second
     /// runner for the same `(install, context, send)`, so a restart
     /// or a double approve can never double-submit.
@@ -681,6 +862,20 @@ impl Shared {
         context: &str,
         send_id: &str,
     ) {
+        // Boot/explicit resume gets no worker for an encrypted target,
+        // even while custody is locked. Release C before registry work.
+        let admission = (|| -> Result<()> {
+            let _custody = self.custody_operation()?;
+            let records = RecordStore::open(&self.state_dir, install)?;
+            let send = records
+                .app_campaign_send(context, send_id)?
+                .ok_or_else(|| Error::rejected("campaign send is unavailable"))?;
+            self.refuse_encrypted_campaign_sender(install, context, &send.connection_id)
+        })();
+        if admission.is_err() {
+            eprintln!("crm send worker admission refused");
+            return;
+        }
         let key = format!("{install}/{context}/{send_id}");
         {
             let mut workers = self
@@ -710,7 +905,8 @@ impl Shared {
     /// Boot reconciliation: every send whose durable intent is still
     /// `sending` gets its `submitting` leftovers marked `uncertain`
     /// (they may have been delivered before the crash — never
-    /// resend) and a worker respawned for the still-`queued` rest.
+    /// resend). Only supported legacy targets get a worker for the
+    /// still-`queued` rest; encrypted history stays uncertain/non-resumed.
     pub(super) fn reconcile_crm_sends(self: &Arc<Self>) {
         let Ok(sends) = self.store.crm_sends_sending() else {
             return;
@@ -823,7 +1019,15 @@ impl Shared {
                 break;
             };
             let customer_id = next.customer_id.clone();
-            if !records.app_campaign_delivery_claim(context, send_id, &customer_id)? {
+            // Classify and claim in one short C -> D section, before the
+            // scope proof (P) and before any token write. Encrypted use
+            // must not become a submitting row even if the loader refuses.
+            let claimed = {
+                let _custody = self.custody_operation()?;
+                self.refuse_encrypted_campaign_sender(install, context, &send.connection_id)?;
+                records.app_campaign_delivery_claim(context, send_id, &customer_id)?
+            };
+            if !claimed {
                 continue;
             }
             // Every check again, right before submission: context
@@ -831,7 +1035,7 @@ impl Shared {
             // authority, content still approved at the pinned
             // revision, customer still sendable — all inside the
             // custody lock the submission itself holds.
-            let step = match self.crm_smtp_scope(install, context, || {
+            let step = match self.crm_smtp_scope(install, context, false, || {
                 self.crm_send_row_step(
                     &records,
                     install,
@@ -975,6 +1179,11 @@ impl Shared {
         customer_id: &str,
         reuse_token: Option<String>,
     ) -> Result<Step> {
+        // Repeat admission at the internal submission entry. Hold the
+        // existing submission custody section from before token writes;
+        // never reenter it below, and never mint a campaign decrypt witness.
+        let _custody = self.custody_operation()?;
+        self.refuse_encrypted_campaign_sender(install, context, &send.connection_id)?;
         // Mint this attempt's unsubscribe token and land its sha256
         // in the App token table plus the core index BEFORE any
         // socket opens — a submitted message's token must always be
@@ -1016,10 +1225,6 @@ impl Shared {
             // pass claims and re-mints it.
             return Ok(Step::Requeue);
         }
-        let _custody = self
-            .platform_custody_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let link = self
             .store
             .crm_smtp_link(install, context)?
@@ -1198,6 +1403,10 @@ fn send_request_id(params: &Value) -> Result<String> {
     let id = required_str(params, "request_id")?;
     crate::proto::identifier(id, "request ID")
 }
+
+#[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "crm_send_rpc_worker_tests.rs"]
+mod custody_worker_checks;
 
 #[cfg(test)]
 mod backoff_tests {

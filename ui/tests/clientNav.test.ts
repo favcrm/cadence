@@ -51,12 +51,14 @@ equal(
   "page href",
 );
 
-/** A download, a new tab, a modifier, or /api/ keeps the browser's load. */
+/** Downloads, reserved server routes and modified clicks keep native navigation. */
 function loads(over: Partial<ClientNavClick>, what: string): void {
   let prevented = false;
   const gone: string[] = [];
+  const requested = click(over);
+  const destination = requested.href;
   const followed = followClientNav(
-    click(over),
+    requested,
     () => {
       prevented = true;
     },
@@ -65,6 +67,7 @@ function loads(over: Partial<ClientNavClick>, what: string): void {
   equal(followed, false, `${what} not followed`);
   equal(prevented, false, `${what} browser proceeds`);
   equal(gone.length, 0, `${what} no navigate`);
+  equal(requested.href, destination, `${what} retains its destination`);
 }
 
 loads({ href: "/api/wiki/file?path=global%2Fhello.md&raw=1", download: true }, "download");
@@ -78,5 +81,15 @@ loads({ href: "/wiki/global", shiftKey: true }, "shift click");
 loads({ href: "/wiki/global", button: 1 }, "middle click");
 loads({ href: "/wiki/global", defaultPrevented: true }, "already handled");
 loads({ href: "#section" }, "hash only");
+
+const platformLogin = `/__platform/login?to=${encodeURIComponent(`${ORIGIN}/projects/cadence?view=list`)}`;
+loads({ href: "/__platform" }, "reserved platform root");
+loads({ href: platformLogin }, "hosted sign-in document handoff");
+loads({ href: platformLogin, target: "_blank" }, "hosted sign-in new tab");
+loads({ href: platformLogin, ctrlKey: true }, "hosted sign-in ctrl click");
+loads({ href: platformLogin, metaKey: true }, "hosted sign-in meta click");
+loads({ href: platformLogin, shiftKey: true }, "hosted sign-in shift click");
+loads({ href: platformLogin, button: 1 }, "hosted sign-in middle click");
+stays("/__platformish", "nonreserved route");
 
 console.log("client nav checks passed");

@@ -5,6 +5,7 @@ use crate::error::{Error, Result};
 use crate::proto::identifier;
 use rusqlite::params;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 use super::messages::{row_message, Message};
@@ -12,6 +13,10 @@ use super::quota::{canonical_quota, merge_quota_json, quota_now_iso};
 use super::schema::AdoptEntry;
 use super::StoreConn;
 use super::{now, Store};
+
+/// What every agent-gc timer output says, verbatim.
+pub(crate) const AGENT_GC_RECORDS_ONLY: &str = "records only: frees no memory and no disk; \
+     a removed agent can no longer be resumed";
 
 /// The agent-state vocabulary — the `agents.state` column values —
 /// for `agent list --state` (CAD-437). `attention` is a fence, `error`
@@ -30,6 +35,9 @@ pub const AGENT_STATES: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub alias: String,
+    /// CAD-819: the durable participant identity, minted at registration.
+    /// The alias is a display name; a re-registered alias gets a new uid.
+    pub uid: String,
     pub provider: String,
     pub endpoint_kind: String,
     pub role: String,
@@ -65,6 +73,17 @@ pub struct Agent {
     pub generation: Option<String>,
     pub state: String,
     pub enabled: bool,
+    /// CAD-804: an explicit keep for every agent-gc path. A stopped,
+    /// idle row with this set is never swept, however old it is.
+    pub gc_keep: bool,
+    /// CAD-1239: set when the row is archived. The alias stays reserved and
+    /// every delete path refuses the row.
+    pub archived_at: Option<f64>,
+    pub archived_by: Option<String>,
+    pub archive_reason: Option<String>,
+    /// Monotonic compare-and-set revision, bumped by the schema trigger on
+    /// every lifecycle-relevant write.
+    pub lifecycle_rev: i64,
     pub error: Option<String>,
     /// Row timestamps — `updated` is the last state write, which
     /// `session end` measures idleness from.
@@ -99,6 +118,7 @@ pub struct ModelDefaultsSnapshot {
 fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
     Ok(Agent {
         alias: row.get("alias")?,
+        uid: row.get("uid")?,
         provider: row.get("provider")?,
         endpoint_kind: row.get("endpoint_kind")?,
         role: row.get("role")?,
@@ -125,6 +145,11 @@ fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         generation: row.get("generation")?,
         state: row.get("state")?,
         enabled: row.get::<_, i64>("enabled")? != 0,
+        gc_keep: row.get::<_, i64>("gc_keep")? != 0,
+        archived_at: row.get("archived_at")?,
+        archived_by: row.get("archived_by")?,
+        archive_reason: row.get("archive_reason")?,
+        lifecycle_rev: row.get("lifecycle_rev")?,
         error: row.get("error")?,
         created: row.get("created")?,
         updated: row.get("updated")?,
@@ -196,7 +221,12 @@ impl Agent {
             },
             "approval_policy": approval_policy,
             "approval_policy_source": approval_policy_source,
-            "enabled": self.enabled, "error": self.error,
+            "enabled": self.enabled, "gc_keep": self.gc_keep, "error": self.error,
+            "archived": self.archived_at.is_some(),
+            "archived_at": self.archived_at,
+            "archived_by": self.archived_by,
+            "archive_reason": self.archive_reason,
+            "lifecycle_rev": self.lifecycle_rev,
             "endpoint": self.endpoint, "params": self.params,
             "quota": self.quota,
             "generation": self.generation,
@@ -207,6 +237,55 @@ impl Agent {
             "dead": self.endpoint.is_none(),
         })
     }
+}
+
+/// CAD-804: one dead row the agent-gc paths consider, with the
+/// open-message count that decides eligibility and the age the caller's
+/// window is measured against. `agent_gc_plan` renders these rows.
+#[derive(Debug, Clone)]
+pub struct GcRow {
+    pub agent: Agent,
+    pub open_messages: i64,
+    pub age_secs: f64,
+}
+
+impl GcRow {
+    pub fn eligible(&self) -> bool {
+        Store::gc_eligible(&self.agent, self.open_messages)
+    }
+}
+
+/// CAD-1239: one archive preview/apply row.
+#[derive(Debug, Clone)]
+pub struct ArchivePlan {
+    pub agent: Agent,
+    pub reasons: Vec<String>,
+    pub open_messages: Vec<(String, String)>,
+    pub open_tasks: Vec<String>,
+    pub digest: String,
+}
+
+fn archive_digest(
+    agent: &Agent,
+    open_messages: &[(String, String)],
+    open_tasks: &[String],
+) -> String {
+    let mut messages = open_messages.to_vec();
+    messages.sort();
+    let mut tasks = open_tasks.to_vec();
+    tasks.sort();
+    let canonical = json!({
+        "alias": agent.alias,
+        "lifecycle_rev": agent.lifecycle_rev,
+        "state": agent.state,
+        "enabled": agent.enabled,
+        "endpoint_present": agent.endpoint.is_some(),
+        "gc_keep": agent.gc_keep,
+        "archived": agent.archived_at.is_some(),
+        "open_messages": messages,
+        "open_task_ids": tasks,
+    });
+    format!("{:x}", Sha256::digest(canonical.to_string().as_bytes()))
 }
 
 impl Store {
@@ -229,8 +308,10 @@ impl Store {
     /// callers should try [`Store::agent_opt`] first.
     pub fn agent_by_native(&self, native: &str) -> Result<Option<Agent>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT * FROM agents WHERE thread_id=?1 OR session_id=?1 LIMIT 2")?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM agents WHERE (thread_id=?1 OR session_id=?1)
+             AND archived_at IS NULL LIMIT 2",
+        )?;
         let rows = stmt
             .query_map([native], row_agent)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -244,7 +325,8 @@ impl Store {
 
     pub fn agents(&self) -> Result<Vec<Agent>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT * FROM agents ORDER BY alias")?;
+        let mut stmt =
+            conn.prepare("SELECT * FROM agents WHERE archived_at IS NULL ORDER BY alias")?;
         let rows = stmt.query_map([], row_agent)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -271,10 +353,11 @@ impl Store {
             return Err(Error::rejected("Working directory must be a directory"));
         }
         if let Some(text) = new.instructions {
-            if text.len() > 32_000 {
-                return Err(Error::rejected(
-                    "Instructions must be at most 32000 characters",
-                ));
+            if text.len() > super::MAX_INSTRUCTIONS_BYTES {
+                return Err(Error::rejected(format!(
+                    "Instructions must be at most {} UTF-8 bytes",
+                    super::MAX_INSTRUCTIONS_BYTES,
+                )));
             }
         }
         if let Some(p) = new.params {
@@ -294,8 +377,27 @@ impl Store {
             // A relaunch of a saved alias must keep that row. Resolving the
             // current defaults first can reject a previously valid near-cap
             // params blob with `params_too_large` and hide the duplicate.
-            if Self::agent_alias_exists(&*tx, new.alias)? {
+            if let Some(existing) = self.agent_opt_in(&*tx, new.alias)? {
+                if existing.archived_at.is_some() {
+                    return Err(Error::rejected(format!(
+                        "Agent '{}' is archived — its alias stays reserved; restore it first",
+                        new.alias
+                    )));
+                }
                 return Err(Self::duplicate_alias());
+            }
+            let active_cloud: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM messages WHERE alias=? AND source='job_dispatch' \
+                 AND state IN ('queued','running','unknown')",
+                [new.alias],
+                |r| r.get(0),
+            )?;
+            if active_cloud > 0 {
+                return Err(Error::rejected(format!(
+                    "Agent '{}' has an active cloud dispatch — stop and reconcile \
+                     the remote before registering this alias again",
+                    new.alias
+                )));
             }
             let defaults = Self::read_model_defaults_tx(&*tx)?;
             let resolved =
@@ -318,10 +420,21 @@ impl Store {
                     }
                 };
             let selection = resolved.model_selection.as_ref().map(Value::to_string);
-            let merged_params = match resolved.params.as_deref() {
+            let merged_params: Value = match resolved.params.as_deref() {
                 Some(raw) => serde_json::from_str(raw)?,
                 None => json!({}),
             };
+            if merged_params.get("profile").and_then(Value::as_str).is_some() {
+                if let Some(model) = merged_params.get("model").and_then(Value::as_str) {
+                    let metadata = &defaults.config.agent_settings;
+                    crate::agent_settings::validate_model_harness(
+                        model,
+                        new.provider,
+                        metadata.get("models").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]),
+                        metadata.get("providers").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]),
+                    )?;
+                }
+            }
             if let Err(err) =
                 registry::validate_launch_params(new.provider, new.endpoint_kind, &merged_params)
             {
@@ -340,8 +453,8 @@ impl Store {
             };
             tx.execute(
                 "INSERT INTO agents(alias,provider,endpoint_kind,role,team_role,cwd,sandbox,
-                               instructions,params,model_selection,state,endpoint,created,updated)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                               instructions,params,model_selection,state,endpoint,created,updated,uid)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     new.alias,
                     new.provider,
@@ -356,7 +469,8 @@ impl Store {
                     state,
                     endpoint,
                     now(),
-                    now()
+                    now(),
+                    format!("agt-{}", uuid::Uuid::new_v4().simple())
                 ],
             )?;
             Self::event(
@@ -713,6 +827,11 @@ impl Store {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
+            if agent.archived_at.is_some() {
+                return Err(Error::rejected(format!(
+                    "Agent '{alias}' is archived — restore it before changing it"
+                )));
+            }
             let mut merged = agent.params.clone().unwrap_or_else(|| json!({}));
             let target = merged
                 .as_object_mut()
@@ -720,6 +839,13 @@ impl Store {
             let patch = patch
                 .as_object()
                 .ok_or_else(|| Error::rejected("params patch must be a JSON object"))?;
+            for key in ["profile", "profile_revision", "profile_digest"] {
+                if patch.contains_key(key) {
+                    return Err(Error::rejected(
+                        "profile identity is fixed at registration and cannot be patched",
+                    ));
+                }
+            }
             let model_selection = if patch.contains_key("model") {
                 if !registry::supports_model(&agent.provider, &agent.endpoint_kind) {
                     return Err(Error::invalid(
@@ -817,6 +943,49 @@ impl Store {
         })
     }
 
+    /// CAD-1752: replace an agent's standing instructions. The row and the
+    /// `instructions_updated` event commit together; the event carries the
+    /// old and new sha256 digests, never the text. Returns `(old, new)`.
+    pub fn set_instructions_by(
+        &self,
+        alias: &str,
+        text: &str,
+        audit: &Value,
+    ) -> Result<(Option<String>, String)> {
+        if text.len() > super::MAX_INSTRUCTIONS_BYTES {
+            return Err(Error::rejected(format!(
+                "Instructions must be at most {} UTF-8 bytes",
+                super::MAX_INSTRUCTIONS_BYTES,
+            )));
+        }
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let agent = self.agent_in(&tx, alias)?;
+            if agent.archived_at.is_some() {
+                return Err(Error::rejected(format!(
+                    "Agent '{alias}' is archived — restore it before changing it"
+                )));
+            }
+            let old = agent
+                .instructions
+                .as_deref()
+                .map(|t| crate::delegation::sha256_hex(t.as_bytes()));
+            let new = crate::delegation::sha256_hex(text.as_bytes());
+            tx.execute(
+                "UPDATE agents SET instructions=?,updated=? WHERE alias=?",
+                params![text, now(), alias],
+            )?;
+            let mut detail = json!({"target": alias, "old_sha256": old, "new_sha256": new});
+            if let Some(extra) = audit.as_object() {
+                for (k, v) in extra {
+                    detail[k.as_str()] = v.clone();
+                }
+            }
+            Self::event(&tx, alias, "instructions_updated", detail)?;
+            Ok((old, new))
+        })
+    }
+
     pub fn model_defaults(&self) -> Result<ModelDefaultsSnapshot> {
         self.read_tx(|conn| {
             let tx = &mut *conn;
@@ -832,9 +1001,8 @@ impl Store {
         document: &str,
         attribution: Option<&str>,
     ) -> Result<ModelDefaultsSnapshot> {
-        let write = crate::model_defaults::parse_settings_document(document)?;
+        let mut write = crate::model_defaults::parse_settings_document(document)?;
         let attribution = crate::model_defaults::normalize_attribution(attribution)?;
-        let stored = serde_json::to_string(&write.config)?;
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let current = Self::read_model_defaults_tx(&tx)?;
@@ -847,6 +1015,24 @@ impl Store {
                     ),
                 ));
             }
+            // `model_defaults_set` does not edit the agents overlay. A body
+            // that omits it (serde default null) must not wipe the object.
+            if write.config.agent_settings.is_null() {
+                write.config.agent_settings = current.config.agent_settings.clone();
+            } else if write.config.agent_settings != current.config.agent_settings {
+                return Err(Error::invalid(
+                    "invalid_config",
+                    "model_defaults_set cannot edit agent_settings; use Agents settings",
+                ));
+            }
+            super::settings_authority::reject_nested_authority(&write.config)?;
+            let (_, _, authority) = super::settings_authority::load_model_defaults_row(&tx)?;
+            super::settings_authority::guard_launch_ids(&super::SettingsDoc {
+                model_defaults: write.config.clone(),
+                pi: authority.pi.clone(),
+                profiles: authority.profiles.clone(),
+            })?;
+            let stored = super::settings_authority::join_document(&write.config, &authority)?;
             let next = current.revision.checked_add(1).ok_or_else(|| {
                 Error::invalid("invalid_request", "model defaults revision overflowed")
             })?;
@@ -875,22 +1061,79 @@ impl Store {
         })
     }
 
-    fn read_model_defaults_tx(tx: &impl super::StoreConn) -> Result<ModelDefaultsSnapshot> {
-        let (revision, document): (i64, String) = tx
-            .query_row(
-                "SELECT revision, document FROM model_defaults WHERE id=1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|err| match err {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    Error::internal("model defaults row is missing")
-                }
-                other => Error::from(other),
-            })?;
-        let mut config: crate::model_defaults::ModelDefaults = serde_json::from_str(&document)
-            .map_err(|err| Error::internal(format!("stored model defaults are invalid: {err}")))?;
+    /// Same revision gate as [`Self::replace_model_defaults`] for a config
+    /// the agents settings writer already validated. The 16 KiB model-defaults
+    /// HTTP envelope does not apply; the serialized document is capped here.
+    pub fn replace_model_defaults_config(
+        &self,
+        expected_revision: i64,
+        mut config: crate::model_defaults::ModelDefaults,
+        attribution: Option<&str>,
+    ) -> Result<ModelDefaultsSnapshot> {
         crate::model_defaults::validate_config(&mut config)?;
+        let attribution = crate::model_defaults::normalize_attribution(attribution)?;
+        let stored_len = serde_json::to_string(&config)?.len();
+        if stored_len > 256 * 1024 {
+            return Err(Error::invalid(
+                "invalid_config",
+                "agents settings document exceeds 256 KiB",
+            ));
+        }
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let current = Self::read_model_defaults_tx(&tx)?;
+            if current.revision != expected_revision {
+                return Err(Error::conflict(
+                    current.revision,
+                    format!(
+                        "model defaults revision is {}, not {expected_revision}",
+                        current.revision
+                    ),
+                ));
+            }
+            if config.agent_settings.is_null() {
+                config.agent_settings = current.config.agent_settings.clone();
+            }
+            super::settings_authority::reject_nested_authority(&config)?;
+            let (_, _, authority) = super::settings_authority::load_model_defaults_row(&tx)?;
+            super::settings_authority::guard_launch_ids(&super::SettingsDoc {
+                model_defaults: config.clone(),
+                pi: authority.pi.clone(),
+                profiles: authority.profiles.clone(),
+            })?;
+            let stored = super::settings_authority::join_document(&config, &authority)?;
+            let next = current.revision.checked_add(1).ok_or_else(|| {
+                Error::invalid("invalid_request", "model defaults revision overflowed")
+            })?;
+            let at = now();
+            tx.execute(
+                "UPDATE model_defaults SET revision=?, document=? WHERE id=1",
+                params![next, stored],
+            )?;
+            Self::event(
+                &tx,
+                Self::DAEMON_STREAM,
+                "model_defaults_updated",
+                json!({
+                    "revision": next,
+                    "before": current.config,
+                    "after": config,
+                    "attribution": attribution.actor,
+                    "transport": attribution.transport,
+                    "at": at,
+                }),
+            )?;
+            Ok(ModelDefaultsSnapshot {
+                revision: next,
+                config,
+            })
+        })
+    }
+
+    pub(super) fn read_model_defaults_tx(
+        tx: &impl super::StoreConn,
+    ) -> Result<ModelDefaultsSnapshot> {
+        let (revision, config, _) = super::settings_authority::load_model_defaults_row(tx)?;
         Ok(ModelDefaultsSnapshot { revision, config })
     }
 
@@ -938,6 +1181,39 @@ impl Store {
         })
     }
 
+    /// CAD-804: set or clear the explicit agent-gc keep. Stamped with the
+    /// derived caller like `set_params_by`, in the same transaction as the
+    /// column change, so a plan can say who protected the row.
+    pub fn set_gc_keep_by(&self, alias: &str, gc_keep: bool, audit: &Value) -> Result<()> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let agent = self.agent_in(&tx, alias)?;
+            if agent.archived_at.is_some() {
+                return Err(Error::rejected(format!(
+                    "Agent '{alias}' is archived — restore it before changing it"
+                )));
+            }
+            // A keep is not activity: do not reset the idle age the
+            // sweep measures. Only the keep column changes.
+            tx.execute(
+                "UPDATE agents SET gc_keep=? WHERE alias=?",
+                params![gc_keep as i64, alias],
+            )?;
+            let mut detail = json!({
+                "alias": alias,
+                "gc_keep": gc_keep,
+                "old": agent.gc_keep,
+            });
+            if let Some(extra) = audit.as_object() {
+                for (k, v) in extra {
+                    detail[k.as_str()] = v.clone();
+                }
+            }
+            Self::event(&tx, alias, "gc_keep_updated", detail)?;
+            Ok(())
+        })
+    }
+
     /// Publish a detached runtime state in ONE write: the state, its
     /// error and the cleared runtime fields land together so a reader
     /// can never observe a fenced (`attention`) or terminal agent that
@@ -981,9 +1257,46 @@ impl Store {
     /// reaching here). Returns the `reply_to` aliases a forced finish
     /// notified — the caller wakes them.
     pub fn remove_agent(&self, alias: &str, force: bool, by: &Value) -> Result<Vec<String>> {
+        self.remove_agent_with(alias, force, by, false)
+    }
+
+    /// CAD-804: a gc sweep's removal. Same row/history removal and caller
+    /// audit as [`Store::remove_agent`], but the shared gc predicate is
+    /// re-checked inside the same transaction, so an agent resumed, kept
+    /// or given work after the candidate snapshot is never deleted.
+    pub fn gc_remove_agent(&self, alias: &str, by: &Value) -> Result<Vec<String>> {
+        self.remove_agent_with(alias, false, by, true)
+    }
+
+    fn remove_agent_with(
+        &self,
+        alias: &str,
+        force: bool,
+        by: &Value,
+        gc: bool,
+    ) -> Result<Vec<String>> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
+            // P-DEL-a: an archived row refuses every delete, `force`
+            // included. This check runs before any prune.
+            if agent.archived_at.is_some() {
+                return Err(Error::rejected("archived"));
+            }
+            if gc {
+                let open_messages: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE alias=? AND source != 'topic_notice'
+                         AND state NOT IN ('completed','failed','interrupted','cancelled')",
+                    [alias],
+                    |r| r.get(0),
+                )?;
+                if !Self::gc_eligible(&agent, open_messages) {
+                    return Err(Error::rejected(format!(
+                        "Agent '{alias}' is no longer a gc candidate — it was resumed, \
+                         kept or given work"
+                    )));
+                }
+            }
             // Inbox rows own no process or pane — their pseudo-endpoint is
             // permanent, so neither gate applies to them.
             if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
@@ -1001,9 +1314,11 @@ impl Store {
                     )));
                 }
             }
+            // A topic notice is turnless: it is never execution debt, so it
+            // neither blocks removal nor counts as open work (CAD-818).
             let open: Vec<Message> = tx
                 .query_vec(
-                    "SELECT * FROM messages WHERE alias=? AND state NOT IN
+                    "SELECT * FROM messages WHERE alias=? AND source != 'topic_notice' AND state NOT IN
                              ('completed','failed','interrupted','cancelled') ORDER BY seq",
                     [alias],
                     row_message,
@@ -1023,6 +1338,28 @@ impl Store {
                 )
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
                 .collect::<rusqlite::Result<_>>()?;
+            let agent = self.agent_in(&tx, alias)?;
+            if agent.provider == "sandbox" && agent.endpoint_kind == "sandbox" {
+                let active: Vec<&Message> = open
+                    .iter()
+                    .filter(|m| {
+                        m.source == "job_dispatch"
+                            && matches!(m.state.as_str(), "queued" | "running" | "unknown")
+                    })
+                    .collect();
+                if !active.is_empty() {
+                    return Err(Error::rejected(format!(
+                        "Agent '{alias}' has an active cloud dispatch ({}) — run \
+                         `cadence agent stop {alias}` and reconcile the remote before \
+                         removing the agent, even with --force",
+                        active
+                            .iter()
+                            .map(|m| format!("{} ({})", m.id, m.state))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
             let mut notify: Vec<String> = Vec::new();
             if !open_messages.is_empty() || !open_tasks.is_empty() {
                 let named = |kind: &str, rows: &[(String, String)]| {
@@ -1146,6 +1483,7 @@ impl Store {
                                    "by": by["by"], "by_kind": by["by_kind"]}),
                 )?;
             }
+            Self::cancel_queued_topic_notices(&tx, alias)?;
             Self::prune_agent_history(&tx, alias)?;
             tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
             Self::event(
@@ -1159,19 +1497,30 @@ impl Store {
         })
     }
 
-    /// Drops a removed alias's message/event history except what job
-    /// history still resolves (CAD-284): messages attached to a task or
-    /// named as a task's `dispatch_message` or a verdict's `message`,
-    /// and job-scoped events. Those stay in place under the old alias so
-    /// `job show`/`job events`/`task show` read them unchanged.
-    fn prune_agent_history(tx: &impl super::StoreConn, alias: &str) -> Result<()> {
+    /// CAD-818: a removed alias's still-queued topic notices are cancelled
+    /// in the removal transaction. They were never made available, and a
+    /// re-registered alias (a new uid) must never claim its predecessor's
+    /// notice. Available and refused notices are history and stay as-is.
+    fn cancel_queued_topic_notices(tx: &impl super::StoreConn, alias: &str) -> Result<()> {
         tx.execute(
-            "DELETE FROM messages WHERE alias=?1 AND task_id IS NULL
-             AND id NOT IN (SELECT dispatch_message FROM tasks
-                            WHERE dispatch_message IS NOT NULL)
-             AND id NOT IN (SELECT message FROM verdicts WHERE message IS NOT NULL)",
-            [alias],
+            "UPDATE messages SET state='cancelled',result=?,completed=?
+                     WHERE alias=? AND source='topic_notice' AND state='queued'",
+            params![
+                json!({"status": "cancelled", "via": "topic_notice", "reason": "agent_removed"})
+                    .to_string(),
+                now(),
+                alias
+            ],
         )?;
+        Ok(())
+    }
+
+    /// Drops a removed alias's event history except job-scoped events
+    /// (CAD-284). CAD-819: message rows are KEPT. The participant is keyed
+    /// by its uid, so the conversation survives `agent rm` and renders as
+    /// "<alias> (removed)"; a re-registered alias gets a new uid and starts
+    /// with no history.
+    fn prune_agent_history(tx: &impl super::StoreConn, alias: &str) -> Result<()> {
         tx.execute(
             "DELETE FROM events WHERE alias=? AND job_id IS NULL",
             [alias],
@@ -1181,21 +1530,249 @@ impl Store {
         Ok(())
     }
 
-    /// Agents eligible for an explicit `agent gc` sweep: dead endpoint
-    /// and a terminal lifecycle state, optionally limited to rows not
-    /// updated within `older_than` seconds. `agent gc` sweeps these on
-    /// command; the daemon's agent-gc timer (CAD-199, off unless `[host]
-    /// agent_gc_older_than_secs` is set) narrows them further through
-    /// [`Store::timer_gc_remove`].
-    pub fn gc_candidates(&self, older_than: Option<f64>) -> Result<Vec<Agent>> {
+    /// CAD-804: the one row rule every agent-gc path applies — no live
+    /// endpoint, a terminal lifecycle state, not enabled, not explicitly
+    /// kept, and no open or unknown message. The caller's `older_than`
+    /// window is applied by the query/removal, not here.
+    pub fn gc_eligible(agent: &Agent, open_messages: i64) -> bool {
+        agent.endpoint.is_none()
+            && matches!(agent.state.as_str(), "attention" | "stopped")
+            && !agent.enabled
+            && !agent.gc_keep
+            && agent.archived_at.is_none()
+            && open_messages == 0
+    }
+
+    /// CAD-804: every dead row inside the caller's age window, with the
+    /// open-message count and age the shared predicate and the plan need.
+    /// Disabled/enabled and `gc_keep` rows are included; callers classify
+    /// them through [`Store::gc_eligible`] so the manual sweep, the plan
+    /// and the timer can never drift.
+    pub fn gc_rows(&self, older_than: Option<f64>) -> Result<Vec<GcRow>> {
         let cutoff = older_than.map(|age| now() - age).unwrap_or(f64::MAX);
         self.read_tx(|conn| {
-            let stmt_sql = "SELECT * FROM agents WHERE endpoint IS NULL
-                         AND state IN ('attention','stopped') AND updated < ?";
+            let stmt_sql = "SELECT a.*,
+                (SELECT COUNT(*) FROM messages m WHERE m.alias=a.alias
+                   AND m.source != 'topic_notice'
+                   AND m.state NOT IN ('completed','failed','interrupted','cancelled'))
+                  AS open_messages
+                FROM agents a WHERE a.endpoint IS NULL
+                  AND a.state IN ('attention','stopped') AND a.updated < ?";
+            let at = now();
             let rows = conn
-                .query_vec(stmt_sql, params![cutoff], row_agent)
+                .query_vec(stmt_sql, params![cutoff], |row| {
+                    let agent = row_agent(row)?;
+                    Ok(GcRow {
+                        age_secs: at - agent.updated,
+                        open_messages: row.get("open_messages")?,
+                        agent,
+                    })
+                })
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    /// Agents eligible for an explicit `agent gc` sweep, through the one
+    /// shared predicate. `agent gc` and the daemon's agent-gc timer
+    /// (CAD-199, off unless `[host] agent_gc_older_than_secs` is set)
+    /// both start here; the timer additionally skips a live pty pane.
+    pub fn gc_candidates(&self, older_than: Option<f64>) -> Result<Vec<Agent>> {
+        Ok(self
+            .gc_rows(older_than)?
+            .into_iter()
+            .filter(GcRow::eligible)
+            .map(|row| row.agent)
+            .collect())
+    }
+
+    fn archive_plan_in(&self, conn: &impl StoreConn, alias: &str) -> Result<ArchivePlan> {
+        let agent = self.agent_in(conn, alias)?;
+        let open_messages: Vec<(String, String)> = conn.query_vec(
+            "SELECT id,state FROM messages WHERE alias=? AND source != 'topic_notice'
+               AND state NOT IN ('completed','failed','interrupted','cancelled')
+             ORDER BY id",
+            [alias],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let open_tasks: Vec<String> = conn.query_vec(
+            "SELECT id FROM tasks WHERE assignee=? AND state NOT IN
+               ('verified','done','cancelled','failed') ORDER BY id",
+            [alias],
+            |r| r.get(0),
+        )?;
+        let mut reasons = Vec::new();
+        if agent.archived_at.is_some() {
+            reasons.push("already_archived".to_string());
+        }
+        if agent.state != "stopped" {
+            reasons.push(format!("not_stopped:{}", agent.state));
+        }
+        if agent.endpoint.is_some() {
+            reasons.push("has_endpoint".to_string());
+        }
+        if agent.enabled {
+            reasons.push("enabled".to_string());
+        }
+        if agent.gc_keep {
+            reasons.push("gc_keep".to_string());
+        }
+        if crate::master::is_master(alias) {
+            reasons.push("master".to_string());
+        }
+        if agent.role == "pm" {
+            reasons.push("standing_pm".to_string());
+        }
+        if agent.endpoint_kind == "inbox" {
+            reasons.push("inbox".to_string());
+        }
+        let upstream: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE alias != ?1
+               AND json_extract(params,'$.upstream') = ?1)",
+            [alias],
+            |r| r.get(0),
+        )?;
+        if upstream != 0 {
+            reasons.push("group_root".to_string());
+        }
+        for (id, state) in &open_messages {
+            reasons.push(format!("open_message:{id}:{state}"));
+        }
+        for id in &open_tasks {
+            reasons.push(format!("open_task:{id}"));
+        }
+        let digest = archive_digest(&agent, &open_messages, &open_tasks);
+        Ok(ArchivePlan {
+            agent,
+            reasons,
+            open_messages,
+            open_tasks,
+            digest,
+        })
+    }
+
+    /// Read-only preview for an explicit alias. Apply re-proves every rule
+    /// inside its write transaction; this value is never authority.
+    pub fn archive_plan(&self, alias: &str) -> Result<ArchivePlan> {
+        self.read_tx(|conn| self.archive_plan_in(conn, alias))
+    }
+
+    /// Archive each `(alias, expected_digest)` in one transaction. Any
+    /// stale digest, eligibility failure or changed row refuses the whole
+    /// batch with no write and no event. Only the marker columns change;
+    /// the schema trigger bumps `lifecycle_rev`.
+    pub fn archive_agents(
+        &self,
+        expected: &[(String, String)],
+        reason: &str,
+        by: &Value,
+    ) -> Result<Vec<ArchivePlan>> {
+        let by_name = by.get("by").and_then(Value::as_str).unwrap_or("operator");
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let mut plans = Vec::new();
+            for (alias, digest) in expected {
+                let plan = self.archive_plan_in(&tx, alias)?;
+                if !plan.reasons.is_empty() {
+                    return Err(Error::rejected(format!(
+                        "{alias}: {}",
+                        plan.reasons.join(", ")
+                    )));
+                }
+                if plan.digest != *digest {
+                    return Err(Error::rejected(format!("stale_preview: {alias}")));
+                }
+                plans.push(plan);
+            }
+            for plan in &plans {
+                let changed = tx.execute(
+                    "UPDATE agents SET archived_at=?, archived_by=?, archive_reason=?
+                     WHERE alias=? AND lifecycle_rev=? AND archived_at IS NULL",
+                    params![
+                        now(),
+                        by_name,
+                        reason,
+                        plan.agent.alias,
+                        plan.agent.lifecycle_rev
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(Error::rejected(format!(
+                        "stale_revision: {}",
+                        plan.agent.alias
+                    )));
+                }
+                let rev: i64 = tx.query_row(
+                    "SELECT lifecycle_rev FROM agents WHERE alias=?",
+                    [&plan.agent.alias],
+                    |r| r.get(0),
+                )?;
+                Self::event(
+                    tx,
+                    Self::DAEMON_STREAM,
+                    "agent_archived",
+                    json!({
+                        "alias": plan.agent.alias,
+                        "by": by,
+                        "reason": reason,
+                        "lifecycle_rev": rev,
+                    }),
+                )?;
+            }
+            Ok(plans)
+        })
+    }
+
+    /// Restore each `(alias, expected_lifecycle_rev)` in one transaction.
+    /// Restore requires the same stopped/disabled/no-endpoint state and
+    /// `gc_keep=0`; it never writes `gc_keep`, `enabled` or `state`.
+    pub fn restore_agents(&self, expected: &[(String, i64)], by: &Value) -> Result<Vec<Agent>> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            for (alias, rev) in expected {
+                let plan = self.archive_plan_in(&tx, alias)?;
+                if plan.agent.archived_at.is_none() {
+                    return Err(Error::rejected(format!("not_archived: {alias}")));
+                }
+                if plan.agent.lifecycle_rev != *rev {
+                    return Err(Error::rejected(format!("stale_revision: {alias}")));
+                }
+                let mut reasons = Vec::new();
+                if plan.agent.state != "stopped" {
+                    reasons.push(format!("not_stopped:{}", plan.agent.state));
+                }
+                if plan.agent.endpoint.is_some() {
+                    reasons.push("has_endpoint".to_string());
+                }
+                if plan.agent.enabled {
+                    reasons.push("enabled".to_string());
+                }
+                if plan.agent.gc_keep {
+                    reasons.push("gc_keep".to_string());
+                }
+                if !reasons.is_empty() {
+                    return Err(Error::rejected(format!("{alias}: {}", reasons.join(", "))));
+                }
+            }
+            let mut restored = Vec::new();
+            for (alias, rev) in expected {
+                let changed = tx.execute(
+                    "UPDATE agents SET archived_at=NULL, archived_by=NULL, archive_reason=NULL
+                     WHERE alias=? AND lifecycle_rev=? AND archived_at IS NOT NULL",
+                    params![alias, rev],
+                )?;
+                if changed != 1 {
+                    return Err(Error::rejected(format!("stale_revision: {alias}")));
+                }
+                Self::event(
+                    tx,
+                    Self::DAEMON_STREAM,
+                    "agent_restored",
+                    json!({"alias": alias, "by": by}),
+                )?;
+                restored.push(self.agent_in(&tx, alias)?);
+            }
+            Ok(restored)
         })
     }
 
@@ -1232,22 +1809,31 @@ impl Store {
             else {
                 return Ok(None);
             };
+            if agent.archived_at.is_some() {
+                return Ok(None);
+            }
             let at = now();
             let age = at - agent.updated;
             let open_messages: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM messages WHERE alias=? AND state NOT IN
-                         ('completed','failed','interrupted','cancelled')",
+                "SELECT COUNT(*) FROM messages WHERE alias=? AND source != 'topic_notice'
+                         AND state NOT IN ('completed','failed','interrupted','cancelled')",
                 [alias],
                 |r| r.get(0),
             )?;
-            let eligible = agent.endpoint.is_none()
-                && matches!(agent.state.as_str(), "attention" | "stopped")
-                && !agent.enabled
-                && age > older_than
-                && open_messages == 0;
+            // D-j: the timer also keeps a row with non-terminal assigned
+            // work, matching `agent remove`'s task refusal.
+            let open_tasks: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE assignee=? AND state NOT IN
+                     ('verified','done','cancelled','failed')",
+                [alias],
+                |r| r.get(0),
+            )?;
+            let eligible =
+                Self::gc_eligible(&agent, open_messages) && open_tasks == 0 && age > older_than;
             if !eligible {
                 return Ok(None);
             }
+            Self::cancel_queued_topic_notices(&tx, alias)?;
             Self::prune_agent_history(&tx, alias)?;
             tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
             Self::event(
@@ -1269,7 +1855,7 @@ impl Store {
                     "thread_id": agent.thread_id,
                     "session_id": agent.session_id,
                     "records_only": true,
-                    "note": crate::daemon::AGENT_GC_RECORDS_ONLY,
+                    "note": AGENT_GC_RECORDS_ONLY,
                 }),
             )?;
             Ok(Some(agent))
@@ -1312,7 +1898,7 @@ impl Store {
             out.entry(alias).or_default().0 = at;
         }
         let mut stmt = conn.prepare(
-            "SELECT alias, COUNT(*) FROM messages WHERE state NOT IN
+            "SELECT alias, COUNT(*) FROM messages WHERE source != 'topic_notice' AND state NOT IN
              ('completed','failed','interrupted','cancelled') GROUP BY alias",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;

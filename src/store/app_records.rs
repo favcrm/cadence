@@ -93,6 +93,10 @@ pub const RECORD_LIMIT: i64 = 100_000;
 /// The list page bound — `limit`'s default and maximum. Independent of
 /// the record ceiling so one page never returns a whole large context.
 pub const RECORD_PAGE_MAX: i64 = 100;
+/// A customer note is plain text on the record timeline, never part of
+/// the profile digest.
+pub const NOTE_BODY_BYTES: usize = 4000;
+pub const NOTE_PAGE_MAX: i64 = 50;
 
 /// Split planned creates against the context's remaining capacity
 /// (CAD-1172): `live` rows already hold room, the first `accepted`
@@ -138,18 +142,25 @@ CREATE TABLE IF NOT EXISTS app_record_revisions(
  context_id TEXT NOT NULL, record_id TEXT NOT NULL,
  revision INTEGER NOT NULL CHECK(revision>0),
  body TEXT NOT NULL, body_digest TEXT NOT NULL,
- actor TEXT NOT NULL, at REAL NOT NULL,
+ actor TEXT NOT NULL, at REAL NOT NULL, human TEXT,
  PRIMARY KEY(context_id, record_id, revision));
 CREATE TABLE IF NOT EXISTS app_record_consent_provenance(
  context_id TEXT NOT NULL, record_id TEXT NOT NULL,
  revision INTEGER NOT NULL CHECK(revision>0),
  method TEXT NOT NULL, note TEXT,
  PRIMARY KEY(context_id, record_id, revision));
+CREATE TABLE IF NOT EXISTS app_record_notes(
+ context_id TEXT NOT NULL, record_id TEXT NOT NULL, note_id TEXT NOT NULL,
+ body TEXT NOT NULL, actor TEXT NOT NULL, created REAL NOT NULL,
+ deleted_at REAL, deleted_by TEXT,
+ PRIMARY KEY(context_id, record_id, note_id));
+CREATE INDEX IF NOT EXISTS app_record_notes_record
+ ON app_record_notes(context_id, record_id, created);
 CREATE TABLE IF NOT EXISTS app_record_csv_imports(
  request_id TEXT PRIMARY KEY, context_id TEXT NOT NULL,
  preview_token TEXT NOT NULL, result TEXT NOT NULL,
  decisions_digest TEXT NOT NULL DEFAULT '',
- state TEXT NOT NULL, at REAL NOT NULL);
+ state TEXT NOT NULL, at REAL NOT NULL, human TEXT);
 CREATE TABLE IF NOT EXISTS app_segments(
  context_id TEXT NOT NULL, id TEXT NOT NULL,
  revision INTEGER NOT NULL CHECK(revision>0),
@@ -199,7 +210,7 @@ CREATE TABLE IF NOT EXISTS app_content_revisions(
  subject TEXT NOT NULL, preheader TEXT NOT NULL,
  blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
  actor TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('operator','proposal')),
- proposal_id TEXT, at REAL NOT NULL, html TEXT, text_override TEXT,
+ proposal_id TEXT, at REAL NOT NULL, html TEXT, text_override TEXT, human TEXT,
  PRIMARY KEY(context_id, campaign_id, revision));
 CREATE TABLE IF NOT EXISTS app_content_proposals(
  context_id TEXT NOT NULL, proposal_id TEXT NOT NULL,
@@ -235,6 +246,27 @@ CREATE TABLE IF NOT EXISTS app_sender_binding_revisions(
  unsubscribe_base TEXT NOT NULL, connection_id TEXT,
  binding_digest TEXT NOT NULL, actor TEXT NOT NULL, at REAL NOT NULL,
  PRIMARY KEY(context_id, binding_id, revision));
+CREATE TABLE IF NOT EXISTS app_works_items(
+ context_id TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL,
+ title TEXT NOT NULL, tags TEXT NOT NULL, owner TEXT NOT NULL,
+ revision INTEGER NOT NULL CHECK(revision>0),
+ reviewed_revision INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_revision>=0),
+ review_status TEXT NOT NULL, pending_revision INTEGER,
+ trashed INTEGER NOT NULL DEFAULT 0, updated REAL NOT NULL,
+ PRIMARY KEY(context_id, id));
+CREATE TABLE IF NOT EXISTS app_works_revisions(
+ context_id TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0),
+ kind TEXT NOT NULL, title TEXT NOT NULL, content_json TEXT NOT NULL,
+ content_digest TEXT NOT NULL, author TEXT NOT NULL, at REAL NOT NULL,
+ PRIMARY KEY(context_id, id, revision));
+CREATE TABLE IF NOT EXISTS app_works_idempotency(
+ context_id TEXT NOT NULL, key TEXT NOT NULL, actor TEXT NOT NULL,
+ op TEXT NOT NULL, payload_digest TEXT NOT NULL, result_json TEXT NOT NULL,
+ at REAL NOT NULL, PRIMARY KEY(context_id, key));
+CREATE TABLE IF NOT EXISTS app_works_audit(
+ context_id TEXT NOT NULL, at REAL NOT NULL, actor TEXT NOT NULL,
+ on_behalf_of TEXT, action TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS app_works_items_updated ON app_works_items(context_id, updated);
 CREATE TABLE IF NOT EXISTS app_campaign_test_sends(
  context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
  content_digest TEXT NOT NULL, link_digest TEXT NOT NULL,
@@ -362,6 +394,9 @@ const CORRUPT_RECORD_FILE: &str = "record file is corrupt or foreign; restore th
 /// One installation's record file. Opened per operator action and
 /// closed after it — persistence is the file itself, shared through
 /// SQLite locking, never daemon memory.
+/// One stored note row: body, author, created, deleted_at, deleted_by.
+type NoteRow = (String, String, f64, Option<f64>, Option<String>);
+
 pub struct RecordStore {
     install_id: String,
     conn: Mutex<Connection>,
@@ -430,6 +465,8 @@ impl RecordStore {
         loop {
             match Self::open_once(state_dir, install_id) {
                 Err(error) if is_transient_open_error(&error) && attempt < 40 => {
+                    #[cfg(test)]
+                    super::wait_probe::waiting();
                     attempt += 1;
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
@@ -439,6 +476,47 @@ impl RecordStore {
                 settled => return settled,
             }
         }
+    }
+
+    /// Read-only open for inventory commands: a missing record file is
+    /// absent social state, not an invitation to create or migrate one.
+    pub fn open_readonly(state_dir: &Path, install_id: &str) -> Result<Option<Self>> {
+        let path = record_db_path(state_dir, install_id)?;
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Err(Error::rejected(CORRUPT_RECORD_FILE)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(Error::internal(format!(
+                    "record file cannot be checked: {error}"
+                )))
+            }
+        }
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| Error::rejected(CORRUPT_RECORD_FILE))?;
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let stored: String = conn
+            .query_row("SELECT install_id FROM record_identity", [], |row| {
+                row.get(0)
+            })
+            .map_err(|_| Error::rejected(CORRUPT_RECORD_FILE))?;
+        if stored != install_id {
+            return Err(Error::rejected(CORRUPT_RECORD_FILE));
+        }
+        let version: i64 = conn
+            .query_row("SELECT version FROM record_schema", [], |row| row.get(0))
+            .map_err(|_| Error::rejected(CORRUPT_RECORD_FILE))?;
+        if version != FILE_SCHEMA {
+            return Err(Error::rejected("record file schema is not current"));
+        }
+        Ok(Some(Self {
+            install_id: install_id.to_owned(),
+            conn: Mutex::new(conn),
+        }))
     }
 
     fn open_once(state_dir: &Path, install_id: &str) -> Result<Self> {
@@ -471,6 +549,8 @@ impl RecordStore {
         })?;
         conn.busy_timeout(BUSY_TIMEOUT)
             .map_err(|e| Error::internal(e.to_string()))?;
+        #[cfg(test)]
+        super::wait_probe::configure(&conn).map_err(|e| Error::internal(e.to_string()))?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| {
                 busy_or(
@@ -579,6 +659,18 @@ impl RecordStore {
                  state TEXT NOT NULL, at REAL NOT NULL)",
             )
             .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+            // CAD-1374: the revision table the human column joins. Its
+            // columns match the base SCHEMA exactly; it is created only
+            // when absent, so an existing file's rows are untouched.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS app_record_revisions(\
+                 context_id TEXT NOT NULL, record_id TEXT NOT NULL,\
+                 revision INTEGER NOT NULL CHECK(revision>0),\
+                 body TEXT NOT NULL, body_digest TEXT NOT NULL,\
+                 actor TEXT NOT NULL, at REAL NOT NULL,\
+                 PRIMARY KEY(context_id, record_id, revision))",
+            )
+            .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
             // The probe classifies by code: contention retries
             // through the bounded wait instead of misreading BUSY as
             // a missing column and dying on a duplicate-column ALTER.
@@ -620,7 +712,14 @@ impl RecordStore {
             // migration like the CSV receipts above; the version
             // stays 1 and older files gain empty tables.
             conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS app_segments(
+                "CREATE TABLE IF NOT EXISTS app_record_notes(
+                 context_id TEXT NOT NULL, record_id TEXT NOT NULL, note_id TEXT NOT NULL,
+                 body TEXT NOT NULL, actor TEXT NOT NULL, created REAL NOT NULL,
+                 deleted_at REAL, deleted_by TEXT,
+                 PRIMARY KEY(context_id, record_id, note_id));
+                 CREATE INDEX IF NOT EXISTS app_record_notes_record
+                 ON app_record_notes(context_id, record_id, created);
+                 CREATE TABLE IF NOT EXISTS app_segments(
                  context_id TEXT NOT NULL, id TEXT NOT NULL,
                  revision INTEGER NOT NULL CHECK(revision>0),
                  name TEXT NOT NULL, definition TEXT NOT NULL, digest TEXT NOT NULL,
@@ -721,7 +820,28 @@ impl RecordStore {
                  sender_name TEXT NOT NULL, sender_address TEXT NOT NULL,
                  unsubscribe_base TEXT NOT NULL, connection_id TEXT,
                  binding_digest TEXT NOT NULL, actor TEXT NOT NULL, at REAL NOT NULL,
-                 PRIMARY KEY(context_id, binding_id, revision))",
+                 PRIMARY KEY(context_id, binding_id, revision));
+                 CREATE TABLE IF NOT EXISTS app_works_items(
+                 context_id TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL,
+                 title TEXT NOT NULL, tags TEXT NOT NULL, owner TEXT NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision>0),
+                 reviewed_revision INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_revision>=0),
+                 review_status TEXT NOT NULL, pending_revision INTEGER,
+                 trashed INTEGER NOT NULL DEFAULT 0, updated REAL NOT NULL,
+                 PRIMARY KEY(context_id, id));
+                 CREATE TABLE IF NOT EXISTS app_works_revisions(
+                 context_id TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0),
+                 kind TEXT NOT NULL, title TEXT NOT NULL, content_json TEXT NOT NULL,
+                 content_digest TEXT NOT NULL, author TEXT NOT NULL, at REAL NOT NULL,
+                 PRIMARY KEY(context_id, id, revision));
+                 CREATE TABLE IF NOT EXISTS app_works_idempotency(
+                 context_id TEXT NOT NULL, key TEXT NOT NULL, actor TEXT NOT NULL,
+                 op TEXT NOT NULL, payload_digest TEXT NOT NULL, result_json TEXT NOT NULL,
+                 at REAL NOT NULL, PRIMARY KEY(context_id, key));
+                 CREATE TABLE IF NOT EXISTS app_works_audit(
+                 context_id TEXT NOT NULL, at REAL NOT NULL, actor TEXT NOT NULL,
+                 on_behalf_of TEXT, action TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL);
+                 CREATE INDEX IF NOT EXISTS app_works_items_updated ON app_works_items(context_id, updated)",
             )
             .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
             // CAD-782 revision 2: proposals record their origin
@@ -935,7 +1055,31 @@ impl RecordStore {
                     .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
                 }
             }
+            // CAD-1374: the verified human behind an owner write, stored
+            // on the receipt it names. Older files gain the nullable
+            // column; their rows stay NULL, honestly unknown.
+            for table in [
+                "app_content_revisions",
+                "app_record_revisions",
+                "app_record_csv_imports",
+            ] {
+                let probe = format!("SELECT human FROM {table} LIMIT 0");
+                let missing = match conn.prepare(&probe) {
+                    Ok(_) => false,
+                    Err(error) if is_contention(&error) => {
+                        return Err(Error::internal("record file is busy"));
+                    }
+                    Err(_) => true,
+                };
+                if missing {
+                    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN human TEXT"))
+                        .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+                }
+            }
         }
+        super::app_social_drafts::ensure_schema(&conn)?;
+        // CAD-1827: additive campaign work table; the file schema is unchanged.
+        super::app_campaign_work::ensure_schema(&conn)?;
         Ok(Self {
             install_id: install_id.to_string(),
             conn: Mutex::new(conn),
@@ -975,6 +1119,29 @@ impl RecordStore {
         tx.commit().map_err(|e| Error::internal(e.to_string()))?;
         drop(conn);
         Ok(out)
+    }
+
+    fn notes_in(
+        conn: &impl super::StoreConn,
+        context: &str,
+        record_id: &str,
+    ) -> Result<Vec<Value>> {
+        conn.query_vec(
+            "SELECT note_id,body,actor,created FROM app_record_notes
+             WHERE context_id=? AND record_id=? AND deleted_at IS NULL
+             ORDER BY created DESC, note_id DESC LIMIT ?",
+            params![context, record_id, NOTE_PAGE_MAX],
+            |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?,
+                    "record_id": record_id,
+                    "body": r.get::<_, String>(1)?,
+                    "actor": r.get::<_, String>(2)?,
+                    "created": r.get::<_, f64>(3)?,
+                }))
+            },
+        )
+        .map_err(|e| Error::internal(e.to_string()))
     }
 
     fn history_in(
@@ -1091,8 +1258,9 @@ impl RecordStore {
             Self::history_in(conn, context, id).map_err(|e| Error::internal(e.to_string()))?;
         let consent_history = Self::consent_history_in(conn, context, id)
             .map_err(|e| Error::internal(e.to_string()))?;
+        let notes = Self::notes_in(conn, context, id)?;
         Ok(
-            json!({"id": id, "install_id": self.install_id, "context_id": context, "kind": kind, "revision": revision, "digest": digest, "profile": profile, "history": history, "consent_history": consent_history}),
+            json!({"id": id, "install_id": self.install_id, "context_id": context, "kind": kind, "revision": revision, "digest": digest, "profile": profile, "history": history, "consent_history": consent_history, "notes": notes}),
         )
     }
 
@@ -1116,7 +1284,39 @@ impl RecordStore {
         profile: &CustomerProfile,
         provenance: Option<&ConsentProvenance>,
     ) -> Result<Value> {
+        self.app_record_create_as(context, record_id, profile, provenance, None)
+    }
+
+    /// [`Self::app_record_create_with`] carrying the verified human behind
+    /// an owner write (CAD-1374). `human` is daemon-derived, never request
+    /// text; it is stored on the revision row in this same transaction.
+    pub fn app_record_create_as(
+        &self,
+        context: &str,
+        record_id: &str,
+        profile: &CustomerProfile,
+        provenance: Option<&ConsentProvenance>,
+        human: Option<&Value>,
+    ) -> Result<Value> {
+        self.app_record_create_as_actor(context, record_id, profile, provenance, "operator", human)
+    }
+
+    /// Actor-aware create. The daemon derives `actor` from the caller
+    /// (`agent:<alias>` for an autonomous turn, `operator` for a native
+    /// owner write); it is never request text.
+    pub fn app_record_create_as_actor(
+        &self,
+        context: &str,
+        record_id: &str,
+        profile: &CustomerProfile,
+        provenance: Option<&ConsentProvenance>,
+        actor: &str,
+        human: Option<&Value>,
+    ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
+        if !record_actor_valid(actor) {
+            return Err(Error::rejected("record actor is invalid"));
+        }
         let unset = CustomerConsent {
             email: ConsentState::Unknown,
             sms: None,
@@ -1167,8 +1367,8 @@ impl RecordStore {
             )
             .map_err(|e| Error::internal(e.to_string()))?;
             tx.execute(
-                "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at) VALUES(?, ?, 1, ?, ?, 'operator', ?)",
-                params![context, record_id, body, digest, now()],
+                "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at,human) VALUES(?, ?, 1, ?, ?, ?, ?, ?)",
+                params![context, record_id, body, digest, actor, now(), human.map(Value::to_string)],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
             if let Some(provenance) = provenance {
@@ -1197,7 +1397,8 @@ impl RecordStore {
     /// Bounded search and pagination over one context's customers.
     /// `query` is a bounded substring matched against the record ID
     /// and body; `limit` is 1..=RECORD_PAGE_MAX; `cursor` pages after
-    /// a record ID. The response carries `records`, `truncated` and
+    /// a record ID. The response carries `records`, `total` (the full
+    /// filtered count, independent of the page), `truncated` and
     /// `next_cursor` (null when complete) alongside each record's show
     /// receipt.
     pub fn app_record_list_paged(
@@ -1233,6 +1434,27 @@ impl RecordStore {
             crate::proto::identifier(after, "record cursor")?;
         }
         let conn = self.conn();
+        // The assistant asks "how many customers" with `customers.search`;
+        // answering from the page alone forced one call per twenty rows
+        // until the provider rejected the accumulated turn. Report the
+        // full filtered count with every page so the count is one call,
+        // while `records` stays bounded.
+        let total: i64 = match like.as_deref() {
+            None => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM app_records WHERE context_id=?",
+                    params![context],
+                    |r| r.get(0),
+                )
+                .map_err(|e| Error::internal(e.to_string()))?,
+            Some(pattern) => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM app_records WHERE context_id=? AND (id LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\')",
+                    params![context, pattern, pattern],
+                    |r| r.get(0),
+                )
+                .map_err(|e| Error::internal(e.to_string()))?,
+        };
         let mut sql = String::from("SELECT id FROM app_records WHERE context_id=?");
         if cursor.is_some() {
             sql.push_str(" AND id > ?");
@@ -1270,7 +1492,9 @@ impl RecordStore {
             .iter()
             .map(|id| self.show_in(&conn, context, id))
             .collect::<Result<Vec<_>>>()?;
-        Ok(json!({"records": records, "truncated": truncated, "next_cursor": next_cursor}))
+        Ok(
+            json!({"records": records, "total": total, "truncated": truncated, "next_cursor": next_cursor}),
+        )
     }
 
     pub fn app_record_update(
@@ -1281,11 +1505,44 @@ impl RecordStore {
         profile: &CustomerProfile,
         provenance: Option<&ConsentProvenance>,
     ) -> Result<Value> {
-        self.update_record(context, record_id, expected, profile, provenance, false)
+        self.app_record_update_as(context, record_id, expected, profile, provenance, None)
+    }
+
+    /// [`Self::app_record_update`] carrying the verified human (CAD-1374).
+    pub fn app_record_update_as(
+        &self,
+        context: &str,
+        record_id: &str,
+        expected: i64,
+        profile: &CustomerProfile,
+        provenance: Option<&ConsentProvenance>,
+        human: Option<&Value>,
+    ) -> Result<Value> {
+        self.update_record(
+            context, record_id, expected, profile, provenance, false, "operator", human,
+        )
+    }
+
+    /// Actor-aware update. `actor` is daemon-derived, never request text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn app_record_update_as_actor(
+        &self,
+        context: &str,
+        record_id: &str,
+        expected: i64,
+        profile: &CustomerProfile,
+        provenance: Option<&ConsentProvenance>,
+        actor: &str,
+        human: Option<&Value>,
+    ) -> Result<Value> {
+        self.update_record(
+            context, record_id, expected, profile, provenance, false, actor, human,
+        )
     }
 
     /// `from_import`: a CSV update row that grants consent is recorded
     /// with the implied `imported` method instead of refused.
+    #[allow(clippy::too_many_arguments)]
     fn update_record(
         &self,
         context: &str,
@@ -1294,9 +1551,14 @@ impl RecordStore {
         profile: &CustomerProfile,
         provenance: Option<&ConsentProvenance>,
         from_import: bool,
+        actor: &str,
+        human: Option<&Value>,
     ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(record_id, "record ID")?;
+        if !record_actor_valid(actor) {
+            return Err(Error::rejected("record actor is invalid"));
+        }
         if expected < 1 {
             return Err(Error::rejected("expected record revision must be positive"));
         }
@@ -1340,8 +1602,8 @@ impl RecordStore {
                 return Err(Error::rejected("record revision is stale"));
             }
             tx.execute(
-                "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at) VALUES(?, ?, ?, ?, ?, 'operator', ?)",
-                params![context, record_id, revision, body, digest, now()],
+                "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at,human) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                params![context, record_id, revision, body, digest, actor, now(), human.map(Value::to_string)],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
             if let Some(provenance) = provenance {
@@ -1353,6 +1615,158 @@ impl RecordStore {
             }
             let result = json!({"record": self.show_in(&tx, context, record_id)?});
             Ok(result)
+        })
+    }
+
+    /// Append a plain-text note to a customer's timeline. A note is
+    /// never part of the profile or its digest, so it cannot change a
+    /// segment or an audience freeze. The same id + bytes + actor is an
+    /// idempotent replay; a different body under the same id refuses.
+    pub fn app_note_create(
+        &self,
+        context: &str,
+        record_id: &str,
+        note_id: &str,
+        body: &str,
+        actor: &str,
+    ) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(record_id, "record ID")?;
+        crate::proto::identifier(note_id, "note ID")?;
+        if !record_actor_valid(actor) {
+            return Err(Error::rejected("note actor is invalid"));
+        }
+        if body.trim().is_empty()
+            || body.len() > NOTE_BODY_BYTES
+            || body
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            return Err(Error::rejected("note body exceeds its supported shape"));
+        }
+        self.write_tx(|tx| {
+            let exists: Option<i64> = tx
+                .query_opt(
+                    "SELECT 1 FROM app_records WHERE context_id=? AND id=?",
+                    params![context, record_id],
+                    |_| Ok(1i64),
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            if exists.is_none() {
+                return Err(Error::rejected(
+                    "customer record is unavailable for this installation and context",
+                ));
+            }
+            let existing: Option<(String, String, f64, Option<f64>)> = tx
+                .query_opt(
+                    "SELECT body,actor,created,deleted_at FROM app_record_notes
+                     WHERE context_id=? AND record_id=? AND note_id=?",
+                    params![context, record_id, note_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            if let Some((stored_body, stored_actor, created, deleted_at)) = existing {
+                if deleted_at.is_none() && stored_body == body && stored_actor == actor {
+                    return Ok(json!({"note": {
+                        "id": note_id, "record_id": record_id, "body": stored_body,
+                        "actor": stored_actor, "created": created,
+                    }}));
+                }
+                return Err(Error::rejected("note ID is already used"));
+            }
+            let created = now();
+            tx.execute(
+                "INSERT INTO app_record_notes(context_id,record_id,note_id,body,actor,created) VALUES(?,?,?,?,?,?)",
+                params![context, record_id, note_id, body, actor, created],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+            Ok(json!({"note": {
+                "id": note_id, "record_id": record_id, "body": body,
+                "actor": actor, "created": created,
+            }}))
+        })
+    }
+
+    /// Newest-first notes for one customer, bounded to 50.
+    pub fn app_note_list(&self, context: &str, record_id: &str, limit: i64) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(record_id, "record ID")?;
+        let limit = limit.clamp(1, NOTE_PAGE_MAX);
+        let conn = self.conn();
+        let exists: Option<i64> = conn
+            .query_opt(
+                "SELECT 1 FROM app_records WHERE context_id=? AND id=?",
+                params![context, record_id],
+                |_| Ok(1i64),
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+        if exists.is_none() {
+            return Err(Error::rejected(
+                "customer record is unavailable for this installation and context",
+            ));
+        }
+        let notes = conn
+            .query_vec(
+                "SELECT note_id,body,actor,created FROM app_record_notes
+                 WHERE context_id=? AND record_id=? AND deleted_at IS NULL
+                 ORDER BY created DESC, note_id DESC LIMIT ?",
+                params![context, record_id, limit],
+                |r| {
+                    Ok(json!({
+                        "id": r.get::<_, String>(0)?,
+                        "record_id": record_id,
+                        "body": r.get::<_, String>(1)?,
+                        "actor": r.get::<_, String>(2)?,
+                        "created": r.get::<_, f64>(3)?,
+                    }))
+                },
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+        Ok(json!({"record_id": record_id, "notes": notes, "count": notes.len()}))
+    }
+
+    /// Soft-delete one note. The row and its author remain as audit.
+    pub fn app_note_delete(
+        &self,
+        context: &str,
+        record_id: &str,
+        note_id: &str,
+        actor: &str,
+    ) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(record_id, "record ID")?;
+        crate::proto::identifier(note_id, "note ID")?;
+        if !record_actor_valid(actor) {
+            return Err(Error::rejected("note actor is invalid"));
+        }
+        self.write_tx(|tx| {
+            let row: Option<NoteRow> = tx
+                .query_opt(
+                    "SELECT body,actor,created,deleted_at,deleted_by FROM app_record_notes
+                     WHERE context_id=? AND record_id=? AND note_id=?",
+                    params![context, record_id, note_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            let Some((body, stored_actor, created, deleted_at, deleted_by)) = row else {
+                return Err(Error::rejected(
+                    "note is unavailable for this installation and context",
+                ));
+            };
+            let deleted = deleted_at.unwrap_or_else(now);
+            if deleted_at.is_none() {
+                tx.execute(
+                    "UPDATE app_record_notes SET deleted_at=?,deleted_by=? WHERE context_id=? AND record_id=? AND note_id=? AND deleted_at IS NULL",
+                    params![deleted, actor, context, record_id, note_id],
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            }
+            Ok(json!({"deleted": true, "note": {
+                "id": note_id, "record_id": record_id, "body": body,
+                "actor": stored_actor, "created": created,
+                "deleted": true, "deleted_by": deleted_by.unwrap_or_else(|| actor.to_string()),
+                "deleted_at": deleted,
+            }}))
         })
     }
 }
@@ -1551,6 +1965,12 @@ pub fn tag_valid(tag: &str) -> bool {
         && tag
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+/// Revision actor: `operator` or `agent:<alias>`. Derive it from the
+/// caller, never from request text; bound it and refuse control bytes.
+pub fn record_actor_valid(actor: &str) -> bool {
+    !actor.is_empty() && actor.len() <= 128 && !actor.chars().any(char::is_control)
 }
 
 impl CustomerProfile {
@@ -2640,6 +3060,31 @@ impl RecordStore {
         decisions: Option<Vec<CsvDecision>>,
         confirm: Option<(&str, &str)>,
     ) -> Result<Value> {
+        self.app_record_csv_import_as(
+            context,
+            csv_text,
+            preview_token,
+            request_id,
+            decisions,
+            confirm,
+            None,
+        )
+    }
+
+    /// [`Self::app_record_csv_import`] carrying the verified human behind
+    /// an owner import (CAD-1374). `human` lands on the import receipt and
+    /// every row revision the import applies.
+    #[allow(clippy::too_many_arguments)]
+    pub fn app_record_csv_import_as(
+        &self,
+        context: &str,
+        csv_text: &str,
+        preview_token: &str,
+        request_id: &str,
+        decisions: Option<Vec<CsvDecision>>,
+        confirm: Option<(&str, &str)>,
+        human: Option<&Value>,
+    ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(request_id, "request ID")?;
         if preview_token.len() > 128 || !preview_token.starts_with("sha256:") {
@@ -2825,8 +3270,8 @@ impl RecordStore {
                 }
             }
             match tx.execute(
-                "INSERT INTO app_record_csv_imports(request_id,context_id,preview_token,result,decisions_digest,state,at) VALUES(?,?,?,?,?,?,?)",
-                params![request_id, context, token, "", decisions_digest, "pending", now()],
+                "INSERT INTO app_record_csv_imports(request_id,context_id,preview_token,result,decisions_digest,state,at,human) VALUES(?,?,?,?,?,?,?,?)",
+                params![request_id, context, token, "", decisions_digest, "pending", now(), human.map(Value::to_string)],
             ) {
                 Ok(_) => {}
                 Err(_) => match Self::import_receipt_in(&tx, request_id)? {
@@ -2873,7 +3318,8 @@ impl RecordStore {
                     ("skipped", Some(*why))
                 }
                 Apply::Create(profile) => {
-                    let stored = self.app_record_create(context, &row.record_id, profile);
+                    let stored =
+                        self.app_record_create_as(context, &row.record_id, profile, None, human);
                     match stored {
                         Ok(_) => {
                             applied += 1;
@@ -2886,8 +3332,16 @@ impl RecordStore {
                     }
                 }
                 Apply::Update(profile, revision) => {
-                    let stored =
-                        self.update_record(context, &row.record_id, *revision, profile, None, true);
+                    let stored = self.update_record(
+                        context,
+                        &row.record_id,
+                        *revision,
+                        profile,
+                        None,
+                        true,
+                        "operator",
+                        human,
+                    );
                     match stored {
                         Ok(_) => {
                             applied += 1;

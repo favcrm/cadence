@@ -102,6 +102,9 @@ one_review_exclude = [
   "src/remote_auth.rs",
   "src/remote_enrollment.rs",
   "src/remote_cli.rs",
+  "src/remote_cli/**",
+  "src/remote_enrollment/**",
+  "src/remote_*_acceptance.rs",
   "src/device_login.rs",
   "src/cli/platform.rs",
   # risk-paths.toml trigger 3: secrets, credentials, redaction

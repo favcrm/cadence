@@ -1,27 +1,53 @@
 import { ApiError } from "../../lib/api";
-import { sessionHeaders } from "../../lib/sessionKey";
+import { sessionHeaders, sessionKey } from "../../lib/sessionKey";
+import { onPrivateReadsPaused, onPrivateSessionReset, privateFetch, privateReadsAllowed, privateSessionGeneration, withPrivateOperation } from "../../lib/privateSession";
 import type { Agent } from "../../lib/types";
 
 export type { Agent };
+
+/** Keep child-facing manifest aliases out of operator identity fields on RPC. */
+function toolActionBody<T extends { alias: string }>(body: T): Omit<T, "alias"> & { tool_alias: string } {
+  const { alias, ...fields } = body;
+  if ("tool_alias" in fields) throw new Error("tool_alias is host-owned request data");
+  return { ...fields, tool_alias: alias };
+}
+/** The catalogue release an install or an upgrade pins: id + exact
+ * version + digest, always carried together (CAD-1471/CAD-1565). It
+ * names a release; it is never a grant by itself. */
+export interface CatalogueLocator { id: string; version: string; digest: string }
+
 export interface Installation {
   install_id: string; name: string; title: string; version: string;
   summary: string; digest: string; catalog_generation: string; storage_kind: "workspace" | "legacy";
   /** The install's recorded upstream — `kind` is path/git/builtin (CAD-1129). */
   source?: { kind?: string; url?: string; sha?: string; dir?: string; path?: string; id?: string };
+  /** Catalogue release locator recorded after an exact metadata match. Null on a path or Git install. */
+  catalogue?: CatalogueLocator | null;
   project_link: string | null; approved: boolean | null; executable: boolean;
+  /** CAD-1129 soft remove: epoch seconds of the mark, and when Restore stops working. */
+  removed?: number | null; restore_after?: number | null;
   approval: { state: string }; guide: string; files: string[];
   /** Declared slot contract from the live bundle manifest (CAD-585): typed capability slots. */
   capabilities: Record<string, SlotDeclaration> | null;
   /** Untyped legacy slots from `needs.connections`, kept working as before. */
   connection_slots: string[];
+  /** CAD-1543: the live bundle declares host SMTP custody (a screen lists `smtp.bind`). */
+  smtp_custody?: boolean;
+  /** Tenant lifecycle; absent on older/local responses, which mean active. */
+  state?: "active" | "disabled" | "removed";
+  disabled_at?: number | null;
+  removed_at?: number | null;
   /**
    * CAD-1171: `execution: "host"` runs the workflow's capability step
    * in-process for the operator's own click — no worker, no owner PM and
    * no separate approve round. `"agent"` (the default, and what an older
    * daemon that omits the field means) keeps the worker path.
    */
-  workflows?: { name: string; source_digest?: string; label?: string | null; capability_slots?: string[]; distinct?: string[]; execution?: "agent" | "host"; inputs: { name: string; default?: string | null; context_default?: boolean }[] }[];
+  workflows?: { name: string; source_digest?: string; label?: string | null; capability_slots?: string[]; distinct?: string[]; execution?: "agent" | "host"; inputs: { name: string; ask?: string | null; optional?: boolean; kind?: string | null; example?: string | null; default?: string | null; context_default?: boolean }[] }[];
 }
+/** A write acknowledgement, distinct from a later installation read. */
+export type CommittedInstallation = Installation & { committed: true };
+
 /** One declared `needs.capabilities` slot: the result the app needs. Reviewed providers own the matching tools. */
 export interface SlotDeclaration {
   schema: number; capability: string; version: number;
@@ -57,13 +83,48 @@ export interface BindingDrift {
 export interface AppBinding {
   id: string; install_id: string; context_id: string | null; slot: string;
   revision: number; state: string; digest: string;
-  config: { bundle_digest: string; connection_id: string; provider: string; account: string; mapping: ActionMapping };
+  config: { bundle_digest: string; connection_id: string; provider: string; account: string; mapping: ActionMapping;
+    publish?: { destination_id: string; destination_label: string; toolkit: string } };
   drift?: BindingDrift;
+}
+/** Declared access changed by a checked bundle (CAD-1565): which
+ * connection slots appear/disappear and which capability slot
+ * declarations differ between the installed and checked manifests. */
+export interface AccessDiff {
+  connections: { added: string[]; removed: string[] };
+  capabilities: Record<string, { before: SlotDeclaration | null; after: SlotDeclaration | null }>;
+}
+
+export interface CompatibilityCheck {
+  kind: "core" | "contract";
+  required: string | number[];
+  host?: string;
+  contract?: string;
+  supported?: number[];
+  stage?: string | null;
+  ok: boolean;
+}
+export interface CompatibilityReceipt {
+  schema: number;
+  ok: boolean | null;
+  compatible?: boolean | null;
+  status?: string;
+  declared: boolean;
+  core?: string | null;
+  contracts?: Record<string, number[]>;
+  unmet?: string | null;
+  host?: { core: string; contracts: Record<string, number[]> } | null;
+  checks: CompatibilityCheck[];
 }
 export interface UpgradeProposal {
   install_id: string; name: string; version: string; digest: string;
   expected_digest: string; expected_generation: string;
   structural_diff: { added: string[]; changed: string[]; removed: string[] };
+  /** The provenance the daemon authorized for this proposal — required
+   *  to equal the locator the caller pinned when one was sent. */
+  catalogue?: CatalogueLocator | null;
+  access_diff?: AccessDiff;
+  compatibility?: CompatibilityReceipt; notes?: string[];
   secret_warnings: unknown[];
 }
 export interface ArtifactReceipt { id: string; step_id: string; digest: string; media_type: string; size: number }
@@ -118,6 +179,20 @@ export interface CapabilityQuote {
   quote_digest: string;
   quote: { schema: 1; currency: "USD"; unit_price_micros: number; units: number; total_price_micros: number; price_revision: string };
 }
+/** CAD-1177: a retained standalone tool invocation receipt. The `result`
+ *  payload shape is tool-owned (e.g. `social.source.posts` for the
+ *  Instagram read); the envelope fields are host-stamped. */
+export interface ToolReceipt {
+  id: string; request_id: string; install_id: string; alias: string; slot: string;
+  binding_digest: string; input_digest: string; digest: string;
+  input: Record<string, unknown>;
+  result: { kind?: string; handle?: string; posts?: SourcePost[]; profile_verified?: boolean;
+    empty_reason?: string | null; charge?: { currency: string; scale: number; amount: string } | null;
+    [key: string]: unknown };
+  asset?: { media_type: string; digest: string; size: number } | null;
+  /** Host-stamped creation epoch seconds; the frame reads it as fetched_at. */
+  created_at?: number;
+}
 export interface AppEffect {
   effect_id: string; request: string; state: string; needs_you: boolean; digest: string;
   authorization_kind: "app_artifact";
@@ -168,28 +243,82 @@ const run = (id: string) => `/api/app-runs/${part(id)}`;
 const effect = (id: string) => `/api/app-effects/${part(id)}`;
 
 /** Reads are abortable and uncached so receipts never outlive an operator session. */
-async function request<T>(path: string, signal?: AbortSignal, body?: object): Promise<T> {
-  const response = await fetch(path, {
-    method: body === undefined ? "GET" : "POST", signal,
-    credentials: "same-origin", cache: "no-store",
-    headers: body === undefined ? sessionHeaders() : {
-      "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders(),
-    },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-  });
-  const value = await response.json().catch(() => null);
-  if (!response.ok) throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status, typeof value?.code === "string" ? { code: value.code } : undefined);
-  if (value === null) throw new ApiError("The server returned an invalid app receipt", 502);
-  return value as T;
+/** CAD-1365: the original's byte bound and the parent fetch lifetime (the metadata timeout is unchanged). */
+export const ORIGINAL_MEDIA_BYTES_MAX = 10 * 1024 * 1024;
+const ORIGINAL_MEDIA_TIMEOUT_MS = 60_000;
+const ORIGINAL_MIME = ["image/png", "image/jpeg", "image/webp"];
+
+/** Read a response body, refusing (and cancelling) past the byte bound or a Content-Length mismatch. */
+async function readBounded(response: Response): Promise<ArrayBuffer> {
+  const invalid = () => new ApiError("The server returned an invalid original image", 502);
+  const declared = response.headers.get("Content-Length");
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > ORIGINAL_MEDIA_BYTES_MAX)) throw invalid();
+  const reader = response.body?.getReader();
+  if (!reader) throw invalid();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > ORIGINAL_MEDIA_BYTES_MAX) { await reader.cancel().catch(() => {}); throw invalid(); }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (declared !== null && Number(declared) !== total) throw invalid();
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) { out.set(chunk, at); at += chunk.byteLength; }
+  return out.buffer as ArrayBuffer;
 }
 
+
+function appResponseError(response: Response, value: unknown): ApiError {
+  const body = value as { code?: unknown; error?: string | { code?: unknown; message?: unknown } } | null;
+  const nested = typeof body?.error === "object" ? body.error : null;
+  const code = typeof body?.code === "string" ? body.code : typeof nested?.code === "string" ? nested.code : undefined;
+  const message = typeof body?.error === "string" ? body.error : typeof nested?.message === "string" ? nested.message : `${response.status} ${response.statusText}`;
+  return new ApiError(message, response.status, code ? { code } : undefined);
+}
+
+async function request<T>(path: string, signal?: AbortSignal, body?: object): Promise<T> {
+  return withPrivateOperation(async (operation) => {
+    const read = body === undefined;
+    const response = await privateFetch(path, {
+      method: read ? "GET" : "POST",
+      credentials: "same-origin", cache: "no-store",
+      headers: read ? sessionHeaders() : {
+        "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders(),
+      },
+      ...(read ? {} : { body: JSON.stringify(body) }),
+    }, operation);
+    const value = await response.json().catch(() => null);
+    operation.assertCurrent();
+    if (!response.ok) throw appResponseError(response, value);
+    if (value === null) throw new ApiError("The server returned an invalid app receipt", 502);
+    return value as T;
+  }, signal);
+}
+
+/** One of the company's connected Instagram accounts (CAD-1290). */
+export interface PublishDestination { destination_id: string; label: string; toolkit: string }
 export const workspaceApps = {
+  /** CAD-1290: the host-composed AgenticOS connect link; `hosted:false` on a local board. */
+  connectLink: (id: string, returnTo: string, signal?: AbortSignal) =>
+    request<{ hosted: boolean; url?: string; unavailable?: boolean }>(`${installation(id)}/publishing/connect-link`, signal, { return_to: returnTo }),
+  destinations: (id: string, signal?: AbortSignal) =>
+    request<{ unavailable: boolean; destinations: PublishDestination[] }>(`${installation(id)}/publishing/destinations`, signal),
+  useDestination: (id: string, body: { destination_id: string; timezone?: string; request_id?: string; expected_revision?: number; context_id?: string }) =>
+    request<{ binding: AppBinding }>(`${installation(id)}/publishing/use`, undefined, body),
   installations: (signal?: AbortSignal) => request<Installation[]>("/api/app-installations", signal),
   detail: (id: string, signal?: AbortSignal) => request<Installation>(installation(id), signal),
-  upgradeCheck: (id: string, body: { source: string; expected_digest: string; expected_generation: string }) =>
-    request<UpgradeProposal>(`${installation(id)}/upgrade/check`, undefined, body),
-  upgrade: (id: string, body: { source: string; expected_digest: string; expected_generation: string; expected_new_digest: string; request_id: string }) =>
-    request<Installation>(`${installation(id)}/upgrade`, undefined, body),
+  upgradeCheck: (id: string, body: UpgradeCheckBody, signal?: AbortSignal) =>
+    request<UpgradeProposal>(`${installation(id)}/upgrade/check`, signal, body),
+  upgrade: (id: string, body: UpgradeApplyBody, signal?: AbortSignal) =>
+    request<CommittedInstallation>(`${installation(id)}/upgrade`, signal, body),
   contexts: async (id: string, signal?: AbortSignal) => (await request<{ contexts: AppContext[] }>(`${installation(id)}/contexts`, signal)).contexts,
   bindings: async (id: string, contextId?: string, signal?: AbortSignal) => (await request<{ bindings: AppBinding[] }>(contextId ? `${installation(id)}/contexts/${part(contextId)}/bindings` : `${installation(id)}/bindings`, signal)).bindings,
   connections: async (signal?: AbortSignal) => (await request<{ connections: Connection[] }>("/api/connections", signal)).connections,
@@ -206,6 +335,7 @@ export const workspaceApps = {
   createBinding: async (id: string, body: BindingCreate) => (await request<{ binding: AppBinding }>(`${installation(id)}/bindings`, undefined, body)).binding,
   updateBinding: async (id: string, bindingId: string, body: { expected_revision: number; connection_id: string }) => (await request<{ binding: AppBinding }>(`${installation(id)}/bindings/${part(bindingId)}/update`, undefined, body)).binding,
   createRun: (body: CreateRun) => request<WorkspaceRun>("/api/app-runs", undefined, body),
+  getRun: (id: string, signal?: AbortSignal) => request<WorkspaceRun>(run(id), signal),
   startRun: (body: StartRun) => request<WorkspaceRun>("/api/app-runs/start", undefined, body),
   team: async (id: string, signal?: AbortSignal) => (await request<{ team: InstallTeam | null }>(`${installation(id)}/team`, signal)).team,
   setTeam: async (id: string, body: { owner_pm: string; roles: Record<string, string>; expected_revision: number }) => (await request<{ team: InstallTeam }>(`${installation(id)}/team`, undefined, body)).team,
@@ -216,6 +346,126 @@ export const workspaceApps = {
   capabilityResult: (id: string, signal?: AbortSignal) => request<SourceReceipt>(`/api/app-capability-results/${part(id)}`, signal),
   capabilityAsset: (id: string, signal?: AbortSignal) => request<ImageAsset>(`/api/app-capability-results/${part(id)}/asset`, signal),
   bindingQuote: (id: string, slot: string, contextId?: string, signal?: AbortSignal) => request<CapabilityQuote>(contextId ? `${installation(id)}/contexts/${part(contextId)}/bindings/${part(slot)}/quote` : `${installation(id)}/bindings/${part(slot)}/quote`, signal),
+  /** CAD-1177: invoke one declared screen tool through the host broker,
+   *  bound to the live mount's action context. The frame supplies only
+   *  alias/input/request_id; install/digest/slot/binding are server-side. */
+  invokeTool: (body: { action_token: string; alias: string; input: Record<string, unknown>; request_id: string; generation_scope?: {operation:"caption"|"image";draft_id:string;revision:number} }) =>
+    request<{ receipt?: ToolReceipt; generation_intent?: {request_id:string;operation:string;draft_id?:string;revision?:number;input_digest:string;state:"pending"|"uncertain";updated_at:number}; replayed: boolean }>("/api/app-screen-tools/invoke", undefined, toolActionBody(body)),
+  /** CAD-1177: retire a mount's action handle on teardown/remount. The
+   *  host sends the mount's action_token; the daemon revokes only a
+   *  context the proven session owns. Best-effort — never blocks unmount. */
+  revokeTool: (body: { action_token: string }) =>
+    request<{ revoked: boolean }>("/api/app-screen-tools/revoke", undefined, body),
+  /** The retained receipts for one installation (operator read). */
+  toolResults: async (id: string, contextId?: string, signal?: AbortSignal) => (await request<{ results: ToolReceipt[] }>(`/api/app-screen-tools/results?install_id=${part(id)}${contextId?`&context_id=${part(contextId)}`:""}`, signal)).results,
+  /** CAD-1365: `media.read` relay for a live `screen-media.v1` mount —
+   *  the workspace catalog's bounded metadata page. The body is exactly
+   *  `{action_token, input}`; the route refuses any scope/credential
+   *  field and adds the proven session itself. */
+  mediaRead: (body: { action_token: string; input: Record<string, unknown> }) =>
+    request<Record<string, unknown>>(
+      "/api/app-media/read", undefined, body),
+  mediaChatAttach: (body: { action_token: string; asset_id: string; expected_revision: number; conversation_id: string | null }) =>
+    request<{ asset_id: string; revision: number; host_command: {
+      operation: "media.chat.attach"; conversation_id: string | null;
+      args: { install_id: string; context_id: string; asset_id: string; revision: number; sha256: string; media_type: string; title: string; preview: string };
+    } }>("/api/app-media/chat-attach", undefined, body),
+  /** CAD-1365: `media.publish` relay — the frozen curation intent
+   *  `{action_token, asset_id, expected_revision, request_id}` only. */
+  mediaPublish: (body: { action_token: string; asset_id: string; expected_revision: number; request_id: string }) =>
+    request<Record<string, unknown>>("/api/app-media/publish", undefined, body),
+  socialDraftAction: (operation: "create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/save"|"effect-stage"|"confirm"|"schedule"|"reschedule"|"cancel", body: Record<string, unknown> & { alias: string }) =>
+    request<Record<string, unknown>>(`/api/app-social-drafts/${operation}`, undefined, toolActionBody(body)),
+  /** SOC-32: the host-owned image upload door. `file` goes as multipart; the
+   *  daemon re-proves the live mount/context/slot, normalises the image and
+   *  returns its durable asset id plus a small display preview. */
+  uploadSocialImage: async (body:{action_token:string;alias:string;file:File}):Promise<{asset_id:string;mime:string;width:number;height:number;size_bytes:number;digest:string}> => {
+    const generation = privateSessionGeneration();
+    const controller = new AbortController();
+    const unsubscribe = onPrivateReadsPaused(() => controller.abort());
+    try {
+      return await withPrivateOperation(async (op) => {
+        const form = new FormData();
+        form.append("action_token", body.action_token);
+        form.append("alias", body.alias);
+        form.append("name", body.file.name);
+        form.append("file", body.file, body.file.name);
+        const response = await privateFetch("/api/app-social-drafts/image", { method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
+          headers: { "X-Cadence-Board": "1", ...sessionHeaders() }, body: form }, op);
+        const value = await response.json().catch(() => null);
+        op.assertCurrent();
+        if (!response.ok) throw appResponseError(response, value);
+        if (controller.signal.aborted || !privateReadsAllowed() || generation !== privateSessionGeneration()) throw new DOMException("The private session changed", "AbortError");
+        const row = value as Record<string, unknown> | null;
+        if (!row || typeof row.asset_id !== "string" || !["image/jpeg", "image/png"].includes(String(row.mime)) ||
+            !Number.isSafeInteger(row.width) || !Number.isSafeInteger(row.height) || !Number.isSafeInteger(row.size_bytes) || typeof row.digest !== "string") {
+          throw new ApiError("The server returned an invalid social image receipt", 502);
+        }
+        return { asset_id: row.asset_id, mime: String(row.mime), width: row.width as number, height: row.height as number, size_bytes: row.size_bytes as number, digest: row.digest };
+      }, controller.signal);
+    } finally { unsubscribe(); }
+  },
+  socialUploadedAsset: async (body:{action_token:string;alias:string;asset_id:string}):Promise<{bytes:ArrayBuffer;mime:string}> => {
+    const generation = privateSessionGeneration();
+    const controller = new AbortController();
+    const unsubscribe = onPrivateReadsPaused(() => controller.abort());
+    try {
+      return await withPrivateOperation(async (op) => {
+        const response = await privateFetch("/api/app-social-drafts/uploaded", { method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
+          headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() }, body: JSON.stringify(toolActionBody({action_token: body.action_token, alias: body.alias, asset_id: body.asset_id})) }, op);
+        if (!response.ok) throw appResponseError(response, await response.json().catch(() => null));
+        const mime = response.headers.get("Content-Type") ?? "";
+        if (!["image/jpeg", "image/png"].includes(mime)) throw new ApiError("The server returned an invalid social image", 502);
+        const bytes = await response.arrayBuffer();
+        op.assertCurrent();
+        if (controller.signal.aborted || !privateReadsAllowed() || generation !== privateSessionGeneration()) throw new DOMException("The private session changed", "AbortError");
+        return { bytes, mime };
+      }, controller.signal);
+    } finally { unsubscribe(); }
+  },
+  socialDraftAsset: async (body:{action_token:string;alias:string;draft_id:string}):Promise<{bytes:ArrayBuffer;mime:string}> => {
+    const generation = privateSessionGeneration();
+    const controller = new AbortController();
+    const unsubscribe = onPrivateReadsPaused(() => controller.abort());
+    try {
+      return await withPrivateOperation(async (op) => {
+        const response = await privateFetch("/api/app-social-drafts/asset", { method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
+          headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() }, body: JSON.stringify(toolActionBody(body)) }, op);
+        if (!response.ok) throw appResponseError(response, await response.json().catch(() => null));
+        const mime = response.headers.get("Content-Type") ?? "";
+        if (!["image/jpeg", "image/png"].includes(mime)) throw new ApiError("The server returned an invalid social image", 502);
+        const bytes = await response.arrayBuffer();
+        op.assertCurrent();
+        if (controller.signal.aborted || !privateReadsAllowed() || generation !== privateSessionGeneration()) {
+          throw new DOMException("The private session changed", "AbortError");
+        }
+        return { bytes, mime };
+      }, controller.signal);
+    } finally { unsubscribe(); }
+  },
+  /** CAD-1365: the native original bytes for `{action_token, asset_id}` only. The response is bounded
+   *  (10 MiB, allowlisted image MIME) and the request lifetime is capped; the caller owns the bytes. */
+  originalMedia: async (body: { action_token: string; asset_id: string }): Promise<{ bytes: ArrayBuffer; mime: string }> => {
+    const generation = privateSessionGeneration();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ORIGINAL_MEDIA_TIMEOUT_MS);
+    const unsubscribe = onPrivateReadsPaused(() => controller.abort());
+    try {
+      return await withPrivateOperation(async (op) => {
+        const response = await privateFetch("/api/app-media/original", { method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
+          headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() }, body: JSON.stringify(body) }, op);
+        if (!response.ok) throw appResponseError(response, await response.json().catch(() => null));
+        const mime = response.headers.get("Content-Type") ?? "";
+        if (!ORIGINAL_MIME.includes(mime)) throw new ApiError("The server returned an invalid original image", 502);
+        const bytes = await readBounded(response);
+        op.assertCurrent();
+        if (controller.signal.aborted || !privateReadsAllowed() || generation !== privateSessionGeneration()) {
+          throw new DOMException("The private session changed", "AbortError");
+        }
+        return { bytes, mime };
+      }, controller.signal);
+    } finally { clearTimeout(timer); unsubscribe(); }
+  },
   artifact: (id: string, signal?: AbortSignal) => request<TextArtifact>(`/api/app-run-artifacts/${part(id)}`, signal),
   stageEffect: async (id: string, body: { artifact_id: string; slot: string; request_id: string; title: string }) => (await request<{ effect: AppEffect }>(`${run(id)}/effects`, undefined, body)).effect,
   decideEffect: async (id: string, body: { digest: string; decision: "accept" | "decline" }) => (await request<{ effect: AppEffect }>(`${effect(id)}/decide`, undefined, body)).effect,
@@ -225,12 +475,25 @@ export const workspaceApps = {
 
 // ---------- CAD-1129: the apps Explorer ----------
 
-/** One catalog card (a built-in, or the operator's checked Git entry). */
+/** Fired after an install, remove or restore so the sidebar's app list
+ * re-reads at once instead of waiting for the next navigation. */
+export const APPS_CHANGED_EVENT = "cadence:apps-changed";
+export function notifyAppsChanged(): void {
+  try { window.dispatchEvent(new Event(APPS_CHANGED_EVENT)); } catch { /* no window in a test */ }
+}
+
+
+/** One catalog card. The built-in catalog is retired (CAD-1422): a
+ *  daemon row is a tombstone (`retired`, `retired_reason`) for a
+ *  catalog id a historical install or open request still names; the
+ *  only live card is the operator's checked Git entry. */
 export interface CatalogCard {
   id: string; source_kind: "builtin" | "git"; name: string; title: string;
-  version: string; tagline?: string; digest?: string; trust: "cadence" | "unreviewed";
+  version?: string; tagline?: string; digest?: string; trust: "cadence" | "unreviewed";
+  /** CAD-1422: the built-in source is retired — `retired_reason` says why. */
+  retired?: boolean; retired_reason?: string;
   state?: "available" | "installed" | "off" | "requested" | "removed";
-  install_id?: string; requested_by_me?: boolean; request_count?: number;
+  install_id?: string; removed?: boolean; restorable?: boolean; requested_by_me?: boolean; request_count?: number;
   update_available?: boolean; featured?: boolean;
   /** Git check's resolved repository and commit. */
   source_url?: string; commit?: string; dir?: string;
@@ -250,6 +513,10 @@ export interface HomeInstallation {
    *  apart (the old `/apps` list's `Project:` chip). */
   project?: string;
   tagline?: string; icon?: string;
+  /** The readable manifest record, when the row carries one: the
+   *  installed version, the bundle's own listing copy and the recorded
+   *  catalogue locator (null/absent on a path or Git install). */
+  version?: string; listing?: Listing | null; catalogue?: CatalogueLocator | null;
   attention: {
     state: "ok" | "setup" | "update" | "off" | "attention" | "removed";
     message: string | null; action: string | null; count: number;
@@ -300,12 +567,38 @@ export interface RemovePreview {
 }
 
 /** The `install-check` receipt: what an install would admit, before it
- * writes anything (CAD-1186/1194). */
+ * writes anything (CAD-1186/1194). `catalogue`/`access_diff`/
+ * `compatibility` ride the same daemon reply the upgrade proposal reports. */
 export interface InstallCheck {
   schema: number; name: string; version: string; digest: string;
   files: string[]; committed: false; notes: string[];
   secret_warnings: { rule: string; line: number; column: number; redacted: string; severity: string }[];
+  catalogue?: CatalogueLocator | null;
+  access_diff?: AccessDiff;
+  compatibility?: CompatibilityReceipt;
 }
+
+/** The upload transport's body: a flat `{path: utf8}` bundle map plus the
+ * pins it stages under — the selected release's expected digest and the
+ * catalogue locator it claims. `catalogue` is optional on the wire. */
+export interface FilesUploadBody {
+  files: Record<string, string>;
+  expected_digest?: string;
+  catalogue?: CatalogueLocator;
+}
+
+/** An upgrade body is a `files` map OR a legacy `source`, never both —
+ * the same closed shape `workspace_upgrade_transport` admits. */
+export type UpgradeBody = {
+  expected_digest: string; expected_generation: string;
+  catalogue?: CatalogueLocator; catalogue_resolution?: "manual";
+} & ({ files: Record<string, string> } | { source: string });
+
+/** A files-mode upgrade check pins the install's recorded digest and the
+ * catalog generation it was read under; a checked apply adds the new
+ * bundle digest and a retained request id. */
+export type UpgradeCheckBody = UpgradeBody;
+export type UpgradeApplyBody = UpgradeBody & { expected_new_digest: string; request_id: string };
 
 export const appExplorer = {
   catalog: (signal?: AbortSignal) => request<{ catalog: CatalogCard[] }>("/api/app-catalog", signal),
@@ -313,17 +606,25 @@ export const appExplorer = {
   home: (signal?: AbortSignal) => request<{ installations: HomeInstallation[] }>("/api/app-home", signal),
   favorites: async (signal?: AbortSignal) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites", signal)),
   requests: (signal?: AbortSignal) => request<{ requests: InstallRequest[] }>("/api/app-requests", signal),
-  /** CAD-1194: the read-only install proposal. `source` is a path, a Git
-   * URL or `builtin:<catalog id>`; the returned `digest` is the pin every
-   * install below must carry. */
+  /** CAD-1194: the read-only install proposal. `source` is a path or a
+   * Git URL (`builtin:<catalog id>` is the retired source form and is
+   * refused); the returned `digest` is the pin every install below must
+   * carry. */
   installCheck: (source: string) => request<InstallCheck>("/api/app-installations/check", undefined, { source }),
-  /** Install a built-in, pinned to the digest `installCheck("builtin:<id>")` returned. */
-  installEntry: (catalogId: string, expectedDigest: string) =>
-    request<Installation>("/api/app-catalog/install", undefined, { catalog_id: catalogId, expected_digest: expectedDigest }),
   /** Install a checked source (a Git URL) — the workspace install route,
    * pinned to the checked digest so changed bytes are refused. */
   installSource: (source: string, expectedDigest: string) =>
     request<Installation>("/api/app-installations", undefined, { source, expected_digest: expectedDigest }),
+  /** The guarded files-mode install check: the board stages the bundle
+   * server-side and the daemon reports what it would admit without
+   * writing anything. The reply's `digest` must equal the release's. */
+  uploadCheck: (body: FilesUploadBody, signal?: AbortSignal) =>
+    request<InstallCheck>("/api/app-installations/upload/check", signal, body),
+  /** The guarded files-mode install: the same staged `files` map, pinned
+   * to the checked `expected_digest` and the catalogue locator. The
+   * reply is the committed installation record. */
+  upload: (body: FilesUploadBody, signal?: AbortSignal) =>
+    request<CommittedInstallation>("/api/app-installations/upload", signal, body),
   gitCheck: (url: string) => request<CatalogCard>("/api/app-catalog/git-check", undefined, { url }),
   putFavorites: async (installIds: string[]) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites", undefined, { install_ids: installIds })),
   putFavoritesDefault: async (installIds: string[]) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites/default", undefined, { install_ids: installIds })),
@@ -335,3 +636,179 @@ export const appExplorer = {
   remove: (installId: string, body: { expected_generation: string; expected_digest: string; request_id: string }) => request<unknown>(`/api/app-installations/${part(installId)}/remove`, undefined, body),
   restore: (installId: string) => request<{ restored: boolean; digest: string }>(`/api/app-installations/${part(installId)}/restore`, undefined, {}),
 };
+// ---------- CAD-1137: per-session snapshot cache ----------
+
+/**
+ * The app page's read set in one in-memory snapshot, keyed by the route's
+ * installation. A revisit paints it at once and the page revalidates behind
+ * it (stale-while-revalidate); writes go through `workspaceApps`.
+ *
+ * The store is this tab's memory only — nothing is persisted — and it is
+ * cleared when the session key changes, so a sign-out or a different
+ * operator session can never see the previous session's payload. Entries
+ * older than `SNAPSHOT_TTL_MS` are ignored rather than revived.
+ */
+export interface WorkspaceAppSnapshot {
+  installation: Installation;
+  contexts: AppContext[];
+  bindings: AppBinding[];
+  connections: Connection[];
+  agents: Agent[];
+  runs: WorkspaceRun[];
+  effects: AppEffect[];
+}
+
+const SNAPSHOT_TTL_MS = 10 * 60 * 1000;
+const snapshots = new Map<string, { at: number; session: string | null; data: WorkspaceAppSnapshot }>();
+
+/** The last snapshot for `installId` from this operator session, or null. */
+export function readWorkspaceAppSnapshot(installId: string): WorkspaceAppSnapshot | null {
+  const entry = snapshots.get(installId);
+  if (!entry) return null;
+  if (entry.session !== sessionKey() || Date.now() - entry.at > SNAPSHOT_TTL_MS) {
+    snapshots.delete(installId);
+    return null;
+  }
+  return entry.data;
+}
+
+/** Record the snapshot a successful read produced. */
+export function writeWorkspaceAppSnapshot(installId: string, data: WorkspaceAppSnapshot, session = sessionKey(), generation = privateSessionGeneration()): void {
+  if (session !== sessionKey() || generation !== privateSessionGeneration() || !privateReadsAllowed()) return;
+  snapshots.set(installId, { at: Date.now(), session, data });
+}
+
+/** Forget one installation's snapshot (access refusal, removal). */
+export function dropWorkspaceAppSnapshot(installId: string): void {
+  snapshots.delete(installId);
+  for (const [key, flight] of snapshotReads) {
+    if (flight.installId === installId) {
+      if (snapshotReads.get(key) === flight) snapshotReads.delete(key);
+      flight.controller.abort();
+    }
+  }
+}
+
+/** The app page's reads, fired in parallel and stored as one snapshot. */
+type SnapshotRead = { installId: string; controller: AbortController; subscribers: number; settled: boolean; promise: Promise<WorkspaceAppSnapshot> };
+const snapshotReads = new Map<string, SnapshotRead>();
+let snapshotEpoch = 0;
+export function readWorkspaceAppSnapshotFresh(installId: string, signal?: AbortSignal): Promise<WorkspaceAppSnapshot> {
+  if (signal?.aborted) return Promise.reject(new DOMException("The operation was aborted", "AbortError"));
+  const requestSession = sessionKey();
+  const generation = privateSessionGeneration();
+  const epoch = snapshotEpoch;
+  const key = JSON.stringify([installId, requestSession, generation]);
+  let flight = snapshotReads.get(key);
+  if (!flight) {
+    const controller = new AbortController();
+    const created: SnapshotRead = { installId, controller, subscribers: 0, settled: false, promise: Promise.resolve(null as never) };
+    created.promise = (async () => {
+      const [installation, contexts, bindings, connections, agents, runs, effects] = await Promise.all([
+        workspaceApps.detail(installId, controller.signal),
+        workspaceApps.contexts(installId, controller.signal),
+        workspaceApps.bindings(installId, undefined, controller.signal),
+        workspaceApps.connections(controller.signal),
+        workspaceApps.agents(controller.signal),
+        workspaceApps.runs(installId, undefined, controller.signal),
+        workspaceApps.effects(installId, undefined, controller.signal),
+      ]);
+      if (controller.signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
+      if (epoch !== snapshotEpoch || requestSession !== sessionKey() || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
+        throw new ApiError("The session changed while loading this app", 401);
+      }
+      const data = { installation, contexts, bindings, connections, agents, runs, effects };
+      writeWorkspaceAppSnapshot(installId, data, requestSession, generation);
+      return data;
+    })().finally(() => {
+      created.settled = true;
+      if (snapshotReads.get(key) === created) snapshotReads.delete(key);
+    });
+    flight = created;
+    snapshotReads.set(key, flight);
+  }
+  const shared = flight;
+  shared.subscribers += 1;
+  return new Promise((resolve, reject) => {
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      signal?.removeEventListener("abort", abort);
+      shared.subscribers -= 1;
+      if (shared.subscribers === 0 && !shared.settled) {
+        if (snapshotReads.get(key) === shared) snapshotReads.delete(key);
+        shared.controller.abort();
+      }
+    };
+    const abort = () => { release(); reject(new DOMException("The operation was aborted", "AbortError")); };
+    signal?.addEventListener("abort", abort, { once: true });
+    shared.promise.then(value => {
+      if (released) return;
+      release();
+      if (epoch !== snapshotEpoch || shared.controller.signal.aborted) {
+        reject(new DOMException("The private session changed", "AbortError"));
+      } else {
+        resolve(value);
+      }
+    }, error => { if (!released) { release(); reject(error); } });
+  });
+}
+
+/**
+ * Warm the cache for `installId` — the sidebar's app links call this on
+ * hover/focus so opening the app paints before the click lands. Joins a
+ * read already in flight for the same installation; failures are dropped.
+ */
+const prefetching = new Map<string, Promise<unknown>>();
+export function prefetchWorkspaceApp(installId: string): void {
+  if (prefetching.has(installId)) return;
+  if (readWorkspaceAppSnapshot(installId) !== null) return;
+  const task = readWorkspaceAppSnapshotFresh(installId)
+    .catch(() => null)
+    .finally(() => { if (prefetching.get(installId) === task) prefetching.delete(installId); });
+  prefetching.set(installId, task);
+}
+
+/** The `/api/app-installations` list, held the same way: the Apps
+ *  screen paints the last read at once and refetches behind it. */
+let installationsSnapshot: { at: number; session: string | null; rows: Installation[] } | null = null;
+
+export function readInstallationsSnapshot(): Installation[] | null {
+  if (!installationsSnapshot || installationsSnapshot.session !== sessionKey() ||
+      Date.now() - installationsSnapshot.at > SNAPSHOT_TTL_MS) return null;
+  return installationsSnapshot.rows;
+}
+
+/** Fresh read of the installations list; stores the snapshot. */
+export async function readInstallationsFresh(signal?: AbortSignal): Promise<Installation[]> {
+  const requestSession = sessionKey();
+  const generation = privateSessionGeneration();
+  const epoch = snapshotEpoch;
+  const rows = await workspaceApps.installations(signal);
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  if (epoch !== snapshotEpoch || requestSession !== sessionKey() || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
+    throw new ApiError("The session changed while loading apps", 401);
+  }
+  installationsSnapshot = { at: Date.now(), session: requestSession, rows };
+  return rows;
+}
+
+export function dropInstallationsSnapshot(): void {
+  installationsSnapshot = null;
+}
+
+onPrivateReadsPaused(() => {
+  snapshotEpoch += 1;
+  for (const flight of snapshotReads.values()) flight.controller.abort();
+  snapshotReads.clear();
+  prefetching.clear();
+});
+
+onPrivateSessionReset(() => {
+  for (const flight of snapshotReads.values()) flight.controller.abort();
+  snapshotReads.clear();
+  snapshots.clear();
+  prefetching.clear();
+  dropInstallationsSnapshot();
+});

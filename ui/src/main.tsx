@@ -8,10 +8,13 @@ import "@fontsource/ibm-plex-mono/latin-500.css";
 import "@fontsource/ibm-plex-mono/latin-600.css";
 import "./styles.css";
 import "./features/projects/board.css";
+import "./features/app-shell/shared/drawer.css";
+import "./features/canvas/canvas.css";
 import App from "./App";
 import { applyLegacyRedirect, installClientNav } from "./lib/useLocation";
 import { initTheme } from "./lib/theme";
 import { captureLoginNonce } from "./features/auth/session";
+import { LocaleProvider } from "./lib/locale";
 
 // The stored theme pick, before the first paint of the app.
 initTheme();
@@ -29,6 +32,6 @@ captureLoginNonce();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <App />
+    <LocaleProvider><App /></LocaleProvider>
   </StrictMode>,
 );

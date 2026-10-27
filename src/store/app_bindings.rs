@@ -52,6 +52,21 @@ fn validate_config(install: &str, context: Option<&str>, config: &Value) -> Resu
             "binding configuration scope does not match its installation/context",
         ));
     }
+    if config["provider"] == crate::platform::account_media::PLATFORM {
+        let source: crate::platform::account_media::AccountSource =
+            serde_json::from_value(config["account_source"].clone()).map_err(|_| {
+                Error::rejected("account image binding requires an exact source receipt")
+            })?;
+        if config["account"] != source.handle() || config["connection_kind"] != "builtin" {
+            return Err(Error::rejected(
+                "account image binding source does not match its connection",
+            ));
+        }
+    } else if config.get("account_source").is_some() {
+        return Err(Error::rejected(
+            "only account images accept an account source receipt",
+        ));
+    }
     if serde_json::to_vec(config)?.len() > CONFIG_BYTES {
         return Err(Error::rejected("binding configuration exceeds 16 KiB"));
     }
@@ -79,6 +94,7 @@ fn binding_material_same(old: &Value, new: &Value) -> bool {
         "connection_revision",
         "provider",
         "account",
+        "account_source",
         "registration_digest",
         "descriptor_revision",
         "mapping",
@@ -698,6 +714,161 @@ impl Store {
         })
     }
 
+    /// CAD-1328: an operator-proven context save moves every configured
+    /// binding of that context onto the new `{id, install_id, revision,
+    /// digest}` pin, in the caller's transaction (the context row is already
+    /// updated). Only the `context` field of the receipt changes: the pin
+    /// exists to catch a changed connection, bundle, descriptor or sink, and
+    /// those fields stay as stored, so `binding_drift` still refuses them.
+    /// Derived grants rest on the connection, not the context, so they stay.
+    /// Waiting effects pinned to the old incarnation fail at send time on
+    /// the binding revision check. The only caller is the operator-gated
+    /// context update; no other path re-pins.
+    pub(super) fn app_bindings_repin_context_in(
+        tx: &impl super::StoreConn,
+        install: &str,
+        context: &str,
+    ) -> Result<()> {
+        let shown = Self::app_context_show_in(tx, install, context)?;
+        if shown["state"] != "active" {
+            return Ok(());
+        }
+        let pin = json!({"id":context,"install_id":install,
+            "revision":shown["revision"],"digest":shown["digest"]});
+        let ids: Vec<String> = tx.query_vec(
+            "SELECT id FROM app_bindings WHERE install_id=? AND context_id=? AND state='configured'",
+            params![install, context],
+            |r| r.get(0),
+        )?;
+        for id in ids {
+            let row = binding_in(tx, install, &id)?;
+            if row["config"]["context"] == pin {
+                continue;
+            }
+            let mut config = row["config"].clone();
+            config["context"] = pin.clone();
+            validate_config(install, Some(context), &config)?;
+            let slot = row["slot"]
+                .as_str()
+                .ok_or_else(|| Error::internal("invalid binding slot"))?;
+            let digest = config_digest(install, Some(context), slot, &config);
+            let updated = tx.execute("UPDATE app_bindings SET config=?,digest=?,revision=revision+1,updated=? WHERE install_id=? AND id=? AND revision=? AND state='configured'",params![config.to_string(),digest,now(),install,id,row["revision"].as_i64()])?;
+            if updated != 1 {
+                return Err(Error::rejected("binding re-pin lost its revision claim"));
+            }
+            Self::event(
+                tx,
+                "app_bindings",
+                "app_binding_repinned",
+                json!({"install_id":install,"binding_id":id,"slot":slot,
+                       "revision":row["revision"].as_i64().unwrap_or(0)+1,"digest":digest,
+                       "from_digest":row["digest"],"from_context":row["config"]["context"],
+                       "to_context":pin,"actor":"operator"}),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// CAD-1328: the operator's destination choice re-pins the context's
+    /// bindings the same way a context save does (see above).
+    pub fn app_context_repin(&self, install: &str, context: &str) -> Result<()> {
+        self.write_tx(|conn| Self::app_bindings_repin_context_in(&*conn, install, context))
+    }
+
+    /// CAD-1140: carry a configured binding onto an upgraded bundle only
+    /// when the upgrade journal staged its exact receipt after verifying the
+    /// slot declaration is byte-identical and pinned to the replaced bundle.
+    /// The caller runs this within the journaled delivery transaction. CAS
+    /// skips rows changed since staging; the current-receipt check skips rows
+    /// whose connection is no longer live.
+    pub fn app_binding_upgrade_carry(
+        &self,
+        install: &str,
+        bundle_digest: &str,
+        workspace: &str,
+        carried: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<Vec<String>> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let mut done = Vec::with_capacity(carried.len());
+            let mut skipped = Vec::new();
+            for (id, expected) in carried {
+                let moved = match binding_in(&tx, install, id) {
+                    Ok(row) => {
+                        row["state"] != "configured"
+                            || row["config"] != *expected
+                            || expected["bundle_digest"].as_str() == Some(bundle_digest)
+                    }
+                    Err(_) => true,
+                };
+                if moved {
+                    skipped.push(id.clone());
+                    continue;
+                }
+                let row = binding_in(&tx, install, id)?;
+                let context = row["context_id"].as_str();
+                let slot = row["slot"]
+                    .as_str()
+                    .ok_or_else(|| Error::internal("invalid binding slot"))?;
+                let proof = BindingProof {
+                    id: id.clone(),
+                    revision: row["revision"]
+                        .as_i64()
+                        .ok_or_else(|| Error::internal("invalid binding revision"))?,
+                    digest: row["digest"]
+                        .as_str()
+                        .ok_or_else(|| Error::internal("invalid binding digest"))?
+                        .to_string(),
+                    config: row["config"].clone(),
+                };
+                if !binding_current_in(&tx, install, context, slot, &proof)? {
+                    skipped.push(id.clone());
+                    continue;
+                }
+                let mut config = expected.clone();
+                config["bundle_digest"] = json!(bundle_digest);
+                validate_config(install, context, &config)?;
+                let digest = config_digest(install, context, slot, &config);
+                let updated = tx.execute("UPDATE app_bindings SET config=?,digest=?,revision=revision+1,updated=? WHERE install_id=? AND id=? AND revision=? AND state='configured'",params![config.to_string(),digest,now(),install,id,row["revision"].as_i64().unwrap_or(0)])?;
+                if updated != 1 {
+                    return Err(Error::rejected(
+                        "binding bundle carry lost its revision claim",
+                    ));
+                }
+                let next = binding_in(&tx, install, id)?;
+                if next["context_id"] != row["context_id"]
+                    || next["slot"] != row["slot"]
+                    || next["config"]["workspace_id"] != json!(workspace)
+                {
+                    return Err(Error::rejected(
+                        "binding bundle carry changed the receipt's scope",
+                    ));
+                }
+                Self::app_effect_invalidate_in(&tx, install, None, Some(id), None)?;
+                Self::event(
+                    &tx,
+                    "app_bindings",
+                    "app_binding_migrated",
+                    json!({"install_id":install,"binding_id":id,
+                           "revision":row["revision"].as_i64().unwrap_or(0)+1,
+                           "digest":digest,"from_digest":row["digest"],
+                           "changes":[json!({"field":"bundle_digest","from":expected["bundle_digest"],"to":bundle_digest})],
+                           "actor":"daemon","via":"upgrade"}),
+                )?;
+                done.push(id.clone());
+            }
+            if !skipped.is_empty() {
+                Self::event(
+                    &tx,
+                    "app_bindings",
+                    "app_binding_carry_skipped",
+                    json!({"install_id":install,"skipped":skipped,"actor":"daemon","via":"upgrade"}),
+                )?;
+            }
+            Ok(done)
+        })
+    }
+
     pub fn app_binding_revoke(&self, install: &str, id: &str, expected: i64) -> Result<Value> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
@@ -728,6 +899,19 @@ impl Store {
         })
     }
 
+    /// History is authoritative even across package versions and revocation.
+    pub fn app_binding_slot_recorded(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        slot: &str,
+    ) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=?)",
+            params![install, scope_key(context), slot], |row| row.get(0),
+        )?)
+    }
+
     pub fn app_binding_for_slot(
         &self,
         install: &str,
@@ -753,4 +937,177 @@ impl Store {
         })
         .transpose()
     }
+
+    /// CAD-1508: `proof` is an earlier incarnation of `current` reached only
+    /// by approved upgrade carries. Each carry rewrites `bundle_digest` and
+    /// nothing else. Any other move, a gap, or a malformed carry record
+    /// returns `Ok(false)` — the caller keeps refusing.
+    pub(crate) fn app_binding_upgrade_carried(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        slot: &str,
+        proof: &BindingProof,
+        current: &BindingProof,
+    ) -> Result<bool> {
+        if proof.id != current.id
+            || proof.revision <= 0
+            || proof.revision >= current.revision
+            || config_digest(install, context, slot, &proof.config) != proof.digest
+            || config_digest(install, context, slot, &current.config) != current.digest
+            || !same_receipt_except_bundle(&proof.config, &current.config)
+        {
+            return Ok(false);
+        }
+        let Some(proof_bundle) = canonical_digest(proof.config["bundle_digest"].as_str()) else {
+            return Ok(false);
+        };
+        let Some(current_bundle) = canonical_digest(current.config["bundle_digest"].as_str())
+        else {
+            return Ok(false);
+        };
+        let payloads: Vec<String> = self.conn().query_vec(
+            "SELECT payload FROM events WHERE alias='app_bindings' AND kind='app_binding_migrated'
+             AND json_extract(payload,'$.install_id')=?1
+             AND json_extract(payload,'$.binding_id')=?2
+             ORDER BY seq ASC",
+            params![install, proof.id],
+            |row| row.get(0),
+        )?;
+        let mut links = Vec::new();
+        for payload in &payloads {
+            match parse_upgrade_carry(payload, install, &proof.id) {
+                CarryParse::Other => {}
+                CarryParse::Corrupt => return Ok(false),
+                CarryParse::Link(link) => links.push(link),
+            }
+        }
+        if links.len() > UPGRADE_CARRY_MAX {
+            return Ok(false);
+        }
+        // One carry per revision. A repeated from-digest is legitimate when
+        // a later upgrade returns to an earlier bundle: the binding digest
+        // is a pure function of the receipt, so the same receipt can be
+        // left twice. Two carries at one revision is a fork.
+        let mut revisions: Vec<i64> = links.iter().map(|link| link.revision).collect();
+        revisions.sort_unstable();
+        if revisions.windows(2).any(|pair| pair[0] == pair[1])
+            || links.iter().any(|link| link.revision > current.revision)
+        {
+            return Ok(false);
+        }
+        let mut cursor_digest = proof.digest.clone();
+        let mut cursor_rev = proof.revision;
+        let mut cursor_bundle = proof_bundle.to_string();
+        for _ in 0..links.len() {
+            if cursor_digest == current.digest
+                && cursor_rev == current.revision
+                && cursor_bundle == current_bundle
+            {
+                break;
+            }
+            let Some(next_rev) = cursor_rev.checked_add(1) else {
+                return Ok(false);
+            };
+            let Some(link) = links
+                .iter()
+                .find(|link| link.from_digest == cursor_digest && link.revision == next_rev)
+            else {
+                return Ok(false);
+            };
+            if link.from_bundle != cursor_bundle {
+                return Ok(false);
+            }
+            cursor_digest = link.digest.clone();
+            cursor_rev = next_rev;
+            cursor_bundle = link.to_bundle.clone();
+        }
+        // Carries at or before the proof are earlier history. Every later
+        // carry has a unique revision at or below the live row, and the
+        // walk consumes proof+1..=current, so a side carry cannot hide.
+        Ok(cursor_digest == current.digest
+            && cursor_rev == current.revision
+            && cursor_bundle == current_bundle)
+    }
+}
+
+const UPGRADE_CARRY_MAX: usize = 32;
+
+struct UpgradeCarryLink {
+    from_digest: String,
+    digest: String,
+    revision: i64,
+    from_bundle: String,
+    to_bundle: String,
+}
+
+enum CarryParse {
+    Other,
+    Corrupt,
+    Link(UpgradeCarryLink),
+}
+
+fn canonical_digest(digest: Option<&str>) -> Option<&str> {
+    let digest = digest?;
+    let hex = digest.strip_prefix("sha256:")?;
+    (hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    .then_some(digest)
+}
+
+fn same_receipt_except_bundle(proof: &Value, current: &Value) -> bool {
+    if !proof.is_object() || !current.is_object() {
+        return false;
+    }
+    let mut expected = proof.clone();
+    expected["bundle_digest"] = current["bundle_digest"].clone();
+    expected == *current
+}
+
+fn parse_upgrade_carry(payload: &str, install: &str, binding_id: &str) -> CarryParse {
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return CarryParse::Corrupt;
+    };
+    if value.get("via") != Some(&json!("upgrade")) {
+        return CarryParse::Other;
+    }
+    let Some(from_digest) = canonical_digest(value["from_digest"].as_str()) else {
+        return CarryParse::Corrupt;
+    };
+    let Some(digest) = canonical_digest(value["digest"].as_str()) else {
+        return CarryParse::Corrupt;
+    };
+    let Some(revision) = value["revision"].as_i64().filter(|revision| *revision > 0) else {
+        return CarryParse::Corrupt;
+    };
+    let Some(changes) = value["changes"].as_array() else {
+        return CarryParse::Corrupt;
+    };
+    let Some(change) = changes.first().filter(|_| changes.len() == 1) else {
+        return CarryParse::Corrupt;
+    };
+    let Some(from_bundle) = canonical_digest(change["from"].as_str()) else {
+        return CarryParse::Corrupt;
+    };
+    let Some(to_bundle) = canonical_digest(change["to"].as_str()) else {
+        return CarryParse::Corrupt;
+    };
+    if value["actor"] != "daemon"
+        || value["install_id"] != install
+        || value["binding_id"] != binding_id
+        || change["field"] != "bundle_digest"
+        || from_digest == digest
+        || from_bundle == to_bundle
+    {
+        return CarryParse::Corrupt;
+    }
+    CarryParse::Link(UpgradeCarryLink {
+        from_digest: from_digest.to_string(),
+        digest: digest.to_string(),
+        revision,
+        from_bundle: from_bundle.to_string(),
+        to_bundle: to_bundle.to_string(),
+    })
 }

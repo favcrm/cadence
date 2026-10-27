@@ -11,16 +11,22 @@
 //!
 //! - **A1** — catalog list/show rows; a member gets the same rows minus
 //!   `digest`/`request_count`; a forged `member_as` never resolves; a
-//!   member scope never widens an agent caller.
+//!   member scope never widens an agent caller. CAD-1422: the built-in
+//!   catalog is retired — list/show answer tombstones for the catalog
+//!   ids a historical `Source::Builtin` install or an open request still
+//!   names; the rows carry the retired reason, never the old listing.
 //! - **A2** — `app_home` reads live installs only; a soft-removed
 //!   install reads `removed`, is absent from the catalog "installed"
 //!   state and from favourites.
-//! - **A3** — the built-in install route needs the checked
-//!   `expected_digest`; a second install of one app is refused; the
-//!   record is `Source::Builtin` with the shipped digest.
+//! - **A3** — the pinned install route needs the checked
+//!   `expected_digest`; a second install of one app is refused. The
+//!   source is a real fixture path — the recorded provenance is
+//!   `Source::Path` — and the retired `builtin:` install-entry route is
+//!   refused outright (CAD-1422).
 //! - **A4** — the Git check refuses non-HTTPS, credential, query,
 //!   fragment, IP-literal and local/private hosts before any network.
-//! - **A5** — the update check reads the record's stored upstream only.
+//! - **A5** — the update check reads the record's stored upstream only;
+//!   a `Source::Builtin` record reports the retired catalog honestly.
 //! - **A6** — soft remove revokes consent, refuses run creation and
 //!   every runtime snapshot; a stale generation/digest refuses.
 //! - **A7** — restore re-consents the same digest; after the window it
@@ -53,6 +59,15 @@ mod tests {
             let dir = tempfile::Builder::new().prefix("c1129a").tempdir().unwrap();
             let pm = dir.path().join("pm");
             crate::issue::Pm::init(&pm).unwrap();
+            crate::board_identity::write_config(
+                dir.path(),
+                &crate::board_identity::Config {
+                    host: "cad1374.example.test".to_string(),
+                    issuer: "https://platform.example.test".to_string(),
+                    company: "cad1374-test-company".to_string(),
+                },
+            )
+            .unwrap();
             let opts = ServeOptions::default();
             opts.provider_env
                 .set("CADENCE_PM_DIR", pm.to_str().unwrap());
@@ -81,9 +96,15 @@ mod tests {
                 role: role.to_string(),
                 handle: handle.to_string(),
             };
+            let config = crate::board_identity::read_config(self.dir.path()).unwrap();
+            let realm = crate::operator_auth::PublicRealm {
+                issuer: config.issuer,
+                company: config.company,
+                host: config.host,
+            };
             self.shared
                 .operator_auth()
-                .open_public(user, &format!("jti-{handle}"), now + 60, "ua", now)
+                .open_public_bound(user, &format!("jti-{handle}"), now + 60, "ua", realm, now)
                 .unwrap()
                 .expect("fresh jti");
         }
@@ -111,16 +132,46 @@ mod tests {
             walk(&self.pm(), &self.pm(), &mut out);
             out
         }
-        /// check -> install of the built-in `id`, exactly as the board does.
-        fn install_builtin(&self, id: &str) -> Value {
-            let check = self.op(
-                "app_workspace_install_check",
-                json!({"source": format!("builtin:{id}")}),
-            );
+        /// check -> install of `tests/fixtures/apps/<id>`, the
+        /// byte-identical snapshot of the retired built-in — the same
+        /// digest-pinned install the board route ran (CAD-1422).
+        fn install_fixture(&self, id: &str) -> Value {
+            let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/apps")
+                .join(id);
+            let check = self.op("app_workspace_install_check", json!({"source": source}));
             self.op(
-                "app_workspace_install_entry",
-                json!({"catalog_id": id, "expected_digest": check["digest"]}),
+                "app_workspace_install",
+                json!({"source": source, "expected_digest": check["digest"]}),
             )
+        }
+        /// A historical `Source::Builtin` install (CAD-1422): the
+        /// record's `kind`/`id`/`digest` are exactly what a pre-retire
+        /// install wrote — catalog identity and tombstone resolution
+        /// depend on them. The record file is rewritten as YAML, not
+        /// edited textually.
+        fn install_retired_builtin(&self, app: &str) -> String {
+            let out = self.install_fixture(app);
+            let install_id = out["install_id"].as_str().unwrap().to_string();
+            let record = self
+                .pm()
+                .join(".apps/installations")
+                .join(&install_id)
+                .join("record.yaml");
+            let mut value: Value =
+                serde_yaml::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+            assert_eq!(
+                value["source"]["kind"].as_str(),
+                Some("path"),
+                "fixture install is path-sourced"
+            );
+            value["source"] = json!({
+                "kind": "builtin",
+                "id": app,
+                "digest": out["digest"].as_str().unwrap(),
+            });
+            std::fs::write(&record, serde_yaml::to_string(&value).unwrap()).unwrap();
+            install_id
         }
         fn bundle(&self, name: &str, app: &str) -> PathBuf {
             let dir = self.dir.path().join("src").join(name);
@@ -207,24 +258,42 @@ mod tests {
 
     // ----------------------------------------------------------------- A1
 
-    /// The two built-ins answer with their listing, access sentences and
-    /// trust chip; the operator sees `digest`/`request_count`, a member
-    /// does not.
+    /// The retired catalog answers tombstones for the ids history
+    /// still names — a historical `Source::Builtin` install, an open
+    /// request. A tombstone carries the retired reason and the real
+    /// install state, never the old listing payloads; the member
+    /// projection still drops `request_count` (and there is no `digest`
+    /// — the host ships no bundle to digest).
     #[test]
     fn a1_catalog_rows_operator_and_member_projection() {
         let fx = Fx::new();
         fx.member("alice");
+        // No history: the retired catalog is empty, not a listing.
+        let list = fx.op("app_catalog_list", json!({}));
+        assert_eq!(list["catalog"], json!([]));
+        // A historical builtin install names its catalog id.
+        let install_id = fx.install_retired_builtin("crm");
         let list = fx.op("app_catalog_list", json!({}));
         let rows = list["catalog"].as_array().unwrap();
         let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, ["crm", "social-content"]);
+        assert_eq!(ids, ["crm"]);
         for row in rows {
-            assert_eq!(row["trust"], "cadence");
-            assert!(row["digest"].as_str().unwrap().starts_with("sha256:"));
+            assert_eq!(row["retired"], json!(true), "{row}");
+            assert!(
+                row["retired_reason"].as_str().unwrap().contains("retired"),
+                "{row}"
+            );
+            assert!(
+                row.get("digest").is_none(),
+                "a tombstone has no digest: {row}"
+            );
+            assert!(
+                row.get("listing").is_none(),
+                "a tombstone invents no listing: {row}"
+            );
             assert!(row["request_count"].is_number());
-            assert!(row["listing"]["tagline"].is_string(), "{row}");
-            assert!(row["access"].is_array(), "{row}");
-            assert_eq!(row["state"], "available");
+            assert_eq!(row["state"], "installed");
+            assert_eq!(row["install_id"], json!(install_id));
         }
         let member = fx.op("app_catalog_list", json!({"member_as": "alice"}));
         for row in member["catalog"].as_array().unwrap() {
@@ -233,16 +302,25 @@ mod tests {
                 row.get("request_count").is_none(),
                 "member sees count: {row}"
             );
-            assert!(row["listing"]["tagline"].is_string());
+            assert_eq!(row["retired"], json!(true), "{row}");
         }
         let show = fx.op("app_catalog_show", json!({"id": "crm"}));
-        assert!(show["digest"].is_string() && show["about"].is_string());
+        assert_eq!(show["retired"], json!(true));
+        assert!(
+            show["retired_reason"].as_str().unwrap().contains("retired"),
+            "{show}"
+        );
+        assert_eq!(show["install_id"], json!(install_id));
+        assert!(
+            show.get("about").is_none(),
+            "a tombstone invents no about: {show}"
+        );
         let shown = fx.op(
             "app_catalog_show",
             json!({"id": "crm", "member_as": "alice"}),
         );
         assert!(shown.get("digest").is_none() && shown.get("request_count").is_none());
-        assert!(shown["about"].is_string());
+        assert_eq!(shown["retired"], json!(true));
         let e = err_text(
             fx.call(
                 Asserted::Operator,
@@ -292,6 +370,37 @@ mod tests {
             fx.shared.store.app_install_requests_open().unwrap().len(),
             0
         );
+    }
+
+    /// `app_install_request` resolves only against a tombstone id —
+    /// an id nothing historical names is refused before the write.
+    #[test]
+    fn a1_retired_catalog_member_request_resolves_a_tombstone_only() {
+        let fx = Fx::new();
+        fx.member("alice");
+        let before = fx.tree();
+        // an unknown id is refused — the retired catalog has no fresh
+        // entries to request.
+        let e = err_text(
+            fx.call(
+                Asserted::Operator,
+                "app_install_request",
+                json!({"catalog_id": "crm", "member_as": "alice"}),
+            ),
+            "request for a retired unknown id",
+        );
+        assert!(e.contains("unknown catalog entry"), "{e}");
+        assert_eq!(fx.tree(), before);
+        // a tombstone id resolves: the historical install names it.
+        let _install = fx.install_retired_builtin("crm");
+        fx.op(
+            "app_install_request",
+            json!({"catalog_id": "crm", "member_as": "alice"}),
+        );
+        let open = fx.shared.store.app_install_requests_open().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0]["catalog_id"], "crm");
+        assert_eq!(open[0]["requested_by"], "alice");
     }
 
     /// A member scope never widens an agent or an unproven caller, and
@@ -383,12 +492,15 @@ mod tests {
         assert!(e.contains("unknown app explorer parameter"), "{e}");
     }
 
-    /// A member files an install request as themselves; `app_install`
-    /// itself never opens to a member.
+    /// A member files an install request as themselves — against a
+    /// tombstone id a historical install names (CAD-1422). The install
+    /// path itself never opens to a member, and the retired built-in
+    /// install route refuses any caller.
     #[test]
     fn a1_member_request_is_attributed_and_cannot_install() {
         let fx = Fx::new();
         fx.member("alice");
+        let _install = fx.install_retired_builtin("crm");
         fx.op(
             "app_install_request",
             json!({"catalog_id": "crm", "member_as": "alice"}),
@@ -405,21 +517,29 @@ mod tests {
             ),
             "request without a requester",
         );
-        // a member scope on the install entry is refused and installs nothing.
+        // a member scope on the install entry is refused (member-scope
+        // claim on a non-member method) — and installs nothing.
         let before = fx.tree();
-        let check = fx.op(
-            "app_workspace_install_check",
-            json!({"source": "builtin:crm"}),
-        );
         err_text(
             fx.call(
                 Asserted::Operator,
                 "app_workspace_install_entry",
-                json!({"catalog_id": "crm", "expected_digest": check["digest"],
+                json!({"catalog_id": "crm", "expected_digest": format!("sha256:{}", "0".repeat(64)),
                     "member_as": "alice"}),
             ),
             "member installs",
         );
+        // the operator's own call on the retired route refuses too —
+        // `builtin::get` is the retired refusal.
+        let e = err_text(
+            fx.call(
+                Asserted::Operator,
+                "app_workspace_install_entry",
+                json!({"catalog_id": "crm", "expected_digest": format!("sha256:{}", "0".repeat(64))}),
+            ),
+            "operator installs from the retired catalog",
+        );
+        assert!(e.contains("built-in catalog"), "{e}");
         assert_eq!(fx.tree(), before);
     }
 
@@ -460,7 +580,7 @@ mod tests {
     #[test]
     fn a2_home_reads_live_installs_and_removed_is_not_installed() {
         let fx = Fx::new();
-        let installed = fx.install_builtin("crm");
+        let installed = fx.install_fixture("crm");
         let id = installed["install_id"].as_str().unwrap().to_string();
         let home = fx.op("app_home", json!({}));
         let row = home["installations"]
@@ -470,14 +590,6 @@ mod tests {
             .find(|r| r["install_id"] == json!(id))
             .expect("live install on the home");
         assert_eq!(row["attention"]["state"], "ok", "{row}");
-        let cat = fx.op("app_catalog_list", json!({}));
-        let crm = cat["catalog"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["id"] == "crm")
-            .unwrap();
-        assert_eq!(crm["state"], "installed");
         fx.op("app_favorites_put", json!({"install_ids": [id]}));
         // soft remove
         fx.op("app_workspace_remove", fx.remove_params(&id, "rm-a2"));
@@ -490,14 +602,6 @@ mod tests {
             .expect("recently removed row");
         assert_eq!(row["attention"]["state"], "removed", "{row}");
         assert_eq!(row["attention"]["action"], "restore");
-        let cat = fx.op("app_catalog_list", json!({}));
-        let crm = cat["catalog"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["id"] == "crm")
-            .unwrap();
-        assert_eq!(crm["state"], "available", "removed still reads installed");
         let favs = fx.op("app_favorites_get", json!({}));
         assert_eq!(
             favs["favorites"],
@@ -506,25 +610,127 @@ mod tests {
         );
     }
 
+    /// A2 variant for the retired catalog: a historical
+    /// `Source::Builtin` install's tombstone tracks the live state —
+    /// `installed`, then `removed`+`restorable` after a soft remove
+    /// (CAD-1422).
+    #[test]
+    fn a2_retired_tombstone_tracks_the_install_state() {
+        let fx = Fx::new();
+        let id = fx.install_retired_builtin("crm");
+        let cat = fx.op("app_catalog_list", json!({}));
+        let crm = cat["catalog"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "crm")
+            .unwrap()
+            .clone();
+        assert_eq!(crm["state"], "installed");
+        assert_eq!(crm["install_id"], json!(id));
+        fx.op("app_workspace_remove", fx.remove_params(&id, "rm-a2r"));
+        let cat = fx.op("app_catalog_list", json!({}));
+        let crm = cat["catalog"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "crm")
+            .unwrap()
+            .clone();
+        assert_eq!(crm["state"], "available", "removed still reads installed");
+        assert_eq!(crm["removed"], json!(true));
+        assert_eq!(crm["restorable"], json!(true));
+    }
+
     // ----------------------------------------------------------------- A3
 
+    /// The pinned install needs the checked `expected_digest` — over
+    /// the generic source install the board's review drives. Missing,
+    /// stale, malformed, wrong-type and other-bundle digests refuse with
+    /// nothing written; the positive control records path provenance
+    /// (CAD-1422: the built-in entry route is retired, checked below).
     #[test]
     fn a3_builtin_install_needs_the_checked_digest_and_writes_nothing_on_refusal() {
         let fx = Fx::new();
-        let check = fx.op(
-            "app_workspace_install_check",
-            json!({"source": "builtin:crm"}),
-        );
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/apps/crm")
+            .display()
+            .to_string();
+        let other_source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/apps/social-content")
+            .display()
+            .to_string();
+        let check = fx.op("app_workspace_install_check", json!({"source": source}));
         let digest = check["digest"].as_str().unwrap().to_string();
+        let other_digest = fx.op(
+            "app_workspace_install_check",
+            json!({"source": other_source}),
+        )["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let before = fx.tree();
         // the check is read-only and never creates the catalog.
         assert!(!fx.pm().join(".apps/catalog.yaml").exists());
         let stale = format!("sha256:{}", "0".repeat(64));
         for params in [
+            json!({"source": source, "expected_digest": ""}),
+            json!({"source": source, "expected_digest": "sha256:"}),
+            json!({"source": source, "expected_digest": stale}),
+            json!({"source": source, "expected_digest": digest.to_uppercase()}),
+            json!({"source": source, "expected_digest": 7}),
+            json!({"source": source, "expected_digest": other_digest}),
+            json!({"source": source, "expected_digest": digest, "actor": "operator"}),
+        ] {
+            let r = fx.call(Asserted::Operator, "app_workspace_install", params.clone());
+            assert!(r.is_err(), "accepted {params}: {r:?}");
+        }
+        assert_eq!(fx.tree(), before, "a refused install wrote");
+        assert!(!fx.pm().join(".apps/catalog.yaml").exists());
+        // positive control + record provenance.
+        let out = fx.op(
+            "app_workspace_install",
+            json!({"source": source, "expected_digest": digest}),
+        );
+        let shown = fx.op(
+            "app_workspace_show",
+            json!({"install_id": out["install_id"]}),
+        );
+        assert_eq!(shown["digest"], json!(digest));
+        assert_eq!(shown["source"]["kind"], "path");
+        // a second install of one app refuses and changes nothing.
+        let after = fx.tree();
+        let again = fx.call(
+            Asserted::Operator,
+            "app_workspace_install",
+            json!({"source": source, "expected_digest": digest}),
+        );
+        assert!(again.is_err(), "second install accepted: {again:?}");
+        assert_eq!(fx.tree(), after);
+        // a bundle edited after the check is not what the digest names.
+        let e = err_text(
+            fx.call(
+                Asserted::Operator,
+                "app_workspace_install",
+                json!({"source": source, "expected_digest": other_digest}),
+            ),
+            "digest of another bundle",
+        );
+        assert!(e.to_lowercase().contains("digest"), "{e}");
+    }
+
+    /// CAD-1422: the retired built-in install-entry route refuses every
+    /// caller and writes nothing — there is no embedded bundle to pin.
+    #[test]
+    fn a3_retired_install_entry_route_refuses_everything() {
+        let fx = Fx::new();
+        let before = fx.tree();
+        let digest = format!("sha256:{}", "0".repeat(64));
+        for params in [
             json!({"catalog_id": "crm"}),
             json!({"catalog_id": "crm", "expected_digest": ""}),
             json!({"catalog_id": "crm", "expected_digest": "sha256:"}),
-            json!({"catalog_id": "crm", "expected_digest": stale}),
+            json!({"catalog_id": "crm", "expected_digest": digest}),
             json!({"catalog_id": "crm", "expected_digest": digest.to_uppercase()}),
             json!({"catalog_id": "crm", "expected_digest": 7}),
             json!({"catalog_id": "social-content", "expected_digest": digest}),
@@ -539,40 +745,16 @@ mod tests {
             );
             assert!(r.is_err(), "accepted {params}: {r:?}");
         }
-        assert_eq!(fx.tree(), before, "a refused built-in install wrote");
-        assert!(!fx.pm().join(".apps/catalog.yaml").exists());
-        // positive control + record provenance.
-        let out = fx.op(
-            "app_workspace_install_entry",
-            json!({"catalog_id": "crm", "expected_digest": digest}),
-        );
-        let shown = fx.op(
-            "app_workspace_show",
-            json!({"install_id": out["install_id"]}),
-        );
-        assert_eq!(shown["digest"], json!(digest));
-        assert_eq!(shown["source"]["kind"], "builtin");
-        assert_eq!(shown["source"]["id"], "crm");
-        assert_eq!(shown["source"]["digest"], json!(digest));
-        // a second install of one app refuses and changes nothing.
-        let after = fx.tree();
-        let again = fx.call(
-            Asserted::Operator,
-            "app_workspace_install_entry",
-            json!({"catalog_id": "crm", "expected_digest": digest}),
-        );
-        assert!(again.is_err(), "second install accepted: {again:?}");
-        assert_eq!(fx.tree(), after);
-        // a bundle edited after the check is not what the digest names.
-        let e = err_text(
-            fx.call(
-                Asserted::Operator,
+        for who in [Asserted::Agent("writer".into()), Asserted::Unproven] {
+            let r = fx.call(
+                who.clone(),
                 "app_workspace_install_entry",
-                json!({"catalog_id": "social-content", "expected_digest": digest}),
-            ),
-            "digest of another bundle",
-        );
-        assert!(e.to_lowercase().contains("digest"), "{e}");
+                json!({"catalog_id": "crm", "expected_digest": digest}),
+            );
+            assert!(r.is_err(), "{who:?} accepted a retired install: {r:?}");
+        }
+        assert_eq!(fx.tree(), before, "a refused retired install wrote");
+        assert!(!fx.pm().join(".apps/catalog.yaml").exists());
     }
 
     // ----------------------------------------------------------------- A4
@@ -709,14 +891,14 @@ mod tests {
         let ok = fx.op("app_workspace_update_check", json!({"install_id": id}));
         assert_eq!(ok["source"], "path");
         assert_eq!(ok["has_update"], false);
-        // a built-in checks against the host catalog.
-        let b = fx.install_builtin("crm");
-        let ok = fx.op(
-            "app_workspace_update_check",
-            json!({"install_id": b["install_id"]}),
-        );
+        // CAD-1422: a historical `Source::Builtin` install reports the
+        // retired source — honestly, never a fake up-to-date digest.
+        let b = fx.install_retired_builtin("crm");
+        let ok = fx.op("app_workspace_update_check", json!({"install_id": b}));
         assert_eq!(ok["source"], "builtin");
         assert_eq!(ok["has_update"], false);
+        assert_eq!(ok["retired"], json!(true));
+        assert!(ok["digest"].is_null() || ok["digest"].is_string());
     }
 
     // ----------------------------------------------------------------- A6
@@ -724,10 +906,7 @@ mod tests {
     #[test]
     fn a6_remove_revokes_consent_refuses_runs_and_checks_staleness() {
         let fx = Fx::new();
-        let id = fx.install_builtin("crm")["install_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let id = fx.install_retired_builtin("crm");
         let pm = fx.shared.pm_at(&fx.pm()).unwrap();
         assert_eq!(fx.consent(&id), "approved", "install records consent");
         // positive control: a live install admits a runtime snapshot.
@@ -740,6 +919,8 @@ mod tests {
                     "inputs": {"facts": "x"}, "request_id": rid}),
             )
         };
+        // the fixture's `email-brief` workflow is the same one the
+        // retired built-in bundle shipped.
         if let Err(e) = run("run-live") {
             assert!(!e.to_string().contains("removed"), "{e}");
         }
@@ -823,10 +1004,7 @@ mod tests {
     #[test]
     fn a7_restore_reconsents_the_same_digest_and_the_window_closes() {
         let fx = Fx::new();
-        let id = fx.install_builtin("crm")["install_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let id = fx.install_retired_builtin("crm");
         let pm = fx.shared.pm_at(&fx.pm()).unwrap();
         let digest = workspace::show(&pm, &id).unwrap()["digest"].clone();
         fx.op("app_workspace_remove", fx.remove_params(&id, "rm-1"));
@@ -886,11 +1064,11 @@ mod tests {
         let fx = Fx::new();
         fx.member("alice");
         fx.member("bob");
-        let a = fx.install_builtin("crm")["install_id"]
+        let a = fx.install_fixture("crm")["install_id"]
             .as_str()
             .unwrap()
             .to_string();
-        let b = fx.install_builtin("social-content")["install_id"]
+        let b = fx.install_fixture("social-content")["install_id"]
             .as_str()
             .unwrap()
             .to_string();
@@ -1117,5 +1295,64 @@ mod tests {
         let d = dir("missing", &[], &with_icon);
         assert!(check(&d).is_err(), "listing icon missing from bundle");
         assert_eq!(fx.tree(), before, "install-check wrote");
+    }
+
+    // ------------------------------------------------------- CAD-1209
+
+    /// Item 3: an update is pending, the operator's tombstone row says
+    /// so and a member's row (list and show) carries no
+    /// `update_available`. The install is a historical
+    /// `Source::Builtin` (CAD-1422) so its tombstone still resolves.
+    #[test]
+    fn c1209_member_row_has_no_update_available() {
+        let fx = Fx::new();
+        fx.member("alice");
+        let id = fx.install_retired_builtin("crm");
+        fx.shared
+            .store
+            .app_update_check_save(&id, true, Some("9.9.9"), None, Some("sha256:x"), &json!({}))
+            .unwrap();
+        let row = |v: &Value| -> Value {
+            v["catalog"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == "crm")
+                .unwrap()
+                .clone()
+        };
+        let op = row(&fx.op("app_catalog_list", json!({})));
+        assert_eq!(op["update_available"], json!(true), "operator row: {op}");
+        let mem = row(&fx.op("app_catalog_list", json!({"member_as": "alice"})));
+        assert_eq!(mem["state"], "installed", "member row: {mem}");
+        assert!(
+            mem.get("update_available").is_none(),
+            "member sees update state: {mem}"
+        );
+        let shown = fx.op(
+            "app_catalog_show",
+            json!({"id": "crm", "member_as": "alice"}),
+        );
+        assert!(shown.get("update_available").is_none(), "{shown}");
+        assert!(!shown.to_string().contains("9.9.9"), "{shown}");
+    }
+
+    /// Item 1 (CAD-1422): the retired catalog ships no bundles, so a
+    /// tombstone's detail carries no access rows — the manifest's
+    /// `data` declaration lives in the detached repository, and the host
+    /// invents nothing for a retired entry. The data-row logic itself is
+    /// covered by `data_access_rows` above and by the `app_access`
+    /// module's own checks.
+    #[test]
+    fn c1209_retired_show_carries_no_invented_access_rows() {
+        let fx = Fx::new();
+        let _install = fx.install_retired_builtin("crm");
+        let shown = fx.op("app_catalog_show", json!({"id": "crm"}));
+        assert_eq!(shown["retired"], json!(true));
+        assert!(
+            shown.get("access").is_none() || shown["access"] == json!([]),
+            "a tombstone invents no access rows: {shown}"
+        );
+        assert!(shown.get("data").is_none(), "{shown}");
     }
 }

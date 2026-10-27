@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { SESSION_EXPIRED_TEXT } from "./hostErrors";
+import { useTranslate } from "../../../lib/localeText";
 
 /**
  * Shared record/form state blocks (CAD-866): the loading, error,
@@ -24,11 +25,17 @@ export function Notice({
   children,
   className,
   state,
+  onRetry,
+  retryLabel = "Retry",
 }: {
   children: ReactNode;
   className?: string;
   /** Optional `data-state` marker (e.g. "read-only") for tests/QA. */
   state?: string;
+  /** CAD-1193: an unavailable access check offers a bounded retry of
+   *  the real check — wired by the caller, never a reload. */
+  onRetry?: () => void;
+  retryLabel?: ReactNode;
 }) {
   return (
     <p
@@ -38,6 +45,14 @@ export function Notice({
       data-state={state}
     >
       {children}
+      {onRetry ? (
+        <>
+          {" "}
+          <button type="button" className="lnk" onClick={onRetry}>
+            {retryLabel}
+          </button>
+        </>
+      ) : null}
     </p>
   );
 }
@@ -76,6 +91,7 @@ export function ErrorNotice({
   bare?: boolean;
   className?: string;
 }) {
+  const t = useTranslate();
   return (
     <p
       className={[
@@ -96,7 +112,7 @@ export function ErrorNotice({
           {children === SESSION_EXPIRED_TEXT ? (
             // A top-level navigation re-authenticates; a retried fetch cannot.
             <button type="button" className="lnk" onClick={() => window.location.reload()}>
-              Reload
+              {t("Reload")}
             </button>
           ) : (
             <button type="button" className="lnk" onClick={onRetry}>

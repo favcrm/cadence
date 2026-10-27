@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useTranslate } from "../../lib/locale";
 
 /** Hidden scrollbars retain keyboard/touch scrolling; arrows expose overflow. */
 export function HorizontalStrip({
@@ -14,6 +15,7 @@ export function HorizontalStrip({
    *  the existing `Math.max(240, clientWidth * 0.8)` viewport behaviour. */
   scrollStep?: number;
 }) {
+  const t = useTranslate();
   const strip = useRef<HTMLDivElement>(null);
   const [edges, setEdges] = useState({ before: false, after: false });
   useEffect(() => {
@@ -59,7 +61,7 @@ export function HorizontalStrip({
         type="button"
         className="wa-scroll-arrow wa-scroll-before"
         hidden={!edges.before}
-        aria-label={`Scroll back in ${label}`}
+        aria-label={t("Scroll back in {label}").replace("{label}", () => label)}
         onClick={() => move(-1)}
       >
         ‹
@@ -68,7 +70,7 @@ export function HorizontalStrip({
         type="button"
         className="wa-scroll-arrow wa-scroll-after"
         hidden={!edges.after}
-        aria-label={`Scroll forward in ${label}`}
+        aria-label={t("Scroll forward in {label}").replace("{label}", () => label)}
         onClick={() => move(1)}
       >
         ›

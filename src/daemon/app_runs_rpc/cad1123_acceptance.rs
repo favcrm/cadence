@@ -16,7 +16,8 @@
 //!      no run row, no dispatch;
 //!   2. a forged team (a team-role input or an owner/assignments field
 //!      in the request) and a missing team;
-//!   3. a changed `expected_quotes` -> `price_changed`;
+//!   3. an `expected_quotes` drawn for another slot set -> the stale
+//!      slot-set refusal (CAD-1141: same-slot price drift is accepted);
 //!   4. a replayed `request_id` -> the same run, one dispatch;
 //!   5. `app_install_team_set` operator-only (RPC and HTTP), a stale
 //!      compare-and-swap refused;
@@ -33,7 +34,8 @@
 //!     default and `admit_operator_read` for the team GET;
 //!   - the role-forgery refusal and the `no default team` refusal in
 //!     `Shared::create_app_run`/`start_app_run` (app_runs_rpc.rs);
-//!   - the `expected_quotes` frozen-quote comparison (price_changed);
+//!   - the `expected_quotes` slot-set comparison (stale capability slot
+//!     set; CAD-1141 dropped the price-equality half);
 //!   - `UNIQUE(install_id, request_id)` replay in
 //!     `Store::app_run_create_with_capabilities`;
 //!   - the `expected_revision` compare-and-swap in `rpc_app_team`.
@@ -195,12 +197,15 @@ fn accept_no_forged_team_and_no_missing_team() {
     assert_eq!(run["snapshot"]["owner_pm"], json!("lead"));
 }
 
-/// Case 3: `expected_quotes` must equal the quotes the run freezes —
-/// any difference (an extra slot, a missing map) is `price_changed` —
-/// and nothing is created. Control: the exact frozen set (`{}` for a
-/// workflow with no capability slots) is served.
+/// Case 3: `expected_quotes` must name exactly the slots the run freezes
+/// — an extra slot or a slot the workflow does not declare is the stale
+/// slot-set refusal, a missing map is refused — and nothing is created.
+/// CAD-1141 (operator decision 2026-10-26): same-slot price drift is
+/// accepted, so only the slot set is compared here; drift itself is
+/// covered by `daemon::cad1141_drift_acceptance`. Control: the exact
+/// frozen set (`{}` for a workflow with no capability slots) is served.
 #[test]
-fn accept_price_drift_is_refused_with_price_changed() {
+fn accept_stale_quote_slot_set_is_refused() {
     let fx = Fx::new();
     fx.start_team();
     team_set(&fx, 0).unwrap();
@@ -211,12 +216,12 @@ fn accept_price_drift_is_refused_with_price_changed() {
         let mut params = start_params(&fx, "drift");
         params["expected_quotes"] = expected;
         let err = refusal(fx.operator("app_run_start", params));
-        assert!(err.contains("price_changed"), "{err}");
+        assert!(err.contains("stale capability slot set"), "{err}");
     }
     let mut missing = start_params(&fx, "drift-missing");
     missing.as_object_mut().unwrap().remove("expected_quotes");
     assert!(refusal(fx.operator("app_run_start", missing)).contains("expected_quotes"));
-    assert_eq!(runs_of(&fx), 0, "a price-drifted start wrote a run row");
+    assert_eq!(runs_of(&fx), 0, "a stale-slot-set start wrote a run row");
     let run = fx
         .operator("app_run_start", start_params(&fx, "exact"))
         .unwrap();
@@ -502,6 +507,11 @@ fn accept_board_http_is_at_least_as_strict_as_the_rpc() {
             ("GET", team_path.clone(), None),
         ] {
             let (status, reply) = board.call(who, method, &path, body);
+            if method == "GET" {
+                assert_eq!(status, 401, "{who} {method} {path}: {reply}");
+                assert_eq!(reply["code"], "operator_session_required", "{reply}");
+                continue;
+            }
             assert_eq!(status, 403, "{who} {method} {path}: {reply}");
             // An agent's attributed write is refused as the operator's
             // own; an unattributable one cannot even name a caller —
@@ -544,4 +554,94 @@ fn accept_board_http_is_at_least_as_strict_as_the_rpc() {
         Some(json!({"owner_pm": "lead", "roles": {"writer": "writer"}, "expected_revision": 1})),
     );
     assert!(status >= 400, "a stale swap was relayed: {reply}");
+}
+
+/// CAD-1848 independent acceptance, author: NativeCombinedReview.
+/// An installed edit remains inspectable, but native approval must refuse
+/// app-storage/v1 before granting execution authority for its new digest.
+/// The implementer must not edit or weaken this acceptance check.
+#[test]
+fn cad1848_installed_storage_edit_cannot_receive_native_execution_approval() {
+    let fx = Fx::new();
+    fx.start_team();
+    let baseline = fx
+        .operator("app_workspace_show", json!({"install_id": fx.install}))
+        .unwrap();
+    let baseline_digest = baseline["digest"].as_str().unwrap();
+    assert_eq!(baseline["compatibility"]["compatible"], true, "{baseline}");
+    let approved = fx
+        .operator(
+            "app_local_install_approve",
+            json!({"install_id": fx.install, "digest": baseline_digest}),
+        )
+        .expect("control: the ordinary installed package can be approved");
+    assert_eq!(approved["approved"], true, "{approved}");
+
+    // Edit the real installed bundle, not a journal or an approval row.
+    let bundle = fx
+        .state()
+        .join("pm/.apps/installations")
+        .join(&fx.install)
+        .join("bundle");
+    let manifest_path = bundle.join("app.md");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    assert!(manifest.contains("needs:\n"), "fixture has a needs mapping");
+    let manifest = manifest.replacen(
+        "needs:\n",
+        "needs:\n  requires: {contracts: {app-storage: [1]}}\n",
+        1,
+    );
+    std::fs::write(&manifest_path, manifest).unwrap();
+    std::fs::create_dir(bundle.join("storage")).unwrap();
+    // Native admits these as bounded inert UTF-8; storage schema validation
+    // belongs to the hosted runtime, not this grammar/compatibility check.
+    std::fs::write(bundle.join("app-storage.json"), "{}\n").unwrap();
+    std::fs::write(bundle.join("storage/001-init.json"), "{}\n").unwrap();
+
+    let edited = fx
+        .operator("app_workspace_show", json!({"install_id": fx.install}))
+        .expect("unsupported installed bytes must remain inspectable");
+    let digest = edited["digest"].as_str().unwrap();
+    assert_ne!(
+        digest, baseline_digest,
+        "the edit changes the bundle digest"
+    );
+    assert_eq!(edited["compatibility"]["compatible"], false, "{edited}");
+    assert_eq!(
+        edited["compatibility"]["contracts"]["app-storage"],
+        json!([1]),
+        "{edited}"
+    );
+    for member in ["app-storage.json", "storage/001-init.json"] {
+        assert!(
+            edited["files"].as_array().unwrap().contains(&json!(member)),
+            "the admitted member {member} must remain inventoried: {edited}"
+        );
+    }
+    let before = fx
+        .shared
+        .store
+        .app_capability_status(&fx.install, digest)
+        .unwrap();
+    assert_eq!(before["state"], "unapproved", "{before}");
+    let error = refusal(fx.operator(
+        "app_local_install_approve",
+        json!({"install_id": fx.install, "digest": digest}),
+    ));
+    assert!(error.contains("app-storage"), "{error}");
+    assert!(error.contains("supports none"), "{error}");
+    let after = fx
+        .shared
+        .store
+        .app_capability_status(&fx.install, digest)
+        .unwrap();
+    assert_eq!(after, before, "refused approval must not write authority");
+
+    let error = refusal(fx.create("cad1848-unsupported-storage"));
+    assert!(
+        error.contains("app-storage")
+            || error.contains("installation capability approval is absent or stale"),
+        "run creation must refuse unsupported or unapproved bytes: {error}"
+    );
+    assert_eq!(runs_of(&fx), 0, "unsupported storage created a native run");
 }

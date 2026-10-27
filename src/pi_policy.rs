@@ -1,4 +1,5 @@
-//! `pm.yaml [pi]` — the operator-owned Pi policy (CAD-559).
+//! Pi launch policy (CAD-559). Settings > Agents is the authority.
+//! `pm.yaml [pi]` is only the legacy import source.
 //!
 //! Pi silently falls back: an unavailable model becomes another
 //! provider's, and an unpinned extension loads whatever the operator's
@@ -23,9 +24,9 @@
 //!   extension shells out to a Devin CLI the sandbox cannot
 //!   credential). A role list that is present replaces `allow` for
 //!   that role, including a present-but-empty one; a role without its
-//!   own list falls back to `allow` unchanged. An absent `[pi]`
-//!   allows nothing: every pi launch refuses until the operator pins
-//!   a list.
+//!   own list falls back to `allow` unchanged. An absent policy
+//!   allows nothing: every pi launch refuses until the operator sets
+//!   a list in Settings > Agents.
 //! - `models.default.{master,worker}` is the role fallback when no
 //!   explicit `--model` (and no `model_defaults` role entry) names one.
 //!   There is no "provider default" for pi — that is the silent
@@ -34,7 +35,10 @@
 //!   pinned `name@version` and resolved under the operator's own Pi
 //!   npm dir (`<PI_CODING_AGENT_DIR|~/.pi/agent>/npm/node_modules`). A
 //!   version drift or a missing package refuses the launch rather than
-//!   load what is there.
+//!   load what is there. CAD-1449: the confined agent's read grant
+//!   also covers each pinned package's installed runtime dependency
+//!   closure (metadata-only resolution, same root); without it the
+//!   extension's own `require` fails MODULE_NOT_FOUND.
 //!
 //! The reader follows [`crate::doctor::host`]'s `pm.yaml` contract:
 //! absent file or table is `None`; a present-but-unusable table is an
@@ -42,7 +46,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
@@ -50,7 +54,7 @@ use crate::error::{Error, Result};
 /// `[pi]` in pm.yaml — everything optional individually; the table's
 /// absence means "no pi policy", which the model gate treats as an
 /// empty allowlist.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PiPolicy {
     /// `name@version` pins for the provider packages Pi may `-e`.
@@ -66,7 +70,7 @@ pub struct PiPolicy {
 }
 
 /// `[pi.models]` — the launch vocabulary and the per-role fallback.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PiModels {
     /// The only `provider/id` values a pi agent may launch on — the
@@ -112,7 +116,7 @@ impl PiModels {
 
 /// `[pi.models.default]` — a fallback per cadence role. A pm-role pi
 /// agent shares `worker`: the master is the only role of its own.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PiRoleDefaults {
     pub master: Option<String>,
@@ -136,7 +140,13 @@ pub fn read(pm_dir: &Path) -> Result<Option<PiPolicy>> {
     let Ok(text) = std::fs::read_to_string(pm_dir.join("pm.yaml")) else {
         return Ok(None);
     };
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&text)
+    parse_text(&text)
+}
+
+/// Parse a legacy pm.yaml document without touching the tracker. Used by
+/// the one-time import and read-only retired-source drift observation.
+pub fn parse_text(text: &str) -> Result<Option<PiPolicy>> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(text)
         .map_err(|e| Error::rejected(format!("pm.yaml is not valid YAML: {e}")))?;
     let Some(pi) = yaml.get("pi") else {
         return Ok(None);
@@ -163,6 +173,10 @@ pub fn read(pm_dir: &Path) -> Result<Option<PiPolicy>> {
 impl PiPolicy {
     /// Every entry is checked at read time — a malformed id or pin is
     /// a config error the operator fixes once, not a per-launch miss.
+    pub(crate) fn validate_public(&self) -> Result<()> {
+        self.validate()
+    }
+
     fn validate(&self) -> Result<()> {
         for provider in &self.agentic_providers {
             if provider.is_empty()
@@ -301,14 +315,14 @@ pub fn require_allowed(policy: Option<&PiPolicy>, role: &str, model: &str) -> Re
         return Ok(());
     }
     let listed = if allow.is_empty() {
-        format!("nothing — pm.yaml has no [pi].models.{key} entries")
+        format!("nothing — Settings > Agents has no Pi {key} entries")
     } else {
         allow.join(", ")
     };
     Err(Error::rejected(format!(
         "pi {role} model '{model}' is not on the operator's allowlist (allowed: \
-         {listed}) — the operator pins the pi model set in pm.yaml \
-         [pi].models.{key} (CAD-559, CAD-575)"
+         {listed}) — set it in Settings > Agents ({key}); pm.yaml is not the \
+         launch authority (CAD-559, CAD-575)"
     )))
 }
 
@@ -330,7 +344,9 @@ pub fn require_safe_transport(model: &str) -> Result<()> {
 }
 
 /// One operator-pinned provider package: its install dir (the confined
-/// master's read grant) and the extension files `-e` receives.
+/// master's read grant), the extension files `-e` receives, and the
+/// exact package dirs of its installed runtime dependency closure
+/// (CAD-1449) — each proven inside the same canonical npm root.
 #[derive(Debug)]
 pub struct ProviderPackage {
     /// `<root>/<name>` canonicalized — the real package dir, proven to
@@ -339,6 +355,11 @@ pub struct ProviderPackage {
     /// The package's `pi.extensions` entries — canonical paths proven
     /// inside `dir`.
     pub entries: Vec<PathBuf>,
+    /// Installed runtime dependencies of `dir`, nearest-`node_modules`
+    /// resolved: canonical package dirs under the same root, each
+    /// carrying the metadata its own resolution needed. Read-only;
+    /// empty when the package declares no dependencies.
+    pub deps: Vec<PathBuf>,
 }
 
 /// `name@version` — the version pin is the part after the LAST `@`
@@ -499,29 +520,26 @@ pub fn package_digest(dir: &Path) -> Result<String> {
 /// pinned version, declare `pi.extensions` entry files inside its own
 /// dir, and — when the pin carries a `#sha256-…` fragment (CAD-572) —
 /// hash to that content digest. Any drift refuses — nothing is loaded
-/// "close enough".
+/// "close enough". The returned package also carries its installed
+/// runtime dependency dirs (CAD-1449): the walk reads only
+/// `package.json` metadata, resolves each `dependencies` entry — and
+/// every `optionalDependencies` entry that is actually installed — by
+/// Node's own nearest-`node_modules` rule bounded at the canonical
+/// root, refuses a missing required dep, a malformed name, an
+/// escaping symlink or an over-budget closure, and dedupes by
+/// canonical dir. Peer and dev deps are never followed.
 pub fn resolve_package(spec: &str, root: &Path) -> Result<ProviderPackage> {
     let (name, pin, digest) = parse_package_pin(spec)?;
     let dir = root.join(name);
-    let manifest = dir.join("package.json");
-    let text = std::fs::read_to_string(&manifest).map_err(|_| {
-        Error::rejected(format!(
-            "pi provider package '{spec}' is not installed under {} — install \
-             it as the operator first (`pi install {name}@{pin}`) (CAD-559)",
-            root.display()
-        ))
-    })?;
-    let pkg: Value = serde_json::from_str(&text).map_err(|e| {
-        Error::rejected(format!(
-            "pi provider package '{spec}': package.json is not valid JSON: {e}"
-        ))
-    })?;
+    // The seed is part of dependency discovery too: apply the same
+    // descriptor, byte and nonblocking bounds before parsing or cloning it.
+    let pkg = dep_manifest(&dir, spec, name)?;
     let installed = pkg.get("version").and_then(Value::as_str).unwrap_or("");
     if installed != pin {
         return Err(Error::rejected(format!(
             "pi provider package '{name}' is installed at version '{installed}', \
-             not the pinned '{pin}' — align the install or the pin in pm.yaml \
-             [pi].providers (CAD-559)"
+             not the pinned '{pin}' — align the install or the pin in \
+             Settings > Agents (CAD-559)"
         )));
     }
     let declared = pkg
@@ -573,7 +591,7 @@ pub fn resolve_package(spec: &str, root: &Path) -> Result<ProviderPackage> {
                 "pi provider package '{spec}': package content drifted from the \
                  pin (pinned {expected}, installed {found}) — reinstall the \
                  pinned package or, after an intentional change, update the \
-                 digest in pm.yaml [pi].providers (CAD-572)"
+                 digest in Settings > Agents (CAD-572)"
             )));
         }
     }
@@ -589,7 +607,240 @@ pub fn resolve_package(spec: &str, root: &Path) -> Result<ProviderPackage> {
                 .map_err(|e| Error::rejected(format!("pi provider package '{spec}': {e}")))?,
         );
     }
-    Ok(ProviderPackage { dir, entries })
+    // CAD-1449: the pinned package's own runtime dependencies get the
+    // same read grant as its dir — Node resolves them from the
+    // package's `node_modules` chain, and a confined extension that
+    // cannot read them fails MODULE_NOT_FOUND. Metadata only: every
+    // walked dir is proven inside the canonical npm root.
+    let deps = dependency_dirs(spec, &pkg, &dir, &root_canon)?;
+    Ok(ProviderPackage { dir, entries, deps })
+}
+
+/// One package.json is metadata; a manifest beyond this refuses rather
+/// than having every launch allocate for it.
+const DEP_MANIFEST_CAP: u64 = 1 << 20;
+/// Hard bounds on the walk: no pinned extension's dependency tree can
+/// legitimately need more packages or more declared deps than this.
+const DEP_MAX_PACKAGES: usize = 64;
+const DEP_MAX_DECLS: usize = 512;
+
+/// A dependency name npm would install: the same grammar
+/// `parse_package_pin` enforces on the pin's name half —
+/// `[A-Za-z0-9._-]` segments, one optional `@scope/` prefix where the
+/// scope is a single segment (a second `@`, a `..` or an empty segment
+/// refuses). Anything else never reaches the filesystem lookup.
+fn dep_name_ok(name: &str) -> bool {
+    let seg = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    };
+    if let Some(rest) = name.strip_prefix('@') {
+        // Exactly "@scope/name": the '@' is the scoping prefix, never
+        // part of the scope name — '@@x/y' has an invalid scope.
+        let segs: Vec<&str> = rest.split('/').collect();
+        segs.len() == 2 && seg(segs[0]) && seg(segs[1])
+    } else {
+        !name.contains('/') && seg(name)
+    }
+}
+
+/// Read `dir/package.json` under the metadata cap and parse it — the
+/// only file the closure walk opens. The open carries `O_NOFOLLOW` and
+/// the type and length are verified on the opened descriptor, so a
+/// swapped or growing manifest cannot slip past the bound.
+fn dep_manifest(dir: &Path, spec: &str, dep: &str) -> Result<Value> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = dir.join("package.json");
+    let bad = |why: String| {
+        Error::rejected(format!(
+            "pi provider package '{spec}': dependency '{dep}' package.json {why}"
+        ))
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .map_err(|_| {
+            bad(format!(
+                "at {} does not open — the dependency is not \
+                         installable as-is",
+                path.display()
+            ))
+        })?;
+    let meta = file
+        .metadata()
+        .map_err(|e| bad(format!("cannot be stat'ed: {e}")))?;
+    if !meta.file_type().is_file() || meta.len() > DEP_MANIFEST_CAP {
+        return Err(bad(format!(
+            "is not a regular file within the {DEP_MANIFEST_CAP}-byte bound"
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(DEP_MANIFEST_CAP + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| bad(format!("cannot be read: {e}")))?;
+    if bytes.len() as u64 > DEP_MANIFEST_CAP {
+        return Err(bad(format!("exceeds the {DEP_MANIFEST_CAP}-byte bound")));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| bad("is not UTF-8".to_string()))?;
+    serde_json::from_str(&text).map_err(|e| bad(format!("is not valid JSON: {e}")))
+}
+
+/// CAD-1449: the installed runtime dependency dirs of the pinned
+/// package `dir`, resolved the way Node does — nearest `node_modules`
+/// first, walking up the ancestors of each requiring package but never
+/// past the canonical npm root. `dependencies` entries are required:
+/// absent → `Err` (the extension cannot load, so the launch must
+/// refuse). `optionalDependencies` entries that are not installed are
+/// skipped; ones that are installed are granted like any other dep.
+/// Every name is validated, every resolved dir canonicalized and
+/// proven under `root_canon`; the walk dedupes by canonical dir and
+/// cycles simply revisit nothing. Peer deps are not followed — an
+/// operator-installed peer is already the root-level package the
+/// closure lands on or it is absent either way.
+fn dependency_dirs(
+    spec: &str,
+    root_pkg: &Value,
+    root_dir: &Path,
+    root_canon: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut seen: std::collections::HashSet<PathBuf> =
+        [root_dir.to_path_buf()].into_iter().collect();
+    let mut found: Vec<PathBuf> = Vec::new();
+    // (requiring package dir, its manifest). Seeded with the pinned
+    // package itself so its own deps resolve against its node_modules.
+    let mut queue: Vec<(PathBuf, Value)> = vec![(root_dir.to_path_buf(), root_pkg.clone())];
+    let mut decls = 0usize;
+    while let Some((pkg_dir, manifest)) = queue.pop() {
+        // npm precedence: a name in optionalDependencies overrides a
+        // same-name entry in dependencies — it resolves once, as
+        // optional, so a duplicated required entry absent from disk
+        // skips rather than refusing the launch.
+        let mut entries: Vec<(&String, bool)> = Vec::new();
+        let mut optional: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for field in ["optionalDependencies", "dependencies"] {
+            let is_optional = field == "optionalDependencies";
+            let Some(table) = manifest.get(field) else {
+                continue;
+            };
+            let Some(map) = table.as_object() else {
+                return Err(Error::rejected(format!(
+                    "pi provider package '{spec}': '{field}' in {} is not an object",
+                    pkg_dir.display()
+                )));
+            };
+            for name in map.keys() {
+                if is_optional {
+                    optional.insert(name.as_str());
+                } else if optional.contains(name.as_str()) {
+                    continue;
+                }
+                entries.push((name, is_optional));
+            }
+        }
+        for (dep_name, optional) in entries {
+            decls += 1;
+            if decls > DEP_MAX_DECLS {
+                return Err(Error::rejected(format!(
+                    "pi provider package '{spec}': dependency closure exceeds \
+                     {DEP_MAX_DECLS} declared entries — refusing"
+                )));
+            }
+            if !dep_name_ok(dep_name) {
+                return Err(Error::rejected(format!(
+                    "pi provider package '{spec}': dependency name '{dep_name}' \
+                     in {} is not a valid npm package name",
+                    pkg_dir.display()
+                )));
+            }
+            // Nearest node_modules lookup, exactly Node's rule:
+            // `<dir>/node_modules/<dep>` for the requiring package's
+            // dir and each ancestor — the flat sibling `<root>/<dep>`
+            // is reached via the root's own parent, so the bound is
+            // on the CANDIDATE staying under the canonical npm root,
+            // not the ancestor. The first hit wins.
+            let mut resolved = None;
+            for dir in pkg_dir.ancestors() {
+                // Node skips a repeated node_modules/node_modules lookup.
+                if dir.file_name().is_some_and(|name| name == "node_modules") {
+                    continue;
+                }
+                let candidate = dir.join("node_modules").join(dep_name);
+                if !candidate.starts_with(root_canon) {
+                    break;
+                }
+                if std::fs::symlink_metadata(&candidate).is_ok() {
+                    let canon = std::fs::canonicalize(&candidate).map_err(|_| {
+                        Error::rejected(format!(
+                            "pi provider package '{spec}': dependency '{dep_name}' \
+                             at {} does not resolve",
+                            candidate.display()
+                        ))
+                    })?;
+                    // Identity: a resolved dep must be a real npm
+                    // package dir for THIS name — its canonical path
+                    // ends `<…>/node_modules/<name>` (scoped:
+                    // `<…>/node_modules/@<scope>/<name>`) strictly
+                    // inside the root. A dep symlinked at the npm
+                    // root itself, at a scope dir or at any unrelated
+                    // location refuses rather than widening the
+                    // grant; a link to another proper package dir
+                    // (pnpm-style) still resolves, and the manifest
+                    // name check below pins its identity.
+                    let tail = Path::new("node_modules").join(dep_name);
+                    if canon == root_canon
+                        || !canon.starts_with(root_canon)
+                        || !canon.ends_with(&tail)
+                        || !canon.is_dir()
+                    {
+                        return Err(Error::rejected(format!(
+                            "pi provider package '{spec}': dependency '{dep_name}' \
+                             resolves to {} which is not an npm package dir for \
+                             that name inside the root {} — refusing",
+                            canon.display(),
+                            root_canon.display()
+                        )));
+                    }
+                    resolved = Some(canon);
+                    break;
+                }
+            }
+            let Some(dep_dir) = resolved else {
+                if optional {
+                    continue;
+                }
+                return Err(Error::rejected(format!(
+                    "pi provider package '{spec}': required dependency '{dep_name}' \
+                     is not installed under the npm root {} — install the pinned \
+                     package's dependencies as the operator first",
+                    root_canon.display()
+                )));
+            };
+            if seen.insert(dep_dir.clone()) {
+                if found.len() >= DEP_MAX_PACKAGES {
+                    return Err(Error::rejected(format!(
+                        "pi provider package '{spec}': dependency closure exceeds \
+                         {DEP_MAX_PACKAGES} packages — refusing"
+                    )));
+                }
+                let dep_pkg = dep_manifest(&dep_dir, spec, dep_name)?;
+                if dep_pkg.get("name").and_then(Value::as_str) != Some(dep_name.as_str()) {
+                    return Err(Error::rejected(format!(
+                        "pi provider package '{spec}': dependency '{dep_name}' resolves \
+                         to {} whose package.json names a different package — refusing",
+                        dep_dir.display()
+                    )));
+                }
+                found.push(dep_dir.clone());
+                queue.push((dep_dir, dep_pkg));
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// A `pi.extensions` entry resolved inside its (canonical) package

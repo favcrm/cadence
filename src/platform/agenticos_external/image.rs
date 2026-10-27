@@ -8,9 +8,13 @@ use serde_json::Value;
 
 use super::{IMAGE_TOOL, PLATFORM};
 
-/// Custody bound on the retained artifact; the AgenticOS backend ceiling is
-/// larger, but this is what the downstream release path accepts.
+/// Custody bound on the retained artifact. Downstream (draft listing, app
+/// bundles, publish) accepts no more, so a larger AgenticOS artifact is
+/// re-encoded to fit (`fit_to_custody`), never retained as is.
 pub(crate) const ASSET_LIMIT: usize = 2 * 1024 * 1024;
+/// What one artifact fetch may read: AgenticOS imports at most 10 MiB
+/// (`MEDIA_IMPORT_MAX_BYTES`, apps/api/src/media/jobs.ts:31).
+pub(crate) const FETCH_LIMIT: usize = 10 * 1024 * 1024;
 // The fixed image operation asks for one square image. Keep decode work
 // independent of the compressed byte count: a tiny file can expand enormously.
 const IMAGE_SIDE_LIMIT: u32 = 2048;
@@ -72,14 +76,22 @@ pub(crate) fn image_plan_preflight(
 }
 
 pub(super) fn image_prompt(authority: &Value, input: &Value) -> Result<String, String> {
+    image_prompt_for(authority, input, PLATFORM)
+}
+
+/// Shared composition, with the calling adapter enforcing its exact provider.
+pub(super) fn image_prompt_for(
+    authority: &Value,
+    input: &Value,
+    provider: &str,
+) -> Result<String, String> {
     if input.as_object().is_none_or(|fields| !fields.is_empty()) {
         return Err("image input cannot override the frozen generation plan".into());
     }
     let config = &authority["binding"]["config"];
     let mapping = &config["mapping"];
     if authority["schema"] != 1
-        || authority["slot"] != "image"
-        || config["provider"] != PLATFORM
+        || config["provider"] != provider
         || config["install_id"] != authority["install_id"]
         || config["connection_id"].as_str().is_none_or(str::is_empty)
         || config["account"].as_str().is_none_or(str::is_empty)
@@ -137,17 +149,38 @@ pub(super) fn image_prompt(authority: &Value, input: &Value) -> Result<String, S
     compose_image_prompt(title, prompt_source, voice, guidance, legacy)
 }
 
-pub(super) fn image_mime(bytes: &[u8], header: &str) -> Result<&'static str, String> {
+/// Why downloaded bytes are not a retainable image (CAD-1315).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageFault {
+    Unsupported,
+    NotSquare,
+    Aspect,
+    TooSmall,
+    Decode,
+    TooLarge,
+}
+
+type Fault = (ImageFault, &'static str);
+
+#[cfg(test)]
+pub(crate) fn image_mime(bytes: &[u8], header: &str) -> Result<&'static str, String> {
+    image_checked(bytes, header).map_err(|(_, message)| message.to_owned())
+}
+
+pub(crate) fn image_checked(bytes: &[u8], header: &str) -> Result<&'static str, Fault> {
     let sniffed = image_data_mime(bytes)?;
     if header.trim().to_ascii_lowercase() != sniffed {
-        return Err("downloaded image MIME differs from its bytes".into());
+        return Err((
+            ImageFault::Unsupported,
+            "downloaded image MIME differs from its bytes",
+        ));
     }
     Ok(sniffed)
 }
 
 /// Byte-sniffed custody decode shared by CDN and base64 paths: no header
 /// trust, full decode inside square/dimension/pixel/allocation limits.
-fn image_data_mime(bytes: &[u8]) -> Result<&'static str, String> {
+fn image_data_mime(bytes: &[u8]) -> Result<&'static str, Fault> {
     let png = bytes.len() >= 45
         && bytes.starts_with(&[
             0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
@@ -168,7 +201,10 @@ fn image_data_mime(bytes: &[u8]) -> Result<&'static str, String> {
     } else if webp {
         "image/webp"
     } else {
-        return Err("downloaded image has no supported image signature".into());
+        return Err((
+            ImageFault::Unsupported,
+            "downloaded image has no supported image signature",
+        ));
     };
     let format = match sniffed {
         "image/png" => image::ImageFormat::Png,
@@ -176,31 +212,299 @@ fn image_data_mime(bytes: &[u8]) -> Result<&'static str, String> {
         "image/webp" => image::ImageFormat::WebP,
         _ => unreachable!(),
     };
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(IMAGE_SIDE_LIMIT);
-    limits.max_image_height = Some(IMAGE_SIDE_LIMIT);
-    limits.max_alloc = Some(IMAGE_DECODE_ALLOC_LIMIT);
+    let limits = decode_limits();
     let mut probe = image::ImageReader::with_format(Cursor::new(bytes), format);
     probe.limits(limits.clone());
-    let (width, height) = probe
-        .into_dimensions()
-        .map_err(|_| "downloaded image dimensions are invalid or exceed custody limit")?;
+    let (width, height) = probe.into_dimensions().map_err(|_| {
+        (
+            ImageFault::Decode,
+            "downloaded image dimensions are invalid or exceed custody limit",
+        )
+    })?;
     if width == 0
         || height == 0
         || width != height
         || u64::from(width) * u64::from(height) > IMAGE_PIXEL_LIMIT
     {
-        return Err("downloaded image is not a bounded square image".into());
+        return Err((
+            ImageFault::NotSquare,
+            "downloaded image is not a bounded square image",
+        ));
     }
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
     reader.limits(limits);
-    let decoded = reader
-        .decode()
-        .map_err(|_| "downloaded image cannot be decoded within custody limits")?;
+    let decoded = reader.decode().map_err(|_| {
+        (
+            ImageFault::Decode,
+            "downloaded image cannot be decoded within custody limits",
+        )
+    })?;
     if decoded.width() != width || decoded.height() != height {
-        return Err("downloaded image dimensions changed during decode".into());
+        return Err((
+            ImageFault::Decode,
+            "downloaded image dimensions changed during decode",
+        ));
     }
     Ok(sniffed)
+}
+
+fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(IMAGE_SIDE_LIMIT);
+    limits.max_image_height = Some(IMAGE_SIDE_LIMIT);
+    limits.max_alloc = Some(IMAGE_DECODE_ALLOC_LIMIT);
+    limits
+}
+
+/// A small, local display derivative of already-proven retained image material.
+/// Reuse custody decode limits; never fetch or expose an original locator.
+pub(crate) fn preview_jpeg(bytes: &[u8], media_type: &str) -> Result<Vec<u8>, Fault> {
+    if bytes.len() > ASSET_LIMIT {
+        return Err((
+            ImageFault::TooLarge,
+            "retained preview exceeds custody limits",
+        ));
+    }
+    let format = match media_type {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        _ => return Err((ImageFault::Decode, "preview requires a PNG or JPEG image")),
+    };
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(decode_limits());
+    let decoded = reader.decode().map_err(|_| {
+        (
+            ImageFault::Decode,
+            "retained preview cannot be decoded within custody limits",
+        )
+    })?;
+    let rgb = if decoded.width() > 320 || decoded.height() > 320 {
+        decoded.thumbnail(320, 320).into_rgb8()
+    } else {
+        decoded.into_rgb8()
+    };
+    const PREVIEW_MAX: usize = 96 * 1024;
+    let mut out = Vec::with_capacity(PREVIEW_MAX);
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 80)
+        .encode_image(&rgb)
+        .map_err(|_| (ImageFault::Decode, "retained preview cannot be encoded"))?;
+    if out.len() > PREVIEW_MAX {
+        return Err((
+            ImageFault::TooLarge,
+            "retained preview exceeds the display bound",
+        ));
+    }
+    Ok(out)
+}
+
+/// Operator-supplied image custody: JPEG or PNG only, decoded under a
+/// bounded allocation, checked against Instagram's 320 px floor and
+/// 4:5–1.91:1 aspect range, scaled down to at most 1440 px, re-encoded as
+/// JPEG (which drops EXIF and any other container metadata), and kept at or
+/// below the same two-MiB asset bound the generated image path uses.
+pub(crate) const UPLOAD_SIDE_MAX: u32 = 1440;
+pub(crate) const UPLOAD_SIDE_MIN: u32 = 320;
+pub(crate) const UPLOAD_DECODE_SIDE: u32 = 4096;
+pub(crate) const UPLOAD_PIXEL_LIMIT: u64 = 4096 * 4096;
+const UPLOAD_DECODE_ALLOC_LIMIT: u64 = 128 * 1024 * 1024;
+const UPLOAD_ASPECT_MIN: f64 = 4.0 / 5.0;
+const UPLOAD_ASPECT_MAX: f64 = 1.91;
+
+fn upload_format(bytes: &[u8]) -> Result<image::ImageFormat, Fault> {
+    let format = image::guess_format(bytes).map_err(|_| {
+        (
+            ImageFault::Unsupported,
+            "uploaded image has no supported image signature",
+        )
+    })?;
+    match format {
+        image::ImageFormat::Png | image::ImageFormat::Jpeg => Ok(format),
+        _ => Err((
+            ImageFault::Unsupported,
+            "uploaded image must be JPEG or PNG",
+        )),
+    }
+}
+
+fn upload_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(UPLOAD_DECODE_SIDE);
+    limits.max_image_height = Some(UPLOAD_DECODE_SIDE);
+    limits.max_alloc = Some(UPLOAD_DECODE_ALLOC_LIMIT);
+    limits
+}
+
+/// Check an image that is already retained by the upload door or the
+/// generated-image path. Unlike `image_mime`, this accepts the full
+/// Instagram aspect range — the upload door normalises dimensions before
+/// custody — while still refusing non-JPEG/PNG, a mismatched stored media
+/// type, corrupt payloads and oversized decodes.
+pub(crate) fn uploaded_image_mime(bytes: &[u8], media_type: &str) -> Result<&'static str, Fault> {
+    if bytes.is_empty() || bytes.len() > ASSET_LIMIT {
+        return Err((
+            ImageFault::TooLarge,
+            "uploaded image is outside the custody size",
+        ));
+    }
+    let format = upload_format(bytes)?;
+    let mime = if format == image::ImageFormat::Png {
+        "image/png"
+    } else {
+        "image/jpeg"
+    };
+    if !media_type.is_empty() && media_type != mime {
+        return Err((
+            ImageFault::Unsupported,
+            "uploaded image media type disagrees with its bytes",
+        ));
+    }
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(upload_limits());
+    let decoded = reader.decode().map_err(|_| {
+        (
+            ImageFault::Decode,
+            "uploaded image cannot be decoded within custody limits",
+        )
+    })?;
+    if decoded.width() < 1 || decoded.height() < 1 {
+        return Err((ImageFault::Decode, "uploaded image has no pixels"));
+    }
+    Ok(mime)
+}
+
+pub(crate) fn normalize_uploaded_image(
+    bytes: &[u8],
+) -> Result<(Vec<u8>, &'static str, u32, u32), Fault> {
+    if bytes.is_empty() || bytes.len() > ASSET_LIMIT {
+        return Err((
+            ImageFault::TooLarge,
+            "uploaded image is outside the custody size",
+        ));
+    }
+    let format = upload_format(bytes)?;
+    let limits = upload_limits();
+    use image::ImageDecoder as _;
+    let mut probe = image::ImageReader::with_format(Cursor::new(bytes), format);
+    probe.limits(limits.clone());
+    let mut decoder = probe.into_decoder().map_err(|_| {
+        (
+            ImageFault::Decode,
+            "uploaded image dimensions are invalid or exceed the decode limit",
+        )
+    })?;
+    let orientation = decoder.orientation().map_err(|_| {
+        (
+            ImageFault::Decode,
+            "uploaded image orientation cannot be read",
+        )
+    })?;
+    let (stored_width, stored_height) = decoder.dimensions();
+    let rotated = matches!(
+        orientation,
+        image::metadata::Orientation::Rotate90
+            | image::metadata::Orientation::Rotate270
+            | image::metadata::Orientation::Rotate90FlipH
+            | image::metadata::Orientation::Rotate270FlipH
+    );
+    let (width, height) = if rotated {
+        (stored_height, stored_width)
+    } else {
+        (stored_width, stored_height)
+    };
+    if width < UPLOAD_SIDE_MIN || height < UPLOAD_SIDE_MIN {
+        return Err((
+            ImageFault::TooSmall,
+            "uploaded image is smaller than 320 pixels on a side",
+        ));
+    }
+    let aspect = f64::from(width) / f64::from(height);
+    if !(UPLOAD_ASPECT_MIN..=UPLOAD_ASPECT_MAX).contains(&aspect) {
+        return Err((
+            ImageFault::Aspect,
+            "uploaded image is outside Instagram's 4:5 to 1.91:1 range",
+        ));
+    }
+    if u64::from(width) * u64::from(height) > UPLOAD_PIXEL_LIMIT {
+        return Err((ImageFault::Decode, "uploaded image exceeds the pixel limit"));
+    }
+    let mut decoded = image::DynamicImage::from_decoder(decoder).map_err(|_| {
+        (
+            ImageFault::Decode,
+            "uploaded image cannot be decoded within custody limits",
+        )
+    })?;
+    decoded.apply_orientation(orientation);
+    if decoded.width() != width || decoded.height() != height {
+        return Err((
+            ImageFault::Decode,
+            "uploaded image dimensions changed during decode",
+        ));
+    }
+    let resized = if width > UPLOAD_SIDE_MAX || height > UPLOAD_SIDE_MAX {
+        decoded.resize(
+            UPLOAD_SIDE_MAX,
+            UPLOAD_SIDE_MAX,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        decoded
+    };
+    let rgb = resized.to_rgb8();
+    for quality in [90u8, 82, 74, 66] {
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+            .encode_image(&rgb)
+            .map_err(|_| (ImageFault::Decode, "uploaded image could not be re-encoded"))?;
+        if out.len() <= ASSET_LIMIT {
+            return Ok((out, "image/jpeg", rgb.width(), rgb.height()));
+        }
+    }
+    Err((
+        ImageFault::TooLarge,
+        "uploaded image does not fit the custody bound after re-encoding",
+    ))
+}
+
+/// An artifact above the custody bound is re-encoded as a JPEG that fits it
+/// (quality steps down until it does), inside the same decode limits. The
+/// caller has already proven the ORIGINAL bytes against the AgenticOS
+/// descriptor; the retained bytes are these.
+pub(crate) fn fit_to_custody(bytes: &[u8]) -> Result<Vec<u8>, Fault> {
+    let sniffed = image_data_mime(bytes)?;
+    let format = match sniffed {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        _ => image::ImageFormat::WebP,
+    };
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(decode_limits());
+    let rgb = reader
+        .decode()
+        .map_err(|_| {
+            (
+                ImageFault::Decode,
+                "downloaded image cannot be decoded within custody limits",
+            )
+        })?
+        .to_rgb8();
+    for quality in [90u8, 80, 70, 60] {
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+            .encode_image(&rgb)
+            .map_err(|_| {
+                (
+                    ImageFault::Decode,
+                    "downloaded image could not be re-encoded",
+                )
+            })?;
+        if out.len() <= ASSET_LIMIT {
+            return Ok(out);
+        }
+    }
+    Err((
+        ImageFault::TooLarge,
+        "downloaded image does not fit the custody bound",
+    ))
 }
 
 /// CAD-734 mapping onto the AOS-94 slice-1 device media-import shape
@@ -409,5 +713,93 @@ mod tests {
         webp.extend(b"WEBPVP8 ");
         webp.extend([0; 8]);
         assert!(image_mime(&webp, "image/webp").is_err());
+    }
+
+    #[test]
+    fn uploaded_images_are_normalized_and_bounded() {
+        let source = encoded_png(2000, 1600);
+        let (bytes, mime, width, height) = normalize_uploaded_image(&source).unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert!(width <= UPLOAD_SIDE_MAX && height <= UPLOAD_SIDE_MAX);
+        assert!(width >= UPLOAD_SIDE_MIN && height >= UPLOAD_SIDE_MIN);
+        assert!(bytes.len() <= ASSET_LIMIT);
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (width, height));
+        assert_ne!(
+            bytes, source,
+            "upload custody re-encodes instead of retaining the original"
+        );
+
+        assert!(normalize_uploaded_image(&encoded_png(300, 300)).is_err());
+        assert!(matches!(
+            normalize_uploaded_image(&encoded_png(320, 1000))
+                .unwrap_err()
+                .0,
+            ImageFault::Aspect
+        ));
+        assert!(matches!(
+            normalize_uploaded_image(&encoded_png(2000, 1000))
+                .unwrap_err()
+                .0,
+            ImageFault::Aspect
+        ));
+        assert!(matches!(
+            normalize_uploaded_image(&encoded_webp(800, 640))
+                .unwrap_err()
+                .0,
+            ImageFault::Unsupported
+        ));
+        assert!(normalize_uploaded_image(b"<svg xmlns='http://www.w3.org/2000/svg'/>").is_err());
+        assert!(matches!(
+            normalize_uploaded_image(&vec![0u8; ASSET_LIMIT + 1])
+                .unwrap_err()
+                .0,
+            ImageFault::TooLarge
+        ));
+    }
+
+    #[test]
+    fn upload_mime_accepts_normalized_non_square_and_rejects_mismatch() {
+        let (jpeg, _, width, height) = normalize_uploaded_image(&encoded_png(1200, 900)).unwrap();
+        assert!(width > height);
+        assert_eq!(
+            uploaded_image_mime(&jpeg, "image/jpeg").unwrap(),
+            "image/jpeg"
+        );
+        assert!(uploaded_image_mime(&jpeg, "image/png").is_err());
+        assert!(uploaded_image_mime(&encoded_png(2, 1), "").is_ok());
+        assert!(uploaded_image_mime(b"not an image", "").is_err());
+        assert!(uploaded_image_mime(&encoded_webp(800, 640), "").is_err());
+    }
+
+    fn jpeg_with_exif_orientation(width: u32, height: u32, orientation: u16) -> Vec<u8> {
+        let jpeg = encoded_jpeg(width, height);
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&[0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00]);
+        payload.extend_from_slice(&[0x01, 0x00]);
+        payload.extend_from_slice(&[0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00]);
+        payload.extend_from_slice(&orientation.to_le_bytes());
+        payload.extend_from_slice(&[0x00, 0x00]);
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        let mut app1 = vec![0xff, 0xe1];
+        app1.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        app1.extend_from_slice(&payload);
+        let mut out = Vec::with_capacity(jpeg.len() + app1.len());
+        out.extend_from_slice(&jpeg[..2]);
+        out.extend_from_slice(&app1);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    #[test]
+    fn uploaded_camera_orientation_is_applied_before_metadata_is_dropped() {
+        let source = jpeg_with_exif_orientation(500, 400, 6);
+        let (bytes, mime, width, height) = normalize_uploaded_image(&source).unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!((width, height), (400, 500));
+        assert!(bytes.len() <= ASSET_LIMIT);
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (400, 500));
+        assert!(!bytes.windows(6).any(|window| window == b"Exif\0\0"));
     }
 }

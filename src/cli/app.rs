@@ -23,6 +23,33 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: ContextAction,
     },
+    /// Offline install validation of a local package: the same bundle
+    /// checks `app catalog install-check` runs — entry grammar, per-file
+    /// and aggregate caps, manifest, descriptors, workflow checks and
+    /// `requires` against this build's contracts — with no daemon, no
+    /// store and no PM read or write. `<source>` is a local directory; a
+    /// git/URL source is refused (a transport, not bytes) and the
+    /// `builtin:<catalog id>` form is retired (CAD-1422). Prints the JSON
+    /// report; exit 0 on pass, 3 on refusal.
+    /// Catalog admission (duplicate installs, pending journals) is not
+    /// reproduced — the report says so.
+    Check {
+        /// Package directory.
+        source: String,
+        /// The output is always the JSON report; `--json` makes the
+        /// machine-readable contract explicit for scripts.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect complete package integrity without claiming target compatibility.
+    /// Observes Native requirements; installs, approves and consents to nothing.
+    Inspect {
+        /// Package directory.
+        source: String,
+        /// Emit the machine-readable inspection receipt.
+        #[arg(long)]
+        json: bool,
+    },
     /// Host-managed per-installation customer records with scoped revisions.
     Record {
         #[command(subcommand)]
@@ -41,6 +68,13 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: ContentAction,
     },
+    /// Works content (CAD-1662): native operator docs, decks and sheets over
+    /// the durable store. Explicit install and context; no actor flags. Review
+    /// needs two verified humans, and the daemon derives the actor.
+    Works {
+        #[command(subcommand)]
+        action: WorksAction,
+    },
     /// CRM app assistant discovery, consented action invocation, and durable receipt reads.
     Assistant {
         #[command(subcommand)]
@@ -56,20 +90,52 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: RunAction,
     },
-    /// Run a fixture-only HMR preview from an explicitly trusted local
-    /// Cadence source checkout. This executes that checkout's known
-    /// development harness, not an installed app or its manifest.
-    Dev {
-        /// Preview directory name under app-previews/.
-        name: String,
-        /// Trusted source checkout containing scripts/app-dev.mjs.
+    /// Export the exact host screen frame and kit CSS for offline previews.
+    FrameKit {
+        /// New output directory for the frame, kit CSS and metadata.
         #[arg(long)]
-        source: PathBuf,
+        out: PathBuf,
+        /// Optional local app bundle to mount as the validated screen entry.
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+        /// Exact parent origin allowed by the frame bridge.
+        #[arg(long, default_value = "http://127.0.0.1")]
+        parent_origin: String,
+        /// Static preview only: inspect integrity without requiring Native support.
+        #[arg(long, requires = "bundle")]
+        integrity_only: bool,
+    },
+    /// Emit canonical screen PUSH fixtures from a local validated app bundle.
+    Fixtures {
+        /// Local app package directory.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Require the machine-readable fixture envelope.
+        #[arg(long)]
+        json: bool,
+        /// Synthetic fixtures only; does not prove target runtime compatibility.
+        #[arg(long)]
+        integrity_only: bool,
+    },
+    /// Run the app's declared local preview. In a detached app repository,
+    /// `--package .` reads `package.json.cadence` and runs the app-owned
+    /// `dev` command with a scrubbed environment. The legacy `--source`
+    /// mode runs a trusted Cadence checkout's `scripts/app-dev.mjs`.
+    Dev {
+        /// Legacy preview directory name under app-previews/.
+        name: Option<String>,
+        /// Legacy trusted source checkout containing scripts/app-dev.mjs.
+        #[arg(long, conflicts_with = "package")]
+        source: Option<PathBuf>,
+        /// Detached app package root; reads its `package.json.cadence`
+        /// contract and runs the app-owned `dev` command.
+        #[arg(long, conflicts_with_all = ["name", "source"])]
+        package: Option<PathBuf>,
         #[arg(long, default_value_t = 3186, value_parser = clap::value_parser!(u16).range(3110..=3199))]
         port: u16,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
-        /// Existing private tailnet hostname; required when sharing.
+        /// Legacy private tailnet hostname; refused with --package.
         #[arg(long)]
         allow_host: Vec<String>,
     },
@@ -433,6 +499,138 @@ pub(crate) enum ContentAction {
         #[arg(long, requires = "message")]
         token: String,
     },
+    /// Set CRM action autonomy: `assisted` keeps the operator decision
+    /// on record writes and campaign sends; `full` lets a scoped agent
+    /// turn run them directly. Operator only.
+    #[command(name = "autonomy-set")]
+    AutonomySet { mode: String },
+    /// Show the current CRM action autonomy.
+    #[command(name = "autonomy-show")]
+    AutonomyShow,
+}
+
+/// CAD-1662 native Works verbs. Each takes an explicit install and
+/// context; the daemon derives the actor from the operator connection,
+/// so no actor flag exists. Content and audit-bearing writes carry a
+/// caller idempotency key and an `if_revision`/`revision` pin.
+#[derive(Subcommand)]
+pub(crate) enum WorksAction {
+    /// List the context's Works items (optional filters).
+    Query {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        review: Option<String>,
+        #[arg(long)]
+        export: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        sort: Option<String>,
+    },
+    /// Show one Works item.
+    Get {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        id: String,
+    },
+    /// Create a doc, deck or sheet from a JSON file.
+    Create {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        /// JSON file holding `{kind, title, content, tags?}`.
+        #[arg(long)]
+        body: PathBuf,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Apply a JSON patch document pinned to `if_revision`.
+    Patch {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        if_revision: i64,
+        /// JSON file holding `{operations: [...]}`.
+        #[arg(long)]
+        body: PathBuf,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Move one item to trash at `if_revision`.
+    Trash {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        if_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Restore one trashed item at `if_revision`.
+    Restore {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        if_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Request independent review of one revision.
+    #[command(name = "request-review")]
+    RequestReview {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        revision: i64,
+    },
+    /// Record a reviewer decision on a pending revision.
+    Review {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        revision: i64,
+        /// `approve` or `changes`.
+        #[arg(long)]
+        decision: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Export an approved, current revision (receipt only; content stays in the store).
+    Export {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        revision: i64,
+        #[arg(long)]
+        format: Option<String>,
+    },
 }
 
 /// CAD-780 audience verbs. JSON files hold predicates (`[{field,
@@ -750,10 +948,18 @@ pub(crate) enum EffectAction {
         digest: String,
     },
 }
-/// The source the daemon installs from: a URL passes through, a local
-/// path is made absolute here because the daemon refuses relative ones.
-/// Shared by `install`, `install-check`, `upgrade-check`.
+/// The source the daemon installs from: URLs pass through, a local path
+/// is made absolute because the daemon refuses relative ones. A
+/// `builtin:` source is refused here — the built-in catalog is retired
+/// (CAD-1422); the daemon refuses it too, but the CLI names the retired
+/// form instead of passing it through. Shared by `install`,
+/// `install-check`, `upgrade-check`.
 fn install_source(source: &str) -> Result<String> {
+    if source.starts_with("builtin:") {
+        return Err(Error::rejected(
+            "builtin: sources are retired (CAD-1422) — install from the app's detached repository (a path or Git URL)",
+        ));
+    }
     if source.contains("://") || source.starts_with("git@") {
         return Ok(source.to_string());
     }
@@ -761,6 +967,41 @@ fn install_source(source: &str) -> Result<String> {
         .map_err(|e| Error::rejected(format!("workspace app source: {e}")))?
         .to_string_lossy()
         .into_owned())
+}
+
+fn catalogue_params(
+    params: &mut Value,
+    id: &Option<String>,
+    version: &Option<String>,
+    digest: &Option<String>,
+    resolution: &Option<String>,
+) -> Result<()> {
+    let locator = match (id, version, digest) {
+        (None, None, None) => None,
+        (Some(id), Some(version), Some(digest)) => {
+            Some(json!({"id": id, "version": version, "digest": digest}))
+        }
+        _ => {
+            return Err(Error::rejected(
+                "catalogue id, version and digest must be set together",
+            ))
+        }
+    };
+    if locator.is_some() && resolution.is_some() {
+        return Err(Error::rejected(
+            "catalogue locator and manual resolution are mutually exclusive",
+        ));
+    }
+    if let Some(resolution) = resolution {
+        if resolution != "manual" {
+            return Err(Error::rejected("catalogue resolution must be manual"));
+        }
+        params["catalogue_resolution"] = json!("manual");
+    }
+    if let Some(locator) = locator {
+        params["catalogue"] = locator;
+    }
+    Ok(())
 }
 
 fn read_record_csv(path: &Path) -> Result<String> {
@@ -946,19 +1187,148 @@ fn record_params(action: &RecordAction) -> Result<(&'static str, serde_json::Val
     })
 }
 
+/// CAD-1662: map each native Works verb to its `app_works_*` RPC. JSON
+/// files are bounded by `read_audience_json` (64 KiB) and forwarded as-is;
+/// the daemon's typed grammar validates every field. No actor is sent.
+fn works_params(action: &WorksAction) -> Result<(&'static str, serde_json::Value)> {
+    Ok(match action {
+        WorksAction::Query {
+            install_id,
+            context_id,
+            text,
+            kind,
+            review,
+            export,
+            tag,
+            owner,
+            sort,
+        } => (
+            "app_works_query",
+            json!({"install_id": install_id, "context_id": context_id, "text": text, "kind": kind, "review": review, "export": export, "tag": tag, "owner": owner, "sort": sort}),
+        ),
+        WorksAction::Get {
+            install_id,
+            context_id,
+            id,
+        } => (
+            "app_works_get",
+            json!({"install_id": install_id, "context_id": context_id, "id": id}),
+        ),
+        WorksAction::Create {
+            install_id,
+            context_id,
+            body,
+            idempotency_key,
+        } => {
+            let mut params = read_works_json(body, "works body")?;
+            let obj = params
+                .as_object_mut()
+                .ok_or_else(|| Error::invalid("app_works", "works body must be an object"))?;
+            obj.insert("install_id".into(), json!(install_id));
+            obj.insert("context_id".into(), json!(context_id));
+            obj.insert("idempotency_key".into(), json!(idempotency_key));
+            ("app_works_create", params)
+        }
+        WorksAction::Patch {
+            install_id,
+            context_id,
+            id,
+            if_revision,
+            body,
+            idempotency_key,
+        } => {
+            let mut params = read_works_json(body, "works patch")?;
+            let obj = params
+                .as_object_mut()
+                .ok_or_else(|| Error::invalid("app_works", "works patch must be an object"))?;
+            obj.insert("install_id".into(), json!(install_id));
+            obj.insert("context_id".into(), json!(context_id));
+            obj.insert("id".into(), json!(id));
+            obj.insert("if_revision".into(), json!(if_revision));
+            obj.insert("idempotency_key".into(), json!(idempotency_key));
+            ("app_works_patch", params)
+        }
+        WorksAction::Trash {
+            install_id,
+            context_id,
+            id,
+            if_revision,
+            idempotency_key,
+        } => (
+            "app_works_trash",
+            json!({"install_id": install_id, "context_id": context_id, "id": id, "if_revision": if_revision, "idempotency_key": idempotency_key}),
+        ),
+        WorksAction::Restore {
+            install_id,
+            context_id,
+            id,
+            if_revision,
+            idempotency_key,
+        } => (
+            "app_works_restore",
+            json!({"install_id": install_id, "context_id": context_id, "id": id, "if_revision": if_revision, "idempotency_key": idempotency_key}),
+        ),
+        WorksAction::RequestReview {
+            install_id,
+            context_id,
+            id,
+            revision,
+        } => (
+            "app_works_request_review",
+            json!({"install_id": install_id, "context_id": context_id, "id": id, "revision": revision}),
+        ),
+        WorksAction::Review {
+            install_id,
+            context_id,
+            id,
+            revision,
+            decision,
+            note,
+        } => (
+            "app_works_review",
+            json!({"install_id": install_id, "context_id": context_id, "id": id, "revision": revision, "decision": decision, "note": note}),
+        ),
+        WorksAction::Export {
+            install_id,
+            context_id,
+            id,
+            revision,
+            format,
+        } => {
+            let mut params = json!({"install_id": install_id, "context_id": context_id, "id": id, "revision": revision});
+            // Omit `format` when absent so the daemon applies its html default
+            // instead of receiving an explicit null (refused as invalid).
+            if let Some(format) = format {
+                params["format"] = json!(format);
+            }
+            ("app_works_export", params)
+        }
+    })
+}
+
+/// Works create/patch bodies: a near-64 KiB revision plus kind, title,
+/// tags or operations exceeds the 64 KiB audience bound, so Works verbs get
+/// their own 80 KiB reader. Other commands keep `read_audience_json`.
+fn read_works_json(path: &Path, kind: &str) -> Result<serde_json::Value> {
+    read_bounded_json(path, kind, 80 * 1024)
+}
+
 fn read_audience_json(path: &Path, kind: &str) -> Result<serde_json::Value> {
+    read_bounded_json(path, kind, 64 * 1024)
+}
+
+fn read_bounded_json(path: &Path, kind: &str, limit: usize) -> Result<serde_json::Value> {
     use std::io::Read;
-    const MAX_AUDIENCE_BYTES: usize = 64 * 1024;
     let file = std::fs::File::open(path)
         .map_err(|e| Error::invalid("app_audience", format!("cannot open {kind}: {e}")))?;
     let mut bytes = Vec::new();
-    file.take((MAX_AUDIENCE_BYTES + 1) as u64)
+    file.take((limit + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|e| Error::invalid("app_audience", format!("cannot read {kind}: {e}")))?;
-    if bytes.len() > MAX_AUDIENCE_BYTES {
+    if bytes.len() > limit {
         return Err(Error::invalid(
             "app_audience",
-            format!("{kind} JSON exceeds 64KiB"),
+            format!("{kind} JSON exceeds {}KiB", limit / 1024),
         ));
     }
     serde_json::from_slice(&bytes)
@@ -1021,6 +1391,8 @@ fn content_params(action: &ContentAction) -> Result<(&'static str, serde_json::V
             "app_content_assistant_proposal_show",
             json!({"install_id":install_id,"context_id":context_id,"proposal_id":proposal_id,"message":message,"token":token}),
         ),
+        ContentAction::AutonomySet { mode } => ("crm_autonomy_set", json!({"mode":mode})),
+        ContentAction::AutonomyShow => ("crm_autonomy_show", json!({})),
     })
 }
 
@@ -1319,45 +1691,126 @@ fn effect_params(action: &EffectAction) -> (&'static str, serde_json::Value) {
 
 #[derive(Subcommand)]
 pub(crate) enum AssistantAction {
+    /// List the actions this installation declares for the current context.
     Actions {
-        install_id: String,
+        /// Installation id; omitted means the live turn's verified App scope.
+        install_id: Option<String>,
         #[arg(long)]
-        context_id: String,
+        context_id: Option<String>,
         #[arg(long)]
-        message: String,
+        message: Option<String>,
         #[arg(long)]
-        token: String,
+        token: Option<String>,
     },
     Invoke {
-        install_id: String,
+        /// Installation id; omitted means the live turn's verified App scope.
+        install_id: Option<String>,
         #[arg(long)]
-        context_id: String,
+        context_id: Option<String>,
         #[arg(long)]
-        message: String,
+        message: Option<String>,
         #[arg(long)]
-        token: String,
+        token: Option<String>,
         #[arg(long)]
         action_id: String,
+        /// Idempotency key; omitted derives one from the turn, action and input.
         #[arg(long)]
-        operation_id: String,
+        operation_id: Option<String>,
+        /// Inline JSON, `@file`, a file path, or `-` for stdin.
         #[arg(long)]
-        input: PathBuf,
+        input: String,
+        /// Poll until the operation leaves `running`.
+        #[arg(long)]
+        wait: bool,
     },
     OperationShow {
+        /// Installation id; omitted means the live turn's verified App scope.
+        install_id: Option<String>,
+        #[arg(long)]
+        context_id: Option<String>,
+        #[arg(long)]
+        message: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        operation_id: String,
+    },
+    /// Operator decision on one pending permission request.
+    Decide {
         install_id: String,
         #[arg(long)]
         context_id: String,
         #[arg(long)]
-        message: String,
-        #[arg(long)]
-        token: String,
-        #[arg(long)]
         operation_id: String,
+        /// The operation revision the decision was made against.
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long, value_parser = ["allow_once", "allow_always", "deny"])]
+        decision: String,
     },
 }
 
 #[derive(Subcommand)]
 pub(crate) enum CatalogAction {
+    /// Selected hosted workspace only: inspect an immutable published release; never uploads local files.
+    ReleaseCheck {
+        listing: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long, requires_all = ["expected_digest", "expected_generation"])]
+        install_id: Option<String>,
+        #[arg(long, requires = "install_id")]
+        expected_digest: Option<String>,
+        #[arg(long, requires = "install_id")]
+        expected_generation: Option<String>,
+    },
+    /// Selected hosted workspace only: consent to the exact release-check JSON review.
+    ReleaseInstall {
+        listing: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        review: PathBuf,
+    },
+    /// Selected hosted workspace only: update exact old bytes/generation to a reviewed published release.
+    ReleaseUpdate {
+        install_id: String,
+        listing: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        expected_digest: String,
+        #[arg(long)]
+        expected_generation: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        review: PathBuf,
+    },
+    /// Selected hosted workspace only: revoke package approval, not business data or run recovery.
+    ReleaseRevoke {
+        install_id: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        expected_generation: String,
+        #[arg(long)]
+        operation_id: String,
+    },
+    /// Selected hosted workspace only: read a durable receipt; dispatched is not executed.
+    Operation { operation_id: String },
+    /// Selected hosted workspace only: discover the pending operation as a current owner.
+    Pending { app: String },
+    /// Selected hosted workspace only: observe/cancel preparation; never redispatch a mutation.
+    Reconcile { operation_id: String },
     /// Approve the exact installed digest for supported local artifact steps.
     Approve {
         install_id: String,
@@ -1383,10 +1836,30 @@ pub(crate) enum CatalogAction {
         /// returned by `install-check`. Omitted: install whatever resolves.
         #[arg(long)]
         expected_digest: Option<String>,
+        /// Catalogue id, with `--catalogue-version` and `--catalogue-digest`.
+        #[arg(long)]
+        catalogue_id: Option<String>,
+        #[arg(long)]
+        catalogue_version: Option<String>,
+        #[arg(long)]
+        catalogue_digest: Option<String>,
+        /// `manual` clears catalogue provenance on a non-catalogue install.
+        #[arg(long)]
+        catalogue_resolution: Option<String>,
     },
     /// Read-only: resolve and validate a bundle exactly as install would and
     /// return its digest, name, version and file list. Writes nothing.
-    InstallCheck { source: String },
+    InstallCheck {
+        source: String,
+        #[arg(long)]
+        catalogue_id: Option<String>,
+        #[arg(long)]
+        catalogue_version: Option<String>,
+        #[arg(long)]
+        catalogue_digest: Option<String>,
+        #[arg(long)]
+        catalogue_resolution: Option<String>,
+    },
     /// Replace one exact workspace bundle while keeping its installation ID.
     /// The current digest and catalog generation must match the inspected row.
     UpgradeCheck {
@@ -1396,6 +1869,15 @@ pub(crate) enum CatalogAction {
         expected_digest: String,
         #[arg(long)]
         expected_generation: String,
+        #[arg(long)]
+        catalogue_id: Option<String>,
+        #[arg(long)]
+        catalogue_version: Option<String>,
+        #[arg(long)]
+        catalogue_digest: Option<String>,
+        /// `manual` when this source is not a catalogue release.
+        #[arg(long)]
+        catalogue_resolution: Option<String>,
     },
     /// Apply an inspected upgrade, pinned to both old and proposed bytes.
     Upgrade {
@@ -1409,6 +1891,14 @@ pub(crate) enum CatalogAction {
         expected_new_digest: String,
         #[arg(long)]
         request_id: String,
+        #[arg(long)]
+        catalogue_id: Option<String>,
+        #[arg(long)]
+        catalogue_version: Option<String>,
+        #[arg(long)]
+        catalogue_digest: Option<String>,
+        #[arg(long)]
+        catalogue_resolution: Option<String>,
     },
     /// Resume a retained workspace upgrade after interrupted Git delivery.
     UpgradeRecover {
@@ -1538,19 +2028,40 @@ fn read_run_inputs(path: &Path) -> Result<serde_json::Value> {
     Ok(json!(inputs))
 }
 
-fn read_assistant_input(state_dir: &Path, path: &Path) -> Result<serde_json::Value> {
+/// Bounded JSON object for `app assistant invoke`: inline, `@file`, a path,
+/// or `-` for stdin. The source never changes the 32 KiB bound.
+fn parse_assistant_input(state_dir: &Path, raw: &str) -> Result<serde_json::Value> {
     use std::io::Read;
     const MAX_INPUT_BYTES: usize = 32 * 1024;
-    let file = cadence_agent::master::open_command_file(state_dir, path)?;
-    let mut bytes = Vec::new();
-    file.take((MAX_INPUT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|e| {
-            Error::invalid(
-                "app_assistant_input",
-                format!("cannot read assistant input: {e}"),
-            )
-        })?;
+    let bytes = if raw == "-" {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .lock()
+            .take((MAX_INPUT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| {
+                Error::invalid(
+                    "app_assistant_input",
+                    format!("cannot read assistant input from stdin: {e}"),
+                )
+            })?;
+        bytes
+    } else if raw.trim_start().starts_with('{') {
+        raw.as_bytes().to_vec()
+    } else {
+        let path = Path::new(raw.strip_prefix('@').unwrap_or(raw));
+        let file = cadence_agent::master::open_command_file(state_dir, path)?;
+        let mut bytes = Vec::new();
+        file.take((MAX_INPUT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| {
+                Error::invalid(
+                    "app_assistant_input",
+                    format!("cannot read assistant input: {e}"),
+                )
+            })?;
+        bytes
+    };
     if bytes.len() > MAX_INPUT_BYTES {
         return Err(Error::invalid(
             "app_assistant_input",
@@ -1566,6 +2077,198 @@ fn read_assistant_input(state_dir: &Path, path: &Path) -> Result<serde_json::Val
         ));
     }
     Ok(input)
+}
+
+#[derive(Clone, Debug)]
+struct AssistantScope {
+    install_id: String,
+    context_id: String,
+    message: String,
+    token: String,
+}
+
+impl AssistantScope {
+    /// The daemon's identity fields plus one call's own fields.
+    fn params(&self, extra: serde_json::Value) -> serde_json::Value {
+        let mut params = json!({
+            "install_id": self.install_id,
+            "context_id": self.context_id,
+            "message": self.message,
+            "token": self.token,
+        });
+        if let (Some(params), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                params.insert(key.clone(), value.clone());
+            }
+        }
+        params
+    }
+}
+
+fn assistant_scope(
+    state_dir: &Path,
+    install_id: Option<&str>,
+    context_id: Option<&str>,
+    message: Option<&str>,
+    token: Option<&str>,
+) -> Result<AssistantScope> {
+    // `agent_identity` derives the caller from the connection, exactly as
+    // `cadence self` does. An operator outside a pane has no live turn and
+    // must pass every identity flag.
+    let live = client::rpc(state_dir, "agent_identity", json!({})).ok();
+    resolve_assistant_scope(live.as_ref(), install_id, context_id, message, token)
+}
+
+/// Explicit flags win; anything omitted comes from the caller's one live
+/// turn and its verified App stamp. Ambiguity refuses instead of guessing.
+fn resolve_assistant_scope(
+    live: Option<&serde_json::Value>,
+    install_id: Option<&str>,
+    context_id: Option<&str>,
+    message: Option<&str>,
+    token: Option<&str>,
+) -> Result<AssistantScope> {
+    let turns = live
+        .and_then(|value| value.get("running"))
+        .and_then(serde_json::Value::as_array);
+    let turn = match (message, token) {
+        (Some(id), Some(_)) => {
+            turns.and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(id)))
+        }
+        (None, None) => match turns.map(Vec::as_slice) {
+            Some([only]) => Some(only),
+            Some(rows) if !rows.is_empty() => {
+                return Err(Error::rejected(format!(
+                    "this agent holds {} running turns — pass --message and --token to choose one",
+                    rows.len()
+                )))
+            }
+            _ => None,
+        },
+        _ => {
+            return Err(Error::rejected(
+                "--message and --token are given together or not at all",
+            ))
+        }
+    };
+    let message =
+        match (message, turn.and_then(|row| row["id"].as_str())) {
+            (Some(id), _) => id.to_string(),
+            (None, Some(id)) => id.to_string(),
+            (None, None) if live.is_none() => return Err(Error::rejected(
+                "this process sees no live agent turn — pass --message, --token and the install id",
+            )),
+            (None, None) => {
+                return Err(Error::rejected(
+                    "no running turn to derive the app scope from — pass --message and --token",
+                ))
+            }
+        };
+    let token = match (token, turn.and_then(|row| row["turn_id"].as_str())) {
+        (Some(token), _) => token.to_string(),
+        (None, Some(token)) => token.to_string(),
+        (None, None) => {
+            return Err(Error::rejected(
+                "no live turn token — pass --token together with --message",
+            ))
+        }
+    };
+    let install_id = install_id
+        .map(str::to_string)
+        .or_else(|| {
+            turn.and_then(|row| row["app_install_id"].as_str())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            Error::rejected("this turn carries no App installation — pass the install id")
+        })?;
+    let context_id = context_id
+        .map(str::to_string)
+        .or_else(|| {
+            turn.and_then(|row| row["app_context_id"].as_str())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| Error::rejected("this turn carries no App context — pass --context-id"))?;
+    Ok(AssistantScope {
+        install_id,
+        context_id,
+        message,
+        token,
+    })
+}
+
+/// One idempotency key for one (turn, action, input), so re-running the
+/// same command replays the operation instead of creating a second effect.
+fn derive_operation_id(message: &str, action_id: &str, input: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(message.as_bytes());
+    digest.update(b"\0");
+    digest.update(action_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(serde_json::to_vec(input).expect("assistant input serializes"));
+    let hex = format!("{:x}", digest.finalize());
+    format!("op-{}", &hex[..24])
+}
+
+fn wait_assistant_operation(
+    state_dir: &Path,
+    scope: &AssistantScope,
+    operation_id: &str,
+    first: serde_json::Value,
+) -> Result<serde_json::Value> {
+    use std::time::{Duration, Instant};
+    let seconds = std::env::var("CADENCE_ASSISTANT_WAIT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(120u64);
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut current = first;
+    loop {
+        let status = current
+            .get("operation")
+            .and_then(|operation| operation.get("status"))
+            .or_else(|| current.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if status != "running" {
+            let mut value = current;
+            if status == "pending_permission" {
+                let revision = value
+                    .get("operation")
+                    .and_then(|operation| operation.get("revision"))
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or_default();
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "wait_note".into(),
+                        json!(format!(
+                            "operation {operation_id} waits for an operator decision: \
+                             `cadence app assistant decide {} --context-id {} \
+                             --operation-id {operation_id} --expected-revision {revision} \
+                             --decision allow_once` (or `allow_always` / `deny`)",
+                            scope.install_id, scope.context_id
+                        )),
+                    );
+                }
+            }
+            return Ok(value);
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::rejected(format!(
+                "operation {operation_id} is still running; read it again with \
+                 `cadence app assistant operation-show {} --operation-id {operation_id}`",
+                scope.install_id
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        current = client::rpc(
+            state_dir,
+            "app_assistant_operation_show",
+            scope.params(json!({"operation_id": operation_id})),
+        )?;
+    }
 }
 
 fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
@@ -1755,6 +2458,15 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
         }
         AppAction::Catalog { action } => {
             let (method, params) = match action {
+                CatalogAction::ReleaseCheck { .. }
+                | CatalogAction::ReleaseInstall { .. }
+                | CatalogAction::ReleaseUpdate { .. }
+                | CatalogAction::ReleaseRevoke { .. }
+                | CatalogAction::Operation { .. }
+                | CatalogAction::Pending { .. }
+                | CatalogAction::Reconcile { .. } => {
+                    return Err(Error::usage("published-release lifecycle commands require a selected remote workspace (--org); local app/catalog commands are unchanged"));
+                }
                 CatalogAction::Approve { install_id, digest } => (
                     "app_local_install_approve",
                     json!({"install_id":install_id,"digest":digest}),
@@ -1766,17 +2478,42 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                 CatalogAction::Install {
                     source,
                     expected_digest,
+                    catalogue_id,
+                    catalogue_version,
+                    catalogue_digest,
+                    catalogue_resolution,
                 } => {
                     let source = install_source(source)?;
                     let mut params = json!({"source":source});
                     if let Some(digest) = expected_digest {
                         params["expected_digest"] = json!(digest);
                     }
+                    catalogue_params(
+                        &mut params,
+                        catalogue_id,
+                        catalogue_version,
+                        catalogue_digest,
+                        catalogue_resolution,
+                    )?;
                     ("app_workspace_install", params)
                 }
-                CatalogAction::InstallCheck { source } => {
+                CatalogAction::InstallCheck {
+                    source,
+                    catalogue_id,
+                    catalogue_version,
+                    catalogue_digest,
+                    catalogue_resolution,
+                } => {
                     let source = install_source(source)?;
-                    ("app_workspace_install_check", json!({"source":source}))
+                    let mut params = json!({"source":source});
+                    catalogue_params(
+                        &mut params,
+                        catalogue_id,
+                        catalogue_version,
+                        catalogue_digest,
+                        catalogue_resolution,
+                    )?;
+                    ("app_workspace_install_check", params)
                 }
                 CatalogAction::Upgrade {
                     install_id,
@@ -1785,8 +2522,15 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     expected_generation,
                     expected_new_digest,
                     request_id,
+                    catalogue_id,
+                    catalogue_version,
+                    catalogue_digest,
+                    catalogue_resolution,
                 } => {
-                    let source = if source.contains("://") || source.starts_with("git@") {
+                    let source = if source.contains("://")
+                        || source.starts_with("git@")
+                        || source.starts_with("builtin:")
+                    {
                         source.clone()
                     } else {
                         // A committed request is replayable after its local
@@ -1808,25 +2552,39 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                         .to_string_lossy()
                         .into_owned()
                     };
-                    (
-                        "app_workspace_upgrade",
-                        json!({"install_id":install_id,"source":source,
+                    let mut params = json!({"install_id":install_id,"source":source,
                         "expected_digest":expected_digest,"expected_generation":expected_generation,
-                        "expected_new_digest":expected_new_digest,"request_id":request_id}),
-                    )
+                        "expected_new_digest":expected_new_digest,"request_id":request_id});
+                    catalogue_params(
+                        &mut params,
+                        catalogue_id,
+                        catalogue_version,
+                        catalogue_digest,
+                        catalogue_resolution,
+                    )?;
+                    ("app_workspace_upgrade", params)
                 }
                 CatalogAction::UpgradeCheck {
                     install_id,
                     source,
                     expected_digest,
                     expected_generation,
+                    catalogue_id,
+                    catalogue_version,
+                    catalogue_digest,
+                    catalogue_resolution,
                 } => {
                     let source = install_source(source)?;
-                    (
-                        "app_workspace_upgrade_check",
-                        json!({"install_id":install_id,"source":source,
-                        "expected_digest":expected_digest,"expected_generation":expected_generation}),
-                    )
+                    let mut params = json!({"install_id":install_id,"source":source,
+                        "expected_digest":expected_digest,"expected_generation":expected_generation});
+                    catalogue_params(
+                        &mut params,
+                        catalogue_id,
+                        catalogue_version,
+                        catalogue_digest,
+                        catalogue_resolution,
+                    )?;
+                    ("app_workspace_upgrade_check", params)
                 }
                 CatalogAction::UpgradeRecover {
                     install_id,
@@ -1869,17 +2627,31 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
             let (method, params) = content_params(action)?;
             client::rpc(state_dir, method, params)?
         }
+        AppAction::Works { action } => {
+            let (method, params) = works_params(action)?;
+            client::rpc(state_dir, method, params)?
+        }
         AppAction::Assistant { action } => {
-            let (method, params) = match action {
+            let (method, params, wait): (
+                &'static str,
+                serde_json::Value,
+                Option<(AssistantScope, String)>,
+            ) = match action {
                 AssistantAction::Actions {
                     install_id,
                     context_id,
                     message,
                     token,
-                } => (
-                    "app_assistant_actions",
-                    json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token}),
-                ),
+                } => {
+                    let scope = assistant_scope(
+                        state_dir,
+                        install_id.as_deref(),
+                        context_id.as_deref(),
+                        message.as_deref(),
+                        token.as_deref(),
+                    )?;
+                    ("app_assistant_actions", scope.params(json!({})), None)
+                }
                 AssistantAction::Invoke {
                     install_id,
                     context_id,
@@ -1888,31 +2660,121 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     action_id,
                     operation_id,
                     input,
-                } => (
-                    "app_assistant_invoke",
-                    json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token,"action_id":action_id,"operation_id":operation_id,"input":read_assistant_input(state_dir, input)?}),
-                ),
+                    wait,
+                } => {
+                    // The ticket's refusal order: malformed or oversized
+                    // input never reaches the daemon, not even the read that
+                    // resolves the live turn.
+                    let input = parse_assistant_input(state_dir, input)?;
+                    let scope = assistant_scope(
+                        state_dir,
+                        install_id.as_deref(),
+                        context_id.as_deref(),
+                        message.as_deref(),
+                        token.as_deref(),
+                    )?;
+                    let operation_id = match operation_id {
+                        Some(id) => id.clone(),
+                        None => derive_operation_id(&scope.message, action_id, &input),
+                    };
+                    let params = scope.params(json!({
+                        "action_id": action_id,
+                        "operation_id": operation_id,
+                        "input": input,
+                    }));
+                    let waiting = wait.then(|| (scope.clone(), operation_id));
+                    ("app_assistant_invoke", params, waiting)
+                }
                 AssistantAction::OperationShow {
                     install_id,
                     context_id,
                     message,
                     token,
                     operation_id,
+                } => {
+                    let scope = assistant_scope(
+                        state_dir,
+                        install_id.as_deref(),
+                        context_id.as_deref(),
+                        message.as_deref(),
+                        token.as_deref(),
+                    )?;
+                    (
+                        "app_assistant_operation_show",
+                        scope.params(json!({"operation_id":operation_id})),
+                        None,
+                    )
+                }
+                AssistantAction::Decide {
+                    install_id,
+                    context_id,
+                    operation_id,
+                    expected_revision,
+                    decision,
                 } => (
-                    "app_assistant_operation_show",
-                    json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token,"operation_id":operation_id}),
+                    "app_assistant_decision",
+                    json!({
+                        "install_id": install_id,
+                        "context_id": context_id,
+                        "operation_id": operation_id,
+                        "expected_revision": expected_revision,
+                        "decision": decision,
+                    }),
+                    None,
                 ),
             };
-            client::rpc(state_dir, method, params)?
+            let result = client::rpc(state_dir, method, params)?;
+            match wait {
+                Some((scope, operation_id)) => {
+                    wait_assistant_operation(state_dir, &scope, &operation_id, result)?
+                }
+                None => result,
+            }
+        }
+        AppAction::FrameKit {
+            out,
+            bundle,
+            parent_origin,
+            integrity_only,
+        } => {
+            return cadence_agent::app_preview_export::write_frame_kit(
+                out,
+                bundle.as_deref(),
+                parent_origin,
+                *integrity_only,
+            );
+        }
+        AppAction::Fixtures {
+            bundle,
+            json,
+            integrity_only,
+        } => {
+            return cadence_agent::app_preview_export::write_fixtures(
+                bundle,
+                *json,
+                *integrity_only,
+            );
         }
         AppAction::Dev {
             name,
             source,
+            package,
             port,
             host,
             allow_host,
         } => {
-            return run_dev(name, source, *port, host, allow_host);
+            return run_dev(
+                name.as_deref(),
+                source.as_deref(),
+                package.as_deref(),
+                *port,
+                host,
+                allow_host,
+            );
+        }
+        // Offline package commands dispatch before org/state-dir resolution.
+        AppAction::Check { .. } | AppAction::Inspect { .. } => {
+            unreachable!("offline app validation dispatches before state-dir resolution")
         }
         AppAction::Install { source, project } => {
             let pm = cadence_agent::issue::Pm::open_default()?;
@@ -1983,14 +2845,64 @@ pub(super) fn run(state_dir: PathBuf, action: AppAction) -> Result<i32> {
     run_app(&state_dir, action)
 }
 
+/// CAD-1270 `cadence app check <dir>`: the offline bundle validator.
+/// Runs before org/state-dir resolution — it opens no state dir, daemon
+/// socket or PM; the only filesystem it reads is the named directory. A
+/// `builtin:` source gets the retired refusal (CAD-1422). The JSON
+/// report prints to stdout; the exit code is the verdict (0 pass, 3
+/// refusal — `rejected` in the kind table).
+pub(super) fn run_check(source: &str, _json: bool) -> Result<i32> {
+    print_package_report(cadence_agent::issue::app_catalog::workspace::check_offline(
+        source,
+    )?)
+}
+
+pub(super) fn run_inspect(source: &str, _json: bool) -> Result<i32> {
+    print_package_report(cadence_agent::issue::app_catalog::workspace::inspect_offline(source)?)
+}
+
+fn print_package_report(report: serde_json::Value) -> Result<i32> {
+    let ok = report["ok"].as_bool() == Some(true);
+    print_json(&report);
+    Ok(if ok { 0 } else { 3 })
+}
+
 /// No production state, PM, socket or app approval is accessed here.
 pub(super) fn run_dev(
-    name: &str,
-    source: &Path,
+    name: Option<&str>,
+    source: Option<&Path>,
+    package: Option<&Path>,
     port: u16,
     host: &str,
     allow_hosts: &[String],
 ) -> Result<i32> {
+    if let Some(package) = package {
+        if !allow_hosts.is_empty() {
+            return Err(Error::invalid(
+                "app_dev_allow_host",
+                "--allow-host is only available in legacy --source mode",
+            ));
+        }
+        if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+            return Err(Error::invalid(
+                "app_dev_host",
+                "package previews must bind loopback",
+            ));
+        }
+        return run_package_dev(package, port, host, true);
+    }
+    let name = name.ok_or_else(|| {
+        Error::invalid(
+            "app_dev_mode",
+            "pass a preview name with --source, or --package <dir>",
+        )
+    })?;
+    let source = source.ok_or_else(|| {
+        Error::invalid(
+            "app_dev_mode",
+            "pass a preview name with --source, or --package <dir>",
+        )
+    })?;
     let source = source
         .canonicalize()
         .map_err(|e| Error::invalid("app_dev_source", format!("trusted source checkout: {e}")))?;
@@ -2013,6 +2925,326 @@ pub(super) fn run_dev(
     // The preview needs tools, not a native identity, state dir, provider
     // keys, browser cookies or the operator's daemon/session environment.
     command.env_clear();
+    copy_preview_env(&mut command);
+    let status = cadence_agent::reaper::status(&mut command)
+        .map_err(|e| Error::internal(format!("app development harness: {e}")))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+struct AppPackageContract {
+    app: String,
+    dev: String,
+    check: Option<String>,
+}
+
+/// An app-owned preview: the package's `package.json` declares the app
+/// name and the commands; Cadence only validates the package and runs
+/// them. No daemon, state dir, PM, socket or approval is read.
+fn run_package_dev(root: &Path, port: u16, host: &str, exec_child: bool) -> Result<i32> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| Error::invalid("app_dev_package", format!("package root: {e}")))?;
+    let contract = package_contract(&root)?;
+    if let Some(check) = contract.check.as_deref() {
+        let status = shell_status(check, &root, &contract.app, port, host)?;
+        if !status.success() {
+            return Ok(status.code().unwrap_or(1));
+        }
+    }
+    let mut child = dev_command(&contract.dev, &root, &contract.app, port, host)?;
+    if exec_child {
+        use std::os::unix::process::CommandExt;
+        let error = child.exec();
+        eprintln!("app dev: {error}");
+        return Ok(launch_error_code(&error));
+    }
+    match cadence_agent::reaper::status(&mut child) {
+        Ok(status) => Ok(status.code().unwrap_or(1)),
+        Err(error) => {
+            eprintln!("app dev: {error}");
+            Ok(launch_error_code(&error))
+        }
+    }
+}
+
+fn launch_error_code(error: &std::io::Error) -> i32 {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        127
+    } else {
+        126
+    }
+}
+
+fn package_contract(root: &Path) -> Result<AppPackageContract> {
+    let manifest = root.join("package.json");
+    let bytes = std::fs::read(&manifest).map_err(|e| {
+        Error::invalid(
+            "app_dev_package",
+            format!("read {}: {e}", manifest.display()),
+        )
+    })?;
+    let json: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::invalid("app_dev_package", format!("package.json: {e}")))?;
+    let cadence = json
+        .get("cadence")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            Error::invalid(
+                "app_dev_package",
+                "package.json needs a cadence object with app and dev",
+            )
+        })?;
+    let app = cadence
+        .get("app")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::invalid("app_dev_package", "cadence.app must be a string"))?;
+    cadence_agent::proto::identifier(app, "app name")?;
+    let dev = package_command(cadence.get("dev"), "cadence.dev", true)?;
+    let check = match cadence.get("check") {
+        Some(value) => Some(package_command(Some(value), "cadence.check", false)?),
+        None => None,
+    };
+    if !root.join("app/app.md").is_file() {
+        return Err(Error::invalid(
+            "app_dev_package",
+            "package needs app/app.md",
+        ));
+    }
+    Ok(AppPackageContract {
+        app: app.to_owned(),
+        dev,
+        check,
+    })
+}
+
+fn package_command(value: Option<&Value>, field: &str, one_command: bool) -> Result<String> {
+    let text = value
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::invalid("app_dev_package", format!("{field} must be a string")))?;
+    if text.trim().is_empty() || text.len() > 4096 {
+        return Err(Error::invalid(
+            "app_dev_package",
+            format!("{field} must be 1..=4096 bytes"),
+        ));
+    }
+    if one_command && parse_dev_command(text).is_err() {
+        return Err(Error::invalid(
+            "app_dev_package",
+            "cadence.dev must be one command; put multiple steps in a script",
+        ));
+    }
+    Ok(text.to_owned())
+}
+
+/// A command Cadence can prefix with `exec` without truncating a shell list.
+/// Quoted metacharacters are ordinary arguments; unquoted separators,
+/// redirects, subshells, command substitution and newlines are refused.
+struct DevCommand {
+    envs: Vec<(String, String)>,
+    argv: Vec<String>,
+}
+
+fn parse_dev_command(text: &str) -> Result<DevCommand> {
+    let words = split_shell_words(text)?;
+    let mut envs = Vec::new();
+    let mut index = 0;
+    while let Some((key, value)) = words.get(index).and_then(|word| assignment(word)) {
+        envs.push((key.to_owned(), value.to_owned()));
+        index += 1;
+    }
+    if index == words.len() {
+        return Err(Error::invalid(
+            "app_dev_package",
+            "cadence.dev needs a command after its assignments",
+        ));
+    }
+    Ok(DevCommand {
+        envs,
+        argv: words[index..].to_vec(),
+    })
+}
+
+fn assignment(word: &str) -> Option<(&str, &str)> {
+    let (key, value) = word.split_once('=')?;
+    let mut chars = key.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some((key, value))
+}
+
+/// Split one command into words without invoking a shell. Quoted separators
+/// stay in the argument; unquoted separators, redirects, subshells, command
+/// substitution and newlines refuse. Expansions are not performed; an app
+/// that needs a shell belongs in a script.
+fn split_shell_words(text: &str) -> Result<Vec<String>> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\n' || ch == '\r' {
+            return Err(Error::invalid(
+                "app_dev_package",
+                "cadence.dev must be one command; newlines are refused",
+            ));
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            } else if active == '"' && ch == '\\' {
+                let next = chars.get(index + 1).ok_or_else(|| {
+                    Error::invalid("app_dev_package", "cadence.dev ends with a backslash")
+                })?;
+                if *next == '\n' || *next == '\r' {
+                    return Err(Error::invalid(
+                        "app_dev_package",
+                        "cadence.dev must be one command; newlines are refused",
+                    ));
+                }
+                if matches!(*next, '$' | '`' | '"' | '\\') {
+                    current.push(*next);
+                    index += 1;
+                } else {
+                    current.push('\\');
+                }
+            } else if ch == '`' || (ch == '$' && chars.get(index + 1) == Some(&'(')) {
+                return Err(Error::invalid(
+                    "app_dev_package",
+                    "cadence.dev does not allow command substitution",
+                ));
+            } else {
+                current.push(ch);
+            }
+            started = true;
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                started = true;
+            }
+            '\\' => {
+                let next = chars.get(index + 1).ok_or_else(|| {
+                    Error::invalid("app_dev_package", "cadence.dev ends with a backslash")
+                })?;
+                current.push(*next);
+                started = true;
+                index += 1;
+            }
+            ' ' | '\t' => {
+                if started {
+                    words.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            ';' | '&' | '|' | '<' | '>' | '`' | '(' | ')' => {
+                return Err(Error::invalid(
+                    "app_dev_package",
+                    "cadence.dev must be one command; put multiple steps in a script",
+                ));
+            }
+            '$' if chars.get(index + 1) == Some(&'(') => {
+                return Err(Error::invalid(
+                    "app_dev_package",
+                    "cadence.dev does not allow command substitution",
+                ));
+            }
+            _ => {
+                current.push(ch);
+                started = true;
+            }
+        }
+        index += 1;
+    }
+    if quote.is_some() {
+        return Err(Error::invalid(
+            "app_dev_package",
+            "cadence.dev has an unterminated quote",
+        ));
+    }
+    if started {
+        words.push(current);
+    }
+    Ok(words)
+}
+
+fn configure_app_env(
+    child: &mut std::process::Command,
+    root: &Path,
+    app: &str,
+    port: u16,
+    host: &str,
+) {
+    child
+        .current_dir(root)
+        .env_clear()
+        .env("CADENCE_APP_ROOT", root)
+        .env("CADENCE_APP_NAME", app)
+        .env("CADENCE_APP_PORT", port.to_string())
+        .env("CADENCE_APP_HOST", host)
+        .env("CADENCE_APP_CONTRACT", "1");
+    copy_preview_env(child);
+}
+
+fn shell_base(root: &Path, app: &str, port: u16, host: &str) -> std::process::Command {
+    let mut child = std::process::Command::new("sh");
+    configure_app_env(&mut child, root, app, port, host);
+    child
+}
+
+/// Run the one parsed `dev` command directly, with leading `NAME=value`
+/// assignments applied to its environment. No shell means `exec` replaces
+/// Cadence cleanly and signals reach the app's own trap.
+fn dev_command(
+    command: &str,
+    root: &Path,
+    app: &str,
+    port: u16,
+    host: &str,
+) -> Result<std::process::Command> {
+    let DevCommand { envs, argv } = parse_dev_command(command)?;
+    let mut child = std::process::Command::new(&argv[0]);
+    child.args(&argv[1..]);
+    configure_app_env(&mut child, root, app, port, host);
+    for (key, value) in envs {
+        child.env(key, value);
+    }
+    Ok(child)
+}
+
+fn shell_command(
+    command: &str,
+    root: &Path,
+    app: &str,
+    port: u16,
+    host: &str,
+) -> std::process::Command {
+    let mut child = shell_base(root, app, port, host);
+    child.arg("-c").arg(command);
+    child
+}
+
+fn shell_status(
+    command: &str,
+    root: &Path,
+    app: &str,
+    port: u16,
+    host: &str,
+) -> Result<std::process::ExitStatus> {
+    let mut child = shell_command(command, root, app, port, host);
+    cadence_agent::reaper::status(&mut child)
+        .map_err(|e| Error::internal(format!("app dev command: {e}")))
+}
+
+fn copy_preview_env(command: &mut std::process::Command) {
     for name in [
         "PATH",
         "HOME",
@@ -2020,19 +3252,199 @@ pub(super) fn run_dev(
         "TERM",
         "PNPM_HOME",
         "XDG_CACHE_HOME",
+        "TMPDIR",
     ] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
     }
-    let status = cadence_agent::reaper::status(&mut command)
-        .map_err(|e| Error::internal(format!("app development harness: {e}")))?;
-    Ok(status.code().unwrap_or(1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn package_dir(dev: &str, check: Option<&str>) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        std::fs::write(
+            dir.path().join("app/app.md"),
+            "---\napp: fixture\ntitle: Fixture\nversion: 0.0.1\n---\n",
+        )
+        .unwrap();
+        let script = dir.path().join("scripts/dev.sh");
+        std::fs::write(&script, format!("#!/bin/sh\nset -eu\n{dev}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cadence = serde_json::json!({"app": "fixture", "dev": "scripts/dev.sh"});
+        if let Some(check) = check {
+            cadence["check"] = serde_json::json!(check);
+        }
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::json!({"cadence": cadence}).to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn package_dev_rejects_a_multi_step_dev_command() {
+        let dir = package_dir("printf dev > dev.txt", None);
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::json!({"cadence": {"app": "fixture", "dev": "printf a; printf b"}})
+                .to_string(),
+        )
+        .unwrap();
+        let error = run_dev(None, None, Some(dir.path()), 3191, "127.0.0.1", &[]).unwrap_err();
+        assert!(error.to_string().contains("one command"), "{error}");
+    }
+
+    #[test]
+    fn package_dev_preserves_quoted_arguments_and_leading_environment() {
+        let dir = package_dir(":", None);
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::json!({
+                "cadence": {
+                    "app": "fixture",
+                    "dev": "GREETING=hello sh -c 'printf \"%s\" \"$GREETING & value\" > quoted.txt'"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let code = run_package_dev(dir.path(), 3191, "127.0.0.1", false).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("quoted.txt")).unwrap(),
+            "hello & value"
+        );
+    }
+
+    #[test]
+    fn package_dev_rejects_a_newline_separated_dev_command() {
+        let dir = package_dir(":", None);
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::json!({
+                "cadence": {"app": "fixture", "dev": "scripts/dev.sh\nscripts/dev.sh"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let error = run_dev(None, None, Some(dir.path()), 3191, "127.0.0.1", &[]).unwrap_err();
+        assert!(error.to_string().contains("one command"), "{error}");
+    }
+
+    #[test]
+    fn parse_dev_command_preserves_double_quoted_backslashes() {
+        let DevCommand { envs, argv } = parse_dev_command(r#"node "a\qb" "a\"b""#).unwrap();
+        assert!(envs.is_empty());
+        assert_eq!(argv[0], "node");
+        assert_eq!(argv[1], r"a\qb");
+        assert_eq!(argv[2], "a\"b");
+    }
+
+    #[test]
+    fn package_dev_missing_executable_returns_127() {
+        let dir = package_dir(":", None);
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::json!({"cadence": {"app": "fixture", "dev": "does-not-exist-xyz"}})
+                .to_string(),
+        )
+        .unwrap();
+        let code = run_package_dev(dir.path(), 3191, "127.0.0.1", false).unwrap();
+        assert_eq!(code, 127);
+    }
+
+    #[test]
+    fn package_dev_runs_check_then_dev_with_the_contract_environment() {
+        let dir = package_dir(
+            "printf '%s' \"$CADENCE_APP_PORT\" > port.txt; \
+             printf '%s' \"$CADENCE_APP_ROOT\" > root.txt; \
+             printf '%s' \"$CADENCE_APP_NAME\" > name.txt; \
+             printf '%s' \"$CADENCE_APP_CONTRACT\" > contract.txt; \
+             printf dev > dev.txt",
+            Some("test ! -e dev.txt && printf checked > check.txt"),
+        );
+        let code = run_package_dev(dir.path(), 3191, "127.0.0.1", false).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("check.txt")).unwrap(),
+            "checked"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("dev.txt")).unwrap(),
+            "dev"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("port.txt")).unwrap(),
+            "3191"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("root.txt")).unwrap(),
+            dir.path().canonicalize().unwrap().display().to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("name.txt")).unwrap(),
+            "fixture"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("contract.txt")).unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn package_dev_check_failure_does_not_spawn_dev() {
+        let dir = package_dir(
+            "printf dev > dev.txt",
+            Some("printf check > check.txt; exit 7"),
+        );
+        let code = run_package_dev(dir.path(), 3191, "127.0.0.1", false).unwrap();
+        assert_eq!(code, 7);
+        assert!(dir.path().join("check.txt").is_file());
+        assert!(!dir.path().join("dev.txt").exists());
+    }
+
+    #[test]
+    fn package_dev_refuses_non_loopback_hosts_and_allow_host() {
+        let dir = package_dir("printf dev > dev.txt", None);
+        let error = run_dev(None, None, Some(dir.path()), 3191, "0.0.0.0", &[]).unwrap_err();
+        assert!(error.to_string().contains("loopback"), "{error}");
+        let error = run_dev(
+            None,
+            None,
+            Some(dir.path()),
+            3191,
+            "127.0.0.1",
+            &["example.invalid".into()],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--allow-host"), "{error}");
+        assert!(!dir.path().join("dev.txt").exists());
+    }
+
+    #[test]
+    fn package_dev_requires_the_app_manifest_and_dev_command() {
+        let dir = package_dir("printf dev > dev.txt", None);
+        std::fs::remove_file(dir.path().join("app/app.md")).unwrap();
+        let error = run_dev(None, None, Some(dir.path()), 3191, "127.0.0.1", &[]).unwrap_err();
+        assert!(error.to_string().contains("app/app.md"), "{error}");
+
+        let dir = package_dir("printf dev > dev.txt", None);
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::json!({"cadence": {"app": "fixture"}}).to_string(),
+        )
+        .unwrap();
+        let error = run_dev(None, None, Some(dir.path()), 3191, "127.0.0.1", &[]).unwrap_err();
+        assert!(error.to_string().contains("cadence.dev"), "{error}");
+    }
 
     #[test]
     fn app_run_inputs_reject_non_string_maps_without_echoing_content() {
@@ -2054,6 +3466,70 @@ mod tests {
             read_run_inputs(&path).unwrap(),
             json!({"source":"source text","writer":"op-writer"})
         );
+    }
+
+    /// CAD-1662: native Works verbs reach the native `app_works_*` methods
+    /// with explicit install/context and no actor, reviewer or on-behalf-of
+    /// field. Export omits `format` when absent so the daemon default applies.
+    #[test]
+    fn works_verbs_map_to_native_methods_without_actor_fields() {
+        let (method, params) = works_params(&WorksAction::Export {
+            install_id: "inst-1".into(),
+            context_id: "ctx-1".into(),
+            id: "doc-1".into(),
+            revision: 3,
+            format: None,
+        })
+        .unwrap();
+        assert_eq!(method, "app_works_export");
+        assert_eq!(
+            params,
+            json!({"install_id": "inst-1", "context_id": "ctx-1", "id": "doc-1", "revision": 3})
+        );
+        assert!(params.get("format").is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let body = dir.path().join("body.json");
+        std::fs::write(
+            &body,
+            r#"{"kind":"doc","title":"t","content":{"blocks":[]}}"#,
+        )
+        .unwrap();
+        let (method, params) = works_params(&WorksAction::Create {
+            install_id: "inst-1".into(),
+            context_id: "ctx-1".into(),
+            body,
+            idempotency_key: "k-1".into(),
+        })
+        .unwrap();
+        assert_eq!(method, "app_works_create");
+        for forbidden in ["actor", "reviewer", "on_behalf_of", "session", "role"] {
+            assert!(
+                params.get(forbidden).is_none(),
+                "{forbidden} must not be a CLI field"
+            );
+        }
+        assert_eq!(params["install_id"], "inst-1");
+        assert_eq!(params["idempotency_key"], "k-1");
+    }
+
+    /// CAD-1662: Works create/patch bodies are bounded by the 80 KiB Works
+    /// reader, and an oversized body is refused before any daemon call.
+    #[test]
+    fn works_bodies_refuse_over_80kib_before_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = dir.path().join("body.json");
+        let text = json!({"kind":"doc","title":"t","content":{"blocks":[{"type":"p","text":"界".repeat(30_000)}]}}).to_string();
+        std::fs::write(&body, text).unwrap();
+        let error = works_params(&WorksAction::Create {
+            install_id: "inst-1".into(),
+            context_id: "ctx-1".into(),
+            body,
+            idempotency_key: "k-1".into(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exceeds 80KiB"), "{error}");
     }
 
     #[test]
@@ -2140,5 +3616,117 @@ mod tests {
             }
             assert!(params.get(field).is_none());
         }
+    }
+
+    fn live_turns(rows: serde_json::Value) -> serde_json::Value {
+        json!({"alias": "agent", "running": rows})
+    }
+
+    #[test]
+    fn assistant_scope_derives_from_one_live_turn() {
+        let live = live_turns(json!([{
+            "id": "msg-1", "turn_id": "tok-1", "task": "t1",
+            "app_install_id": "inst-1", "app_context_id": "ctx-1"
+        }]));
+        let scope = resolve_assistant_scope(Some(&live), None, None, None, None).unwrap();
+        assert_eq!(scope.install_id, "inst-1");
+        assert_eq!(scope.context_id, "ctx-1");
+        assert_eq!(scope.message, "msg-1");
+        assert_eq!(scope.token, "tok-1");
+        // The daemon still receives every identity field it validates.
+        assert_eq!(
+            scope.params(json!({"action_id": "customers.search"})),
+            json!({"install_id":"inst-1","context_id":"ctx-1","message":"msg-1",
+                   "token":"tok-1","action_id":"customers.search"})
+        );
+    }
+
+    #[test]
+    fn assistant_scope_flags_win_and_multiple_turns_refuse() {
+        let live = live_turns(json!([
+            {"id":"msg-1","turn_id":"tok-1","app_install_id":"inst-1","app_context_id":"ctx-1"},
+            {"id":"msg-2","turn_id":"tok-2","app_install_id":"inst-2","app_context_id":"ctx-2"}
+        ]));
+        let error = resolve_assistant_scope(Some(&live), None, None, None, None)
+            .expect_err("two live turns must refuse rather than guess");
+        assert!(error.to_string().contains("--message"), "{error}");
+        let scope = resolve_assistant_scope(
+            Some(&live),
+            Some("inst-x"),
+            Some("ctx-x"),
+            Some("msg-2"),
+            Some("tok-2"),
+        )
+        .unwrap();
+        assert_eq!(scope.install_id, "inst-x");
+        assert_eq!(scope.context_id, "ctx-x");
+        assert_eq!(scope.message, "msg-2");
+    }
+
+    #[test]
+    fn assistant_scope_without_a_turn_needs_every_flag() {
+        let error = resolve_assistant_scope(None, None, None, None, None)
+            .expect_err("no live turn and no flags must refuse");
+        assert!(error.to_string().contains("--message"), "{error}");
+        let scope = resolve_assistant_scope(
+            None,
+            Some("inst-1"),
+            Some("ctx-1"),
+            Some("msg-1"),
+            Some("tok-1"),
+        )
+        .unwrap();
+        assert_eq!(scope.token, "tok-1");
+        // A live turn with no App stamp cannot invent an installation.
+        let live = live_turns(json!([{"id":"msg-1","turn_id":"tok-1"}]));
+        let error = resolve_assistant_scope(Some(&live), None, None, None, None)
+            .expect_err("no stamp must refuse");
+        assert!(error.to_string().contains("install"), "{error}");
+    }
+
+    #[test]
+    fn operation_ids_are_stable_per_turn_action_and_input() {
+        let input = json!({"query": "acme"});
+        let first = derive_operation_id("msg-1", "customers.search", &input);
+        assert_eq!(
+            first,
+            derive_operation_id("msg-1", "customers.search", &input)
+        );
+        assert_ne!(
+            first,
+            derive_operation_id("msg-2", "customers.search", &input)
+        );
+        assert_ne!(
+            first,
+            derive_operation_id("msg-1", "customers.show", &input)
+        );
+        assert_ne!(
+            first,
+            derive_operation_id("msg-1", "customers.search", &json!({"query": "other"}))
+        );
+        assert!(first.starts_with("op-"), "{first}");
+    }
+
+    #[test]
+    fn assistant_input_accepts_inline_and_at_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        assert_eq!(
+            parse_assistant_input(state, r#"{"query":"acme"}"#).unwrap(),
+            json!({"query":"acme"})
+        );
+        let file = dir.path().join("input.json");
+        std::fs::write(&file, r#"{"limit":3}"#).unwrap();
+        let at = format!("@{}", file.display());
+        assert_eq!(
+            parse_assistant_input(state, &at).unwrap(),
+            json!({"limit":3})
+        );
+        assert_eq!(
+            parse_assistant_input(state, file.to_str().unwrap()).unwrap(),
+            json!({"limit":3})
+        );
+        assert!(parse_assistant_input(state, r#"[1,2]"#).is_err());
+        assert!(parse_assistant_input(state, "{not json").is_err());
     }
 }

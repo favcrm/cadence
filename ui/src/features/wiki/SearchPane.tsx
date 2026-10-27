@@ -8,6 +8,7 @@ import Button from "../../ui/Button";
 import { EmptyCard, Failure, Loading, useWikiScope, WikiToolbar } from "./shared";
 import type { WikiRoute } from "./Wiki";
 import { withinScope } from "./scope";
+import { useTranslate } from "../../lib/locale";
 
 const FILTER_LABELS: Record<TypeFilter, string> = { all: "All", pages: "Pages", images: "Images", video: "Video", pdf: "PDF" };
 
@@ -24,6 +25,7 @@ export default function SearchPane({
   route: WikiRoute;
   navHref: (route: Route) => string;
 }) {
+  const t = useTranslate();
   const scope = useWikiScope();
   const query = route.query ?? "";
   const [value, setValue] = useState(query);
@@ -59,7 +61,7 @@ export default function SearchPane({
 
   return (
     <>
-      <WikiToolbar path="" navHref={navHref} label="Search" actions={<>
+      <WikiToolbar path="" navHref={navHref} label={t("Search")} actions={<>
           {TYPE_FILTERS.map((type) => (
             <button
               key={type}
@@ -85,26 +87,26 @@ export default function SearchPane({
             name="q"
             enterKeyHint="search"
             value={value}
-            aria-label={scope ? "Search project context" : "Search the wiki"}
-            placeholder="Search pages and files…"
+            aria-label={scope ? t("Search project context") : t("Search the wiki")}
+            placeholder={t("Search pages and files…")}
             onChange={(e) => setValue(e.target.value)}
           />
-          <Button type="submit">Search</Button>
+          <Button type="submit">{t("Search")}</Button>
         </form>
       </WikiToolbar>
 
       {error !== null ? (
         <Failure what="search failed" error={error} />
       ) : !query ? (
-        <EmptyCard title={scope ? "Search project context" : "Search the wiki"}>
-          Enter a word or path, then choose Search.
+        <EmptyCard title={scope ? t("Search project context") : t("Search the wiki")}>
+          {t("Enter a word or path, then choose Search.")}
         </EmptyCard>
       ) : shown === null ? (
         <Loading what={`searching for “${query}”…`} />
       ) : shown.length === 0 ? (
-        <EmptyCard title="No matches">
-          No page matches <span className="num">{query}</span>
-          {filter !== "all" ? ` among ${filter}` : ""}.
+        <EmptyCard title={t("No matches")}>
+          {t("No page matches")} <span className="num">{query}</span>
+          {filter !== "all" ? ` ${t("among")} ${filter}` : ""}.
         </EmptyCard>
       ) : (
         <div className="wk-sres">
@@ -123,14 +125,14 @@ export default function SearchPane({
               <div className="wk-sexcerpts">
                 {file.matches.slice(0, 3).map((hit, index) => (
                   <div key={index} className="wk-snip">
-                    {hit.line != null && <span className="wk-sline num">Line {hit.line}</span>}
+                    {hit.line != null && <span className="wk-sline num">{t("Line")} {hit.line}</span>}
                     <span>{snippetParts(hit.snippet, query).map((part, i) =>
                       part.mark ? <mark key={i}>{part.text}</mark> : <span key={i}>{part.text}</span>,
                     )}</span>
                   </div>
                 ))}
               </div>
-              {file.matches.length > 3 && <div className="wk-smatches wk-smore">{file.matches.length - 3} more {file.matches.length === 4 ? "match" : "matches"} in this file</div>}
+              {file.matches.length > 3 && <div className="wk-smatches wk-smore">{file.matches.length - 3} {file.matches.length === 4 ? t("more match") : t("more matches")} {t("in this file")}</div>}
             </div>
           ))}
         </div>

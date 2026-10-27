@@ -49,9 +49,13 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } =
   require("react-dom/client") as typeof import("react-dom/client");
-const Outbox = (
+const OutboxView = (
   require("../src/features/outbox/Outbox") as typeof import("../src/features/outbox/Outbox")
 ).default;
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
+const Outbox = (props: React.ComponentProps<typeof OutboxView>) =>
+  React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(OutboxView, props) });
 const { resources } =
   require("../src/lib/resources") as typeof import("../src/lib/resources");
 const { navigate } =
@@ -141,7 +145,7 @@ async function main() {
   await render(false);
   assert(
     reads.length === 0 &&
-      host.textContent?.includes("Sign in to view") &&
+      host.textContent?.includes("Operator access required") &&
       !host.textContent?.includes("No published posts"),
     "unproven viewer never requests or claims empty, even on a direct link",
   );
@@ -330,7 +334,7 @@ async function main() {
   await flush();
   assert(
     reads.length === count &&
-      host.textContent?.includes("Sign in to view") &&
+      host.textContent?.includes("Operator access required") &&
       !host.textContent?.includes("Recovered content"),
     "access revocation unmounts protected content and ignores pending response",
   );

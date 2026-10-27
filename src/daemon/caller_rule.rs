@@ -90,6 +90,9 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("health", Rule::Read),
     ("daemon_info", Rule::Read),
     ("shutdown", Rule::Shutdown),
+    ("hosted_local_agent_connect", Rule::Handler("operator_connection_on_agent: explicit workspace binding only")),
+    ("hosted_local_agent_disconnect", Rule::Handler("operator_connection_on_agent: original workspace binding only")),
+    ("hosted_local_agent_observe", Rule::Handler("operator_connection_on_agent: private hosted informational inbox")),
     // CAD-561: the update's drain gate is an operator action — an agent
     // can never stop the fleet's work to push a build. `update_status`
     // is the read side (the board's banner, `cadence update status`).
@@ -104,13 +107,52 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
             "authorize_register: agent callers by CAD-149; an unattributed caller needs proven_operator (CAD-431)",
         ),
     ),
+    // CAD-1752: the static role catalogue plus the settings-derived model
+    // per role — a read, like `model_defaults_get`.
+    ("agent_roles", Rule::Read),
+    (
+        "agent_instructions_set",
+        Rule::Handler("operator_connection_on_agent: the operator only; no agent, not even the target or its PM (CAD-1752)"),
+    ),
     ("model_defaults_get", Rule::Read),
     (
         "model_defaults_set",
         Rule::Handler("operator_connection (CAD-337)"),
     ),
+    (
+        "agent_settings_get",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
+    (
+        "agent_settings_set",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
+    (
+        "agent_settings_catalog",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
+    (
+        "agent_settings_sync",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
+    (
+        "agent_settings_preview",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
+    (
+        "agent_settings_command",
+        Rule::Handler(
+            "settings_caller: operator, or a settings grant bound to the exact op+payload+revision+agent identity (CAD-1586)",
+        ),
+    ),
+    (
+        "cli_settings_command",
+        Rule::Handler(
+            "cli_caller: re-verified cli_envelope on a proven board relay; human owner or grant-bound agents/<h> principal (CAD-1586)",
+        ),
+    ),
     ("agent_list", Rule::Read),
-    ("agent_show", Rule::Read),
+    ("agent_show", Rule::Handler("read; optional profile instructions require authorize_agent_mutation(SelfService)")),
     // CAD-886: `agent_wait` answers a strict subset of what `agent_show`
     // discloses (state/reason/message/turn/waited_secs) — same visibility.
     ("agent_wait", Rule::Read),
@@ -137,9 +179,57 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         ),
     ),
     ("thread_read", Rule::Read),
+    // CAD-1374: the owner activity trail. The handler always proves the
+    // operator connection; a present public_session must also be a live
+    // board-owner session (AND, not OR). Export records its receipt after
+    // the page is built and before its bytes return.
+    (
+        "activity_query",
+        Rule::Handler("activity_owner: operator_connection AND, when public_session is present, a live verified owner session (CAD-1374)"),
+    ),
+    (
+        "activity_export",
+        Rule::Handler("activity_owner: operator_connection AND, when public_session is present, a live verified owner session (CAD-1374); prepared receipt written after the page is built, before bytes return"),
+    ),
+    (
+        "pm_activity_prepare",
+        Rule::Handler("pm_activity_prepare: agent connections refused (even app grants), operator_connection, and a live board session; a member may prepare only issue_comment_added (CAD-1374)"),
+    ),
     (
         "thread_send",
         Rule::Handler("rpc_thread_send: agents refused, operator on proof (CAD-384)"),
+    ),
+    // CAD-1168: retained chat attachments. Upload is the operator's
+    // chat (`operator_chat` — the `thread_send` proof); read is the
+    // operator or the master under its live assigned turn.
+    (
+        "chat_file_upload",
+        Rule::Handler("operator_chat: agents refused, operator on proof (CAD-1168)"),
+    ),
+    (
+        "chat_file_read",
+        Rule::Handler("operator or the master's live assigned turn (CAD-1168)"),
+    ),
+    // CAD-1726: canvas artifacts. Put is the master's live assigned turn
+    // (scope from that turn); read and versions are the operator's, scope
+    // re-proved against the conversation in view.
+    (
+        "artifact_put",
+        Rule::Handler("the master's live assigned turn; scope from the turn, never the request (CAD-1726)"),
+    ),
+    // CAD-1752: the master's inert proposal to hire a catalogue role -
+    // the same live-turn binding as `artifact_put`; nothing is registered.
+    (
+        "hire_propose",
+        Rule::Handler("the master's live assigned turn, in its Home conversation; refuses every other caller; records one inert thread entry (CAD-1752)"),
+    ),
+    (
+        "artifact_read",
+        Rule::Handler("operator only on proof; stored scope re-proved against the conversation in view (CAD-1726)"),
+    ),
+    (
+        "artifact_versions",
+        Rule::Handler("operator only on proof; stored scope re-proved against the conversation in view (CAD-1726)"),
     ),
     // CAD-1098: the app conversations are the operator's chat, like
     // `thread_send` — one proof (`operator_chat`), identical on the board.
@@ -151,6 +241,45 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "conversation_create",
         Rule::Handler("operator_chat: agents refused, operator on proof (CAD-1098 I1)"),
     ),
+    // CAD-818 threads. The work list and the operator's Ask are the
+    // operator's chat (`operator_chat`). The topic verbs derive the caller
+    // with `topic_caller` (an unproven connection is refused) and then
+    // `may_use_topic` (an agent must be a subscriber; create/membership
+    // checks live in the handler). The stamp returns counters only.
+    (
+        "work_conversation_list",
+        Rule::Handler("operator_chat: agents refused, operator on proof (CAD-818)"),
+    ),
+    (
+        "work_conversation_read",
+        Rule::Handler("operator_chat: agents refused, operator on proof (CAD-818)"),
+    ),
+    (
+        "topic_request",
+        Rule::Handler("operator_chat: agents refused, operator on proof (CAD-818)"),
+    ),
+    (
+        "topic_create",
+        Rule::Handler("topic_caller: unproven refused; the handler checks the kind and creator (CAD-818)"),
+    ),
+    (
+        "topic_subscribe",
+        Rule::Handler("topic_caller: unproven refused; the handler checks membership rights (CAD-818)"),
+    ),
+    (
+        "topic_unsubscribe",
+        Rule::Handler("topic_caller: unproven refused; the handler checks membership rights (CAD-818)"),
+    ),
+    (
+        "topic_publish",
+        Rule::Handler("topic_caller + may_use_topic: an agent must be a subscriber (CAD-818)"),
+    ),
+    (
+        "topic_read",
+        Rule::Handler("topic_caller + may_use_topic: an agent must be a subscriber (CAD-818)"),
+    ),
+    ("threads_stamp", Rule::Read),
+    ("master_stamp", Rule::Read),
     ("agent_events", Rule::Read),
     (
         "agent_requests",
@@ -217,6 +346,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         ),
     ),
     (
+        "message_list",
+        Rule::Handler(
+            "rpc_message_list: an agent lists only its own alias; an unproven \
+             caller is refused because listing enumerates ids",
+        ),
+    ),
+    (
         "message_report",
         Rule::Handler(
             "rpc_message_report: an explicit id+token reports by bearer possession, \
@@ -239,11 +375,52 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     ("job_list", Rule::Read),
     ("job_show", Rule::Read),
+    // CAD-1380/AOS-216 member plane: every member_* method re-binds
+    // `member_as` to a stored assistant row on a proven operator/board
+    // connection only (members_rpc::member_caller); a request field, an
+    // agent connection or an unproven one never mints a member identity.
+    // CAD-1420: the dedicated platform-projection verb the assist relay
+    // calls before state/history/send. Same channel as the member plane —
+    // a proven operator/board connection plus a re-verified signed
+    // envelope (`proven_operator` inside the handler); an agent or
+    // unproven connection never projects a binding.
+    (
+        "platform_assistant_provision",
+        Rule::Handler("proven_operator + re-verified member envelope (CAD-1420)"),
+    ),
+    // CAD-1568: the remote CLI's principal-bound plane. Every cli_message_*
+    // verb re-binds `cli_envelope` on a proven operator/board relay only and
+    // cryptographically re-verifies it (cli_rpc::cli_caller); the handler's
+    // recipient classes and principal-scoped readback are daemon-enforced —
+    // a request field never widens them.
+    (
+        "cli_message_send",
+        Rule::Handler("cli_caller: re-verified human cli_envelope on a proven board relay; hosted master coordination is human-owner only (CAD-1568)"),
+    ),
+    (
+        "cli_message_read",
+        Rule::Handler("cli_caller + principal-owned messages only (CAD-1568)"),
+    ),
+    (
+        "cli_message_inbox",
+        Rule::Handler("cli_caller: re-verified human-owner cli_envelope for passive inbox inspection (CAD-1568)"),
+    ),
+    ("member_assist_state", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_assist_history", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_assist_send", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_job_request", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_job_list", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_job_evidence", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_job_events", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_job_subscribe", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_job_share", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_job_reconcile", Rule::Handler("member_caller: member_as on a proven board relay only")),
     ("job_events", Rule::Read),
     ("job_cancel", Rule::OnJob(Target::Job)),
     ("job_close", Rule::OnJob(Target::Job)),
     ("task_new", Rule::OnJob(Target::Job)),
     ("task_show", Rule::Read),
+    ("cloud_probe", Rule::Read),
     ("task_dispatch", Rule::OnJob(Target::Task)),
     (
         "task_verdict",
@@ -259,16 +436,18 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("task_cancel", Rule::OnJob(Target::Task)),
     (
         "memory_propose",
-        Rule::Handler("memory_actor: caller_identity (CAD-381)"),
+        Rule::Handler("memory_actor: caller_identity or positive proven_operator"),
     ),
     (
         "memory_review",
-        Rule::Handler("memory_actor: caller_identity (CAD-381)"),
+        Rule::Handler("memory_actor: caller_identity; native curator evidence"),
     ),
     (
         "memory_finalize",
-        Rule::Handler("memory_actor: caller_identity (CAD-381)"),
+        Rule::Handler("memory_actor and schema-bound native finalization policy"),
     ),
+    ("memory_classify", Rule::Handler("rpc_memory_classify: proven_operator")),
+    ("memory_feedback", Rule::Handler("rpc_memory_feedback: caller_identity and owned active turn")),
     (
         "monitor_register",
         Rule::Attributed {
@@ -309,6 +488,18 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("agent_caller + gc_partition (CAD-304 S3)"),
     ),
     ("agent_gc_plan", Rule::Read),
+    (
+        "agent_archive_plan",
+        Rule::Handler("operator_connection (CAD-1239)"),
+    ),
+    (
+        "agent_archive",
+        Rule::Handler("operator_connection (CAD-1239)"),
+    ),
+    (
+        "agent_restore",
+        Rule::Handler("operator_connection (CAD-1239)"),
+    ),
     ("agent_resume", Rule::OnAgent(Target::Alias, SelfService)),
     (
         "slot_acquire",
@@ -340,8 +531,56 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("operator_connection (CAD-217)"),
     ),
     (
+        "approval_state",
+        Rule::Handler("operator_connection + approver allowlist (CAD-1218)"),
+    ),
+    (
+        "approval_revoke_shown",
+        Rule::Handler("operator_connection + approver allowlist (CAD-1218)"),
+    ),
+    (
+        "approval_record_shown",
+        Rule::Handler("operator_connection + approver allowlist (CAD-1218)"),
+    ),
+    (
         "approval_designate",
         Rule::Handler("operator_connection_on_agent (CAD-918)"),
+    ),
+    (
+        "business_template_create",
+        Rule::Handler("connection_caller: operator or registered agent drafts a version; unproven refused (CAD-1393)"),
+    ),
+    (
+        "business_template_revise",
+        Rule::Handler("connection_caller: operator or registered agent drafts a new version from a base (CAD-1393)"),
+    ),
+    (
+        "business_template_intake",
+        Rule::Handler("connection_caller: operator or registered agent reads a reference (CAD-1393)"),
+    ),
+    (
+        "business_template_sample",
+        Rule::Handler("connection_caller: operator or registered agent previews a draft or approved version as a labelled SAMPLE; creates nothing (CAD-1393)"),
+    ),
+    (
+        "business_template_show",
+        Rule::Handler("connection_caller: proven operator or registered agent reads (CAD-1393)"),
+    ),
+    (
+        "business_template_approve",
+        Rule::Handler("operator_connection: human approval of an exact digest, never an agent (CAD-1393)"),
+    ),
+    (
+        "business_document_create",
+        Rule::Handler("connection_caller: draft from an approved version only (CAD-1393)"),
+    ),
+    (
+        "business_document_export",
+        Rule::Handler("connection_caller: export a retained draft; creates or sends nothing (CAD-1393)"),
+    ),
+    (
+        "business_document_show",
+        Rule::Handler("connection_caller: proven operator or registered agent reads (CAD-1393)"),
     ),
     ("approval_designations", Rule::Read),
     (
@@ -403,6 +642,21 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "issue_kickoff_options",
         Rule::Handler("operator_connection (CAD-606)"),
     ),
+    // CAD-1601: the operator recovery of an interrupted tracker write.
+    // The two reads expose the tracker's own state and change nothing;
+    // the two that decide or apply bind the operator from the
+    // connection, so an agent, its detached child and a forged identity
+    // field never reach the tracker.
+    ("tracker_recovery_review", Rule::Read),
+    (
+        "tracker_recovery_decide",
+        Rule::Handler("operator_connection (CAD-1601)"),
+    ),
+    (
+        "tracker_recovery_execute",
+        Rule::Handler("operator_connection (CAD-1601)"),
+    ),
+    ("tracker_recovery_status", Rule::Read),
     // CAD-608: the issue page's lane card. `lane_show` is a read of the
     // issue's own lane. Every mutation is operator-only inside the
     // handler — an agent, its detached child, and a forged identity
@@ -444,7 +698,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_assistant_permissions", Rule::Handler("operator_connection (CAD-1184)")),
     ("app_assistant_permission_revoke", Rule::Handler("operator_connection (CAD-1184)")),
     ("app_assistant_permission_block", Rule::Handler("operator_connection (CAD-1184)")),
+    ("app_screen_service_call", Rule::Handler("operator_connection + live scoped screen capability + governed native handler (CAD-811)")),
+    ("app_screen_service_slot_prepare", Rule::Handler("operator_connection + live scoped screen capability + native confirmation custody (CAD-811)")),
+    ("app_screen_service_slot_confirm", Rule::Handler("operator_connection + live scoped screen capability + bound native confirmation (CAD-811)")),
     ("app_screen_mint", Rule::Handler("operator_connection (CAD-1006)")),
+    ("app_media_read", Rule::Handler("operator_connection + consumed live mount + declared media.read (CAD-1365)")),
+    ("app_media_chat_attach", Rule::Handler("operator_connection + consumed live mount + declared media.chat.attach (CAD-1482)")),
+    ("app_media_publish", Rule::Handler("operator_connection + consumed live mount + declared media.publish (CAD-1365)")),
     // The frame-GET peer: authority is the burned one-use nonce, not a
     // connection class — the handler binds it to the consuming session.
     ("app_screen_consume", Rule::Handler("operator_connection + burned one-use frame capability + stored-session liveness (CAD-1006)")),
@@ -462,6 +722,23 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_run_list", Rule::Handler("operator_connection (CAD-631)")),
     ("app_run_artifact", Rule::Handler("assigned turn or operator (CAD-631)")),
     ("app_binding_quote", Rule::Handler("operator_connection and exact current binding (CAD-632)")),
+    // CAD-1177: standalone (no run/agent/team) screen tool invocation —
+    // operator connection + the live mount's server-bound action context,
+    // read/draft only. A send effect is refused at this door.
+    ("app_tool_invoke", Rule::Handler("operator_connection + live mount action context + declared read/draft slot (CAD-1177)")),
+    ("app_social_draft_create", Rule::Handler("operator_connection + live mount + context + draft slot (CAD-1177)")),
+    ("app_social_image_upload", Rule::Handler("operator_connection + live mount + context + draft slot + bounded JPEG/PNG custody (SOC-32)")),
+    ("app_social_upload_asset", Rule::Handler("operator_connection + live mount + context + retained upload custody (SOC-32)")),
+    ("app_social_draft_list", Rule::Handler("operator_connection + live mount + context + declared slot (CAD-1177)")),
+    ("app_social_draft_show", Rule::Handler("operator_connection + live mount + context + declared slot (CAD-1177)")),
+    ("app_social_draft_update", Rule::Handler("operator_connection + live mount + context + draft slot (CAD-1177)")),
+    ("app_social_draft_discard", Rule::Handler("operator_connection + live mount + context + draft slot (CAD-1303)")),
+    ("app_social_draft_asset", Rule::Handler("operator_connection + live mount + context + attached draft asset (CAD-1177)")),
+    ("app_social_sources_show", Rule::Handler("operator_connection + live mount + context + declared slot (CAD-1177)")),
+    ("app_social_sources_save", Rule::Handler("operator_connection + live mount + context + draft slot (CAD-1177)")),
+    ("app_tool_result", Rule::Handler("operator_connection (CAD-1177)")),
+    ("app_tool_results", Rule::Handler("operator_connection (CAD-1177)")),
+    ("app_tool_revoke", Rule::Handler("operator_connection + session-owned mount context (CAD-1177)")),
     ("app_run_capability_call", Rule::Handler("active assigned app turn and exact frozen binding (CAD-632)")),
     ("app_run_capability_results", Rule::Handler("operator_connection (CAD-632)")),
     ("app_run_capability_result", Rule::Handler("operator_connection (CAD-632)")),
@@ -472,10 +749,18 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_binding_show", Rule::Handler("operator_connection (CAD-692)")),
     ("app_binding_list", Rule::Handler("operator_connection (CAD-692)")),
     ("app_binding_publish_set", Rule::Handler("operator_connection (CAD-1123)")),
+    ("social_connect_link", Rule::Handler("operator_connection (CAD-1290)")),
+    ("social_destinations", Rule::Handler("operator_connection (CAD-1290)")),
+    ("app_binding_use_destination", Rule::Handler("operator_connection (CAD-1290)")),
     ("app_effect_stage", Rule::Handler("operator_connection (CAD-692)")),
     ("app_effect_show", Rule::Handler("operator_connection (CAD-692)")),
     ("app_effect_list", Rule::Handler("operator_connection (CAD-692)")),
     ("app_effect_decide", Rule::Handler("operator_connection (CAD-692)")),
+    ("app_effect_publish_now", Rule::Handler("operator_connection (CAD-1177)")),
+    ("app_effect_confirm_publish", Rule::Handler("operator_connection (CAD-1328)")),
+    ("app_effect_schedule", Rule::Handler("operator_connection (CAD-1397)")),
+    ("app_effect_reschedule", Rule::Handler("operator_connection (CAD-1397)")),
+    ("app_effect_cancel", Rule::Handler("operator_connection (CAD-1397)")),
     ("app_effect_resolve", Rule::Handler("operator_connection (CAD-692)")),
     ("social_publish_media_import", Rule::Handler("operator_connection (CAD-979)")),
     ("social_publish_schedule", Rule::Handler("operator_connection (CAD-771)")),
@@ -501,6 +786,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_record_csv_import", Rule::Handler("operator_connection (CAD-779)")),
     ("app_record_csv_confirm", Rule::Handler("operator_connection (CAD-1014: host-bound confirm receipt mint)")),
     ("app_segment_save", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_segment_delete", Rule::Handler("operator_connection (CAD-780)")),
     ("app_segment_show", Rule::Handler("operator_connection (CAD-780)")),
     ("app_segment_list", Rule::Handler("operator_connection (CAD-780)")),
     ("app_exclusion_save", Rule::Handler("operator_connection (CAD-780)")),
@@ -519,6 +805,22 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_sender_binding_list", Rule::Handler("operator_connection (CAD-782)"),
     ),
     ("app_content_save", Rule::Handler("operator_connection (CAD-782)")),
+    ("app_works_create", Rule::Handler("operator_connection (CAD-1649)")),
+    ("app_works_get", Rule::Handler("operator_connection (CAD-1649)")),
+    ("app_works_query", Rule::Handler("operator_connection (CAD-1649)")),
+    ("app_works_patch", Rule::Handler("operator_connection (CAD-1649)")),
+    ("app_works_trash", Rule::Handler("operator_connection (CAD-1649)")),
+    ("app_works_restore", Rule::Handler("operator_connection (CAD-1649)")),
+    (
+        "app_works_request_review",
+        Rule::Handler("operator_connection (CAD-1649)"),
+    ),
+    ("app_works_review", Rule::Handler("operator_connection (CAD-1649)")),
+    ("app_works_export", Rule::Handler("operator_connection (CAD-1649)")),
+    // CAD-1827: the read derives authorization and scope from the live
+    // install/context; discovery enumerates installed packages by contract.
+    ("crm_campaign_work_read", Rule::Handler("operator_connection + verified live campaign-work source and context (CAD-1827)")),
+    ("crm_campaign_work_sources", Rule::Handler("operator_connection; declarative discovery of sources that require crm-campaign-work (CAD-1827)")),
     ("app_content_show", Rule::Handler("operator_connection (CAD-782)")),
     ("app_content_clone", Rule::Handler("operator_connection (CAD-1182)")),
     ("app_content_list", Rule::Handler("operator_connection (CAD-782)")),
@@ -651,6 +953,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("operator_connection (CAD-339)"),
     ),
     (
+        "master_identity_set",
+        Rule::Handler(
+            "operator_connection (CAD-1817): the workspace coordinator's bounded \
+             name/tone/look write; the operator's alone",
+        ),
+    ),
+    (
         "master_start",
         Rule::Handler("operator_connection (CAD-339)"),
     ),
@@ -727,6 +1036,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("agent_caller: the answer's own recorded author (CAD-447)"),
     ),
     ("delivery_list", Rule::Read),
+    ("delivery_requirements", Rule::Read),
     (
         "delivery_review_evidence",
         Rule::Handler("operator_connection (CAD-120)"),
@@ -758,6 +1068,22 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "rollout_revoke",
         Rule::Handler("operator_connection (CAD-384)"),
+    ),
+    (
+        "portable_replace",
+        Rule::Handler("operator_connection (CAD-1163)"),
+    ),
+    (
+        "portable_replace_preflight",
+        Rule::Handler("operator_connection (CAD-1163)"),
+    ),
+    (
+        "portable_activate",
+        Rule::Handler("operator_connection (CAD-1163)"),
+    ),
+    (
+        "portable_activate_preflight",
+        Rule::Handler("operator_connection (CAD-1163)"),
     ),
     // CAD-1024: the staging allowlist and grant store. Every write is the
     // operator's alone — an agent, a detached child or a forged operator
@@ -823,9 +1149,110 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         ),
     ),
     ("board_session_check", Rule::Bearer),
+    // CAD-1412: the human-actor proof. The connection is the operator's
+    // own (`operator_connection` refuses agents); the token is the
+    // cookie-only credential, and the handler reads no identity field.
+    (
+        "human_actor_check",
+        Rule::Handler("operator_connection + public session token (CAD-1412)"),
+    ),
+    // CAD-1412: every human room method names the verified human through
+    // the same gate (operator connection + stored verified scope) and the
+    // store's room ACL. None grants operator, approval or agent power.
+    (
+        "human_roster_scope",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_people_search",
+        Rule::Handler("operator_connection + verified human session (CAD-1453)"),
+    ),
+    (
+        "human_rooms_list",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_dm_open",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_group_create",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_room_read",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_room_post",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_room_mark_read",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_room_add",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_room_remove",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    // CAD-1423: notification inbox, preferences, mute and push enrollment. Each
+    // runs the same human guard; none grants room access, Ask or agent power.
+    (
+        "human_notification_delivery_prepare",
+        Rule::Handler("platform service proof, verified before any business check (CAD-1423)"),
+    ),
+    (
+        "human_notification_delivery_finish",
+        Rule::Handler("platform service proof, verified before any business check (CAD-1423)"),
+    ),
+    (
+        "human_push_presence",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
+        "human_notifications",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
+        "human_notifications_read",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
+        "human_notification_prefs_set",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
+        "human_room_mute",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
+        "human_push_subscribe",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
+        "human_push_rebind",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
+        "human_push_unsubscribe",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
+        "human_agents_list",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_room_ask",
+        Rule::Handler("operator_chat + verified human operator session (CAD-1412)"),
+    ),
     // CAD-1129: a member's public session the board opens for
-    // `member_as` re-proof — the compact bearer is the credential,
-    // same class as `board_session_check`.
+    // `member_as` re-proof. The board relays it over its own operator
+    // connection, so it is gated by `operator_connection` — a bearer
+    // alone never admits it.
     ("board_session_member", Rule::Handler("operator_connection (CAD-1129)")),
     (
         "operator_sessions",
@@ -873,11 +1300,56 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "connection_test",
         Rule::Handler("rpc_connection: operator_connection (CAD-1065)"),
     ),
+    (
+        "connection_custody_initialize",
+        Rule::Handler("rpc_custody: operator_connection (CAD-1128)"),
+    ),
+    (
+        "connection_custody_unlock",
+        Rule::Handler("rpc_custody: operator_connection (CAD-1128)"),
+    ),
+    (
+        "connection_custody_lock",
+        Rule::Handler("rpc_custody: operator_connection (CAD-1128)"),
+    ),
+    (
+        "connection_custody_status",
+        Rule::Handler("rpc_custody: operator_connection (CAD-1128)"),
+    ),
     ("crm_smtp_bind", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_rebind", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_revoke", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_show", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_test_send", Rule::Handler("rpc_crm_smtp")),
+    // CAD-1562: every WhatsApp door verb enters `rpc_whatsapp`, whose
+    // first act is `operator_connection`.
+    ("whatsapp_status", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_connect_session", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_conversations_list", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_conversations_show", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_messages", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_reply_prepare", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_reply_send", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_reply_status", Rule::Handler("rpc_whatsapp")),
+    // CAD-1590: door v2 templates and broadcasts, same handler.
+    ("whatsapp_templates_list", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_template_show", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_template_prepare", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_template_send", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_template_status", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcasts_list", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_show", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_estimate", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_results", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_draft", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_test_prepare", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_test_send", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_prepare", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_send", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_stop", Rule::Handler("rpc_whatsapp")),
+    // CAD-1651: door v3 takeover, same handler.
+    ("whatsapp_handoff_set", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_handoff_release", Rule::Handler("rpc_whatsapp")),
     // CAD-786: the send verbs all enter `rpc_crm_send`, whose first
     // act is `operator_connection`.
     ("crm_send_prepare", Rule::Handler("rpc_crm_send")),
@@ -887,11 +1359,15 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("crm_send_resolve", Rule::Handler("rpc_crm_send")),
     ("crm_send_origin_set", Rule::Handler("rpc_crm_send")),
     ("crm_send_origin_show", Rule::Handler("rpc_crm_send")),
+    ("crm_autonomy_set", Rule::Handler("rpc_crm_send")),
+    ("crm_autonomy_show", Rule::Handler("rpc_crm_send")),
     // CAD-786: the unsubscribe token is the credential — the verb
     // can only add a suppression.
     ("crm_unsubscribe_redeem", Rule::Bearer),
     ("platform_accounts", Rule::Read),
     ("platform_defaults", Rule::Read),
+    // CAD-1640: the reviewed tables only — no credential, no network.
+    ("platform_tools", Rule::Read),
     (
         "platform_grants",
         Rule::Handler(
@@ -910,8 +1386,9 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "platform_call",
         Rule::Handler(
-            "request_caller: the calling agent is connection-derived; the \
-             record's agent is never a request field (CAD-506)",
+            "request_caller: the calling agent is connection-derived; a proven \
+             operator may run read/draft tools, a send still needs an agent \
+             (CAD-506, CAD-1642)",
         ),
     ),
     (
@@ -955,6 +1432,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
     ),
     (
+        "wiki_transfer",
+        Rule::Handler("wiki_caller + transfer owner/target/authority binding (CAD-914)"),
+    ),
+    (
         "wiki_mkdir",
         Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
     ),
@@ -973,6 +1454,36 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "wiki_history",
         Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
+    ),
+    (
+        "wiki_collection_get",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-1470)"),
+    ),
+    (
+        "wiki_collection_put",
+        Rule::Handler(
+            "wiki_caller: owner connection only; metadata labels are not authority (CAD-1470)",
+        ),
+    ),
+    (
+        "wiki_read_revision",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as; historical selector never falls back to live (CAD-1470)"),
+    ),
+    (
+        "wiki_corrections_list",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-1470)"),
+    ),
+    (
+        "wiki_corrections_submit",
+        Rule::Handler(
+            "wiki_caller plus verified human subject; not issue_created and not an operator alias (CAD-1470)",
+        ),
+    ),
+    (
+        "wiki_corrections_review",
+        Rule::Handler(
+            "wiki_caller owner plus a different verified human subject; session id is not identity (CAD-1470)",
+        ),
     ),
     // CAD-719: index health is operator-only — a read-only status and
     // an explicit rebuild. These do not bind `wiki_caller`: they gate
@@ -1169,56 +1680,58 @@ fn keep_or(params: &Value, field: &str, default: Option<&str>) -> Value {
     }
 }
 
+/// Every method name in `Shared::dispatch_method`'s match — parsed from
+/// the source so a test sees methods added later (the CAD-339 table
+/// parse). One parser for the whole daemon: the caller-rule table, the
+/// master allowlist and the app-conversation allowlist all read the same
+/// list, so a method missing from one is missing from all.
+#[cfg(test)]
+pub(crate) fn dispatch_methods() -> Vec<String> {
+    let src = include_str!("../daemon.rs");
+    let start = src.find("    fn dispatch_method(\n").expect("dispatch fn");
+    let body = &src[start..];
+    let body = &body[body.find("match method {").expect("match")..];
+    let body = &body[..body
+        .find("other => Err(Error::rejected(format!(\"Unknown method")
+        .expect("end")];
+    // rustfmt splits a long `"a" | "b" | "c" =>` arm across lines,
+    // so join each arm's continuation lines (they start with `|`)
+    // before reading its names — a wrapped arm still counts once.
+    let mut out = Vec::new();
+    let mut arm_text = String::new();
+    let mut in_arm = false;
+    for line in body.lines() {
+        let t = line.trim_start();
+        let indent = line.len() - t.len();
+        if in_arm && t.starts_with('|') {
+            // A wrapped `| "next"` continuation — same 12-space
+            // indent as the arm's first line.
+            arm_text.push_str(t);
+        } else {
+            in_arm = false;
+        }
+        if indent == 12 && t.starts_with('"') {
+            arm_text.clear();
+            arm_text.push_str(t);
+            in_arm = true;
+        }
+        if in_arm && arm_text.contains("=>") {
+            let (arms, _) = arm_text.split_once("=>").unwrap();
+            for arm in arms.split('|') {
+                let name = arm.trim().trim_matches('"');
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    out.push(name.to_string());
+                }
+            }
+            in_arm = false;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every method name in `Shared::dispatch`'s match — parsed from the
-    /// source so the test sees methods added later (the CAD-339 table
-    /// parse).
-    pub(crate) fn dispatch_methods() -> Vec<String> {
-        let src = include_str!("../daemon.rs");
-        let start = src.find("    fn dispatch_method(\n").expect("dispatch fn");
-        let body = &src[start..];
-        let body = &body[body.find("match method {").expect("match")..];
-        let body = &body[..body
-            .find("other => Err(Error::rejected(format!(\"Unknown method")
-            .expect("end")];
-        // rustfmt splits a long `"a" | "b" | "c" =>` arm across lines,
-        // so join each arm's continuation lines (they start with `|`)
-        // before reading its names — a wrapped arm still counts once.
-        let mut out = Vec::new();
-        let mut arm_text = String::new();
-        let mut in_arm = false;
-        for line in body.lines() {
-            let t = line.trim_start();
-            let indent = line.len() - t.len();
-            if in_arm && t.starts_with('|') {
-                // A wrapped `| "next"` continuation — same 12-space
-                // indent as the arm's first line.
-                arm_text.push_str(t);
-            } else {
-                in_arm = false;
-            }
-            if indent == 12 && t.starts_with('"') {
-                arm_text.clear();
-                arm_text.push_str(t);
-                in_arm = true;
-            }
-            if in_arm && arm_text.contains("=>") {
-                let (arms, _) = arm_text.split_once("=>").unwrap();
-                for arm in arms.split('|') {
-                    let name = arm.trim().trim_matches('"');
-                    if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
-                    {
-                        out.push(name.to_string());
-                    }
-                }
-                in_arm = false;
-            }
-        }
-        out
-    }
 
     fn agent(a: &str) -> Who {
         Who::Agent(a.to_string())
@@ -1247,7 +1760,11 @@ mod tests {
     #[test]
     fn every_dispatch_method_has_a_caller_rule() {
         let table = dispatch_methods();
-        assert!(table.len() > 50, "method table parse: {table:?}");
+        // The weak (pre-consolidation) parser saw 417 of 450 methods
+        // because it skipped rustfmt-wrapped arms. Keep the floor above
+        // that result and below the real count, so the regression fails
+        // here instead of silently shrinking the table.
+        assert!(table.len() > 440, "method table parse: {}", table.len());
         for m in &table {
             assert!(
                 rule_of(m).is_some(),

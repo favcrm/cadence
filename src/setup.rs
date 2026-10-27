@@ -446,8 +446,8 @@ fn skill_check() -> Check {
         "skill",
         |ctx| {
             let status = crate::skill::status(&ctx.home);
-            let path = status["path"].as_str().unwrap_or("").to_string();
-            if status["installed"] != true {
+            let path = status["root"].as_str().unwrap_or("").to_string();
+            if status["has_files"] != true {
                 return match &ctx.sandbox {
                     Some(name) => Found::Unknown(format!(
                         "not installed; the sandbox profile ({name}) never writes the \
@@ -456,20 +456,47 @@ fn skill_check() -> Check {
                     None => Found::Absent("not installed".into()),
                 };
             }
-            // Installed: setup never rewrites it. Another binary's copy —
-            // older or newer — and a link the operator removed stay as
-            // they are; `skill install` is the explicit refresh.
+            // Any existing files make this an observed install, including a
+            // partial bundle. Only explicit `skill install` refreshes it.
             let mut differs = Vec::new();
-            if status["content_match"] != true {
-                differs.push("SKILL.md content".to_string());
+            for skill in status["skills"].as_array().into_iter().flatten() {
+                let name = skill["name"].as_str().unwrap_or("skill");
+                if skill["installed"] != true {
+                    differs.push(format!("{name} files missing"));
+                } else if skill["content_match"] != true {
+                    differs.push(format!("{name} content"));
+                }
+                for (dir, state) in skill["links"].as_object().into_iter().flatten() {
+                    if state == "foreign" {
+                        differs.push(format!(
+                            "{name} {dir} link is a foreign entry and was left unchanged"
+                        ));
+                    } else if state != "ok" {
+                        differs.push(format!(
+                            "{name} {dir} link {}",
+                            state.as_str().unwrap_or("?")
+                        ));
+                    }
+                }
             }
-            for (dir, state) in status["links"].as_object().into_iter().flatten() {
-                if state != "ok" && state != "foreign" {
-                    differs.push(format!("{dir} link {}", state.as_str().unwrap_or("?")));
+            // A foreign provider entry must stay visible. Returning
+            // `Unknown` here would also make a first install `failed`:
+            // apply re-detects, and only `Present` counts as created.
+            // The detail carries the conflict, and scope prints
+            // `provider_discovery`, so the skill line is not a silent ok.
+            if status["provider_discovery"] != "current" {
+                if let Some(note) = status["attention"].as_str() {
+                    if !differs.iter().any(|item| item.contains("foreign")) {
+                        differs.push(note.to_string());
+                    }
                 }
             }
             if differs.is_empty() {
                 Found::Present(path)
+            } else if status["content_match"] == true
+                && differs.iter().all(|item| item.contains("foreign"))
+            {
+                Found::Present(format!("{path}; {}", differs.join("; ")))
             } else {
                 Found::Unknown(format!(
                     "{path} differs from this binary ({}) — left as is",
@@ -487,10 +514,10 @@ fn skill_check() -> Check {
         },
     )
     .apply(|ctx| {
-        let report = crate::skill::sync(&ctx.home, false)?;
+        let report = crate::skill::sync(&ctx.home, false, None)?;
         Ok(Applied::Created(format!(
             "installed {}",
-            report["installed"].as_str().unwrap_or("the skill")
+            report["root"].as_str().unwrap_or("the skill bundle")
         )))
     })
 }
@@ -773,7 +800,7 @@ fn master_check() -> Check {
         "master",
         |ctx| {
             let dir = ctx.pm_dir.join("agents").join("master");
-            let missing: Vec<&str> = ["SOUL.md", "AGENT.md"]
+            let missing: Vec<&str> = crate::master::FILES
                 .into_iter()
                 .filter(|f| !dir.join(f).is_file())
                 .collect();
@@ -1613,6 +1640,31 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_provider_entry_is_named_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let first = run_checks(&ctx, &[skill_check()], |_| {});
+        assert_eq!(first[0].status, Status::Created, "{:?}", first[0]);
+        let foreign = ctx.home.join(".claude/skills/cadence");
+        std::fs::remove_file(&foreign).unwrap();
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join("keep.txt"), "foreign\n").unwrap();
+        let out = run_checks(&ctx, &[skill_check()], |_| {});
+        assert_eq!(out[0].status, Status::Ok, "{:?}", out[0]);
+        assert!(
+            out[0].detail.contains("foreign"),
+            "setup must show the conflict: {:?}",
+            out[0]
+        );
+        assert!(out[0].detail.contains("left unchanged"), "{:?}", out[0]);
+        assert_eq!(
+            std::fs::read(foreign.join("keep.txt")).unwrap(),
+            b"foreign\n"
+        );
+        assert!(foreign.is_dir());
+    }
+
+    #[test]
     fn an_installed_skill_that_differs_is_reported_and_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ctx(dir.path());
@@ -1625,16 +1677,6 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         let out = run_checks(&ctx, &[skill_check()], |_| {});
         assert_eq!(out[0].status, Status::Unknown, "{:?}", out[0]);
-        assert!(
-            out[0].detail.contains("differs from this binary"),
-            "{:?}",
-            out[0]
-        );
-        assert!(out[0]
-            .fix
-            .as_deref()
-            .unwrap()
-            .ends_with("cadence skill install"));
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "operator's own skill\n"

@@ -1,4 +1,5 @@
 import type { Project, ProjectContext } from "../../lib/types";
+import { useTranslate } from "../../lib/locale";
 
 const DOC_STATE_CHIP: Record<string, string> = {
   ready: "bg-ok/15 text-ok",
@@ -16,19 +17,23 @@ export default function ProjectScope({
   context,
   contextLoading,
   onOpenContext,
+  hosted = false,
 }: {
   project: string;
   projects: Project[];
   context: ProjectContext | null;
   contextLoading: boolean;
   onOpenContext: () => void;
+  /** A hosted tenant does not serve the wiki; the context page is wiki-backed. */
+  hosted?: boolean;
 }) {
+  const t = useTranslate();
   const meta = projects.find((p) => p.key === project);
   const docs = context?.documents.filter((d) => d.selected) ?? [];
   const shown = docs.slice(0, 6);
   return (
     <section>
-      <div className="slabel mb-2">project context</div>
+      <div className="slabel mb-2">{t("project context")}</div>
       <div className="card px-4 py-3.5 space-y-3">
         {meta && (
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-micro">
@@ -47,14 +52,14 @@ export default function ProjectScope({
             ))}
             {meta.default_owner && (
               <span className="text-ink-500">
-                default owner {meta.default_owner}
+                {t("default owner")} {meta.default_owner}
               </span>
             )}
           </div>
         )}
         {contextLoading && !context && (
           <p className="text-label text-ink-500">
-            reading the project's tracked manifest…
+            {t("reading the project's tracked manifest…")}
           </p>
         )}
         {docs.length > 0 && (
@@ -66,7 +71,7 @@ export default function ProjectScope({
               >
                 <span className="text-label text-ink-200">{doc.title}</span>
                 <span className="num text-micro text-ink-500">{doc.path}</span>
-                {doc.required && <span className="kicker">required</span>}
+                {doc.required && <span className="kicker">{t("required")}</span>}
                 {!DOC_STATE_CHIP[doc.state] && (
                   <span className="chip bg-fail/10 text-fail !py-[.15rem]">
                     {doc.state}
@@ -78,15 +83,17 @@ export default function ProjectScope({
         )}
         {context && docs.length > shown.length && (
           <p className="text-micro text-ink-500">
-            Showing {shown.length} of {docs.length} source documents
+            {t("Showing")} {shown.length} {t("of")} {docs.length} {t("source documents")}
           </p>
         )}
-        <button
-          onClick={onOpenContext}
-          className="lnk text-label"
-        >
-          Open project context →
-        </button>
+        {!hosted && (
+          <button
+            onClick={onOpenContext}
+            className="lnk text-label"
+          >
+            {t("Open project context →")}
+          </button>
+        )}
       </div>
     </section>
   );

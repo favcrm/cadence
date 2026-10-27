@@ -82,6 +82,7 @@ pub fn layout() -> Result<Layout> {
                 root.display()
             )));
         }
+        let root = guard_home(root)?;
         return Ok(Layout {
             source: Source::Env,
             marker_present: layout_marker_declared(&root),
@@ -106,9 +107,9 @@ pub fn home() -> Result<PathBuf> {
 /// `<home>/tracker` under the new layout, else `~/pm`.
 pub fn tracker_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CADENCE_PM_DIR") {
-        return Ok(PathBuf::from(dir));
+        return test_guard(PathBuf::from(dir), ".", "pm");
     }
-    tracker_default()
+    test_guard(tracker_default()?, ".", "pm")
 }
 
 /// `tracker_dir` with `CADENCE_PM_DIR` unset — the production
@@ -127,9 +128,9 @@ pub fn tracker_default() -> Result<PathBuf> {
 /// the new layout, else the legacy default.
 pub fn state_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("CADENCE_STATE_DIR") {
-        return Ok(PathBuf::from(dir));
+        return test_guard(PathBuf::from(dir), ".local/state", "cadence");
     }
-    state_default()
+    test_guard(state_default()?, ".local/state", "cadence")
 }
 
 /// `state_dir` with `CADENCE_STATE_DIR` unset — the production
@@ -172,6 +173,303 @@ pub fn vault_for(tracker: &Path) -> Result<PathBuf> {
         } => Ok(tracker.join("wiki")),
         l => Ok(l.root.join("vault")),
     }
+}
+
+/// Operational upload workspace: `<resolved-home>/workspace`. This is
+/// independent of tracker/state overrides and does not activate any part
+/// of the broader home-layout migration.
+pub fn workspace_dir() -> Result<PathBuf> {
+    Ok(layout()?.root.join("workspace"))
+}
+
+/// Resolve an instance's workspace from its captured daemon environment,
+/// never from a request or a later process-global layout switch.
+pub fn workspace_for_instance(
+    tracker: &Path,
+    cadence_home: Option<&str>,
+    home: Option<&str>,
+) -> Result<PathBuf> {
+    let (home_root, vault) = match cadence_home {
+        Some(raw) => {
+            let root = PathBuf::from(raw);
+            if !root.is_absolute() {
+                return Err(Error::rejected("CADENCE_HOME must be an absolute path"));
+            }
+            let root = checked_root(&guard_home(root)?)?;
+            (root.clone(), root.join("vault"))
+        }
+        None => {
+            let user_home = match home {
+                Some(raw) => {
+                    let path = PathBuf::from(raw);
+                    if !path.is_absolute() {
+                        return Err(Error::rejected("HOME must be an absolute path"));
+                    }
+                    path
+                }
+                None => user_home()?,
+            };
+            let root = checked_root(&user_home.join(".cadence"))?;
+            let tracker = checked_root(tracker)?;
+            (root, tracker.join("wiki"))
+        }
+    };
+    let workspace = checked_root(&home_root.join("workspace"))?;
+    let tracker = checked_root(tracker)?;
+    let vault = checked_root(&vault)?;
+    for protected in [&tracker, &vault] {
+        if workspace.starts_with(protected) || protected.starts_with(&workspace) {
+            return Err(Error::rejected(
+                "operational upload workspace overlaps tracker or knowledge vault",
+            ));
+        }
+    }
+    Ok(workspace)
+}
+
+/// Refuse an operational workspace that overlaps any read or write root
+/// granted to either supported Master provider. The policies are built by
+/// the adapters themselves so this check follows their effective authority.
+pub(crate) fn validate_workspace_isolated(
+    workspace: &Path,
+    state_dir: &Path,
+    env: &crate::adapter::ProviderEnv,
+) -> Result<()> {
+    let workspace = checked_root(workspace)?;
+    let policies = [
+        crate::adapter::claude::master_confinement(env, state_dir).1,
+        crate::adapter::pi::pi_master_confinement(env, state_dir).1,
+    ];
+    for policy in policies {
+        validate_master_policy(&workspace, policy)?;
+    }
+    Ok(())
+}
+
+/// When a daemon-bound provider is launched, validate and freeze the exact
+/// policy that will be encoded into its `cadence confine` argv.
+pub(crate) fn validate_policy_for_env(
+    policy: crate::confine::Policy,
+    env: &crate::adapter::ProviderEnv,
+) -> Result<crate::confine::Policy> {
+    match env.workspace() {
+        Some(workspace) => validate_master_policy(workspace, policy),
+        None => Ok(policy),
+    }
+}
+
+/// Normalize every granted path to the target Landlock will follow, and
+/// reject bidirectional overlap with the immutable operational workspace.
+pub(crate) fn validate_master_policy(
+    workspace: &Path,
+    mut policy: crate::confine::Policy,
+) -> Result<crate::confine::Policy> {
+    let workspace = checked_root(workspace)?;
+    for (kind, paths) in [("read", &mut policy.read), ("write", &mut policy.write)] {
+        for path in paths.iter_mut() {
+            let authority = if process_relative_proc_authority(path).map_err(|reason| {
+                Error::rejected(format!(
+                    "cannot establish Master {kind} authority for workspace isolation at {}: {reason}",
+                    path.display()
+                ))
+            })? {
+                // `/proc/self` and `/proc/thread-self` are interpreted by
+                // the confined child, not by this daemon. Keep their spelling
+                // intact; canonicalizing here would grant the daemon's PID.
+                if workspace.starts_with("/proc") {
+                    return Err(Error::rejected(
+                        "operational upload workspace cannot be isolated from process-relative /proc authority",
+                    ));
+                }
+                path.clone()
+            } else {
+                normalize_authority(path).map_err(|reason| {
+                    Error::rejected(format!(
+                        "cannot establish Master {kind} authority for workspace isolation at {}: {reason}",
+                        path.display()
+                    ))
+                })?
+            };
+            if workspace.starts_with(&authority) || authority.starts_with(&workspace) {
+                return Err(Error::rejected(format!(
+                    "operational upload workspace overlaps effective Master {kind} filesystem grant"
+                )));
+            }
+            *path = authority;
+        }
+    }
+    Ok(policy)
+}
+
+/// Detect the kernel-relative process aliases whose meaning changes from
+/// this daemon to the Master child. Their spelling must reach Landlock intact.
+fn process_relative_proc_authority(path: &Path) -> std::result::Result<bool, &'static str> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Ok(false);
+    }
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir))
+        || !matches!(components.next(), Some(Component::Normal(proc)) if proc == "proc")
+    {
+        return Ok(false);
+    }
+    if !matches!(components.next(), Some(Component::Normal(alias)) if alias == "self" || alias == "thread-self")
+    {
+        return Ok(false);
+    }
+    if components.any(|component| matches!(component, Component::ParentDir)) {
+        return Err("process-relative /proc authority contains parent traversal");
+    }
+    Ok(true)
+}
+
+/// Resolve an authority path as Landlock will: follow existing symlink
+/// aliases, then retain a normalized missing suffix below its real ancestor.
+/// Unlike workspace roots, grants may name files as well as directories.
+fn normalize_authority(path: &Path) -> std::result::Result<PathBuf, &'static str> {
+    use std::{collections::VecDeque, path::Component};
+
+    fn enqueue(
+        path: &Path,
+        from_link: bool,
+        pending: &mut VecDeque<(PathBuf, bool)>,
+    ) -> std::result::Result<(), &'static str> {
+        for component in path.components() {
+            match component {
+                Component::RootDir => pending.push_back((PathBuf::from("/"), from_link)),
+                Component::CurDir => pending.push_back((PathBuf::from("."), from_link)),
+                Component::ParentDir => pending.push_back((PathBuf::from(".."), from_link)),
+                Component::Normal(part) => pending.push_back((PathBuf::from(part), from_link)),
+                Component::Prefix(_) => return Err("path has an unsupported prefix"),
+            }
+        }
+        Ok(())
+    }
+
+    fn is_process_relative_proc(path: &Path) -> bool {
+        path == Path::new("/proc/self")
+            || path.starts_with("/proc/self/")
+            || path == Path::new("/proc/thread-self")
+            || path.starts_with("/proc/thread-self/")
+    }
+
+    if !path.is_absolute() {
+        return Err("path is not absolute");
+    }
+    let mut pending = VecDeque::new();
+    enqueue(path, false, &mut pending)?;
+    let mut resolved = PathBuf::from("/");
+    let mut missing = false;
+    let mut symlink_hops = 0usize;
+
+    while let Some((component, from_link)) = pending.pop_front() {
+        if component == Path::new("/") {
+            if from_link {
+                resolved = PathBuf::from("/");
+            }
+            continue;
+        }
+        if component == Path::new(".") {
+            continue;
+        }
+        if component == Path::new("..") {
+            if missing {
+                return Err("parent traversal after a missing path component is ambiguous");
+            }
+            if resolved != Path::new("/") {
+                match std::fs::metadata(&resolved) {
+                    Ok(metadata) if metadata.is_dir() => {}
+                    _ => return Err("parent traversal does not follow a directory"),
+                }
+                resolved.pop();
+            }
+            continue;
+        }
+
+        resolved.push(&component);
+        if is_process_relative_proc(&resolved) {
+            return Err("ordinary alias resolves through process-relative /proc authority");
+        }
+        if missing {
+            if from_link {
+                return Err("symlink target is dangling");
+            }
+            continue;
+        }
+        match std::fs::symlink_metadata(&resolved) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                symlink_hops += 1;
+                if symlink_hops > 40 {
+                    return Err("symlink resolution exceeded 40 hops");
+                }
+                let target = std::fs::read_link(&resolved).map_err(|_| "symlink cannot be read")?;
+                resolved.pop();
+                if target.is_absolute() {
+                    resolved = PathBuf::from("/");
+                }
+                let mut target_components = VecDeque::new();
+                enqueue(&target, true, &mut target_components)?;
+                while let Some(item) = target_components.pop_back() {
+                    pending.push_front(item);
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if from_link {
+                    return Err("symlink target is dangling");
+                }
+                missing = true;
+            }
+            Err(_) => return Err("path cannot be inspected"),
+        }
+    }
+    Ok(resolved)
+}
+
+/// Resolve an authoritative storage root without adopting `..`, relative
+/// paths, or symlink aliases. Missing suffixes are retained lexically so a
+/// root can be validated before first use.
+fn checked_root(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(Error::rejected("storage root must be absolute"));
+    }
+    let mut checked = PathBuf::from("/");
+    let mut missing = false;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) if !missing => {
+                checked.push(part);
+                match std::fs::symlink_metadata(&checked) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(Error::rejected(format!(
+                            "storage root {} contains a symlink",
+                            path.display()
+                        )));
+                    }
+                    Ok(metadata) if !metadata.is_dir() => {
+                        return Err(Error::rejected(format!(
+                            "storage root {} contains a non-directory component",
+                            path.display()
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = true,
+                    Err(error) => {
+                        return Err(Error::rejected(format!(
+                            "cannot validate storage root {}: {error}",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+            Component::Normal(part) => checked.push(part),
+            _ => return Err(Error::rejected("storage root is not normalized")),
+        }
+    }
+    Ok(checked)
 }
 
 /// Managed repo checkouts: `<home>/repos` — under the legacy layout
@@ -232,4 +530,254 @@ fn legacy_state_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(dir).join("cadence"));
     }
     local_state_dir()
+}
+
+/// CAD-1210: a test process must never reach the invoking user's real
+/// tracker (`~/pm`) or state dir (`~/.local/state/cadence`). Armed
+/// only under `cfg(test)` and the `test-seam` feature (integration
+/// targets build the lib without `cfg(test)`); a release build is a
+/// no-op. Allowlist-shaped: only those two production roots refuse.
+#[cfg(not(any(test, feature = "test-seam")))]
+fn test_guard(dir: PathBuf, _rel: &str, _leaf: &str) -> Result<PathBuf> {
+    Ok(dir)
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+fn test_guard(dir: PathBuf, rel: &str, leaf: &str) -> Result<PathBuf> {
+    test_guard_in(dir, real_home().as_deref(), rel, leaf)
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+fn test_guard_in(dir: PathBuf, real: Option<&Path>, rel: &str, leaf: &str) -> Result<PathBuf> {
+    match real {
+        Some(real) => {
+            let mut root = real.to_path_buf();
+            if rel != "." {
+                root.push(rel);
+            }
+            let root = root.join(leaf);
+            // CAD-1227: the one allowlisted path under a refused root: a
+            // queued test job's own isolation tree (a fresh empty state
+            // dir the daemon creates per job). Strictly below `run/`.
+            if leaf == "cadence" {
+                let run = resolve_for_compare(&root.join("test-queue/run"));
+                let got = resolve_for_compare(&dir);
+                if got != run && got.starts_with(&run) {
+                    return Ok(dir);
+                }
+            }
+            refuse_under(dir, &root)
+        }
+        None => Ok(dir),
+    }
+}
+
+/// CAD-1227: a test process must not take the invoking user's real
+/// `~/.cadence` as its `CADENCE_HOME` either.
+fn guard_home(root: PathBuf) -> Result<PathBuf> {
+    test_guard(root, ".", ".cadence")
+}
+
+/// [`guard_home`] with the real home passed in (pure; for tests).
+#[cfg(test)]
+pub(crate) fn guard_home_in(root: PathBuf, real: Option<&Path>) -> Result<PathBuf> {
+    test_guard_in(root, real, ".", ".cadence")
+}
+
+/// The same refusal for a tracker path that did not come through
+/// [`tracker_dir`] (a daemon's `provider_env`, the CLI's env read).
+pub fn guard_tracker(dir: PathBuf) -> Result<PathBuf> {
+    test_guard(dir, ".", "pm")
+}
+
+/// [`guard_tracker`] with the real home passed in (pure; for tests).
+#[cfg(test)]
+pub(crate) fn guard_tracker_in(dir: PathBuf, real: Option<&Path>) -> Result<PathBuf> {
+    test_guard_in(dir, real, ".", "pm")
+}
+
+/// `p` made comparable: relative paths become absolute against the
+/// current directory; the longest existing prefix of the RAW path is
+/// canonicalised (so a symlink is followed before any `..` after it is
+/// applied, exactly as the OS would); `.` and `..` are folded
+/// lexically only in the not-yet-existing tail.
+#[cfg(any(test, feature = "test-seam"))]
+fn resolve_for_compare(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(p),
+            Err(_) => p.to_path_buf(),
+        }
+    };
+    let comps: Vec<Component> = abs.components().collect();
+    for k in (1..=comps.len()).rev() {
+        let prefix: PathBuf = comps[..k].iter().collect();
+        if let Ok(mut real) = std::fs::canonicalize(&prefix) {
+            for c in &comps[k..] {
+                match c {
+                    Component::ParentDir => {
+                        real.pop();
+                    }
+                    Component::CurDir => {}
+                    c => real.push(c.as_os_str()),
+                }
+            }
+            return real;
+        }
+    }
+    abs
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+fn refuse_under(dir: PathBuf, root: &Path) -> Result<PathBuf> {
+    let root = resolve_for_compare(root);
+    if resolve_for_compare(&dir).starts_with(&root) {
+        return Err(Error::rejected(format!(
+            "refusing to resolve {}: a test process must not touch the real {} \
+             (CAD-1210); point CADENCE_PM_DIR/CADENCE_STATE_DIR at a temp dir",
+            dir.display(),
+            root.display()
+        )));
+    }
+    Ok(dir)
+}
+
+/// The invoking user's home from the passwd database (never `$HOME`,
+/// which tests isolate). `CADENCE_TEST_REAL_HOME` substitutes a fake
+/// stand-in; it is read only in these test builds.
+#[cfg(any(test, feature = "test-seam"))]
+fn real_home() -> Option<PathBuf> {
+    if let Some(h) = std::env::var_os("CADENCE_TEST_REAL_HOME") {
+        return Some(PathBuf::from(h));
+    }
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: getpwuid returns null or a pointer to a static passwd
+    // record whose pw_dir is a NUL-terminated string; copied at once.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr((*pw).pw_dir);
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn production_roots_refuse_and_other_dirs_pass() {
+        let fake = PathBuf::from("/tmp/c1210-fakehome");
+        let pm = fake.join("pm");
+        let st = fake.join(".local/state/cadence");
+        let err = refuse_under(pm.join("sub"), &pm).unwrap_err().to_string();
+        assert!(err.contains("CAD-1210"), "{err}");
+        assert!(refuse_under(st.clone(), &st).is_err());
+        assert!(refuse_under(fake.join("pm-other"), &pm).is_ok());
+        assert!(refuse_under(fake.join("tmp-state"), &st).is_ok());
+    }
+
+    #[test]
+    fn symlinked_and_dotdot_paths_to_the_root_refuse() {
+        let base = std::env::temp_dir().join(format!("c1210-sl-{}", std::process::id()));
+        let pm = base.join("fakehome/pm");
+        std::fs::create_dir_all(&pm).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&pm, &link).unwrap();
+        // symlink to the root with a tail that does not exist yet
+        assert!(refuse_under(link.join("newsub/deeper"), &pm).is_err());
+        // `..` through a missing dir, back into the root
+        let dd = base.join("nope/../fakehome/pm/x");
+        assert!(refuse_under(dd, &pm).is_err());
+        // a sibling that merely shares a prefix still passes
+        assert!(refuse_under(base.join("fakehome/pm-other/x"), &pm).is_ok());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Fake real home inside a fresh temp dir; returns (base, fake pm).
+    fn fake(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("c1227-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pm = base.join("fakehome/pm");
+        std::fs::create_dir_all(pm.join("sub")).unwrap();
+        (base, pm)
+    }
+
+    #[test]
+    fn symlink_to_subdir_then_dotdot_refuses() {
+        let (base, pm) = fake("sd");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(pm.join("sub"), &link).unwrap();
+        // link/.. is pm itself: symlink resolved before `..` folds
+        assert!(refuse_under(link.join(".."), &pm).is_err());
+        assert!(refuse_under(link.join("../newdir"), &pm).is_err());
+        // a symlink out of the root does not
+        let other = base.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let out = base.join("out");
+        std::os::unix::fs::symlink(&other, &out).unwrap();
+        assert!(refuse_under(out.join("x"), &pm).is_ok());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn relative_dotdot_resolves_against_cwd() {
+        let (base, pm) = fake("rel");
+        // The process cwd is shared; build the relative path from it
+        // so no cwd change is needed: `<up to base>/fakehome/pm/x`.
+        let cwd = std::env::current_dir().unwrap();
+        let mut rel = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            rel.push("..");
+        }
+        let rel_pm = rel.join(pm.strip_prefix("/").unwrap()).join("x");
+        assert!(rel_pm.is_relative());
+        assert!(refuse_under(rel_pm, &pm).is_err());
+        // a relative sibling `pm2` passes
+        let sib = base.join("fakehome/pm2");
+        std::fs::create_dir_all(&sib).unwrap();
+        let rel_sib = rel.join(sib.strip_prefix("/").unwrap());
+        assert!(refuse_under(rel_sib, &pm).is_ok());
+        // a leading `..` beyond the root is clamped, not dropped into pm
+        assert!(refuse_under(PathBuf::from("../../../../../../../../../tmp/zz-none"), &pm).is_ok());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn cadence_home_production_root_refuses() {
+        let (base, _pm) = fake("home");
+        let real = base.join("fakehome");
+        let root = real.join(".cadence");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(guard_home_in(root.clone(), Some(&real)).is_err());
+        assert!(guard_home_in(root.join("tracker"), Some(&real)).is_err());
+        assert!(guard_home_in(base.join("tmp-home"), Some(&real)).is_ok());
+        assert!(guard_home_in(real.join(".cadence2"), Some(&real)).is_ok());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn only_the_test_queue_run_tree_is_allowlisted_under_state() {
+        let (base, _pm) = fake("tq");
+        let real = base.join("fakehome");
+        let st = real.join(".local/state/cadence");
+        let run = st.join("test-queue/run");
+        std::fs::create_dir_all(run.join("tq-1/state")).unwrap();
+        let g = |d: PathBuf| test_guard_in(d, Some(&real), ".local/state", "cadence");
+        assert!(g(run.join("tq-1/state")).is_ok());
+        assert!(g(run.join("tq-2/state")).is_ok());
+        // the state root, siblings of run/, run/ itself and `..` escapes refuse
+        assert!(g(st.clone()).is_err());
+        assert!(g(st.join("test-queue")).is_err());
+        assert!(g(st.join("test-queue/jobs")).is_err());
+        assert!(g(run.clone()).is_err());
+        assert!(g(run.join("tq-1/../../..")).is_err());
+        assert!(g(run.join("tq-1/state/../../../queue")).is_err());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 }

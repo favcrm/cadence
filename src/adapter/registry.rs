@@ -47,6 +47,9 @@ const DEVIN_CLOUD_PARAMS: &[&str] = &[
     "upstream",
     "agents_md",
     "stall_secs",
+    "profile",
+    "profile_revision",
+    "profile_digest",
 ];
 
 /// The modes `cursor --permission-mode` accepts — each maps to one
@@ -393,6 +396,52 @@ pub static SPECS: &[EndpointSpec] = &[
         launch_default: true,
         internal: false,
     },
+    // CAD-1624: omp is the team's primary harness. It ships the same managed-rpc
+    // surface as Pi (`--mode rpc`, `--tools`, `-e`/`--no-extensions`,
+    // `--session-dir`, `--thinking`), so it rides the Pi adapter with its own
+    // program and inherits the same Settings allowlist gate — never a second,
+    // ungated launch path.
+    EndpointSpec {
+        provider: "omp",
+        endpoint_kind: "managed",
+        display: "OMP (managed rpc)",
+        has_actor: true,
+        attach: Attach::Headless,
+        ready_gate: false,
+        screen_probe: false,
+        reports: Reporting::TurnResult,
+        report_hint: Reporting::TurnResult,
+        turn_token: Some(PI_MANAGED_TURN_TOKENS),
+        brokers_requests: false,
+        resumable: true,
+        resume_label: "cadence agent resume <alias> (stored omp session file)",
+        live_settable_params: &["stall_secs", "auto_stop", "auto_stop_idle_secs"],
+        launch_params: &[
+            "model",
+            "effort",
+            "turn_idle_secs",
+            "turn_max_secs",
+            "session",
+            "upstream",
+            "agents_md",
+            "stall_secs",
+            "confine",
+        ],
+        session_id_label: "OMP session",
+        respond_rejection: Some(
+            "managed omp endpoints broker no requests — extension UI dialogs are \
+             auto-cancelled and recorded as pi_ui_request events",
+        ),
+        capabilities: &["managed_pi_rpc", "native_turn_steering"],
+        doctor_caps: &["managed_pi_rpc"],
+        probe_bins: &[("omp", &["--version"])],
+        session_disposable: true,
+        // The endpoint an explicitly named `join <pm> omp` selects. This is not
+        // the installation default provider — `join <pm>` keeps resolving to pi
+        // until the operator moves that default deliberately.
+        launch_default: true,
+        internal: false,
+    },
     EndpointSpec {
         provider: "claude",
         endpoint_kind: "pty",
@@ -661,6 +710,35 @@ pub static SPECS: &[EndpointSpec] = &[
         launch_default: true,
         internal: false,
     },
+    // CAD-1673: the cloud sandbox runner seam (see `adapter::sandbox`).
+    // AOS-324: registered cloud runner. It has no local actor; dispatch
+    // selects it by `endpoint_kind` and starts the remote job. The image
+    // and budget are AOS-owned; no launch params are accepted.
+    EndpointSpec {
+        provider: "sandbox",
+        endpoint_kind: "sandbox",
+        display: "Cloud sandbox",
+        has_actor: false,
+        attach: Attach::None,
+        ready_gate: false,
+        screen_probe: false,
+        reports: Reporting::TurnResult,
+        report_hint: Reporting::TurnResult,
+        turn_token: None,
+        brokers_requests: false,
+        resumable: false,
+        resume_label: "",
+        live_settable_params: &[],
+        launch_params: &[],
+        session_id_label: "Sandbox session",
+        respond_rejection: None,
+        capabilities: &[],
+        doctor_caps: &[],
+        probe_bins: &[],
+        session_disposable: false,
+        launch_default: false,
+        internal: false,
+    },
 ];
 
 /// `health.capabilities` entry for daemon-wide model defaults.
@@ -754,6 +832,38 @@ pub fn provider_ids() -> Vec<&'static str> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Where an endpoint's process actually runs, derived from the pair the
+/// caller cannot choose. `Queue` is a durable mailbox with no process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    Local,
+    Cloud,
+    Queue,
+}
+
+impl Placement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Cloud => "cloud",
+            Self::Queue => "queue",
+        }
+    }
+}
+
+/// Placement of one registered endpoint. Total by construction: a pair
+/// without an actor is a queue, an endpoint kind named `cloud` is hosted,
+/// everything else runs on the daemon's own host.
+pub fn placement(provider: &str, endpoint_kind: &str) -> Placement {
+    if !has_actor(provider, endpoint_kind) {
+        Placement::Queue
+    } else if endpoint_kind == "cloud" {
+        Placement::Cloud
+    } else {
+        Placement::Local
+    }
 }
 
 pub fn endpoint_kind_ids() -> Vec<&'static str> {
@@ -888,7 +998,8 @@ pub fn has_actor(provider: &str, kind: &str) -> bool {
 /// enrolls for strict build-slot admission (CAD-230). Panes keep their
 /// legacy binding; the fake and mailbox kinds own no provider process.
 pub fn enrolls_build_slots(provider: &str, kind: &str) -> bool {
-    matches!(provider, "claude" | "codex" | "pi") && matches!(kind, "managed" | "managed-ws")
+    (matches!(provider, "claude" | "codex") && matches!(kind, "managed" | "managed-ws"))
+        || pi_family_managed(provider, kind)
 }
 
 /// The endpoint exposes an attachable surface (tmux pane or provider
@@ -1247,7 +1358,7 @@ pub fn validate_next_launch_param(
         (_, Value::Null) => Ok(()),
         ("effort", Value::String(level)) if provider == "claude" => claude_effort(level),
         ("effort", Value::String(level)) if provider == "codex" => codex_effort(level),
-        ("effort", Value::String(level)) if provider == "pi" => pi_effort(level),
+        ("effort", Value::String(level)) if pi_family_managed(provider, kind) => pi_effort(level),
         ("approval_policy", Value::String(policy)) => codex_approval_policy(policy),
         ("confine", Value::Bool(_)) => Ok(()),
         ("model", Value::String(m)) if !m.trim().is_empty() => Ok(()),
@@ -1530,6 +1641,25 @@ fn validate_devin_cloud(params: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Does this endpoint run the Pi adapter — and therefore its Landlock
+/// confinement, its session handling and its Settings allowlist gate? The
+/// capability decides, never the provider name, so a pi-compatible runtime
+/// (pi, omp, and whatever joins them) inherits all three by construction.
+pub fn pi_family_managed(provider: &str, kind: &str) -> bool {
+    kind == "managed"
+        && spec(provider, kind).is_ok_and(|spec| spec.capabilities.contains(&"managed_pi_rpc"))
+}
+
+/// Provider-level variant of [`pi_family_managed`]. The Settings allowlist
+/// and confinement policy gate on the provider, so a stored row whose
+/// kind is inconsistent with its provider must still fail closed rather
+/// than skip the policy read.
+pub fn pi_family_provider(provider: &str) -> bool {
+    SPECS
+        .iter()
+        .any(|spec| spec.provider == provider && spec.capabilities.contains(&"managed_pi_rpc"))
+}
+
 /// Register-time validation for enumerated launch params. Params not
 /// named here keep their historical pass-through (claude's modes are
 /// provider-validated — its own CLI rejects bad values on spawn).
@@ -1635,11 +1765,15 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
             }
         }
     }
-    if provider == "pi" {
+    if pi_family_managed(provider, kind) {
         if let Some(v) = params.get("model") {
             match v.as_str() {
                 Some(model) if !model.trim().is_empty() => {}
-                _ => return Err(Error::rejected("pi model must be a non-empty string")),
+                _ => {
+                    return Err(Error::rejected(format!(
+                        "{provider} model must be a non-empty string"
+                    )))
+                }
             }
         }
         if let Some(v) = params.get("effort") {
@@ -1647,21 +1781,21 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
                 Some(level) => pi_effort(level)?,
                 None => {
                     return Err(Error::rejected(format!(
-                        "pi effort must be a string, one of: {}",
+                        "{provider} effort must be a string, one of: {}",
                         PI_EFFORTS.join(", ")
                     )))
                 }
             }
         }
     }
-    // CAD-556: Landlock confinement exists for `pi/managed` only —
-    // anywhere else the flag would be silently meaningless, so it is
-    // refused instead of dropped.
+    // CAD-556: Landlock confinement is the Pi adapter's policy. Any managed
+    // endpoint that runs that adapter (pi, omp) may ask for it; anywhere else
+    // the flag would be silently meaningless, so it is refused, not dropped.
     if let Some(v) = params.get("confine") {
-        if !(provider == "pi" && kind == "managed") {
+        if !pi_family_managed(provider, kind) {
             return Err(Error::rejected(
-                "'confine' only applies to pi/managed — the pi worker's \
-                 Landlock policy is the only worker confinement today",
+                "'confine' only applies to a managed Pi-family endpoint — \
+                 the Pi adapter's Landlock policy is the only worker confinement today",
             ));
         }
         if !v.is_boolean() {
@@ -1771,6 +1905,21 @@ pub fn capabilities_json(provider: &str, kind: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn placement_is_derived_from_the_pair() {
+        assert_eq!(super::placement("devin", "cloud"), super::Placement::Cloud);
+        assert_eq!(super::placement("pi", "managed"), super::Placement::Local);
+        assert_eq!(
+            super::placement("codex", "managed-ws"),
+            super::Placement::Local
+        );
+        assert_eq!(super::placement("claude", "pty"), super::Placement::Local);
+        assert_eq!(
+            super::placement("inbox", super::INBOX),
+            super::Placement::Queue
+        );
+        assert_eq!(super::placement("fake", "fake"), super::Placement::Local);
+    }
     use super::*;
 
     #[test]
@@ -1833,7 +1982,7 @@ mod tests {
         );
         assert_eq!(
             spec("devin", "managed").unwrap_err().to_string(),
-            "No managed adapter for provider 'devin' (implemented: codex, claude, pi)"
+            "No managed adapter for provider 'devin' (implemented: codex, claude, pi, omp)"
         );
         assert_eq!(
             spec("devin", "bogus").unwrap_err().to_string(),
@@ -1877,7 +2026,13 @@ mod tests {
     fn model_matrix_keeps_devin_and_drops_test_doubles() {
         let rows = model_provider_matrix();
         let ids: Vec<&str> = rows.iter().map(|row| row.id).collect();
-        assert_eq!(ids, vec!["codex", "claude", "pi", "devin", "cursor"]);
+        assert_eq!(
+            ids,
+            vec!["codex", "claude", "pi", "omp", "devin", "cursor", "sandbox"]
+        );
+        assert!(rows
+            .iter()
+            .any(|row| { row.id == "sandbox" && !row.eligible && row.limitation.is_some() }));
         assert!(rows.iter().any(|row| row.id == "claude" && row.eligible));
         assert!(rows.iter().any(|row| row.id == "pi" && row.eligible));
         assert!(rows
@@ -2346,15 +2501,15 @@ mod tests {
     }
 
     /// Adding an endpoint kind forces a decision: every spec row names
-    /// its scheme, and only pty rows, managed claude and managed pi have
-    /// one today.
+    /// its scheme, and only pty rows, managed claude and the managed
+    /// Pi family have one today.
     #[test]
     fn only_generation_minting_endpoints_carry_a_turn_token_scheme() {
         for s in SPECS {
             let expected = match (s.provider, s.endpoint_kind) {
                 (_, "pty") => Some(PTY_TURN_TOKENS),
                 ("claude", "managed") => Some(CLAUDE_MANAGED_TURN_TOKENS),
-                ("pi", "managed") => Some(PI_MANAGED_TURN_TOKENS),
+                _ if pi_family_managed(s.provider, s.endpoint_kind) => Some(PI_MANAGED_TURN_TOKENS),
                 _ => None,
             };
             assert_eq!(s.turn_token, expected, "{}/{}", s.provider, s.endpoint_kind);

@@ -1,9 +1,9 @@
 /**
- * The colour theme: the system preference unless the operator picked one.
- * A pick is stored per browser and applied as `data-theme` on <html>,
- * which styles.css reads; "system" removes both, so the media query
- * decides again. Storage can throw (private windows, locked-down web
- * views) — then the pick lasts only for the page.
+ * The colour theme: the system preference by default, unless the operator
+ * picked one. A pick is stored per browser and applied as `data-theme` on
+ * <html>, which styles.css reads; "system" is stored explicitly so the media
+ * query decides. Storage can throw (private windows, locked-down web views) —
+ * then the pick lasts only for the page.
  */
 
 export type ThemePref = "system" | "light" | "dark";
@@ -13,7 +13,7 @@ const THEME_KEY = "cadence-theme";
 export function readThemePref(storage: Pick<Storage, "getItem"> | undefined): ThemePref {
   try {
     const value = storage?.getItem(THEME_KEY);
-    return value === "light" || value === "dark" ? value : "system";
+    return value === "light" || value === "dark" || value === "system" ? value : "system";
   } catch {
     return "system";
   }
@@ -24,8 +24,9 @@ export function writeThemePref(
   storage: Pick<Storage, "setItem" | "removeItem"> | undefined,
 ): void {
   try {
-    if (pref === "system") storage?.removeItem(THEME_KEY);
-    else storage?.setItem(THEME_KEY, pref);
+    // "system" is a real pick, not an absence: it is stored explicitly so
+    // the next load does not conflate it with the default.
+    storage?.setItem(THEME_KEY, pref);
   } catch {
     // Unstorable: the theme still applies until the page reloads.
   }
@@ -34,6 +35,20 @@ export function writeThemePref(
 /** system → light → dark → system. */
 export function nextThemePref(pref: ThemePref): ThemePref {
   return pref === "system" ? "light" : pref === "light" ? "dark" : "system";
+}
+
+/**
+ * The next pick for a control that must always change what is on screen.
+ *
+ * Derived from what is *rendered*, not from the pref's name: an explicit
+ * "light" on a light OS renders exactly like "system" does, so a successor
+ * computed from the pref alone can be invisible. Whatever the starting state,
+ * the toggle lands on the opposite of the current render. "System" remains
+ * selectable from the account menu; the header control is a light/dark switch.
+ */
+export function nextThemeFor(pref: ThemePref, systemDark: boolean): ThemePref {
+  const renderedDark = pref === "dark" || (pref === "system" && systemDark);
+  return renderedDark ? "light" : "dark";
 }
 
 function browserStorage(): Storage | undefined {
@@ -59,4 +74,24 @@ export function initTheme(): ThemePref {
 export function setThemePref(pref: ThemePref): void {
   writeThemePref(pref, browserStorage());
   applyThemePref(pref);
+}
+
+/** The theme a framed app must be told about: the `data-theme` the board is
+ *  actually showing, or null for "system" (the pick that leaves the attribute
+ *  off so the OS decides). A sandboxed frame is a separate document and never
+ *  sees this attribute, so the host must carry it into the mount. */
+export type FrameTheme = "light" | "dark";
+export function appliedFrameTheme(root: HTMLElement = document.documentElement): FrameTheme | null {
+  const value = root.getAttribute("data-theme");
+  return value === "light" || value === "dark" ? value : null;
+}
+
+/** Observe the applied theme, so an open screen can re-mint with the new one.
+ *  Returns an unsubscribe (no-op outside a browser). */
+export function onAppliedThemeChange(listener: (theme: FrameTheme | null) => void): () => void {
+  if (typeof MutationObserver === "undefined" || typeof document === "undefined") return () => {};
+  const target = document.documentElement;
+  const observer = new MutationObserver(() => listener(appliedFrameTheme(target)));
+  observer.observe(target, { attributes: true, attributeFilter: ["data-theme"] });
+  return () => observer.disconnect();
 }

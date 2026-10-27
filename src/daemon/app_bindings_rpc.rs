@@ -266,15 +266,104 @@ impl Shared {
         let sink = adapter
             .connection_registration()
             .ok_or_else(|| Error::rejected("connection sink registration unavailable"))?;
-        Ok(
-            json!({"schema":1,"install_id":install,"context":context,"bundle_digest":bundle["digest"],
+        let mut config = json!({"schema":1,"install_id":install,"context":context,"bundle_digest":bundle["digest"],
             "workspace_id":self.store.connection_workspace_id()?,"connection_id":connection["id"],
             "provider":provider,"account":connection["account"],"connection_kind":connection["kind"],
             "connection_revision":connection["revision"],"registration_digest":connection["registration_digest"],
             "sink_registration":sink,"descriptor_revision":descriptor.revision,
             "reviewed_pin":connection["status"]["reviewed_pin"],"reported_pin":connection["status"]["reported_pin"],
-            "mapping":mapping,"declaration":declaration}),
-        )
+            "mapping":mapping,"declaration":declaration});
+        if provider == crate::platform::account_media::PLATFORM {
+            let source = crate::platform::account_media::identities()?
+                .into_iter()
+                .find(|identity| {
+                    connection["account"]
+                        == crate::platform::account_media::account_handle(identity)
+                })
+                .ok_or_else(|| Error::rejected("saved account source is missing or replaced"))?;
+            config["account_source"] =
+                serde_json::to_value(crate::platform::account_media::AccountSource::from(&source))?;
+        }
+        Ok(config)
+    }
+
+    /// A genuinely never-bound image slot may use the one account owned by
+    /// the proven native actor. Any explicit row or tombstone is authoritative.
+    pub(super) fn app_binding_auto_image(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        slot: &str,
+        actor: &Value,
+        bundle: &Value,
+        files: &BTreeMap<String, String>,
+    ) -> Result<Option<BindingProof>> {
+        if let Some(proof) = self.app_binding_live(install, context, slot, bundle, files)? {
+            self.app_account_binding_owned(actor, &proof)?;
+            return Ok(Some(proof));
+        }
+        if self
+            .store
+            .app_binding_slot_recorded(install, context, slot)?
+        {
+            return Ok(None);
+        }
+        let manifest = app::parse_manifest(
+            files
+                .get("app.md")
+                .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
+        )?;
+        let declaration = manifest
+            .capabilities
+            .get(slot)
+            .ok_or_else(|| Error::rejected("capability slot is not declared by this app"))?;
+        declaration.validate()?;
+        if declaration.capability != "media.generate"
+            || declaration.version != 1
+            || declaration.action != "generate_image"
+            || declaration.effect != "draft"
+            || declaration.resource_kind != "connection_account"
+        {
+            return Ok(None);
+        }
+        let mut eligible = crate::platform::account_media::identities()?
+            .into_iter()
+            .filter(|source| {
+                Self::account_image_owned(
+                    actor,
+                    &crate::platform::account_media::AccountSource::from(source),
+                )
+            });
+        let source = match (eligible.next(), eligible.next()) {
+            (Some(source), None) => source,
+            (None, _) => {
+                return Err(Error::rejected(
+                    "no signed-in image account belongs to the proven native actor",
+                ))
+            }
+            _ => {
+                return Err(Error::rejected(
+                    "choose the image account from the signed-in accounts",
+                ))
+            }
+        };
+        self.account_image_actor_live(actor)?;
+        let account = crate::platform::account_media::account_handle(&source);
+        let connection =
+            self.builtin_connection_id(crate::platform::account_media::PLATFORM, &account)?;
+        let config = self.app_binding_config(install, context, slot, &connection, bundle, files)?;
+        if config["account_source"]
+            != serde_json::to_value(crate::platform::account_media::AccountSource::from(&source))?
+        {
+            return Err(Error::rejected(
+                "saved image account changed during binding",
+            ));
+        }
+        let request = format!("account-image-{}", uuid::Uuid::new_v4().simple());
+        self.store
+            .app_binding_create(install, context, slot, &config, &request)?;
+        self.store
+            .app_binding_for_slot(install, context, slot, required_str(bundle, "digest")?)
     }
 
     /// CAD-1119: the binding a new run or quote uses for one slot. A
@@ -301,6 +390,9 @@ impl Shared {
         else {
             return Ok(None);
         };
+        // Runtime use is unsupported even when a historical metadata binding
+        // exists. Refuse before readiness re-derivation or compatible migration.
+        self.refuse_encrypted_binding(&proof.config)?;
         let connection = proof.config["connection_id"]
             .as_str()
             .ok_or_else(|| Error::rejected("binding connection receipt is missing"))?;
@@ -373,39 +465,131 @@ impl Shared {
         bundle: &Value,
         files: &BTreeMap<String, String>,
     ) -> Result<()> {
-        let current = self
-            .store
-            .app_binding_for_slot(install, context, slot, required_str(bundle, "digest")?)?
-            .ok_or_else(|| Error::rejected("publication binding is absent or revoked"))?;
-        if current.id != proof.id
-            || current.revision != proof.revision
-            || current.digest != proof.digest
-            || current.config != proof.config
-        {
-            return Err(Error::rejected(
-                "publication binding revision or incarnation changed",
-            ));
+        let current = self.configured_slot_proof(install, context, slot, bundle)?;
+        if binding_proof_exact(&current, proof) {
+            return self.binding_receipt_live(install, context, slot, &proof.config, bundle, files);
         }
+        Err(Error::rejected(
+            "publication binding revision or incarnation changed",
+        ))
+    }
+
+    /// CAD-1508: library refine may use a retained source whose producing
+    /// binding was carried onto the installed bundle by approved upgrades.
+    /// A proof that already matches the live row takes the same path as
+    /// [`Self::app_binding_receipt_current`]. Anything else still refuses.
+    pub(super) fn app_binding_receipt_library_source(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        slot: &str,
+        proof: &BindingProof,
+        bundle: &Value,
+        files: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let current = self.configured_slot_proof(install, context, slot, bundle)?;
+        if binding_proof_exact(&current, proof) {
+            return self.binding_receipt_live(install, context, slot, &proof.config, bundle, files);
+        }
+        if self
+            .store
+            .app_binding_upgrade_carried(install, context, slot, proof, &current)?
+        {
+            return self.binding_receipt_live(
+                install,
+                context,
+                slot,
+                &current.config,
+                bundle,
+                files,
+            );
+        }
+        Err(Error::rejected(incarnation_refusal(proof, &current)))
+    }
+
+    fn configured_slot_proof(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        slot: &str,
+        bundle: &Value,
+    ) -> Result<BindingProof> {
+        self.store
+            .app_binding_for_slot(install, context, slot, required_str(bundle, "digest")?)?
+            .ok_or_else(|| Error::rejected("publication binding is absent or revoked"))
+    }
+
+    fn binding_receipt_live(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        slot: &str,
+        config: &Value,
+        bundle: &Value,
+        files: &BTreeMap<String, String>,
+    ) -> Result<()> {
         let configured = carry_publish(
             self.app_binding_config(
                 install,
                 context,
                 slot,
-                proof.config["connection_id"]
+                config["connection_id"]
                     .as_str()
                     .ok_or_else(|| Error::rejected("binding connection receipt is missing"))?,
                 bundle,
                 files,
             )?,
-            &proof.config,
+            config,
         );
-        if configured != proof.config {
+        if configured != *config {
             return Err(Error::rejected(
                 "publication binding installation/context/connection receipt is stale",
             ));
         }
         Ok(())
     }
+}
+
+fn shown_binding_id(id: &str) -> &str {
+    if crate::proto::identifier(id, "binding id").is_ok() {
+        id
+    } else {
+        "unrecognized"
+    }
+}
+
+fn shown_digest(digest: &str) -> &str {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return "unrecognized";
+    };
+    if hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        digest
+    } else {
+        "unrecognized"
+    }
+}
+
+fn binding_proof_exact(current: &BindingProof, proof: &BindingProof) -> bool {
+    current.id == proof.id
+        && current.revision == proof.revision
+        && current.digest == proof.digest
+        && current.config == proof.config
+}
+
+fn incarnation_refusal(proof: &BindingProof, current: &BindingProof) -> String {
+    format!(
+        "publication binding incarnation changed: retained proof is binding {} revision {} digest {}; live binding is {} revision {} digest {}. Regenerate the source image on the current build",
+        shown_binding_id(&proof.id),
+        proof.revision,
+        shown_digest(&proof.digest),
+        shown_binding_id(&current.id),
+        current.revision,
+        shown_digest(&current.digest),
+    )
 }
 
 pub(super) fn strict_fields(params: &Value, allowed: &[&str]) -> Result<()> {

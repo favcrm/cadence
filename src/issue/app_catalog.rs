@@ -1,8 +1,13 @@
 //! CAD-630 foundation: explicit single-workspace installation catalog.
 //! No daemon/HTTP routing, execution or grant translation is enabled here.
 pub mod builtin;
-mod fs;
+pub(crate) mod catalogue;
+pub(crate) mod client;
+pub(super) mod fs;
 pub mod workspace;
+
+#[cfg(test)]
+mod cad1862_acceptance;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -72,14 +77,6 @@ pub struct Entry {
     pub storage: Storage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_revision: Option<String>,
-}
-impl Entry {
-    /// Is this installation soft-removed? The mark lives on its
-    /// record, not the catalog — the caller reads the record itself
-    /// (CAD-1129 H5).
-    pub fn removed(&self) -> bool {
-        false
-    }
 }
 impl Entry {
     fn paths(&self, id: &InstallationId) -> (PathBuf, PathBuf) {
@@ -566,76 +563,23 @@ impl Catalog {
         let current: Catalog = decode(&required(root, Path::new(CATALOG), CATALOG_CAP)?)?;
         current.validate()?;
         if current != *self {
-            return Err(Error::rejected(
+            return Err(Error::invalid(
+                CATALOG_NOT_CURRENT,
                 "cached catalog generation is no longer published",
             ));
         }
         Ok(())
     }
     pub fn load(root: &Path) -> Result<Self> {
-        Self::load_observed(root, || {})
-    }
-    fn load_observed(root: &Path, observed: impl FnOnce()) -> Result<Self> {
         let root = Root::open(root)?;
         no_pending(&root)?;
         let catalog: Self = decode(&required(&root, Path::new(CATALOG), CATALOG_CAP)?)?;
         catalog.validate()?;
-        observed();
         for id in catalog.installations.keys() {
             catalog.installation(&root, id)?;
         }
         catalog.require_current(&root)?;
         Ok(catalog)
-    }
-    #[cfg(feature = "test-seam")]
-    #[doc(hidden)]
-    pub fn load_with_observer(root: &Path, observed: impl FnOnce()) -> Result<Self> {
-        Self::load_observed(root, observed)
-    }
-    pub fn resolve_id(&self, root: &Path, id: &str) -> Result<Installation> {
-        self.resolve_observed(root, id, || {})
-    }
-    fn resolve_observed(
-        &self,
-        root: &Path,
-        id: &str,
-        observed: impl FnOnce(),
-    ) -> Result<Installation> {
-        let id = InstallationId::parse(id)?;
-        let root = Root::open(root)?;
-        self.require_current(&root)?;
-        observed();
-        let installation = self.installation(&root, &id)?;
-        self.require_current(&root)?;
-        Ok(installation)
-    }
-    #[cfg(feature = "test-seam")]
-    #[doc(hidden)]
-    pub fn resolve_id_with_observer(
-        &self,
-        root: &Path,
-        id: &str,
-        observed: impl FnOnce(),
-    ) -> Result<Installation> {
-        self.resolve_observed(root, id, observed)
-    }
-    pub fn resolve_legacy(&self, root: &Path, project: &str, name: &str) -> Result<Installation> {
-        model::check_key(project)?;
-        if !model::valid_tag(name) {
-            return Err(Error::rejected("invalid legacy app name"));
-        }
-        let id = self
-            .installations
-            .iter()
-            .find_map(|(id, entry)| match &entry.storage {
-                Storage::Legacy {
-                    project: p,
-                    name: n,
-                } if p == project && n == name => Some(id),
-                _ => None,
-            })
-            .ok_or_else(|| Error::rejected("unknown exact legacy installation alias"))?;
-        self.resolve_id(root, id)
     }
 }
 
@@ -658,21 +602,39 @@ fn record(text: &str, name: &str) -> Result<Record> {
     }
     Ok(record)
 }
+/// CAD-1212: stable codes for the refusals the lock-free read retry
+/// (`workspace::optimistic`) classifies. It matches these, never message
+/// text, so rewording a message cannot silently disable a retry.
+pub(crate) const PENDING_UPGRADE: &str = "app_upgrade_pending";
+pub(crate) const PENDING_INSTALL: &str = "app_install_pending";
+pub(crate) const PENDING_PUBLICATION: &str = "app_catalog_publication_pending";
+pub(crate) const CATALOG_NOT_CURRENT: &str = "app_catalog_not_current";
+pub(crate) const RECORD_CHANGED: &str = "app_record_changed_during_inspection";
+pub(crate) const ADMISSION_CHANGED: &str = "app_changed_during_runtime_admission";
+pub(crate) const LEGACY_CHANGED: &str = "app_legacy_files_changed_during_read";
+
 fn no_pending(root: &Root) -> Result<()> {
     if root
         .read(Path::new(".apps/upgrade-pending.yaml"), RECORD_CAP)?
         .is_some()
     {
-        return Err(Error::rejected("workspace upgrade is pending; use app catalog upgrade-recover with its installation ID and request ID"));
+        return Err(Error::invalid(
+            PENDING_UPGRADE,
+            "workspace upgrade is pending; use app catalog upgrade-recover with its installation ID and request ID",
+        ));
     }
     if root
         .read(Path::new(".apps/install-pending.yaml"), RECORD_CAP)?
         .is_some()
     {
-        return Err(Error::rejected("workspace installation is pending; use app catalog recover with the retained installation ID"));
+        return Err(Error::invalid(
+            PENDING_INSTALL,
+            "workspace installation is pending; use app catalog recover with the retained installation ID",
+        ));
     }
     if root.read(Path::new(PENDING), RECORD_CAP)?.is_some() {
-        return Err(Error::rejected(
+        return Err(Error::invalid(
+            PENDING_PUBLICATION,
             "app catalog publication is pending; recover its retained journal first",
         ));
     }

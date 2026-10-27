@@ -752,7 +752,10 @@ pub(crate) fn tcp_peer_agent(
 /// of a daemon-launched tool re-parents to the daemon), carries no
 /// agent environment, holds no pane pty, and leads or descends from
 /// its session. A peer on another host, or whose socket has no visible
-/// owner, is unprovable and refused.
+/// owner, is unprovable and refused. A live loopback socket with no
+/// process in this pid namespace is reported separately by
+/// [`loopback_ownerless`]; the board accepts that only after an
+/// operator session.
 pub(crate) fn tcp_peer_operator_proof(
     server_port: u16,
     peer: SocketAddr,
@@ -776,6 +779,21 @@ pub(crate) fn tcp_peer_operator_proof(
         roots.operator_proof(pid, uid, daemon_pid)?;
     }
     Ok(())
+}
+
+/// A live loopback client socket whose process is not in this pid
+/// namespace. Distinct from a closed socket (`client_socket` is
+/// `None`), which stays unprovable. The board treats this as the
+/// operator's tunnel only after a live operator session.
+pub(crate) fn loopback_ownerless(server_port: u16, peer: SocketAddr) -> bool {
+    let peer = canonical(peer);
+    if !peer.ip().is_loopback() {
+        return false;
+    }
+    match client_socket(server_port, peer) {
+        Ok(Some((inode, _))) => socket_owners(inode).is_empty(),
+        _ => false,
+    }
 }
 
 /// A v4-mapped v6 address (`::ffff:127.0.0.1`, what a dual-stack
@@ -1155,6 +1173,24 @@ mod tests {
             let err = proof(&managed).unwrap_err();
             assert!(err.contains("enrolled managed endpoint"), "{err}");
         }
+    }
+
+    /// A connection this process holds has a visible owner, so the
+    /// ownerless-tunnel excuse does not apply to it.
+    #[test]
+    fn a_visible_loopback_client_is_not_treated_as_an_ownerless_tunnel() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (_accepted, peer) = listener.accept().unwrap();
+        let (inode, _) = client_socket(port, peer).unwrap().unwrap();
+        assert!(
+            !socket_owners(inode).is_empty(),
+            "this process owns the socket, so operator proof must still inspect it"
+        );
+        assert!(!loopback_ownerless(port, peer));
+        let (_, uid) = proc_uids(std::process::id()).unwrap();
+        assert!(tcp_peer_operator_proof(port, peer, uid, 0, &AgentRoots::default()).is_ok());
     }
 
     /// The client socket's uid column is read, and it is ours for a

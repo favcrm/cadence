@@ -2,22 +2,24 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fmtBytes } from "../../lib/fmt";
 import type { Route } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
+import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
+import PageState from "../../ui/PageState";
 import {
   blobPage,
   wiki,
   WikiError,
-  wikiFileUrl,
-  wikiRawUrl,
   type WikiEntry,
   type WikiListing,
   type WikiPage,
 } from "./api";
+import { isCollectionRoot, readRevision } from "./knowledge";
+import CollectionPane from "./CollectionPane";
 import { treeRows } from "./tree";
 import { scopedAncestors, withinScope, type WikiScope } from "./scope";
 import { baseName, joinPath, parentPath } from "./paths";
 import { relTime } from "./history";
-import { kindLabel, previewKind } from "./preview";
+import { kindLabel, previewKind, type PreviewKind } from "./preview";
 import {
   WikiToolbar,
   EmptyCard,
@@ -26,6 +28,7 @@ import {
   LockIcon,
   Note,
   WIKI_ROOT_LABEL,
+  useWikiBlobSource,
   WikiScopeContext,
 } from "./shared";
 import FileExplorer from "./FileExplorer";
@@ -68,6 +71,7 @@ function message(error: unknown): string {
 }
 
 export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }: WikiProps) {
+  const t = useTranslate();
   const root = scope?.root ?? "";
   const current = route.path ?? root;
   const validPath = withinScope(current, root);
@@ -193,6 +197,11 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
     };
     void (async () => {
       try {
+        if (route.at !== undefined) {
+          if (!path || !route.at) throw new WikiError("This revision is unavailable", 404);
+          land({ path, kind: "file", page: { ...(await readRevision(path, route.at)), historical: true } });
+          return;
+        }
         const known = path ? entryOf(path) : null;
         if (path === root || known?.kind === "dir") {
           land(await listing());
@@ -223,7 +232,7 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
     return () => {
       cancelled = true;
     };
-  }, [route.mode, current, root, validPath, entryOf, tick, scope]);
+  }, [route.mode, route.at, current, root, validPath, entryOf, tick, scope]);
 
   const toggle = (path: string) => {
     if (expanded.has(path)) {
@@ -246,18 +255,18 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
     navHref({ screen: "wiki", mode: "browse", path: path || null, query: null });
   const dir = open?.kind === "dir" ? open.path : parentPath(current);
 
-  if (!validPath) return <EmptyCard title="Page outside this project">Choose a page from this project’s file explorer.</EmptyCard>;
+  if (!validPath) return <EmptyCard title={t("Page outside this project")}>{t("Choose a page from this project’s file explorer.")}</EmptyCard>;
 
   return (
     <WikiScopeContext value={scope}>
     <div className="wk-content">
       <div className="wk-split">
         <FileExplorer
-          label={scope ? "Project files" : "Files"}
+          label={scope ? t("Project files") : t("Files")}
           rows={rows}
           current={current}
           folder={open?.kind === "file" ? parentPath(current) : undefined}
-          emptyText={dirError[root] ? "Files unavailable" : missingRoot || open?.kind === "dir" ? "No pages yet" : "Loading…"}
+          emptyText={dirError[root] ? t("Files unavailable") : missingRoot || open?.kind === "dir" ? t("No pages yet") : t("Loading…")}
           hrefFor={hrefFor}
           onToggle={toggle}
         />
@@ -303,6 +312,8 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
               dir={dir}
               navHref={navHref}
               readOnly={readOnly}
+              section={route.section}
+              page={route.page}
               onToast={onToast}
               onRefresh={refresh}
               onFail={fail}
@@ -324,6 +335,8 @@ function BrowsePane({
   dir,
   navHref,
   readOnly,
+  section,
+  page: citedPage,
   onToast,
   onRefresh,
   onFail,
@@ -336,10 +349,13 @@ function BrowsePane({
   dir: string;
   navHref: (route: Route) => string;
   readOnly: boolean;
+  section?: string;
+  page?: number;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   onRefresh: () => void;
   onFail: (error: unknown, verb: string) => void;
 }) {
+  const t = useTranslate();
   const [creating, setCreating] = useState<{ kind: "page" | "dir"; value: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const createContext = async () => {
@@ -357,17 +373,18 @@ function BrowsePane({
 
   if (error) {
     if (error.status === 403) {
+      // CAD-1312: the refusal is the pane's one calm state — same 403
+      // condition and message selection, the shared PageState styling.
       return (
         <>
           <Bar path={path} navHref={navHref} />
-          <EmptyCard title={error.message.includes("session") ? "Sign in to view these pages" : "Access unavailable"} warn>
-            {error.message.includes("session") ? "Use Sign in at the top of the board to open your project pages." : error.message}
-            <div className="mt-2">
-              <Button href={navHref({ screen: "wiki", mode: "browse", path: null, query: null })}>
-                Back to {scope?.label ?? WIKI_ROOT_LABEL}
-              </Button>
-            </div>
-          </EmptyCard>
+          <PageState title={error.message.includes("session") ? t("Sign in to view these pages") : t("Access unavailable")} actions={
+            <Button href={navHref({ screen: "wiki", mode: "browse", path: null, query: null })}>
+              {t("Back to")} {scope?.label ?? t(WIKI_ROOT_LABEL)}
+            </Button>
+          }>
+            {error.message.includes("session") ? t("Use Sign in at the top of the board to open your project pages.") : error.message}
+          </PageState>
         </>
       );
     }
@@ -421,8 +438,8 @@ function BrowsePane({
       <input
         className="field wk-newinput"
         autoFocus
-        aria-label={creating.kind === "dir" ? "Folder name" : "Page name"}
-        placeholder={creating.kind === "dir" ? "folder name" : "page name"}
+        aria-label={creating.kind === "dir" ? t("Folder name") : t("Page name")}
+        placeholder={creating.kind === "dir" ? t("folder name") : t("page name")}
         value={creating.value}
         onChange={(e) => setCreating({ ...creating, value: e.target.value })}
       />
@@ -440,35 +457,36 @@ function BrowsePane({
       <>
         <WikiToolbar path={path} navHref={navHref} actions={<>
             <Button disabled={writeBlocked} onClick={() => setCreating({ kind: "page", value: "" })}>
-              New page
+              {t("New page")}
             </Button>
             <Button disabled={writeBlocked} onClick={() => setCreating({ kind: "dir", value: "" })}>
-              New folder
+              {t("New folder")}
             </Button>
             <Button
               href={navHref({ screen: "wiki", mode: "upload", path: path || null, query: null })}
               disabled={writeBlocked}
             >
-              Upload
+              {t("Upload")}
             </Button>
-            <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>Search</Button>
+            <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>{t("Search")}</Button>
         </>} />
         {missingRoot && scope && (
-          <EmptyCard title="No project context yet" action={
-            <Button disabled={readOnly || busy} onClick={() => void createContext()}>Create project context</Button>
+          <EmptyCard title={t("No project context yet")} action={
+            <Button disabled={readOnly || busy} onClick={() => void createContext()}>{t("Create project context")}</Button>
           }>
-            Start with a project brief, research, or decisions.
-            {readOnly && " Sign in with editing access to create pages."}
+            {t("Start with a project brief, research, or decisions.")}
+            {readOnly && ` ${t("Sign in with editing access to create pages.")}`}
           </EmptyCard>
         )}
         {locked && (
           <Note warn>
             <LockIcon size={13} />
-            {path ? `${path}/` : WIKI_ROOT_LABEL} is read-only for you — you can read, not write.
+            {path ? `${path}/` : t(WIKI_ROOT_LABEL)} {t("is read-only for you — you can read, not write.")}
           </Note>
         )}
-        {readOnly && !locked && !missingRoot && <Note warn>Sign in with editing access to add or edit pages.</Note>}
+        {readOnly && !locked && !missingRoot && <Note warn>{t("Sign in with editing access to add or edit pages.")}</Note>}
         {newRow}
+        {!missingRoot && isCollectionRoot(path) && <CollectionPane path={path} navHref={navHref} readOnly={readOnly} />}
         {!missingRoot && <FolderPane
           entries={open.listing.entries ?? []}
           navHref={navHref}
@@ -482,42 +500,44 @@ function BrowsePane({
   }
 
   const page = open.page;
-  if (page.kind === "page") return <PagePane page={page} navHref={navHref} readOnly={readOnly} />;
-  return (
-    <>
-      <WikiToolbar path={page.path} navHref={navHref} actions={<>
-          <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>Search</Button>
-          <a className="btn" href={wikiFileUrl(page.path)} download>Download</a>
-      </>} />
-      <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} />
-    </>
-  );
+  if (page.kind === "page" || page.historical) return <PagePane page={page} navHref={navHref} readOnly={readOnly || page.historical === true} section={section} citedPage={citedPage} />;
+  return <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} navHref={navHref} />;
 }
 
-function BlobPane({ page, blob }: { page: WikiPage; blob: ReturnType<typeof previewKind> }) {
-  const url = wikiFileUrl(page.path);
+function BlobPane({ page, blob, navHref }: {
+  page: WikiPage;
+  blob: PreviewKind;
+  navHref: (route: Route) => string;
+}) {
+  const t = useTranslate();
+  const { src, download, error, loading } = useWikiBlobSource(page.path, blob, true);
   const name = baseName(page.path);
   return (
     <>
+      <WikiToolbar path={page.path} navHref={navHref} actions={<>
+        <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>{t("Search")}</Button>
+        {download ? <a className="btn" href={download} download={name}>{t("Download")}</a> : <Button disabled>{t("Download")}</Button>}
+      </>} />
+      {error && <Failure what="could not open this file" error={error} />}
       <div className="wk-pstage">
-        {blob === "image" ? (
-          <img className="wk-img" src={url} alt={name} />
-        ) : blob === "video" ? (
-          <video className="wk-video" src={url} controls preload="metadata">
+        {loading ? <Loading what="loading the file…" /> : blob === "image" && src ? (
+          <img className="wk-img" src={src} alt={name} />
+        ) : blob === "video" && src ? (
+          <video className="wk-video" src={src} controls preload="metadata">
             <track kind="captions" />
           </video>
-        ) : blob === "pdf" ? (
-          <iframe className="wk-pdf" src={url} sandbox="" title={name} />
+        ) : blob === "pdf" && src ? (
+          <iframe className="wk-pdf" src={src} sandbox="" title={name} />
         ) : (
           <div className="wk-download">
             <span className="chip bg-ink-800 text-ink-400">{kindLabel(name, page.mime)}</span>
             <div className="wk-etitle">{name}</div>
             <div className="wk-ebody">
-              this type has no inline preview — download it, or open it with the tool it belongs to.
+              {t("this type has no inline preview — download it, or open it with the tool it belongs to.")}
             </div>
-            <a className="btn btn-primary" href={wikiRawUrl(page.path)} download>
-              Download
-            </a>
+            {download && <a className="btn btn-primary" href={download} download={name}>
+              {t("Download")}
+            </a>}
           </div>
         )}
       </div>
@@ -525,7 +545,7 @@ function BlobPane({ page, blob }: { page: WikiPage; blob: ReturnType<typeof prev
         <span className="num">{name}</span>
         {page.size != null && <span>{fmtBytes(page.size)}</span>}
         {page.mime && <span>{page.mime}</span>}
-        {page.edited_by && <span>uploaded by {page.edited_by}</span>}
+        {page.edited_by && <span>{t("uploaded by")} {page.edited_by}</span>}
         {page.mtime && <span>{relTime(page.mtime)}</span>}
       </div>
     </>

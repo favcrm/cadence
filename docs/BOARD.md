@@ -36,6 +36,93 @@ Activation needs an operator-reviewed image/configuration backup and restore
 runbook; a failed guard must not automatically fall back to the sessionless
 local surface.
 
+## My work
+
+My work (`/my-work`) lists PM issues assigned to the signed-in human. It reuses
+the current issue read model and links to the existing Issue page for requirements,
+comments, references and progress. Refresh rereads the tracker; reassignment removes
+the issue from the previous owner's personal result. Loading, empty and unavailable
+states do not invent work. No local agent, model provider or Git repository is needed.
+Refresh retains keyboard focus while its read is pending and announces the busy
+state on the page. Refreshing again cancels the previous read; a late response
+cannot replace the newer result.
+
+The queue reads one page at a time (CAD-1703). Tabs split Active (doing, review,
+ready and backlog, grouped in that order), Done, Dropped and All, each with its
+count. Search matches an issue's id or title; Project, Priority and Blocked only
+narrow the results, and Sort orders by last update, priority or creation. The
+server applies all of them, so a search finds done issues that were never loaded.
+The view lives in the URL (`/my-work?tab=done&search=smtp&project=cadence`), so
+reloading or sharing the link restores it. Load more appends the next 50 rows;
+its cursor names the last row shown, not an offset, so a row that changed tabs
+in between is neither repeated nor skipped among the rest. A refresh or live
+update re-reads the rows already loaded (up to 500) rather than dropping them.
+
+`GET /api/my-work` accepts exactly `tab`, `q`, `project`, `priority`, `blocked`,
+`sort`, `cursor` and `limit` (1-100, default 50); any other parameter, a repeat
+or a malformed value is a 400. The response adds `total` for the tab, `counts`
+per tab and per status (every filter except the tab), `next_cursor`, and the
+`projects` the caller holds issues in. Rows are a queue projection (status,
+priority, blocked, checks, comment count, `updated`), not the full board card.
+
+Each compact card has an Inspect button and a separate Details link. Inspect
+opens a native modal snapshot; full details, history, evidence and execution
+remain on the existing Issue page. Returning from Details restores the queue's
+scroll and focused item. On narrow screens the drawer fills the viewport, with
+Close and full-details navigation pinned around its scrolling body.
+
+The personal drawer permits two existing revision-bound writes: a comment and
+an explicit status Save. Selecting a status alone never writes, and an unchanged
+status cannot be saved. Derived/container status locks only the status control;
+it does not prohibit an otherwise authorized comment. Current membership,
+write permission and fresh issue reads are required for either action. Failed
+or conflicting writes retain the draft and never replay automatically. Drafts
+and pending submission tokens survive close/reopen in memory, scoped to the
+issue and verified session; changing identity clears them.
+
+A denied issue read (401/403/404) retires its personal card and draft even if
+the drawer has already closed. A write refusal instead triggers fresh reads
+and permission verification: it does not itself prove the issue is unreadable.
+Older projection responses cannot restore a retired row.
+
+Assignment context is optional and is read for one issue at a time:
+`GET /api/my-work/issues/<ID>` answers whether that issue is still the caller's
+and, when it is, its recorded handoff. The peek uses it both for its
+Assignment row and for the membership its writes require, because the queue
+holds only the loaded page. A bounded, shared first-parent Git history walk
+proves the current ownership transition against a pinned history head;
+unresolved history, actors, corrupt objects or changed snapshots return
+unavailable context. Git authors and later no-op edits are not assigners.
+Self-assignment requires the exact verified human receipt, never the shared
+`operator` spelling. Provenance work finishes before the final caller/policy
+check and is limited by a shared deadline and object-read budget.
+
+My work remains an assigned-task queue, not a personal read-receipt or follow-up
+list. Status represents shared task progress; opening Inspect changes neither
+status nor attention state. Comment counts are totals, not unread indicators.
+Done and dropped issues stay reachable under their tabs; no personal tracking
+fields are introduced.
+
+The board derives the owner from its live session and rechecks the caller after
+the read. No query parameter names an owner, subject or role. Local board sessions use the existing
+`operator` attribution; named hosted Owners and Members retain their own user handles.
+Existing project access is applied before deriving cards, relationships and epic
+roll-ups; being assigned an issue never grants access to its project. Owner
+administrative visibility does not replace the Owner's individual attribution.
+Only readable issue targets contribute parent, blocker, related and duplicate
+links. This scoped PM projection is not an execution-eligibility decision.
+The read is discarded if its project-access set or effective caller authority
+changes while it is being prepared. This personal filter introduces no new grant
+and does not activate Private projects or qualify assistant/filesystem isolation.
+
+`cadence --org <org> my-work` provides the same PM read for a signed-in hosted org
+through the existing `cli.read` actor-envelope protocol. The native server derives
+the owner from the verified user actor and accepts no arguments. A local-org CLI
+invocation explains that a hosted org is required. Existing project, issue, setup,
+membership and local-agent commands remain their current interfaces; this feature
+adds no setup/access screens, work-proof format or agent-execution dashboard.
+
+
 ## Issue folder
 
 ```
@@ -102,6 +189,31 @@ created: 2026-09-17T16:01:23Z
 Statuses: `backlog ready doing review done dropped`. Issues are never
 deleted — `dropped` is the end state. `dropped` issues don't render on
 the board (`issue ls` still lists them).
+
+## Pi adapter implementation
+
+`src/adapter/pi.rs` owns the RPC transport and turn lifecycle. Its private
+modules separate launch argv, paths and environment (`pi_launch.rs`),
+confinement profiles (`pi_confine.rs`), the generated tool guard
+(`pi_guard.rs`), and provider catalogues (`pi_devin_catalog.rs` and
+`pi_agenticos.rs`). Public adapter entry points remain at `adapter::pi`.
+
+The managed master and worker confinement profiles resolve the real Pi program
+and grant the same validated read-only managed dependencies — the install's
+version pointer, the selected release and the selected Node. A confined worker
+can therefore start a managed Pi launcher without receiving neighboring
+releases, release/private credentials, the operator's `HOME`, or any write
+access outside its existing profile. A non-managed launcher layout grants none
+of these.
+
+The worker profile additionally grants the canonical resolver target of
+`/etc/resolv.conf` as a read-only file, and only when that exact target is
+`/run/systemd/resolve/stub-resolv.conf` or `/run/systemd/resolve/resolv.conf`.
+Only the selected regular file is granted: never `/run`, `/run/systemd`, the
+`resolve` directory, a sibling resolver file, an arbitrary symlink target, or
+private files. A `/etc/resolv.conf` that is already a regular file needs no
+extra grant. The master profile and the confinement helper validation are
+unchanged.
 
 ## `[pi]` in pm.yaml — the operator's Pi policy (CAD-559)
 
@@ -244,37 +356,15 @@ unvetted build.
 
 ### Which models to use
 
-- **devin** models are the unconfined worker/reviewer path — check
-  `devin models list` for cost_tier: `swe-2-{high,medium,max}` are
-  **Free**; `deepseek-v4-1-flash-*` is low cost, not free. Default:
-  `devin/swe-2-high` + `--effort max` (SWE-2 Max); DeepSeek V4.1 Flash
-  Max (`devin/deepseek-v4-1-flash-high` + `--effort max`) is the
-  low-cost alternative. Switch a live agent with
-  `agent set <alias> --next-launch model=… effort=max`, then
-  stop + resume.
-  The devin provider exists only because the pinned `pi-devin` package
-  loads with `-e` — a daemon built before CAD-559 launches workers as
-  `--no-extensions` with no `-e`, so the model resolves nowhere and pi
-  exits ("Model \"devin/…\" not found" → the agent fences with
-  "Pi process disconnected"). Check `readlink ~/.local/bin/cadence`
-  before dispatching on a devin model.
-- **`openrouter/*` is the paid path** — do not route workers or
-  reviewers through it. The production master's pinned
-  `openrouter/z-ai/glm-5.3-flash` is the one accepted exception.
-- Verify by hand as the operator:
-  `pi --list-models -e ~/.pi/agent/npm/node_modules/pi-devin/extensions/index.ts | grep devin`
-  (shows `devin deepseek-v4-1-flash-high`, 1.0M ctx, reasoning+tools)
-  and a one-shot
-  `pi -p "Reply with exactly: ok" --no-extensions -e <that path> --model devin/deepseek-v4-1-flash-high`.
-- If deepseek returns `Your Windsurf version is out of date` while
-  `devin/swe-2-high` works and `devin` CLI runs deepseek fine, the
-  backend is gating the `ide` field, not the version: `pi-devin` ≤ 0.2.1
-  sends `ide="devin-desktop"` on every request and Cognition
-  version-gates that ide for non-Local models. Fix in the installed
-  package (`src/stream.ts` `buildMetadata` call): send
-  `ide="windsurf"` unless the model uid starts with `gpt-5-6-` — Devin
-  Local-only models still need `devin-desktop`. Reinstalling the pinned
-  package reverts the patch.
+See [the repository model instructions](../AGENTS.md#pi-agents-and-models-cad-559-cad-855).
+The CLI and operator-owned runtime policy enforce launch permissions.
+An explicit authenticated operator selection takes precedence over those
+preferences, within the applicable runtime allowlist and instructions.
+Workers and reviewers use Pi; Devin is not an exclusive model transport.
+Built-in `openai-codex/*` models do not require the `pi-devin` extension.
+The OpenRouter worker/reviewer prohibition and existing master exception
+remain unchanged. A catalog entry or this documentation does not authorize
+an unlisted model or a production configuration change.
 
 ## `cadence issue` — the only writer
 
@@ -469,9 +559,27 @@ digest is canonical across reordered keys and defaults written out or
 left implicit — but `risk` rule order is significant, so reordering
 rules changes it and needs re-approval.
 
+`integration_branch` optionally permits one additional PR target beside the
+repository default branch (CAD-1561). It must be a canonical branch name, not
+a `refs/` path or revision expression, and match the current, exactly approved
+policy. An unapproved, removed or malformed section cannot enable it through
+the last-approved fallback. Re-approve through the operator connection after
+changing the target; this option does not replace any CI, review or approval
+requirements and is compatible with the supported `solo_operator` profile.
+Requirements and readiness bind the actual target as `base_ref`, alongside
+the head/base OIDs and policy digest. Protection and required checks come from
+that target, including slashed branch names. Retargeting invalidates the
+evidence even when both branches share an OID; old readiness records without
+`base_ref` need fresh binding. Enqueue comments include an exact
+`Base branch: <name>` line. Omitting the option preserves existing policy digests.
+Native merge approval and legacy merge check/enqueued phases enforce the same
+target admission for every policy activation, including custom and fallback
+policies. Operator merge approval does not approve a project integration target.
+
 ```yaml
 delivery:
   merge: {method: squash, queue: true}    # optional; method: squash|merge|rebase
+  integration_branch: staging              # optional; operator-approved extra target
   max_revise: 2                           # optional; 1..=10
   reviews:                                # required, non-empty: the names
     standards: {kind: agent, focus: standards}      # focus: general|standards|
@@ -627,10 +735,17 @@ the `Issue: <ID>` trailer — as JSON.
   else it refuses naming the candidates. An explicit `--repo` must be
   one of the declared repos (code-commit discovery only walks those);
   an undeclared path is refused with the declared list and a pointer
-  to `repos` in `project.yaml`. **Base** resolves `--base`, else fetches
-  the branch named by `origin/HEAD` and pins its exact commit SHA; a
-  repository without a remote default falls back to its current branch.
-  A fetch failure refuses setup with a retry/explicit `--base` remedy.
+  to `repos` in `project.yaml`. **Base** resolves `--base`, else the
+  repo's configured integration branch (`repos[].base`, for example
+  `staging`), else fetches the branch named by `origin/HEAD`, else the
+  remote's symbolic HEAD (`git ls-remote --symref origin HEAD`), and
+  pins that commit. A repository with no `origin` remote uses its
+  current branch. When `origin` exists but its integration branch
+  cannot be resolved, start refuses — it does not adopt the main
+  checkout's current branch. When that checkout's tip is not contained
+  in the integration commit, the lane is still cut from the integration
+  commit and the output's `base.warning` names the mismatch. A fetch
+  failure refuses setup with a retry/explicit `--base` remedy.
 - The worktree is minted through the same helper as
   `cadence devin --worktree` (shared `src/worktree.rs`), including the
   `.gitignore` `.cadence/` rule — added only when missing.
@@ -678,8 +793,8 @@ the `Issue: <ID>` trailer — as JSON.
   else — an operator's own link — is refused, not silently
   half-shared.
 - The worktree gets a `.env` with `CARGO_BUILD_JOBS` and
-  `CADENCE_BUILD_SLOT` for the slot service (docs/PROTOCOL.md). To
-  keep `issue finish`'s clean-tree guard green, `issue start` appends
+  `CADENCE_BUILD_SLOT` for the slot service. To keep `issue finish`'s
+  clean-tree guard green, `issue start` appends
   the root-anchored patterns `/.env` and `/.env.tmp` to the repo's
   `info/exclude` — under flock, idempotent — which for a linked
   worktree is the COMMON git dir: the entries are permanent and cover
@@ -833,6 +948,147 @@ business: no `--ready`, no forced claims; the output prints the queued
 message id and the worker's probe verdict so the operator knows
 whether it lands now or when the pane idles.
 
+**Task context delivery (CAD-1822, CAD-1846).** Plain dispatch, explicit
+`dispatch --job --spec`, and native issue-linked job task dispatch use the
+same project-source and current-policy lesson selection for the actual
+worker's role. They pin the task contract and the assigned project's tracked
+sources, but only when that project's tracked
+`docs/cadence/project-context.yaml` at HEAD sets `agent_delivery: true`.
+Absent or false leaves every existing dispatch path unchanged. A
+tracked manifest the daemon cannot read or parse cannot prove the
+opt-in, so delivery stays off and dispatch is unchanged; once
+`agent_delivery: true` is parsed, an invalid manifest, a missing
+required source or an over-cap payload refuses. Selection
+is daemon-side: the issue's registered project's declared local
+repository and the manifest at HEAD. Required documents are
+selected regardless of role; optional ones by the worker's runtime
+role (`dev` by default, `qa` for reviewer/QA, `pm`/`devops` exact).
+The schema-2 pin includes canonical issue prose (without tracker frontmatter
+or duplicated acceptance lines), complete acceptance, the project revision
+and each source's `id`/`path`/`revision`/`sha256`/bytes. Plain task revisions
+are SHA-256 of the captured `issue.md`. A job task retains its distinct task
+and parent issue identities; its composite revision also covers the complete
+effective spec, stored task criteria, native revision and exact execution/report
+contract, so a spec-only change cannot masquerade as retained context. The
+kickoff carries scope and the native report/SHA contract without duplicating
+the spec or criteria. These persist in a `context_pin` event bound to that
+message id — a retried send keeps its first pin, and two queued
+dispatches cannot share one. Before the first managed turn the daemon
+appends the full contract and sources, quoted as data inside its own
+envelope; a confirmed retained session with the same task, conversation
+and provider session/generation receives no duplicate source body, and
+a new, lost or compacted session restores the complete mandatory
+payload. Optional continuity history is a prefix: it is delivered only
+when the whole pack fits the remaining combined budget, otherwise it
+is omitted whole with a recorded reason — never at the expense of the
+task contract or required sources. A definite provider result — completed,
+failed or interrupted — writes a `context_supplied` receipt (target,
+task/source revisions, included/withheld/omitted reasons,
+session/generation, appended bytes) — supply, not model use. A
+pre-submission refusal, an uncertain outcome or a not-rendered paste
+writes none. For an
+opted-in task the daemon establishes the alias's native home
+conversation at pin time, so enqueue notes, provider compaction notes
+and receipts all name the same thread. Before delivery the actor also
+records one durable activation binding per pin in that conversation —
+the exact pin, task and task revision. A follow-up with no pin of its
+own restores from that binding, never from the alias's latest queued
+pin and never from optional event rollups, so losing a supply receipt
+never loses the task; only `context_supplied` proves residency. A
+failed activation write refuses the turn before provider submission. The
+pin (or a disabled selection) commits in the same admission transaction
+as the accepted message row, so a kickoff becomes claimable only after
+both are durable and a rejected or duplicate envelope writes nothing. A
+native dispatch whose assigned scope is not opted in passes a disabled
+selection that persists one exact-message `context_disabled` marker only
+if the alias already has feature state at that commit — never for a
+never-opted-in legacy alias. Before delivering it the actor clears the
+conversation's active binding (one `context_deactivated` marker, only for
+a real prior binding) and a failed clear refuses the turn before the
+provider. An already-accepted id is decided by the store's exact-envelope
+comparison: an exact lost-acknowledgement retry returns the known accepted
+outcome without re-capturing project context or adding metadata, while a
+genuinely new id is still evaluated for required sources. Same-issue
+re-dispatch after opt-out therefore
+cannot reuse the previous pin, while a legitimate issue follow-up
+without a disabled marker keeps the immutable current pin. These
+markers carry no source bodies and are not written per turn. Delivery
+planning verifies acceptance presence against the actual delivered body
+in order — never inferred from the message source or a non-empty
+manifest; a body that does not carry every criterion gets the complete
+canonical acceptance. A retained turn reports only sources confirmed
+resident by an earlier receipt, plus the actual prior gap
+state/reason for anything still undelivered; if a required source is
+not confirmed resident the turn degrades to a delta and appends it.
+The body itself must fit the combined cap, and the actor's two-byte
+join is counted in every budget. Known local adapter-added prompt
+material is reserved conservatively in the same cap — currently the
+44-byte guarded Pi-adapter task prefix for every registry-defined Pi-family
+provider, even while its guard is off. This is a local byte reservation, not provider-window
+accounting; the receipt records it as `adapter_reserved_bytes`, never as
+appended source. An opted-in plain issue's changed actionable contract or
+kickoff body supersedes a reported plain duplicate. The completed-contract
+comparison excludes tracker bookkeeping, not narrative/title/criteria;
+live retries still return before recapture.
+A missing
+required source, an unusable manifest, a combined payload over 48 000
+bytes, a pinned project context on an endpoint that cannot receive
+prompt content, or a pin naming another task refuses before the turn
+(and, before `issue start`, at dispatch) with `context refused: <code>: …`, where
+`<code>` is `missing-required-source`, `scope-conflict`,
+`unavailable-project`, `unsupported-endpoint`, `mandatory-overflow` or
+`cross-task-binding`. Required acceptance is never truncated. An agent's
+own later file or `message read` calls are its tool use, recorded in the
+thread; they are never counted as the daemon's automatic injection. A
+required document over the reader's
+64 KiB cap, or a required set that cannot fit the combined cap, refuses
+by design — the project must split or demote it in its tracked manifest
+rather than have it silently truncated. A revised task dispatched again
+keeps the earlier message and ref as history: a different kickoff body
+for the same completed worker/lane is an explicit revision, not a
+duplicate.
+
+For opted-in job tasks, spec files must resolve within the canonical issue
+directory, that issue's actual task worktree, or a tracked regular-file path
+at HEAD in the declared project repository. Descriptor-relative reads reject
+symlink escapes and hardlinks; arbitrary external paths are refused. Tracked
+spec paths supply their current bounded UTF-8 working bytes with an exact
+content digest, **not** a claim that those bytes were verified at a Git SHA.
+Opt-out does not read the spec through this context pipeline. Old incomplete
+pins are not silently upgraded to complete contracts; dispatch a new revision.
+For a new opted-in job whose default spec is exactly its canonical `issue.md`,
+the daemon pins `spec_sha256` over the complete Markdown body, including every
+criterion, rather than tracker frontmatter. Claim/lane/message-ref bookkeeping
+therefore cannot invalidate the job's own spec. Material body changes still
+refuse; the accepted job digest is never refreshed. The context manifest
+separately retains the exact raw captured issue/source revision. Other spec
+files retain their raw-byte job hash. A task-specific checklist does not replace
+requirements in the effective canonical spec: only criteria already represented
+verbatim are deduplicated. Older canonical jobs with raw-source hashes are not
+silently converted; recreate/reconcile their binding when that hash no longer
+matches the effective spec.
+
+Eligible lessons reuse the existing accepted-memory matching/rendering policy;
+no approval or verification rule is relaxed. One optional `native:lessons`
+source carries the bounded rendered lessons and selected IDs. Stale/withheld,
+load-failure and whole-source budget omissions remain explicit gaps.
+`--no-lessons` suppresses this source. The opted-in path does not also append
+the legacy lessons sidecar. Supply receipts record lesson IDs, not proof of
+model use or source verification.
+
+CLI retry identity is checked before source capture or `issue start`.
+A live plain kickoff cannot suppress an explicit job kickoff, nor can a
+completed kickoff for a sibling task. A matching open job's canonical
+`<job>-t1` task returns its accepted live/completed message without recapturing
+sources or creating another job. An unaccepted draft is reused only after
+its assignee, issue/lane, branch/base, criteria and spec locator match.
+Ambiguous open jobs, conflicting live modes or an unprovable/ceased accepted
+binding refuse for reconciliation; native task redispatch remains explicit.
+Material task/job/worker identity is rechecked in the admission transaction
+before the pin, message and task revision become visible together.
+An explicit task-bound follow-up cannot borrow another task's active pack;
+a passive report remains ambient rather than activating its reported task.
+
 ### Claims — who may start or dispatch an issue in flight (CAD-383)
 
 Two sessions implementing the same ticket is the failure this prevents:
@@ -966,144 +1222,189 @@ or activity enumeration; an unknown check is not evidence of no live use.
 
 ## Project memory — `cadence memory`
 
-One reviewed fact per file at `<pm>/<project>/memory/<slug>.md`:
-YAML frontmatter (`id`, `type`, `status`, `confidence`, `scope`,
-`author`, authenticated `author_proof`, `source`, `created`,
-`verified_at`, optional `stale`, review cycle/receipts and optional
-`supersedes`)
-plus a body contract — a fact, then `**Why:**` and `**How to apply:**`
-sections. Types are `rule | gotcha | decision | recipe`; statuses are
-`proposed | accepted | rejected | superseded`.
+One claim per canonical file at `<pm>/<project>/memory/<slug>.md`; Wiki
+continues to project those files. There is no second vault or memory database.
+The body remains a fact, `**Why:**` and `**How to apply:**`. Existing types
+`rule | gotcha | decision | recipe` describe the claim's purpose, not its trust.
+
+### Versioned schema and rollout
+
+`src/memory/mod.rs::Front` and `src/memory/policy.rs::PolicyV2` are the
+authoritative serialized schema. New proposals are always server-stamped
+policy revision 2, including proposals read from a file. Imported author,
+approval, verification or usage fields cannot create authority. There is no
+caller-selectable v1 mode and no per-project activation switch.
+
+The optional `policy` distinguishes the existing v1 representation from v2.
+V2 records retain:
+
+- claim nature (`mechanical | judgement`), source provenance, project-local
+  approval audience and optional native team-role restrictions;
+- immutable typed evidence references and an optional declarative check
+  identifier/source revision/target revision — never an executable command;
+- native authorship/contributors, confirmed model evidence where available,
+  operator source attestations, digest/cycle-bound reviews and decisions;
+- bounded latest usage-report receipts and report counts. Full audit history
+  stays in the canonical record, not the default agent context.
+
+Existing v1 records are neither rewritten nor silently adopted. Their native
+two-reviewer/PM lifecycle remains in `memory::submit_review`,
+`memory::finalize_native` and the legacy retrieval evaluator. Incomplete
+historical receipts remain readable but cannot authorize retrieval. Explicit
+legacy adoption belongs to CAD-382.
+
+This is a source rollout, not an installation instruction. After an approved
+installation, every new proposal uses v2; existing files retain their version.
+Mechanical promotion is intentionally blocked until CAD-348 supplies genuine
+native logic-check evidence. A hash, command string, review or operator source
+attestation cannot stand in for a check result. Curator scheduling is CAD-349;
+this change launches no curator or provider.
+
+### Native commands
+
+Example candidate, not pre-approved guidance:
 
 ```bash
-cadence memory propose --project demo --type gotcha \
-    --scope-path 'src/adapter/**' -m "$(cat <<'EOF'
-Retrying a wedged adapter needs daemon restart first.
+cadence memory propose --project demo --type gotcha --nature judgement \
+    --scope-path 'src/adapter/**' -m 'Review a context pack against its recorded revision.
 
-**Why:** the adapter holds the socket.
+**Why:** an unpinned source can change after review.
 
-**How to apply:** `cadence daemon stop` before the retry.
-EOF
-)"
-cadence memory review <slug> --operation accept --verdict pass \
+**How to apply:** inspect the recorded revision before applying this claim.'
+
+cadence memory show <slug> --project demo --json
+cadence memory review <slug> --project demo --operation accept --verdict pass \
     --digest <sha256> --evidence 'source and applicability checks'
-cadence memory accept pipe-drain [--project demo]   # PM finalization only
-cadence memory reject <slug>                       # PM only
-cadence memory supersede <old> <new>               # currently refused
-cadence memory verify <slug>                       # fresh review cycle + PM
-cadence memory ls [--project k]... [--status s]... [--type t]...
-                  [--component c]... [--path f]... [--stale [--days 30]]
-                  [--sort k] [--limit n] [--fields f,…] [--json]
-                                            # value flags repeat/comma-join
-                                            # (any-of); flags AND
-cadence memory show <slug> [--json]
-cadence memory match --issue <ID> [--provider p] [--json]
+cadence memory accept <slug> --project demo --digest <sha256> \
+    --evidence 'decision on this exact judgement'
+cadence memory classify <slug> --project demo --digest <sha256> \
+    --evidence 'operator source-provenance attestation'
+cadence memory revalidate <slug> --project demo --digest <sha256> \
+    --evidence 'why the existing claim must be withheld'
+cadence memory verify <slug> --project demo --digest <sha256> \
+    --evidence 'current-cycle policy decision'
+cadence memory invalidate <slug> --project demo --digest <sha256> \
+    --evidence 'why the claim is no longer valid'
+cadence memory reject <slug> --project demo --digest <sha256> \
+    --evidence 'why the candidate is refused'
+cadence memory supersede <old> <new> --project demo  # refused pending CAD-464
+
+cadence memory feedback <slug> --project demo --digest <sha256> \
+    --message <own-running-message> --token <current-turn> --kind used
+cadence memory ls [--project k]... [--status s]... [--type t]... [--json]
+cadence memory match --issue <ID> [--provider p] [--role dev] [--json]
 cadence memory lint [--project k]
 ```
 
-Every authority-bearing proposal/review/finalization is a daemon RPC.
-The daemon derives exactly one live agent endpoint from the Unix socket
-peer through its one caller-identity verifier (CAD-381): a pty pane by
-current adapter ownership, endpoint generation and process start, or a
-managed (headless claude/codex) endpoint by its daemon-minted CAD-230
-enrollment (provider pid + start time + uid + owner generation), plus the
-registration incarnation. A caller outside every agent tree has no agent
-identity and is refused — which is not operator proof: operator authority
-needs its own positive proof (CAD-276, CAD-313). Two endpoints on one
-ancestry are ambiguous and refused. Request aliases, `CADENCE_ALIAS`,
-operator UI labels and external identities cannot create proof.
-Two distinct non-author PM/worker endpoint identities, displayed with
-unique aliases, must pass the same semantic SHA-256 revision (claim/body,
-trusted author/contributors, type, source, confidence, scope and supersede
-target); an authenticated PM endpoint then finalizes. Body edits, stale
-digests, duplicate aliases, missing evidence, disagreement and reused
-endpoint identities fail closed.
-Legacy accepted records remain visible with a review-blocked reason and
-are excluded from matching until a corrected native proposal is reviewed.
-`verify` opens a fresh receipt cycle; a timestamp alone cannot revalidate.
-Worker receipts do not make a record retrievable: acceptance and each
-verify cycle need a durable PM finalization receipt bound to the same
-semantic digest. A finalized cycle is consumed; a later verify starts the
-next cycle and cannot reuse its receipts.
-Supersede is refused until crash-atomic pair recovery exists. Every write
-is one tracker commit carrying `Memory: <slug>` and `Actor:` trailers —
-never `Issue:`. `issue lint`
-validates memory files with everything else (the pre-commit hook
-covers them); `memory lint` runs the same checks alone. Lint bounds a
-fact block to 5 lines and 512 bytes and a path glob to 200 chars and
-two `**` segments; a file that cannot be parsed at all is a warning —
-every read path already reports it, and an error there would let one
-stray file brick every tracker commit.
+`propose` also accepts `--audience project|role|company`, repeated
+`--scope-role`, typed JSON `--evidence-ref` and typed JSON
+`--verification-condition`. Role audience requires explicit selectors.
+Company audience changes approval requirements, **not** cross-project
+visibility. `accept`, `verify`, `reject`, `classify`, `revalidate` and
+`invalidate` bind the caller's explicit digest; the CLI does not silently
+approve whichever revision happens to be current.
 
-Matching is a union: a memory applies when ANY scope axis intersects
-the dispatch context — `--scope-project` (every dispatch in the
-project), `--scope-component`, `--scope-path` (repo-relative globs
-matched against the issue's recorded-commit paths), `--scope-tag`
-(issue `tags:`), `--scope-provider` (the target worker's provider).
-`match --issue` prints the ranked list: `rule` > `gotcha` > `recipe` >
-`decision`, then confidence, then most recently verified (unverified
-and decayed last), each with its evidence label, followed by withheld
-entries and their reasons (`--json`: `matched[].evidence`,
-`withheld[]`).
+### Authority and decisions
 
-Evidence freshness (CAD-203) is separate from review status. Accepting
-a lesson records the review; it does not re-check the evidence, so only
-a PM-finalized `verify` cycle stamps `verified_at` and clears `stale`.
-Retrieval reads the verify finalization receipt itself, and every
-injected lesson carries an evidence label:
+`src/daemon/memory_rpc.rs` uses the shared native caller verifier: current
+owned pane proof or managed-root enrollment, including native UID, registration,
+generation and process identity. A missing agent identity is not operator
+proof; operator actions require `Shared::proven_operator`. Request labels,
+provider transport names and configured/requested models are not evidence.
+Ready events must match the native endpoint model/generation; managed owner
+generation remains a separate native proof binding.
 
-- `verified <date>` — last finalized verify is inside the project's
-  freshness window: `memory: {stale_days: N}` in `project.yaml`,
-  default 30 days;
-- `unverified (last verified <date>)` — the verify has aged past the
-  window. Age alone never withholds: the lesson decays and is still
-  injected;
-- `unverified` — never verified. Older records whose `verified_at` was
-  stamped at accept time read the same way; the files are not rewritten.
+`memory::policy::qualify` is the approval-matrix evaluator. Read its computed
+requirements and current refusal reason with `memory show --json`
+(`policy.requirements`, `quorum`, `evidence`); the Memory screen reads the same
+projection. Do not substitute a fixed vote count. Unknown underlying model
+vendors do not qualify as independent curators. An operator cannot replace the
+required first curator.
 
-A lesson is **withheld** only when its evidence is explicitly stale —
-`stale: <why>` in its frontmatter (set by a curator today, by CAD-111's
-citation re-check later; the next finalized verify clears it). The
-withholding is recorded with its reason so "why did I not get this?" is
-answerable: in the lessons file (`## Withheld` section), the dispatch
-comment (`Lessons withheld: <slug> (<reason>)`), the dispatch JSON
-(`lessons_withheld`), `memory match` and the `issue context` memory
-manifest. Contradiction is not a withholding reason here.
+Native operator proposals have operator origin, but origin alone is not a
+decision. `classify` is operator-only source attestation on a current
+agent-claimed v2 record; it rotates the semantic digest/cycle and retains
+history. It neither proves a passing check nor approves the company-level
+extra requirement. External-derived candidates remain quarantined until an
+actual operator release; agents cannot assert their own provenance.
 
-Injection happens in two places:
+Review and decision receipts bind the semantic claim digest and cycle.
+Claim/body, applicability, provenance or verification-condition changes
+invalidate old receipts. Review/feedback timestamps and counters do not
+rewrite the claim digest. Writes use the record-scoped PM lock, locked reread
+and scoped commit; stale revisions and refused actors leave no partial record.
+Supersede remains refused until crash-atomic pair recovery exists.
 
-- `dispatch` renders the matched accepted set to
-  `<state>/dispatch/<message-id>-lessons.md` (≤ 12 entries, ≤ 4 KiB),
-  appends `Lessons: <file>.` to the kickoff body, records the slugs in
-  the dispatch comment (`Lessons injected: …`) and returns `lessons`,
-  `lessons_withheld` and `lessons_file` in the JSON. `--no-lessons` skips it; `--job`
-  kickoffs are daemon-templated and never carry the file. Memory
-  failures degrade, never sink the dispatch (the worktree already
-  exists): a memory file that fails to load is excluded and named
-  while valid lessons still inject, and an unwritable lessons file or
-  a suffix that would push the kickoff body over the pty cap drops the
-  file — every case carries a `lessons_error` string naming the
-  reason. The lessons file is written via tmp + rename, so a failed
-  write never leaves a partial artifact.
-- `agent bootstrap`/`join` briefings gain a
-  `## Project memory — accepted rules (<project>)` section listing the
-  project's accepted `rule`s not marked stale (each with its evidence
-  label) for the worker's cwd — ≤ 8 entries and ≤ 4 KiB, same bound
-  as the dispatch lessons file. An over-budget rule is skipped, not a
-  stop; omitted rules are counted.
+HTTP memory curation stays closed. Browser authentication and Origin checks
+do not turn a browser request into native reviewer or operator proof.
 
-Memory readers skip files that fail to load and report them: `ls`,
-`ls --stale` and `match` warn once on stderr and include `load_errors`
-in `--json`; the API returns `memory_errors`. An absent `memory/` dir
-is a valid empty store; a directory that exists but cannot be
-enumerated is a load error. Write-time glob bounds are re-applied at
-load — a hand-edited over-complex path scope is quarantined with an
-error before it can reach matching.
+### Validity, age and authenticated reports
 
-Staleness: `ls --stale` flags an accepted memory not verified within
-the `--days` window (30 default), or whose path globs match files
-changed in a project repo after `verified_at` — informational only;
-`verify` is the refresh. Retrieval labels by its own window as above.
+V2 statuses are `proposed | quarantined | accepted | pending-revalidation |
+invalidated | rejected | superseded`. Pending records are withheld; native
+revalidation decisions can restore accepted state. Rejection and invalidation
+are terminal in place and retain the claim and prior decisions.
+
+`memory::matching::withhold_reason` combines explicit staleness with v2
+inactivity expiry. An accepted v2 claim expires from supply after 28 days
+without an authenticated reported use, initially measured from acceptance.
+Expiry does not delete or rewrite it. A current owned-turn `used` report can
+renew inactivity after manual reading, including an expired accepted claim.
+Reviews, decisions, `wrong` and `reread` reports do not count as use.
+Source classification may rotate the digest, but classification/revalidation
+retain the original acceptance inactivity anchor; neither starts a new lifetime.
+
+`memory_feedback` derives the reporter and trusted issue/job-task project
+from the live native assignment. Foreign recipients, retired/completed turns,
+wrong tokens, stale claim digests and caller-supplied receipts/counters/times
+are refused. Only report aggregates and the latest receipt per kind are kept;
+raw turn tokens are not copied into canonical memory. Counts mean reports,
+not unique uses, observed consumption or proven benefit.
+Do not paste the current token into `--evidence`: feedback containing its raw
+token there is refused before persistence, without echoing or silently redacting it.
+
+Feedback takes the record-scoped tracker lock and rereads/CAS-checks the claim
+before `Store::with_memory_feedback` rechecks current native ownership and
+assignment inside the fenced writer. The writer covers the atomic canonical
+file save, not Git hooks. A native transaction error restores the original
+bytes before any Git commit; the tracker lock remains held through the later
+audit commit. This prevents a turn retired during lock contention from renewing
+guidance and avoids re-entering Store from a Git hook while its mutex is held.
+
+Policy review age, source provenance, inactivity and mechanical verification
+are distinct. V2 policy decisions never stamp `verified_at` or claim
+verification at a SHA. Existing v1 verification labels continue to read their
+native verify receipt; verification age alone decays that label, while an
+explicit stale mark withholds. `ls --stale` remains evidence-age inspection,
+not a synonym for all validity/role refusals; `match --json` lists applicable
+withholding reasons.
+
+### Applicability and efficient context
+
+Existing scope axes retain their union semantics: project-wide, component,
+repo-relative path glob, issue tag or target provider. Native team-role
+restrictions are an additional gate. Dispatch and briefing pass the assigned
+team role, never an authorization-role fallback; an unknown role withholds
+role-restricted guidance. All matching stays within the canonical project.
+
+Revisioned kickoffs select one optional lessons source, bounded by
+`memory::render_lessons` to 12 entries / 4 KiB and omitted whole when the pack
+cannot fit it. Its revision hashes rendered claim/application text and evidence
+labels, not audit receipts or usage counters. Feedback does not cause repeated
+history injection or a counter-only pack revision. `--no-lessons` selects none.
+Legacy non-pack dispatch retains its bounded lessons sidecar; a pack kickoff
+does not inject that same guidance twice.
+
+Briefings supply eligible project-wide rules under their separate 8-entry /
+4-KiB cap. Withheld items disclose identity/reason, never claim/application
+instructions. List/detail JSON and the read-only screen expose bounded policy
+summaries; v2 decision summaries show the latest eight entries plus full counts.
+Canonical/Wiki history remains available for deliberate inspection.
+
+Unreadable files are excluded and reported, not treated as accepted empty
+records. `memory lint` and `issue lint` share `memory::check_front`; readers
+report malformed files and unsafe scope globs as load errors. The existing
+five-line / 512-byte fact and 200-character / two-`**` glob limits are unchanged.
 
 ## `cadence ui` — the reader
 
@@ -1128,8 +1429,8 @@ over the persisted `ui.json` in the state dir and saves the result —
 a later plain `ui start` reuses it, `--reset` forgets it, and
 `ui status` prints the effective options. Extra flags:
 `--allow-host <name>` / `--allow-origin <origin>` (repeatable — extend
-the Host/Origin allowlists), `--read-only` (every write answers `403`,
-the SPA hides its edit controls; `--no-read-only` clears a persisted
+the Host/Origin allowlists), `--read-only` (workspace writes answer `403`,
+the SPA hides its edit controls; sign-in/sign-out remain available; `--no-read-only` clears a persisted
 one), `--device-login-issuer <origin> --device-login-org <ws-id>
 --device-login-subject <id>` (remote operator sign-in through the
 AgenticOS device grant, CAD-777/841 — issuer + org + at least one
@@ -1139,8 +1440,16 @@ they apply live to a running board and never persist in `ui.json`;
 `ui start --reset` does not touch the daemon store either — only
 `cadence ui device-login clear` turns the flow off; default off).
 
-**Signing in (CAD-313, ADR 0004).** Board writes need the operator's
-session. `cadence ui login`, run from your own shell, prints a link —
+Private local reads require a session by default (CAD-1452).
+`--allow-anonymous-reads` explicitly permits local unsigned reads;
+`--no-allow-anonymous-reads` clears a persisted allowance. This policy is
+independent of `--read-only`: disabling writes does not grant read access.
+Configuring it together with a hosted board identity or tailnet sharing is
+refused. Changing an already-running board's read policy requires restarting
+that board explicitly.
+
+**Signing in (CAD-313, ADR 0004; read boundary CAD-1452).** Private board
+reads and operator writes need a session. `cadence ui login`, run from your own shell, prints a link —
 `http://cadence-<port>.localhost:<port>/login#n=<nonce>` (`--tailnet`:
 the tailnet URL) — that works once, within 120 s, for one browser.
 `cadence-<port>.localhost` is this board's own name: every `*.localhost`
@@ -1149,14 +1458,15 @@ cookie on this name is never sent to another board, an agent's dev
 server or anything else on `127.0.0.1`, `localhost` or
 `cadence.localhost` (the gateway vhost), whatever the port. Loopback
 sessions are opened and honoured on this Host only; on any other Host
-the board is sign-in-less and refuses writes. Opening
-it sets an HttpOnly, `SameSite=Strict` session cookie (`Secure` and
+the board cannot accept a local sign-in and refuses private reads and writes.
+Opening the link sets an HttpOnly, `SameSite=Strict` session cookie (`Secure` and
 `__Host-` on the https tailnet origin) valid 24 h idle, 7 days at most,
-and hands the page a second key it keeps in that tab's `sessionStorage`
-and sends as `X-Cadence-Session` on every request. The cookie alone is
-no session: a server on another port that receives it (cookies ignore
-ports) never has the key, and a cross-site page cannot set the header.
-A new tab signs in with a fresh link — the board tells it so. Links to
+and hands the page a second key it keeps in this browser's `localStorage`
+(per origin, port included) and sends as `X-Cadence-Session` on every
+request. The cookie alone is no session: a server on another port that
+receives it (cookies ignore ports) never has the key, and a cross-site
+page cannot set the header. A new tab, a reload or a browser restart
+reuses that key; clearing the browser's storage needs a fresh link. Links to
 this machine in agent-written markdown are shown, never clickable.
 The nonce rides in the URL fragment, which a browser never sends to a
 server, so it never reaches `ui.log`. The link is minted only for a
@@ -1174,6 +1484,72 @@ random bits, and a shared failure budget would let an agent lock the
 operator out with no credential at all. A second link opened in the same
 tab (only the fragment changes, so no page load) is picked up by the
 login view's `hashchange` listener.
+
+**Loading, recovery and persistence (CAD-1452).** Both local Cadence and
+hosted AgenticOS boards verify the existing session before mounting private
+navigation, records, polling or streams. The accepted design reference is
+[the authentication preview](https://preview.simplebuild.site/20261015-061045/cadence-auth-loading/?e=1792131045&t=er1MMIdOAYNzo0KDOke6vw)
+(owner accepted 2026-10-15; source `design-plans/cad1452-auth-boundary/`).
+Local sign-in remains the one-use link (or configured device flow); hosted
+sign-in remains the AgenticOS membership/assertion handoff.
+
+Navigation, a same-tab reload, a new tab and a browser restart reuse the
+cookie and the browser's saved key; they do not mint a new session or extend
+its absolute expiry. Clearing the browser's storage needs a fresh link.
+Hosted cookies retain their existing host-only lifetime.
+An unanswered verification conceals the admitted workspace and stops its
+effects, preserving same-session drafts and credentials for Retry. A
+confirmed sign-out, expiry or identity change clears private observations
+and rejects stale in-flight responses. A session-required `401` supersedes
+older pending verification; a feature's ordinary role-based `403` does not
+sign the board session out. Signed-in members pass the read boundary without
+operator privileges. Authentication and write authority remain separate.
+
+**`operator` in `/api/meta` (CAD-432, CAD-1193).** A signed-in session says
+who you are, not that you are the operator. `GET /api/meta` computes
+`operator` only with `?operator=1` (the UI asks once per page load);
+without it the field is `null`. With it, `true`/`false` is a proven answer
+and `null` means unknown: a dependency (the daemon's `daemon_info` or
+`agent_list`) did not answer in budget, and the board fails closed, never
+granting the role. A sandbox board therefore answers at all only with a
+live daemon on the same state dir, and answers `true` only when the board
+process, and the browser that asks, run outside any agent pane or managed
+endpoint and the board was not launched by the daemon; a board started from
+an agent pane gets a proven `false`.
+
+Private async work owns one operation across response headers, body decoding
+and any follow-up request, state adoption or navigation. Pause, caller cancellation or
+session reset permanently abandons that operation; re-verification cannot
+revive it. A paused draft may be retried explicitly with a fresh operation.
+Cancellation uses baseline-compatible signal forwarding, not `AbortSignal.any`.
+Already-accepted server mutations are not rolled back by abandoning a client
+continuation.
+
+Chat and Wiki uploads abort the underlying transfer on pause. Wiki retains
+same-session queued files for explicit **Retry uploads**, never automatic
+replay after verification; an identity reset discards those files. Verification
+retry restores the previous live control's keyboard focus or returns focus to
+the admitted workspace.
+Hosted language-preference reads and saves share the same operation lifetime
+and typed session-refusal boundary. Local language choices remain browser-only.
+Queued agent-history reads retire on pause before acquiring a read slot;
+re-verification creates fresh work rather than reviving old cached promises.
+Private notification toasts share the admitted workspace's boundary; a pause
+clears their room titles/actions and dismissal timers, without discarding drafts.
+Notification actions check their originating generation before follow-up reads.
+Browser-alert work captures its private lifetime before queue/browser waits and
+checks it before consent or remote effects. Signed-out local subscription cleanup
+can still finish, but never starts an authenticated request after re-admission.
+
+Private SSE uses authenticated fetch streaming rather than URL-carried tab
+keys. The server revalidates the live session every five seconds with a
+two-second validation deadline; thread polls add at most two seconds.
+Buffered bytes cannot be retracted, and a blocked OS write is not a strict
+socket-close deadline. No later private frame is authorized after a failed
+recheck. File previews/downloads fetch with the same session proof; temporary
+preview URLs are revoked on pause, session reset or unmount, and untrusted
+document frames remain sandboxed. Template downloads recreate fresh URLs
+from retained results on same-session recovery.
 
 **Remote sign-in without SSH (CAD-777, daemon-owned since CAD-841).**
 Device login is configured on the *daemon*, never by the board:
@@ -1398,8 +1774,8 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 
 | Route | Returns |
 |---|---|
-| `GET /api/health` | `ok`, `pm_dir`, `pm_present`, counts, `daemon`, `embedded` |
-| `GET /api/meta` | `read_only`, `actor` (the request's resolved write identity), `tailnet_proof` (`null`, or whether the tailnet proxy was proven and which check refused), `tailnet_url`, `signed_in` (CAD-313: this request holds a live operator session), `session` (`{id, origin, created, last_used, idle_expires_at, expires_at, user_agent}` or `null` — never the token), `login_hint` (`cadence ui login`, or `… --tailnet` on the tailnet), `operator` (CAD-432, only with `?operator=1` — the proof walks `/proc`, so the SPA asks once per page load; `null` otherwise: this client passes the operator decisions' checks — a writable board, a live operator session (CAD-313) from a caller tied to no agent, CAD-276's positive proof on the peer, and the same proof on the board process itself, whose daemon connection relays the decision; the UI offers operator decisions such as stage moves only then), the serving binary's `version`/`build_commit`/`build_time`, plus the daemon's `daemon_info` when reachable |
+| `GET /api/health` | unsigned: `ok`, `build`, `embedded` only; admitted readers also receive `pm_dir`, `pm_present`, project/issue counts and `daemon`. Unknown credential validation is unavailable, not unsigned success |
+| `GET /api/meta` | safe local bootstrap: `read_only`, explicit local `anonymous_reads`, tri-state `signed_in` (`null` means unavailable), `hosted`, `session` (display identity/timestamps or `null`, never credentials), `login_hint`, `device_login`, `tab_signed_out`, `actor`, `tailnet_proof`, `tailnet_url`, serving build/version and daemon build projection. `operator` is a separate tri-state proof requested with `?operator=1`; a signed-in member need not be an operator. Hosted metadata remains session-gated |
 | `GET /api/setup[?fresh=1]` | the `/setup` wizard's checks (CAD-327): `cadence setup`'s list run **detect only** — no `apply`, nothing created, started or written; the `ui` check is answered by the serving board. `{checks: [{check, status, detail, fix, group}], master: {providers: [{bin, ready, start, warning}]}, checked_at, detect_only: true}`, `group` one of `environment`/`provider`/`master`. `master.providers` (CAD-448) is the master step's provider choice — every CLI `master start` accepts, each ready one with its exact `master start --provider <bin>` command once the `master` check's own prerequisites are met (the offer then absorbs the check's bare `master start` fix: one command for the action); a host that cannot confine adds `--unconfined` and carries the `UNCONFINED_WARNING` risk text in `warning`, and `master_login` states the same risk. Provider probes follow setup's rules (a version token and an exit code or a file's presence — never their output), each bounded at 5 s. One run is reused for 60 s and concurrent requests share it; `fresh=1` (or `true`) re-runs unless the last run is under 5 s old, and each answer says `ran_now`, `age_ms` and `recheck_in_ms`. **Operator on the host only:** `403` before any probe runs on a read-only board (`check: "read_only"`), for a request through the tailnet (`"tailnet"`, proven or not) and for a non-loopback peer (`"loopback"`) — the payload shows HOME's layout, installed CLIs and their sign-in state, and the daemon's pid and socket. Write methods answer `405` |
 | `GET /api/projects` | folders, prefixes, components, declared tags, repos, issue counts |
 | `GET /api/issues?project=` | card views: derived status, readiness, `tags`, counts, `rev`, the CAD-405 `work` block (type, milestone, size/weight; stage, progress and health on epics). The `issue ls` filters, combinable (AND across keys): `tag=` (repeat or comma-join — all of), `status=`/`type=`/`milestone=`/`owner=`/`component=`/`priority=`/`epic=<ID>` (repeat or comma-join — any of), `plan=` (`any` or a plan state), `open=1`; `400` on a value that could never match (unknown status/priority, bad tag or id grammar) |
@@ -1416,8 +1792,8 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/memories/:project/:slug` | one memory: frontmatter + body; `404` on unknown slug, `400` on grammar |
 | `GET /api/overview` | the Overview screen payload: `needs_me`, `drift`, `projects`, `github`, `daemon`, `generated_at` — same shape as `cadence overview --json` |
 | `GET /api/stream` | server-sent events — `event: issues` on tracker change, `event: jobs`/`event: agents`/`event: monitoring` on daemon state change; each frame's data names the board resources it invalidates (`{"resources":["agents","issue","overview"]}`); `: ping` immediately and every 15 s of silence; `405` on HEAD; deltas only (baselines at connect) |
-| `GET /api/threads/<alias>?after=&limit=` | one page of the agent's durable chat (CAD-319) over the daemon's `thread_read`: `{thread, entries, cursor}`; `?tail=1` (the newest page) or `?before=<seq>` read backwards and add `more_before` (CAD-328; `400` combined with `after`); `404` unknown alias, `501` a daemon without threads. Unscoped in the MVP: any caller that reaches the board reads any agent's thread, as with `/api/agents/<alias>`. A live turn token quoted in thread prose is only redacted at `export` |
-| `GET /api/threads/<alias>/stream` | server-sent events — one `event: entry` frame per thread entry with `id: <seq>`; resumes after `Last-Event-ID` (else `?after=`); `: ping` on each 15 s idle poll; `event: error` while the daemon is unreachable; `405` on HEAD |
+| `GET /api/threads/<alias>?after=&limit=` | one page of the agent's durable chat (CAD-319) over the daemon's `thread_read`: `{thread, entries, cursor}`; `?tail=1` (the newest page) or `?before=<seq>` read backwards and add `more_before` (CAD-328; `400` combined with `after`); `404` unknown alias, `501` a daemon without threads. Any admitted board reader can read agent threads, as with `/api/agents/<alias>`; private local/hosted admission happens first. A live turn token quoted in thread prose is only redacted at `export` |
+| `GET /api/threads/<alias>/stream` | server-sent events — one `event: entry` frame per thread entry with `id: <seq>`; resumes after `Last-Event-ID` (else `?after=`); `: ping` on each idle poll; closes when a daemon poll fails or session admission is lost; the authenticated UI reconnects from the last event ID; `405` on HEAD |
 | `GET /api/master/summary?since=<epoch secs>` | "since you left" (CAD-328) over the daemon's `master_summary` (CAD-339), never posted to the thread: plans proposed and decided, tickets moved, reports, open questions, `routing_backlog`; `400` without a numeric `since`, `501 unsupported_daemon` on a daemon without the master, `503` daemon down |
 
 ### API — writes
@@ -1450,7 +1826,8 @@ exactly one git commit whose subject carries the actor:
 | `POST /api/delivery/:id/decline` | `{reason}` — same path and refusals; relays the daemon's operator-only `delivery_decline`; a blank reason is `400 reason_required` | `200` with the loop record |
 | `POST /api/epics/:epic/stage` | `{stage, note?}` — CAD-432: move an epic's stage over the daemon's `epic_stage` (CAD-405); the board never writes the tracker for it. The relay runs on the board's own connection, which the daemon attributes to the operator, so **every** board move needs the operator, not only moves into an `operator_stages` stage: read-only, the write guards, `403 operator_only` for an agent-attributed caller and `403 operator_proof` for a peer without the positive proof — the plan routes' path — before anything is written; no identity field is read (`deny_unknown_fields`). The relay sets `operator_decision: true`, and the daemon then requires the operator on the board's connection for any target, so a board an agent started is refused too (`403 operator_proof`) instead of landing the move as that agent's. Agents move stages with `cadence issue epic stage` over their own connection. The daemon's rules still apply: one step forward, any step back to the floor | `200` `{epic, from, to, forward, needs_operator, by, at, …}`; `400` a skip or unknown stage; `409` already there; `404` unknown epic |
 | `POST /api/issues/:id/answers` | `{question, text}` — the operator's answer (CAD-328) to the open question report `question` on `:id`: an `answer` task report (CAD-341) authored `operator`, never from the request or the board's environment; `403 operator_only` for an agent caller and `403 operator_proof` for a peer that is not provably the operator (same proof as the plan routes); `400` when `question` is not a question report on the ticket or `text` is blank. Then the daemon's `answer_route` (CAD-447) queues one message to the question's author with the answer and the report path — the reply's `route` says whether it was sent (`undeliverable` when the asker is gone; the answer stands either way) — and a best-effort `reports_changed` so the master's report router (CAD-339) picks it up at once | `201` `{issue, card, warnings, route}` |
-| `POST /api/threads/:alias/messages` | `{text, message?}` — the operator's chat message (CAD-319): starts the thread on first use and queues `text` to the agent like `cadence send`. Refused `403 caller_agent` when the caller is attributed to an agent (pane or managed endpoint tool process); the daemon refuses agent connections again. Tied to no agent is the operator by default, not positive proof (CAD-313) | `200` with the send receipt and `thread` |
+| `POST /api/threads/:alias/messages` | `{text, message?, expected_recipient_uid?}` — the operator's chat message (CAD-319): starts the thread on first use and queues `text` to the agent like `cadence send`. `expected_recipient_uid` (CAD-1591) is an optional identity constraint, never authority: a nonempty uid the daemon's enqueue transaction compares to the recipient's current uid — a mismatch refuses before any message or thread side effect, and an omitted field keeps the ordinary path. Refused `403 caller_agent` when the caller is attributed to an agent (pane or managed endpoint tool process); the daemon refuses agent connections again. Tied to no agent is the operator by default, not positive proof (CAD-313) | `200` with the send receipt and `thread` |
+| `POST /api/master/identity` | `{expected_revision, name?, tone?, look?}` — at least one of name/tone/look; operator session and positive native operator proof, no actor/alias selectors. The opaque revision covers the protected identity files and effective avatar; a stale editor is refused before mutation. `look` uses the existing eleven-slug avatar catalogue | `{identity: {name, tone, look, revision}, applies: "next_turn"}`; the actor includes committed identity in its next model turn, including after a provider session reset |
 
 Success bodies are `{issue, card, warnings}` — the fresh payloads, so
 the UI needs no second fetch. `warnings` notes a `ready`/`doing`/`review`
@@ -1610,8 +1987,9 @@ session:
   lateral authorship forgery between agents, with no operator
   privilege. The pty tie was kept because dropping it would have sent a
   `setsid` child of a pane back to `operator (ui)`; since CAD-313 that
-  child is refused instead, and CAD-280 re-decides the tie. `tests/board.rs` pins the
-  residual so a fix flips it deliberately.
+  child is refused instead, and CAD-280 re-decides the tie. The residual is
+  documented in `src/peer.rs`; the former `tests/board.rs` pin was retired
+  with CAD-1073, so no current test flips it deliberately.
 
 Same-user is not a hostile isolation boundary. The operator session
 closes the ambient default (a local caller tied to no agent, and every
@@ -1621,9 +1999,13 @@ that deliberately steals the secret and evades `operator_proof` — ADR
 
 ### Security posture
 
-Reads need no auth; operator authority needs the session above. The
-rest is containment, so the write path adds four cross-site guards, each checked in order before any body is read
-or any writer runs, and each refusal names its check in `403` JSON:
+Private reads require the session above; unsigned local browsing requires
+the explicit `--allow-anonymous-reads` policy and never applies to hosted
+boards. Safe bootstrap, liveness/build probes and existing one-use capability
+routes are exceptions, not blanket read access. Operator authority remains
+a separate proof. The write path also adds four cross-site guards, checked
+in order before any body is read or writer runs; refusals name the check in
+`403` JSON:
 
 1. **Route + method.** Writes are `POST`/`PATCH`/`DELETE` on known
    shapes only; a known shape with the wrong method is `405`, anything
@@ -1679,11 +2061,22 @@ payload at read time — nothing is stored; `cadence overview [--json]
 
 **Needs me** — one row per subject, ranked by urgency then age, each with
 `{kind, title, age, project, link, command, audience, audience_reason}`.
+Plan, question, merge-decision, unattended-hold and master-permission rows may also carry
+display-only `short_title` (about 50 characters) and `why` (one sentence),
+sanitized server-side and omitted when the source is empty or reads as a
+command (the word `cadence` anywhere, a backtick, `${` or `$(`); nothing reads them back
+(CAD-1219). A pending master-permission row's `short_title` is its
+sanitized reason and `why` appears only once the request is decided; plan
+and merge rows carry no `why` (only `short_title` where they have one); a
+question whose summary is refused uses its body. The board never shows
+agent text as a title on its own, and shows a permission's whole reason
+(`permission.reason`) as text to read before Allow (CAD-1293).
 *Class* is where a kind starts; *Owner* is who must act on it:
 
 | Rank | Kind | Class | Owner | Command |
 |---|---|---|---|---|
 | 10 | `merge` — open PR with `qa-verdict=success` and green checks | team | the issue owner (`cadence/<id>-…` head branch) | `gh pr merge <n> --repo <slug> --squash --admin --match-head-commit <sha>` |
+| 17 | `unattended_held` — bounded workflow work cannot safely continue | operator | operator; Details contain the reason and next inspection step | `cadence delivery ls` |
 | 20 | `approval` — a brokered permission request is open | operator | — | `cadence agent respond <a> --request <h> --decision accept` (provider input requests: `--answers-file <f>`) |
 | 20 | `idea_plan` — an idea in `review` tagged `plan-ready` (CAD-139). A `parked` or `idea-stale` review does not raise `review_no_pr` | operator | — | `cadence idea decide <id> approve` |
 | 20 | `idea_duplicate` — a backlog idea linked `duplicate_of` another open issue | operator | — | `cadence issue show <id>` |
@@ -1750,6 +2143,14 @@ minutes):
 A row whose `since` is null escalates only when its owner cannot act,
 and its reason never says `unhandled`. `age` is unchanged — it still
 orders rows inside a rank.
+
+An unattended hold and a worker fence coalesce only when the native queue proves
+the same owned unknown or failed turn. The held turn determines the project;
+the worker's registered cwd may belong to another project. The fenced recovery
+row stays primary and retains both causes; unrelated fences remain visible.
+A failed provider turn is not an unknown outcome that can be reconciled as
+completed. Acknowledging either observation does not resolve its underlying
+condition.
 
 Both CI rows share one subject, `ci:<slug>@<branch>`, so a red and
 unverified main is one row with two causes. They come from the
@@ -1855,21 +2256,142 @@ inside a disclosure. An unproven viewer sees the sign-in explanation and makes
 no protected Outbox request. This view adds no publication or file-management
 actions.
 
-`ui/`: Vite + React 19 + TypeScript + Tailwind 4, pnpm. Design tokens
+`ui/`: Vite + React 19 + TypeScript + Tailwind 4, Bun 1.4.4 with Node 22 for scripts and tests. Design tokens
 per `~/Project/agentic-alpha/DESIGN.md` — graphite ink ramp, IBM Plex
 Sans/Mono, teal `#2dd4bf` on interactive elements only.
 
 ```bash
 cd ui
-npx --yes pnpm@12.2.1 install
-CADENCE_DEV_BOARD_PORT=3117 npx --yes pnpm@12.2.1 dev  # Vite HMR; /api → isolated sandbox board
-npx --yes pnpm@12.2.1 typecheck  # tsc --noEmit
-npx --yes pnpm@12.2.1 build      # → local ui/dist (--features ui embeds it)
+bun install --frozen-lockfile
+CADENCE_DEV_BOARD_PORT=3117 bun run dev  # Vite HMR; /api → isolated sandbox board
+bun run typecheck  # tsrs --noEmit (TypeScript 7, Rust checker)
+bun run lint       # oxlint --deny-warnings (rules: ui/.oxlintrc.json)
+bun run build      # → local ui/dist (--features ui embeds it)
 ```
+
+The UI build also emits precompressed Brotli (`.br`) and gzip (`.gz`)
+siblings. The embedded board negotiates these for its HTML, JavaScript and
+CSS; `--dist` mode uses available sibling files. Compression runs at build
+time, not per request. Static file responses keep `Cache-Control: no-store`
+and vary on `Accept-Encoding`, including raw responses. A client that
+refuses identity and every available coding receives `406`; otherwise a
+missing acceptable compressed sibling falls back to the original bytes.
 
 Start an isolated sandbox board and use the Rust restart loop in
 [CONTRIBUTING.md](../CONTRIBUTING.md#isolated-board-development) before running
 the Vite server. The configured dev port must match that sandbox board.
+
+### Assistant identity
+
+The chat header, answer sender, composer and About panel use the committed
+identity of that conversation's actor. A custom name is literal in English and
+Traditional Chinese; the localized role label is only the unset-name fallback.
+An unavailable profile is not reported as an unnamed or successfully saved one.
+
+Member-assistant setup is optional and request-first. The assistant may ask
+"What would you like to call me?" and "How would you like me to communicate?",
+one question per turn; skip/later do not block work. On Native, the existing
+fenced ACK accepts `name` (the assistant), `tone`, `user_name` (how to address the
+user), `preferences` and `look`. Later edits preserve the existing bootstrap
+state and conversation. Name/tone remain in the managed IDENTITY.md/SOUL.md
+sections; user address/preferences stay in private USER.md. Subsequent valid turns read
+the committed profile. A personal avatar selection is an ordinary chat request,
+not a browser-side profile write, and remains pending until state confirms it.
+The profile patch is bounded by UTF-8 value bytes: 4096 per field and 16384
+across supplied values (including a supplied look), not JSON encoding or the
+merged stored profile. Avatar params are validated before profile-file effects.
+
+The avatar renderer and eleven looks are the existing `AgentAvatar` catalogue.
+A new personal assistant pins its immutable alias-derived look once in
+`params.look`; renaming, setup deferral, reload and login never reroll it.
+Existing pins win, and an unpinned Master keeps the robot.
+
+Native Master-backed Home/app conversations are still workspace-owned. Their
+headers keep that scope visible at narrow widths too. The About panel offers
+proven operators a bounded name/personality/avatar editor through
+`POST /api/master/identity` (`master_identity_set` natively). IDENTITY.md and
+SOUL.md use the protected writer and digest record, never agent self-edit.
+Identity reads check the protected source digests before per-turn use. A
+coordinator identity save refuses existing drift in any protected source before
+writing; it records only the fields changed and verifies the post-save briefing
+sources rather than blessing unrelated edits.
+`MASTER_IDENTITY_LOCK` serializes verified reads with protected file/digest/params
+publication, including direct Master file edits and installation. A legitimate
+save cannot be mistaken for external drift while its digest is being published.
+`Shared::prompt_with_profile` includes committed name/personality in the initial
+prompt and any permitted fresh-session retry, including Pi `/new` and pre-tool
+history recovery. The UI reports next-turn application, not a change to an
+already-running turn. An editor retains its draft and base revision on a
+concurrent update; explicitly reload the saved identity to edit the newer base.
+The About panel preserves Escape dismissal and returns focus after a save.
+A rename does not change the `master` routing alias, ownership, permissions or
+retained history. Personal-assistant Home/app routing
+and scoped assistant-to-Master queries remain the separate CAD-1818 phase.
+
+The tenant Worker port (AOS-378) uses the same shared UI without changing its
+existing recipients: subject-owned Home/app conversations are personal, while
+the reserved owner-only Recruit conversation uses the workspace coordinator.
+The server adds `actor_identity: {scope, conversation_id, identity}` to the
+selected conversation's master state and initial streamed snapshot; the UI
+reads `/api/master/state?conversation=<id>` and refuses mismatched projections.
+Only an absent projection retains Native's coordinator contract. A present
+malformed projection or failed/stale canonical read is unavailable, with no
+borrowed profile, ownership claim or edit control.
+Before the first hosted Home message, the thread may still be null. Home binds
+the valid personal projection from its default master-state response, whose
+server-issued conversation ID already exists; the first streamed entries do
+not need a reload to acquire the name or scope. That validated binding is also
+adopted by the empty thread before its hosted stream opens, so initial turn
+snapshots and Stop/Cancel use the same ID without relaxing stream admission.
+App/Recruit panes still require their selected conversation ID and never borrow
+that default Home projection.
+Hosted app turn indicators and Stop/Cancel reconciliation use the selected
+conversation's state too; an idle Home snapshot cannot hide its running turn.
+
+Worker personal profiles are canonical actor-private Workspace-DO rows, not
+Native Markdown files. The actor-bound `assistant_profile` tool uses the same
+fields and bootstrap states, while protected workspace edits remain owner-only
+HTTP actions. Initial personal avatars are pinned from the immutable
+tenant-scoped subject; a rename never rerolls them. User address/preferences
+never enter UI identity projections or workspace context. Recruit's About panel
+is the workspace editor; editing it does not rename the user's assistant.
+Both source repositories and the matching UI release must pass their normal
+promotion/release gates before this behavior is available in a hosted tenant.
+
+### App routing QA handovers
+
+Use `/apps/<app-key>` (for example `/apps/social-content`) for installed-app
+navigation. Installation IDs remain internal scope identifiers and API path
+parameters; `/app-installations/<id>` is a compatibility bookmark, not a second
+app entry point. A legacy bookmark may redirect only when its exact active
+installation maps unambiguously to the canonical route. Missing, removed,
+ambiguous or inaccessible mappings must fail safely, never select another
+installation. Preserve context, conversation, record and app-view selection.
+
+Legacy and canonical links share the same access, list-error and identity
+checks. A compatibility redirect carries `install=<original-id>` so a stale
+list or a later reinstall cannot transfer the link to a replacement with the
+same app key. An existing conflicting pin refuses before redirect or app
+mount; it is never overwritten. The redirect replaces history and preserves
+the original query and fragment, adding only a missing installation pin.
+
+Every setup or Browser QA handover states these separately:
+
+- The actually served backend build and board address, with the existing
+  build/version evidence used to identify them.
+- The actually served UI revision: the embedded build, or the Vite checkout
+  revision and any uncommitted changes when testing a development UI.
+- The reviewed candidate's exact head, whether or not it is served.
+- The installed app package version and digest, when relevant, using existing
+  installation metadata.
+
+Mark unknown provenance as unverified. A requested restart, successful build,
+fixture harness or canonical-looking URL is not evidence that the candidate is
+installed or served. Identify fixture/component evidence as such rather than
+claiming a real board acceptance run. At desktop and narrow widths, exercise
+canonical navigation and a representative old contextual deep link; verify
+that the installation/context is retained and missing access fails safely.
+This procedure grants no permission to refresh staging or production.
 
 The original mock is `ui/design/board-mock-v4.html`. In I2 cards drag
 between columns (derived/container cards don't — the reason shows on
@@ -1958,26 +2480,131 @@ A successful revoke remains distinct from a failed follow-up read; stale data
 cannot revoke another rule. Existing RPC/HTTP operator proofs, API shapes and
 rule policy remain unchanged. Live permission decisions stay in Home.
 
-Settings → Models is a full-width provider workspace. A compact provider
-selector opens one editor at a time and keeps drafts for every provider.
-The default model applies to newly registered agents across projects; existing
-agents keep their saved selection. A role can inherit that configured default,
-use the provider-native default, or select a specific model. Pi is the exception:
-its default option is labelled Operator policy default and uses the configured
-Pi policy fallback; explicit model IDs still require that policy's allowlist.
-Suggestions remain previously observed IDs, not a provider catalog. Unavailable providers retain
-their limitation text. Save applies all provider drafts with the current
-expected revision; reset omits that provider and discard restores all saved
-values. Read-only/sign-in gates, validation, failed-save drafts and revision
-conflicts remain visible. Initial read failure offers Retry; loading and an
-empty provider list are distinct. Labels and responsive role rows use shared
-controls, theme tokens and keyboard focus.
+Settings → Agents has Harnesses, Profiles, and Providers & models tabs.
+Declarations do not install programs, create adapters, change credentials or
+alter running sessions. Installation, versions and fleet usage are observed
+separately from editable declarations. Native CLI models do not use Pi
+allowlists; Pi scopes distinguish master and worker runtime permissions.
+A profile's team role selects model preferences, never runtime authority.
+Drawers scroll vertically on short or narrow screens so job descriptions,
+model details, file targets and actions remain reachable without clipping.
+New harness and provider drawers keep the registry ID separate from the display
+label (for example, `claude` versus “Claude Code”). Closing a drawer keeps edits
+to existing rows in the page draft; Discard resets that draft and its status.
+An existing model's blank or duplicate ID stays visible as a validation error;
+Save model stays disabled until the ID is corrected.
+An empty registry shows empty states, not the mockup's demo rows. Providers &
+models follows the approved mockup without a Role defaults editor; stored
+defaults are preserved and inherited profiles still resolve them. Launch
+eligibility comes from saved-state Preview, not an optimistic unsaved badge.
+The operator-approved clean presentation omits the registry banner, subtitles
+and explanatory paragraphs. Information buttons expose page and field help on
+hover, keyboard focus or tap in styled, viewport-bounded top-layer tooltips.
+Escape dismisses help before closing its drawer; outside taps and scrolling
+dismiss help too. Touch pointers get 44px targets. Validation, failures, live
+status and concise empty states stay visible; Save and Discard remain grouped
+on narrow screens.
+
+Save commits harness/provider/model declarations, role defaults, Pi policy,
+pins and profile definitions in one revision-bound SQLite transaction.
+Conflicts and validation failures retain the draft; Discard restores the saved
+revision. Sync and Preview require saved state. Full settings reads include
+profile job bodies, so RPC and HTTP both require operator proof. Read-only
+operator sessions can inspect but cannot mutate settings. Catalog Refresh reads the supported
+`omp models <provider> --json --no-extensions` listing and shows its actual
+source and fetch time; discovered models are not launch permission. Import
+adds missing rows to the draft with Pi permission off. Picking a combobox row
+fills metadata; opening an existing row preserves its saved values.
+Provider pins accept `name@version` or `name version`; Save stores the canonical
+`name@version` form. The legacy model-defaults writer preserves the Agents
+overlay and refuses edits to it; use Agents Save for those fields.
+
+At daemon startup, legacy `pm.yaml [pi]` and non-master
+`agents/<profile>/AGENT.md` definitions are imported once. The SQLite settings
+authority is then used by CLI, daemon and adapter launch paths; subsequent
+file edits do not replace it. Retired-source drift is informational. The
+master's own instructions and integrity protections remain separate.
+Regular files directly under `agents/` are not profile definitions and are
+left untouched. Symlinks, special files and invalid actual profiles still
+refuse import rather than being followed or silently discarded.
+
+Portable coordination exports omit settings authority alongside model defaults.
+An execution-disabled portable restore does not import legacy settings or
+recreate those authority rows. Its existing read-only and no-launch fences
+remain in force.
+
+`cadence join <pm> <provider> --profile <id>` snapshots the saved job, team role,
+model selection, settings revision and profile digest for the new session.
+An explicit model or native provider-default selection can override the
+profile preference, but cannot bypass known model/harness compatibility or
+Pi policy. Existing sessions retain their stored instructions. New or changed
+jobs must fit both the AGENT.md character cap and the 32,000 UTF-8 byte launch
+instruction limit. Larger imported jobs remain preserved; Preview and launch
+explain the refusal until they are shortened.
+Profile usage lists active sessions. Stopped/offline sessions retain their
+snapshots and audit history but do not prevent profile deletion.
+
+Sync writes supported derived `.pi/agents/<id>.md` and
+`.claude/agents/<id>.md` exports under the PM root. It preserves unmanaged files,
+refuses symlinked ancestors and never replaces a concurrently created target.
+Managed updates write the validated, single-link file descriptor rather than
+replacing its path; their ownership header survives partial writes, allowing
+a later Sync to repair an interrupted derived export. These files are not the
+canonical launch source. Preview reports the saved selection, compatibility,
+installation and permission refusals, including host Pi-confinement defaults,
+without starting an agent session.
 
 The SPA has real routes (CAD-326, `ui/src/lib/router.ts`): `/` Home,
 `/overview` (the team overview: needs, drift, monitors, projects),
 `/projects[/:slug[/epics|/milestones|/context]]`, `/agents[/:alias]`, `/setup` and
 `/settings[/memory]`; the nav shows Home, Projects, Agents and Settings,
 and Home's rail links to the overview.
+
+Threads notifications (CAD-1423) group received messages by authorized conversation
+in the header inbox. Unread respects both actually viewed thread messages and the
+notification-dismissal cursor; All retains received conversation history after
+either cursor advances. Mark all read dismisses notifications without marking
+unviewed transcript messages read.
+All includes every eligible conversation, not a truncated first page. The bell's
+unread total covers that complete authorized history.
+
+Agent-pair Threads stay read-only (CAD-1591): a message whose recorded
+sender is a still-registered agent carries a "Reply as you" action that
+opens the operator's existing DM to that participant — an operator reply,
+never a reply impersonating either agent. The composer shows a context
+strip with the original message id, a bounded quoted excerpt and a
+backlink to the pair conversation it came from, and the sent body appends
+a `Replying to your message <id>` quote block; the quote is context, never
+a routing field, so origin and reply_to are untouched and the send is an
+ordinary operator DM. The recorded sender's uid rides every attempt as
+`expected_recipient_uid`: a removed or replaced participant is refused by
+the daemon's enqueue transaction before any side effect, never silently
+re-addressed, and a removed, legacy or unproven sender is never offered
+the action at all. The reply draft is scoped to the recorded sender uid
+and original message id (`threads-reply:<uid>:<messageId>`), so it can
+never merge into or displace the ordinary DM draft and clears with a
+private-session reset; it lives in page state, not the URL, so a copied
+link cannot fabricate a reply context. Drafting never sends. After an
+accepted send the context stays until an explicit Cancel — only the exact
+submitted intent is marked sent, nothing is unconditionally cleared — so
+post-submit edits remain visible with their reply context.
+
+Browser alerts require explicit device opt-in through the browser's native
+permission and subscription flow. Alerts are generic by default; opening one
+still requires normal thread authorization. Muting a conversation or enabling
+the 22:00–08:00 quiet-hours preset suppresses interruptions, not unread messages.
+Sound and message previews are off by default. Posts and delivery remain turnless.
+
+An enrolled browser reports its visible thread through
+`POST /api/human-threads/push/presence` with `device_id`, a per-page `tab_id` and
+`room` (null clears that tab). The server verifies device ownership; these IDs
+never confer authority. Reports refresh every 15 seconds and expire after 30
+seconds of server time. Presence from any visible tab suppresses that device,
+without another tab's null report clearing it or suppressing other devices.
+Leaving the thread, hiding or closing a page releases only that page's report.
+Re-enrollment after revocation creates a fresh consent without transplanting old
+device presence or delivery metadata. A different human cannot take over a live
+endpoint. Private VAPID signing material remains in Host custody, not Native.
 
 Home is chat-first (CAD-328, `ui/src/features/home/`): the master's
 thread (`/api/threads/master`) rendered by kind — the operator's
@@ -1991,6 +2618,59 @@ its draft to itself, so typing never re-renders the thread. The composer posts
 with a client message id, shows the message at once and retires it when
 the stored `operator` entry with that id arrives; it is disabled, with
 the reason, on a read-only board or while the master is not running.
+While a turn works, its own rows carry a timestamped Assistant name row
+with a subtle Working indicator (CAD-1462) — anchored to the turn's own
+message id, never the list tail, so a newer queued or failed pending
+message cannot steal it; the truthful queued/submitting/compacting
+status line and Stop stay in the floating composer dock, outside the
+message rows. Attachments the operator picked show as compact wrapping
+chips above the composer (one status/remove icon slot each, +N more
+past three), and a sent message's files render as read-only chips under
+its bubble (CAD-1419/CAD-1462).
+
+The shared turn bar (CAD-1700) names the conversation actually ahead of a
+queued message, including Home's server-issued thread id. The master queue
+projection includes every queued message, so a position beyond twenty still
+retains Queued, View and Cancel after optimistic state retires. View opens
+that predecessor, not necessarily the running turn's app. Read-only viewers
+keep View and Review, but never Stop, Cancel or Retry. Review skips decided
+permission history and reaches the pending actionable card. Mounted cards
+refresh on pushed permission changes and ignore superseded reads. The bar
+retries the stored failure it displays with a fresh message id and its
+original content/app binding. An unrelated transport failure keeps its own
+same-id row Retry; neither action uses a later draft.
+An unresolved conversation id never claims an unthreaded running turn;
+the surface can still identify its own pending or stored operator message.
+The Conversations dropdown belongs to the positioned pane header, so it opens
+below the header rather than the page and keyboard focus does not scroll the
+workspace down to reach it.
+
+The shell loads conversation replies on mount and observes them while their
+pane is offscreen: an app reply opens its exact conversation, and a Home
+reply opens `/`. Only a foreground conversation is marked seen; a hidden
+tab cannot consume a foreground announcement. Seeing a conversation clears
+its dots and toast in every tab without clearing another unread room.
+The conversation-list and thread-read `reply_seq` values are computed from
+nonblank agent `assistant_text` / `turn_result` entries; creation,
+operator/system entries and tool progress do not count. Home uses the
+complete thread watermark, even when its reply is older than the loaded
+200-entry tail. Seen and announced reply sequences live only in browser
+IndexedDB, not a server unread table. Readwrite transactions serialize
+cross-tab changes and eligible toast delivery: an observer that cannot show
+the reply consumes no announcement, and an aborted write retracts its toast.
+localStorage carries only change signals. Old browser-local timestamp and
+sequence maps are ignored.
+
+The shared board watcher samples the master stamp every 250 ms while other
+tracker/agent work keeps its one-second cadence. Master invalidations
+bypass the client's trailing legacy batch. Each connection to
+`/api/threads/master/stream` starts with an authoritative `master` state
+snapshot, before any resumed `entry` frame. App actions additionally wait
+for the captured install/context operation reader to reconcile that
+connection; read errors keep the bar last-known. Opening the socket or
+switching context cannot make cached turn state live.
+`Last-Event-ID` takes precedence over the query cursor.
+
 A plan the thread mentions (or a `plan` row in Needs you) renders as a
 card — goal, tickets with size and acceptance, weighted progress, and
 Approve / Reject-with-reason through the plan endpoints above. The

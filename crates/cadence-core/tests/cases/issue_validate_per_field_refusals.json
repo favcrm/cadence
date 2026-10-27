@@ -1,0 +1,32 @@
+{
+  "input": {
+    "v": 1,
+    "op": "issue.validate",
+    "input": {
+      "project_key": "Bad_Key",
+      "status": "open",
+      "priority": "P9"
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "issue.validate",
+    "value": {
+      "valid": false,
+      "refusals": [
+        {
+          "field": "project_key",
+          "message": "Invalid project key 'Bad_Key' \u2014 1-32 lowercase letters, digits or hyphens"
+        },
+        {
+          "field": "status",
+          "message": "Unknown status 'open' \u2014 one of backlog ready doing review done dropped"
+        },
+        {
+          "field": "priority",
+          "message": "Unknown priority 'P9' \u2014 one of P0 P1 P2 P3"
+        }
+      ]
+    }
+  }
+}

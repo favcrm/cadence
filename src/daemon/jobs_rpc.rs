@@ -1,5 +1,6 @@
 //! CAD-534: `cadence daemon` jobs RPC handlers — moved verbatim from src/daemon.rs.
 
+use super::members_rpc::MemberCaller;
 use super::*;
 
 impl Shared {
@@ -28,6 +29,19 @@ impl Shared {
         }
         let spec = required_str(params, "spec")?;
         let spec_sha256 = required_str(params, "spec_sha256")?;
+        // The canonical issue's effective spec is its complete body, not
+        // tracker metadata changed by claim/lane/message-ref bookkeeping.
+        // This new pin is server-derived; accepted jobs are never refreshed.
+        let canonical_digest = match (optional_str(params, "issue"), self.pm()) {
+            (Some(issue), Ok(pm)) => crate::issue::dispatch::canonical_issue_spec_digest(
+                &pm,
+                issue,
+                std::path::Path::new(spec),
+                true,
+            )?,
+            _ => None,
+        };
+        let spec_sha256 = canonical_digest.as_deref().unwrap_or(spec_sha256);
         let id = optional_str(params, "job")
             .map(str::to_string)
             .unwrap_or_else(|| format!("job-{}", &Uuid::new_v4().simple().to_string()[..8]));
@@ -53,7 +67,7 @@ impl Shared {
         Ok(json!({"job": job.to_json(), "duplicate": duplicate}))
     }
 
-    pub(super) fn rpc_job_list(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_job_list(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         // CAD-437: `states` is the repeatable any-of form; the singular
         // `state` stays accepted and merges into it.
         let mut states = optional_strs(params, "states")?;
@@ -79,19 +93,27 @@ impl Shared {
         }
         // CAD-325: `tasks_detail` lists each task's id/state/title, so the
         // board binds agents to issues without one `job_show` per job.
+        // CAD-1280: `open_tasks_only` leaves terminal tasks out of that
+        // list (the board binds only what an agent still holds), and the
+        // counts and lists come from one query each, not one per job.
         let detail = params.get("tasks_detail").and_then(Value::as_bool) == Some(true);
+        let open_only = params.get("open_tasks_only").and_then(Value::as_bool) == Some(true);
+        let mut summary = self.store.job_task_summary(detail.then_some(open_only))?;
         let mut out = Vec::new();
         for job in jobs {
-            let mut j = job.to_json();
-            let mut counts: std::collections::BTreeMap<String, i64> =
-                std::collections::BTreeMap::new();
-            let tasks = self.store.tasks_for_job(&job.id)?;
-            for task in &tasks {
-                *counts.entry(task.state.clone()).or_insert(0) += 1;
+            // CAD-1380: a member-private job is withheld from every caller
+            // except the operator, its owner, an authorized actor, or a
+            // subscriber, before it is serialized.
+            if self.member_job_row_withheld(&job.id, peer_pid)? {
+                continue;
             }
-            j["tasks"] = json!(counts);
+            let mut j = job.to_json();
+            j["tasks"] = json!(summary.counts.remove(&job.id).unwrap_or_default());
             if detail {
-                j["task_list"] = json!(tasks
+                j["task_list"] = json!(summary
+                    .lists
+                    .remove(&job.id)
+                    .unwrap_or_default()
                     .iter()
                     .map(|t| json!({"id": t.id, "state": t.state, "title": t.title}))
                     .collect::<Vec<_>>());
@@ -113,10 +135,32 @@ impl Shared {
         if let Some(sha) = &job.spec_sha256 {
             match sha256_file(std::path::Path::new(&job.spec_path)) {
                 Some(now) if now != *sha => {
-                    jj["attention"] = json!(
-                        "spec changed since `job new` — \
-                        re-create the job if the drift is real work"
-                    );
+                    let canonical_digest = match (job.issue_id.as_deref(), self.pm()) {
+                        (Some(issue), Ok(pm)) => {
+                            crate::issue::dispatch::canonical_issue_spec_digest(
+                                &pm,
+                                issue,
+                                std::path::Path::new(&job.spec_path),
+                                false,
+                            )
+                        }
+                        _ => Ok(None),
+                    };
+                    match canonical_digest {
+                        Ok(Some(now)) if now == *sha => {}
+                        Ok(_) => {
+                            jj["attention"] = json!(
+                                "spec changed since `job new` — \
+                                re-create the job if the drift is real work"
+                            );
+                        }
+                        Err(error) => {
+                            jj["attention"] = json!(format!(
+                                "spec {} is unavailable for drift inspection: {error}",
+                                job.spec_path
+                            ));
+                        }
+                    }
                 }
                 None => {
                     jj["attention"] = json!(format!("spec {} is unreadable", job.spec_path));
@@ -292,6 +336,14 @@ impl Shared {
         Ok(json!({"task": task.to_json()}))
     }
 
+    /// Read-only entitlement probe for a cloud start. The CLI has no
+    /// hosted company context; the daemon does, and its refusal carries
+    /// the stable `cloud_sandbox_not_entitled` code.
+    pub(super) fn rpc_cloud_probe(self: &Arc<Self>, _params: &Value) -> Result<Value> {
+        crate::issue::cloud::probe_entitlement()?;
+        Ok(json!({"entitled": true}))
+    }
+
     /// `job dispatch` — bookkeeping plus the kickoff enqueue in one
     /// store transaction. Does not bypass the ready gate: `--ready` is
     /// claimed client-side exactly like `send --ready`.
@@ -300,24 +352,480 @@ impl Shared {
             .map(|a| self.resolve_alias(a))
             .transpose()?;
         let by = required_str(params, "by")?;
-        self.plan_gate_task(required_str(params, "task")?)?;
-        let pending = self.store.task(required_str(params, "task")?)?;
-        if let Some(alias) = to.as_deref().or(pending.assignee.as_deref()) {
-            let target = self.store.agent(alias)?;
-            crate::adapter::pi::refuse_confined_devin_agent(&target)?;
-        }
-        let (task, message, duplicate, behind_dead) = self.store.dispatch_task(
-            required_str(params, "task")?,
+        let task_id = required_str(params, "task")?;
+        let _grant = self
+            .unattended_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        self.plan_gate_task(task_id)?;
+        // CAD-1846: capture the exact native task/job/worker and the proposed
+        // kickoff revision/id before any source read. An accepted live
+        // kickoff keeps that identity; only a fresh kickoff prepares context.
+        let plan = self.store.plan_task_dispatch(
+            task_id,
             to.as_deref(),
             optional_str(params, "message"),
-            by,
         )?;
+        // The planned worker is the pre-transaction backend choice; the
+        // fenced admission re-reads its identity, so a registry change
+        // between here and the write refuses instead of retargeting.
+        crate::adapter::pi::refuse_confined_devin_agent(&plan.worker)?;
+        if !plan.worker.enabled {
+            return Err(Error::rejected(format!(
+                "Agent '{}' is disabled — resume it before dispatching",
+                plan.worker.alias
+            )));
+        }
+        let cloud_dispatch = plan.worker.endpoint_kind == "sandbox";
+        // Read-only AOS probe before the dispatch transaction. A denied
+        // company leaves the task revision, job and kickoff untouched.
+        if cloud_dispatch {
+            crate::issue::cloud::probe_entitlement()?;
+        }
+        let stall_secs = optional_i64(params, "stall_secs");
+        if stall_secs.is_some_and(|s| s < 0) {
+            return Err(Error::rejected("stall_secs must be non-negative"));
+        }
+        let no_lessons = match params.get("no_lessons") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err(Error::rejected("no_lessons must be a boolean")),
+        };
+        // A live accepted kickoff is admitted with its original identity and
+        // selection: never recapture issue/spec sources for that retry.
+        let delivery = if plan.duplicate {
+            None
+        } else {
+            Some(self.prepare_job_delivery(&plan, no_lessons)?)
+        };
+        // CAD-1380 deferred commit: an assist-bound job's dispatch re-proves
+        // the member's live authority at consume time — the approval gate
+        // alone is not the commit. This final proof runs after every blocking
+        // read above (source capture included), immediately before admission,
+        // so a long context capture cannot stale the authority it proved.
+        // The stored `assist_requests` row's `credential_id`/`authority_rev`
+        // name the provenance the consume re-proves (never the member's
+        // latest mint), while the assistant the pull binds is the CURRENT
+        // live binding's — a revoked binding fails, a re-minted one names the
+        // current principal. The final assignee — the request's `to` or the
+        // task's stored `assignee` — is checked after, never silently skipped.
+        //
+        // A store error on the provenance read propagates — the guard never
+        // silently skips the re-prove on an unreadable table. And a job in the
+        // `assist-` id family with NO provenance row is fail-closed too: its
+        // binding was deleted or corrupted, never a silent drop to an ordinary
+        // dispatch (a missing row cannot be re-proven, so the member's
+        // recorded authority is unverifiable). The fenced admission below
+        // re-reads the captured provenance under the write lock.
+        let mut expect: Option<crate::store::AssistDispatchExpect> = None;
+        match self.store.assist_request_for_job(&plan.job.id)? {
+            Some(assist) => {
+                let binding = self
+                    .store
+                    .assistant_binding(&assist.org, &assist.sub)?
+                    .ok_or_else(|| {
+                        Error::rejected(
+                            "task dispatch refused: the assist-bound job has no live \
+                         assistant binding for its member (CAD-1380)",
+                        )
+                    })?;
+                if !binding.is_active() {
+                    return Err(Error::rejected(format!(
+                        "task dispatch refused: the assist-bound job's member binding is '{}' — \
+                     only an active binding can dispatch (CAD-1380)",
+                        binding.state
+                    )));
+                }
+                let member = MemberCaller {
+                    org: assist.org.clone(),
+                    sub: assist.sub.clone(),
+                    assistant_id: binding.assistant_id.clone(),
+                    alias: binding.alias.clone(),
+                    conversation_id: None,
+                    state: binding.state.clone(),
+                    credential_id: assist.credential_id.clone().unwrap_or_default(),
+                };
+                self.member_authority_live(
+                    // No member envelope survives to consume time — the
+                    // deferred-commit bearer is the enrolled `hosted-board`
+                    // service credential (`assist.revalidate`); absent one,
+                    // the empty envelope produces a bearer the platform
+                    // rejects — fail closed. `operation` is the daemon's
+                    // internal deferred-commit name — admitted by the strict
+                    // revalidate schema, absent from the browser-callable
+                    // verb table (`/call` cannot mint it).
+                    "",
+                    &member,
+                    crate::daemon::members_rpc::MemberReprove {
+                        operation: "job_dispatch",
+                        scope: "assist.jobs",
+                        job_id: Some(&plan.job.id),
+                        // The queued effect's own recorded provenance — the
+                        // `assist_requests.credential_id` it committed under.
+                        // The platform re-proves THIS credential live, never
+                        // the binding's latest, so a stale dispatch denied
+                        // after revocation does NOT ride a renewal.
+                        op_credential_id: assist.credential_id.as_deref(),
+                    },
+                    "task dispatch",
+                )?;
+                expect = Some(crate::store::AssistDispatchExpect {
+                    org: assist.org.clone(),
+                    sub: assist.sub.clone(),
+                    assistant_id: binding.assistant_id.clone(),
+                    alias: binding.alias.clone(),
+                    credential_id: assist.credential_id.clone(),
+                    job: plan.job.id.clone(),
+                });
+                // The member-assistant PM never dispatches its own bound
+                // job — that would be self-approval. Check the exact planned
+                // worker — the request's `to` OR the task's stored assignee.
+                if plan.worker.alias == binding.alias {
+                    return Err(Error::rejected(format!(
+                        "task dispatch refused: the assist-bound job cannot be \
+                     dispatched to its own assistant '{}' — that is \
+                     self-approval (CAD-1380)",
+                        binding.alias
+                    )));
+                }
+            }
+            // The `assist-<digest>` id family is minted ONLY by
+            // `member_job_request`; a job in that family with no provenance
+            // row cannot be re-proven — refuse rather than dispatch as though
+            // it were an ordinary job.
+            None if plan.job.id.starts_with("assist-") => {
+                return Err(Error::rejected(format!(
+                    "task dispatch refused: job '{}' is assist-bound but has no \
+                     `assist_requests` provenance — the member's authority cannot be \
+                     re-proven at commit (CAD-1380)",
+                    plan.job.id
+                )));
+            }
+            None => {}
+        }
+        let (task, message, duplicate, behind_dead) =
+            self.store
+                .dispatch_task_planned(&plan, delivery, by, expect.as_ref(), stall_secs)?;
+        if cloud_dispatch {
+            let shared = Arc::clone(self);
+            let task_id = task.id.clone();
+            let message_id = message.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = shared.run_cloud_dispatch(&task_id, &message_id) {
+                    eprintln!("cloud sandbox dispatch {task_id} failed: {error}");
+                }
+            });
+        }
         if let Some(assignee) = &task.assignee {
             self.notify_agent(assignee);
         }
+        let message_state = self.store.message(&message)?.map(|m| m.state);
         self.wake();
         Ok(json!({"task": task.to_json(), "message": message,
+                  "message_state": message_state,
                   "duplicate": duplicate, "queued_behind_dead": behind_dead}))
+    }
+
+    /// CAD-1846: the complete issue-linked job kickoff selected from the
+    /// issue's own server-derived project and pinned context, or the legacy
+    /// daemon-templated kickoff paired with an honest `Disabled` selection
+    /// when the job has no issue binding or its project is not opted in to
+    /// context delivery.
+    ///
+    /// Runs entirely outside the dispatch write transaction: callers prepare
+    /// the delivery first and hand it to `dispatch_task_planned`, which writes
+    /// the message, the pin/disabled marker and the task transition
+    /// atomically. The caller has already run `plan_gate_task` for this task;
+    /// this helper adds no broader parent-policy gate. An accepted live retry
+    /// must never call this — its original selection already committed, and
+    /// recapturing moved sources would retarget it.
+    pub(super) fn prepare_job_delivery(
+        &self,
+        plan: &crate::store::DispatchPlan,
+        no_lessons: bool,
+    ) -> Result<(String, store::IssueSelection)> {
+        let legacy = |reason: String| -> Result<(String, store::IssueSelection)> {
+            Ok((
+                store::job_kickoff(
+                    &plan.job,
+                    &plan.task,
+                    plan.revision,
+                    &plan.message_id,
+                    &plan.worker.provider,
+                    &plan.worker.endpoint_kind,
+                    false,
+                )?,
+                store::IssueSelection::Disabled {
+                    task: plan.task.id.clone(),
+                    reason,
+                },
+            ))
+        };
+        let Some(issue_id) = plan.job.issue_id.as_deref() else {
+            return legacy("the job is not bound to a tracker issue".to_string());
+        };
+        let pm = self.pm()?;
+        // Capture the issue snapshot without re-running the parent policy
+        // gate: `plan_gate_task` already applied exactly that gate for every
+        // native caller. A named id no project holds keeps its legacy kickoff
+        // (`gate_id` documents that jobs need not name a tracker issue); an id
+        // a project holds but cannot be read/parsed fails closed.
+        let Some(gated) = crate::issue::dispatch::capture_issue(&pm, issue_id)? else {
+            self.refuse_known_opted_in_unheld(&pm, plan)?;
+            return legacy(
+                "no native issue context binding: the job's tracker issue is not \
+                 held by a project"
+                    .to_string(),
+            );
+        };
+        let target = crate::issue::dispatch::ContextTarget {
+            team_role: plan.worker.team_role.as_deref(),
+            provider: &plan.worker.provider,
+            endpoint_kind: &plan.worker.endpoint_kind,
+        };
+        // CAD-1846: the native scope proof, run only after the project is
+        // confirmed opted in and its endpoint can receive context, and before
+        // any spec byte is read. The job's declared repository must be exactly
+        // the checkout of this issue's single verified open lane, and the
+        // task's worktree must be that same lane — not merely another
+        // worktree in the same repository. Canonicalization failures fail
+        // closed rather than falling back to a textual comparison.
+        let scope = |project: &crate::issue::project::Project,
+                     front: &crate::issue::model::Front|
+         -> Result<()> {
+            let lane = self.dispatch_lane("job dispatch", project, front)?;
+            let lane_root = crate::worktree::main_root(&lane).map_err(|error| {
+                crate::context_pack::Refusal::ScopeConflict {
+                    detail: format!(
+                        "issue {}'s lane {} has no proven repository: {error}",
+                        front.id,
+                        lane.display()
+                    ),
+                }
+                .error()
+            })?;
+            let repo = plan.job.repo.as_deref().ok_or_else(|| {
+                crate::context_pack::Refusal::ScopeConflict {
+                    detail: format!("issue-linked job '{}' names no repository", plan.job.id),
+                }
+                .error()
+            })?;
+            let repo = std::path::Path::new(repo).canonicalize().map_err(|error| {
+                crate::context_pack::Refusal::ScopeConflict {
+                    detail: format!(
+                        "job '{}' repository {repo} cannot be resolved: {error}",
+                        plan.job.id
+                    ),
+                }
+                .error()
+            })?;
+            if repo != lane_root {
+                return Err(crate::context_pack::Refusal::ScopeConflict {
+                    detail: format!(
+                        "job '{}' names repository {}, but issue {}'s lane {} is in {}",
+                        plan.job.id,
+                        repo.display(),
+                        front.id,
+                        lane.display(),
+                        lane_root.display()
+                    ),
+                }
+                .error());
+            }
+            let worktree = plan.task.worktree.as_deref().ok_or_else(|| {
+                crate::context_pack::Refusal::ScopeConflict {
+                    detail: format!("issue-linked task '{}' binds no worktree", plan.task.id),
+                }
+                .error()
+            })?;
+            let task_lane = crate::worktree::layout::worktree_dir(&lane_root, worktree);
+            let task_lane = task_lane.canonicalize().map_err(|error| {
+                crate::context_pack::Refusal::ScopeConflict {
+                    detail: format!(
+                        "task '{}' worktree {} cannot be resolved: {error}",
+                        plan.task.id,
+                        task_lane.display()
+                    ),
+                }
+                .error()
+            })?;
+            if task_lane != lane {
+                return Err(crate::context_pack::Refusal::ScopeConflict {
+                    detail: format!(
+                        "task '{}' binds worktree {}, not issue {}'s verified lane {}",
+                        plan.task.id,
+                        task_lane.display(),
+                        front.id,
+                        lane.display()
+                    ),
+                }
+                .error());
+            }
+            Ok(())
+        };
+        let prepared = crate::issue::dispatch::job_context(
+            &pm,
+            gated,
+            crate::issue::dispatch::JobContext {
+                job: &plan.job,
+                task: &plan.task,
+                revision: plan.revision,
+                message: &plan.message_id,
+                target,
+                admission_scope: Some(&scope),
+            },
+            no_lessons,
+        )?;
+        let Some(prepared) = prepared else {
+            return legacy("the assigned project is not opted in to agent delivery".to_string());
+        };
+        Ok((
+            prepared.body.into_owned(),
+            store::IssueSelection::Pin(prepared.manifest.pin_payload(&plan.message_id)),
+        ))
+    }
+
+    /// CAD-1846: a job whose tracker id no project holds is normally legacy
+    /// (jobs need not name a tracker issue). But when the job's declared
+    /// repository belongs to a registered project that explicitly opted in to
+    /// agent delivery, the missing canonical issue context is a known
+    /// requirement and must fail closed instead of being mislabeled as an
+    /// opt-out. One bounded pin over the registered projects, only on this
+    /// exceptional resolution path; no default or current-screen project is
+    /// ever guessed.
+    fn refuse_known_opted_in_unheld(
+        &self,
+        pm: &crate::issue::Pm,
+        plan: &crate::store::DispatchPlan,
+    ) -> Result<()> {
+        let Some(repo) = plan.job.repo.as_deref() else {
+            return Ok(());
+        };
+        let Ok(repo) = std::path::Path::new(repo).canonicalize() else {
+            return Ok(());
+        };
+        let (role, _) = crate::context_pack::selection_role(plan.worker.team_role.as_deref());
+        for project in crate::issue::project::list(&pm.dir)? {
+            if !crate::issue::start::declared_repos(&project)
+                .iter()
+                .any(|root| root == &repo)
+            {
+                continue;
+            }
+            if crate::issue::context::pin(&project, Some(role)).state != "unconfigured" {
+                return Err(crate::context_pack::Refusal::ScopeConflict {
+                    detail: format!(
+                        "job '{}' names issue '{}' that no project holds, while its \
+                         repository {} is declared by opted-in project '{}'; the \
+                         canonical issue context cannot be resolved",
+                        plan.job.id,
+                        plan.job.issue_id.as_deref().unwrap_or_default(),
+                        repo.display(),
+                        project.key
+                    ),
+                }
+                .error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume a sandbox agent's dispatched kickoff. The normal dispatch
+    /// transaction already set the task `dispatched` and queued `message`;
+    /// claim the queued delivery before any external side effect, then drive
+    /// the remote job and call the same finish/report path. A cancelled or
+    /// already-claimed delivery is left alone. `has_actor=false` means no
+    /// actor exists.
+    pub(super) fn run_cloud_dispatch(&self, task_id: &str, message_id: &str) -> Result<()> {
+        fn fail(
+            store: &crate::store::Store,
+            message: &crate::store::Message,
+            error: Error,
+        ) -> Error {
+            if store.cloud_create_attempted(&message.id).unwrap_or(false) {
+                let _ = store.requeue_cloud_claim(&message.id, &format!("cloud:{}", message.id));
+                return Error::Structured(crate::error::Structured {
+                    kind: "rejected",
+                    code: crate::issue::cloud::UNCERTAIN.to_string(),
+                    message: format!(
+                        "cloud sandbox recovery preflight failed after a prior create \
+                         attempt: {error}"
+                    ),
+                    revision: None,
+                });
+            }
+            crate::issue::cloud::fail_message(store, message, &error);
+            error
+        }
+        let message = self.store.message(message_id)?.ok_or_else(|| {
+            Error::rejected(format!("cloud dispatch message '{message_id}' is gone"))
+        })?;
+        let turn = format!("cloud:{}", message.id);
+        let claimed = if message.state == "unknown" {
+            self.store.claim_cloud_recovery(&message.id, &turn)?
+        } else {
+            self.store.mark_running_queued(&message.id, &turn)?
+        };
+        if !claimed {
+            return Ok(());
+        }
+        let task = self
+            .store
+            .task(task_id)
+            .map_err(|error| fail(&self.store, &message, error))?;
+        let job = self
+            .store
+            .job(&task.job_id)
+            .map_err(|error| fail(&self.store, &message, error))?;
+        let alias = task.assignee.as_deref().unwrap_or(message.alias.as_str());
+        let agent = self
+            .store
+            .agent(alias)
+            .map_err(|error| fail(&self.store, &message, error))?;
+        if agent.provider != "sandbox" || agent.endpoint_kind != "sandbox" {
+            let error = Error::rejected(format!(
+                "cloud kickoff recipient '{alias}' is no longer a sandbox agent"
+            ));
+            return Err(fail(&self.store, &message, error));
+        }
+        let _ = crate::issue::cloud::hosted_company(|key| std::env::var(key).ok())
+            .map_err(|error| fail(&self.store, &message, error))?;
+        let pm = self
+            .pm()
+            .map_err(|error| fail(&self.store, &message, error))?;
+        loop {
+            let outcome = crate::issue::cloud::run_dispatch(
+                &pm,
+                &self.store,
+                &task,
+                &job,
+                &message,
+                &agent,
+                &|| {
+                    self.store
+                        .cloud_stop_requested(&message.id)
+                        .unwrap_or(false)
+                },
+            );
+            if let Err(error) = &outcome {
+                if error.code() == Some(crate::issue::cloud::UNCERTAIN) {
+                    let _ = self
+                        .store
+                        .requeue_cloud_claim(&message.id, &format!("cloud:{}", message.id));
+                    // Re-enter the same kickoff/remote identity instead of
+                    // leaving a queued claim without a consumer.
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    if !self
+                        .store
+                        .mark_running_queued(&message.id, &format!("cloud:{}", message.id))?
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
+            return outcome;
+        }
     }
 
     /// `job verdict` — the reviewer is the verified caller (CAD-372),

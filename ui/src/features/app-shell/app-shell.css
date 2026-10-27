@@ -1,3 +1,6 @@
+@import "../../../screen-ui/src/primitives.css";
+@import "../../../screen-ui/src/drawer-base.css";
+
 /* CAD-802 trusted shared App shell. Canonical board tokens only.
  *
  * One chat node serves both panes: the desktop left column and the
@@ -35,6 +38,7 @@
   min-width: 0;
   margin-bottom: 0.75rem;
   flex-shrink: 0;
+  flex-wrap: wrap;
 }
 
 /* Two panes on desktop: live master thread left, outlet right. The
@@ -58,92 +62,69 @@
 }
 
 /* The single chat node: a bounded flex column in the left pane on
-   desktop, a fixed left sheet at narrow widths. The column owns
-   internal scrolling: drawer head and composer never shrink, the
-   message list takes the leftover height and scrolls (CAD-1007). */
+   desktop. At narrow widths it is the full-width "Assistant" panel of
+   the approved mock's Assistant | Workspace switch — both panels stay
+   mounted and CSS shows one, so draft, stream and workspace state
+   survive switching. The column owns internal scrolling: the message
+   list takes the leftover height and scrolls (CAD-1007). */
 .app-shell-chat {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  position: fixed;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  width: min(22rem, 88dvw);
-  z-index: 50;
-  background: var(--color-ink-900);
-  border-right: 1px solid var(--color-ink-700);
-  padding: 0.9rem;
-  overflow-y: auto;
-  transform: translateX(-105%);
-  visibility: hidden;
-  transition: transform 0.2s ease, visibility 0.2s;
+  height: 100%;
+  overflow: hidden;
 }
 
-.app-shell-chat[data-open] {
-  transform: translateX(0);
-  visibility: visible;
-}
-
-@media (min-width: 1024px) {
-  .app-shell-chat {
-    position: static;
-    height: 100%;
-    width: auto;
-    z-index: auto;
-    background: transparent;
-    border-right: 0;
-    padding: 0;
-    overflow: hidden;
-    transform: none;
-    visibility: visible;
-    transition: none;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .app-shell-chat {
-    transition: none;
-  }
-}
-
-/* Drawer chrome exists only at narrow widths; the desktop pane is
-   labelled by the pane itself. */
-.app-shell-chat-head {
+.app-shell-panels {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-  margin-bottom: 0.75rem;
+  gap: 0.5rem;
+  padding: 0.35rem 0;
+  margin-bottom: 0.5rem;
+  border-bottom: 1px solid var(--color-ink-700);
   flex-shrink: 0;
 }
 
+.app-shell-panel-tab {
+  flex: 1;
+  min-height: 2.5rem;
+  padding: 0.35rem;
+  border: 0;
+  border-radius: 0.3rem;
+  background: transparent;
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+}
+
+.app-shell-panel-tab[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--color-accent) 9%, transparent);
+  color: var(--color-accent);
+}
+
+.app-shell-panel-tab:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
 @media (min-width: 1024px) {
-  .app-shell-chat-head {
+  .app-shell-panels {
     display: none;
   }
 }
 
-.app-shell-chat-toggle {
-  margin-left: auto;
-}
-
-@media (min-width: 1024px) {
-  .app-shell-chat-toggle {
+@media (max-width: 1023.98px) {
+  .app-shell-grid[data-shell-panel="chat"] .app-shell-outlet,
+  .app-shell-grid[data-shell-panel="work"] .app-shell-chat {
     display: none;
   }
 }
 
-.app-shell-scrim {
-  position: fixed;
-  inset: 0;
-  background: var(--color-scrim);
-  z-index: 40;
-}
-
-@media (min-width: 1024px) {
-  .app-shell-scrim {
-    display: none;
+/* CAD-1726: on a tablet, an open agent canvas covers beside the chat, never
+   over it — the chat pane keeps a 22rem column (352px) at the left. A phone
+   gets the canvas as a full-screen sheet instead. Keep in step with
+   APP_TABLET_CHAT_RIGHT in features/canvas/canvasStore.ts. */
+@media (min-width: 640px) and (max-width: 1023.98px) {
+  [data-canvas] .app-shell-grid[data-shell-panel="chat"] {
+    grid-template-columns: minmax(0, 22rem);
   }
 }
 
@@ -171,6 +152,127 @@
   flex-direction: column;
 }
 
+/* CAD-1615 / CAD-1777 — the app screen presented in the board-wide drawer:
+   the whole window height on the right, the rest of the board under the one
+   host scrim. The host promotes the OUTLET ITSELF (the same DOM node that
+   already holds the mounted frame), so a geometry change never reloads the
+   frame or discards an in-progress draft; the app draws its own header,
+   footer and body scrolling inside this box. */
+.app-shell[data-screen-drawer="true"] {
+  /* The promoted panel is fixed and owns its own scroll; freezing the
+     shell's scroller keeps the board (and its scrollbar) still behind the
+     scrim. Scrolling is restored from the shell's saved position on close. */
+  overflow: hidden;
+}
+.app-workspace .app-shell[data-screen-drawer="true"] {
+  overflow: hidden;
+}
+.app-shell[data-screen-drawer="true"] .app-shell-outlet {
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: auto;
+  width: min(30rem, 100dvw);
+  height: 100vh;
+  height: 100dvh;
+  max-height: 100dvh;
+  z-index: 51;
+  background: var(--color-ink-875);
+  border-left: 1px solid var(--color-ink-700);
+  box-shadow: -12px 0 32px rgb(0 0 0 / .35);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+/* The frame fills the panel; everything inside is the app's to draw. */
+.app-shell[data-screen-drawer="true"] .app-shell-outlet > [aria-label="Installed app screen"] {
+  flex: 1 1 0%;
+  min-height: 0;
+}
+/* The board's narrow layout (single pane, no second column) gets the whole
+   viewport rather than a slice of it — the same breakpoint the shell uses to
+   switch from two panes to one. */
+@media (max-width: 1023.98px) {
+  .app-shell[data-screen-drawer="true"] .app-shell-outlet {
+    width: 100dvw;
+    max-width: 100dvw;
+    border-left: 0;
+    box-shadow: none;
+  }
+}
+.app-shell-screen-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: var(--color-scrim);
+  overscroll-behavior: contain;
+}
+/* Background interaction exclusion: the promoted panel is the only live
+   region — the scrim takes pointer input and AppShell marks the other panes
+   inert, so neither a click nor a tab can reach the board behind it. */
+.app-shell[data-screen-drawer="true"] .app-shell-crumb,
+.app-shell[data-screen-drawer="true"] .app-shell-panels,
+.app-shell[data-screen-drawer="true"] .app-shell-chat {
+  pointer-events: none;
+}
+
+/* CAD-1777 — the independent drawer. This is the ONLY thing that becomes
+   fixed: a shell-owned panel on the right (the whole viewport at the board's
+   narrow breakpoint), with one host scrim behind it. The primary app frame
+   stays in `.app-shell-outlet` in normal flow at its exact bounds and is
+   merely inert while the panel is open; nothing is promoted, moved or
+   measured. The core bar keeps a trusted close above the child frame. */
+.app-shell-screen-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(30rem, 100dvw);
+  z-index: 51;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--color-ink-875);
+  border-left: 1px solid var(--color-ink-700);
+  box-shadow: -12px 0 32px rgb(0 0 0 / .35);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+.app-shell-screen-drawer:focus {
+  outline: none;
+}
+.app-shell-screen-drawer-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-height: 2.75rem;
+  padding: 0.25rem 0.75rem;
+  border-bottom: 1px solid var(--color-ink-700);
+}
+.app-shell-screen-drawer-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0%;
+  min-height: 0;
+}
+.app-shell-screen-drawer-error {
+  display: grid;
+  gap: 0.75rem;
+  justify-items: start;
+  padding: 1rem;
+}
+@media (max-width: 1023.98px) {
+  .app-shell-screen-drawer {
+    width: 100dvw;
+    max-width: 100dvw;
+    border-left: 0;
+    box-shadow: none;
+  }
+}
+
 .app-shell-context {
   display: grid;
   gap: 0.35rem;
@@ -189,13 +291,98 @@
   gap: 0.5rem;
   border: 1px solid var(--color-ink-700);
   border-radius: 0.5rem;
-  background: var(--color-ink-875);
+  background: var(--color-ink-850);
   padding: 0.75rem;
+}
+
+.app-chat-label {
+  margin: 0;
+  color: var(--color-ink-500);
+  text-transform: uppercase;
+}
+
+/* Static app prompts as full-width suggestion rows (mockup .sugg); they
+   only fill the composer. */
+.app-chat-sugg {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.app-chat-sugg-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  min-height: 2.5rem;
+  padding: 0.45rem 0.65rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.375rem;
+  background: var(--color-ink-875);
+  color: var(--color-ink-300);
+  font-size: var(--text-label);
+}
+.app-chat-sugg-row:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-ink-100);
+}
+.app-chat-sugg-row:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* CAD-1431: the composer's More actions menu opens upward over the tools
+   row; the on-demand CSV importer sits above the composer, scrollable. */
+.app-chat-actions {
+  position: relative;
+}
+.app-chat-actions-menu {
+  position: absolute;
+  bottom: calc(100% + 0.375rem);
+  right: 0;
+  z-index: 10;
+  display: grid;
+  min-width: 12rem;
+  padding: 0.25rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: var(--color-ink-850);
+}
+.app-chat-actions-item {
+  padding: 0.45rem 0.6rem;
+  border-radius: 0.375rem;
+  text-align: left;
+  color: var(--color-ink-200);
+  font-size: var(--text-label);
+}
+.app-chat-actions-item:hover,
+.app-chat-actions-item:focus-visible {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+.app-chat-import {
+  display: grid;
+  gap: 0.5rem;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: var(--color-ink-850);
+}
+.app-chat-import[hidden] {
+  display: none;
+}
+.app-chat-import-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
 }
 
 .app-chat-list {
   display: grid;
-  gap: 0.5rem;
+  gap: 0.875rem;
   flex: 1;
   min-height: 0;
   max-height: none;
@@ -205,6 +392,10 @@
   margin: 0;
   padding: 0;
 }
+.app-chat-list .chat-bubble:not([data-chat-message="user"] .chat-bubble),
+.app-chat-list .typing {
+  background: var(--color-ink-875);
+}
 
 .app-chat-form {
   display: grid;
@@ -212,65 +403,390 @@
   flex-shrink: 0;
 }
 
+/* CAD-1168 compact composer (the approved unified-chat mock): one
+   bordered card holding the auto-growing box and an icon-only tool
+   row — Attach on the left, a circular up-arrow Send on the right.
+   No resize grip, no persistent hint row. */
+.app-chat-composer {
+  display: grid;
+  gap: 0.25rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.75rem;
+  background: var(--color-ink-850);
+  padding: 0.55rem 0.6rem;
+}
+
+/* Mock: .composer:focus-within — the card warms toward the accent
+   while the box is active. */
+.app-chat-composer:focus-within {
+  border-color: color-mix(in srgb, var(--color-accent) 55%, var(--color-ink-700));
+}
+
+.app-chat-composer-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .app-chat-box {
   width: 100%;
-  resize: vertical;
-  min-height: 2.75rem;
-  max-height: 10rem;
+  resize: none;
+  min-height: 2.3rem;
+  max-height: 7.5rem; /* the mock's 120 px cap, then the box scrolls */
+  overflow-y: auto;
   background: transparent;
   color: var(--color-ink-100);
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.375rem;
-  padding: 0.5rem;
+  border: 0;
+  padding: 0.25rem 0.15rem;
   font-size: var(--text-secondary);
+  line-height: 1.5;
 }
 
 .app-chat-box:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 1px;
+  outline: none; /* the card's focus-within ring is the cue */
 }
 
 .app-chat-box::placeholder {
   color: var(--color-ink-500);
 }
 
-/* Generic outlet tabs + detail drawer. */
-.app-outlet {
+/* Icon-only Attach (CAD-1168 slice 2 wired it to /api/chat/upload).
+   Mock: .attach-button. */
+.app-chat-attach {
   display: grid;
-  gap: 0.75rem;
-  align-content: start;
-  /* A grid item defaults to min-width: auto: without this, a wide
-     descendant (e.g. a customer table) forces the whole document
-     past narrow viewports instead of scrolling internally (CAD-781 F2). */
-  min-width: 0;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--color-ink-400);
 }
 
-.app-outlet-tabs {
+.app-chat-attach:hover:not(:disabled) {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+
+.app-chat-attach:disabled {
+  opacity: 0.45;
+}
+
+.app-chat-attach svg {
+  width: 1.05rem;
+  height: 1.05rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The queued-attachment chips above the composer (CAD-1462 finishes
+   CAD-1419's approved geometry): compact, bounded, wrapping pills —
+   the icon slot, name and `size · kind` on ONE line, the refusal
+   reason and Retry on a failed chip, Remove on the icon slot. */
+.app-chat-attachrow {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.25rem;
-  border-bottom: 1px solid var(--color-ink-700);
+  align-items: center;
+  gap: 0.375rem;
+  margin-bottom: 0.375rem;
 }
 
-.app-outlet-tab {
-  padding: 0.5rem 0.9rem;
+.app-chat-filerow {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  max-width: min(17rem, 100%);
+  height: 1.75rem;
+  padding: 0 0.5rem 0 0.375rem;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 30%, var(--color-ink-700));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-accent) 7%, var(--color-ink-850));
   font-size: var(--text-label);
-  color: var(--color-ink-400);
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
+  color: var(--color-ink-200);
 }
 
-.app-outlet-tab:focus-visible {
+/* A failed chip keeps the refusal reachable but stays bounded: the
+   name/meta line holds its one-line height, and the reason wraps to a
+   second truncated line inside the pill rather than growing a card. */
+.app-chat-filerow.failed {
+  height: auto;
+  min-height: 1.75rem;
+  flex-wrap: wrap;
+  row-gap: 0.125rem;
+  padding-block: 0.25rem;
+  max-width: 100%;
+  border-color: color-mix(in srgb, var(--color-fail) 55%, transparent);
+  background: color-mix(in srgb, var(--color-fail) 6%, var(--color-ink-850));
+}
+
+.app-chat-filerow > svg {
+  width: 1.05rem;
+  height: 1.05rem;
+  color: var(--color-accent);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.app-chat-filerow.failed > svg {
+  color: var(--color-fail);
+}
+
+/* Name and meta share one line: the name truncates first, the meta
+   keeps its size · kind readable. */
+.app-chat-filename {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.app-chat-filename small {
+  font-size: var(--text-micro);
+  color: var(--color-ink-400);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* Mock: .upload-error — the refusal reason is visible text, one
+   truncated line under the name (full text on the chip's title). */
+.app-chat-filename small.app-chat-upload-error {
+  font-size: var(--text-micro);
+  color: var(--color-fail);
+}
+
+/* CAD-1419/CAD-1462: one icon slot per draft chip. Rest shows the
+   status glyph (file, spinner while uploading, warning on failure);
+   hover or focus swaps in Remove, and a coarse pointer keeps Remove
+   visible. */
+.app-chat-filerow .app-chat-upload-error {
+  flex: 1 1 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.app-chat-filerow .app-chat-chip-retry { flex-shrink: 0; }
+.app-chat-chip-name {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.app-chat-chip-slot {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 1.5rem;
+  height: 1.5rem;
+}
+.app-chat-chip-status,
+.app-chat-chip-slot > .app-chat-remove {
+  grid-area: 1 / 1;
+}
+.app-chat-chip-status svg {
+  width: 1rem;
+  height: 1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  color: var(--color-accent);
+}
+.app-chat-filerow.failed .app-chat-chip-status svg { color: var(--color-fail); }
+.app-chat-chip-slot > .app-chat-remove { opacity: 0; pointer-events: none; }
+.app-chat-filerow:hover .app-chat-chip-status,
+.app-chat-filerow:focus-within .app-chat-chip-status { visibility: hidden; }
+.app-chat-filerow:hover .app-chat-remove,
+.app-chat-filerow:focus-within .app-chat-remove { opacity: 1; pointer-events: auto; }
+/* Touch has no hover: Remove holds the one icon slot, and the state
+   that the glyph would show is written out in the chip's meta line. */
+.app-chat-touch-status { display: none; }
+@media (hover: none) {
+  .app-chat-chip-slot > .app-chat-remove { opacity: 1; pointer-events: auto; }
+  .app-chat-filerow .app-chat-chip-status { display: none; }
+  .app-chat-touch-status { display: inline; }
+}
+.app-chat-spinner {
+  width: 0.9rem;
+  height: 0.9rem;
+  border: 1.5px solid color-mix(in srgb, var(--color-accent) 30%, transparent);
+  border-top-color: var(--color-accent);
+  border-radius: 50%;
+  animation: app-chat-spin 0.9s linear infinite;
+}
+@keyframes app-chat-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .app-chat-spinner { animation: none; }
+}
+.app-chat-more {
+  align-self: center;
+  font-size: var(--text-micro);
+}
+.app-chat-more.failed { color: var(--color-fail); }
+
+/* The operator bubble's sent files (CAD-1462, the mock's `.sentchips`):
+   compact read-only chips wrapping beside the bubble — extension tag,
+   truncated name, `size · kind` — collapsing past three behind the
+   shared +N more. Never links, never remove/retry: they already sent. */
+.sentchips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.375rem;
+  margin-top: 0.375rem;
+  /* Contain inside the inline-block operator bubble at narrow widths:
+     a flex row's max-content is the single-line sum of its chips, so
+     bound it to the bubble's width and let the chips wrap (CAD-1462). */
+  min-width: 0;
+  max-width: 100%;
+}
+.sentchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-width: 0;
+  max-width: min(15rem, 100%);
+  height: 1.5rem;
+  padding: 0 0.5rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 999px;
+  background: var(--color-ink-850);
+  font-size: var(--text-micro);
+  color: var(--color-ink-200);
+}
+.sentchip-ext {
+  flex-shrink: 0;
+  font-size: 0.5625rem;
+  letter-spacing: 0.04em;
+  color: var(--color-ink-400);
+}
+.sentchip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sentchip-meta {
+  flex-shrink: 0;
+  color: var(--color-ink-500);
+}
+
+.app-chat-filerow .lnk {
+  flex-shrink: 0;
+  color: var(--color-ink-300);
+}
+
+.app-chat-remove {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--color-ink-400);
+}
+
+.app-chat-remove:hover {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+
+.app-chat-remove svg {
+  width: 0.85rem;
+  height: 0.85rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+}
+
+.app-chat-remove:focus-visible,
+.app-chat-attach:focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
 
-.app-outlet-tab[data-on] {
-  color: var(--color-accent);
-  border-bottom-color: var(--color-accent);
-  font-weight: 600;
+/* Circular up-arrow Send. Mock: .send — a monochrome disc: the lightest
+   ink on dark, the darkest on light, so both themes follow the tokens. */
+.app-chat-send {
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  margin-left: auto;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  background: var(--color-ink-200);
+  color: var(--color-ink-950);
+  transition: background 0.15s ease, transform 0.15s ease, opacity 0.15s ease;
 }
 
+.app-chat-send:hover:not(:disabled) {
+  background: var(--color-ink-100);
+  transform: translateY(-1px);
+}
+
+.app-chat-send:active:not(:disabled) {
+  transform: scale(0.94);
+}
+
+.app-chat-send:disabled {
+  background: var(--color-ink-600);
+  color: var(--color-ink-500);
+  opacity: 0.6;
+}
+
+.app-chat-send:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+.app-chat-send svg {
+  width: 1rem;
+  height: 1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+@media (max-width: 1023.98px) {
+  /* Mock's mobile rule: 40px touch targets and a 16px box (no iOS
+     focus zoom). */
+  .app-chat-send,
+  .app-chat-attach,
+  .app-chat-remove,
+  .app-chat-chip-slot {
+    width: 2.5rem;
+    height: 2.5rem;
+  }
+  .app-chat-remove svg {
+    width: 1rem;
+    height: 1rem;
+  }
+  .app-chat-textarea {
+    font-size: 16px;
+  }
+}
+
+/* Generic outlet tabs + detail drawer. */
 .app-outlet-drawer {
   border: 1px solid var(--color-ink-700);
   border-radius: 0.5rem;
@@ -284,64 +800,6 @@
   justify-content: space-between;
   gap: 0.75rem;
   margin-bottom: 0.5rem;
-}
-
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
-}
-
-/* CRM Customers inside the trusted shell (CAD-781). Canonical board
-   tokens only — no App-provided styling runs here. */
-.crm {
-  gap: 0.75rem;
-}
-
-.crm-crumb {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  min-width: 0;
-}
-
-.crm-list {
-  display: grid;
-  gap: 0.75rem;
-  align-content: start;
-  min-width: 0;
-}
-
-.crm-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  flex-wrap: wrap;
-  min-width: 0;
-}
-
-/* The lede takes the free width and wraps; the header action stays on
-   the same row, right-aligned, in every CRM section. */
-.crm-toolbar-lede {
-  flex: 1 1 14rem;
-  min-width: 0;
-  margin: 0;
-}
-
-.crm-search {
-  flex: 1 1 14rem;
-  min-width: 0;
-}
-
-.crm-search-input {
-  width: 100%;
 }
 
 .crm-table-wrap {
@@ -396,25 +854,6 @@
   border-bottom: 0;
 }
 
-.crm-pager {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-  min-width: 0;
-}
-
-.crm-field {
-  display: grid;
-  gap: 0.3rem;
-  min-width: 0;
-}
-
-.crm-field .field {
-  width: 100%;
-  max-width: 100%;
-}
-
 .crm-field-row {
   display: grid;
   gap: 0.75rem;
@@ -425,149 +864,6 @@
   .crm-field-row {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
-}
-
-/* Right detail drawer: a fixed sheet on desktop, a full overlay at
-   narrow widths. Non-modal — the list stays usable behind it. */
-.crm-drawer {
-  position: fixed;
-  top: 0;
-  bottom: 0;
-  right: 0;
-  width: min(30rem, 100dvw);
-  z-index: 30;
-  background: var(--color-ink-875);
-  border-left: 1px solid var(--color-ink-700);
-  padding: 1rem 1.1rem 2rem;
-  overflow-y: auto;
-}
-
-.crm-drawer-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-  margin-bottom: 0.35rem;
-}
-
-.crm-detail {
-  display: grid;
-  gap: 0.5rem;
-  margin: 0;
-}
-
-.crm-detail > div {
-  display: grid;
-  grid-template-columns: 8rem minmax(0, 1fr);
-  gap: 0.5rem;
-  align-items: baseline;
-}
-
-.crm-detail dt {
-  font-size: var(--text-label);
-  color: var(--color-ink-500);
-}
-
-.crm-detail dd {
-  margin: 0;
-  font-size: var(--text-secondary);
-  color: var(--color-ink-200);
-  overflow-wrap: anywhere;
-}
-
-.crm-history {
-  display: grid;
-  gap: 0.3rem;
-  list-style: none;
-  margin: 0.35rem 0 0;
-  padding: 0;
-}
-
-/* Campaign email preview: source/text forms scroll internally so a
-   long render never pushes the document past narrow viewports. */
-.crm-preview {
-  margin: 0;
-  padding: 0.75rem;
-  max-width: 100%;
-  overflow: auto;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.5rem;
-  background: var(--color-ink-950);
-  color: var(--color-ink-300);
-  font-family: var(--font-mono);
-  font-size: var(--text-label);
-}
-
-/* Visual preview: the host-sanitized render runs in a scriptless
-   sandbox (sandbox=""), so no preview markup can execute here. */
-.crm-preview-frame {
-  width: 100%;
-  min-height: 24rem;
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.5rem;
-  background: #fff;
-}
-
-/* The test-send panel reads apart from every save/preview control:
-   one operator address, SMTP acceptance only — not a campaign send. */
-.crm-test {
-  border-color: var(--color-info);
-}
-
-/* The final-send panel reads as the irreversible section: warning
-   chrome, a prepared material view and a typed-count confirm — never
-   visually confusable with the test send above it. */
-.crm-send {
-  border-color: var(--color-warn);
-}
-
-/* Send state chips: prepared/sending read informational; completed
-   and accepted read ok; closed/failed/uncertain read as failures the
-   operator must reconcile. */
-.crm-send-chip[data-state="sending"],
-.crm-send-chip[data-state="submitting"],
-.crm-send-chip[data-state="queued"] {
-  border-color: var(--color-info);
-  color: var(--color-info);
-}
-.crm-send-chip[data-state="completed"],
-.crm-send-chip[data-state="accepted"] {
-  border-color: var(--color-ok);
-  color: var(--color-ok);
-}
-.crm-send-chip[data-state="closed"],
-.crm-send-chip[data-state="failed"],
-.crm-send-chip[data-state="uncertain"] {
-  border-color: var(--color-fail);
-  color: var(--color-fail);
-}
-
-/* The typed-count confirm dialog: modal over the campaign, compact,
-   centred. The count input is the gate — Cancel/Approve stay paired. */
-.crm-confirm-wrap {
-  position: fixed;
-  inset: 0;
-  z-index: 40;
-  display: grid;
-  place-items: center;
-  padding: 1rem;
-}
-.crm-confirm-scrim {
-  position: absolute;
-  inset: 0;
-  background: var(--color-scrim);
-}
-.crm-confirm {
-  position: relative;
-  width: min(26rem, 100%);
-  max-height: calc(100dvh - 2rem);
-  overflow-y: auto;
-  padding: 1rem;
-}
-.crm-confirm .field {
-  max-width: 10rem;
 }
 
 /* CAD-861 app-views/v1 dev preview: the contract renderer reuses the
@@ -710,40 +1006,6 @@
   gap: 0.4rem;
 }
 
-/* ============================================================
-   CAD-1008 additive layer: CRM-only selectors + shared host
-   primitives (CAD-866), appended after the parent's shared shell.
-   No parent app-shell, app-view or existing CRM rule above is overridden —
-   every block below is a new selector or a CRM-scoped rule. */
-
-/* CAD-1008: the email content form and its saved-version preview sit
-   side by side on wide viewports — the operator writes and sees the
-   rendered email in one glance. Narrow viewports stack them so the
-   preview lands immediately after the content card, before approval. */
-.crm-compose {
-  display: grid;
-  gap: 0.75rem;
-  grid-template-columns: minmax(0, 1fr);
-  min-width: 0;
-  align-items: start;
-}
-
-@media (min-width: 1100px) {
-  .crm-compose {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  }
-}
-
-/* Diagnostic record metadata (ids, revisions, digests, workspace)
-   collapses behind this details block instead of leading the page. */
-.crm-diag summary {
-  cursor: pointer;
-  list-style: disclosure-closed;
-}
-
-.crm-diag[open] summary {
-  list-style: disclosure-open;
-}
 /* Scoped entry: the unselected multi-context state lists each active
    context as an explicit `?ctx=` link — a real URL write, never a
    hidden default. Replaces the removed header picker without
@@ -802,145 +1064,179 @@
     min-height: 2.75rem;
   }
 }
-/* CAD-866 shared host primitives. These generic classes carry the same
-   canonical tokens the CRM (`crm-*`) and app-views (`av-*`) shapes used;
-   consumers keep their legacy class as an extra hook for tests/QA while
-   the field/table/detail/state chrome now lives here once. */
-.sfield {
-  display: grid;
-  /* Label/hint/error sit as one unit (8px spacing scale); control
-     heights, rows-driven textareas and required/error/readonly
-     semantics are untouched (CAD-910). */
-  gap: 0.5rem;
-  min-width: 0;
-}
-
-.sfield .field,
-.sfield > input:not([type="file"]),
-.sfield > textarea,
-.sfield > select {
-  width: 100%;
-  max-width: 100%;
-}
-
-.sfield-label {
-  /* Mid weight lifts the label above its hint without reaching the
-     semibold reserved for selected tabs/headings (CAD-910). */
-  font-weight: 500;
-}
-
-/* Shared hint typography overrides the compact utilities emitted by Field. */
-p.sfield-hint {
-  margin: 0;
-  font-size: var(--text-label);
-  line-height: 1.5;
-  color: var(--color-ink-400);
-}
-
-.sfield-error {
-  margin: 0;
-}
-
-.stable-wrap {
-  overflow: auto;
-  max-width: 100%;
-  /* Inside a bounded flex column this is the only flex-growing region:
-     it fills the leftover height and scrolls the table internally
-     instead of letting the document grow past the fold. */
-  flex: 1;
-  min-height: 0;
-  contain: layout paint;
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.5rem;
-  background: var(--color-ink-850);
-}
-
-.stable-wrap:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
-}
-
-.stable {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: var(--text-table);
-}
-
-.stable th,
-.stable td {
-  text-align: left;
-  /* Same 12px block/inline padding as .crm-table: both owners read
-     identically wherever DataTable or a bare table renders (CAD-910). */
-  padding: 0.75rem;
-  border-bottom: 1px solid var(--color-ink-700);
-  vertical-align: top;
-  /* Long unbreakable tokens wrap; horizontal scrolling stays inside
-     `.stable-wrap`, never the document. */
-  overflow-wrap: anywhere;
-}
-
-.stable thead th {
-  font-size: var(--text-label);
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--color-ink-400);
-  background: var(--color-ink-875);
-}
-
-.stable tbody tr:hover {
-  background: var(--color-ink-875);
-}
-
-.stable tbody tr:last-child td,
-.stable tbody tr:last-child th {
-  border-bottom: 0;
-}
-
-.sdetail {
-  display: grid;
-  gap: 0.5rem;
-  margin: 0;
-}
-
-.sdetail > div {
-  display: grid;
-  grid-template-columns: 8rem minmax(0, 1fr);
-  gap: 0.5rem;
-  align-items: baseline;
-}
-
-.sdetail dt {
-  font-size: var(--text-label);
-  color: var(--color-ink-500);
-}
-
-.sdetail dd {
-  margin: 0;
-  font-size: var(--text-secondary);
-  color: var(--color-ink-200);
-  overflow-wrap: anywhere;
-}
-
-.snotice,
-.sempty,
-.serror {
-  margin: 0;
-}
-
-.sloading {
-  margin: 0;
-}
 /* CAD-1051: collapsible chat rail (desktop). The pane stays on the
    left; collapsed it is a thin rail with a waiting dot. */
 .app-chat-rail {
   display: none;
 }
+/* Keep named actor and workspace scope visible beside the conversation tools. */
 .app-chat-head {
+  position: relative;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
+  min-height: 2rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--color-ink-800);
+}
+.app-chat-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: var(--text-body);
+  color: var(--color-ink-100);
+}
+.app-chat-title strong {
+  font-weight: 500;
+}
+.app-chat-mark {
+  align-self: center;
+  color: var(--color-accent);
+  font-size: 1.1rem;
+  line-height: 1;
+}
+.app-chat-conv[data-state="offline"] {
+  color: var(--color-warn);
+}
+.app-chat-head-tools {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 0.125rem;
+}
+.app-chat-iconbtn {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 1.875rem;
+  height: 1.875rem;
+  padding: 0;
+  border: 0;
+  border-radius: 0.5rem;
+  background: transparent;
+  color: var(--color-ink-400);
+  cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+.app-chat-iconbtn:hover:not(:disabled),
+.app-chat-iconbtn[aria-expanded="true"] {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+.app-chat-iconbtn:active:not(:disabled) {
+  background: var(--color-ink-700);
+}
+.app-chat-iconbtn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.app-chat-iconbtn:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+.app-chat-iconbtn svg {
+  width: 1.125rem;
+  height: 1.125rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+@media (max-width: 1023.98px) {
+  .app-chat-iconbtn {
+    width: 2.5rem;
+    height: 2.5rem;
+  }
+}
+.app-chat-sep {
+  width: 1px;
+  height: 1rem;
+  margin: 0 0.25rem;
+  background: var(--color-ink-700);
+}
+.app-chat-iconbtn-dot {
+  position: absolute;
+  top: 0.3rem;
+  right: 0.3rem;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 9999px;
+  background: var(--color-accent);
+  box-shadow: 0 0 0 2px var(--color-ink-900);
+}
+/* The Conversations menu drops from the history button. */
+.app-chat-history {
+  position: absolute;
+  top: calc(100% + 0.25rem);
+  right: 0;
+  z-index: 30;
+  display: grid;
+  gap: 0.125rem;
+  width: min(16.25rem, 100%);
+  max-height: 18rem;
+  overflow-y: auto;
+  padding: 0.25rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.625rem;
+  background: var(--color-ink-850);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 0.35);
+}
+.app-chat-history-row {
+  display: grid;
+  grid-template-columns: 0.875rem minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.45rem 0.5rem;
+  border: 0;
+  border-radius: 0.375rem;
+  background: transparent;
+  color: var(--color-ink-200);
+  font-size: var(--text-label);
+  text-align: left;
+  cursor: pointer;
+}
+.app-chat-history-row:hover,
+.app-chat-history-row:focus-visible {
+  background: var(--color-ink-800);
+  outline: none;
+}
+.app-chat-history-mark {
+  color: var(--color-accent);
+  font-size: 0.75rem;
+}
+.app-chat-history-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.app-chat-history-row[data-unread] .app-chat-history-name {
+  color: var(--color-ink-100);
+  font-weight: 500;
+}
+.app-chat-history-row[data-unread] .app-chat-history-mark::before {
+  content: "";
+  display: block;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 9999px;
+  background: var(--color-accent);
+}
+.app-chat-history-new {
+  color: var(--color-ink-500);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+}
+.app-chat-history-row[data-unread] .app-chat-history-new {
+  color: var(--color-accent);
+}
+.app-chat-history-divider {
+  height: 1px;
+  margin: 0.25rem;
+  background: var(--color-ink-700);
 }
 .app-chat-collapse {
   display: none;
@@ -948,22 +1244,6 @@ p.sfield-hint {
 .app-chat-card {
   padding: 0.5rem 0.65rem;
   background: var(--color-ink-850);
-}
-.app-chat-ctx {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-}
-.app-chat-prompt {
-  border: 1px dashed var(--color-ink-600);
-  background: transparent;
-  border-radius: 0.25rem;
-  padding: 0.1rem 0.45rem;
-  color: var(--color-ink-400);
-}
-.app-chat-prompt:hover:not(:disabled) {
-  border-style: solid;
-  color: var(--color-ink-200);
 }
 .app-chat-dot {
   width: 0.45rem;
@@ -1006,80 +1286,6 @@ p.sfield-hint {
     transition: none;
   }
 }
-.app-chat-chip {
-  display: inline-flex;
-  gap: 0.35rem;
-  align-items: center;
-  border: 1px solid var(--color-ink-600);
-  border-radius: 0.25rem;
-  padding: 0.1rem 0.4rem;
-}
-
-/* CAD-1058 New campaign dialog: a short modal on the shared confirm
-   scrim. Board tokens only; no motion. */
-.crm-newc {
-  position: relative;
-  width: min(37.5rem, 100%);
-  max-height: calc(100dvh - 2rem);
-  overflow-y: auto;
-  padding: 1rem 1.1rem;
-}
-.crm-newc-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 0.5rem;
-}
-.crm-newc-foot {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 0.4rem;
-  padding-top: 0.5rem;
-  border-top: 1px solid var(--color-ink-700);
-}
-.crm-newc-foot > span {
-  margin-right: auto;
-}
-.crm-starts {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0.5rem;
-}
-@media (max-width: 36rem) {
-  .crm-starts {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-.crm-start {
-  display: grid;
-  gap: 0.15rem;
-  text-align: left;
-  padding: 0.6rem 0.75rem;
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.5rem;
-  background: var(--color-ink-850);
-}
-.crm-start:hover:not(:disabled) {
-  border-color: var(--color-ink-600);
-}
-.crm-start[aria-checked="true"] {
-  border-color: var(--color-accent);
-}
-.crm-start:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
-}
-.crm-start-title {
-  font-size: var(--text-secondary);
-  font-weight: 500;
-  color: var(--color-ink-100);
-}
-.crm-start-hint {
-  font-size: var(--text-label);
-  color: var(--color-ink-500);
-}
 
 /* Programmatic focus on an outlet heading keeps a11y focus but shows a
    ring only for keyboard focus (CAD-1097). */
@@ -1087,36 +1293,50 @@ p.sfield-hint {
   outline: none;
 }
 
-/* Emails stay on one line; the table scrolls inside its card. Link
-   buttons in cells wrap left-aligned (CAD-1097). */
-.crm-table td.crm-nowrap {
-  white-space: nowrap;
-  overflow-wrap: normal;
-}
-
 .crm-table .lnk {
   text-align: left;
 }
 
-/* CAD-1098: conversation picker + "+ New" in the chat header. */
-.app-chat-conv {
+/* CAD-1168: the mock's compact "Working…" line with a Stop button. */
+.app-chat-working {
   display: flex;
-  gap: 0.5rem;
   align-items: center;
-  min-width: 0;
+  gap: 0.45rem;
+  font-size: 0.625rem;
+  color: var(--color-ink-400);
 }
-.app-chat-conv-select {
-  flex: 1 1 auto;
-  min-width: 0;
+.app-chat-pulse {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  animation: app-chat-pulse 1.2s infinite;
+}
+@keyframes app-chat-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-chat-pulse {
+    animation: none;
+  }
+}
+.app-chat-stop {
+  margin-left: auto;
+  padding: 0.25rem 0.55rem;
+  border: 1px solid var(--color-edge);
+  border-radius: 0.25rem;
   background: transparent;
-  color: var(--color-ink-100);
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.375rem;
-  padding: 0.25rem 0.4rem;
+  color: var(--color-ink-200);
+  font-size: 0.625rem;
 }
-.app-chat-conv-select:focus-visible {
+.app-chat-stop:focus-visible {
   outline: 2px solid var(--color-accent);
-  outline-offset: 1px;
+  outline-offset: 2px;
+}
+.app-chat-jump {
+  align-self: center;
 }
 
 /* Generic durable app-assistant activity and consent controls. */
@@ -1218,4 +1438,34 @@ p.sfield-hint {
 .app-assistant-settings li span { display: grid; gap: 0.15rem; min-width: 0; }
 .app-assistant-settings li strong { overflow-wrap: anywhere; color: var(--color-ink-200); }
 .app-assistant-settings li small { overflow-wrap: anywhere; color: var(--color-ink-500); }
+.app-assistant-history {
+  min-width: 0;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.375rem;
+}
+.app-assistant-history > summary {
+  padding: 0.4rem 0.55rem;
+  color: var(--color-ink-400);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.app-assistant-history > summary:hover { color: var(--color-ink-200); }
+.app-assistant-history-list {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0 0.5rem 0.5rem;
+}
 .app-assistant-activity > p { margin: 0; }
+
+/* The Social screen's context choice (2+ active contexts), in the header row. */
+.app-shell-context-pick {
+  min-width: 0;
+  max-width: 14rem;
+  height: 2rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.375rem;
+  background: var(--color-ink-850);
+  color: var(--color-ink-100);
+  font-size: var(--text-label);
+  padding: 0 0.5rem;
+}

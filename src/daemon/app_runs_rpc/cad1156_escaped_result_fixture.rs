@@ -184,7 +184,7 @@ impl Fx {
 
     pub(super) fn install_social(&self, connection: &str) -> (String, String) {
         let source = format!(
-            "{}/workspace-apps/social-content",
+            "{}/tests/fixtures/apps/social-content",
             env!("CARGO_MANIFEST_DIR")
         );
         let installed = self.op("app_workspace_install", json!({"source": source}));
@@ -239,6 +239,20 @@ impl Fx {
                 checked(store.message(&taken.id), "turn reread failed"),
                 "claimed turn missing",
             );
+            if step == 1 {
+                let artifact = required(
+                    run["artifacts"][0]["id"].as_str(),
+                    "artifact handle missing",
+                );
+                checked(
+                    store.app_artifact_with_digest(
+                        artifact,
+                        Some((&taken.id, taken.turn_id.as_deref().unwrap())),
+                        bundle,
+                    ),
+                    "guarded dependency fetch failed",
+                );
+            }
             checked(
                 store.finish(
                     &taken,

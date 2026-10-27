@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::proto::identifier;
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::agents::Agent;
 use super::schema::Take;
@@ -22,6 +22,29 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn take_decoded_messages() -> usize {
     DECODED_MESSAGES.with(|n| n.replace(0))
+}
+
+/// The correlated worker result needed by the delivery router, without
+/// decoding a kickoff body on every pending-turn check.
+#[derive(Debug)]
+pub(crate) struct WorkerTurn {
+    pub id: String,
+    pub state: String,
+    pub created: f64,
+    pub sha: Option<String>,
+}
+
+/// CAD-1822: the context selection committed atomically with a dispatch
+/// enqueue. Only an accepted NEW message row persists it; a duplicate or a
+/// rejected envelope writes nothing, so a colliding request cannot retarget a
+/// queued turn's context.
+pub enum IssueSelection {
+    /// The accepted kickoff's `context_pin` payload.
+    Pin(Value),
+    /// The accepted assignment carries no opted-in pin. A `context_disabled`
+    /// marker is written only when the alias already has feature state at this
+    /// transaction's commit.
+    Disabled { task: String, reason: String },
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +74,17 @@ pub struct Message {
     pub created: f64,
     pub started: Option<f64>,
     pub completed: Option<f64>,
+    /// CAD-1353: the stall budget chosen for this dispatch. `None` falls
+    /// back to the job default, then the agent's `stall_secs`.
+    pub stall_secs: Option<i64>,
+    /// CAD-819: the daemon-derived sender participant (uid, label). NULL
+    /// on a legacy row, which reads as an unknown sender.
+    pub sender_uid: Option<String>,
+    pub sender: Option<String>,
+    pub recipient_uid: Option<String>,
+    pub recipient: Option<String>,
+    /// The original message a routed copy answers (CAD-819).
+    pub origin: Option<String>,
 }
 
 pub(super) fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
@@ -75,6 +109,12 @@ pub(super) fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         created: row.get("created")?,
         started: row.get("started")?,
         completed: row.get("completed")?,
+        stall_secs: row.get("stall_secs")?,
+        sender_uid: row.get("sender_uid")?,
+        sender: row.get("sender")?,
+        recipient_uid: row.get("recipient_uid")?,
+        recipient: row.get("recipient")?,
+        origin: row.get("origin")?,
     })
 }
 
@@ -99,6 +139,13 @@ impl Message {
     /// unconfirmed paste) never fences the agent.
     pub fn is_nudge(&self) -> bool {
         self.source == NUDGE_SOURCE
+    }
+
+    /// CAD-810: a daemon-origin topic notice. It never owns a turn and never
+    /// reaches the provider: the claim consumes it in the store (see
+    /// `take_queued_app_proven`), so `holds_turn` and `is_routed` stay false.
+    pub fn is_topic_notice(&self) -> bool {
+        self.source == crate::proto::TOPIC_NOTICE_SOURCE
     }
 
     /// CAD-250: a report-owing turn whose paste was delivered and that
@@ -294,11 +341,152 @@ impl Steer<'_> {
 
 /// Sources that never own a turn — [`Message::is_routed`] plus
 /// [`Message::is_nudge`]; they pass the one-turn hold and never hold it.
-const TURNLESS_SOURCES_SQL: &str = "('worker_result','worker_notice','job_event','nudge')";
+const TURNLESS_SOURCES_SQL: &str =
+    "('worker_result','worker_notice','job_event','nudge','topic_notice')";
 
 /// The `unknown` rows that fence an agent: every one except a nudge's,
 /// whose unconfirmed paste belongs to no turn (CAD-250).
 pub(super) const FENCING_UNKNOWN_SQL: &str = "state='unknown' AND source != 'nudge'";
+
+/// CAD-818: a topic notice that the claim has made `available` or `refused`
+/// is history, not work — it never owns a turn and cannot be dispatched.
+/// Only the `topic_notice` source ends this way; every other row keeps its
+/// `state NOT IN (terminal)` classification.
+const NOTICE_ENDED_SQL: &str = "(source = 'topic_notice' AND state IN ('available','refused'))";
+
+/// Columns for [`Store::message_index`]. Body, result, error, and
+/// `turn_id` are not selected.
+const INDEX_COLS: &str = "seq, id, alias, state, source, sender, reply_to, task_id, issue, \
+     priority, created, started, completed, length(body), \
+     CASE WHEN state='running' \
+          AND source NOT IN ('worker_result','worker_notice','job_event','nudge','topic_notice') \
+          AND json_valid(result) AND json_extract(result,'$.status')='submitted' \
+          THEN 1 ELSE 0 END";
+
+/// One index row. `body_chars` is SQLite's character length of the stored
+/// body; the text itself is not loaded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageIndex {
+    pub seq: i64,
+    pub id: String,
+    pub alias: String,
+    pub state: String,
+    pub source: String,
+    pub sender: Option<String>,
+    pub reply_to: Option<String>,
+    pub task_id: Option<String>,
+    pub issue: Option<String>,
+    pub priority: Priority,
+    pub created: f64,
+    pub started: Option<f64>,
+    pub completed: Option<f64>,
+    pub body_chars: i64,
+    pub awaiting_report: bool,
+}
+
+impl MessageIndex {
+    pub fn to_json(&self) -> Value {
+        let mut row = json!({
+            "seq": self.seq,
+            "id": self.id,
+            "alias": self.alias,
+            "state": self.state,
+            "source": self.source,
+            "reply_to": self.reply_to,
+            "task_id": self.task_id,
+            "issue": self.issue,
+            "created": self.created,
+            "started": self.started,
+            "completed": self.completed,
+            "body_chars": self.body_chars,
+        });
+        if let Some(sender) = &self.sender {
+            row["from"] = json!(sender);
+        }
+        if self.priority != Priority::Normal {
+            row["priority"] = json!(self.priority.as_str());
+        }
+        if self.awaiting_report {
+            row["awaiting_report"] = json!(true);
+        }
+        if self.source == NUDGE_SOURCE {
+            row["nudge"] = json!(true);
+        }
+        row
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageIndexPage {
+    pub rows: Vec<MessageIndex>,
+    pub omitted: usize,
+}
+
+/// Filters for [`Store::message_index`]. An empty `states` list matches
+/// every state. `since` is a message id of this alias or a unix timestamp.
+#[derive(Debug, Clone, Copy)]
+pub struct MessageIndexQuery<'a> {
+    pub states: &'a [String],
+    pub from: Option<&'a str>,
+    pub source: Option<&'a str>,
+    pub since: Option<&'a str>,
+    pub limit: usize,
+    /// Operator listings include app-dispatch rows. Agent listings do not.
+    pub include_app: bool,
+}
+
+#[derive(Clone)]
+enum Bind {
+    Text(String),
+    Real(f64),
+    Int(i64),
+}
+
+impl rusqlite::types::ToSql for Bind {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        match self {
+            Bind::Text(value) => value.to_sql(),
+            Bind::Real(value) => value.to_sql(),
+            Bind::Int(value) => value.to_sql(),
+        }
+    }
+}
+
+fn index_query(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    binds: &[Bind],
+) -> Result<Vec<MessageIndex>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds), row_index)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn count_query(conn: &rusqlite::Connection, sql: &str, binds: &[Bind]) -> Result<i64> {
+    Ok(conn.query_row(sql, rusqlite::params_from_iter(binds), |row| row.get(0))?)
+}
+
+fn row_index(row: &rusqlite::Row) -> rusqlite::Result<MessageIndex> {
+    let rank: i64 = row.get(9)?;
+    let awaiting: i64 = row.get(14)?;
+    Ok(MessageIndex {
+        seq: row.get(0)?,
+        id: row.get(1)?,
+        alias: row.get(2)?,
+        state: row.get(3)?,
+        source: row.get(4)?,
+        sender: row.get(5)?,
+        reply_to: row.get(6)?,
+        task_id: row.get(7)?,
+        issue: row.get(8)?,
+        priority: Priority::from_rank(rank),
+        created: row.get(10)?,
+        started: row.get(11)?,
+        completed: row.get(12)?,
+        body_chars: row.get(13)?,
+        awaiting_report: awaiting == 1,
+    })
+}
 
 /// Enqueue rejects a body over 48_000 bytes. The inlined spec is cut in
 /// bytes, on a char boundary, so a multibyte spec cannot blow that limit.
@@ -369,6 +557,7 @@ impl Store {
             &Steer::NONE,
             None,
             None,
+            None,
         )
     }
 
@@ -411,9 +600,108 @@ impl Store {
         steer: &Steer,
         refs: Option<&Value>,
         app: Option<&Value>,
+        attachments: Option<&Value>,
+    ) -> Result<(bool, String)> {
+        self.enqueue_steered_with_human_for(
+            alias,
+            None,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            issue,
+            worktree,
+            sender,
+            steer,
+            refs,
+            app,
+            attachments,
+            None,
+        )
+    }
+
+    /// The one steering-enqueue body (CAD-1374 + CAD-1412): an optional
+    /// expected recipient uid checked inside the write transaction AND
+    /// the optional verified human stamped on the entry and `queued`
+    /// event. Neither is a request field — both are daemon derivations;
+    /// `None`/`None` is the ordinary path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_steered_with_human_for(
+        &self,
+        alias: &str,
+        expected_uid: Option<&str>,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
+        sender: &Sender,
+        steer: &Steer,
+        refs: Option<&Value>,
+        app: Option<&Value>,
+        attachments: Option<&Value>,
+        human: Option<&Value>,
+    ) -> Result<(bool, String)> {
+        self.enqueue_steered_for_with_conversation(
+            alias,
+            expected_uid,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            issue,
+            worktree,
+            sender,
+            steer,
+            refs,
+            app,
+            attachments,
+            None,
+            human,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// `authorized_until` is daemon-derived and checked after acquiring
+    /// the queue writer. Ordinary sends pass `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_steered_for_with_conversation(
+        &self,
+        alias: &str,
+        expected_uid: Option<&str>,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
+        sender: &Sender,
+        steer: &Steer,
+        refs: Option<&Value>,
+        app: Option<&Value>,
+        attachments: Option<&Value>,
+        conversation: Option<&str>,
+        human: Option<&Value>,
+        media_refs: Option<&Value>,
+        authorized_until: Option<f64>,
+        selection: Option<IssueSelection>,
     ) -> Result<(bool, String)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
+            if let Some(uid) = expected_uid {
+                if self.agent_in(&tx, alias)?.uid != uid {
+                    return Err(Error::rejected(
+                        "Recipient changed before the request was queued; nothing was sent",
+                    ));
+                }
+            }
             let mut named: Vec<&str> = Vec::new();
             for m in steer.supersedes {
                 if !named.contains(&m.as_str()) {
@@ -440,7 +728,17 @@ impl Store {
                     .map(|m| self.supersedable_in(&tx, alias, m))
                     .collect::<Result<Vec<_>>>()?
             };
-            let out = self.enqueue_tx(
+            // Existing-envelope retries mint no work; new turns must still
+            // be authorized after the connection and SQLite writer waits.
+            if !retry
+                && authorized_until
+                    .is_some_and(|until| crate::issue::time::now_epoch() as f64 >= until)
+            {
+                return Err(Error::rejected(
+                    "the bound grant expired before the queue write — nothing was queued",
+                ));
+            }
+            let out = self.enqueue_tx_with_conversation(
                 &tx,
                 alias,
                 body,
@@ -452,8 +750,14 @@ impl Store {
                 worktree,
                 sender,
                 steer.priority,
+                false,
                 refs,
                 app,
+                attachments,
+                human,
+                conversation,
+                media_refs,
+                selection,
             )?;
             for old in &superseded {
                 self.supersede_in(&tx, old, id, steer)?;
@@ -539,6 +843,8 @@ impl Store {
                 &Sender::Unattributed,
                 Priority::Normal,
                 true,
+                None,
+                None,
                 None,
                 None,
             )?;
@@ -828,6 +1134,7 @@ impl Store {
                 steer.priority,
                 None,
                 None,
+                None,
             )?;
             if duplicate {
                 // The stored row is authoritative: the retry learns the
@@ -960,7 +1267,7 @@ impl Store {
                 return Err(Error::rejected(format!(
                     "native nudge disposition must be queued|skipped_inactive|rejected|unknown, \
                      not '{other}'"
-                )))
+                )));
             }
         };
         self.write_tx(|conn| {
@@ -1034,15 +1341,77 @@ impl Store {
         priority: Priority,
         refs: Option<&Value>,
         app: Option<&Value>,
+        attachments: Option<&Value>,
     ) -> Result<(bool, String)> {
-        self.enqueue_tx_as(
-            tx, alias, body, reply_to, id, source, task_id, issue, worktree, sender, priority,
-            false, refs, app,
+        self.enqueue_tx_with_conversation(
+            tx,
+            alias,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            issue,
+            worktree,
+            sender,
+            priority,
+            false,
+            refs,
+            app,
+            attachments,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
+    /// [`Self::enqueue_tx`] carrying the verified human (CAD-1374).
     #[allow(clippy::too_many_arguments)]
-    fn enqueue_tx_as(
+    pub(super) fn enqueue_tx_human(
+        &self,
+        tx: &impl super::StoreConn,
+        alias: &str,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
+        sender: &Sender,
+        priority: Priority,
+        refs: Option<&Value>,
+        app: Option<&Value>,
+        attachments: Option<&Value>,
+        human: Option<&Value>,
+    ) -> Result<(bool, String)> {
+        self.enqueue_tx_with_conversation(
+            tx,
+            alias,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            issue,
+            worktree,
+            sender,
+            priority,
+            false,
+            refs,
+            app,
+            attachments,
+            human,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Transactional enqueue with optional human attribution and conversation.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn enqueue_tx_with_conversation(
         &self,
         tx: &impl super::StoreConn,
         alias: &str,
@@ -1058,6 +1427,11 @@ impl Store {
         daemon: bool,
         refs: Option<&Value>,
         app: Option<&Value>,
+        attachments: Option<&Value>,
+        human: Option<&Value>,
+        conversation: Option<&str>,
+        media_refs: Option<&Value>,
+        selection: Option<IssueSelection>,
     ) -> Result<(bool, String)> {
         if !daemon {
             crate::proto::caller_message(id, source)?;
@@ -1066,7 +1440,12 @@ impl Store {
             return Err(Error::rejected("Prompt must contain 1-48000 characters"));
         }
         identifier(id, "Message id")?;
-        self.agent_in(tx, alias)?;
+        let target = self.agent_in(tx, alias)?;
+        if target.archived_at.is_some() {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is archived — its alias is reserved"
+            )));
+        }
         let reply_recipient = if let Some(target) = reply_to {
             let recipient = self.agent_in(tx, target)?;
             if target == alias {
@@ -1084,7 +1463,19 @@ impl Store {
             }
             self.task_in(tx, task)?;
         }
+        // CAD-1568: a CLI retry must retain its canonical principal, not
+        // merely its lossy display source. Keep the existing local retry
+        // contract: starting a chat may add operator attribution later.
         if let Some(old) = self.message_in(tx, id)? {
+            let same_sender = match sender {
+                Sender::Cli(authority) => {
+                    old.sender.as_deref() == Some(authority.sender_label().as_str())
+                }
+                _ => !old
+                    .sender
+                    .as_deref()
+                    .is_some_and(|label| label.starts_with("cli:")),
+            };
             // `refs` lives on the enqueue's thread-entry payload, not
             // the message row — the stored side is read back so a
             // retry naming different refs conflicts like any field.
@@ -1096,8 +1487,13 @@ impl Store {
                 && old.issue.as_deref() == issue
                 && old.worktree.as_deref() == worktree
                 && old.priority == priority
+                && same_sender
                 && Self::entry_refs_in(tx, id)? == refs.cloned()
-                && Self::entry_app_in(tx, id)? == app.cloned();
+                && Self::entry_app_in(tx, id)? == app.cloned()
+                && Self::entry_attachments_in(tx, id)? == attachments.cloned()
+                && Self::entry_human_in(tx, id)? == human.cloned()
+                && Self::entry_media_refs_in(tx, id)? == media_refs.cloned()
+                && Self::entry_conversation_in(tx, id)?.as_deref() == conversation;
             if !same {
                 return Err(Error::rejected(
                     "Message id was already used with different content",
@@ -1105,9 +1501,14 @@ impl Store {
             }
             return Ok((true, old.state));
         }
+        let (sender_uid, sender_label) = self.sender_identity_in(tx, sender)?;
+        let recipient = self.agent_in(tx, alias)?;
+        let recipient_uid = recipient.uid.clone();
+        let recipient_label = recipient.alias.clone();
         tx.execute(
-            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,issue,worktree,priority,created)
-             VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,issue,worktree,priority,created,
+                                  sender_uid,recipient_uid,sender,recipient)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 id,
                 alias,
@@ -1118,29 +1519,149 @@ impl Store {
                 issue,
                 worktree,
                 priority.rank(),
-                now()
+                now(),
+                sender_uid,
+                recipient_uid,
+                sender_label,
+                recipient_label
             ],
         )?;
-        Self::event_scoped(
-            tx,
-            alias,
-            "queued",
-            json!({
-                "message": id,
-                "source": source,
-                "reply_to": reply_to,
-                "sender": sender.label(),
-                "recipient_identity": reply_recipient
-                    .as_ref()
-                    .map(Self::agent_identity),
-            }),
-            None,
-            task_id,
-        )?;
+        let mut queued = json!({
+            "message": id,
+            "source": source,
+            "reply_to": reply_to,
+            "sender": sender.label(),
+            "recipient_identity": reply_recipient
+                .as_ref()
+                .map(Self::agent_identity)
+                // A topic notice binds its own recipient's identity: the
+                // claim's alias-reuse fence compares it with the live row.
+                .or_else(|| {
+                    (source == crate::proto::TOPIC_NOTICE_SOURCE)
+                        .then(|| Self::agent_identity(&recipient))
+                }),
+        });
+        // CAD-1374: the verified human is recorded only when present, so a
+        // legacy enqueue keeps the exact event shape it always had.
+        if let Some(human) = human {
+            queued["human"] = human.clone();
+        }
+        Self::event_scoped(tx, alias, "queued", queued, None, task_id)?;
         if source != "app_run_dispatch" {
-            Self::thread_note_enqueued(tx, alias, sender, source, body, id, refs, app)?;
+            Self::thread_note_enqueued(
+                tx,
+                alias,
+                sender,
+                source,
+                body,
+                id,
+                refs,
+                app,
+                attachments,
+                human,
+                conversation,
+                media_refs,
+            )?;
+        }
+        // CAD-1822: the context selection commits with the accepted NEW row.
+        // The existing-id comparison above returns before this point, so a
+        // duplicate or rejected envelope can never write or retarget
+        // selection; a failure here rolls the message row back too.
+        if let Some(selection) = selection {
+            match selection {
+                IssueSelection::Pin(payload) => {
+                    Self::event(tx, alias, crate::context_pack::PIN_EVENT, payload)?;
+                }
+                IssueSelection::Disabled { task, reason } => {
+                    if Self::has_context_state_in(tx, alias)? {
+                        Self::event(
+                            tx,
+                            alias,
+                            crate::context_pack::DISABLED_EVENT,
+                            json!({"message": id, "task": task, "reason": reason}),
+                        )?;
+                    }
+                }
+            }
         }
         Ok((false, "queued".to_string()))
+    }
+    /// CAD-819: the uid of a live agent row, `None` when the alias is gone
+    /// (a routed copy from a removed agent keeps its origin, not a uid).
+    pub(super) fn agent_uid_of_in(
+        &self,
+        tx: &impl super::StoreConn,
+        alias: &str,
+    ) -> Result<Option<String>> {
+        Ok(self.agent_opt_in(tx, alias)?.map(|a| a.uid))
+    }
+
+    /// CAD-819: the stored participant identity for a daemon-derived
+    /// sender: `(uid, label)`. An agent sender carries its uid and alias;
+    /// the operator stores the fixed `operator` label with no uid; an
+    /// unattributed caller stores neither (an unknown sender).
+    fn sender_identity_in(
+        &self,
+        tx: &impl super::StoreConn,
+        sender: &Sender,
+    ) -> Result<(Option<String>, Option<String>)> {
+        Ok(match sender {
+            Sender::Agent(alias) => (Some(self.agent_in(tx, alias)?.uid), Some(alias.clone())),
+            Sender::Operator | Sender::OperatorChat => (None, Some("operator".into())),
+            // CAD-1380: a member is attributed by label only, never as the
+            // operator and never with an agent uid.
+            Sender::Member(_) | Sender::VerifiedMember(_) => (None, Some("member".into())),
+            // CAD-1568: a remote CLI principal is attributed by its
+            // verified canonical `(org, sub)` key, never as the operator
+            // and never with an agent uid — `cli:<canonical>` is the
+            // durable per-principal identity the enqueue dedupe and a
+            // cli-scoped readback own.
+            Sender::Cli(auth) => (None, Some(auth.sender_label())),
+            Sender::Unattributed => (None, None),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn enqueue_tx_as(
+        &self,
+        tx: &impl super::StoreConn,
+        alias: &str,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
+        sender: &Sender,
+        priority: Priority,
+        daemon: bool,
+        refs: Option<&Value>,
+        app: Option<&Value>,
+        attachments: Option<&Value>,
+        human: Option<&Value>,
+    ) -> Result<(bool, String)> {
+        self.enqueue_tx_with_conversation(
+            tx,
+            alias,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            issue,
+            worktree,
+            sender,
+            priority,
+            daemon,
+            refs,
+            app,
+            attachments,
+            human,
+            None,
+            None,
+            None,
+        )
     }
 
     pub(super) fn message_in(
@@ -1153,6 +1674,73 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// The caller already holds its record-scoped PM lock. Keep current native
+    /// ownership and assignment fenced through the local file save, not Git
+    /// hooks or network work. The caller restores the file if this tx fails.
+    pub(crate) fn with_memory_feedback(
+        &self,
+        expected: &Agent,
+        id: &str,
+        token: &str,
+        save: impl FnOnce(Agent, Message, String) -> Result<Value>,
+    ) -> Result<Value> {
+        self.write_tx(|tx| {
+            let agent = self.agent_in(tx, &expected.alias)?;
+            let message = self
+                .message_in(tx, id)?
+                .ok_or_else(|| Error::rejected("unknown feedback message"))?;
+            if !matches!(agent.role.as_str(), "pm" | "worker")
+                || message.alias != expected.alias
+                || message.recipient_uid.as_deref() != Some(agent.uid.as_str())
+                || message.state != "running"
+                || message.turn_id.as_deref() != Some(token)
+                || agent.uid != expected.uid
+                || agent.created.to_bits() != expected.created.to_bits()
+                || agent.generation != expected.generation
+                || agent.pid != expected.pid
+                || agent.pid_start != expected.pid_start
+                || !registry::turn_token_current(
+                    &agent.provider,
+                    &agent.endpoint_kind,
+                    agent.generation.as_deref(),
+                    token,
+                )
+            {
+                return Err(Error::rejected(
+                    "feedback requires this native agent's current owned active turn",
+                ));
+            }
+            let bound_issue = match message.task_id.as_deref() {
+                Some(task_id) => {
+                    let task = self.task_in(tx, task_id)?;
+                    let job = self.job_in(tx, &task.job_id)?;
+                    if task.assignee.as_deref() != Some(message.alias.as_str())
+                        || task.dispatch_message.as_deref() != Some(id)
+                        || !matches!(task.state.as_str(), "dispatched" | "running")
+                        || job.state != "open"
+                    {
+                        return Err(Error::rejected(
+                            "feedback task is not this active native assignment",
+                        ));
+                    }
+                    let issue = job
+                        .issue_id
+                        .ok_or_else(|| Error::rejected("feedback job has no issue scope"))?;
+                    if message.issue.as_deref().is_some_and(|bound| bound != issue) {
+                        return Err(Error::rejected(
+                            "feedback message and native job disagree on issue scope",
+                        ));
+                    }
+                    issue
+                }
+                None => message.issue.clone().ok_or_else(|| {
+                    Error::rejected("feedback message has no trusted issue scope")
+                })?,
+            };
+            save(agent, message, bound_issue)
+        })
     }
 
     /// Read the recipient binding from the source message's durable queued
@@ -1224,6 +1812,7 @@ impl Store {
         let current = self.agent_opt_in(tx, recipient)?;
         let reason = match current.as_ref() {
             None => Some("recipient_missing"),
+            Some(agent) if agent.archived_at.is_some() => Some("recipient_archived"),
             Some(_) if expected.is_none() => Some("recipient_identity_unavailable"),
             Some(agent) if !Self::identity_matches(expected.as_ref().unwrap(), agent) => {
                 Some("recipient_identity_changed")
@@ -1392,6 +1981,14 @@ impl Store {
             };
             loop {
                 let next = tx.query_row(&next_sql, [alias], row_message).ok();
+                // CAD-810: a topic notice never reaches the actor. It is made
+                // available here, in this transaction, after its provenance and
+                // the recipient's identity are proven; the adapter, the turn
+                // slot, `busy` and `submitting` are never touched.
+                if let Some(notice) = next.as_ref().filter(|m| m.is_topic_notice()) {
+                    self.consume_topic_notice_in(&tx, &agent, notice)?;
+                    continue;
+                }
                 let Some(message) = next else {
                     // A prior routed row in this same transaction may have
                     // been failed as unresolved before the queue became empty.
@@ -1485,6 +2082,67 @@ impl Store {
         })
     }
 
+    /// CAD-810: make one daemon topic notice available to its recipient,
+    /// in the claim's transaction. It is never a turn: no adapter call, no
+    /// session switch, no turn slot or token, no `busy`/`submitting`.
+    ///
+    /// Provenance is required, not a source string: the message must have a
+    /// `topic_deliveries` row whose `uid` is the recipient's CURRENT uid and
+    /// whose `message_id` is this message. The enqueue-time identity fence
+    /// (the same binding routed rows use) must also still match, so a reused
+    /// alias never receives a notice queued for its predecessor. A failed
+    /// proof fails the notice closed and no turn starts.
+    ///
+    /// The notice ends `available`: it has been made readable, which is not
+    /// the same as seen. A later explicit read exposes it; nothing here
+    /// marks it completed or delivered to a turn.
+    fn consume_topic_notice_in(
+        &self,
+        tx: &impl super::StoreConn,
+        agent: &Agent,
+        notice: &Message,
+    ) -> Result<()> {
+        let delivery_uid: Option<String> = tx.query_opt(
+            "SELECT uid FROM topic_deliveries WHERE message_id=?",
+            [notice.id.as_str()],
+            |r| r.get(0),
+        )?;
+        let proven = delivery_uid.as_deref() == Some(agent.uid.as_str());
+        let fenced =
+            match self.queued_recipient_identity(tx, &agent.alias, &notice.id, &notice.source)? {
+                Some(expected) => Self::identity_matches(&expected, agent),
+                None => false,
+            };
+        let state = if proven && fenced {
+            "available"
+        } else {
+            "refused"
+        };
+        let reason = if !proven {
+            "delivery_provenance_mismatch"
+        } else if !fenced {
+            "recipient_identity_changed"
+        } else {
+            "ok"
+        };
+        tx.execute(
+            "UPDATE messages SET state=?, result=?, completed=? WHERE id=? AND state='queued'",
+            params![
+                state,
+                json!({"status": state, "via": "topic_notice", "reason": reason}).to_string(),
+                now(),
+                notice.id
+            ],
+        )?;
+        Self::event(
+            tx,
+            &agent.alias,
+            "topic_notice_available",
+            json!({"message": notice.id, "state": state, "reason": reason}),
+        )?;
+        Ok(())
+    }
+
     /// Record that the provider acknowledged a turn start.
     pub fn mark_running(&self, message_id: &str, turn_id: &str) -> Result<()> {
         self.write_tx(|conn| {
@@ -1508,6 +2166,239 @@ impl Store {
             // are untouched).
             self.task_on_running(&tx, message_id, &alias)?;
             Ok(())
+        })
+    }
+
+    /// Claim an `unknown` cloud kickoff for restart/reconcile. The guarded
+    /// transition ensures one recovery consumer; the create replay and
+    /// stop use the original kickoff identity.
+    pub fn claim_cloud_recovery(&self, message_id: &str, turn_id: &str) -> Result<bool> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let changed = tx.execute(
+                "UPDATE messages SET state='running',turn_id=? \
+                 WHERE id=? AND state='unknown'",
+                params![turn_id, message_id],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            Self::event(
+                &tx,
+                &alias,
+                "cloud_recovery_claimed",
+                json!({"message": message_id, "turn_id": turn_id}),
+            )?;
+            self.task_on_running(&tx, message_id, &alias)?;
+            Ok(true)
+        })
+    }
+
+    /// Claim a queued kickoff for a non-actor backend. Returns `false` when
+    /// the message was cancelled or already claimed, so the caller must not
+    /// start an external job or resurrect a terminal delivery.
+    pub fn mark_running_queued(&self, message_id: &str, turn_id: &str) -> Result<bool> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let changed = tx.execute(
+                "UPDATE messages SET state='running',turn_id=? \
+                 WHERE id=? AND state='queued'",
+                params![turn_id, message_id],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            Self::event(
+                &tx,
+                &alias,
+                "turn_started",
+                json!({"message": message_id, "turn_id": turn_id}),
+            )?;
+            self.task_on_running(&tx, message_id, &alias)?;
+            Ok(true)
+        })
+    }
+
+    /// Record an operator stop request for a running cloud kickoff. The
+    /// poller observes it and calls the AOS stop route; the event is the
+    /// durable handoff because the runner is not an AgentCtl.
+    pub fn request_cloud_stop(&self, message_id: &str) -> Result<()> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            let publishing: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_publication_started' \
+                 AND json_extract(payload,'$.message')=? AND alias=?",
+                params![message_id, alias],
+                |r| r.get(0),
+            )?;
+            if publishing > 0 {
+                return Err(Error::rejected(
+                    "cloud dispatch is already completing; the stop was refused",
+                ));
+            }
+            Self::event(
+                &tx,
+                &alias,
+                "cloud_stop_requested",
+                json!({"message": message_id}),
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Serialize the first publication write with a concurrent operator
+    /// stop. A stop that commits first makes this return `false`; once this
+    /// commits, `request_cloud_stop` refuses to cancel the completion.
+    pub fn begin_cloud_publication(&self, message_id: &str) -> Result<bool> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            let stopped: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_stop_requested' \
+                 AND json_extract(payload,'$.message')=? AND alias=?",
+                params![message_id, alias],
+                |r| r.get(0),
+            )?;
+            if stopped > 0 {
+                return Ok(false);
+            }
+            Self::event(
+                &tx,
+                &alias,
+                "cloud_publication_started",
+                json!({"message": message_id}),
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Mark that a create request is about to be sent. A later definitive
+    /// refusal cannot be assumed to mean no remote exists: an earlier
+    /// attempt may have created it before its response was lost.
+    pub fn note_cloud_create_attempt(&self, message_id: &str) -> Result<()> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            Self::event(
+                &tx,
+                &alias,
+                "cloud_create_attempted",
+                json!({"message": message_id}),
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Whether any create request was already attempted for this kickoff.
+    pub fn cloud_create_attempted(&self, message_id: &str) -> Result<bool> {
+        self.read_tx(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_create_attempted' \
+                 AND json_extract(payload,'$.message')=? \
+                 AND alias=(SELECT alias FROM messages WHERE id=?)",
+                params![message_id, message_id],
+                |r| r.get(0),
+            )?;
+            Ok(count > 0)
+        })
+    }
+
+    /// Authorize one create attempt and record it in the same transaction
+    /// as the stop check. A stop that wins before the first attempt means
+    /// no remote may be created. Once an attempt is recorded, a later
+    /// definitive refusal is not proof that no remote exists.
+    /// Returns `(authorized, had_prior_attempt)`.
+    pub fn authorize_cloud_create(&self, message_id: &str) -> Result<(bool, bool)> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            let stopped: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_stop_requested' \
+                 AND json_extract(payload,'$.message')=? AND alias=?",
+                params![message_id, alias],
+                |r| r.get(0),
+            )?;
+            let attempted: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_create_attempted' \
+                 AND json_extract(payload,'$.message')=? AND alias=?",
+                params![message_id, alias],
+                |r| r.get(0),
+            )?;
+            if stopped > 0 && attempted == 0 {
+                return Ok((false, false));
+            }
+            Self::event(
+                &tx,
+                &alias,
+                "cloud_create_attempted",
+                json!({"message": message_id}),
+            )?;
+            Ok((true, attempted > 0))
+        })
+    }
+
+    /// Whether an operator stop was requested for this kickoff.
+    pub fn cloud_stop_requested(&self, message_id: &str) -> Result<bool> {
+        self.read_tx(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_stop_requested' \
+                 AND json_extract(payload,'$.message')=? \
+                 AND alias=(SELECT alias FROM messages WHERE id=?)",
+                params![message_id, message_id],
+                |r| r.get(0),
+            )?;
+            Ok(count > 0)
+        })
+    }
+
+    /// Return a cloud kickoff to `queued` when its remote job's state could
+    /// not be proven and the stop was not confirmed. The guarded claim
+    /// token means only the consumer that claimed this delivery can release
+    /// it; a retry then re-enters the same task/revision remote job.
+    pub fn requeue_cloud_claim(&self, message_id: &str, turn_id: &str) -> Result<bool> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let changed = tx.execute(
+                "UPDATE messages SET state='queued',turn_id=NULL \
+                 WHERE id=? AND state='running' AND turn_id=?",
+                params![message_id, turn_id],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            Self::event(
+                &tx,
+                &alias,
+                "turn_requeued",
+                json!({"message": message_id, "turn_id": turn_id,
+                       "reason": "cloud sandbox job state unproven"}),
+            )?;
+            Ok(true)
         })
     }
 
@@ -1597,6 +2488,45 @@ impl Store {
         })
     }
 
+    /// CAD-1752: the agent page's figures, one bounded query each.
+    /// `tasks_done` counts its verified/done tasks, `reports` the
+    /// `task_reported` events on its stream, and `avg_turn_secs` the mean
+    /// of its last 100 completed turns (nudges excluded). `hired_at` is the
+    /// registration time. Figures the store cannot attribute to an agent
+    /// (merged PRs, drafts sent) stay null rather than being invented.
+    pub fn agent_stats(&self, alias: &str) -> Result<Value> {
+        let conn = self.conn();
+        let hired_at: Option<f64> = conn
+            .query_row("SELECT created FROM agents WHERE alias=?", [alias], |r| {
+                r.get(0)
+            })
+            .ok();
+        let tasks_done: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE assignee=? AND state IN ('verified','done')",
+            [alias],
+            |r| r.get(0),
+        )?;
+        let reports: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE alias=? AND kind='task_reported'",
+            [alias],
+            |r| r.get(0),
+        )?;
+        let avg_turn_secs: Option<f64> = conn.query_row(
+            "SELECT AVG(completed-started) FROM (
+                 SELECT started, completed FROM messages
+                 WHERE alias=? AND state='completed' AND source != 'nudge'
+                   AND started IS NOT NULL AND completed IS NOT NULL
+                 ORDER BY seq DESC LIMIT 100)",
+            [alias],
+            |r| r.get(0),
+        )?;
+        Ok(json!({
+            "hired_at": hired_at, "tasks_done": tasks_done, "reports": reports,
+            "avg_turn_secs": avg_turn_secs,
+            "prs_merged": Value::Null, "drafts_sent": Value::Null,
+        }))
+    }
+
     /// Count an agent's queued inbound messages (`cadence self` for an
     /// inbox reports this instead of a running turn).
     pub fn queued_count(&self, alias: &str) -> Result<i64> {
@@ -1621,12 +2551,12 @@ impl Store {
     pub fn messages(&self, alias: &str) -> Result<Vec<Message>> {
         let conn = self.conn();
         let agent = self.agent_in(&conn, alias)?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT * FROM messages WHERE alias=?1
-             AND (created >= ?2 OR state NOT IN
-                  ('completed','failed','interrupted','cancelled'))
-             ORDER BY seq",
-        )?;
+             AND (created >= ?2 OR (state NOT IN
+                  ('completed','failed','interrupted','cancelled') AND NOT {NOTICE_ENDED_SQL}))
+             ORDER BY seq"
+        ))?;
         let rows = stmt.query_map(params![alias, agent.created], row_message)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -1660,11 +2590,13 @@ impl Store {
                 _ => {
                     return Err(Error::rejected(format!(
                         "since '{since}' is neither a message id of '{alias}' nor a timestamp"
-                    )))
+                    )));
                 }
             }
         }
-        let live = "state NOT IN ('completed','failed','interrupted','cancelled')";
+        let live = format!(
+            "state NOT IN ('completed','failed','interrupted','cancelled') AND NOT {NOTICE_ENDED_SQL}"
+        );
         let mut rows = {
             let mut stmt =
                 conn.prepare(&format!("SELECT * FROM messages WHERE alias=?1 AND {live}"))?;
@@ -1684,12 +2616,130 @@ impl Store {
         rows.extend(recent.collect::<rusqlite::Result<Vec<_>>>()?);
         rows.sort_by_key(|m| m.seq);
         let total: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM messages WHERE alias=?1 AND (created >= ?2 OR {live})"),
+            &format!(
+                "SELECT COUNT(*) FROM messages WHERE alias=?1 AND (created >= ?2 OR ({live}))"
+            ),
             params![alias, agent.created],
             |r| r.get(0),
         )?;
         let omitted = (total as usize).saturating_sub(rows.len());
         Ok((rows, omitted))
+    }
+
+    /// Bounded index of one alias's messages. Rows carry no body, result,
+    /// error, or turn token — those stay on `message read` and the
+    /// owner's own report path. Same registration window as
+    /// [`Self::messages_window`]: every matching non-terminal row, plus
+    /// the newest `limit` matching terminal rows. `since` is a message
+    /// id of this alias (rows after it) or a unix timestamp.
+    pub fn message_index(
+        &self,
+        alias: &str,
+        query: &MessageIndexQuery<'_>,
+    ) -> Result<MessageIndexPage> {
+        let MessageIndexQuery {
+            states,
+            from,
+            source,
+            since,
+            limit,
+            include_app,
+        } = *query;
+        let conn = self.conn();
+        let agent = self.agent_in(&conn, alias)?;
+        let (mut after_seq, mut after_ts) = (0i64, f64::MIN);
+        if let Some(since) = since {
+            let by_id = conn
+                .query_row(
+                    "SELECT seq FROM messages WHERE alias=?1 AND id=?2",
+                    params![alias, since],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?;
+            match (by_id, since.parse::<f64>()) {
+                (Some(seq), _) => after_seq = seq,
+                (None, Ok(ts)) if ts.is_finite() => after_ts = ts,
+                _ => {
+                    return Err(Error::rejected(format!(
+                        "since '{since}' is neither a message id of '{alias}' nor a timestamp"
+                    )));
+                }
+            }
+        }
+        let mut filter = String::new();
+        let mut filter_binds: Vec<Bind> = Vec::new();
+        if let Some(from) = from {
+            filter.push_str(" AND sender=?");
+            filter_binds.push(Bind::Text(from.to_string()));
+        }
+        if let Some(source) = source {
+            filter.push_str(" AND source=?");
+            filter_binds.push(Bind::Text(source.to_string()));
+        }
+        if !states.is_empty() {
+            filter.push_str(" AND state IN (");
+            for (i, state) in states.iter().enumerate() {
+                if i > 0 {
+                    filter.push(',');
+                }
+                filter.push('?');
+                filter_binds.push(Bind::Text(state.clone()));
+            }
+            filter.push(')');
+        }
+        if !include_app {
+            filter.push_str(" AND source!='app_run_dispatch'");
+        }
+        let live = format!(
+            "state NOT IN ('completed','failed','interrupted','cancelled') AND NOT {NOTICE_ENDED_SQL}"
+        );
+        let cols = INDEX_COLS;
+        let mut live_binds = vec![Bind::Text(alias.to_string())];
+        live_binds.extend(filter_binds.iter().cloned());
+        let live_rows = index_query(
+            &conn,
+            &format!("SELECT {cols} FROM messages WHERE alias=? AND ({live}){filter} ORDER BY seq"),
+            &live_binds,
+        )?;
+        let mut terminal_binds = vec![
+            Bind::Text(alias.to_string()),
+            Bind::Real(agent.created),
+            Bind::Real(after_ts),
+            Bind::Int(after_seq),
+        ];
+        terminal_binds.extend(filter_binds.iter().cloned());
+        terminal_binds.push(Bind::Int(limit as i64));
+        let mut rows = live_rows;
+        rows.extend(index_query(
+            &conn,
+            &format!(
+                "SELECT {cols} FROM messages WHERE alias=? AND NOT ({live})
+                 AND created >= ? AND created >= ? AND seq > ?{filter}
+                 ORDER BY seq DESC LIMIT ?"
+            ),
+            &terminal_binds,
+        )?);
+        rows.sort_by_key(|row| row.seq);
+        // Count the same set the two queries can return: every matching
+        // live row, plus terminal rows after the cursor. Older terminal
+        // mail is not "omitted" from a cursor page.
+        let mut count_binds = vec![
+            Bind::Text(alias.to_string()),
+            Bind::Real(agent.created),
+            Bind::Real(after_ts),
+            Bind::Int(after_seq),
+        ];
+        count_binds.extend(filter_binds);
+        let total: i64 = count_query(
+            &conn,
+            &format!(
+                "SELECT COUNT(*) FROM messages WHERE alias=? AND (({live})
+                 OR (NOT ({live}) AND created >= ? AND created >= ? AND seq > ?)){filter}"
+            ),
+            &count_binds,
+        )?;
+        let omitted = (total as usize).saturating_sub(rows.len());
+        Ok(MessageIndexPage { rows, omitted })
     }
 
     /// Current work and unresolved outcomes for overview probes. Terminal
@@ -1700,10 +2750,36 @@ impl Store {
         self.agent_in(&conn, alias)?;
         let mut stmt = conn.prepare(
             "SELECT * FROM messages WHERE alias=?1
-             AND state IN ('queued','submitting','running','unknown') ORDER BY seq",
+             AND state IN ('queued','submitting','running','unknown')
+             AND source != 'topic_notice' ORDER BY seq",
         )?;
         let rows = stmt.query_map([alias], row_message)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// CAD-1353: one grouped read for the fleet status view — how many
+    /// deliveries each alias is waiting to start and how long the oldest
+    /// has waited. A running turn is already delivering, so it is not
+    /// counted as queued; the stall view reports it separately.
+    pub fn open_delivery_summary(&self) -> Result<HashMap<String, (i64, Option<f64>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT alias, COUNT(*), MIN(created) FROM messages
+             WHERE alias != '' AND state IN ('queued','submitting','unknown')
+             AND source != 'topic_notice' GROUP BY alias",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, i64>(1)?, row.get::<_, Option<f64>>(2)?),
+            ))
+        })?;
+        let mut summary = HashMap::new();
+        for row in rows {
+            let (alias, counts) = row?;
+            summary.insert(alias, counts);
+        }
+        Ok(summary)
     }
 
     /// Running rows only, via the queue index: recurring summaries must
@@ -1724,12 +2800,14 @@ impl Store {
         let conn = self.conn();
         let agent = self.agent_in(&conn, alias)?;
         Ok(conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE alias=?1 AND state!='running'
-             AND (created >= ?2 OR state NOT IN
-                  ('completed','failed','interrupted','cancelled'))
+            &format!(
+                "SELECT COUNT(*) FROM messages WHERE alias=?1 AND state!='running'
+             AND (created >= ?2 OR (state NOT IN
+                  ('completed','failed','interrupted','cancelled') AND NOT {NOTICE_ENDED_SQL}))
              AND CASE WHEN json_valid(result)
                       THEN json_extract(result,'$.via') = 'pty_render_miss'
-                      ELSE 0 END",
+                      ELSE 0 END"
+            ),
             params![alias, agent.created],
             |row| row.get(0),
         )?)
@@ -1738,6 +2816,50 @@ impl Store {
     pub fn message(&self, id: &str) -> Result<Option<Message>> {
         let conn = self.conn();
         self.message_in(&conn, id)
+    }
+
+    /// CAD-1353: the recorded budget for a dispatch, falling back to the
+    /// job default. The agent's own `stall_secs` remains the final
+    /// fallback in the watcher.
+    pub fn message_stall_budget(&self, message: &Message) -> Option<i64> {
+        if let Some(secs) = message.stall_secs {
+            return Some(secs);
+        }
+        let task_id = message.task_id.as_deref()?;
+        let task = self.task(task_id).ok()?;
+        self.job(&task.job_id).ok()?.stall_secs
+    }
+
+    /// Whether a message row with this id exists. A bare existence probe
+    /// for send paths that must not decode the full row.
+    pub fn message_exists(&self, id: &str) -> Result<bool> {
+        let conn = self.conn();
+        match conn.query_row(
+            "SELECT 1 FROM messages WHERE id=? LIMIT 1",
+            [id],
+            |_| Ok(()),
+        ) {
+            Ok(()) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Whether an agent caller may read this message body. The row must
+    /// name the alias, and a known recipient UID must be the alias's
+    /// CURRENT UID; a legacy NULL UID counts only from the current
+    /// registration on (`created >= agent.created`). Unknown alias: no.
+    pub fn agent_reads_message(&self, msg: &Message, alias: &str) -> Result<bool> {
+        let Some(agent) = self.agent_opt(alias)? else {
+            return Ok(false);
+        };
+        if msg.alias != agent.alias {
+            return Ok(false);
+        }
+        Ok(match &msg.recipient_uid {
+            Some(uid) => *uid == agent.uid,
+            None => msg.created >= agent.created,
+        })
     }
 
     /// CAD-880: message ids starting with `prefix`, ordered — the pool a
@@ -1773,8 +2895,14 @@ impl Store {
             pattern.push(c);
         }
         pattern.push('%');
+        // The same predicate as `agent_reads_message`: a known recipient
+        // UID must be the alias's current UID; a NULL (legacy) UID counts
+        // only from the current registration on. An unknown alias matches
+        // nothing (NULL comparisons are false).
         let mut stmt = conn.prepare(
-            "SELECT id FROM messages WHERE id LIKE ?1 ESCAPE '\\' AND alias = ?2 \
+            "SELECT id FROM messages WHERE id LIKE ?1 ESCAPE '\\' AND alias = ?2 AND \
+             (recipient_uid = (SELECT uid FROM agents WHERE alias = ?2) OR \
+              (recipient_uid IS NULL AND created >= (SELECT created FROM agents WHERE alias = ?2))) \
              ORDER BY id LIMIT 11",
         )?;
         let rows = stmt.query_map((pattern, alias), |r| r.get(0))?;
@@ -1800,6 +2928,88 @@ impl Store {
         }
     }
 
+    /// The lane's latest owned turn on this issue: the original
+    /// dispatch kickoff or a daemon-issued native review follow-up
+    /// (a `source='review'` row with no caller-derived sender — only
+    /// `send_issue_followup` writes one, tagged server-side). Only rows
+    /// carrying the lane's `issue`/`worktree` tags count: an untagged
+    /// `review` row is ordinary mail, never this worker's turn.
+    pub(crate) fn worker_issue_turn(
+        &self,
+        issue: &str,
+        worker: &str,
+    ) -> Result<Option<WorkerTurn>> {
+        self.read_worker_turn(
+            "SELECT id,state,created,CASE WHEN state='completed' THEN result END \
+             FROM messages WHERE alias=?1 AND issue=?2 AND worktree IS NOT NULL \
+             AND (source='dispatch' OR (source='review' AND sender_uid IS NULL)) \
+             ORDER BY seq DESC LIMIT 1",
+            params![worker, issue],
+        )
+    }
+
+    /// The worktree the lane's latest dispatch kickoff was tagged
+    /// with — the current authorized lane after a manual retry or
+    /// worktree repair re-sent it. Follow-ups re-derive the lane tag
+    /// from that native queue record; they never take a caller's or a
+    /// follow-up's own claim, so `source='dispatch'` rows only — never
+    /// a `source='review'` row a follow-up itself wrote.
+    pub(crate) fn worker_issue_lane(&self, issue: &str, worker: &str) -> Result<Option<String>> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT worktree FROM messages WHERE alias=?1 AND issue=?2 \
+             AND source='dispatch' AND worktree IS NOT NULL \
+             ORDER BY seq DESC LIMIT 1",
+            params![worker, issue],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn read_worker_turn(
+        &self,
+        query: &str,
+        parameters: impl rusqlite::Params,
+    ) -> Result<Option<WorkerTurn>> {
+        let row: Option<(String, String, f64, Option<String>)> = {
+            let conn = self.conn();
+            conn.query_row(query, parameters, |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .optional()?
+        };
+        let Some((id, state, created, raw)) = row else {
+            return Ok(None);
+        };
+        let sha = if let Some(raw) = raw {
+            let result: Value = serde_json::from_str(&raw)
+                .map_err(|_| Error::rejected("the worker's durable result is malformed"))?;
+            match result.get("sha") {
+                Some(Value::String(sha)) => Some(super::check_commit_sha(sha)?),
+                Some(Value::Null) | None => ["text", "note"].iter().find_map(|field| {
+                    result
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .and_then(super::last_sha_line)
+                }),
+                Some(_) => {
+                    return Err(Error::rejected(
+                        "the worker's durable result revision is not a string",
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Some(WorkerTurn {
+            id,
+            state,
+            created,
+            sha,
+        }))
+    }
+
     /// CAD-250: the agent's delivered, unreported pty turns, oldest
     /// first. One at most once `take_queued` holds the line; more only
     /// for rows that accumulated before it did (adopted on a hot
@@ -1821,6 +3031,21 @@ impl Store {
             .into_iter()
             .filter(Message::holds_turn)
             .collect())
+    }
+
+    /// CAD-1266: every in-flight message (`running` or `submitted`) as
+    /// `(alias, id, state, since)` in one query, `since` being `started`
+    /// else `created`. Replaces loading each agent's whole history to
+    /// filter it in memory; the terminal history is never read.
+    pub fn inflight_messages(&self) -> Result<Vec<(String, String, String, f64)>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_vec(
+                "SELECT alias, id, state, COALESCE(started, created) FROM messages
+                 WHERE state IN ('running','submitted')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?)
+        })
     }
 
     /// CAD-375: every running message's turn token and its agent —
@@ -1898,13 +3123,54 @@ impl Store {
     /// Bound a non-agent event stream to its newest `keep` rows — the
     /// daemon's `wal_checkpointed` stream has no agents row, so the
     /// agent-removal `DELETE` never reaches it.
+    ///
+    /// Daemon `assist_intent` rows sit outside the `keep` window and are
+    /// dropped only when terminal (`delivered`/`refused`/`unresolved`), with a
+    /// `job_id` whose canonical `jobs` row is gone; pending, NULL, unknown or
+    /// malformed status and a missing job association are kept. On the daemon
+    /// stream an open mutation intent is not pruned: a `prepared` row survives
+    /// until its matching `finished` row exists (same request, correlation,
+    /// company, action and resource, schema 1, a valid outcome for its kind).
+    /// A `pm_mutation_prepared` row has no SQLite finish, so it is always kept.
+    /// Malformed or unmatched identity keeps the row. Protected rows are kept
+    /// in addition to the newest `keep`; ordinary rows follow the cap as before.
     pub fn prune_stream(&self, alias: &str, keep: i64) -> Result<()> {
         self.write_tx(|conn| {
             conn.execute(
-                "DELETE FROM events WHERE alias=?1 AND seq NOT IN (
-                             SELECT seq FROM events WHERE alias=?1
-                             ORDER BY seq DESC LIMIT ?2)",
-                params![alias, keep],
+                "DELETE FROM events WHERE alias=?1 AND (
+                   (kind='assist_intent' AND alias='daemon' AND job_id IS NOT NULL
+                    AND CASE WHEN json_valid(payload)
+                          THEN json_extract(payload,'$.status') END
+                        IN ('delivered','refused','unresolved')
+                    AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.id=events.job_id))
+                   OR (NOT (kind='assist_intent' AND alias='daemon') AND seq NOT IN (
+                        SELECT seq FROM events
+                        WHERE alias=?1 AND NOT (kind='assist_intent' AND alias='daemon')
+                        ORDER BY seq DESC LIMIT ?2)
+                 AND NOT (alias=?3 AND (
+                     kind='pm_mutation_prepared'
+                     OR (kind IN ('app_workspace_mutation_prepared','board_session_mutation_prepared')
+                         AND NOT EXISTS (SELECT 1 FROM events f
+                             WHERE f.alias=events.alias
+                             AND f.kind=CASE events.kind
+                                 WHEN 'app_workspace_mutation_prepared'
+                                 THEN 'app_workspace_mutation_finished'
+                                 ELSE 'board_session_mutation_finished' END
+                             AND CASE f.kind
+                                 WHEN 'app_workspace_mutation_finished'
+                                 THEN json_extract(f.payload,'$.outcome') IN
+                                     ('installed','removed','already_removed','restored',
+                                      'already_live_consent_recorded','already_live','refused','uncertain')
+                                 ELSE json_extract(f.payload,'$.outcome') IN ('completed','uncertain') END
+                             AND json_extract(f.payload,'$.schema_version')=1
+                             AND json_extract(events.payload,'$.schema_version')=1
+                             AND json_extract(f.payload,'$.request_id')=json_extract(events.payload,'$.request_id')
+                             AND json_extract(f.payload,'$.correlation_id')=json_extract(events.payload,'$.correlation_id')
+                             AND json_extract(f.payload,'$.company') IS json_extract(events.payload,'$.company')
+                             AND json_extract(f.payload,'$.action')=json_extract(events.payload,'$.action')
+                             AND json_extract(f.payload,'$.resource')=json_extract(events.payload,'$.resource'))))))
+                 )",
+                params![alias, keep, Self::DAEMON_STREAM],
             )?;
             Ok(())
         })
@@ -1931,6 +3197,41 @@ impl Store {
         }
     }
 
+    /// CAD-1700: the complete queue's routing metadata in delivery order
+    /// (`submitting` leads, then priority, then arrival): each message id
+    /// and the conversation its enqueue note landed in. One narrow
+    /// projection — no message bodies, no per-row lookup — so a pane can
+    /// find its own message and its predecessor at any queue position.
+    /// The first entry per message is the grouped `MIN(e.seq)`: `seq` is a
+    /// global AUTOINCREMENT key, so SQLite's bare-column-with-min rule
+    /// makes the row's bare `thread_id` exactly that entry — no window
+    /// function, which the store's authorizer does not allow.
+    pub fn queued_metadata(&self, alias: &str) -> Result<Vec<(String, Option<String>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "WITH queue AS (
+                 SELECT id, state, priority, seq FROM messages
+                 WHERE alias=?1 AND state IN ('queued','submitting')
+             ), first_entry AS (
+                 SELECT e.message_id, e.thread_id, MIN(e.seq) AS first_seq
+                 FROM thread_entries e JOIN threads t ON t.id=e.thread_id
+                 WHERE e.message_id IN (SELECT id FROM queue)
+                   AND (t.alias=?1 OR t.archived_alias=?1)
+                 GROUP BY e.message_id
+             )
+             SELECT q.id, f.thread_id
+             FROM queue q
+             LEFT JOIN first_entry f ON f.message_id=q.id
+             ORDER BY q.state='submitting' DESC, q.priority DESC, q.seq",
+        )?;
+        let rows = stmt.query_map([alias], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// CAD-413: per `stopped` agent with work waiting, its oldest queued
     /// message id and the queued count — the candidates an auto-resume
     /// sweep considers. Nudges are never queued for a stopped agent and
@@ -1939,10 +3240,11 @@ impl Store {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT m.alias, m.id FROM messages m JOIN agents a ON a.alias = m.alias
-             WHERE a.state = 'stopped' AND m.state = 'queued' AND m.source != ?
+             WHERE a.state = 'stopped' AND a.archived_at IS NULL
+               AND m.state = 'queued' AND m.source NOT IN (?, ?)
              ORDER BY m.alias, m.seq",
         )?;
-        let rows = stmt.query_map([NUDGE_SOURCE], |r| {
+        let rows = stmt.query_map([NUDGE_SOURCE, crate::proto::TOPIC_NOTICE_SOURCE], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
         let mut out: Vec<(String, String, i64)> = Vec::new();
@@ -1954,5 +3256,232 @@ impl Store {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+    use crate::store::agents::NewAgent;
+
+    fn open() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("cadence.sqlite3")).unwrap();
+        (dir, store)
+    }
+
+    fn register(store: &Store, alias: &str, dir: &std::path::Path) {
+        store
+            .register_agent(&NewAgent {
+                alias,
+                provider: "fake",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: dir.to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+    }
+
+    fn index<'a>(
+        store: &Store,
+        alias: &str,
+        states: &'a [String],
+        from: Option<&'a str>,
+    ) -> MessageIndexPage {
+        store
+            .message_index(
+                alias,
+                &MessageIndexQuery {
+                    states,
+                    from,
+                    source: None,
+                    since: None,
+                    limit: 20,
+                    include_app: false,
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn index_omits_body_result_and_turn_token() {
+        let (dir, store) = open();
+        register(&store, "worker", dir.path());
+        register(&store, "pm", dir.path());
+        let secret = "turn-token-secret-body";
+        store
+            .enqueue("worker", secret, None, "m-run", "user")
+            .unwrap();
+        store.mark_running("m-run", "pty-secret-token").unwrap();
+        store
+            .enqueue_sent(
+                "worker",
+                "from-pm-body",
+                None,
+                "m-pm",
+                "user",
+                None,
+                &Sender::Agent("pm".into()),
+            )
+            .unwrap();
+        let page = index(&store, "worker", &[], None);
+        assert_eq!(page.rows.len(), 2);
+        let running = page.rows.iter().find(|row| row.id == "m-run").unwrap();
+        assert!(running.awaiting_report || running.state == "running");
+        assert_eq!(running.body_chars, secret.chars().count() as i64);
+        let encoded = serde_json::to_string(&running.to_json()).unwrap();
+        for leaked in [secret, "pty-secret-token", "from-pm-body"] {
+            assert!(!encoded.contains(leaked), "{encoded}");
+        }
+        for key in ["body", "turn_id", "result", "error", "sender_uid"] {
+            assert!(running.to_json().get(key).is_none(), "{key}");
+        }
+        let from_pm = index(&store, "worker", &[], Some("pm"));
+        assert_eq!(from_pm.rows.len(), 1);
+        assert_eq!(from_pm.rows[0].id, "m-pm");
+        assert_eq!(from_pm.rows[0].to_json()["from"], "pm");
+        let queued_states = ["queued".to_string()];
+        let queued = index(&store, "worker", &queued_states, None);
+        assert_eq!(queued.rows.len(), 1);
+        assert_eq!(queued.rows[0].id, "m-pm");
+    }
+}
+
+/// CAD-1700: the master push stamp and the ordered queue it reports.
+#[cfg(test)]
+mod master_stamp_tests {
+    use super::*;
+    use crate::store::agents::NewAgent;
+    use crate::store::{NewEntry, KIND_MESSAGE, ROLE_SYSTEM};
+
+    fn open() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("cadence.sqlite3")).unwrap();
+        store
+            .register_agent(&NewAgent {
+                alias: "master",
+                provider: "fake",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: dir.path().to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn master_stamp_moves_on_enqueue_run_finish_and_thread_entry() {
+        let (_dir, store) = open();
+        let quiet = store.master_stamp("master").unwrap();
+        assert_eq!(
+            store.master_stamp("master").unwrap(),
+            quiet,
+            "an idle master is stable"
+        );
+
+        store
+            .enqueue("master", "one", None, "m-1", "operator")
+            .unwrap();
+        let queued = store.master_stamp("master").unwrap();
+        assert_ne!(queued, quiet, "enqueue moves the stamp");
+        assert_eq!(queued.2, 1, "one queued message is counted");
+
+        store.mark_running("m-1", "tok").unwrap();
+        let running = store.master_stamp("master").unwrap();
+        assert_ne!(running, queued, "starting the turn moves the stamp");
+        assert_eq!((running.1, running.2), (1, 0), "one running, none queued");
+
+        store.ensure_thread("master").unwrap();
+        store
+            .thread_append(
+                "master",
+                NewEntry {
+                    role: ROLE_SYSTEM,
+                    kind: KIND_MESSAGE,
+                    text: "a step",
+                    payload: None,
+                    message_id: Some("m-1"),
+                },
+            )
+            .unwrap();
+        let entry = store.master_stamp("master").unwrap();
+        assert!(
+            entry.3 > running.3,
+            "a thread entry moves the newest entry seq"
+        );
+
+        store
+            .finish_running("m-1", "completed", &json!({"text": "done"}), None)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            store.master_stamp("master").unwrap(),
+            entry,
+            "finishing the turn moves the stamp"
+        );
+    }
+
+    /// CAD-1700: the pane's queue projection is complete rather than a
+    /// 20-row page, in delivery order, and carries each message's
+    /// conversation from the one narrow join. An enqueue writes the
+    /// message's operator note when the alias has a home thread, so every
+    /// master row resolves home; an alias with no home thread drops the
+    /// note (the documented CLI/unattributed path), so its row is NULL.
+    #[test]
+    fn queued_metadata_is_complete_and_carries_conversations() {
+        let (_dir, store) = open();
+        let home = store.ensure_thread("master").unwrap().id;
+        for i in 1..=25 {
+            let id = format!("m{i}");
+            store.enqueue("master", &id, None, &id, "operator").unwrap();
+        }
+        let queued = store.queued_metadata("master").unwrap();
+        assert_eq!(
+            queued.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            (1..=25).map(|i| format!("m{i}")).collect::<Vec<_>>(),
+            "the projection is complete and in delivery order"
+        );
+        assert_eq!(queued[19].0, "m20", "the predecessor is represented");
+        assert_eq!(queued[20].0, "m21", "the 21st message is represented");
+        assert!(
+            queued
+                .iter()
+                .all(|(_, conversation)| conversation.as_deref() == Some(home.as_str())),
+            "every enqueued master message resolves its home conversation"
+        );
+        // A canonical message whose note was dropped: w1 has an agent but
+        // no home thread, so its enqueue note lands nowhere.
+        store
+            .register_agent(&NewAgent {
+                alias: "w1",
+                provider: "fake",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: _dir.path().to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        store
+            .enqueue("w1", "unthreaded", None, "w-note", "operator")
+            .unwrap();
+        assert_eq!(
+            store.queued_metadata("w1").unwrap(),
+            vec![("w-note".to_string(), None::<String>)],
+            "a queued message with no thread note has no conversation"
+        );
     }
 }

@@ -29,10 +29,9 @@ CREATE TABLE IF NOT EXISTS crm_settings(
  by TEXT NOT NULL, updated REAL NOT NULL);
 ";
 
-/// One core send row — the crash-reconciliation unit.
-pub struct CrmSend {
-    pub state: String,
-}
+pub const CRM_AUTONOMY_KEY: &str = "crm_autonomy";
+pub const CRM_AUTONOMY_ASSISTED: &str = "assisted";
+pub const CRM_AUTONOMY_FULL: &str = "full";
 
 impl Store {
     /// Open the durable intent for an approved send. One row per
@@ -157,6 +156,26 @@ impl Store {
         )
         .optional()
         .map_err(|e| Error::internal(e.to_string()))
+    }
+
+    /// CRM autonomy: `assisted` keeps the operator decision on record
+    /// writes and campaign sends; `full` lets a scoped agent turn run
+    /// them directly. Default `assisted`; the setting is operator-only.
+    pub fn crm_autonomy(&self) -> Result<String> {
+        Ok(self
+            .crm_setting(CRM_AUTONOMY_KEY)?
+            .unwrap_or_else(|| CRM_AUTONOMY_ASSISTED.to_string()))
+    }
+
+    pub fn crm_autonomy_is_full(&self) -> Result<bool> {
+        Ok(self.crm_autonomy()? == CRM_AUTONOMY_FULL)
+    }
+
+    pub fn crm_autonomy_set(&self, mode: &str, by: &str) -> Result<()> {
+        if mode != CRM_AUTONOMY_ASSISTED && mode != CRM_AUTONOMY_FULL {
+            return Err(Error::rejected("CRM autonomy must be assisted or full"));
+        }
+        self.crm_setting_set(CRM_AUTONOMY_KEY, Some(mode), by)
     }
 
     /// Best-effort audit for the unsubscribe origin — the origin is

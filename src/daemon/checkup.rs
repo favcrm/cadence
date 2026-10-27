@@ -349,14 +349,27 @@ impl Shared {
         match self.store.expire_awaiting_report(&m.id, None, why) {
             Ok(true) => {
                 self.notify_routed_target(m, &Value::Null);
+                // CAD-1142: an app-owned turn's stored account is
+                // operator-private; the public fence text is the
+                // bounded class. The daemon-authored `why` already
+                // carries no provider prose, so this is the same
+                // defense `Shared::unknown` applies, not a behaviour
+                // change for ordinary turns.
+                let public_reason = if m.source == "app_run_dispatch" {
+                    crate::store::app_runs::app_uncertain_turn_reason()
+                } else {
+                    why.to_string()
+                };
                 let _ = self.store.set_state_detached(
                     &agent.alias,
                     "attention",
-                    Some(&format_unknown_fence(why)),
+                    Some(&format_unknown_fence(&public_reason)),
                 );
-                let _ = self
-                    .store
-                    .event_public(&agent.alias, "attention", json!({"reason": why}));
+                let _ = self.store.event_public(
+                    &agent.alias,
+                    "attention",
+                    json!({"reason": public_reason}),
+                );
                 self.wake();
                 (
                     Outcome::Escalate,

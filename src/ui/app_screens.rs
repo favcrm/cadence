@@ -6,11 +6,14 @@
 //! never by trusting a caller-supplied id:
 //!
 //! - `POST /api/app-installations/<id>/screens/<tag>/mount` —
-//!   `RouteClass::OperatorOnly`, body `{}`. The board takes the request's
-//!   session cookie token + `X-Cadence-Session` key (the same credentials
-//!   `check_session` already proves) and relays them to `app_screen_mint`,
-//!   which runs `Auth::check`/`check_public` itself and binds the minted
-//!   cap to the *resolved* session id. Returns `{mount: path}`.
+//!   `RouteClass::ScreenRead` (CAD-1537: a member or `--read-only` board
+//!   mounts read-only), body `{context_id?, parent_action_token?}`. The
+//!   board takes the request's session cookie token + `X-Cadence-Session`
+//!   key (the same credentials `check_session` already proves) and relays
+//!   them, with the host-held drawer pairing token, to `app_screen_mint`,
+//!   which runs `Auth::check`/`check_public` itself, binds the minted cap
+//!   to the *resolved* session id and re-proves the pairing against live
+//!   native state. Returns `{mount: path}`.
 //!
 //! - `GET /api/app-screen/<nonce>` — the frame document. A navigation
 //!   is headerless (no `X-Cadence-Session` page key), so it never runs
@@ -34,27 +37,6 @@ use crate::operator_auth::Origin;
 
 const BODY_CAP: u64 = 4 * 1024;
 
-/// `POST /api/app-installations/<id>/screens/<tag>/mount` → `(id, tag)`.
-pub(super) fn mount_route(path: &str) -> Option<(&str, &str)> {
-    let rest = path.strip_prefix("/api/app-installations/")?;
-    let (install, rest) = rest.split_once("/screens/")?;
-    let (tag, verb) = rest.split_once('/')?;
-    if verb != "mount" || install.is_empty() || install.contains('/') {
-        return None;
-    }
-    if !crate::issue::app_screen_pkg::valid_tag(tag) {
-        return None;
-    }
-    if install.len() > 128
-        || !install
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-    {
-        return None;
-    }
-    Some((install, tag))
-}
-
 /// `GET /api/app-screen/<nonce>` → `Some(nonce)` for exactly that shape.
 pub(super) fn frame_route(path: &str) -> Option<&str> {
     let nonce = path.strip_prefix("/api/app-screen/")?;
@@ -70,7 +52,7 @@ pub(super) fn frame_route(path: &str) -> Option<&str> {
 /// presents no session cookie for its origin — refused upstream by the
 /// daemon's check either way. Used ONLY by the mint POST; the frame GET
 /// relays nothing (the nonce is its sole authority).
-fn request_credentials(
+pub(super) fn request_credentials(
     request: &Request,
     opts: &ServeOpts,
 ) -> Option<(String, String, &'static str)> {
@@ -80,9 +62,13 @@ fn request_credentials(
     Some((token, key, origin.as_str()))
 }
 
-/// The mint handler — body `{}` only; scope (`install_id`,`tag`) from the
-/// URL; session credentials relayed from the proven request. `admit`'s
-/// OperatorOnly gate has already run before this handler is reached.
+/// The mint handler — body `{context_id?, parent_action_token?}` only;
+/// install/tag are from the URL, the optional context is re-proven by the
+/// daemon for that install, and the optional parent action token is the
+/// trusted host's drawer pairing for a child mount (proven natively to be
+/// a live, consumed, non-read-only PRIMARY of the same records screen and
+/// context). Session credentials are relayed from the proven request. The
+/// child frame never supplies or receives any of this authority.
 pub(super) fn mount(
     request: &mut Request,
     state_dir: &std::path::Path,
@@ -94,30 +80,412 @@ pub(super) fn mount(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let ok = serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .is_some_and(|v| v.as_object().is_some_and(|m| m.is_empty()));
-    if !ok {
-        return err_response(400, "screen mount takes no fields — send {}");
+    // Duplicate fields refuse: the closed body must not let a second
+    // `parent_action_token`/`context_id` override the first.
+    let body = match serde_json::from_slice::<UniqueServiceJson>(&bytes) {
+        Ok(UniqueServiceJson(v)) if v.is_object() => v,
+        _ => return err_response(400, "screen mount body must be an object"),
+    };
+    let fields = body.as_object().expect("checked object");
+    if fields
+        .keys()
+        .any(|k| k != "context_id" && k != "parent_action_token")
+    {
+        return err_response(400, "screen mount has unsupported fields");
+    }
+    let context_id = match fields.get("context_id") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(value)) => value.as_str(),
+        Some(_) => return err_response(400, "screen context ID must be a string"),
+    };
+    if context_id.len() > 128 {
+        return err_response(400, "screen context ID exceeds its bound");
+    }
+    let parent_action_token = match fields.get("parent_action_token") {
+        None => None,
+        Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+        Some(_) => {
+            return err_response(400, "screen parent action token must be a non-empty string")
+        }
+    };
+    if parent_action_token.is_some_and(|token| token.len() > 128) {
+        return err_response(400, "screen parent action token exceeds its bound");
     }
     let Some((token, key, origin)) = request_credentials(request, opts) else {
         return err_response(403, "screen mount needs a live operator session");
     };
     let generation = next_generation();
+    let mut params = json!({
+        "install_id": install_id,
+        "context_id": if context_id.is_empty() { Value::Null } else { json!(context_id) },
+        "tag": tag,
+        "token": token,
+        "key": key,
+        "origin": origin,
+        "generation": generation,
+    });
+    if let Some(parent) = parent_action_token {
+        params["parent_action_token"] = json!(parent);
+    }
+    // CAD-1537: the `--read-only` board can only narrow its mounts; the
+    // daemon makes a member's mount read-only on its own. A read-only
+    // board cannot open a drawer child — the daemon refuses it too.
+    if opts.read_only {
+        params["read_only"] = json!(true);
+    }
+    match client::rpc(state_dir, "app_screen_mint", params) {
+        Ok(v) => super::json_response(v),
+        Err(e) => home::rpc_err(&e, "app_screen_mint"),
+    }
+}
+
+/// Closed trusted-host service endpoints. Credentials come ONLY from the
+/// admitted request, never from its JSON body or the child frame.
+pub(super) fn service_route(path: &str) -> Option<&'static str> {
+    match path {
+        "/api/app-screen-services/call" => Some("app_screen_service_call"),
+        "/api/app-screen-services/slot-prepare" => Some("app_screen_service_slot_prepare"),
+        "/api/app-screen-services/slot-confirm" => Some("app_screen_service_slot_confirm"),
+        _ => None,
+    }
+}
+
+// Value's ordinary parser collapses duplicate fields. This visitor preserves
+// the closed service contract by refusing duplicates at every JSON level.
+struct UniqueServiceJson(Value);
+impl<'de> serde::Deserialize<'de> for UniqueServiceJson {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueServiceJson;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("JSON without duplicate fields")
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(UniqueServiceJson(json!(v)))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(UniqueServiceJson(json!(v)))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(UniqueServiceJson(json!(v)))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                Ok(UniqueServiceJson(json!(v)))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(UniqueServiceJson(json!(v)))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(UniqueServiceJson(json!(v)))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(UniqueServiceJson(Value::Null))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                while let Some(UniqueServiceJson(v)) = a.next_element()? {
+                    items.push(v);
+                }
+                Ok(UniqueServiceJson(Value::Array(items)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut fields = serde_json::Map::new();
+                while let Some(k) = a.next_key::<String>()? {
+                    if fields.contains_key(&k) {
+                        return Err(serde::de::Error::custom("duplicate service field"));
+                    }
+                    let UniqueServiceJson(v) = a.next_value()?;
+                    fields.insert(k, v);
+                }
+                Ok(UniqueServiceJson(Value::Object(fields)))
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
+/// `read_only` (CAD-1537): a member or `--read-only` board caller — the
+/// board refuses a non-read operation itself before relaying, as strict
+/// as the daemon's own read-only mount rule.
+pub(super) fn service(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    method: &'static str,
+    read_only: bool,
+) -> HttpResp {
+    // One finite read budget before bounded envelope inspection. The named
+    // operation then imposes its smaller exact raw-envelope + args budget.
+    let bytes = match read_body(request, 327_680 + 4096) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let mut body = match serde_json::from_slice::<UniqueServiceJson>(&bytes) {
+        Ok(UniqueServiceJson(v)) if v.is_object() => v,
+        _ => {
+            return err_response(
+                400,
+                "screen service body must be duplicate-free JSON object",
+            )
+        }
+    };
+    let confirm = method == "app_screen_service_slot_confirm";
+    let allowed = if confirm {
+        &["action_token", "confirmation_token", "confirmation"][..]
+    } else {
+        &["action_token", "operation", "args"][..]
+    };
+    if body
+        .as_object()
+        .unwrap()
+        .keys()
+        .any(|key| !allowed.contains(&key.as_str()))
+    {
+        return err_response(400, "screen service body has unsupported fields");
+    }
+    let cap = if confirm {
+        16_384
+    } else {
+        match serde_json::from_value::<crate::issue::app_screen_decl::ScreenOperation>(
+            body["operation"].clone(),
+        ) {
+            Ok(operation) if read_only && !operation.is_screen_read() => {
+                return super::coded_response(
+                    403,
+                    "forbidden",
+                    "a read-only screen admits only read operations",
+                    None,
+                )
+            }
+            Ok(operation) => operation.args_limit(),
+            Err(_) => return err_response(400, "unknown screen service operation"),
+        }
+    };
+    let args = if confirm {
+        &body["confirmation"]
+    } else {
+        &body["args"]
+    };
+    if bytes.len() > cap + 4096 || !args.is_object() || args.to_string().len() > cap {
+        return err_response(400, "screen service request exceeds operation byte bound");
+    }
+    let Some((token, key, origin)) = request_credentials(request, opts) else {
+        return super::coded_response(
+            403,
+            "forbidden",
+            "screen service requires live operator session",
+            None,
+        );
+    };
+    let operation = body
+        .get("operation")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    body["token"] = json!(token);
+    body["key"] = json!(key);
+    body["origin"] = json!(origin);
+    match client::rpc(state_dir, method, body) {
+        Ok(v) => service_json_response(&v),
+        Err(error)
+            if error.kind() == "rejected" && error.code() == Some("screen_access_denied") =>
+        {
+            super::coded_response(403, "forbidden", "screen service access unavailable", None)
+        }
+        Err(error)
+            if error.kind() == "rejected"
+                && method == "app_screen_service_call"
+                && matches!(
+                    (operation.as_deref(), error.code()),
+                    (Some("audience.show"), Some("app_audience_freeze_missing"))
+                        | (Some("content.show"), Some("app_content_missing"))
+                ) =>
+        {
+            super::coded_response(404, "not_found", &error.to_string(), None)
+        }
+        // CAD-1656: only the confirm-time facts refusal keeps its own code.
+        // CAD-1827: a campaign-work stale revision keeps `stale_revision`
+        // too — the app's stale-save recovery is keyed on it, and rewriting
+        // it to a generic conflict would strand the panel's conflict state.
+        // Every other conflict still reaches the frame as `conflict`.
+        Err(error) if error.kind() == "conflict" => {
+            let campaign_work_stale = operation
+                .as_deref()
+                .is_some_and(|op| op.starts_with("campaign-work."))
+                && error.code() == Some("stale_revision");
+            let code = if campaign_work_stale {
+                "stale_revision"
+            } else if error.code() == Some("facts_changed") {
+                "facts_changed"
+            } else {
+                "conflict"
+            };
+            super::coded_response(409, code, &error.to_string(), error.revision())
+        }
+        Err(error) => home::rpc_err(&error, method),
+    }
+}
+
+/// Serialize once: the exact compact wire bytes, not a compact estimate
+/// followed by pretty JSON. Private service/confirmation results are never
+/// cacheable. Error responses retain the existing refusal/status mapping.
+fn service_json_response(value: &Value) -> HttpResp {
+    let bytes = match serde_json::to_vec(value) {
+        Ok(bytes) if bytes.len() <= 1_048_576 => bytes,
+        Ok(_) => return err_response(502, "screen service response exceeds byte bound"),
+        Err(_) => return err_response(502, "screen service response serialization failed"),
+    };
+    let mut response = Response::from_data(bytes).with_status_code(StatusCode(200));
+    response.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+    response.add_header(Header::from_bytes("Vary", "Cookie, X-Cadence-Session").unwrap());
+    response.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
+    response
+}
+
+/// `POST /api/app-screen-tools/invoke` — the standalone tool call the
+/// trusted host relays for a live mounted frame. Body
+/// `{action_token, tool_alias, input, request_id}`. The host API adapter maps
+/// the child-facing `alias` selector to `tool_alias`. The board relays the
+/// request's own session credentials (the same `check_session` proof the
+/// mount mint uses); the daemon re-proves the session AND the
+/// server-bound mount action context before any broker/provider work.
+/// The frame itself never reaches this route (`connect-src 'none'`).
+pub(super) fn tool_route(path: &str) -> bool {
+    path == "/api/app-screen-tools/invoke"
+}
+
+pub(super) fn tool_invoke(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let body: Value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v) if v.is_object() => v,
+        _ => return err_response(400, "tool invoke body must be a JSON object"),
+    };
+    // Closed body shape the daemon re-checks; the session fields are
+    // added host-side from the proven request, never from the body.
+    let alias = body.get("tool_alias").and_then(Value::as_str).unwrap_or("");
+    let action_token = body
+        .get("action_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let request_id = body.get("request_id").and_then(Value::as_str).unwrap_or("");
+    let input = body.get("input").cloned().unwrap_or_else(|| json!({}));
+    let generation_scope = body.get("generation_scope").cloned();
+    if body.as_object().is_some_and(|o| {
+        o.keys().any(|k| {
+            !matches!(
+                k.as_str(),
+                "action_token" | "tool_alias" | "input" | "request_id" | "generation_scope"
+            )
+        })
+    }) {
+        return err_response(400, "tool invoke body contains unsupported fields");
+    }
+    if alias.is_empty() || action_token.is_empty() || request_id.is_empty() || !input.is_object() {
+        return err_response(
+            400,
+            "tool invoke needs action_token, alias, request_id and object input",
+        );
+    }
+    let Some((token, key, origin)) = request_credentials(request, opts) else {
+        return err_response(403, "tool invoke needs a live operator session");
+    };
+    let mut params = json!({"action_token":action_token,"tool_alias":alias,"input":input,"request_id":request_id,"token":token,"key":key,"origin":origin});
+    if let Some(scope) = generation_scope {
+        params["generation_scope"] = scope;
+    }
+    match client::rpc(state_dir, "app_tool_invoke", params) {
+        Ok(v) => super::json_response(v),
+        Err(e) => home::rpc_err(&e, "app_tool_invoke"),
+    }
+}
+
+/// `POST /api/app-screen-tools/revoke` — the host tearing a mount down
+/// revokes its action handle. Body `{action_token}`. OperatorOnly; the
+/// board relays the request's own session so the daemon only revokes a
+/// context that session owns. Idempotent — tearing down an already-gone
+/// mount is a no-op, never an error.
+pub(super) fn tool_revoke_route(path: &str) -> bool {
+    path == "/api/app-screen-tools/revoke"
+}
+
+pub(super) fn tool_revoke(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let body: Value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v) if v.is_object() => v,
+        _ => return err_response(400, "tool revoke body must be a JSON object"),
+    };
+    let action_token = body
+        .get("action_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if action_token.is_empty() {
+        return err_response(400, "tool revoke needs action_token");
+    }
+    let Some((token, key, origin)) = request_credentials(request, opts) else {
+        return err_response(403, "tool revoke needs a live operator session");
+    };
     match client::rpc(
         state_dir,
-        "app_screen_mint",
+        "app_tool_revoke",
         json!({
-            "install_id": install_id,
-            "tag": tag,
+            "action_token": action_token,
             "token": token,
             "key": key,
             "origin": origin,
-            "generation": generation,
         }),
     ) {
         Ok(v) => super::json_response(v),
-        Err(e) => home::rpc_err(&e, "app_screen_mint"),
+        Err(e) => home::rpc_err(&e, "app_tool_revoke"),
+    }
+}
+
+/// `GET /api/app-screen-tools/results?install_id=<id>` — operator read of
+/// retained standalone tool receipts for one installation (the projection
+/// reads them to restore posts after reload). Operator-read gated like
+/// every app read; relays to `app_tool_results`.
+pub(super) fn tool_results_route(path: &str) -> bool {
+    path == "/api/app-screen-tools/results"
+}
+
+pub(super) fn tool_results(request: &Request, state_dir: &std::path::Path) -> HttpResp {
+    let query = request.url().split_once('?').map(|(_, q)| q).unwrap_or("");
+    let params: std::collections::HashMap<&str, &str> = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .collect();
+    let install_id = params.get("install_id").map(|v| v.to_string());
+    let context_id = params.get("context_id").map(|v| v.to_string());
+    let Some(install_id) = install_id.filter(|id| !id.is_empty()) else {
+        return err_response(400, "tool results needs an install_id");
+    };
+    let params = if let Some(context) = context_id {
+        json!({"install_id":install_id,"context_id":context})
+    } else {
+        json!({"install_id":install_id})
+    };
+    match client::rpc(state_dir, "app_tool_results", params) {
+        Ok(v) => super::json_response(v),
+        Err(e) => home::rpc_err(&e, "app_tool_results"),
     }
 }
 
@@ -156,25 +524,55 @@ pub(super) fn frame(
     // value so the host recognizes the child's echoed init. Never mint a
     // fresh one at render and never accept a child-chosen nonce.
     let bridge_nonce = out["bridge_nonce"].as_str().unwrap_or("").to_string();
-    let assets = out["assets"].as_object();
-    let css = assets
-        .and_then(|a| a.iter().find(|(k, _)| k.ends_with(".css")))
-        .and_then(|(_, v)| v.as_str())
-        .unwrap_or("");
-    let js = assets
-        .and_then(|a| a.get("client.js"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    // Rebuild from the native manifest + exact string bodies, never from a
+    // host/frame-selected script vector or an order inferred from file names.
+    let package = (|| -> crate::error::Result<crate::issue::app_screen_pkg::ScreenPackage> {
+        use crate::error::Error;
+        let manifest = out["manifest"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("screen manifest unavailable"))?;
+        let assets = out["assets"]
+            .as_object()
+            .ok_or_else(|| Error::rejected("screen assets unavailable"))?
+            .iter()
+            .map(|(name, value)| {
+                value
+                    .as_str()
+                    .map(|text| (name.clone(), text.to_owned()))
+                    .ok_or_else(|| Error::rejected("screen asset is not text"))
+            })
+            .collect::<crate::error::Result<std::collections::BTreeMap<_, _>>>()?;
+        let checked = crate::issue::app_screen_decl::validate_map(manifest, &assets)?;
+        Ok(crate::issue::app_screen_pkg::ScreenPackage {
+            tag: out["tag"]
+                .as_str()
+                .ok_or_else(|| Error::rejected("screen tag unavailable"))?
+                .to_owned(),
+            manifest: manifest.to_owned(),
+            assets,
+            app: checked.app().to_owned(),
+            remote_images: checked.remote_images().to_vec(),
+            contract: checked.contract().to_owned(),
+            may: checked.may().to_vec(),
+            tools: checked.tools().clone(),
+            host_contract: checked.host_contract().map(str::to_owned),
+            operations: checked.operations().to_vec(),
+            navigation: checked.navigation().cloned(),
+        })
+    })();
+    let package = match package {
+        Ok(package) => package,
+        Err(_) => return err_response(500, "screen package refused"),
+    };
     let origin_str = board_origin(request, opts);
     let generation = out["generation"].as_u64().unwrap_or(0);
     let tag = out["tag"].as_str().unwrap_or("");
-    let html = match crate::daemon::render_frame_html(
+    let html = match crate::daemon::render_package_frame_html(
         &csp_nonce,
         tag,
         &bridge_nonce,
         generation,
-        css,
-        js,
+        &package,
         &origin_str,
     ) {
         Ok(h) => h,
@@ -185,13 +583,7 @@ pub(super) fn frame(
     resp.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
     resp.add_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap());
     resp.add_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
-    let remote_images: Vec<String> = out["remote_images"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect();
-    let csp = frame_csp(&csp_nonce, &origin_str, &remote_images);
+    let csp = frame_csp(&csp_nonce, &origin_str, &package.remote_images);
     resp.add_header(Header::from_bytes("Content-Security-Policy", csp).unwrap());
     resp
 }

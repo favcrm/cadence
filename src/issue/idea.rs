@@ -699,11 +699,6 @@ pub fn link_duplicate(pm: &Pm, id: &str, target: &str) -> Result<()> {
     Ok(())
 }
 
-/// Overview's one-line note for a plan that is waiting.
-pub fn decision_note(recommendation: Option<&str>, title: &str) -> String {
-    one_line(recommendation.unwrap_or(title), 160)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

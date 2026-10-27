@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { Agent } from "../../lib/types";
+import { useHref } from "../../lib/useLocation";
 import type { Viewer } from "../projects/work";
 import { ApiError } from "../../lib/api";
+import { useTranslate } from "../../lib/locale";
 import { StoredDraftCard } from "./StoredDraftCard";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
@@ -22,31 +24,39 @@ import { plainTitle, runLane, statusText, statusTone } from "./presentation";
 import { SlotBindings } from "./SlotBindings";
 import { ReadinessPanel } from "./ReadinessPanel";
 import { TeamSettings } from "./TeamSettings";
+import { PublishToInstagram } from "./PublishToInstagram";
+import { connectOutcome, connectToast, publishAllowed, withoutConnectParams } from "./socialConnect";
+import Toast, { type ToastMsg } from "../../ui/Toast";
 import { declaredSlots } from "./bindingChoices";
 import {
   workspaceApps,
-  type Installation,
+  readWorkspaceAppSnapshot,
+  readWorkspaceAppSnapshotFresh,
+  dropWorkspaceAppSnapshot,
   type AppContext,
-  type AppBinding,
+  type Installation,
   type WorkspaceRun,
   type TextArtifact,
-  type AppEffect,
-  type Connection,
   type WorkspaceOutbox,
   type UpgradeProposal,
+  type WorkspaceAppSnapshot,
 } from "./workspaceApps";
 import { retainedRequest, completeRequest } from "./requests";
 import PublishPanel, { type PublishCandidate } from "./PublishPanel";
 import ScheduleCalendar from "./ScheduleCalendar";
-import { forgetContext, initialContext, rememberedContext, rememberContext } from "./contextSelection";
+import { conversationList } from "../app-shell/conversationClient";
+import { forgetContext, rememberContext } from "./contextSelection";
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
 import ScreenHost from "./screen/ScreenHost";
+import type { MediaChatAttach } from "./screen/screenLifecycle";
 import { makePlanner, runCall, type ActionContext } from "./screen/screenActions";
 import { useScreenExtras } from "./screen/useScreenExtras";
 import { screenTag, screenProjection, settleIntentRead, type IntentRead } from "./screen/screenProjection";
+import { screenFailurePane, type ScreenPaneState } from "./screen/screenFailure";
 import { socialPublish } from "./socialPublish";
 import { supportsSocialContentWorkspace } from "./socialContentSupport";
+import { isUnchangedUpgradeError } from "../explorer/appErrors";
 
 type Section =
   | "Board"
@@ -57,35 +67,220 @@ type Section =
   | "Settings"
   | "Schedule"
   | "Sources";
-type Snapshot = {
-  installation: Installation;
-  contexts: AppContext[];
-  bindings: AppBinding[];
-  connections: Connection[];
-  agents: Agent[];
-  runs: WorkspaceRun[];
-  effects: AppEffect[];
-};
+/** CAD-1137: the app page's snapshot — the same read set the cache stores. */
+type Snapshot = WorkspaceAppSnapshot;
+
+/** Display-only stale content while AppShell obtains fresh scope receipts.
+ *  This never mounts the app screen or any workspace controls. */
+export function WorkspaceAppCachedPreview({
+  snapshot,
+  contextId,
+}: {
+  snapshot: Snapshot;
+  contextId: string | null;
+}) {
+  const t = useTranslate();
+  const context = contextId === null
+    ? null
+    : snapshot.contexts.find((value) =>
+      value.id === contextId && value.install_id === snapshot.installation.install_id && value.state === "active",
+    ) ?? null;
+  const runs = context
+    ? snapshot.runs.filter((run) => run.install_id === snapshot.installation.install_id && run.context_id === context.id).slice(0, 3)
+    : [];
+  return (
+    <section className="card px-4 py-5" aria-label={t("Cached workspace preview")} role="status">
+      <p className="text-micro text-ink-500">{t("Previously viewed · verifying access")}</p>
+      <h2 className="mt-1 text-cardtitle font-medium text-ink-100">
+        {snapshot.installation.title || snapshot.installation.name}
+      </h2>
+      {context ? (
+        <>
+          <p className="mt-1 text-micro text-ink-500">{context.config.label}</p>
+          {runs.length > 0 ? (
+            <ul className="mt-4 space-y-2" aria-label={t("Previously viewed runs")}>
+              {runs.map((run) => (
+                <li key={run.id} className="rounded border border-line/50 px-3 py-2">
+                  <span className="text-label text-ink-200">{run.snapshot.workflow.title}</span>
+                  <span className="ml-2 text-micro text-ink-500">{run.state}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-3 text-label text-ink-400">{t("No recent activity in this context.")}</p>
+          )}
+        </>
+      ) : (
+        <p className="mt-3 text-label text-ink-400">{t("Workspace details will appear after access is verified.")}</p>
+      )}
+    </section>
+  );
+}
+
+/** The installed version, shown where the app's own name is — an update is
+ *  only visible to a person who can see what is installed. */
+function AppVersion({ version }: { version?: string }) {
+  if (!version) return null;
+  return <span className="text-micro text-ink-500" data-app-version={version}> · v{version}</span>;
+}
+
+/**
+ * One honest pane for a screen that did not mount: the state's own title and
+ * only the actions that can change it. The outlet supplies `onRetry` (a
+ * remount of the same projection); `onReinstall` exists only when the app has
+ * a recorded install source and this viewer may write.
+ */
+function ScreenFailurePane({ failure, onRetry, onReinstall, busy }: {
+  failure: ScreenPaneState;
+  onRetry: () => void;
+  onReinstall?: () => void;
+  busy?: boolean;
+}) {
+  const t = useTranslate();
+  const pane = screenFailurePane(failure, onReinstall !== undefined);
+  const title = failure.kind === "needs_host_update"
+    ? t(pane.title).replace("{required}", () => failure.required).replace("{current}", () => failure.current)
+    : t(pane.title);
+  return (
+    <section className="card px-4 py-5" aria-label={t("Installed app screen")} data-screen-pane={failure.kind} role="status">
+      <p className="wa-muted">{title}</p>
+      <div className="wa-row">
+        {pane.actions.includes("sign_in") && <Button href="/login">{t("Sign in")}</Button>}
+        {pane.actions.includes("retry") && <Button onClick={onRetry}>{t("Retry")}</Button>}
+        {pane.actions.includes("reinstall") && onReinstall && <Button onClick={onReinstall} loading={busy}>{t("Reinstall")}</Button>}
+        {pane.actions.includes("check_update") && <Button onClick={() => window.location.reload()}>{t("Check for update")}</Button>}
+      </div>
+    </section>
+  );
+}
+
 const message = (error: unknown) =>
   error instanceof Error
     ? error.message
     : "Could not complete this action. Refresh and try again.";
 
+type SocialDestination = { contextId: string; conversationId: string };
+type DestinationProof = {
+  visitKey: string;
+  selectionEpoch: number;
+  installId: string;
+  contextId: string;
+  conversationId: string;
+  ownerSignature: string;
+  conversationAsOf: number;
+};
+type ReadyOwnerSnapshot = { snapshot: Snapshot; signature: string; context: AppContext };
+type SavedContextInvocation = {
+  action: ActionContext;
+  visitKey: string | null;
+  href: string;
+  selectionEpoch: number;
+};
+
+function sameInstallation(left: Installation, right: Installation): boolean {
+  return left.install_id === right.install_id && left.version === right.version && left.digest === right.digest;
+}
+
+function rawQueryValues(rawQuery: string, parameter: string): (string | null)[] {
+  const values: (string | null)[] = [];
+  for (const part of rawQuery.split("&")) {
+    const separator = part.indexOf("=");
+    const rawName = separator < 0 ? part : part.slice(0, separator);
+    let name: string;
+    try {
+      name = decodeURIComponent(rawName.replace(/\+/g, " "));
+    } catch {
+      continue;
+    }
+    if (name !== parameter) continue;
+    const rawValue = separator < 0 ? "" : part.slice(separator + 1);
+    try {
+      values.push(decodeURIComponent(rawValue.replace(/\+/g, " ")));
+    } catch {
+      values.push(null);
+    }
+  }
+  return values;
+}
+
+function workspaceHrefMatches(path: string, installId: string, appKey?: string): boolean {
+  const prefix = "/app-installations/";
+  if (path.startsWith(prefix) && !path.slice(prefix.length).includes("/")) {
+    try { return decodeURIComponent(path.slice(prefix.length)) === installId; }
+    catch { return false; }
+  }
+  const appPrefix = "/apps/";
+  if (!appKey || !path.startsWith(appPrefix) || path.slice(appPrefix.length).includes("/")) return false;
+  try { return decodeURIComponent(path.slice(appPrefix.length)) === appKey; }
+  catch { return false; }
+}
+
+function parseSocialDestination(href: string, installId: string, appKey?: string): SocialDestination | null {
+  const queryStart = href.indexOf("?");
+  const path = queryStart < 0 ? href : href.slice(0, queryStart);
+  if (!workspaceHrefMatches(path, installId, appKey)) return null;
+  if (queryStart < 0) return null;
+  const rawQuery = href.slice(queryStart + 1).split("#", 1)[0];
+  const params = new URLSearchParams(rawQuery);
+  const contextIds = params.getAll("ctx");
+  const rawContextIds = rawQueryValues(rawQuery, "ctx");
+  const conversationIds = params.getAll("conversation");
+  const rawConversationIds = rawQueryValues(rawQuery, "conversation");
+  if (
+    contextIds.length !== 1 || rawContextIds.length !== 1 ||
+    conversationIds.length !== 1 || rawConversationIds.length !== 1 ||
+    rawContextIds[0] === null || rawConversationIds[0] === null ||
+    contextIds[0] === "" || conversationIds[0] === "" ||
+    contextIds[0] !== rawContextIds[0] || conversationIds[0] !== rawConversationIds[0]
+  ) return null;
+  return { contextId: contextIds[0], conversationId: conversationIds[0] };
+}
+
+
 export default function WorkspaceApp({
   installId,
   viewer,
   onBack,
+  appKey,
+  contextId,
+  onMediaAttach,
+  onScreenDrawer,
+  presentation,
+  onScreenClosed,
+  drawerTarget,
 }: {
   installId: string;
   viewer: Viewer;
   onBack?: () => void;
+  appKey?: string;
+  /** CAD-1560: the shell-owned app scope. This workspace never resolves or
+   *  stores the selection itself — in-workspace choices go through
+   *  `rememberContext`, and the owner hands the verified value back here. */
+  contextId: string;
+  onMediaAttach?: MediaChatAttach;
+  /** CAD-1615 / CAD-1777 — the board-wide drawer the screen may ask for,
+   *  and the surface the shell is presenting it in. `independent` marks a
+   *  negotiated `screen-surfaces.v1` open that the shell mounts as its own
+   *  fixed child overlay. */
+  onScreenDrawer?: (mode: "outlet" | "drawer", surface?: string, independent?: boolean) => void;
+  presentation?: "outlet" | "drawer";
+  /** CAD-1777 — the shell-owned fixed overlay target for the primary's
+   *  child drawer frame; null while it is closed. */
+  drawerTarget?: HTMLElement | null;
+  /** The screen went away (a refused push, a retired mount): close with it. */
+  onScreenClosed?: () => void;
 }) {
-  const [data, setData] = useState<Snapshot | null>(null);
+  const t = useTranslate();
+  // CAD-1137: a revisit mounts with the last session's snapshot already
+  // painted (stale-while-revalidate); only the very first load skeletons.
+  const [data, setData] = useState<Snapshot | null>(() => readWorkspaceAppSnapshot(installId));
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [actionStatus, setActionStatus] = useState<string | null>(null);
+  const [loading, setLoading] = useState(() => readWorkspaceAppSnapshot(installId) === null);
+  /** True while a revalidation runs behind painted data — the subtle cue. */
+  const refreshing = loading && data !== null;
   const [section, setSection] = useState<Section>("Board");
-  const [contextId, setContextId] = useState(() => rememberedContext(installId) ?? "");
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [verifiedImage, setVerifiedImage] = useState<VerifiedImage | null>(null);
   const [creating, setCreating] = useState(false);
@@ -94,8 +289,53 @@ export default function WorkspaceApp({
   const [busy, setBusy] = useState(false);
   const mutationLock = useRef(false);
   const activeRead = useRef<AbortController | null>(null);
+  const ownerReadReceipt = useRef<{ visitKey: string | null; installId: string } | null>(null);
+  const ownerRefreshRequestedVisit = useRef<string | null>(null);
   const identity = useRef(installId);
   identity.current = installId;
+  const href = useHref();
+  const hrefRef = useRef(href);
+  hrefRef.current = href;
+  const destination = useMemo(() => parseSocialDestination(href, installId, appKey), [href, installId, appKey]);
+  const linkSignature = destination
+    ? JSON.stringify([installId, destination.contextId, destination.conversationId])
+    : null;
+  const currentLinkRef = useRef<{ signature: string | null; sequence: number }>({ signature: null, sequence: 0 });
+  if (currentLinkRef.current.signature !== linkSignature) {
+    currentLinkRef.current = { signature: linkSignature, sequence: currentLinkRef.current.sequence + 1 };
+  }
+  const destinationVisitKey = destination && linkSignature
+    ? JSON.stringify([linkSignature, currentLinkRef.current.sequence])
+    : null;
+  const destinationVisitRef = useRef<string | null>(destinationVisitKey);
+  destinationVisitRef.current = destinationVisitKey;
+  const userContextIntentEpoch = useRef(0);
+  const mountedOwner = useRef(false);
+  useLayoutEffect(() => {
+    mountedOwner.current = true;
+    return () => {
+      mountedOwner.current = false;
+      userContextIntentEpoch.current += 1;
+    };
+  }, []);
+  const consumedDestinationVisit = useRef<string | null>(null);
+  const conversationRefreshStarted = useRef<string | null>(null);
+  const conversationInFlightSeen = useRef<string | null>(null);
+  const [destinationProof, setDestinationProof] = useState<DestinationProof | null>(null);
+  const supersedeDestinationWithUserChoice = useCallback((expected?: { visitKey: string | null; selectionEpoch: number }) => {
+    // A deliberate in-workspace choice retires the pending destination:
+    // bump the intent epoch so an in-flight proof can no longer adopt the
+    // linked scope, mark the visit consumed, and drop the proof. The URL
+    // strip is the scope owner's job (its context emit rewrites the link).
+    if (expected && (
+      destinationVisitRef.current !== expected.visitKey ||
+      userContextIntentEpoch.current !== expected.selectionEpoch
+    )) return false;
+    userContextIntentEpoch.current += 1;
+    consumedDestinationVisit.current = destinationVisitRef.current;
+    setDestinationProof(null);
+    return true;
+  }, []);
   const [artifact, setArtifact] = useState<TextArtifact | null>(null);
   const [artifactError, setArtifactError] = useState<string | null>(null);
   const [artifactLoading, setArtifactLoading] = useState(false);
@@ -113,6 +353,40 @@ export default function WorkspaceApp({
   const [selectedEffectId, setSelectedEffectId] = useState("");
   const [accessDenied, setAccessDenied] = useState(false);
   const [intentRead, setIntentRead] = useState<IntentRead | undefined>(undefined);
+  // CAD-1290: AgenticOS sends the owner back here with `aos_connect=…`. Say
+  // what happened, drop the params so a reload does not repeat it, and have
+  // the Settings accounts read again.
+  const [connectToastMsg, setConnectToastMsg] = useState<ToastMsg | null>(null);
+  const [connectReturned, setConnectReturned] = useState(0);
+  useEffect(() => {
+    const outcome = connectOutcome(window.location.search);
+    if (!outcome) return;
+    setConnectToastMsg(connectToast(outcome, publishAllowed(window.location.search)));
+    setConnectReturned(value => value + 1);
+    window.history.replaceState(window.history.state, "", window.location.pathname + withoutConnectParams(window.location.search) + window.location.hash);
+    const timer = window.setTimeout(() => setConnectToastMsg(null), 6000);
+    return () => window.clearTimeout(timer);
+  }, [installId]);
+  const destinationContexts = destination && data
+    ? data.contexts.filter(value => value.id === destination.contextId && value.install_id === installId && value.state === "active")
+    : [];
+  const destinationContext = destinationContexts.length === 1 ? destinationContexts[0] : null;
+  const ownerApprovalCurrent = data?.installation.approved === true || data?.installation.approval?.state === "approved";
+  const destinationOwnerSignature = destination && destinationContext && data &&
+      data.installation.install_id === installId && ownerApprovalCurrent
+    ? JSON.stringify([
+      installId, data.installation.digest, data.installation.approved, data.installation.approval?.state,
+      destinationContext.id, destinationContext.revision, destinationContext.digest,
+    ])
+    : null;
+  const readReceipt = ownerReadReceipt.current;
+  const ownerReady = viewer.operator && !!destinationOwnerSignature &&
+    readReceipt?.visitKey === destinationVisitKey && readReceipt.installId === installId &&
+    !loading && !loadError && !accessDenied;
+  const readyOwnerSnapshot = useRef<ReadyOwnerSnapshot | null>(null);
+  readyOwnerSnapshot.current = ownerReady && data && destinationContext && destinationOwnerSignature
+    ? { snapshot: data, signature: destinationOwnerSignature, context: destinationContext }
+    : null;
   const clearPrivate = useCallback(() => {
     activeRead.current?.abort();
     activeRead.current = null;
@@ -120,52 +394,38 @@ export default function WorkspaceApp({
     setBrandName(""); setBrandVoice(""); setProtectedTerms("");
     setContentPrompt(""); setImagePrompt(""); setEditingContextId("");
     forgetContext(installId);
-    setContextId(""); setImporting(false); setSelectedSource(null);
+    setImporting(false); setSelectedSource(null);
     setUpgradeSource(""); setUpgradeProposal(null);
     setData(null); setSelectedRun(null); setSelectedArtifact(""); setArtifact(null);
     setVerifiedImage(null);
     setOutbox(null); setSelectedEffectId(""); setCreating(false); setAccessDenied(true);
+    dropWorkspaceAppSnapshot(installId);
   }, [installId]);
   const refused = (error: unknown) => error instanceof ApiError && [401, 403].includes(error.status);
-  const canWrite = viewer.operator && !viewer.readOnly && !accessDenied;
-  const refresh = useCallback(async () => {
-    if (!viewer.operator) {
+  const canWrite = viewer.operator === true && !viewer.readOnly && !accessDenied;
+  /** `fresh`: a write just landed, so a read already in flight may predate it: retire it and read again. */
+  const refresh = useCallback(async (fresh = false) => {
+    // CAD-1193: an unresolved role (null) waits — it is neither a
+    // proven operator nor a refusal; no protected read runs before
+    // `operator === true`.
+    if (viewer.operator !== true) {
       setLoading(false);
       return;
     }
-    if (activeRead.current && !activeRead.current.signal.aborted) return;
+    if (activeRead.current && !activeRead.current.signal.aborted) {
+      if (!fresh) return;
+      activeRead.current.abort();
+    }
     const controller = new AbortController();
     activeRead.current = controller;
+    const readFor = { visitKey: destinationVisitRef.current, installId };
     setLoading(true);
     try {
-      const [
-        installation,
-        contexts,
-        bindings,
-        connections,
-        agents,
-        runs,
-        effects,
-      ] = await Promise.all([
-        workspaceApps.detail(installId, controller.signal),
-        workspaceApps.contexts(installId, controller.signal),
-        workspaceApps.bindings(installId, undefined, controller.signal),
-        workspaceApps.connections(controller.signal),
-        workspaceApps.agents(controller.signal),
-        workspaceApps.runs(installId, undefined, controller.signal),
-        workspaceApps.effects(installId, undefined, controller.signal),
-      ]);
+      const snapshot = await readWorkspaceAppSnapshotFresh(installId, controller.signal);
       if (!controller.signal.aborted) {
+        ownerReadReceipt.current = readFor;
         setAccessDenied(false);
-        setData({
-          installation,
-          contexts,
-          bindings,
-          connections,
-          agents,
-          runs,
-          effects,
-        });
+        setData(snapshot);
         setLoadError(null);
       }
     } catch (error) {
@@ -179,18 +439,20 @@ export default function WorkspaceApp({
     }
   }, [installId, viewer.operator, clearPrivate]);
   useEffect(() => {
-    setData(null);
+    // Re-entry paints this session's last snapshot for the route's
+    // installation; a first (or stale) visit gets the skeleton instead.
+    const cached = readWorkspaceAppSnapshot(installId);
+    setData(cached);
     setBrandName(""); setBrandVoice(""); setProtectedTerms("");
     setContentPrompt(""); setImagePrompt(""); setEditingContextId("");
     setImporting(false); setSelectedSource(null);
     setUpgradeSource(""); setUpgradeProposal(null);
-    setContextId(rememberedContext(installId) ?? "");
     setSelectedRun(null);
     setVerifiedImage(null);
     setSelectedEffectId("");
     setArtifact(null);
     setOutbox(null);
-    setLoading(true);
+    setLoading(cached === null);
     setActionError(null);
     void refresh();
     const timer = window.setInterval(() => {
@@ -203,10 +465,114 @@ export default function WorkspaceApp({
     };
   }, [refresh]);
   useEffect(() => {
-    if (!data || data.installation.install_id !== installId) return;
-    const selected = initialContext(installId, data.contexts.filter(value => value.state === "active").map(value => value.id));
-    if (selected !== contextId) setContextId(selected);
-  }, [data, contextId, installId]);
+    const visitKey = destinationVisitKey;
+    if (!visitKey || !destination || !viewer.operator || busy || mutationLock.current || loading || accessDenied) return;
+    const receipt = ownerReadReceipt.current;
+    if (receipt?.visitKey === visitKey && receipt.installId === installId) return;
+    if (ownerRefreshRequestedVisit.current === visitKey || (activeRead.current && !activeRead.current.signal.aborted)) return;
+    ownerRefreshRequestedVisit.current = visitKey;
+    void refresh();
+  }, [destinationVisitKey, destination, installId, viewer.operator, data, loading, busy, loadError, accessDenied, refresh]);
+  useEffect(() => {
+    const visitKey = destinationVisitKey;
+    const target = destination;
+    const owner = readyOwnerSnapshot.current;
+    if (
+      !visitKey || !target || !owner || !viewer.operator || loading || loadError || accessDenied || busy ||
+      mutationLock.current || consumedDestinationVisit.current === visitKey || destinationProof?.visitKey === visitKey
+    ) return;
+    const selectionEpoch = userContextIntentEpoch.current;
+    const proofKey = JSON.stringify([visitKey, owner.signature, selectionEpoch]);
+    let active = true;
+    let sawInFlight = conversationInFlightSeen.current === proofKey;
+    const resource = conversationList(installId);
+    const observe = () => {
+      if (!active) return;
+      const state = resource.get();
+      if (state.inFlight) {
+        sawInFlight = true;
+        conversationInFlightSeen.current = proofKey;
+        return;
+      }
+      if (!sawInFlight) return;
+      const latestOwner = readyOwnerSnapshot.current;
+      if (
+        destinationVisitRef.current !== visitKey || identity.current !== installId ||
+        userContextIntentEpoch.current !== selectionEpoch || !latestOwner || latestOwner.signature !== owner.signature
+      ) return;
+      const matches = state.data?.conversations.filter(value => value.id === target.conversationId) ?? [];
+      if (
+        state.status !== "ok" || state.error !== null || state.asOf === null ||
+        !state.data || state.data.legacy || matches.length !== 1
+      ) return;
+      setDestinationProof({
+        visitKey,
+        selectionEpoch,
+        installId,
+        contextId: target.contextId,
+        conversationId: target.conversationId,
+        ownerSignature: latestOwner.signature,
+        conversationAsOf: state.asOf,
+      });
+    };
+    const unsubscribe = resource.subscribe(observe);
+    observe();
+    if (conversationRefreshStarted.current !== proofKey) {
+      conversationRefreshStarted.current = proofKey;
+      void resource.refresh().then(observe).catch(() => {});
+    }
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [
+    destinationVisitKey, destination, destinationOwnerSignature, installId, viewer.operator,
+    loading, loadError, accessDenied, busy, destinationProof?.visitKey,
+  ]);
+  useLayoutEffect(() => {
+    const proof = destinationProof;
+    if (
+      !proof || proof.visitKey !== destinationVisitKey || proof.installId !== installId ||
+      consumedDestinationVisit.current === proof.visitKey || !viewer.operator || loading || loadError ||
+      accessDenied || busy || mutationLock.current || userContextIntentEpoch.current !== proof.selectionEpoch ||
+      destinationVisitRef.current !== proof.visitKey || identity.current !== installId
+    ) return;
+    const owner = readyOwnerSnapshot.current;
+    if (!owner || owner.snapshot !== data || owner.signature !== proof.ownerSignature) return;
+    const installation = owner.snapshot.installation;
+    if (
+      installation.install_id !== installId ||
+      !(installation.approved === true || installation.approval?.state === "approved") ||
+      installation.digest === ""
+    ) return;
+    const contexts = owner.snapshot.contexts.filter(value =>
+      value.id === proof.contextId && value.install_id === installId && value.state === "active");
+    if (contexts.length !== 1) return;
+    const resourceState = conversationList(installId).get();
+    const conversationMatches = resourceState.data?.conversations.filter(value => value.id === proof.conversationId) ?? [];
+    if (
+      resourceState.status !== "ok" || resourceState.inFlight || resourceState.error !== null ||
+      resourceState.asOf !== proof.conversationAsOf || !resourceState.data || resourceState.data.legacy ||
+      conversationMatches.length !== 1
+    ) return;
+    consumedDestinationVisit.current = proof.visitKey;
+    setDestinationProof(null);
+    if (contextId !== proof.contextId) {
+      setEditingContextId("");
+      setBrandName(""); setBrandVoice(""); setProtectedTerms("");
+      setContentPrompt(""); setImagePrompt("");
+      setSelectedSource(null);
+      setSelectedRun(null);
+      setSelectedArtifact("");
+      setActionError(null);
+    }
+    // Persist + emit: the shell applies the proven scope and rewrites the
+    // link; no selection state lives here anymore.
+    rememberContext(installId, proof.contextId);
+  }, [
+    destinationProof, destinationVisitKey, destinationOwnerSignature, installId, viewer.operator,
+    loading, loadError, accessDenied, busy, data, contextId,
+  ]);
   // Candidates re-check on every Settings visit — including the return
   // from Settings → Connections — on top of the background poll below.
   useEffect(() => {
@@ -217,18 +583,25 @@ export default function WorkspaceApp({
     mutationLock.current = true;
     setBusy(true);
     setActionError(null);
+    setActionStatus(null);
     const expectedInstall = installId;
+    let refreshAfterMutation = true;
     try {
       await work();
     } catch (error) {
       if (identity.current === expectedInstall) {
         if (refused(error)) clearPrivate();
-        setActionError(message(error));
+        if (isUnchangedUpgradeError(error)) {
+          setActionStatus("Up to date — this package is the version you have.");
+          refreshAfterMutation = false;
+        } else {
+          setActionError(message(error));
+        }
       }
     } finally {
       mutationLock.current = false;
       setBusy(false);
-      if (identity.current === expectedInstall) await refresh();
+      if (refreshAfterMutation && identity.current === expectedInstall) await refresh();
     }
   };
   // CAD-1025: the mounted screen's publish intents, read with the existing
@@ -319,7 +692,7 @@ export default function WorkspaceApp({
   );
   // CAD-1123 HP1: the board reads behind the screen.v2 projection.
   const screenExtras = useScreenExtras({
-    enabled: !!screenInstall && screenInstall === installId && !accessDenied && viewer.operator,
+    enabled: !!screenInstall && screenInstall === installId && !accessDenied && viewer.operator === true,
     installation: data?.installation ?? null, installId, contextId,
     runs: data?.runs ?? [], bindings: data?.bindings ?? [], workers: data ? workers.length : null,
     onDenied: clearPrivate,
@@ -329,11 +702,51 @@ export default function WorkspaceApp({
   // a scope change remounts the frame and retires any live slot.
   const actionCtx = useRef<ActionContext | null>(null);
   actionCtx.current = data && data.installation.install_id === installId && !accessDenied
-    ? { installation: data.installation, installId, contextId, runs: data.runs, onChanged: () => { void refresh(); } } : null;
+    ? { installation: data.installation, installId, contextId, runs: data.runs, onChanged: () => refresh(true) } : null;
+  const savedContextHandler = useRef<((saved: AppContext, invocation: SavedContextInvocation) => void) | null>(null);
+  savedContextHandler.current = (saved, invocation) => {
+    const activeAction = actionCtx.current;
+    const action = invocation.action;
+    if (
+      !mountedOwner.current || !activeAction || !viewer.operator || viewer.readOnly || accessDenied ||
+      installId !== action.installId || identity.current !== action.installId ||
+      action.installation.install_id !== action.installId || activeAction.installId !== action.installId ||
+      !sameInstallation(action.installation, activeAction.installation) || activeAction.contextId !== action.contextId ||
+      destinationVisitRef.current !== invocation.visitKey || hrefRef.current !== invocation.href ||
+      userContextIntentEpoch.current !== invocation.selectionEpoch ||
+      saved.install_id !== action.installId || saved.state !== "active" ||
+      typeof saved.id !== "string" || saved.id.length === 0
+    ) return;
+    userContextIntentEpoch.current += 1;
+    if (invocation.visitKey) consumedDestinationVisit.current = invocation.visitKey;
+    setDestinationProof(null);
+    if (contextId !== saved.id) {
+      setEditingContextId("");
+      setBrandName(""); setBrandVoice(""); setProtectedTerms("");
+      setContentPrompt(""); setImagePrompt("");
+      setSelectedSource(null);
+      setSelectedRun(null);
+      setSelectedArtifact("");
+      setActionError(null);
+    }
+    // Persist + emit: the shell owns the selection and the URL strip.
+    rememberContext(action.installId, saved.id);
+  };
   const screenActions = useMemo(() => viewer.operator && !viewer.readOnly ? {
-    call: (verb: Parameters<typeof runCall>[1], args: Record<string, unknown>, ui: Parameters<typeof runCall>[3]) =>
-      actionCtx.current ? runCall(actionCtx.current, verb, args, ui)
-        : Promise.resolve({ ok: false as const, refusal: { code: "denied", text: "Only the operator can do that." } }),
+    call: (verb: Parameters<typeof runCall>[1], args: Record<string, unknown>, ui: Parameters<typeof runCall>[3]) => {
+      const action = actionCtx.current;
+      if (!action) return Promise.resolve({ ok: false as const, refusal: { code: "denied", text: "Only the operator can do that." } });
+      const invocation: SavedContextInvocation = {
+        action,
+        visitKey: destinationVisitRef.current,
+        href: hrefRef.current,
+        selectionEpoch: userContextIntentEpoch.current,
+      };
+      return runCall({ ...action,
+        onChanged: () => (mountedOwner.current ? actionCtx.current?.onChanged() : undefined),
+        onSavedContext: saved => savedContextHandler.current?.(saved, invocation),
+      }, verb, args, ui);
+    },
     planner: makePlanner(() => {
       if (!actionCtx.current) throw new Error("no scope");
       return actionCtx.current;
@@ -586,24 +999,103 @@ export default function WorkspaceApp({
       ),
     },
   ];
-  if (!viewer.operator) return <main className="workspace-app" aria-label="Workspace app"><h1>Workspace app</h1><p className="wa-alert">Sign in as the operator to inspect this installation.</p><Button href="/apps">All apps</Button></main>;
+  if (viewer.operator === null) {
+    // CAD-1193: "checking" only while a probe is in flight; a completed
+    // unanswered probe is unavailable, with a retry wired to the real
+    // metadata refresh — never a sign-in and never authority.
+    return (
+      <main className="workspace-app" aria-label="Workspace app" role="status">
+        <h1>{t("Workspace app")}</h1>
+        {viewer.access === "unavailable" ? (
+          <p className="wa-alert">
+            {t("Access could not be confirmed — the board's access check did not answer. This installation stays closed until it does.")}{" "}
+            {viewer.onRetryAccess && (
+              <Button onClick={viewer.onRetryAccess}>{t("Retry access check")}</Button>
+            )}
+          </p>
+        ) : (
+          <p className="wa-alert">{t("Checking whether this session may inspect this installation…")}</p>
+        )}
+      </main>
+    );
+  }
+  if (!viewer.operator) return <main className="workspace-app" aria-label={t("Workspace app")}><h1>{t("Workspace app")}</h1><p className="wa-alert">{t("Sign in as the operator to inspect this installation.")}</p><Button href="/apps">{t("All apps")}</Button></main>;
   const tag = data && screenTag(data.installation);
   let projection = null;
-  if (data && tag && !accessDenied) {
+  if (data && tag && !accessDenied && !loadError) {
     try { projection = screenProjection(data.installation, tag, contextId, data.contexts, data.runs, data.effects, intentRead, screenExtras.extras); }
     catch { /* Oversized/unavailable scope retains the existing native outlet. */ }
   }
+  const contextPicker = () => (
+    <Select
+      value={contextId}
+      onChange={(value) => {
+        supersedeDestinationWithUserChoice();
+        rememberContext(installId, value);
+        setEditingContextId("");
+        setBrandName(""); setBrandVoice(""); setProtectedTerms("");
+        setContentPrompt(""); setImagePrompt("");
+        setSelectedSource(null);
+        setSelectedRun(null);
+        setSelectedArtifact("");
+        setActionError(null);
+      }}
+      options={[
+        { value: "", label: "No brand context" },
+        ...contexts.map((value) => ({
+          value: value.id,
+          label: value.config.label,
+        })),
+      ]}
+      aria-label="Optional brand context"
+      disabled={busy}
+      full
+    />
+  );
+  const reinstallSource = data && canWrite && data.installation.source?.kind === "git"
+    ? data.installation.source.url ?? null
+    : null;
+  // Reinstall re-applies the recorded source to this installation. A plain
+  // install would be refused as already installed, so this is the existing
+  // upgrade path pinned to the current digest.
+  const reinstall = (installation: Installation, source: string) => () => void mutate(async () => {
+    const checked = await workspaceApps.upgradeCheck(installation.install_id, {
+      source,
+      expected_digest: installation.digest,
+      expected_generation: installation.catalog_generation,
+      catalogue_resolution: "manual",
+    });
+    const requestKey = JSON.stringify([installation.install_id, "reinstall", checked.expected_digest, checked.expected_generation, checked.digest]);
+    await workspaceApps.upgrade(installation.install_id, {
+      source,
+      expected_digest: checked.expected_digest,
+      expected_generation: checked.expected_generation,
+      expected_new_digest: checked.digest,
+      request_id: retainedRequest(requestKey),
+      catalogue_resolution: "manual",
+    });
+    completeRequest(requestKey);
+  });
+  const renderScreenFailure = (failure: ScreenPaneState, retry: () => void) => (
+    <ScreenFailurePane failure={failure} onRetry={retry} busy={busy}
+      onReinstall={data && reinstallSource ? reinstall(data.installation, reinstallSource) : undefined} />
+  );
   const screen = (fallback: React.ReactNode) => projection
-    ? <ScreenHost projection={projection} fallback={fallback} loadAsset={screenExtras.loadAsset} actions={screenActions} /> : fallback;
+    ? <><ScreenHost projection={projection} fallback={fallback} renderFailure={renderScreenFailure} loadAsset={screenExtras.loadAsset} actions={screenActions} onMediaAttach={onMediaAttach} onScreenDrawer={onScreenDrawer} presentation={presentation} drawerTarget={drawerTarget} onNavigation={(navigation) => { if (navigation === null) onScreenClosed?.(); }} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
     return screen(<main className="workspace-app" aria-label="Workspace app">
-      <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>
+      <header className="wa-header"><h1>{data.installation.title || data.installation.name}<AppVersion version={data.installation.version} /></h1><Button href="/apps">All apps</Button></header>
       <section className="wa-panel wa-stack">
         <p>{data.installation.summary}</p>
-        <p className="wa-muted">This installation has no supported board workspace yet. Use its installed guide and the app commands to inspect supported workflows.</p>
-        <p className="wa-kicker">Installation {installId} · version {data.installation.version}</p>
+        <p className="wa-muted">{t("This installation has no supported board workspace yet. Use its installed guide and the app commands to inspect supported workflows.")}</p>
+        <div className="wa-row"><Button onClick={() => void refresh(true)}>{t("Retry")}</Button></div>
+        <p className="wa-kicker">{t("Installation {id} · version {version}").replace("{id}", () => installId).replace("{version}", () => data.installation.version)}</p>
         <pre className="wa-preview">{data.installation.guide}</pre>
       </section>
+      {loadError && <p className="wa-alert" data-tone="fail" role="alert">{loadError}</p>}
+      {actionError && <p className="wa-alert" data-tone="fail" role="alert">{actionError}</p>}
+      <PublishToInstagram installation={data.installation} bindings={data.bindings} contextId={contextId || null}
+        canWrite={canWrite} busy={busy} refreshKey={connectReturned} mutate={mutate} />
     </main>);
   }
   return screen(
@@ -614,27 +1106,34 @@ export default function WorkspaceApp({
             <IconApps size={22} />
           </span>
           <div>
-              <h1>{data?.installation.title || "Workspace app"}</h1>
+              <h1>{data?.installation.title || "Workspace app"}<AppVersion version={data?.installation.version} /></h1>
             <p className="wa-kicker">
-              Workspace app · reviewed drafts and Local release
+              {t("Workspace app · reviewed drafts and Local release")}
             </p>
           </div>
         </div>
         <div className="wa-row">
-          {onBack && <Button onClick={onBack}>All apps</Button>}
+          {onBack && <Button onClick={onBack}>{t("All apps")}</Button>}
           <Button
             icon={<IconRefresh />}
-            loading={loading}
+            loading={loading && !data}
             onClick={() => void refresh()}
           >
-            Refresh
+            {t("Refresh")}
           </Button>
+          {refreshing && (
+            <span
+              className="wa-live-dot"
+              role="status"
+              title={t("Refreshing in the background")}
+              aria-label={t("Refreshing in the background")}
+            />
+          )}
         </div>
       </header>
       {!canWrite && (
         <p className="wa-alert">
-          <IconLock /> Read-only view. A verified operator can configure the
-          app, approve runs and release drafts.
+          <IconLock /> {t("Read-only view. A verified operator can configure the app, approve runs and release drafts.")}
         </p>
       )}
       {loadError && (
@@ -645,45 +1144,50 @@ export default function WorkspaceApp({
             : ""}
         </p>
       )}
+      {actionStatus && !creating && !run && (
+        <p className="wa-muted" role="status">{actionStatus}</p>
+      )}
       {actionError && !creating && !run && (
         <p className="wa-alert" data-tone="fail" role="alert">
           {actionError}
         </p>
       )}
       {loading && !data && (
-        <p className="wa-empty" role="status">
-          Loading this workspace app…
-        </p>
+        // The first load only: a quiet skeleton in the page's real shape,
+        // never a spinner — a revisit paints the snapshot before this.
+        <div className="wa-skeleton" role="status" aria-label={t("Loading this workspace app")}>
+          <span className="sr-only">{t("Loading this workspace app…")}</span>
+          <div className="wa-skel-head">
+            <span className="wa-skel wa-skel-pulse" style={{ width: "2.5rem", height: "2.5rem", borderRadius: "0.5rem" }} />
+            <span className="wa-skel wa-skel-pulse" style={{ width: "10rem", height: "1.25rem" }} />
+            <span style={{ flex: 1 }} />
+            <span className="wa-skel wa-skel-pulse" style={{ width: "5rem", height: "2rem" }} />
+          </div>
+          <div className="wa-skel-head">
+            <span className="wa-skel wa-skel-pulse" style={{ width: "min(18rem, 55%)", height: "2rem" }} />
+            <span style={{ flex: 1 }} />
+            <span className="wa-skel wa-skel-pulse" style={{ width: "5.5rem", height: "2rem" }} />
+          </div>
+          <div className="wa-skel-tabs">
+            {[5.5, 4.5, 3, 5.5, 4, 5, 4.5].map((w, i) => (
+              <span key={i} className="wa-skel wa-skel-pulse" style={{ width: `${w}rem`, height: "0.85rem" }} />
+            ))}
+          </div>
+          <div className="wa-skel-board">
+            {["Drafting", "In review", "Needs you", "Released"].map((lane) => (
+              <div key={lane} className="wa-skel-lane">
+                <span className="wa-skel wa-skel-pulse" style={{ width: "45%", height: "0.8rem" }} />
+                <span className="wa-skel wa-skel-pulse" style={{ width: "100%", height: "4.5rem" }} />
+                <span className="wa-skel wa-skel-pulse" style={{ width: "100%", height: "4.5rem" }} />
+              </div>
+            ))}
+          </div>
+        </div>
       )}
       {data && (
         <>
           <div className="wa-toolbar">
-            <div className="wa-context">
-              <Select
-                value={contextId}
-                onChange={(value) => {
-                  setContextId(value);
-                  rememberContext(installId, value);
-                  setEditingContextId("");
-                  setBrandName(""); setBrandVoice(""); setProtectedTerms("");
-                  setContentPrompt(""); setImagePrompt("");
-                  setSelectedSource(null);
-                  setSelectedRun(null);
-                  setSelectedArtifact("");
-                  setActionError(null);
-                }}
-                options={[
-                  { value: "", label: "No brand context" },
-                  ...contexts.map((value) => ({
-                    value: value.id,
-                    label: value.config.label,
-                  })),
-                ]}
-                aria-label="Optional brand context"
-                disabled={busy}
-                full
-              />
-            </div>
+            {!projection && <div className="wa-context">{contextPicker()}</div>}
             <Button
               variant="primary"
               onClick={() => {
@@ -721,20 +1225,19 @@ export default function WorkspaceApp({
                 disabled={!canWrite}
                 loading={busy}
               >
-                Restore access
+                {t("Restore access")}
               </Button>
             </div>
           )}
           {!binding && (
             <div className="wa-alert">
-              Choose and save a Local destination in Settings before creating a
-              run. The destination is frozen into its plan.{" "}
+              {t("Choose and save a Local destination in Settings before creating a run. The destination is frozen into its plan.")}{" "}
               <Button size="sm" onClick={() => setSection("Settings")}>
-                Set destination
+                {t("Set destination")}
               </Button>
             </div>
           )}
-          <nav className="wa-tabs" aria-label="App sections">
+          <nav className="wa-tabs" aria-label={t("App sections")}>
             {(
               [
                 "Board",
@@ -768,7 +1271,7 @@ export default function WorkspaceApp({
           </nav>
           <div className="wa-content">
             {section === "Board" && (
-              <HorizontalStrip label="Post board" className="wa-board">
+              <HorizontalStrip label={t("Post board")} className="wa-board">
                 {lanes.map((lane) => (
                   <section key={lane.id} className="wa-lane">
                     <header className="wa-lane-head">
@@ -780,7 +1283,7 @@ export default function WorkspaceApp({
                         lane.rows.map(card)
                       ) : (
                         <p className="wa-empty">
-                          No posts in {lane.label.toLowerCase()}.
+                          {t("No posts in {lane}.").replace("{lane}", () => lane.label.toLowerCase())}
                         </p>
                       )}
                     </div>
@@ -839,12 +1342,12 @@ export default function WorkspaceApp({
             {section === "Settings" && (
               <div className="wa-stack">
                 <section className="wa-panel wa-stack">
-                  <h2>App package</h2>
-                  <p className="wa-muted">Installed version {data.installation.version}. Check a new package from a path on this Cadence host or a Git URL. The check shows the exact digest and changed files before you apply it. Completed drafts and retained source posts keep their original version.</p>
+                  <h2>{t("App package")}</h2>
+                  <p className="wa-muted">{t("Installed version {version}. Check a new package from a path on this Cadence host or a Git URL. The check shows the exact digest and changed files before you apply it. Completed drafts and retained source posts keep their original version.").replace("{version}", () => data.installation.version)}</p>
                   <label className="wa-field">
-                    <span>Package path or Git URL</span>
+                    <span>{t("Package path or Git URL")}</span>
                     <input className="wa-input" type="text" value={upgradeSource} onChange={event => { setUpgradeSource(event.target.value); setUpgradeProposal(null); }}
-                      placeholder="/absolute/path/to/app or https://github.com/owner/repo"
+                      placeholder={t("/absolute/path/to/app or https://github.com/owner/repo")}
                       autoComplete="off" disabled={!canWrite || busy} />
                   </label>
                   <div className="wa-row">
@@ -854,18 +1357,19 @@ export default function WorkspaceApp({
                         const receipt = await workspaceApps.upgradeCheck(installId, {
                           source, expected_digest: data.installation.digest,
                           expected_generation: data.installation.catalog_generation,
+                          catalogue_resolution: "manual",
                         });
                         setUpgradeProposal({ source, receipt });
-                      })}>Check update</Button>
+                      })}>{t("Check update")}</Button>
                   </div>
                   {upgradeProposal && <div className="wa-stack" aria-live="polite">
-                    <p className="wa-kicker">Proposed version {upgradeProposal.receipt.version} · {upgradeProposal.receipt.name}</p>
-                    <p className="wa-muted">New digest: <code>{upgradeProposal.receipt.digest}</code></p>
+                    <p className="wa-kicker">{t("Proposed version {version} · {name}").replace("{version}", () => upgradeProposal.receipt.version).replace("{name}", () => upgradeProposal.receipt.name)}</p>
+                    <p className="wa-muted">{t("New digest:")} <code>{upgradeProposal.receipt.digest}</code></p>
                     {(["added", "changed", "removed"] as const).map(kind => <p key={kind} className="wa-muted">
                       {kind}: {upgradeProposal.receipt.structural_diff[kind].join(", ") || "none"}
                     </p>)}
-                    {!!upgradeProposal.receipt.secret_warnings?.length && <p className="wa-alert">Package validation reported secret warnings; review the source before applying.</p>}
-                    <p className="wa-muted">Applying preserves this installation, contexts, version-pinned bindings and completed work. Applying it approves the new version. New-version runs need new bindings.</p>
+                    {!!upgradeProposal.receipt.secret_warnings?.length && <p className="wa-alert">{t("Package validation reported secret warnings; review the source before applying.")}</p>}
+                    <p className="wa-muted">{t("Applying preserves this installation, contexts, version-pinned bindings and completed work. Applying it approves the new version. New-version runs need new bindings.")}</p>
                     <Button variant="primary" disabled={!canWrite || busy || !!upgradeProposal.receipt.secret_warnings?.length} loading={busy}
                       onClick={() => void mutate(async () => {
                         const { source, receipt } = upgradeProposal;
@@ -875,11 +1379,12 @@ export default function WorkspaceApp({
                           expected_generation: receipt.expected_generation,
                           expected_new_digest: receipt.digest,
                           request_id: retainedRequest(requestKey),
+                          catalogue_resolution: "manual",
                         });
                         completeRequest(requestKey);
                         setUpgradeProposal(null);
                         setUpgradeSource("");
-                      })}>Apply checked update</Button>
+                      })}>{t("Apply checked update")}</Button>
                   </div>}
                 </section>
                 <ReadinessPanel
@@ -922,13 +1427,22 @@ export default function WorkspaceApp({
                   busy={busy}
                   mutate={mutate}
                 />
+                <PublishToInstagram
+                  installation={data.installation}
+                  bindings={data.bindings}
+                  contextId={contextId || null}
+                  canWrite={canWrite}
+                  busy={busy}
+                  refreshKey={connectReturned}
+                  mutate={mutate}
+                />
                 <section className="wa-panel wa-stack">
-                  <h2>Brand contexts</h2>
+                  <h2>{t("Brand contexts")}</h2>
                   <p className="wa-muted">
-                    A brand is optional app context. {supportsContentPrompt ? "Save prompt defaults here; each new post can override them without changing these settings. " : "This installed bundle needs an upgrade before prompt defaults are available. "}A project isn’t required.
+                    {supportsContentPrompt ? t("A brand is optional app context. Save prompt defaults here; each new post can override them without changing these settings. A project isn’t required.") : t("A brand is optional app context. This installed bundle needs an upgrade before prompt defaults are available. A project isn’t required.")}
                   </p>
                   {selectedContext && <div className="wa-row">
-                    <p className="wa-kicker">Selected: {selectedContext.config.label} · revision {selectedContext.revision}</p>
+                    <p className="wa-kicker">{t("Selected: {label} · revision {revision}").replace("{label}", () => selectedContext.config.label).replace("{revision}", () => String(selectedContext.revision))}</p>
                     <Button disabled={!canWrite || busy} onClick={() => {
                       setEditingContextId(selectedContext.id);
                       setBrandName(selectedContext.config.label);
@@ -937,7 +1451,7 @@ export default function WorkspaceApp({
                       setContentPrompt(selectedContext.config.input_defaults.content_prompt ?? "");
                       setImagePrompt(selectedContext.config.input_defaults.image_prompt ?? "");
                       setActionError(null);
-                    }}>Edit saved defaults</Button>
+                    }}>{t("Edit saved defaults")}</Button>
                   </div>}
                   <form
                     className="wa-stack"
@@ -954,9 +1468,13 @@ export default function WorkspaceApp({
                         );
                         return;
                       }
+                      const selectionAtSubmit = {
+                        visitKey: destinationVisitRef.current,
+                        selectionEpoch: userContextIntentEpoch.current,
+                      };
                       void mutate(async () => {
                         const editing = editingContextId === selectedContext?.id ? selectedContext : undefined;
-                        const inputDefaults: Record<string, string> = { ...(editing?.config.input_defaults ?? {}) };
+                        const inputDefaults: Record<string, string> = { ...editing?.config.input_defaults };
                         for (const [key, value] of Object.entries({ brand_voice: brandVoice, protected_terms: protectedTerms, content_prompt: contentPrompt, image_prompt: imagePrompt })) {
                           if (value.trim()) inputDefaults[key] = value.trim();
                           else delete inputDefaults[key];
@@ -968,8 +1486,10 @@ export default function WorkspaceApp({
                             label, input_defaults: inputDefaults,
                             request_id: retainedRequest(JSON.stringify({ installId, label, inputDefaults })),
                           });
-                        if (identity.current === installId) {
-                          setContextId(context.id);
+                        if (
+                          mountedOwner.current && identity.current === installId &&
+                          supersedeDestinationWithUserChoice(selectionAtSubmit)
+                        ) {
                           rememberContext(installId, context.id);
                           setEditingContextId("");
                           setBrandName("");
@@ -996,24 +1516,24 @@ export default function WorkspaceApp({
                     </div>
                     {(supportsContentPrompt || supportsImagePrompt) && <div className="wa-fields">
                       {supportsContentPrompt && <div className="wa-field">
-                        <label htmlFor="wa-default-content-prompt">Content prompt default</label>
+                        <label htmlFor="wa-default-content-prompt">{t("Content prompt default")}</label>
                         <textarea id="wa-default-content-prompt" name="content_prompt" className="wa-input wa-prompt-input"
                           value={contentPrompt} onChange={event => setContentPrompt(event.target.value)} maxLength={512}
                           placeholder="Leave empty to use the app default" disabled={!canWrite || busy} />
-                        <p className="wa-kicker">Guides caption wording. One line, up to 512 characters.</p>
+                        <p className="wa-kicker">{t("Guides caption wording. One line, up to 512 characters.")}</p>
                       </div>}
                       {supportsImagePrompt && <div className="wa-field">
-                        <label htmlFor="wa-default-image-prompt">Image prompt default</label>
+                        <label htmlFor="wa-default-image-prompt">{t("Image prompt default")}</label>
                         <textarea id="wa-default-image-prompt" name="image_prompt" className="wa-input wa-prompt-input"
                           value={imagePrompt} onChange={event => setImagePrompt(event.target.value)} maxLength={512}
                           placeholder="Leave empty to use the app default" disabled={!canWrite || busy} />
-                        <p className="wa-kicker">Guides the one generated draft image; provider and safety constraints stay fixed.</p>
+                        <p className="wa-kicker">{t("Guides the one generated draft image; provider and safety constraints stay fixed.")}</p>
                       </div>}
                     </div>}
                     <div className="wa-fields">
                       <div className="wa-field">
                         <label htmlFor="wa-brand-voice">
-                          Brand voice (optional)
+                          {t("Brand voice (optional)")}
                         </label>
                         <input
                           id="wa-brand-voice"
@@ -1029,7 +1549,7 @@ export default function WorkspaceApp({
                       </div>
                       <div className="wa-field">
                         <label htmlFor="wa-protected-terms">
-                          Protected terms (optional)
+                          {t("Protected terms (optional)")}
                         </label>
                         <input
                           id="wa-protected-terms"
@@ -1045,7 +1565,7 @@ export default function WorkspaceApp({
                       </div>
                     </div>
                     <p className="wa-kicker">
-                      Use one line for each default. New plans freeze their effective values; editing this context cannot change an existing plan.
+                      {t("Use one line for each default. New plans freeze their effective values; editing this context cannot change an existing plan.")}
                     </p>
                     <Button type="submit" disabled={!canWrite} loading={busy}>
                       {editingContextId ? "Save brand defaults" : "Add brand"}
@@ -1053,16 +1573,16 @@ export default function WorkspaceApp({
                     {editingContextId && <Button disabled={busy} onClick={() => {
                       setEditingContextId(""); setBrandName(""); setBrandVoice(""); setProtectedTerms("");
                       setContentPrompt(""); setImagePrompt(""); setActionError(null);
-                    }}>Cancel editing</Button>}
+                    }}>{t("Cancel editing")}</Button>}
                   </form>
                 </section>
                 <section className="wa-panel wa-stack">
-                  <h2>Available in this version</h2>
+                  <h2>{t("Available in this version")}</h2>
                   <p className="wa-muted">
-                    {imageEnabled ? "Retained Instagram source → priced caption and image plan → independent review of text and bytes → explicit Local release. External publishing and scheduling are unavailable." : sourceEnabled ? "Retained public Instagram source or pasted facts → writer → independent review → explicit Local release. Image generation, external publishing and scheduling are unavailable." : "Pasted text → actual writer → independent review → explicit Local release. Remote sources, image generation, external publishing and scheduling are unavailable."}
+                    {imageEnabled ? t("Retained Instagram source → priced caption and image plan → independent review of text and bytes → explicit Local release. External publishing and scheduling are unavailable.") : sourceEnabled ? t("Retained public Instagram source or pasted facts → writer → independent review → explicit Local release. Image generation, external publishing and scheduling are unavailable.") : t("Pasted text → actual writer → independent review → explicit Local release. Remote sources, image generation, external publishing and scheduling are unavailable.")}
                   </p>
                   <details className="wa-details">
-                    <summary>Installation details</summary>
+                    <summary>{t("Installation details")}</summary>
                     <p className="wa-digest">
                       {installId}
                       <br />
@@ -1113,21 +1633,21 @@ export default function WorkspaceApp({
         />
       )}
       {run && isSourceRun(run) && (
-        <WorkspaceDialog title={`Read @${run.snapshot.inputs.profile_handle}`} onClose={() => { if (!busy) setSelectedRun(null); }}>
+        <WorkspaceDialog title={t("Read @{handle}").replace("{handle}", () => run.snapshot.inputs.profile_handle)} onClose={() => { if (!busy) setSelectedRun(null); }}>
           <div className="wa-stack">
             {actionError && <p className="wa-alert" data-tone="fail" role="alert">{actionError}</p>}
             <div className="wa-row"><span className="wa-status" data-tone={statusTone(run.state)}>{statusText(run.state)}</span><span className="wa-kicker">{run.id}</span></div>
             {run.failure && !actionError && <p className="wa-alert" data-tone="fail" role="status">{run.failure.kind === "uncertain" ? "The provider outcome is uncertain; no automatic retry was made." : "This source read was refused."} {run.failure.reason}</p>}
             <p className="wa-muted">This run reads public posts from the frozen @{run.snapshot.inputs.profile_handle} profile. It cannot publish or generate an image.</p>
-            {run.snapshot.quotes?.source?.currency === "USD" && Number.isSafeInteger(run.snapshot.quotes.source.total_price_micros) ? <p className="wa-alert">Frozen provider charge: <strong>USD {(run.snapshot.quotes.source.total_price_micros / 1_000_000).toFixed(6)}</strong> for one read. Binding {run.snapshot.capabilities?.source?.digest || "unavailable"}. A changed quote or binding stops dispatch.</p> : <p className="wa-alert" data-tone="fail">This source plan has no verified provider quote. It cannot be approved.</p>}
-            <details className="wa-details"><summary>Inspect the exact source plan</summary><pre>{JSON.stringify(run.snapshot, null, 2)}</pre><p className="wa-digest">{run.snapshot_digest}</p></details>
+            {run.snapshot.quotes?.source?.currency === "USD" && Number.isSafeInteger(run.snapshot.quotes.source.total_price_micros) ? <p className="wa-alert">{t("Frozen provider charge: {amount} for one read. Binding {digest}. A changed quote or binding stops dispatch.").replace("{amount}", () => `USD ${(run.snapshot.quotes!.source!.total_price_micros / 1_000_000).toFixed(6)}`).replace("{digest}", () => run.snapshot.capabilities?.source?.digest || t("unavailable"))}</p> : <p className="wa-alert" data-tone="fail">{t("This source plan has no verified provider quote. It cannot be approved.")}</p>}
+            <details className="wa-details"><summary>{t("Inspect the exact source plan")}</summary><pre>{JSON.stringify(run.snapshot, null, 2)}</pre><p className="wa-digest">{run.snapshot_digest}</p></details>
             {/* CAD-1171: a host run already carries its consent — the click
                 that created it. Only an agent run shows the approve round. */}
-            {run.state === "awaiting_approval" && run.snapshot.workflow.execution !== "host" && <Button variant="primary" disabled={!canWrite || !run.snapshot.quotes?.source || !run.snapshot.capabilities?.source} loading={busy} onClick={() => void mutate(async () => { await workspaceApps.approveRun(run.id, run.snapshot_digest); })}>Approve source plan</Button>}
-            {run.state === "approved" && run.snapshot.workflow.execution !== "host" && <Button variant="primary" disabled={!canWrite || !run.snapshot.quotes?.source || !run.snapshot.capabilities?.source} loading={busy} onClick={() => void mutate(async () => { await workspaceApps.dispatchRun(run.id); })}>Start source reader</Button>}
+            {run.state === "awaiting_approval" && run.snapshot.workflow.execution !== "host" && <Button variant="primary" disabled={!canWrite || !run.snapshot.quotes?.source || !run.snapshot.capabilities?.source} loading={busy} onClick={() => void mutate(async () => { await workspaceApps.approveRun(run.id, run.snapshot_digest); })}>{t("Approve source plan")}</Button>}
+            {run.state === "approved" && run.snapshot.workflow.execution !== "host" && <Button variant="primary" disabled={!canWrite || !run.snapshot.quotes?.source || !run.snapshot.capabilities?.source} loading={busy} onClick={() => void mutate(async () => { await workspaceApps.dispatchRun(run.id); })}>{t("Start source reader")}</Button>}
             {run.state === "running" && <p className="wa-muted" role="status">{run.snapshot.workflow.execution === "host" ? "The host is calling the frozen source binding and storing the provider receipt. Refresh Sources to see retained posts." : "Waiting for the assigned reader and provider receipt. Refresh Sources to see retained posts."}</p>}
-            {run.state === "failed" && <p className="wa-alert" data-tone="fail">The source run failed. No posts will be fabricated. Inspect its exact plan and stored run for details.</p>}
-            {run.state === "succeeded" && <p className="wa-muted">The provider receipt is available in Sources. Choose one post there to start a caption.</p>}
+            {run.state === "failed" && <p className="wa-alert" data-tone="fail">{t("The source run failed. No posts will be fabricated. Inspect its exact plan and stored run for details.")}</p>}
+            {run.state === "succeeded" && <p className="wa-muted">{t("The provider receipt is available in Sources. Choose one post there to start a caption.")}</p>}
           </div>
         </WorkspaceDialog>
       )}
@@ -1153,10 +1673,10 @@ export default function WorkspaceApp({
             {run.failure && !actionError && <p className="wa-alert" data-tone="fail" role="status">{run.failure.kind === "uncertain" ? "The provider outcome is uncertain; no automatic retry was made." : "This capability was refused."} {run.failure.reason}</p>}
             <p className="wa-muted">{run.snapshot.inputs.source}</p>
             {isImageRun(run) && (imagePlanPriced
-              ? <p className="wa-alert">Current rate at approval: <strong>USD {(imageQuote!.total_price_micros / 1_000_000).toFixed(6)}</strong> per image — billed at the provider's actual charge. This covers one square image draft from {run.snapshot.source ? "the selected post" : "pasted facts"}. Binding {run.snapshot.capabilities?.image?.digest}. A changed rate or binding stops dispatch.</p>
-              : <p className="wa-alert" data-tone="fail">This image plan has no verified one-image quote and cannot be approved.</p>)}
+              ? <p className="wa-alert">{t("Current rate at approval: {amount} per image — billed at the provider's actual charge. This covers one square image draft from {source}. Binding {digest}. A changed rate or binding stops dispatch.").replace("{amount}", () => `USD ${(imageQuote!.total_price_micros / 1_000_000).toFixed(6)}`).replace("{source}", () => run.snapshot.source ? t("the selected post") : t("pasted facts")).replace("{digest}", () => run.snapshot.capabilities?.image?.digest ?? "")}</p>
+              : <p className="wa-alert" data-tone="fail">{t("This image plan has no verified one-image quote and cannot be approved.")}</p>)}
             <section className="wa-stack">
-              <h3>Frozen plan</h3>
+              <h3>{t("Frozen plan")}</h3>
               {run.snapshot.workflow.steps.map((step) => (
                 <div key={step.id} className="wa-step">
                   <span>
@@ -1174,19 +1694,18 @@ export default function WorkspaceApp({
                 </div>
               ))}
               <p className="wa-kicker">
-                Responsible PM: {run.snapshot.owner_pm}. Destination and brand
-                context are frozen into this plan.
+                {t("Responsible PM: {pm}. Destination and brand context are frozen into this plan.").replace("{pm}", () => run.snapshot.owner_pm)}
               </p>
               {(run.snapshot.inputs.content_prompt || run.snapshot.inputs.image_prompt) && <div className="wa-stack">
-                <h4>Frozen prompts</h4>
+                <h4>{t("Frozen prompts")}</h4>
                 {(["content_prompt", "image_prompt"] as const).map(name => run.snapshot.inputs[name] && <div key={name} className="wa-field">
                   <span>{name === "content_prompt" ? "Content prompt" : "Image prompt"} · {run.snapshot.input_origins?.[name] === "run_override" ? "this post’s override" : run.snapshot.input_origins?.[name] === "context_default" ? "saved brand default" : run.snapshot.input_origins?.[name] === "app_default" ? "app default" : "frozen value"}</span>
                   <p className="wa-preview">{run.snapshot.inputs[name]}</p>
                 </div>)}
-                <p className="wa-kicker">These values were frozen when the plan was created. Source facts and provider settings are separate.</p>
+                <p className="wa-kicker">{t("These values were frozen when the plan was created. Source facts and provider settings are separate.")}</p>
               </div>}
               <details className="wa-details">
-                <summary>Inspect the exact plan</summary>
+                <summary>{t("Inspect the exact plan")}</summary>
                 <pre>{JSON.stringify(run.snapshot, null, 2)}</pre>
                 <p className="wa-digest">{run.snapshot_digest}</p>
               </details>
@@ -1235,7 +1754,7 @@ export default function WorkspaceApp({
                 <p className="wa-digest">{review.artifact_digest}</p>
                 {isImageRun(run) && (review.asset_receipt_id && review.asset_digest
                   ? <p className="wa-digest">Retained image {review.asset_receipt_id}<br />{review.asset_digest}</p>
-                  : <p className="wa-alert" data-tone="fail">This review has no pinned retained image. Caption and image release is unavailable.</p>)}
+                  : <p className="wa-alert" data-tone="fail">{t("This review has no pinned retained image. Caption and image release is unavailable.")}</p>)}
               </div>
             ))}
             {run.artifacts.length > 1 && (
@@ -1262,7 +1781,7 @@ export default function WorkspaceApp({
             )}
             {artifact && (
               <section className="wa-stack">
-                <h3>Stored text</h3>
+                <h3>{t("Stored text")}</h3>
                 <pre className="wa-preview">{artifact.text}</pre>
                 <p className="wa-digest">{artifact.digest}</p>
                 {run.state === "succeeded" &&
@@ -1318,7 +1837,7 @@ export default function WorkspaceApp({
             )}
             {selectedEffect && (
               <section className="wa-stack">
-                <h3>Local release</h3>
+                <h3>{t("Local release")}</h3>
                 <span
                   className="wa-status"
                   data-tone={statusTone(selectedEffect.state)}
@@ -1326,7 +1845,7 @@ export default function WorkspaceApp({
                   {statusText(selectedEffect.state)}
                 </span>
                 <p className="wa-muted">
-                  Inspect the server’s exact release receipt before deciding.
+                  {t("Inspect the server’s exact release receipt before deciding.")}
                   This writes only to the configured Local destination.
                 </p>
                 {selectedEffect.record.preview && (
@@ -1343,7 +1862,7 @@ export default function WorkspaceApp({
                       : "No confirmed verification is recorded yet."}
                 </p>
                 <details className="wa-details">
-                  <summary>Exact release receipt</summary>
+                  <summary>{t("Exact release receipt")}</summary>
                   <pre>{JSON.stringify(selectedEffect.record, null, 2)}</pre>
                   <p className="wa-digest">{selectedEffect.digest}</p>
                 </details>
@@ -1382,7 +1901,7 @@ export default function WorkspaceApp({
                         })
                       }
                     >
-                      Close without releasing
+                      {t("Close without releasing")}
                     </Button>
                   </div>
                 )}
@@ -1408,7 +1927,7 @@ export default function WorkspaceApp({
                         })
                       }
                     >
-                      Close after checking outcome
+                      {t("Close after checking outcome")}
                     </Button>
                   </>
                 )}
@@ -1429,17 +1948,17 @@ export default function WorkspaceApp({
                         })
                       }
                     >
-                      Acknowledge this outcome
+                      {t("Acknowledge this outcome")}
                     </Button>
                   )}
                 {outboxError && (
                   <p className="wa-alert" data-tone="fail" role="alert">
-                    Could not read the Local outbox: {outboxError}
+                    {t("Could not read the Local outbox:")} {outboxError}
                   </p>
                 )}
                 {outbox !== null && (
                   <div className="wa-stack">
-                    <h3>Actual Local item</h3>
+                    <h3>{t("Actual Local item")}</h3>
                     <p className="wa-muted">
                       {outbox.item.title} · {outbox.item.published_at}
                     </p>
@@ -1447,7 +1966,7 @@ export default function WorkspaceApp({
                       <pre className="wa-preview">{outbox.item.post}</pre>
                     )}
                     <details className="wa-details">
-                      <summary>Persisted outbox receipt</summary>
+                      <summary>{t("Persisted outbox receipt")}</summary>
                       <pre>{JSON.stringify(outbox, null, 2)}</pre>
                     </details>
                     <p className="wa-kicker">

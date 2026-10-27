@@ -1,36 +1,42 @@
 # CRM package setup
 
-`workspace-apps/crm` is the installable CRM metadata bundle. Installing it
+The canonical CRM package lives in the independent
+[`favcrm/cadence-app-crm`](https://github.com/favcrm/cadence-app-crm)
+repository, under `app/`. Use a trusted, pinned checkout of that repository,
+not the historical embedded `workspace-apps/crm` snapshot or
+`tests/fixtures/apps/crm` (host-contract test data only). Installing it
 creates a workspace installation whose app is named `crm` — the name the
-host-compiled CRM screens (Customers, Segments, Campaigns, content review,
-bounded send controls) key on. The package is metadata plus one local-only
-`email-brief` workflow; the CRM UI, customer records domain, authorization
-checks and sending are **host-compiled features of the daemon and board**,
-not contents of this bundle. Installing it grants no additional authority —
-it makes the already host-compiled UI discoverable to an authorized operator
+packaged CRM screens (Customers, Segments, Campaigns, content review, bounded
+send controls) key on. Since CAD-1519 the package ships those screens itself
+and core mounts them through the generic app shell; the bundle is screens,
+metadata and one local-only `email-brief` workflow. The customer records
+domain, authorization checks and sending remain **host-compiled features of
+the daemon and board**, not contents of this bundle. Installing it grants no additional authority —
+it makes the packaged UI discoverable to an authorized operator
 under the name `crm`; it does not itself confer UI access, records, SMTP
 custody, send authority, or a sandbox over what workers may do.
 
-Use a trusted Cadence source checkout and an owned, disposable test daemon
+Use a trusted CRM package checkout and an owned, disposable test daemon
 and workspace. These are operator commands, not a production rollout.
 
-## Install and approve
+## Install (consent)
 
 ```sh
-cadence app catalog install workspace-apps/crm
+cadence app check /absolute/path/to/cadence-app-crm/app
+cadence app catalog install /absolute/path/to/cadence-app-crm/app
 cadence app catalog show <install-id>
 ```
 
 `install` validates and copies the local bundle and returns a stable
 installation ID plus the bundle `digest` and `catalog_generation`.
-Installing is the approval (CAD-1119): it records the approval of exactly
-that digest, which permits the bundle's bounded local text capability
-only. It creates no run, dispatch, binding,
-customer record, SMTP connection or send authority.
+Installing is the operator's consent (CAD-1119): when the bundle passes local
+execution checks, install records approval of exactly that digest, which permits
+the bundle's bounded local text capability only. It creates no run, dispatch,
+binding, customer record, SMTP connection or send authority.
 
 ## Generic app assistant declaration
 
-`workspace-apps/crm/app-assistant.json` declares the CRM action IDs and their
+The CRM repository's `app/app-assistant.json` declares the CRM action IDs and their
 input schemas as data in `app-assistant/v1`. It is not executable code and
 cannot add host handlers, commands, URLs, identity or scope. The host serves
 actions only for the selected installation and context, and its reviewed
@@ -162,9 +168,9 @@ A package-only upgrade (changed `version`/content bytes) goes through the
 supported check/commit pair:
 
 ```sh
-cadence app catalog upgrade-check <install-id> --source <dir> \
+cadence app catalog upgrade-check <install-id> <dir> \
   --expected-digest <current-digest> --expected-generation <generation>
-cadence app catalog upgrade <install-id> --source <dir> \
+cadence app catalog upgrade <install-id> <dir> \
   --expected-digest <current-digest> --expected-generation <generation> \
   --expected-new-digest <proposed-digest> --request-id <unique-id>
 ```
@@ -178,15 +184,19 @@ digest.
 ## Production boundary
 
 Everything above describes package installation and local, package-tested
-behaviour on a disposable workspace. The host-compiled CRM UI and send path
-are verified separately; installing or approving this package is **not**
+behaviour on a disposable workspace. The packaged CRM screens and the host
+send path are verified separately; installing or approving this package is **not**
 proof of the production send path, and a host binary rollout is a separate
 operator-owned action.
 
 ## MVP acceptance matrix (CAD-865)
 
 One row per promised MVP flow, mapped to its source and existing evidence,
-at lane source `d379ae54` (this work's parent). Historical CAD-786 browser
+at lane source `d379ae54` (this work's parent). This is a historical
+acceptance snapshot, not a map of the current checkout: CAD-1073 retired the
+`tests/crm_*.rs` Rust suites, and CAD-1519 removed the CRM app UI from core
+along with the `crmCustomers`/`crmSegments`/`crmCampaigns` UI tests. The
+verdict column records the CAD-865 run only. Historical CAD-786 browser
 evidence under `/home/ubuntu/.cache/fb597/e2e` is retained at its own SHA
 and does not validate this head. `browser-pending` means the flow is proven
 in daemon tests and mounted UI tests but awaits the real-browser run; the

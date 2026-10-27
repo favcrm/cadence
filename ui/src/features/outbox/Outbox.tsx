@@ -2,6 +2,7 @@ import { useEffect, useId, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
+import { useTranslate } from "../../lib/locale";
 import { navigate, useHref } from "../../lib/useLocation";
 import { fmtBytes } from "../../lib/fmt";
 import type { OutboxItem } from "../../lib/types";
@@ -9,6 +10,7 @@ import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import Select from "../../ui/Select";
+import PageState from "../../ui/PageState";
 import { IconCaret, IconRefresh, IconSearch } from "../../ui/icons";
 import {
   outboxHref,
@@ -27,6 +29,7 @@ export default function Outbox({
   operator: boolean;
   onOpenIssue?: (id: string) => void;
 }) {
+  const t = useTranslate();
   const href = useHref();
   const queryStart = href.indexOf("?");
   const search = queryStart >= 0 ? href.slice(queryStart + 1) : "";
@@ -64,10 +67,10 @@ export default function Outbox({
             id="outbox-title"
             className="text-section font-medium text-ink-100"
           >
-            Outbox
+            {t("Outbox")}
           </h1>
           <p className="text-label text-ink-400 mt-1">
-            Released posts saved to your local outbox.
+            {t("Released posts saved to your local outbox.")}
           </p>
         </div>
         {resource && (
@@ -75,8 +78,8 @@ export default function Outbox({
             variant="ghost"
             className="outbox-refresh"
             icon={<IconRefresh />}
-            aria-label="Refresh outbox"
-            title="Refresh outbox"
+            aria-label={t("Refresh outbox")}
+            title={t("Refresh outbox")}
             loading={state?.inFlight}
             onClick={() => void resource.refresh()}
           />
@@ -84,17 +87,9 @@ export default function Outbox({
       </div>
 
       {!operator ? (
-        <div className="card outbox-notice">
-          <div>
-            <h2 className="text-secondary font-medium text-ink-100 mb-1">
-              Sign in to view published posts
-            </h2>
-            <p>
-              Outbox is available to the operator. Use Sign in in the top bar to
-              connect with a login link.
-            </p>
-          </div>
-        </div>
+        <PageState title={t("Operator access required")}>
+          {t("Outbox is available to the operator. Use Sign in in the status bar if you have operator access.")}
+        </PageState>
       ) : filters.item ? (
         <OutboxDetailView
           key={filters.item}
@@ -107,7 +102,7 @@ export default function Outbox({
           {items && (items.length > 0 || filtered) && (
             <div className="outbox-tools">
               <div className="outbox-search">
-                <label htmlFor={searchId}>Search posts</label>
+                <label htmlFor={searchId}>{t("Search posts")}</label>
                 <div className="outbox-search-box">
                   <IconSearch />
                   <input
@@ -115,7 +110,7 @@ export default function Outbox({
                     type="search"
                     className="field"
                     value={filters.query}
-                    placeholder="Title, preview or attachment"
+                    placeholder={t("Title, preview or attachment")}
                     autoComplete="off"
                     onChange={(event) =>
                       navigate(
@@ -129,11 +124,11 @@ export default function Outbox({
               {(projects.length > 1 || filters.project) && (
                 <div className="outbox-project">
                   <label className="outbox-project-label" htmlFor={projectId}>
-                    Project
+                    {t("Project")}
                   </label>
                   <Select
                     id={projectId}
-                    aria-label="Project"
+                    aria-label={t("Project")}
                     value={filters.project}
                     full
                     options={[
@@ -150,7 +145,7 @@ export default function Outbox({
               )}
               {filtered && (
                 <Button variant="ghost" onClick={clearFilters}>
-                  Clear filters
+                  {t("Clear filters")}
                 </Button>
               )}
             </div>
@@ -158,17 +153,15 @@ export default function Outbox({
           {state?.status === "stale" && (
             <div className="card outbox-notice outbox-warning" role="status">
               <div>
-                Refresh failed. Showing the last loaded posts
                 {state.asOf
-                  ? ` from ${publicationTime(new Date(state.asOf).toISOString())}`
-                  : ""}
-                .
+                  ? t("Refresh failed. Showing the last loaded posts from {time}.").replace("{time}", () => publicationTime(new Date(state.asOf!).toISOString()))
+                  : t("Refresh failed. Showing the last loaded posts.")}
               </div>
               <Button
                 onClick={() => resource && void resource.refresh()}
                 loading={state.inFlight}
               >
-                Retry
+                {t("Retry")}
               </Button>
             </div>
           )}
@@ -181,14 +174,14 @@ export default function Outbox({
                 {state.status === "failed" ? (
                   <>
                     <p className="text-ink-100 font-medium">
-                      Could not load published posts
+                      {t("Could not load published posts")}
                     </p>
                     <p className="mt-1">
                       {state.error ?? "Try again in a moment."}
                     </p>
                   </>
                 ) : (
-                  "Loading published posts…"
+                  t("Loading published posts…")
                 )}
               </div>
               {state.status === "failed" && (
@@ -196,7 +189,7 @@ export default function Outbox({
                   onClick={() => resource && void resource.refresh()}
                   loading={state.inFlight}
                 >
-                  Retry
+                  {t("Retry")}
                 </Button>
               )}
             </div>
@@ -211,11 +204,11 @@ export default function Outbox({
                       : items.length}{" "}
                     post{items.length === 1 ? "" : "s"}
                   </span>
-                  <span>Newest first</span>
+                  <span>{t("Newest first")}</span>
                 </div>
               )}
               {visible.length ? (
-                <ul className="outbox-list" aria-label="Published posts">
+                <ul className="outbox-list" aria-label={t("Published posts")}>
                   {visible.map((item) => (
                     <li key={item.effect_id}>
                       <Link
@@ -280,6 +273,7 @@ function OutboxDetailView({
   backHref: string;
   onOpenIssue?: (id: string) => void;
 }) {
+  const t = useTranslate();
   const [detail, setDetail] = useState<Detail>({ status: "loading" });
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
@@ -311,7 +305,7 @@ function OutboxDetailView({
         href={backHref}
         icon={<IconCaret size={14} style={{ transform: "rotate(180deg)" }} />}
       >
-        Back to posts
+        {t("Back to posts")}
       </Button>
       {detail.status !== "ready" ? (
         <div
@@ -322,28 +316,28 @@ function OutboxDetailView({
             {detail.status === "failed" ? (
               <>
                 <p className="font-medium text-ink-100">
-                  Could not load this post
+                  {t("Could not load this post")}
                 </p>
                 <p className="mt-1">{detail.error}</p>
               </>
             ) : (
-              "Loading post…"
+              t("Loading post…")
             )}
           </div>
-          {detail.status === "failed" && <Button onClick={retry}>Retry</Button>}
+          {detail.status === "failed" && <Button onClick={retry}>{t("Retry")}</Button>}
         </div>
       ) : (
         <article className="card outbox-detail-card">
           <header className="outbox-detail-heading">
             <div className="flex justify-between items-center gap-3">
               <span className="text-micro font-medium text-ink-400">
-                Published locally
+                {t("Published locally")}
               </span>
               <Button
                 variant="ghost"
                 icon={<IconRefresh />}
-                aria-label="Refresh post"
-                title="Refresh post"
+                aria-label={t("Refresh post")}
+                title={t("Refresh post")}
                 onClick={retry}
               />
             </div>
@@ -363,23 +357,22 @@ function OutboxDetailView({
                 <Md text={detail.item.post} onOpen={onOpenIssue} />
               ) : (
                 <p className="text-label text-ink-400">
-                  This post has no text content.
+                  {t("This post has no text content.")}
                 </p>
               )
             ) : (
               <div className="outbox-notice" role="status">
                 <div>
-                  The saved post content could not be read. Its publication
-                  details are still available.
+                  {t("The saved post content could not be read. Its publication details are still available.")}
                 </div>
-                <Button onClick={retry}>Retry content</Button>
+                <Button onClick={retry}>{t("Retry content")}</Button>
               </div>
             )}
           </div>
           {!!detail.item.attachments?.length && (
-            <section className="outbox-attachments" aria-label="Attachments">
+            <section className="outbox-attachments" aria-label={t("Attachments")}>
               <h3 className="text-secondary font-medium text-ink-100">
-                Attachments{" "}
+                {t("Attachments")}{" "}
                 <span className="text-ink-500">
                   ({detail.item.attachments.length})
                 </span>
@@ -397,13 +390,13 @@ function OutboxDetailView({
             </section>
           )}
           <details className="outbox-storage">
-            <summary>Publication details</summary>
+            <summary>{t("Publication details")}</summary>
             <dl>
-              <dt>Publication ID</dt>
+              <dt>{t("Publication ID")}</dt>
               <dd className="num">{effectId}</dd>
               {detail.item.path && (
                 <>
-                  <dt>Local folder</dt>
+                  <dt>{t("Local folder")}</dt>
                   <dd className="num">{detail.item.path}</dd>
                 </>
               )}

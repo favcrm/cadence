@@ -81,7 +81,7 @@ const IMPORT_MAX_BYTES: usize = super::image::ASSET_LIMIT;
 /// receipt.
 const IMPORT_RESPONSE_CAP: u64 = 64 * 1024;
 
-const IMPORT_PATH: &str = "/v1/runtime/connectors/media/import";
+const IMPORT_PATH: &str = "/media/import";
 
 /// Bounded well inside the worker→daemon RPC frame so a stuck door answers
 /// the caller instead of hanging it.
@@ -143,7 +143,7 @@ impl MediaImporter {
         credential: DeviceCredential,
         timeout: Duration,
     ) -> Result<Self> {
-        let base = super::valid_base(base)?;
+        let base = credential.door_base(base)?;
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
             .http_status_as_error(false)
@@ -200,11 +200,12 @@ impl MediaImporter {
         // it over the same bytes and the receipt must echo it. The key that
         // comes back must embed this digest — anything else is refused.
         let digest = format!("{:x}", Sha256::digest(bytes));
-        let url = format!("{}{}", self.base, IMPORT_PATH);
-        let envelope = self
-            .http
-            .post(&url)
-            .header("authorization", &self.credential.authorization())
+        let url = format!("{}{}", self.base, self.credential.route(IMPORT_PATH));
+        let mut request = self.http.post(&url);
+        if let Some(authorization) = self.credential.authorization() {
+            request = request.header("authorization", &authorization);
+        }
+        let envelope = request
             .header("content-type", mime)
             .query("connectionId", connection_id)
             .query("digest", &digest)
@@ -441,7 +442,7 @@ fn receipt_of(
 // that workspace is `not_found` and never mints a key.
 // ===========================================================================
 
-const DESTINATIONS_PATH: &str = "/v1/runtime/connectors/destinations";
+const DESTINATIONS_PATH: &str = "/destinations";
 
 /// One upstream destination row (`toDeviceDestination`, AOS
 /// `device-publish.ts`): `{connectionId, toolkit, displayName,
@@ -455,6 +456,10 @@ pub struct DestinationRow {
     pub destination_id: String,
     /// `publishable` — a row not publishable cannot be a send target.
     pub publishable: bool,
+    /// `displayName` — shown to the owner only; never an identity.
+    pub display_name: String,
+    /// `available` — the connection is live now.
+    pub available: bool,
 }
 
 /// The typed proof a daemon-layer resolver hands to the store: the
@@ -520,7 +525,7 @@ pub struct MediaResolver {
 
 impl MediaResolver {
     pub fn new(base: &str, credential: DeviceCredential) -> Result<Self> {
-        let base = super::valid_base(base)?;
+        let base = credential.door_base(base)?;
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(IMPORT_TIMEOUT))
             .http_status_as_error(false)
@@ -533,6 +538,29 @@ impl MediaResolver {
         })
     }
 
+    /// One read of the company's destination rows. Malformed rows are
+    /// dropped, not trusted. `Err` is any transport, status or parse fault.
+    fn rows(&self) -> std::result::Result<Vec<DestinationRow>, ()> {
+        let url = format!("{}{}", self.base, self.credential.route(DESTINATIONS_PATH));
+        let mut request = self.http.get(&url);
+        if let Some(authorization) = self.credential.authorization() {
+            request = request.header("authorization", &authorization);
+        }
+        let data = match request.call() {
+            Ok(resp) => read_destinations_envelope(resp).map_err(|_| ())?,
+            Err(_) => return Err(()),
+        };
+        parse_destinations(&data)
+    }
+
+    /// CAD-1290: the company's active, publishable destinations for one
+    /// toolkit, for the owner to choose from. `None` when the read failed.
+    pub fn list_active(&self, toolkit: &str) -> Option<Vec<DestinationRow>> {
+        let mut rows = self.rows().ok()?;
+        rows.retain(|r| r.toolkit == toolkit && r.publishable && r.available);
+        Some(rows)
+    }
+
     /// Resolve `(toolkit, destination_id)` to its remote AOS `connectionId`
     /// under the read credential's scoped workspace. The reply row set is
     /// already filtered by `listWorkspaceConnectionBindings(…, 100)` — a
@@ -541,43 +569,10 @@ impl MediaResolver {
     /// be ruled out). A caller-supplied id is never trusted; the read is
     /// the only source of the map.
     pub fn resolve(&self, toolkit: &str, destination_id: &str) -> DestinationLookup {
-        let url = format!("{}{}", self.base, DESTINATIONS_PATH);
-        let data = match self
-            .http
-            .get(&url)
-            .header("authorization", &self.credential.authorization())
-            .call()
-        {
-            Ok(resp) => match read_destinations_envelope(resp) {
-                Ok(d) => d,
-                Err(Fault::Ambiguous) => return DestinationLookup::Unavailable,
-                Err(Fault::Refused(_)) => return DestinationLookup::Unavailable,
-            },
-            Err(_) => return DestinationLookup::Unavailable,
+        let rows = match self.rows() {
+            Ok(rows) => rows,
+            Err(()) => return DestinationLookup::Unavailable,
         };
-        // Parse the row set; malformed rows are dropped, not trusted.
-        let rows: Vec<DestinationRow> = data
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| {
-                        let connection_id = v.get("connectionId")?.as_str()?.to_owned();
-                        let toolkit = v.get("toolkit")?.as_str()?.to_owned();
-                        let destination_id = v.get("destinationId")?.as_str()?.to_owned();
-                        let publishable = v
-                            .get("publishable")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        Some(DestinationRow {
-                            connection_id,
-                            toolkit,
-                            destination_id,
-                            publishable,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         // A full 100-row window can't rule out an unseen later match.
         if rows.len() >= 100 {
             return DestinationLookup::Ambiguous;
@@ -598,7 +593,42 @@ impl MediaResolver {
     }
 }
 
-/// Read the destinations envelope. Only a 2xx `{ok:true,data:[…]}` is a
+/// The destinations document (`DevicePublishDestinations`, AOS
+/// `device-publish.ts`): `{version:"1", destinations:[…]}`. Strict by
+/// design: a bare array, a missing `destinations` array or another version
+/// is contract drift and fails the read, because "zero rows" would hide it
+/// (CAD-1301). Individual malformed rows are dropped, not trusted.
+fn parse_destinations(data: &Value) -> std::result::Result<Vec<DestinationRow>, ()> {
+    if data.get("version").and_then(Value::as_str) != Some("1") {
+        return Err(());
+    }
+    let rows = data
+        .get("destinations")
+        .and_then(Value::as_array)
+        .ok_or(())?;
+    Ok(rows
+        .iter()
+        .filter_map(|v| {
+            Some(DestinationRow {
+                connection_id: v.get("connectionId")?.as_str()?.to_owned(),
+                toolkit: v.get("toolkit")?.as_str()?.to_owned(),
+                destination_id: v.get("destinationId")?.as_str()?.to_owned(),
+                publishable: v
+                    .get("publishable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                display_name: v
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                available: v.get("available").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect())
+}
+
+/// Read the destinations envelope. Only a 2xx `{ok:true,data:{…}}` is a
 /// read; a 4xx door error is a refused read, 5xx/redirect/drift ambiguous.
 /// The upstream `message` is never consulted.
 fn read_destinations_envelope(

@@ -1,5 +1,7 @@
 import { ApiError } from "../../lib/api";
+import { errorMessage } from "../../lib/apiError";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import { assertCleanBody, assertScope, listPath, type HostScope } from "./hostActions";
 
 /**
@@ -198,24 +200,27 @@ export function checkCsvText(csvText: string): void {
   }
 }
 
-async function post<T>(path: string, body: Record<string, unknown>): Promise<T> {
-  const response = await fetch(path, {
-    method: "POST",
-    credentials: "same-origin",
-    cache: "no-store",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: JSON.stringify(body),
+async function post<T>(path: string, body: Record<string, unknown>, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const response = await privateFetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: JSON.stringify(body),
+    }, op);
+    const value = await response.json().catch(() => null);
+    op.assertCurrent();
+    if (!response.ok) {
+      throw new ApiError(errorMessage(value, `${response.status} ${response.statusText}`), response.status);
+    }
+    if (value === null) throw new ApiError("The server returned an invalid CSV receipt", 502);
+    return value as T;
   });
-  const value = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status);
-  }
-  if (value === null) throw new ApiError("The server returned an invalid CSV receipt", 502);
-  return value as T;
 }
 
 export const csvActions = {

@@ -1,6 +1,42 @@
 use super::*;
 
 #[test]
+fn app_effect_list_filters_by_state_before_the_row_window() {
+    let (_dir, s) = store();
+    let (row, authority) = child_fixture(&s);
+    let staged = s.app_effect_stage(&row, &authority).unwrap();
+    let id = staged["effect"]["effect_id"].as_str().unwrap();
+    let contains = |list: &Value| {
+        list["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|effect| effect["effect_id"] == id)
+    };
+    assert!(contains(
+        &s.app_effect_list(Some("install-a"), None, None, 0).unwrap()
+    ));
+    assert!(contains(
+        &s.app_effect_list(Some("install-a"), None, Some("waiting"), 0)
+            .unwrap()
+    ));
+    assert!(!contains(
+        &s.app_effect_list(Some("install-a"), None, Some("posted"), 0)
+            .unwrap()
+    ));
+    assert!(!contains(
+        &s.app_effect_list(Some("install-b"), None, Some("waiting"), 0)
+            .unwrap()
+    ));
+    assert!(s
+        .app_effect_list(Some("install-a"), None, Some("waiting"), 100)
+        .unwrap()["effects"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn cad692_uncertain_outcome_and_resolution_preserve_exact_historical_authority() {
     let (_dir, s) = store();
     let (row, authority) = child_fixture(&s);

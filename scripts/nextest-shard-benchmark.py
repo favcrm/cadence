@@ -203,7 +203,7 @@ def context(root):
             'workspace': str(root), 'target': str(root / 'target'),
             'rustc': output(['rustc', '--version', '--verbose']), 'cargo': output(['cargo', '--version']),
             'nextest': output([os.environ['CADENCE_NEXTTEST_BIN'], '--version']),
-            'node': output(['node', '--version']), 'pnpm': output(['pnpm', '--version']),
+            'node': output(['node', '--version']), 'bun': output(['bun', '--version']),
             'runner': {k: os.environ.get(k, 'unset') for k in ('RUNNER_OS', 'RUNNER_ARCH', 'ImageOS', 'ImageVersion')},
             'environment': {k: os.environ.get(k, 'unset') for k in ('RUSTFLAGS', 'CARGO_BUILD_JOBS', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'CARGO_INCREMENTAL')},
             'tool_sha': digest(Path(os.environ['CADENCE_NEXTTEST_BIN'])),

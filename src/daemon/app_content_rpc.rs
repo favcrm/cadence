@@ -36,8 +36,9 @@
 //! follows the CAD-768 strict-peer contract (URL IDs are authority,
 //! exact transport grammar, POST-only writes) and exposes no
 //! assistant-mint route.
-use super::app_audiences_rpc::{audience_expected, audience_name, audience_predicates};
+use super::app_audiences_rpc::{audience_expected, audience_name};
 use super::app_records_rpc::{csv_decisions, csv_text};
+use super::app_screen_services_rpc::ScreenServiceProof;
 use super::*;
 use crate::issue::app_catalog::workspace;
 use crate::store::app_content::{CloneOptions, Draft};
@@ -162,7 +163,26 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
+        self.rpc_app_content_with_proof(method, params, peer_pid, None)
+    }
+
+    pub(super) fn rpc_app_content_with_proof(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+        proof: Option<&ScreenServiceProof>,
+    ) -> Result<Value> {
+        Self::screen_service_method(proof, method)?;
         self.operator_connection("app content management", params, peer_pid)?;
+        // CAD-1374: only an owner save may carry the board's public session
+        // proof; it is stripped before the store sees the params, and the
+        // verified human is a typed argument, never a params field.
+        let human = if method == "app_content_save" {
+            self.verified_owner_human(params)?
+        } else {
+            None
+        };
         // Receipt-shaped fields are refused everywhere: assistant
         // attribution requires a CAD-784 chat receipt, and no such
         // receipt exists yet, so any present receipt is forged.
@@ -200,6 +220,7 @@ impl Shared {
                 "html",
                 "text",
                 "expected_revision",
+                "public_session",
             ],
             "app_content_show" => &["install_id", "context_id", "campaign_id"],
             "app_content_clone" => &[
@@ -287,7 +308,6 @@ impl Shared {
         let install = required_str(params, "install_id")?;
         crate::proto::identifier(install, "installation ID")?;
         let context = required_str(params, "context_id")?;
-        let pm = self.pm_at(&self.pm_dir()?)?;
         let write = !matches!(
             method,
             "app_content_show"
@@ -299,224 +319,236 @@ impl Shared {
                 | "app_sender_binding_show"
                 | "app_sender_binding_list"
         );
-        workspace::with_runtime_snapshot(&pm, install, |_, _| {
-            let _release = self
-                .app_release_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // Reads prove the live context too: an unknown, archived
-            // or foreign context refuses before any file opens.
-            self.store.app_context_proof(install, context)?;
-            Ok(())
-        })?;
-        let records = RecordStore::open(&self.state_dir, install)?;
-        let result = match method {
-            "app_content_save" => {
-                let draft = content_save_draft(params)?;
-                if let Some(html) = &draft.html {
-                    // The host's own unsubscribe URL shapes: saved
-                    // bindings, the preview base and the configured
-                    // send origin (`{origin}/unsubscribe/<token>`).
-                    let mut endpoints = records.app_unsubscribe_endpoints(context)?;
-                    if let Ok(origin) = self.crm_send_origin() {
-                        endpoints.extend(crate::store::app_content_html::HostEndpoint::origin(
-                            &origin,
-                        ));
-                    }
-                    crate::store::app_content_html::refuse_host_unsubscribe(html, &endpoints)?;
-                }
-                records.app_content_save(
-                    context,
-                    required_str(params, "campaign_id")?,
-                    content_expected(params)?,
-                    &draft,
-                )
-            }
-            "app_content_show" => {
-                records.app_content_show(context, required_str(params, "campaign_id")?)
-            }
-            "app_content_clone" => {
-                let copy_audience = match params.get("copy_audience") {
-                    None => false,
-                    Some(Value::Bool(value)) => *value,
-                    Some(_) => {
-                        return Err(Error::rejected(
-                            "campaign clone audience flag must be boolean",
-                        ));
-                    }
-                };
-                let copy_sender = match params.get("copy_sender") {
-                    None => false,
-                    Some(Value::Bool(value)) => *value,
-                    Some(_) => {
-                        return Err(Error::rejected(
-                            "campaign clone sender flag must be boolean",
-                        ));
-                    }
-                };
-                let optional_id = |key: &str| -> Result<Option<&str>> {
-                    match params.get(key) {
-                        None => Ok(None),
-                        Some(Value::String(id)) => Ok(Some(id)),
-                        Some(_) => {
-                            Err(Error::rejected("campaign clone reference must be a string"))
+        let result = self.screen_service_scope(install, context, true, proof, || {
+            let records = RecordStore::open(&self.state_dir, install)?;
+            match method {
+                "app_content_save" => {
+                    let draft = content_save_draft(params)?;
+                    if let Some(html) = &draft.html {
+                        // The host's own unsubscribe URL shapes: saved
+                        // bindings, the preview base and the configured
+                        // send origin (`{origin}/unsubscribe/<token>`).
+                        let mut endpoints = records.app_unsubscribe_endpoints(context)?;
+                        if let Ok(origin) = self.crm_send_origin() {
+                            endpoints.extend(crate::store::app_content_html::HostEndpoint::origin(
+                                &origin,
+                            ));
                         }
+                        crate::store::app_content_html::refuse_host_unsubscribe(html, &endpoints)?;
                     }
-                };
-                records.app_content_clone(
+                    records.app_content_save_as(
+                        context,
+                        required_str(params, "campaign_id")?,
+                        content_expected(params)?,
+                        &draft,
+                        human.as_ref(),
+                    )
+                }
+                "app_content_show" => {
+                    records.app_content_show(context, required_str(params, "campaign_id")?)
+                }
+                "app_content_clone" => {
+                    let copy_audience = match params.get("copy_audience") {
+                        None => false,
+                        Some(Value::Bool(value)) => *value,
+                        Some(_) => {
+                            return Err(Error::rejected(
+                                "campaign clone audience flag must be boolean",
+                            ));
+                        }
+                    };
+                    let copy_sender = match params.get("copy_sender") {
+                        None => false,
+                        Some(Value::Bool(value)) => *value,
+                        Some(_) => {
+                            return Err(Error::rejected(
+                                "campaign clone sender flag must be boolean",
+                            ));
+                        }
+                    };
+                    let optional_id = |key: &str| -> Result<Option<&str>> {
+                        match params.get(key) {
+                            None => Ok(None),
+                            Some(Value::String(id)) => Ok(Some(id)),
+                            Some(_) => {
+                                Err(Error::rejected("campaign clone reference must be a string"))
+                            }
+                        }
+                    };
+                    records.app_content_clone(
+                        context,
+                        required_str(params, "campaign_id")?,
+                        &CloneOptions {
+                            expected_revision: content_revision(params)?,
+                            name: required_str(params, "name")?,
+                            copy_audience,
+                            source_freeze_id: optional_id("source_freeze_id")?,
+                            copy_sender,
+                            source_binding_id: optional_id("source_binding_id")?,
+                        },
+                    )
+                }
+                "app_content_list" => records.app_content_list(context),
+                "app_sender_binding_save" => {
+                    let admitted_connection;
+                    let connection = if proof.is_some() {
+                        // The screen cannot select custody through a preview
+                        // binding. Derive only the current admitted scoped link
+                        // while the screen scope holds custody + release locks.
+                        if params.get("connection_id").is_some() {
+                            return Err(Error::rejected("screen cannot select sender connection"));
+                        }
+                        admitted_connection = match self.store.crm_smtp_link(install, context)? {
+                            Some(link) if link.state == "live" => {
+                                self.crm_smtp_authority(&link.connection_id, link.auth_revision)?;
+                                Some(link.connection_id)
+                            }
+                            _ => None,
+                        };
+                        admitted_connection.as_deref()
+                    } else {
+                        match params.get("connection_id") {
+                            None => None,
+                            Some(Value::String(id)) => Some(id.as_str()),
+                            Some(_) => {
+                                return Err(Error::rejected(
+                                    "sender connection ID must be a string",
+                                ))
+                            }
+                        }
+                    };
+                    let draft = crate::store::app_content::BindingDraft {
+                        sender_name: required_str(params, "sender_name")?,
+                        sender_address: required_str(params, "sender_address")?,
+                        unsubscribe_base: required_str(params, "unsubscribe_base")?,
+                        connection_id: connection,
+                    };
+                    records.app_sender_binding_save(
+                        context,
+                        required_str(params, "binding_id")?,
+                        content_expected(params)?,
+                        &draft,
+                    )
+                }
+                "app_sender_binding_show" => {
+                    records.app_sender_binding_show(context, required_str(params, "binding_id")?)
+                }
+                "app_sender_binding_list" => records.app_sender_binding_list(context),
+                "app_content_render" => {
+                    let (revision, sample) = content_render_scope(params)?;
+                    records.app_content_render(
+                        context,
+                        required_str(params, "campaign_id")?,
+                        revision,
+                        sample.as_deref(),
+                        content_binding(params)?,
+                    )
+                }
+                "app_content_propose" => records.app_content_propose(
                     context,
                     required_str(params, "campaign_id")?,
-                    &CloneOptions {
-                        expected_revision: content_revision(params)?,
-                        name: required_str(params, "name")?,
-                        copy_audience,
-                        source_freeze_id: optional_id("source_freeze_id")?,
-                        copy_sender,
-                        source_binding_id: optional_id("source_binding_id")?,
-                    },
-                )
-            }
-            "app_content_list" => records.app_content_list(context),
-            "app_sender_binding_save" => {
-                let connection = match params.get("connection_id") {
-                    None => None,
-                    Some(Value::String(id)) => Some(id.as_str()),
-                    Some(_) => {
-                        return Err(Error::rejected("sender connection ID must be a string"));
+                    required_str(params, "proposal_id")?,
+                    &content_draft(params)?,
+                ),
+                // CAD-813: the operator mints a one-time proposal
+                // request against a chat message. The message must exist
+                // and carry the server-verified App binding for this
+                // installation and context — the stamp is host scope,
+                // never a browser value. Campaign and source revision
+                // are stamped here and re-proved at redemption.
+                "app_content_proposal_request" => {
+                    let message_id = required_str(params, "message")?;
+                    if message_id.is_empty()
+                        || message_id.len() > 128
+                        || message_id.chars().any(char::is_control)
+                    {
+                        return Err(Error::rejected("proposal message identity is malformed"));
                     }
-                };
-                let draft = crate::store::app_content::BindingDraft {
-                    sender_name: required_str(params, "sender_name")?,
-                    sender_address: required_str(params, "sender_address")?,
-                    unsubscribe_base: required_str(params, "unsubscribe_base")?,
-                    connection_id: connection,
-                };
-                records.app_sender_binding_save(
-                    context,
-                    required_str(params, "binding_id")?,
-                    content_expected(params)?,
-                    &draft,
-                )
-            }
-            "app_sender_binding_show" => {
-                records.app_sender_binding_show(context, required_str(params, "binding_id")?)
-            }
-            "app_sender_binding_list" => records.app_sender_binding_list(context),
-            "app_content_render" => {
-                let (revision, sample) = content_render_scope(params)?;
-                records.app_content_render(
-                    context,
-                    required_str(params, "campaign_id")?,
-                    revision,
-                    sample.as_deref(),
-                    content_binding(params)?,
-                )
-            }
-            "app_content_propose" => records.app_content_propose(
-                context,
-                required_str(params, "campaign_id")?,
-                required_str(params, "proposal_id")?,
-                &content_draft(params)?,
-            ),
-            // CAD-813: the operator mints a one-time proposal
-            // request against a chat message. The message must exist
-            // and carry the server-verified App binding for this
-            // installation and context — the stamp is host scope,
-            // never a browser value. Campaign and source revision
-            // are stamped here and re-proved at redemption.
-            "app_content_proposal_request" => {
-                let message_id = required_str(params, "message")?;
-                if message_id.is_empty()
-                    || message_id.len() > 128
-                    || message_id.chars().any(char::is_control)
-                {
-                    return Err(Error::rejected("proposal message identity is malformed"));
+                    self.store
+                        .message(message_id)?
+                        .ok_or_else(|| Error::rejected("proposal request message is unknown"))?;
+                    let hint = self.store.message_app(message_id)?.ok_or_else(|| {
+                        Error::rejected("proposal request message carries no verified App scope")
+                    })?;
+                    if hint.get("install_id").and_then(Value::as_str) != Some(install)
+                        || hint.get("context_id").and_then(Value::as_str) != Some(context)
+                    {
+                        return Err(Error::rejected(
+                            "proposal request scope does not match its verified chat message",
+                        ));
+                    }
+                    records.app_content_proposal_request(
+                        context,
+                        required_str(params, "campaign_id")?,
+                        message_id,
+                        content_request_id(params)?,
+                    )
                 }
-                self.store
-                    .message(message_id)?
-                    .ok_or_else(|| Error::rejected("proposal request message is unknown"))?;
-                let hint = self.store.message_app(message_id)?.ok_or_else(|| {
-                    Error::rejected("proposal request message carries no verified App scope")
-                })?;
-                if hint.get("install_id").and_then(Value::as_str) != Some(install)
-                    || hint.get("context_id").and_then(Value::as_str) != Some(context)
-                {
-                    return Err(Error::rejected(
-                        "proposal request scope does not match its verified chat message",
-                    ));
+                "app_content_proposal_show" => {
+                    records.app_content_proposal_show(context, required_str(params, "proposal_id")?)
                 }
-                records.app_content_proposal_request(
-                    context,
-                    required_str(params, "campaign_id")?,
-                    message_id,
-                    content_request_id(params)?,
-                )
-            }
-            "app_content_proposal_show" => {
-                records.app_content_proposal_show(context, required_str(params, "proposal_id")?)
-            }
-            // CAD-1014: the operator's before-Apply preview of a pending
-            // proposal — the SAME safe render_html/text the saved-content
-            // path uses, over the stored proposal draft. Pure read; no
-            // apply/save/approve/send, send_ready always false.
-            "app_content_proposal_render" => {
-                let (_, sample) = content_render_scope(params)?;
-                records.app_content_proposal_render(
+                // CAD-1014: the operator's before-Apply preview of a pending
+                // proposal — the SAME safe render_html/text the saved-content
+                // path uses, over the stored proposal draft. Pure read; no
+                // apply/save/approve/send, send_ready always false.
+                "app_content_proposal_render" => {
+                    let (_, sample) = content_render_scope(params)?;
+                    records.app_content_proposal_render(
+                        context,
+                        required_str(params, "proposal_id")?,
+                        sample.as_deref(),
+                        content_binding(params)?,
+                    )
+                }
+                "app_content_proposal_list" => {
+                    let campaign = match params.get("campaign_id") {
+                        None => None,
+                        Some(Value::String(id)) => Some(id.as_str()),
+                        Some(_) => {
+                            return Err(Error::rejected("campaign ID must be a string"));
+                        }
+                    };
+                    records.app_content_proposal_list(context, campaign)
+                }
+                "app_content_proposal_apply" => records.app_content_proposal_apply(
                     context,
                     required_str(params, "proposal_id")?,
-                    sample.as_deref(),
-                    content_binding(params)?,
-                )
-            }
-            "app_content_proposal_list" => {
-                let campaign = match params.get("campaign_id") {
-                    None => None,
-                    Some(Value::String(id)) => Some(id.as_str()),
-                    Some(_) => {
-                        return Err(Error::rejected("campaign ID must be a string"));
-                    }
-                };
-                records.app_content_proposal_list(context, campaign)
-            }
-            "app_content_proposal_apply" => records.app_content_proposal_apply(
-                context,
-                required_str(params, "proposal_id")?,
-                content_expected(params)?,
-            ),
-            "app_content_proposal_discard" => {
-                records.app_content_proposal_discard(context, required_str(params, "proposal_id")?)
-            }
-            "app_content_approve" => records.app_content_approve(
-                context,
-                required_str(params, "campaign_id")?,
-                content_revision(params)?,
-            ),
-            "app_content_test_prepare" => records.app_content_test_prepare(
-                context,
-                required_str(params, "campaign_id")?,
-                required_str(params, "to_email")?,
-                content_binding(params)?,
-            ),
-            "app_content_send_prepare" => {
-                let freeze = match params.get("audience_freeze_id") {
-                    None => None,
-                    Some(Value::String(id)) => {
-                        crate::proto::identifier(id, "freeze ID")?;
-                        Some(id.as_str())
-                    }
-                    Some(_) => {
-                        return Err(Error::rejected("audience freeze ID must be a string"));
-                    }
-                };
-                records.app_content_send_prepare(
+                    content_expected(params)?,
+                ),
+                "app_content_proposal_discard" => records
+                    .app_content_proposal_discard(context, required_str(params, "proposal_id")?),
+                "app_content_approve" => records.app_content_approve(
                     context,
                     required_str(params, "campaign_id")?,
-                    required_str(params, "binding_id")?,
-                    freeze,
-                )
+                    content_revision(params)?,
+                ),
+                "app_content_test_prepare" => records.app_content_test_prepare(
+                    context,
+                    required_str(params, "campaign_id")?,
+                    required_str(params, "to_email")?,
+                    content_binding(params)?,
+                ),
+                "app_content_send_prepare" => {
+                    let freeze = match params.get("audience_freeze_id") {
+                        None => None,
+                        Some(Value::String(id)) => {
+                            crate::proto::identifier(id, "freeze ID")?;
+                            Some(id.as_str())
+                        }
+                        Some(_) => {
+                            return Err(Error::rejected("audience freeze ID must be a string"));
+                        }
+                    };
+                    records.app_content_send_prepare(
+                        context,
+                        required_str(params, "campaign_id")?,
+                        required_str(params, "binding_id")?,
+                        freeze,
+                    )
+                }
+                _ => Err(Error::rejected("unknown app content method")),
             }
-            _ => Err(Error::rejected("unknown app content method")),
-        }?;
+        })?;
         if write {
             // Best-effort audit on core; digests only, never content.
             let digest = result
@@ -599,7 +631,12 @@ impl Shared {
                 "app content payload has unsupported fields",
             ));
         }
-        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant proposal")?;
+        let scoped = self.scoped_chat_assistant(
+            params,
+            peer_pid,
+            "app_content_assistant_propose",
+            "assistant proposal",
+        )?;
         let ScopedChat {
             caller,
             install,
@@ -670,7 +707,12 @@ impl Shared {
         if fields.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
             return Err(Error::rejected("app record payload has unsupported fields"));
         }
-        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant CSV import")?;
+        let scoped = self.scoped_chat_assistant(
+            params,
+            peer_pid,
+            "app_record_csv_assistant_import",
+            "assistant CSV import",
+        )?;
         let records = RecordStore::open(&self.state_dir, &scoped.install)?;
         let request_id = required_str(params, "request_id")?;
         let confirm_token = required_str(params, "confirm_token")?;
@@ -760,7 +802,9 @@ impl Shared {
             "context_id",
             "segment_id",
             "name",
+            "segment_type",
             "predicates",
+            "member_ids",
             "expected_revision",
             "message",
             "token",
@@ -770,7 +814,12 @@ impl Shared {
                 "app audience payload has unsupported fields",
             ));
         }
-        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant segment save")?;
+        let scoped = self.scoped_chat_assistant(
+            params,
+            peer_pid,
+            "app_segment_assistant_save",
+            "assistant segment save",
+        )?;
         let records = RecordStore::open(&self.state_dir, &scoped.install)?;
         // One stamped message redeems one action across all ids
         // (CAD-1014); `expected_revision` is the CAS on the named
@@ -781,7 +830,9 @@ impl Shared {
             "domain": "cadence-app-segment-assistant-save-v1",
             "segment_id": required_str(params, "segment_id")?,
             "name": required_str(params, "name")?,
+            "segment_type": params.get("segment_type").cloned().unwrap_or(Value::Null),
             "predicates": params.get("predicates").cloned().unwrap_or(Value::Null),
+            "member_ids": params.get("member_ids").cloned().unwrap_or(Value::Null),
             "expected_revision": params.get("expected_revision").cloned().unwrap_or(Value::Null),
         }));
         records.app_assistant_claim(
@@ -792,12 +843,12 @@ impl Shared {
             &payload_digest,
             &scoped.caller,
         )?;
-        let result = records.app_segment_save(
+        let result = records.app_segment_save_definition(
             &scoped.context,
             required_str(params, "segment_id")?,
             audience_expected(params)?,
             &audience_name(params)?,
-            &audience_predicates(params)?,
+            &super::app_audiences_rpc::audience_segment_definition(params)?,
         )?;
         let digest = result
             .get("segment")
@@ -845,7 +896,7 @@ impl Shared {
                 "app assistant read payload has unsupported fields",
             ));
         }
-        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant read")?;
+        let scoped = self.scoped_chat_assistant(params, peer_pid, method, "assistant read")?;
         let records = RecordStore::open(&self.state_dir, &scoped.install)?;
         // Reads only — no claim, no mutation, no audit write.
         match method {
@@ -934,7 +985,12 @@ impl Shared {
                 "app content payload has unsupported fields",
             ));
         }
-        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant email draft")?;
+        let scoped = self.scoped_chat_assistant(
+            params,
+            peer_pid,
+            "app_content_assistant_draft",
+            "assistant email draft",
+        )?;
         scoped.require_campaign(required_str(params, "campaign_id")?)?;
         let draft = content_draft(params)?;
         let records = RecordStore::open(&self.state_dir, &scoped.install)?;
@@ -993,9 +1049,78 @@ impl ScopedChat {
             _ => Ok(()),
         }
     }
+
+    /// CAD-1636: a WhatsApp copilot action serves only the WhatsApp
+    /// conversation this chat is about; a chat with no subject (General)
+    /// or another subject refuses.
+    pub(super) fn require_whatsapp(&self, conversation: &str) -> Result<()> {
+        if self.subject.as_deref()
+            != Some(super::whatsapp_copilot::subject_of(conversation).as_str())
+        {
+            return Err(Error::rejected(
+                "WhatsApp assistant actions serve only this chat's own WhatsApp conversation",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Shared {
+    /// Endpoint-session bind shared with media inspection. Pane ancestry
+    /// alone also derives a `setsid`-detached child that kept the pane on
+    /// its ancestry, so the caller must live in the endpoint's own session.
+    /// Pi's bash tool is the one proved exception: a direct child session
+    /// of the managed endpoint, never a further detached descendant.
+    /// Under a test-seam agent assertion the seam stands in for ancestry.
+    pub(super) fn assigned_agent_endpoint_session(
+        &self,
+        peer_pid: u32,
+        caller: &str,
+        desc: &str,
+    ) -> Result<()> {
+        let seam_agent = matches!(
+            crate::test_seam::asserted(),
+            Some(crate::test_seam::Asserted::Agent(ref alias)) if alias == caller
+        );
+        if seam_agent {
+            return Ok(());
+        }
+        let caller_session = crate::peer::proc_session(peer_pid)
+            .map_err(|_| Error::rejected(format!("{desc} caller session is unreadable")))?;
+        let inside = match self.slot_identity(peer_pid)? {
+            Some(SlotWho::Strict(proof)) => {
+                let root = *proof
+                    .segment
+                    .last()
+                    .ok_or_else(|| Error::rejected(format!("{desc} endpoint ancestry is empty")))?;
+                let endpoint_session = crate::peer::proc_session(root).map_err(|_| {
+                    Error::rejected(format!("{desc} endpoint session is unreadable"))
+                })?;
+                proof.lane == caller
+                    && (caller_session == endpoint_session
+                        || self.pi_bash_tool_session(caller, &proof, caller_session)?)
+            }
+            Some(SlotWho::Pane { lane, .. }) => {
+                if lane != caller {
+                    false
+                } else {
+                    let row = self.store.agent(caller)?;
+                    match row.pid.and_then(|pid| u32::try_from(pid).ok()) {
+                        Some(pane) => crate::peer::proc_session(pane).ok() == Some(caller_session),
+                        None => false,
+                    }
+                }
+            }
+            None => false,
+        };
+        if !inside {
+            return Err(Error::rejected(
+                "detached child is outside the assigned agent endpoint session",
+            ));
+        }
+        Ok(())
+    }
+
     /// The shared CAD-813/CAD-1014(b) scoped-chat redeem gate. `desc`
     /// names the verb in refusal text. Returns the connection-derived
     /// caller and the stamped install/context; a detached child, an
@@ -1005,6 +1130,7 @@ impl Shared {
         self: &Arc<Self>,
         params: &Value,
         peer_pid: u32,
+        method: &str,
         desc: &str,
     ) -> Result<ScopedChat> {
         // The caller is the connection's alone: identity-shaped,
@@ -1032,46 +1158,7 @@ impl Shared {
         // a test-seam agent assertion the seam stands in for ancestry
         // (production builds carry no seam) and only the turn proofs
         // below decide.
-        let seam_agent = matches!(
-            crate::test_seam::asserted(),
-            Some(crate::test_seam::Asserted::Agent(ref alias)) if alias == &caller
-        );
-        if !seam_agent {
-            let caller_session = crate::peer::proc_session(peer_pid)
-                .map_err(|_| Error::rejected(format!("{desc} caller session is unreadable")))?;
-            let inside = match self.slot_identity(peer_pid)? {
-                Some(SlotWho::Strict(proof)) => {
-                    let root = *proof.segment.last().ok_or_else(|| {
-                        Error::rejected(format!("{desc} endpoint ancestry is empty"))
-                    })?;
-                    let endpoint_session = crate::peer::proc_session(root).map_err(|_| {
-                        Error::rejected(format!("{desc} endpoint session is unreadable"))
-                    })?;
-                    proof.lane == caller
-                        && (caller_session == endpoint_session
-                            || self.pi_bash_tool_session(&caller, &proof, caller_session)?)
-                }
-                Some(SlotWho::Pane { lane, .. }) => {
-                    if lane != caller {
-                        false
-                    } else {
-                        let row = self.store.agent(&caller)?;
-                        match row.pid.and_then(|pid| u32::try_from(pid).ok()) {
-                            Some(pane) => {
-                                crate::peer::proc_session(pane).ok() == Some(caller_session)
-                            }
-                            None => false,
-                        }
-                    }
-                }
-                None => false,
-            };
-            if !inside {
-                return Err(Error::rejected(
-                    "detached child is outside the assigned agent endpoint session",
-                ));
-            }
-        }
+        self.assigned_agent_endpoint_session(peer_pid, &caller, desc)?;
         let install = required_str(params, "install_id")?;
         crate::proto::identifier(install, "installation ID")?;
         let context = required_str(params, "context_id")?;
@@ -1157,6 +1244,15 @@ impl Shared {
             self.store.app_context_proof(install, context)?;
             Ok(())
         })?;
+        // CAD-1518: the verb runs only when the installation's consented
+        // bundle declares what it serves — never decided by app name.
+        let need = crate::app_assistant::scoped_need(method)
+            .ok_or_else(|| Error::rejected(format!("{desc} is not a scoped chat verb")))?;
+        if !super::app_assistant_rpc::install_declared(self, install)?.admits(need) {
+            return Err(Error::rejected(format!(
+                "{desc} is not declared by this installation"
+            )));
+        }
         Ok(ScopedChat {
             subject: conversation.subject,
             caller,

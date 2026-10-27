@@ -23,6 +23,8 @@ import {
   type PublishState,
 } from "./socialPublish";
 import { workspaceApps } from "./workspaceApps";
+import { useTranslate } from "../../lib/locale";
+import { displayUiNotice, type UiNotice } from "../../lib/uiNotice";
 
 export interface PublishCandidate {
   run_id: string;
@@ -65,6 +67,7 @@ export default function PublishPanel({
   loadArtifact?: typeof workspaceApps.artifact;
   imageReceipts?: typeof workspaceApps.imageResults;
 }) {
+  const t = useTranslate();
   const [intents, setIntents] = useState<PublishIntent[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -100,7 +103,7 @@ export default function PublishPanel({
     ready: boolean;
     error: string | null;
   } | null>(null);
-  const [notice, setNotice] = useState("");
+  const [notice, setNotice] = useState<UiNotice | null>(null);
   // CAD-1027: the imported, digest-verified media for one draft+channel.
   const [media, setMedia] = useState<{ key: string; digest: string; subject: string } | null>(null);
   const statusRef = useRef<HTMLHeadingElement>(null);
@@ -232,8 +235,8 @@ export default function PublishPanel({
       setConfirmation(null);
       setNotice(
         mode === "now"
-          ? `Posted for dispatch as ${reply.intent.intent_id}.`
-          : `Scheduled as ${reply.intent.intent_id} for ${dueLabel(epoch, PUBLISH_TIMEZONE)}.`,
+          ? { key: "Posted for dispatch as {intent}.", slots: { intent: reply.intent.intent_id } }
+          : { key: "Scheduled as {intent} for {due}.", slots: { intent: reply.intent.intent_id, due: dueLabel(epoch, PUBLISH_TIMEZONE) } },
       );
       statusRef.current?.focus();
       await refresh();
@@ -253,7 +256,7 @@ export default function PublishPanel({
     try {
       await client.cancel(intentId, intent.install_id, intent.context_id);
       setConfirmCancel(null);
-      setNotice(`Cancelled ${intentId} before dispatch. Nothing was sent.`);
+      setNotice({ key: "Cancelled {intent} before dispatch. Nothing was sent.", slots: { intent: intentId } });
       statusRef.current?.focus();
       await refresh();
     } catch (error) {
@@ -310,8 +313,8 @@ export default function PublishPanel({
       setSendReview(null);
       setNotice(
         reply.intent.state === "posted"
-          ? `Sent ${intentId} — posted.`
-          : `Send-now for ${intentId} left it ${reply.intent.state}.`
+          ? { key: "Sent {intent} — posted.", slots: { intent: intentId } }
+          : { key: "Send-now for {intent} left it {state}.", slots: { intent: intentId, state: reply.intent.state } }
       );
       statusRef.current?.focus();
       await refresh();
@@ -323,7 +326,7 @@ export default function PublishPanel({
   };
 
   const card = (intent: PublishIntent) => {
-    const reading = reconcileReading(intent.state);
+    const reading = reconcileReading(intent.state, t);
     const unconfirmed = showsUncertainReading(intent);
     // Writer/reviewer prefer the relay-joined envelope values, then the
     // approved-run candidates, never invented.
@@ -335,69 +338,65 @@ export default function PublishPanel({
       <div className="wa-row">
         <h3>{PILOT_DESTINATION.handle}</h3>
         <span className="wa-status" data-tone={publishStateTone(intent.state)}>
-          {publishStateText(intent.state)}
+          {publishStateText(intent.state, t)}
         </span>
       </div>
       <p className="wa-kicker">
-        {intent.intent_id} · due {dueLabel(intent.due_epoch, intent.timezone)}
+        {intent.intent_id} · {t("due")} {dueLabel(intent.due_epoch, intent.timezone)}
       </p>
       <p className="wa-kicker">
         {writer} → {reviewer}
       </p>
       <p className="wa-muted">
-        Destination id echoed <code>{intent.destination_id}</code> (handle
-        never relay-vouched)
+        {t("Destination id echoed")} <code>{intent.destination_id}</code> {t("(handle never relay-vouched)")}
       </p>
       <p className="wa-muted">
-        Caption <code>{intent.caption_digest}</code>
+        {t("Caption")} <code>{intent.caption_digest}</code>
         {intent.image_digest ? (
-          <> · image <code>{intent.image_digest}</code></>
+          <> · {t("image")} <code>{intent.image_digest}</code></>
         ) : (
-          " · text-only"
+          t(" · text-only")
         )}{" "}
-        · binding <code>{intent.frozen_digest}</code> · key{" "}
+        · {t("binding")} <code>{intent.frozen_digest}</code> · {t("key")}{" "}
         <code>{intent.idempotency_key}</code>
       </p>
       {intent.state === "posted" && (
         <p className="wa-muted">
-          Verified receipt bound to the approved revision
+          {t("Verified receipt bound to the approved revision")}
           {intent.permalink ? (
             <>
               {" · "}
               <code>{intent.permalink}</code>
             </>
           ) : null}
-          . A bare success string never counts.
+          {t(". A bare success string never counts.")}
         </p>
       )}
       {intent.state === "refused" && intent.refusal && (
-        <p className="wa-alert">{refusalCopy(intent.refusal)}</p>
+        <p className="wa-alert">{refusalCopy(intent.refusal, t)}</p>
       )}
       {/* Held surfaces state plus a human reason string, never a machine
         code (backend-confirmed): "dispatch authority differs from frozen
         approval" or "approved material changed since freeze". Raw, then
         the needs-human reading. */}
       {intent.state === "held" && intent.refusal?.message && (
-        <p className="wa-alert">Dispatch report: {intent.refusal.message}</p>
+        <p className="wa-alert">{t("Dispatch report:")} {intent.refusal.message}</p>
       )}
       {intent.state === "processing" && !unconfirmed && (
         <p className="wa-muted">
-          Provider call in flight — outcomes reconcile through the status
-          query before any retry.
+          {t("Provider call in flight — outcomes reconcile through the status query before any retry.")}
         </p>
       )}
       {unconfirmed && (
         <p className="wa-muted">
-          Reads as uncertain: the status query found a lost response after
-          accept while state stays processing. Reconcile the upstream
-          ledger before any retry. Never duplicate a provider post.
+          {t("Reads as uncertain: the status query found a lost response after accept while state stays processing. Reconcile the upstream ledger before any retry. Never duplicate a provider post.")}
         </p>
       )}
       {reading && <p className="wa-muted">{reading}</p>}
       {intent.state === "queued" &&
         (sendReview?.intentId === intent.intent_id ? (
-          <section className="wa-panel wa-stack" aria-label="Confirm send now">
-            <h4>Send this exact post now</h4>
+          <section className="wa-panel wa-stack" aria-label={t("Confirm send now")}>
+            <h4>{t("Send this exact post now")}</h4>
             {sendReview.error ? (
               <p className="wa-alert" data-tone="fail" role="alert">
                 {sendReview.error}
@@ -424,17 +423,17 @@ export default function PublishPanel({
                 disabled={!canWrite || !sendReview.ready || sendReview.error !== null}
                 onClick={() => void sendNow(intent)}
               >
-                Confirm send now
+                {t("Confirm send now")}
               </Button>
               <Button size="sm" disabled={busy} onClick={() => setSendReview(null)}>
-                Keep queued
+                {t("Keep queued")}
               </Button>
             </div>
           </section>
         ) : (
           <div className="wa-row">
             <Button size="sm" disabled={!canWrite || busy} onClick={() => armSend(intent)}>
-              Send now
+              {t("Send now")}
             </Button>
           </div>
         ))}
@@ -449,14 +448,14 @@ export default function PublishPanel({
                 disabled={!canWrite}
                 onClick={() => void cancel(intent)}
               >
-                Confirm cancel
+                {t("Confirm cancel")}
               </Button>
               <Button
                 size="sm"
                 disabled={busy}
                 onClick={() => setConfirmCancel(null)}
               >
-                Keep
+                {t("Keep")}
               </Button>
             </>
           ) : (
@@ -465,7 +464,7 @@ export default function PublishPanel({
               disabled={!canWrite || busy}
               onClick={() => setConfirmCancel(intent.intent_id)}
             >
-              Cancel before dispatch
+              {t("Cancel before dispatch")}
             </Button>
           )}
         </div>
@@ -477,28 +476,25 @@ export default function PublishPanel({
   return (
     <div className="wa-stack">
       <section className="wa-panel wa-stack" aria-labelledby="publish-new">
-        <h2 id="publish-new">Publish decision</h2>
+        <h2 id="publish-new">{t("Publish decision")}</h2>
         <p className="wa-muted">
-          Destination is operator-selected:{" "}
+          {t("Destination is operator-selected:")}{" "}
           <strong>
             {PILOT_DESTINATION.handle} · {PILOT_DESTINATION.account_id}
           </strong>
-          . Never inferred from a source handle.
+          {t(". Never inferred from a source handle.")}
         </p>
         <p className="wa-kicker">
-          Landed contract: send grants allow 1–10 uses · dispatch stays
-          closed (send_disabled) until the operator enables it · scheduling
-          freezes the intent, never sends · binding pins digest-form, caption
-          re-resolves from the run at dispatch.
+          {t("Landed contract: send grants allow 1–10 uses · dispatch stays closed (send_disabled) until the operator enables it · scheduling freezes the intent, never sends · binding pins digest-form, caption re-resolves from the run at dispatch.")}
         </p>
         <div className="wa-field">
-          <label htmlFor="publish-grant">AgenticOS send grant</label>
+          <label htmlFor="publish-grant">{t("AgenticOS send grant")}</label>
           <input
             id="publish-grant"
             className="wa-input"
             value={grantId}
             onChange={(event) => setGrantId(event.target.value)}
-            placeholder="dpq_…"
+            placeholder={t("dpq_…")}
             autoComplete="off"
             spellCheck={false}
             disabled={!canWrite || busy}
@@ -506,25 +502,24 @@ export default function PublishPanel({
         </div>
         {grantReady ? (
           <p className="wa-muted">
-            Grant bound: <code>{grantId}</code>
+            {t("Grant bound:")} <code>{grantId}</code>
           </p>
         ) : (
           <p className="wa-alert">
             {grantId
-              ? "A send grant id is dpq_ followed by 8–64 letters, digits, _ or -."
-              : "No publish grant is bound. Enter the AgenticOS send grant id before scheduling."}
+              ? t("A send grant id is dpq_ followed by 8–64 letters, digits, _ or -.")
+              : t("No publish grant is bound. Enter the AgenticOS send grant id before scheduling.")}
           </p>
         )}
         {!candidates.length && (
           <p className="wa-empty">
-            No approved drafts with reviewed artifacts yet. Approve a run
-            first — digests derive from its reviewed material.
+            {t("No approved drafts with reviewed artifacts yet. Approve a run first — digests derive from its reviewed material.")}
           </p>
         )}
         {!!candidates.length && (
           <>
             <div className="wa-field">
-              <label htmlFor="publish-candidate">Approved draft</label>
+              <label htmlFor="publish-candidate">{t("Approved draft")}</label>
               <Select
                 value={candidateId}
                 onChange={setCandidateId}
@@ -533,8 +528,8 @@ export default function PublishPanel({
                   label: value.title,
                   hint: `r ${value.run_id}`,
                 }))}
-                placeholder="Choose an approved draft"
-                aria-label="Approved draft"
+                placeholder={t("Choose an approved draft")}
+                aria-label={t("Approved draft")}
                 disabled={!canWrite || busy}
                 full
               />
@@ -545,14 +540,14 @@ export default function PublishPanel({
                 <p className="wa-kicker">
                   {candidate.writer} → {candidate.reviewer}
                   {candidate.image_digest
-                    ? " · reviewed image bound"
-                    : " · text-only (Facebook only)"}
+                    ? t(" · reviewed image bound")
+                    : t(" · text-only (Facebook only)")}
                 </p>
               </div>
             )}
             <fieldset className="wa-field" disabled={!canWrite || busy}>
-              <legend className="wa-kicker">Choose, then confirm</legend>
-              <div className="wa-row" role="radiogroup" aria-label="Post now or schedule">
+              <legend className="wa-kicker">{t("Choose, then confirm")}</legend>
+              <div className="wa-row" role="radiogroup" aria-label={t("Post now or schedule")}>
                 {(["now", "schedule"] as const).map((value) => (
                   <label key={value} className="wa-row">
                     <input
@@ -562,14 +557,14 @@ export default function PublishPanel({
                       checked={choice === value}
                       onChange={() => setChoice(value)}
                     />{" "}
-                    {value === "now" ? "Post now" : "Schedule"}
+                    {value === "now" ? t("Post now") : t("Schedule")}
                   </label>
                 ))}
               </div>
               {choice === "schedule" && (
                 <div className="wa-field">
                   <label htmlFor="publish-due">
-                    Due time · {PUBLISH_TIMEZONE}
+                    {t("Due time")} · {PUBLISH_TIMEZONE}
                   </label>
                   <input
                     id="publish-due"
@@ -582,7 +577,7 @@ export default function PublishPanel({
                 </div>
               )}
               <div className="wa-field">
-                <label htmlFor="publish-toolkit">Destination channel</label>
+                <label htmlFor="publish-toolkit">{t("Destination channel")}</label>
                 <Select
                   value={toolkit}
                   onChange={(value) =>
@@ -592,14 +587,14 @@ export default function PublishPanel({
                     { value: "instagram", label: "Instagram" },
                     { value: "facebook", label: "Facebook" },
                   ]}
-                  aria-label="Destination channel"
+                  aria-label={t("Destination channel")}
                   disabled={!canWrite || busy}
                 />
               </div>
             </fieldset>
             {confirmation && candidate ? (
-              <section className="wa-panel wa-stack" aria-label="Confirm publish">
-                <h3>Confirm this exact post</h3>
+              <section className="wa-panel wa-stack" aria-label={t("Confirm publish")}>
+                <h3>{t("Confirm this exact post")}</h3>
                 <PublishConfirmation
                   facts={{
                     caption:
@@ -625,10 +620,10 @@ export default function PublishPanel({
                     loading={busy}
                     onClick={() => void schedule()}
                   >
-                    {choice === "now" ? "Confirm and post now" : "Confirm and schedule"}
+                    {choice === "now" ? t("Confirm and post now") : t("Confirm and schedule")}
                   </Button>
                   <Button disabled={busy} onClick={() => setConfirmation(null)}>
-                    Back
+                    {t("Back")}
                   </Button>
                 </div>
               </section>
@@ -640,52 +635,50 @@ export default function PublishPanel({
                     loading={busy}
                     onClick={() => void importImage()}
                   >
-                    {mediaReady ? "Image imported" : "Import image"}
+                    {mediaReady ? t("Image imported") : t("Import image")}
                   </Button>
                 )}
                 <Button variant="primary" disabled={!canReview} onClick={review}>
-                  {choice === "now" ? "Review post now" : "Review schedule"}
+                  {choice === "now" ? t("Review post now") : t("Review schedule")}
                 </Button>
               </div>
             )}
             {imageMissing && (
               <p className="wa-alert" data-tone="fail" role="alert">
-                Instagram needs a reviewed provider-accessible image. Pick a
-                draft with a bound image, or use Facebook text-only.
+                {t("Instagram needs a reviewed provider-accessible image. Pick a draft with a bound image, or use Facebook text-only.")}
               </p>
             )}
           </>
         )}
         {actionError && (
           <p className="wa-alert" data-tone="fail" role="alert">
-            {actionError}
+            {t(actionError)}
           </p>
         )}
         {notice && (
           <p className="wa-muted" role="status">
-            {notice}
+            {displayUiNotice(notice, t)}
           </p>
         )}
       </section>
 
       <section aria-labelledby="publish-status">
         <h2 id="publish-status" ref={statusRef} tabIndex={-1}>
-          Dispatch status
+          {t("Dispatch status")}
         </h2>
         {intents === null && !loadError && (
           <p className="wa-empty" role="status">
-            Loading publish intents…
+            {t("Loading publish intents…")}
           </p>
         )}
         {loadError && (
           <p className="wa-alert" data-tone="fail" role="alert">
-            {loadError}
+            {t(loadError)}
           </p>
         )}
         {intents !== null && !intents.length && (
           <p className="wa-empty">
-            No publish intents yet. An approved decision appears here with its
-            queued, processing and terminal states.
+            {t("No publish intents yet. An approved decision appears here with its queued, processing and terminal states.")}
           </p>
         )}
         {intents !== null && intents.length > 0 && (

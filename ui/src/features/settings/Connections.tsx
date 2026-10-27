@@ -1,12 +1,17 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
+import { routePath, type ConnectionPage } from "../../lib/router";
+import { navigate } from "../../lib/useLocation";
 import type { Connection, ConnectionProvider } from "../../lib/types";
 import Button from "../../ui/Button";
+import Link from "../../ui/Link";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
-import { IconRefresh } from "../../ui/icons";
+import { IconRefresh, IconWarning } from "../../ui/icons";
+import PageState from "../../ui/PageState";
 import {
+  acceptsHosted,
   acceptsSmtp,
   acceptsToken,
   canManage,
@@ -18,6 +23,7 @@ import {
   readinessText,
   scopeHint,
   serviceGroups,
+  serviceLabel,
   smtpPortTlsError,
   smtpSummary,
   isSmtpSender,
@@ -29,7 +35,10 @@ import {
   type VerificationOutcome,
 } from "./connectionsView";
 import { PRESETS, portFor, type Preset, type TlsMode } from "./hostedSmtpView";
+import SmtpAccountForm from "./SmtpAccountForm";
 import { connectionLabel } from "../../lib/connections";
+import "./connections.css";
+import { useTranslate } from "../../lib/locale";
 
 /**
  * CAD-1013 safe enrollment errors. A provider/daemon refusal can carry
@@ -41,6 +50,10 @@ import { connectionLabel } from "../../lib/connections";
  * land here as the backend (CAD-1014) supplies them; anything else is
  * deliberately non-specific.
  */
+// UI-owned copy: kept as English keys, translated at render (never stored translated).
+const UI_CUSTODY_UNPROTECTED = "The daemon cannot isolate this credential from agents using the same system account, so it refused to store it — nothing was stored. To save it anyway, tick the storage-consent box below, then retry — it is never pre-selected.";
+const UI_ENROLL_UNCERTAIN = "Could not confirm the connection was added. Refresh connections before retrying.";
+
 const ENROLL_ERROR: Record<string, string> = {
   // The only stable code the daemon actually emits on this path
   // (platform_rpc enroll): custody_unprotected. It can truthfully say
@@ -48,8 +61,7 @@ const ENROLL_ERROR: Record<string, string> = {
   // credential. Invented codes for non-emitted paths would only mask a
   // future fix under a false specific; the generic fallback below is the
   // honest answer until the backend emits a real code.
-  custody_unprotected:
-    "The daemon cannot isolate this credential from agents using the same system account, so it refused to store it — nothing was stored. To save it anyway, tick the storage-consent box below, then retry — it is never pre-selected.",
+  custody_unprotected: UI_CUSTODY_UNPROTECTED,
 };
 
 /**
@@ -78,27 +90,145 @@ function enrollErrorMessage(e: unknown): string {
   // can echo the credential. The network outcome may be uncertain (the
   // daemon can commit before a lost response), so do not claim 'nothing
   // was saved' — ask the operator to confirm before retrying instead.
-  return "Could not confirm the connection was added. Refresh connections before retrying.";
+  return UI_ENROLL_UNCERTAIN;
 }
 
 /**
- * Settings → Connections (CAD-585): the operator's view of exact
- * provider accounts — the reviewed providers, the always-present Local
- * outbox, enrolled credentials and their local configuration check,
- * rotation and revocation.
+ * CAD-1839 hosted connect. The worker's success envelope is exactly
+ * `{ok:true, hosted:true, url:<https>}`; any other shape — a falsy flag,
+ * a missing or relative URL, a non-https scheme — is a refusal, never a
+ * link to open. The credential and OAuth state never reach this board.
+ */
+const UI_HOSTED_REFUSED =
+  "The deployment did not return a secure sign-in link — nothing was changed.";
+const UI_HOSTED_UNAVAILABLE =
+  "Hosted connections are not available for this service here — nothing was changed.";
+const UI_HOSTED_FAILED =
+  "Could not start the hosted sign-in. Reload the board and try again — nothing was changed.";
+
+function hostedConnectUrl(reply: unknown): string | null {
+  if (reply === null || typeof reply !== "object") return null;
+  const body = reply as { ok?: unknown; hosted?: unknown; url?: unknown };
+  if (body.ok !== true || body.hosted !== true || typeof body.url !== "string") return null;
+  try {
+    const url = new URL(body.url);
+    return url.protocol === "https:" ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function hostedConnectError(e: unknown): string {
+  // 404 is the deployment saying this provider has no hosted connect
+  // route; any other refusal keeps the generic retry line. Raw server
+  // text is never rendered on this path.
+  return e instanceof ApiError && e.status === 404 ? UI_HOSTED_UNAVAILABLE : UI_HOSTED_FAILED;
+}
+
+/** The add/setup/detail routes under the connections section. */
+function connectionsIndexHref(): string {
+  return routePath({ screen: "settings", section: "connections" });
+}
+function connectionAddHref(): string {
+  return routePath({ screen: "settings", section: "connections", page: { kind: "add" } });
+}
+function connectionAddProviderHref(provider: string): string {
+  return routePath({
+    screen: "settings",
+    section: "connections",
+    page: { kind: "addProvider", provider },
+  });
+}
+function connectionDetailHref(id: string): string {
+  return routePath({
+    screen: "settings",
+    section: "connections",
+    page: { kind: "detail", id },
+  });
+}
+
+const emptyGate = {
+  data: null,
+  status: "loading" as const,
+  error: null,
+  asOf: null,
+  inFlight: false,
+};
+
+/**
+ * Settings → Connections (CAD-585, CAD-1319): the operator's view of
+ * exact provider accounts — the reviewed providers, the always-present
+ * Local outbox, enrolled credentials and their local configuration
+ * check, rotation and revocation.
+ *
+ * Presentation is a small routed family, all under the existing
+ * screen=settings / section=connections route object so the sidebar
+ * and section tabs stay selected:
+ *
+ *   /settings/connections                  index of services + accounts
+ *   /settings/connections/new              the service chooser
+ *   /settings/connections/new/<provider>   one service's pinned setup
+ *   /settings/connections/account/<id>     one connection's detail
  *
  * Reads and writes go through the existing strict HTTP APIs
  * (`/api/connection-providers`, `/api/connections…`), operator-only
  * like the daemon RPC they relay. A token exists only in the immediate
  * form state of the create/rotate request that carries it — it is
  * cleared the moment the request settles and is never stored, logged
- * or rendered.
+ * or rendered. A non-operator or a read-only board never mounts the
+ * form or the guarded detail actions — the fetch guards below mean no
+ * resource request is even issued for them.
  */
 export default function Connections({
   viewer,
+  page,
 }: {
-  viewer: { operator: boolean; readOnly: boolean };
+  viewer: {
+    operator: boolean | null;
+    readOnly: boolean;
+    /** CAD-1193: splits the `operator: null` unknown into checking
+     *  vs a completed-but-unanswered check. */
+    access?: "checking" | "unavailable" | null;
+    onRetryAccess?: () => void;
+  };
+  page?: ConnectionPage;
 }) {
+  const canWrite = viewer.operator === true && !viewer.readOnly;
+  // Unknown access grants nothing on any Connections route. Reuse the
+  // index's checking/unavailable state until the bounded proof answers.
+  if (viewer.operator === null) {
+    return <ConnectionsIndex viewer={viewer} canWrite={false} />;
+  }
+  const provenViewer = { ...viewer, operator: viewer.operator };
+  if (page?.kind === "add" || page?.kind === "addProvider") {
+    return <ConnectionsAdd viewer={provenViewer} canWrite={canWrite} page={page} />;
+  }
+  if (page?.kind === "detail") {
+    // Keyed to the id: an id change remounts the page so a stale
+    // per-mount `answered` flag can never carry the proof across ids.
+    return <ConnectionsDetail key={page.id} viewer={provenViewer} canWrite={canWrite} id={page.id} />;
+  }
+  return <ConnectionsIndex viewer={viewer} canWrite={canWrite} />;
+}
+
+/**
+ * The connections index: every registered service and enrolled account,
+ * grouped by provider. Accounts are compact links to their own detail
+ * pages — nothing expands in place.
+ */
+function ConnectionsIndex({
+  viewer,
+  canWrite,
+}: {
+  viewer: {
+    operator: boolean | null;
+    readOnly: boolean;
+    access?: "checking" | "unavailable" | null;
+    onRetryAccess?: () => void;
+  };
+  canWrite: boolean;
+}) {
+  const t = useTranslate();
   const listRes = viewer.operator ? resources.connections : null;
   const providersRes = viewer.operator ? resources.connectionProviders : null;
   const listState = useMaybeResource(listRes);
@@ -109,110 +239,84 @@ export default function Connections({
   useEffect(() => {
     if (providersRes) void providersRes.revalidate();
   }, [providersRes]);
-  const [selected, setSelected] = useState<string | null>(null);
-  // The provider an open Add flow is pinned to, or "" for the pick list;
-  // null = closed.
-  const [adding, setAdding] = useState<string | null>(null);
-  const canWrite = viewer.operator && !viewer.readOnly;
   const rows = listState?.data ?? [];
   const providers = providersState?.data ?? [];
+  const catalogUnavailable = providersState?.status === "empty";
   const refresh = () => {
     if (listRes) void listRes.revalidate();
     if (providersRes) void providersRes.revalidate();
   };
   const groups = serviceGroups(providers, rows);
-  const addProviders = providers.filter((p) => p.provider !== "local");
-  const addBusy = adding !== null;
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="connections-title">
       <div className="flex flex-wrap items-start gap-3 mb-4">
         <div className="min-w-0 flex-1">
-          <h1 id="connections-title" className="text-section font-medium text-ink-100">
-            Connections
-          </h1>
-          <p className="text-label text-ink-400 mt-1 break-words">
-            Exact provider accounts in this workspace. Creating or selecting a connection grants
-            no worker, app or run permissions.
-          </p>
+          <h1 id="connections-title" className="text-section font-medium text-ink-100">{t("Connections")}</h1>
+          <p className="text-label text-ink-400 mt-1 break-words">{t("The accounts your apps use. Credentials stay here; each app chooses how it uses them.")}</p>
         </div>
         {viewer.operator && (
           <div className="flex flex-wrap gap-2 shrink-0 items-center">
-            <StaleChip state={listState ?? { data: null, status: "loading", error: null, asOf: null, inFlight: false }} />
-            <StaleChip state={providersState ?? { data: null, status: "loading", error: null, asOf: null, inFlight: false }} />
+            <StaleChip state={listState ?? emptyGate} />
+            <StaleChip state={providersState ?? emptyGate} />
             <Button
               variant="ghost"
               icon={<IconRefresh />}
               loading={Boolean(listState?.inFlight || providersState?.inFlight)}
               onClick={refresh}
-            >
-              Refresh
-            </Button>
+            >{t("Refresh")}</Button>
             {canWrite && (
-              <Button
-                variant="primary"
-                onClick={() => setAdding("")}
-                disabled={addBusy}
-              >
-                Add connection
-              </Button>
+              <Button variant="primary" href={connectionAddHref()}>{t("Add connection")}</Button>
             )}
           </div>
         )}
       </div>
 
-      {!viewer.operator ? (
-        <div className="card px-4 py-5">
-          <h2 className="text-secondary font-medium text-ink-100 mb-1">
-            Sign in to manage connections
-          </h2>
-          <p className="text-label text-ink-400">
-            Connections are available to the operator. Use Sign in in the top bar to connect
-            with a login link.
-          </p>
-        </div>
+      {viewer.operator === null ? (
+        <PageState title={viewer.access === "unavailable" ? t("Access could not be confirmed") : t("Checking access…")}>
+          {viewer.access === "unavailable" ? (
+            <>
+              {t("Connections are available to the operator; the board's access check did not answer, so nothing is shown.")}{" "}
+              {viewer.onRetryAccess && (
+                <Button size="sm" onClick={viewer.onRetryAccess}>{t("Retry access check")}</Button>
+              )}
+            </>
+          ) : (
+            t("Connections are available to the operator; the board is still proving this session.")
+          )}
+        </PageState>
+      ) : !viewer.operator ? (
+        <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
       ) : (
         <>
           <ResourceGate
-            state={
-              listState ?? { data: null, status: "loading", error: null, asOf: null, inFlight: false }
-            }
+            state={listState ?? emptyGate}
             loading="loading connections…"
             failed="could not load connections"
             onRetry={refresh}
           />
-          <ResourceGate
-            state={
-              providersState ?? { data: null, status: "loading", error: null, asOf: null, inFlight: false }
-            }
-            loading="loading services…"
-            failed="could not load the registered services"
-            onRetry={refresh}
-          />
+          {catalogUnavailable ? (
+            <p className="text-label text-ink-500 break-words" data-state="catalogue-unavailable">
+              {t("The service catalogue is not available on this board. Email accounts from this workspace are shown below.")}
+            </p>
+          ) : (
+            <ResourceGate
+              state={providersState ?? emptyGate}
+              loading="loading services…"
+              failed="could not load the registered services"
+              onRetry={refresh}
+            />
+          )}
           {listState?.data && (
             <div className="space-y-3 min-w-0">
-              {adding !== null && (
-                <AddConnection
-                  // The draft (secret + consent) lives only in this
-                  // component; keying on the preset means a different
-                  // group Setup can never reuse it.
-                  key={adding}
-                  providers={addProviders}
-                  existing={rows}
-                  preset={adding === "" ? null : adding}
-                  onClose={() => setAdding(null)}
-                  onAdded={(id) => {
-                    setAdding(null);
-                    setSelected(id);
-                    refresh();
-                  }}
-                />
-              )}
               {groups.length === 0 ? (
-                <section className="card px-4 py-3.5 min-w-0" aria-label="connections">
-                  <p className="text-label text-ink-500">
-                    No services are registered and no accounts are connected.
-                  </p>
+                <section className="card px-4 py-3.5 min-w-0" aria-label={t("connections")}>
+                  <p className="text-label text-ink-500">{t("No services are registered and no accounts are connected.")}</p>
+                  {canWrite && (
+                    <p className="text-label mt-2">
+                      <Link href={connectionAddHref()} className="lnk">{t("Add a connection")}</Link>
+                    </p>
+                  )}
                 </section>
               ) : (
                 groups.map((group) => (
@@ -220,18 +324,6 @@ export default function Connections({
                     key={group.provider}
                     group={group}
                     canWrite={canWrite}
-                    addBusy={addBusy}
-                    selected={selected}
-                    providers={providers}
-                    onSelect={(id) =>
-                      setSelected((cur) => (cur === id ? null : id))
-                    }
-                    onSetup={() => canWrite && setAdding(group.provider)}
-                    onChanged={refresh}
-                    onRevoked={() => {
-                      setSelected(null);
-                      refresh();
-                    }}
                   />
                 ))
               )}
@@ -244,122 +336,446 @@ export default function Connections({
 }
 
 /**
- * One service group: the provider heading, its account rows and the
- * contextual setup action (or the explicit unsupported state when this
- * service declares no reviewed enrollment).
+ * One service group on the index: the provider heading, its account
+ * links and a setup action when the service offers a reviewed
+ * enrollment. Never silently drops an unavailable provider or an
+ * orphaned account.
  */
 function ServiceSection({
   group,
   canWrite,
-  addBusy,
-  selected,
-  providers,
-  onSelect,
-  onSetup,
-  onChanged,
-  onRevoked,
 }: {
   group: ServiceGroup;
   canWrite: boolean;
-  addBusy: boolean;
-  selected: string | null;
-  providers: ConnectionProvider[];
-  onSelect: (id: string) => void;
-  onSetup: () => void;
-  onChanged: () => void;
-  onRevoked: () => void;
 }) {
+  const t = useTranslate();
   const support = enrollmentSupport(group.info);
   return (
     <section
       className="card px-4 py-3.5 min-w-0"
-      aria-label={`${group.label} connections`}
+      aria-label={t("{label} connections").replace("{label}", () => String(group.label ?? ""))}
     >
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-2">
         <h2 className="slabel">{group.label}</h2>
         <span className="text-micro text-ink-500">
           {group.connections.length === 0
-            ? "nothing connected"
-            : `${group.connections.length} connected`}
+            ? t("nothing connected")
+            : t("{count} connected").replace("{count}", String(group.connections.length))}
         </span>
+        {group.builtin && (
+          <span className="chip bg-ink-800 text-ink-300">{t("built-in")}</span>
+        )}
         {!group.builtin && canWrite && support.shapes.length > 0 && (
           <Button
             variant="ghost"
             size="sm"
             className="ml-auto"
-            onClick={onSetup}
-            disabled={addBusy}
+            href={connectionAddProviderHref(group.provider)}
           >
-            Set up {group.label}
-          </Button>
+            {t("Set up {label}").replace("{label}", () => String(group.label ?? ""))}</Button>
+        )}
+        {!group.builtin && canWrite && group.provider === "smtp" && group.info === null && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="ml-auto"
+            href={connectionAddProviderHref("smtp")}
+          >
+            {group.connections.length === 0 ? t("Add email account") : t("Replace email account")}</Button>
         )}
       </div>
       {group.connections.length === 0 ? (
         <p className="text-label text-ink-500 break-words">
           {group.builtin
-            ? "No built-in accounts."
+            ? t("No built-in accounts.")
             : support.shapes.length === 0
               ? support.reason
-              : `No ${group.label} account connected yet.`}
+              : t("No {label} account connected yet.").replace("{label}", () => String(group.label ?? ""))}
         </p>
       ) : (
         <ul className="space-y-1.5">
           {group.connections.map((row) => (
             <li key={row.id}>
-              <button
-                type="button"
-                onClick={() => onSelect(row.id)}
-                aria-pressed={selected === row.id}
-                aria-label={`${connectionLabel(row)} — ${readinessText(row)}`}
-                className={`w-full text-left px-3 py-2 rounded border min-w-0 ${
-                  selected === row.id
-                    ? "border-accent/60 bg-accent/10"
-                    : "border-ink-700 bg-ink-850 hover:border-edge-hover"
-                }`}
+              <Link
+                href={connectionDetailHref(row.id)}
+                className="conn-row"
               >
-                <span className="flex flex-wrap items-center gap-2 min-w-0">
-                  <span className="text-label font-medium text-ink-100 min-w-0 break-words flex-1">
-                    {connectionLabel(row)}
+                <span className="conn-row-main">
+                  <span className="text-label font-medium text-ink-100 min-w-0 break-words">
+                    {isSmtpSender(row) && row.smtp?.sender ? row.smtp.sender : connectionLabel(row)}
                   </span>
                   <span
                     className={`chip ${row.kind === "builtin" ? "bg-ink-800 text-ink-300" : "bg-accent/15 text-accent"}`}
                   >
-                    {row.kind === "builtin" ? "built-in" : "enrolled"}
+                    {row.kind === "builtin" ? t("built-in") : t("enrolled")}
                   </span>
                   {!isAvailable(row) && (
-                    <span className="chip bg-warn/10 text-warn">unavailable</span>
+                    <span className="chip bg-warn/10 text-warn">{t("unavailable")}</span>
                   )}
                 </span>
-                <span className="block text-micro text-ink-500 mt-0.5 break-words">
+                <span className="conn-row-sub text-micro text-ink-500 break-words">
                   {readinessText(row)}
                 </span>
-              </button>
-              {selected === row.id && (
-                <ConnectionDetail
-                  row={row}
-                  provider={providers.find((p) => p.provider === row.provider) ?? null}
-                  capabilities={connectionCapabilities(providers, row.provider)}
-                  canWrite={canWrite}
-                  onChanged={onChanged}
-                  onRevoked={onRevoked}
-                />
-              )}
+              </Link>
             </li>
           ))}
         </ul>
       )}
       {group.builtin && (
-        <p className="text-micro text-ink-500 mt-2 break-words">
-          Built-in accounts are always present — they carry no credential and cannot be
-          edited or disconnected here.
-        </p>
+        <p className="text-micro text-ink-500 mt-2 break-words">{t("Built-in accounts are always present — they carry no credential and cannot be edited or disconnected here.")}</p>
       )}
-      {!group.builtin && !group.info && (
-        <p className="text-micro text-ink-500 mt-2 break-words">
-          This provider&apos;s service metadata could not be loaded — the account stays
-          under its recorded name. Refresh services; a failed load is not proof the
-          provider was removed.
-        </p>
+      {!group.builtin && !group.info && group.provider !== "smtp" && (
+        <p className="text-micro text-ink-500 mt-2 break-words">{t("This provider's service metadata could not be loaded — the account stays under its recorded name. Refresh services; a failed load is not proof the provider was removed.")}</p>
+      )}
+    </section>
+  );
+}
+
+/**
+ * The dedicated Add pages (CAD-1319): `/new` is the backend-driven
+ * service chooser; `/new/<provider>` is that one service's pinned
+ * setup. A non-operator or a read-only board gets the shared blocked
+ * state and no resource requests or forms — the guards below are the
+ * same as the index's.
+ */
+function ConnectionsAdd({
+  viewer,
+  canWrite,
+  page,
+}: {
+  viewer: { operator: boolean; readOnly: boolean };
+  canWrite: boolean;
+  page: ConnectionPage & { kind: "add" | "addProvider" };
+}) {
+  const t = useTranslate();
+  const providersRes = viewer.operator ? resources.connectionProviders : null;
+  const listRes = viewer.operator ? resources.connections : null;
+  const providersState = useMaybeResource(providersRes);
+  const listState = useMaybeResource(listRes);
+  useEffect(() => {
+    if (providersRes) void providersRes.revalidate();
+  }, [providersRes]);
+  useEffect(() => {
+    if (listRes) void listRes.revalidate();
+  }, [listRes]);
+  const providers = providersState?.data ?? [];
+  const rows = listState?.data ?? [];
+  const refresh = () => {
+    if (providersRes) void providersRes.revalidate();
+    // The list is re-read after an enrollment: bypass the freshness
+    // window so a just-created row is not reported missing.
+    if (listRes) void listRes.invalidate();
+  };
+  // The chooser/setup candidates: the reviewed enrollment shapes only.
+  // Provider "local" (the built-in outbox) is never offered for setup.
+  const addProviders = providers.filter((p) => p.provider !== "local");
+  const pinned = page.kind === "addProvider" ? page.provider : null;
+  const chosen = pinned ? addProviders.find((p) => p.provider === pinned) ?? null : null;
+  const catalogUnavailable = providersState?.status === "empty";
+  const smtpFallback = catalogUnavailable && (page.kind === "add" || (page.kind === "addProvider" && page.provider === "smtp"));
+
+  let title = t("Add connection");
+  if (page.kind === "addProvider") title = t("Set up {label}").replace("{label}", () => serviceLabel(chosen?.provider ?? pinned ?? ""));
+  if (smtpFallback && page.kind === "addProvider") title = t("Add email account");
+
+  return (
+    <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="connections-add-title">
+      <p className="text-label mb-3">
+        <Link href={connectionsIndexHref()} className="lnk">{t("← Connections")}</Link>
+      </p>
+      <div className="conn-add-head conn-form">
+        <h1 id="connections-add-title" className="text-section font-medium text-ink-100 break-words">
+          {title}
+        </h1>
+        {viewer.operator && canWrite && chosen !== null && (
+          <p className="text-micro text-ink-500 break-words">
+            <Link href={connectionAddHref()} className="lnk">{t("← Choose a different service")}</Link>
+          </p>
+        )}
+      </div>
+      <p className="text-label text-ink-400 mt-1 break-words">{t("Creating a connection grants no worker, app or run permissions.")}</p>
+
+      {!viewer.operator ? (
+        <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
+      ) : (
+        <div className="conn-form mt-4">
+          {!canWrite ? (
+            <PageState title={t("Read-only board")}>
+              {t("This board is read-only — connections cannot be added or changed here.")}
+              <span className="block mt-3">
+                <Link href={connectionsIndexHref()} className="lnk">{t("Back to connections")}</Link>
+              </span>
+            </PageState>
+          ) : smtpFallback ? (
+            <>
+              <p className="text-label text-ink-400 break-words" data-state="smtp-fallback">
+                {t("The service catalogue is not available on this board. You can still manage the workspace email account here.")}
+              </p>
+              <ResourceGate
+                state={listState ?? emptyGate}
+                loading="loading connections…"
+                failed="could not load connections"
+                onRetry={refresh}
+              />
+              {listState?.data && (
+                <SmtpAccountForm
+                  rows={rows}
+                  onSaved={(id) => {
+                    refresh();
+                    navigate(connectionDetailHref(id));
+                  }}
+                />
+              )}
+            </>
+          ) : (
+            <>
+              <StaleChip state={providersState ?? emptyGate} />
+              <ResourceGate
+                state={providersState ?? emptyGate}
+                loading="loading services…"
+                failed="could not load the registered services"
+                onRetry={refresh}
+              />
+              {providersState?.data && page.kind === "add" ? (
+                <ServiceChooser providers={addProviders} />
+              ) : providersState?.data && page.kind === "addProvider" ? (
+                chosen === null ? (
+                  <PageState title={t("Service unavailable")}>
+                    {t("That service is not available for setup — it may have been removed or its reviewed enrollment metadata could not be read.")}
+                    <span className="block mt-3">
+                      <Link href={connectionAddHref()} className="lnk">{t("Choose a different service")}</Link>
+                    </span>
+                  </PageState>
+                ) : acceptsHosted(chosen) ? (
+                  // CAD-1839: a hosted provider has no token/SMTP form —
+                  // the deployment runs the sign-in and the board only
+                  // opens the returned URL. Returning to Connections
+                  // revalidates the list like any other enrollment.
+                  <HostedConnect
+                    key={chosen.provider}
+                    provider={chosen}
+                    onClose={() => navigate(connectionsIndexHref())}
+                  />
+                ) : (
+                  <>
+                    <AddConnection
+                      // The draft (secret + consent) lives only in this
+                      // component; keying on the provider means a route
+                      // change to another service can never reuse it.
+                      key={chosen.provider}
+                      providers={addProviders}
+                      existing={rows}
+                      preset={chosen.provider}
+                      hideProviderPicker
+                      submitLabel={t("Save connection")}
+                      onClose={() => navigate(connectionsIndexHref())}
+                      onAdded={(id) => {
+                        refresh();
+                        navigate(connectionDetailHref(id));
+                      }}
+                    />
+                  </>
+                )
+              ) : null}
+            </>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** The `/new` chooser: every registered service that offers a reviewed
+ *  enrollment, with truthful reasons on the ones that do not. No fake
+ *  services and no invented OAuth/API capabilities. */
+function ServiceChooser({ providers }: { providers: ConnectionProvider[] }) {
+  const t = useTranslate();
+  const enrollable = providers.filter((p) => enrollmentSupport(p).shapes.length > 0);
+  const unsupported = providers.filter((p) => enrollmentSupport(p).shapes.length === 0);
+  return (
+    <div className="space-y-4">
+      <p className="text-label text-ink-400 break-words">{t("Choose a registered service to connect. Only the enrollment methods the service's reviewed descriptor declares are offered.")}</p>
+      {enrollable.length === 0 ? (
+        <p className="text-label text-ink-500 break-words">{t("No registered service currently offers a reviewed enrollment.")}</p>
+      ) : (
+        <ul className="space-y-1.5">
+          {enrollable.map((p) => (
+            <li key={p.provider}>
+              <Link href={connectionAddProviderHref(p.provider)} className="conn-row">
+                <span className="conn-row-main">
+                  <span className="text-label font-medium text-ink-100 break-words">
+                    {serviceLabel(p.provider)}
+                  </span>
+                  {capabilityWords(p) && (
+                    <span className="text-micro text-ink-500 break-words">
+                      {capabilityWords(p)}
+                    </span>
+                  )}
+                </span>
+                <span className="conn-row-sub text-micro text-ink-500 break-words">
+                  {t("Connects with {shapes}").replace("{shapes}", () =>
+                    enrollmentSupport(p)
+                      .shapes.map((shape) => (shape === "hosted" ? t("a hosted sign-in") : shape))
+                      .join(" or "),
+                  )}
+                </span>
+              </Link>
+            </li>
+          ))}
+        </ul>
+      )}
+      {unsupported.length > 0 && (
+        <div>
+          <h2 className="slabel mb-2">{t("Not available to connect")}</h2>
+          <ul className="space-y-1.5">
+            {unsupported.map((p) => (
+              <li key={p.provider} className="px-3 py-2 rounded border border-ink-700 bg-ink-850">
+                <span className="text-label text-ink-300 break-words">{serviceLabel(p.provider)}</span>
+                <span className="block text-micro text-ink-500 mt-0.5 break-words">
+                  {enrollmentSupport(p).reason}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One connection's dedicated detail page (CAD-1319). The id comes from
+ * the route; only a fresh successful list answer may report it missing
+ * — a loading, failed or stale read never becomes a false not-found.
+ */
+function ConnectionsDetail({
+  viewer,
+  canWrite,
+  id,
+}: {
+  viewer: { operator: boolean; readOnly: boolean };
+  canWrite: boolean;
+  id: string;
+}) {
+  const t = useTranslate();
+  const listRes = viewer.operator ? resources.connections : null;
+  const providersRes = viewer.operator ? resources.connectionProviders : null;
+  const listState = useMaybeResource(listRes);
+  const providersState = useMaybeResource(providersRes);
+  // CAD-1319 review: a row missing from a previously cached answer is
+  // never a 404 — the entry forces one fetch for this mount (bypassing
+  // revalidate's freshness skip) and only a completed successful answer
+  // with no request in flight may call the id unknown. A failed or
+  // stale fetch keeps its own state; it is never misread as missing.
+  const [answered, setAnswered] = useState(false);
+  useEffect(() => {
+    setAnswered(false);
+    if (!listRes) return;
+    let live = true;
+    void listRes.refresh().then(() => {
+      if (live) setAnswered(true);
+    });
+    return () => {
+      live = false;
+    };
+  }, [listRes, id]);
+  useEffect(() => {
+    if (providersRes) void providersRes.revalidate();
+  }, [providersRes]);
+  const rows = listState?.data ?? [];
+  const providers = providersState?.data ?? [];
+  const refresh = () => {
+    if (listRes) void listRes.invalidate();
+    if (providersRes) void providersRes.revalidate();
+  };
+  const row = rows.find((r) => r.id === id) ?? null;
+  const provider = row ? providers.find((p) => p.provider === row.provider) ?? null : null;
+  // The provider's descriptor is unknown while its resource is still
+  // loading or failed — distinct from a loaded answer that genuinely
+  // does not contain the provider. Metadata unknown is never shown as
+  // "unsupported verification": verification reads unsupported only on
+  // a loaded answer.
+  const providersPending = providersState === null || providersState.status === "loading";
+  const providersFailed = providersState?.status === "failed";
+  const providerUnknown = row !== null && provider === null && (providersPending || providersFailed === true);
+  // Settled-and-empty: this mount's fetch completed and the id is not
+  // in the answer. An in-flight or stale/failed answer never qualifies.
+  const notFound =
+    row === null && answered && !listState?.inFlight &&
+    (listState?.status === "ok" || listState?.status === "empty");
+
+  return (
+    <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="connection-detail-title">
+      <div className="flex flex-wrap gap-2 items-center justify-between mb-4">
+        <Link href={connectionsIndexHref()} className="lnk text-label">{t("← Connections")}</Link>
+        {viewer.operator && (
+          <div className="flex flex-wrap gap-2 items-center ms-auto">
+            <StaleChip state={listState ?? emptyGate} />
+            <StaleChip state={providersState ?? emptyGate} />
+            <Button
+              variant="ghost"
+              icon={<IconRefresh />}
+              loading={Boolean(listState?.inFlight || providersState?.inFlight)}
+              onClick={refresh}
+            >{t("Refresh")}</Button>
+          </div>
+        )}
+      </div>
+
+      {!viewer.operator ? (
+        <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
+      ) : (
+        <>
+          <ResourceGate
+            state={listState ?? emptyGate}
+            loading="loading connection…"
+            failed="could not load the connection"
+            onRetry={refresh}
+          />
+          {row !== null ? (
+            <>
+              {providerUnknown && (
+                <p className="text-micro text-ink-500 mb-2 break-words" role="status">
+                  {providersPending ? t("Loading this connection's service metadata…") : t("This connection's service metadata could not be loaded — capabilities and remote-verification status are unknown until it loads. The account below is intact.")}
+                  {providersFailed === true && (
+                    <>
+                      {" "}
+                      <button className="lnk" onClick={() => providersRes && void providersRes.revalidate()}>{t("retry")}</button>
+                    </>
+                  )}
+                </p>
+              )}
+              <ConnectionDetail
+                // Keyed to the exact account: a route change to another
+                // id remounts the detail, so rotation/revoke drafts and
+                // check/test generations can never carry across.
+                key={row.id}
+                row={row}
+                provider={provider}
+                capabilities={connectionCapabilities(providers, row.provider)}
+                canWrite={canWrite}
+                standalone
+                providerMetaPending={providerUnknown}
+                onChanged={refresh}
+                onRevoked={() => {
+                  refresh();
+                  navigate(connectionsIndexHref());
+                }}
+              />
+            </>
+          ) : notFound ? (
+            <PageState title={t("Connection not found")}>
+              {t("This connection is not on this board — it may have been disconnected or the link is out of date.")}
+              <span className="block mt-3">
+                <Link href={connectionsIndexHref()} className="lnk">{t("Back to connections")}</Link>
+              </span>
+            </PageState>
+          ) : listState?.data || listState?.status === "stale" || listState?.status === "failed" ? (
+            // The list answered once but is refreshing or failed over:
+            // the missing row may simply be stale — never a 404.
+            <div className="card px-4 py-5 text-secondary text-ink-400" role="status">{t("Checking this connection against the latest account list…")}</div>
+          ) : null}
+        </>
       )}
     </section>
   );
@@ -371,6 +787,8 @@ export function ConnectionDetail({
   provider,
   capabilities,
   canWrite,
+  standalone = false,
+  providerMetaPending = false,
   onChanged,
   onRevoked,
 }: {
@@ -378,17 +796,26 @@ export function ConnectionDetail({
   provider?: ConnectionProvider | null;
   capabilities: string | null;
   canWrite: boolean;
+  /** Standalone page: the card owns the heading; skip the inner title. */
+  standalone?: boolean;
+  /** Provider metadata is still loading or failed — its absence is not
+   *  evidence the provider is gone, so verification/support copy reads
+   *  unknown rather than unsupported. */
+  providerMetaPending?: boolean;
   onChanged: () => void;
   onRevoked: () => void;
 }) {
+  const t = useTranslate();
   const [rotating, setRotating] = useState(false);
   const [revoking, setRevoking] = useState(false);
   const [checking, setChecking] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [note, setNote] = useState<{ ok: boolean; warn?: boolean; text: string } | null>(null);
+  const [note, setNote] = useState<{ ok: boolean; warn?: boolean; text: string; suffix?: string } | null>(null);
   const [verifyNote, setVerifyNote] = useState<VerificationOutcome | null>(null);
   const managed = canManage(row);
-  const verify = verificationSupport(provider ?? null);
+  const verify = providerMetaPending
+    ? { supported: false, reason: "" }
+    : verificationSupport(provider ?? null);
   // The broker's test is admissible only for a writable operator on an
   // enrolled SMTP sender whose provider advertises the reviewed
   // smtp-login-no-send-v1 operation and whose live row is available — a
@@ -462,18 +889,15 @@ export function ConnectionDetail({
         if (!isAvailable(c) || smtpErr !== null) {
           setNote({
             ok: false,
-            text:
-              readinessText(c) +
-              (smtpErr ? " " + smtpErr : "") +
-              " Fix the configuration, then check again.",
+            text: readinessText(c) + (smtpErr ? " " + smtpErr : ""),
+            suffix: "Fix the configuration, then check again.",
           });
         } else if (c.status.manifest_status !== "matched") {
           setNote({
             ok: false,
             warn: true,
-            text:
-              pinWord(c.status) +
-              " — the local configuration is present but its deployment does not match the reviewed contract, so this is not a verified connection.",
+            text: pinWord(c.status),
+            suffix: "— the local configuration is present but its deployment does not match the reviewed contract, so this is not a verified connection.",
           });
         } else {
           setNote({
@@ -545,26 +969,36 @@ export function ConnectionDetail({
   };
 
   return (
-    <section className="card px-4 py-3.5 min-w-0" aria-label={`${connectionLabel(row)} detail`}>
-      <h2 className="text-cardtitle font-medium text-ink-100 break-words">
-        {connectionLabel(row)}
-      </h2>
+    <section className="card px-4 py-3.5 min-w-0" aria-label={t("{connectionLabel} detail").replace("{connectionLabel}", () => String(connectionLabel(row) ?? ""))}>
+      {standalone ? (
+        <h1 id="connection-detail-title" className="text-section font-medium text-ink-100 break-words">
+          {connectionLabel(row)}
+        </h1>
+      ) : (
+        <h2 className="text-cardtitle font-medium text-ink-100 break-words">
+          {connectionLabel(row)}
+        </h2>
+      )}
       <dl className="mt-2 space-y-1 text-label min-w-0">
         <div className="flex flex-wrap gap-x-2">
-          <dt className="text-ink-500">Account</dt>
+          <dt className="text-ink-500">{t("Account")}</dt>
           <dd className="text-ink-200 break-words">
             {row.provider} · {row.account}
           </dd>
         </div>
+        <div className="flex flex-wrap gap-x-2 min-w-0">
+          <dt className="text-ink-500">{t("Readiness")}</dt>
+          <dd className="text-ink-200 break-words">{readinessText(row)}</dd>
+        </div>
         {smtpSummary(row) && (
           <div className="flex flex-wrap gap-x-2 min-w-0">
-            <dt className="text-ink-500">Sender</dt>
+            <dt className="text-ink-500">{t("Sender")}</dt>
             <dd className="text-ink-200 break-words">{smtpSummary(row)}</dd>
           </div>
         )}
         {smtpErrorMessage(row) && (
           <div className="flex flex-wrap gap-x-2 min-w-0">
-            <dt className="text-ink-500">Sender</dt>
+            <dt className="text-ink-500">{t("Sender")}</dt>
             <dd className="text-fail break-words" role="alert" data-smtp-error={row.smtp_error ?? "unavailable"}>
               {smtpErrorMessage(row)}
             </dd>
@@ -572,77 +1006,66 @@ export function ConnectionDetail({
         )}
         {capabilities && (
           <div className="flex flex-wrap gap-x-2 min-w-0">
-            <dt className="text-ink-500">Capabilities</dt>
+            <dt className="text-ink-500">{t("Capabilities")}</dt>
             <dd className="text-ink-200 break-words">{capabilities}</dd>
           </div>
         )}
       </dl>
 
       <details className="mt-2 text-label min-w-0">
-        <summary className="cursor-pointer select-none text-ink-400">
-          Technical details
-        </summary>
+        <summary className="cursor-pointer select-none text-ink-400">{t("Technical details")}</summary>
         <dl className="mt-2 space-y-1 min-w-0">
           <div className="flex flex-wrap gap-x-2 min-w-0">
-            <dt className="text-ink-500">Connection ID</dt>
+            <dt className="text-ink-500">{t("Connection ID")}</dt>
             <dd className="num text-ink-200 break-all">{row.id}</dd>
           </div>
           <div className="flex flex-wrap gap-x-2">
-            <dt className="text-ink-500">Credential</dt>
+            <dt className="text-ink-500">{t("Credential")}</dt>
             <dd className="text-ink-200">
-              {row.kind === "builtin"
-                ? "none — built-in"
-                : `revision ${row.revision ?? "?"}`}
+              {row.kind === "builtin" ? t("none — built-in") : `revision ${row.revision ?? "?"}`}
             </dd>
           </div>
           {row.scopes.length > 0 && (
             <div className="flex flex-wrap gap-x-2 min-w-0">
-              <dt className="text-ink-500">Scopes</dt>
+              <dt className="text-ink-500">{t("Scopes")}</dt>
               <dd className="num text-ink-200 break-words">{row.scopes.join(", ")}</dd>
             </div>
           )}
           {row.registration_digest && (
             <div className="flex flex-wrap gap-x-2 min-w-0">
-              <dt className="text-ink-500">Registration</dt>
+              <dt className="text-ink-500">{t("Registration")}</dt>
               <dd className="num text-ink-200 break-all">{row.registration_digest}</dd>
             </div>
           )}
           {row.status.reviewed_pin && (
             <div className="flex flex-wrap gap-x-2 min-w-0">
-              <dt className="text-ink-500">Reviewed pin</dt>
+              <dt className="text-ink-500">{t("Reviewed pin")}</dt>
               <dd className="num text-ink-200 break-all">{row.status.reviewed_pin}</dd>
             </div>
           )}
           {row.status.reported_pin && (
             <div className="flex flex-wrap gap-x-2 min-w-0">
-              <dt className="text-ink-500">Reported pin</dt>
+              <dt className="text-ink-500">{t("Reported pin")}</dt>
               <dd className="num text-ink-200 break-all">{row.status.reported_pin}</dd>
             </div>
           )}
           <div className="flex flex-wrap gap-x-2 min-w-0">
-            <dt className="text-ink-500">Deployment</dt>
+            <dt className="text-ink-500">{t("Deployment")}</dt>
             <dd className="text-ink-200 break-words">{pinWord(row.status)}</dd>
           </div>
           <div className="flex flex-wrap gap-x-2 min-w-0">
-            <dt className="text-ink-500">Remote verification</dt>
+            <dt className="text-ink-500">{t("Remote verification")}</dt>
             <dd className="text-ink-200 break-words">
-              {verify.supported
-                ? "available"
-                : `unsupported — ${verify.reason}`}
+              {providerMetaPending ? t("unknown — the service's metadata is still loading") : verify.supported ? t("available") : `unsupported — ${verify.reason}`}
             </dd>
           </div>
-          <p className="text-micro text-ink-500 pt-1 break-words">
-            Listing and local configuration reads never contact this account&apos;s
-            network; a remote login test (when offered) is a separate explicit check.
-            Either way the result is evidence only — it grants no execution permission
-            and proves no message delivery or sender entitlement.
-          </p>
+          <p className="text-micro text-ink-500 pt-1 break-words">{t("Listing and local configuration reads never contact this account's network; a remote login test (when offered) is a separate explicit check. Either way the result is evidence only — it grants no execution permission and proves no message delivery or sender entitlement.")}</p>
         </dl>
       </details>
 
       {note && (
         <p className={`text-label mt-2 break-words ${note.ok ? "text-ink-300" : note.warn ? "text-warn" : "text-fail"}`} role={note.ok ? "status" : "alert"}>
-          {note.text}
+          {t(note.text)}{note.suffix ? " " + t(note.suffix) : ""}
         </p>
       )}
       {verifyNote && (
@@ -651,13 +1074,13 @@ export function ConnectionDetail({
           role={verifyNote.ok ? "status" : "alert"}
           data-verify-status={verifyNote.ok ? "success" : verifyNote.stale ? "stale" : "failed"}
         >
-          {verifyNote.text}
+          {t(verifyNote.text)}
         </p>
       )}
       {canWrite && (
         <div className="flex flex-wrap items-center gap-2 mt-3">
           <Button variant="secondary" size="sm" onClick={check} loading={checking}>
-            {checking ? "Checking…" : "Check configuration"}
+            {checking ? t("Checking…") : t("Check configuration")}
           </Button>
           {testable && (
             <Button
@@ -667,7 +1090,7 @@ export function ConnectionDetail({
               loading={testing}
               disabled={testing || checking}
             >
-              {testing ? "Testing…" : "Test connection"}
+              {testing ? t("Testing…") : t("Test SMTP login")}
             </Button>
           )}
           {managed && (
@@ -679,9 +1102,7 @@ export function ConnectionDetail({
                   setRevoking(false);
                   setRotating((v) => !v);
                 }}
-              >
-                Update credentials…
-              </Button>
+              >{t("Update credentials…")}</Button>
               <Button
                 variant="danger"
                 size="sm"
@@ -689,18 +1110,13 @@ export function ConnectionDetail({
                   setRotating(false);
                   setRevoking((v) => !v);
                 }}
-              >
-                Disconnect…
-              </Button>
+              >{t("Disconnect…")}</Button>
             </>
           )}
         </div>
       )}
       {!canWrite && managed && (
-        <p className="text-micro text-ink-500 mt-2">
-          Updating credentials and disconnecting are the operator&apos;s on an editable
-          board.
-        </p>
+        <p className="text-micro text-ink-500 mt-2">{t("Updating credentials and disconnecting are the operator's on an editable board.")}</p>
       )}
       {managed && rotating && (
         <RotateForm row={row} onDone={onChanged} onClose={() => setRotating(false)} />
@@ -709,10 +1125,7 @@ export function ConnectionDetail({
         <RevokeConfirm row={row} onDone={onRevoked} onClose={() => setRevoking(false)} />
       )}
       {!managed && (
-        <p className="text-micro text-ink-500 mt-2 break-words">
-          Built-in connections are always present — they carry no credential and cannot be
-          edited or disconnected through credential management.
-        </p>
+        <p className="text-micro text-ink-500 mt-2 break-words">{t("Built-in connections are always present — they carry no credential and cannot be edited or disconnected through credential management.")}</p>
       )}
     </section>
   );
@@ -728,6 +1141,7 @@ export function RotateForm({
   onDone: () => void;
   onClose: () => void;
 }) {
+  const t = useTranslate();
   const tokenId = useId();
   const scopesId = useId();
   const [token, setToken] = useState("");
@@ -821,23 +1235,21 @@ export function RotateForm({
   return (
     <form
       className="mt-3 space-y-2 border-t border-ink-700 pt-3"
-      aria-label={`rotate ${connectionLabel(row)}`}
+      aria-label={t("rotate {connectionLabel}").replace("{connectionLabel}", () => String(connectionLabel(row) ?? ""))}
       onSubmit={(e) => {
         e.preventDefault();
         submit();
       }}
     >
       <p className="text-label text-ink-300 break-words">
-        Replace the credential. The connection keeps its identity and moves to a new revision;
-        re-enrolling the same account later creates a new connection instead.
+        {t("Replace the credential. The connection keeps its identity and moves to a new revision; re-enrolling the same account later creates a new connection instead.")}
         {isSmtp && (
-          <> Rotating an SMTP sender invalidates its installation bindings until the
-          operator rebinds them.</>
+          <> {t("Rotating an SMTP sender invalidates its installation bindings until the operator rebinds them.")}</>
         )}
       </p>
       <div>
         <label htmlFor={tokenId} className="text-label font-medium text-ink-200">
-          {isSmtp ? "New SMTP password" : "New token"}
+          {isSmtp ? t("New SMTP password") : t("New token")}
         </label>
         <input
           id={tokenId}
@@ -856,22 +1268,18 @@ export function RotateForm({
       {isSmtp && (
         <details className="space-y-2" open={unreadable}>
           <summary className="text-label font-medium text-ink-300 cursor-pointer select-none">
-            Server &amp; sender details{" "}
+            {t("Server & sender details")}{" "}
             <span className="text-ink-500 font-normal">
-              {unreadable ? "(required — enter every field)" : "(optional — blank keeps the current values)"}
+              {unreadable ? t("(required — enter every field)") : t("(optional — blank keeps the current values)")}
             </span>
           </summary>
           <fieldset className="space-y-2 mt-2">
-            <legend className="sr-only">SMTP server and sender</legend>
+            <legend className="sr-only">{t("SMTP server and sender")}</legend>
             <p className="text-micro text-ink-500 break-words">
-              {unreadable
-                ? "Nothing is kept from the unreadable settings. Enter the server, port, username and sender address; the sender name is optional."
-                : "Leave everything blank to keep the live server and sender. Only fill a field you intend to change."}
+              {unreadable ? t("Nothing is kept from the unreadable settings. Enter the server, port, username and sender address; the sender name is optional.") : t("Leave everything blank to keep the live server and sender. Only fill a field you intend to change.")}
             </p>
             <div>
-              <label htmlFor={`${scopesId}-host`} className="text-label text-ink-300">
-                Server host
-              </label>
+              <label htmlFor={`${scopesId}-host`} className="text-label text-ink-300">{t("Server host")}</label>
               <input
                 id={`${scopesId}-host`}
                 type="text"
@@ -885,9 +1293,7 @@ export function RotateForm({
               />
             </div>
             <div>
-              <label htmlFor={`${scopesId}-transport`} className="text-label text-ink-300">
-                Port &amp; security
-              </label>
+              <label htmlFor={`${scopesId}-transport`} className="text-label text-ink-300">{t("Port & security")}</label>
               <select
                 id={`${scopesId}-transport`}
                 value={smtpTransport}
@@ -896,18 +1302,16 @@ export function RotateForm({
                 disabled={busy}
               >
                 {row.smtp ? (
-                  <option value="">Keep current — {row.smtp.port} ({row.smtp.tls_mode === "implicit" ? "implicit TLS" : "STARTTLS"})</option>
+                  <option value="">{t("Keep current — {port} ({mode})").replace("{port}", String(row.smtp.port ?? "")).replace("{mode}", () => row.smtp!.tls_mode === "implicit" ? t("implicit TLS") : t("STARTTLS"))}</option>
                 ) : (
-                  <option value="">Choose…</option>
+                  <option value="">{t("Choose…")}</option>
                 )}
-                <option value="implicit">465 — implicit TLS</option>
-                <option value="starttls">587 — STARTTLS</option>
+                <option value="implicit">{t("465 — implicit TLS")}</option>
+                <option value="starttls">{t("587 — STARTTLS")}</option>
               </select>
             </div>
             <div>
-              <label htmlFor={`${scopesId}-username`} className="text-label text-ink-300">
-                Username
-              </label>
+              <label htmlFor={`${scopesId}-username`} className="text-label text-ink-300">{t("Username")}</label>
               <input
                 id={`${scopesId}-username`}
                 type="text"
@@ -921,9 +1325,7 @@ export function RotateForm({
               />
             </div>
             <div>
-              <label htmlFor={`${scopesId}-sender`} className="text-label text-ink-300">
-                Sender address (verified)
-              </label>
+              <label htmlFor={`${scopesId}-sender`} className="text-label text-ink-300">{t("Sender address (verified)")}</label>
               <input
                 id={`${scopesId}-sender`}
                 type="text"
@@ -937,9 +1339,7 @@ export function RotateForm({
               />
             </div>
             <div>
-              <label htmlFor={`${scopesId}-sender_name`} className="text-label text-ink-300">
-                Sender name
-              </label>
+              <label htmlFor={`${scopesId}-sender_name`} className="text-label text-ink-300">{t("Sender name")}</label>
               <input
                 id={`${scopesId}-sender_name`}
                 type="text"
@@ -960,7 +1360,7 @@ export function RotateForm({
       {!isSmtp && (
         <div>
           <label htmlFor={scopesId} className="text-label font-medium text-ink-200">
-            Scopes <span className="text-ink-500 font-normal">(optional — blank keeps the current scopes)</span>
+            {t("Scopes")} <span className="text-ink-500 font-normal">{t("(optional — blank keeps the current scopes)")}</span>
           </label>
           <input
             id={scopesId}
@@ -977,16 +1377,14 @@ export function RotateForm({
       )}
       {error && (
         <p className="text-label text-fail break-words" role="alert">
-          {error}
+          {t(error)}
         </p>
       )}
       <div className="flex flex-wrap gap-2">
         <Button variant="primary" size="sm" type="submit" loading={busy} disabled={token.trim() === ""}>
-          {busy ? "Replacing…" : "Replace credential"}
+          {busy ? t("Replacing…") : t("Replace credential")}
         </Button>
-        <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>
-          Cancel
-        </Button>
+        <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>{t("Cancel")}</Button>
       </div>
     </form>
   );
@@ -1002,28 +1400,52 @@ function RevokeConfirm({
   onDone: () => void;
   onClose: () => void;
 }) {
+  const t = useTranslate();
   const [armed, setArmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // CAD-1319 review: a revoke is bound to the exact mounted row context —
+  // id + credential revision + registration digest. A row swap (route or
+  // refresh), a close, a rotation or an unmount invalidates the request,
+  // so a late success can never navigate away from a newer view and a
+  // late failure never reports on a different account.
+  const revokeGen = useRef(0);
+  const ctx = `${row.id}:${row.revision ?? "x"}:${row.registration_digest ?? "x"}`;
+  const ctxRef = useRef(ctx);
+  ctxRef.current = ctx;
+  // Commit-phase cleanup (see AddConnection): an unmount driven by a
+  // synchronous store change invalidates the in-flight revoke before the
+  // next view commits, so a late success never navigates away.
+  useLayoutEffect(() => {
+    return () => {
+      revokeGen.current += 1; // unmount/close invalidates any in-flight revoke
+    };
+  }, []);
 
   const submit = () => {
     if (busy || !armed) return;
     setBusy(true);
     setError(null);
+    const gen = ++revokeGen.current;
+    const want = ctxRef.current;
     api
       .connectionRevoke(row.id)
-      .then(() => onDone())
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
-      .finally(() => setBusy(false));
+      .then(() => {
+        if (gen !== revokeGen.current || ctxRef.current !== want) return;
+        onDone();
+      })
+      .catch((e: ApiError) => {
+        if (gen !== revokeGen.current || ctxRef.current !== want) return;
+        setError(e.message ?? String(e));
+      })
+      .finally(() => {
+        if (gen === revokeGen.current) setBusy(false);
+      });
   };
 
   return (
-    <div className="mt-3 space-y-2 border-t border-ink-700 pt-3" aria-label={`disconnect ${connectionLabel(row)}`}>
-      <p className="text-label text-ink-200 break-words">
-        Disconnecting removes this connection&apos;s grants and its bindings and defaults,
-        and closes its pending effects. This cannot be undone — re-enrolling the same
-        account creates a new connection.
-      </p>
+    <div className="mt-3 space-y-2 border-t border-ink-700 pt-3" aria-label={t("disconnect {connectionLabel}").replace("{connectionLabel}", () => String(connectionLabel(row) ?? ""))}>
+      <p className="text-label text-ink-200 break-words">{t("Disconnecting removes this connection's grants and its bindings and defaults, and closes its pending effects. This cannot be undone — re-enrolling the same account creates a new connection.")}</p>
       <label className="flex items-start gap-2 text-label text-ink-300">
         <input
           type="checkbox"
@@ -1033,41 +1455,115 @@ function RevokeConfirm({
           className="mt-0.5"
         />
         <span>
-          I understand disconnecting {connectionLabel(row)} removes its grants and bindings
-          and closes pending effects.
-        </span>
+          {t("I understand disconnecting {connectionLabel} removes its grants and bindings and closes pending effects.").replace("{connectionLabel}", () => connectionLabel(row))}</span>
       </label>
       {error && (
         <p className="text-label text-fail break-words" role="alert">
-          {error}
+          {t(error)}
         </p>
       )}
       <div className="flex flex-wrap gap-2">
         <Button variant="danger" size="sm" onClick={submit} loading={busy} disabled={!armed}>
-          {busy ? "Disconnecting…" : "Disconnect"}
+          {busy ? t("Disconnecting…") : t("Disconnect")}
         </Button>
-        <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>
-          Cancel
-        </Button>
+        <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>{t("Cancel")}</Button>
       </div>
     </div>
   );
 }
 
-/** Enroll a scoped token for a supported provider. The token clears on settle. */
+/**
+ * CAD-1839: connect a provider whose reviewed descriptor declares the
+ * `hosted` enrollment shape. The tenant deployment's worker starts the
+ * provider sign-in and returns an https URL; this board only opens it in
+ * a new tab and never sees the credential or the OAuth state. Host mode
+ * declares no hosted providers, so this page exists only on a tenant
+ * deployment.
+ */
+function HostedConnect({
+  provider,
+  onClose,
+}: {
+  provider: ConnectionProvider;
+  onClose: () => void;
+}) {
+  const t = useTranslate();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const connect = () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    api
+      .connectionProviderConnect(provider.provider)
+      .then((reply) => {
+        const url = hostedConnectUrl(reply);
+        if (url === null) {
+          setError(UI_HOSTED_REFUSED);
+          return;
+        }
+        // `noopener,noreferrer` keeps the sign-in tab from reaching back
+        // into the board; the board keeps its own operator session.
+        window.open(url, "_blank", "noopener,noreferrer");
+      })
+      .catch((e: unknown) => setError(hostedConnectError(e)))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <section className="min-w-0" aria-label={t("hosted connection")}>
+      <p className="text-label text-ink-400 break-words">
+        {t("This service connects through a secure sign-in on your deployment — no credential is entered on this board.")}
+      </p>
+      {capabilityWords(provider) && (
+        <p className="text-micro text-ink-500 mt-1 break-words">
+          {t("Permissions")}: {capabilityWords(provider)}
+        </p>
+      )}
+      {error && (
+        <p className="text-label text-fail break-words mt-3" role="alert">
+          {t(error)}
+        </p>
+      )}
+      <div className="flex flex-wrap gap-2 mt-4">
+        <Button variant="primary" loading={busy} onClick={connect}>
+          {busy
+            ? t("Opening sign-in…")
+            : t("Connect {label}").replace("{label}", () => serviceLabel(provider.provider))}
+        </Button>
+        <Button variant="ghost" onClick={onClose} disabled={busy}>{t("Cancel")}</Button>
+      </div>
+      <p className="text-micro text-ink-500 mt-3 break-words">
+        {t("Finish the sign-in in the new tab, then return here — connections refresh when you come back.")}
+      </p>
+    </section>
+  );
+}
+
+/** Enroll a scoped token or SMTP sender for a supported provider. The
+ *  credential clears the moment the request settles. When `preset`
+ *  pins the provider (the dedicated `/new/<provider>` page) the
+ *  redundant Service dropdown is omitted (`hideProviderPicker`) and the
+ *  heading comes from the page, not this card. */
 export function AddConnection({
   providers,
   existing,
   preset,
+  hideProviderPicker = false,
+  submitLabel,
   onClose,
   onAdded,
 }: {
   providers: ConnectionProvider[];
   existing: Connection[];
   preset?: string | null;
+  /** Pinned presentation: omit the Service dropdown — the page names the service. */
+  hideProviderPicker?: boolean;
+  /** Primary action label — "Add connection" on the generic card. */
+  submitLabel?: string;
   onClose: () => void;
   onAdded: (id: string) => void;
 }) {
+  const t = useTranslate();
   const providerId = useId();
   const accountId = useId();
   const tokenId = useId();
@@ -1111,14 +1607,36 @@ export function AddConnection({
     sender: "",
     sender_name: "",
   });
+  const customSmtp = smtpShape && smtpPreset.id === "other";
+
+  // CAD-1319 review: every in-flight enroll request is bound to a draft
+  // generation. Any draft-context change — reset, provider, method,
+  // preset, descriptor fingerprint or unmount — bumps it, so a late
+  // completion can never navigate, set an error/risk state on a newer
+  // draft, clear a newer secret or release a newer request's `busy`.
+  // An invalidated success is still a real enrollment on the daemon —
+  // the response is dropped silently here, never claimed "not stored".
+  const requestGen = useRef(0);
+  const live = (gen: number) => gen === requestGen.current;
+  // Commit-phase cleanup: an unmount driven by a synchronous store
+  // change (or an operator-loss meta swap) invalidates in-flight enroll
+  // before the blocked view commits — a passive cleanup would leave a
+  // window where the old completion still reads as live.
+  useLayoutEffect(() => {
+    return () => {
+      requestGen.current += 1; // unmount invalidates any in-flight enroll
+    };
+  }, []);
 
   const resetDraft = () => {
+    requestGen.current += 1; // an in-flight request's settle can no longer act
     setToken("");
     setScopePicks(new Set());
     setAccount("");
     setAcceptRisk(false);
     setRiskNeeded(false);
     setError(null);
+    setBusy(false); // release the superseded request's busy — it stays ignored
     setMethod(null);
     setSmtpPreset(PRESETS[0]);
     setSmtp({
@@ -1161,14 +1679,17 @@ export function AddConnection({
   };
 
   const choosePreset = (next: Preset) => {
+    // A preset change retargets the SMTP service: a different mail
+    // server is a different draft context — an in-flight request's
+    // completion, the password and the custody consent never carry into
+    // it. The non-secret account/sender fields may stay; transport
+    // follows the new preset's paired host/port/TLS.
+    requestGen.current += 1;
     setSmtpPreset(next);
-    // A preset change retargets the SMTP service: the password and the
-    // custody consent never carry into a different mail server. The
-    // non-secret account/sender fields may stay; transport follows the
-    // new preset's paired host/port/TLS.
     setToken("");
     setAcceptRisk(false);
     setRiskNeeded(false);
+    setBusy(false); // release the superseded request's busy — it stays ignored
     setSmtp((cur) => ({ ...cur, host: next.host, tls_mode: next.tls, port: String(next.port) }));
     setError(null);
   };
@@ -1215,7 +1736,7 @@ export function AddConnection({
         smtp.host.trim() === "" || port === "" || !/^\d+$/.test(port) ||
         smtp.username.trim() === "" || token.trim() === "" || smtp.sender.trim() === ""
       ) {
-        setError("Fill in the host, port, login, password and verified sender for the SMTP sender.");
+        setError("Fill in the host, port, login, password and sender address for the SMTP sender.");
         return;
       }
       const portTlsError = smtpPortTlsError(smtp.host.trim(), port, smtp.tls_mode);
@@ -1225,6 +1746,7 @@ export function AddConnection({
       }
       setBusy(true);
       setError(null);
+      const gen = requestGen.current;
       api
         .connectionCreate({
           provider,
@@ -1240,15 +1762,24 @@ export function AddConnection({
           scopes: wanted,
           ...(acceptRisk ? { accept_same_uid_risk: true } : {}),
         })
-        .then((out) => onAdded(out.connection.id))
+        .then((out) => {
+          // Only a completion on the exact draft context that issued the
+          // request may navigate. An obsolete/unmounted draft drops the
+          // result — it may still be a real enrollment; it is simply not
+          // this draft's to claim.
+          if (!live(gen)) return;
+          onAdded(out.connection.id);
+        })
         // CAD-1013: typed-code safe reason — never the raw downstream
         // message, which can echo the SMTP host/password just typed.
         // custody_unprotected surfaces the risk toggle near Save.
         .catch((e: ApiError) => {
+          if (!live(gen)) return; // never clobber a newer draft's state
           setRiskNeeded(e instanceof ApiError && e.code === "custody_unprotected");
           setError(enrollErrorMessage(e));
         })
         .finally(() => {
+          if (!live(gen)) return;
           // The password crossed this one request into daemon
           // custody. It must not survive in the form, whatever the
           // outcome.
@@ -1267,6 +1798,7 @@ export function AddConnection({
     }
     setBusy(true);
     setError(null);
+    const gen = requestGen.current;
     api
       .connectionCreate({
         provider,
@@ -1276,13 +1808,18 @@ export function AddConnection({
         scopes: wanted,
         ...(acceptRisk ? { accept_same_uid_risk: true } : {}),
       })
-      .then((out) => onAdded(out.connection.id))
+      .then((out) => {
+        if (!live(gen)) return; // obsolete/unmounted draft — never navigate
+        onAdded(out.connection.id);
+      })
       // CAD-1013: typed-code safe reason — never raw downstream text.
       .catch((e: ApiError) => {
+        if (!live(gen)) return;
         setRiskNeeded(e instanceof ApiError && e.code === "custody_unprotected");
         setError(enrollErrorMessage(e));
       })
       .finally(() => {
+        if (!live(gen)) return;
         // The credential crossed this one request into daemon custody.
         // It must not survive in the form, whatever the outcome.
         setToken("");
@@ -1296,197 +1833,248 @@ export function AddConnection({
   // disables submission and never sends a draft.
   const unavailable = provider !== "" && !candidates.some((p) => p.provider === provider);
   const cannotSubmit = busy || provider === "" || unavailable || methodPending;
+  const primaryLabel = submitLabel ?? "Add connection";
 
   return (
-    <section className="card px-4 py-3.5 min-w-0" aria-label="add connection">
-      <h2 className="text-cardtitle font-medium text-ink-100">
-        {chosen ? `Set up ${chosen.provider}` : "Add connection"}
-      </h2>
+    <section className={hideProviderPicker ? "min-w-0" : "card px-4 py-3.5 min-w-0"} aria-label={t("add connection")}>
+      {!hideProviderPicker && (
+        <h2 className="text-cardtitle font-medium text-ink-100">
+          {chosen ? `Set up ${chosen.provider}` : t("Add connection")}
+        </h2>
+      )}
       {candidates.length === 0 ? (
         <p className="text-label text-ink-400 mt-2 break-words">
-          No provider currently offers enrollment. {existing.length > 0 && (
-            <>Existing connections are listed below.</>
+          {t("No provider currently offers enrollment.")} {existing.length > 0 && (
+            <>{t("Existing connections are listed below.")}</>
           )}
         </p>
       ) : (
         <form
-          className="mt-2 space-y-2"
+          className="mt-2 space-y-4"
           onSubmit={(e) => {
             e.preventDefault();
             submit();
           }}
         >
-          <div>
-            <label htmlFor={providerId} className="text-label font-medium text-ink-200">
-              Service
-            </label>
-            <select
-              id={providerId}
-              value={provider}
-              onChange={(e) => chooseProvider(e.target.value)}
-              className="field w-full mt-1"
-              disabled={busy}
-            >
+          {!hideProviderPicker && (
+            <div>
+              <label htmlFor={providerId} className="text-label font-medium text-ink-200">{t("Service")}</label>
+              <select
+                id={providerId}
+                value={provider}
+                onChange={(e) => chooseProvider(e.target.value)}
+                className="field w-full mt-1"
+                disabled={busy}
+              >
+                {provider === "" && (
+                  <option value="" disabled>{t("Choose a service…")}</option>
+                )}
+                {unavailable && (
+                  <option value={provider}>{t("{provider} — unavailable now").replace("{provider}", () => String(provider ?? ""))}</option>
+                )}
+                {candidates.map((p) => (
+                  <option key={p.provider} value={p.provider}>
+                    {serviceLabel(p.provider)}
+                    {capabilityWords(p) ? ` — ${capabilityWords(p)}` : ""}
+                  </option>
+                ))}
+              </select>
               {provider === "" && (
-                <option value="" disabled>
-                  Choose a service…
-                </option>
+                <p className="text-micro text-ink-500 mt-1 break-words">{t("Choose a service to connect.")}</p>
               )}
-              {unavailable && (
-                <option value={provider}>{provider} — unavailable now</option>
-              )}
-              {candidates.map((p) => (
-                <option key={p.provider} value={p.provider}>
-                  {p.provider}
-                  {capabilityWords(p) ? ` — ${capabilityWords(p)}` : ""}
-                </option>
-              ))}
-            </select>
-            {provider === "" && (
-              <p className="text-micro text-ink-500 mt-1 break-words">
-                Choose a service to connect.
-              </p>
-            )}
-            {unavailable && (
-              <p className="text-micro text-warn mt-1 break-words" role="alert">
-                That service is no longer available — pick another service to connect, or
-                cancel. Nothing typed here can go to a different service.
-              </p>
-            )}
-          </div>
+            </div>
+          )}
+          {unavailable && (
+            <p className="text-micro text-warn mt-1 break-words" role="alert">{t("That service is no longer available — pick another service to connect, or cancel. Nothing typed here can go to a different service.")}</p>
+          )}
           {provider === "" || unavailable ? null : (
           <>
           {bothShapes && (
-            <div role="group" aria-label="How to connect" className="flex flex-wrap gap-2">
+            <div role="group" aria-label={t("How to connect")} className="flex flex-wrap gap-2">
               <Button
                 size="sm"
                 variant={method === "token" ? "primary" : "secondary"}
                 aria-pressed={method === "token"}
                 disabled={busy}
                 onClick={() => chooseMethod("token")}
-              >
-                API token
-              </Button>
+              >{t("API token")}</Button>
               <Button
                 size="sm"
                 variant={method === "smtp" ? "primary" : "secondary"}
                 aria-pressed={method === "smtp"}
                 disabled={busy}
                 onClick={() => chooseMethod("smtp")}
-              >
-                Email (SMTP)
-              </Button>
+              >{t("Email (SMTP)")}</Button>
             </div>
           )}
           {methodPending && (
             <p className="text-micro text-ink-500 break-words">
-              Choose how to connect {provider} — a scoped API token, or an SMTP sender.
-            </p>
+              {t("Choose how to connect {serviceLabel} — a scoped API token, or an SMTP sender.").replace("{serviceLabel}", () => serviceLabel(provider))}</p>
           )}
           {!methodPending && (
           <>
-          <div>
-            <label htmlFor={accountId} className="text-label font-medium text-ink-200">
-              {smtpShape ? "Email account name" : "Account"}
-            </label>
-            <input
-              id={accountId}
-              type="text"
-              autoComplete="off"
-              spellCheck={false}
-              value={account}
-              onChange={(e) => setAccount(e.target.value)}
-              placeholder={
-                provider === "agenticos_external"
-                  ? "ws_…"
-                  : smtpShape
-                    ? "newsletter"
-                    : "account name"
-              }
-              className="field w-full mt-1"
-              disabled={busy}
-            />
-            {provider === "agenticos_external" && (
-              <p className="text-micro text-ink-500 mt-1 break-words">
-                The exact workspace ID from the device exchange — <span className="num">ws_</span>
-                followed by the lowercase UUID.
+          {smtpShape && (
+          <fieldset className="space-y-2">
+            <legend className="text-label font-medium text-ink-200">{t("Email provider")}</legend>
+            <p className="text-micro text-ink-500 break-words">{t("SMTP server configuration — encrypted submission only.")}</p>
+            <div role="group" aria-label={t("Email provider")} className="flex flex-wrap gap-2">
+              {PRESETS.map((p) => (
+                <Button
+                  key={p.id}
+                  variant={p.id === smtpPreset.id ? "primary" : "secondary"}
+                  aria-pressed={p.id === smtpPreset.id}
+                  disabled={busy}
+                  onClick={() => choosePreset(p)}
+                >
+                  {p.label}
+                </Button>
+              ))}
+            </div>
+            <p className="text-micro text-ink-500 break-words" data-hint={smtpPreset.id}>
+              {smtpPreset.hint}
+            </p>
+            {smtpPreset.id !== "other" && (
+              <p className="text-micro text-ink-500 num break-words" data-server>
+                {smtp.host} · {t("port")} {portFor(smtp.tls_mode)} · {smtp.tls_mode === "implicit" ? "SSL/TLS" : "STARTTLS"}
               </p>
             )}
-          </div>
-          {!smtpShape && (
-            <fieldset>
-              <legend className="text-label font-medium text-ink-200">
-                Permissions <span className="text-ink-500 font-normal">(declare only what the provider granted)</span>
-              </legend>
-              {hint.length === 0 ? (
-                <p className="text-micro text-ink-500 mt-1 break-words">
-                  This provider declares no reviewed permission scopes — there is nothing to
-                  enroll safely.
-                </p>
-              ) : (
-                <div className="mt-1 space-y-1">
-                  {hint.map((s) => (
-                    <label key={s} className="flex items-start gap-2 text-label text-ink-300">
-                      <input
-                        type="checkbox"
-                        checked={scopePicks.has(s)}
-                        onChange={() => toggleScope(s)}
-                        disabled={busy}
-                        className="mt-0.5"
-                      />
-                      <span className="num">{s}</span>
-                    </label>
-                  ))}
-                </div>
-              )}
-              <p className="text-micro text-ink-500 mt-1 break-words">
-                These declarations select which reviewed capabilities the account enrolls —
-                they do not grant new upstream scopes.
-              </p>
-            </fieldset>
-          )}
-          {smtpShape ? (
-            <fieldset className="space-y-2">
-              <legend className="text-label font-medium text-ink-200">
-                SMTP server — encrypted submission only
-              </legend>
-              <div role="group" aria-label="Email provider" className="flex flex-wrap gap-2">
-                {PRESETS.map((p) => (
-                  <Button
-                    key={p.id}
-                    size="sm"
-                    variant={p.id === smtpPreset.id ? "primary" : "secondary"}
-                    aria-pressed={p.id === smtpPreset.id}
+            {smtpPreset.id === "other" && (
+              <>
+                <div>
+                  <label htmlFor={`${tokenId}-host`} className="text-label text-ink-300">{t("Mail server")}</label>
+                  <input
+                    id={`${tokenId}-host`}
+                    type="text"
+                    autoComplete="off"
+                    spellCheck={false}
+                    value={smtp.host}
+                    onChange={(e) => setSmtp((cur) => ({ ...cur, host: e.target.value }))}
+                    placeholder="mail.example.com"
+                    className="field w-full mt-1"
                     disabled={busy}
-                    onClick={() => choosePreset(p)}
+                  />
+                </div>
+                <div>
+                  <label htmlFor={`${tokenId}-tls`} className="text-label text-ink-300">{t("Port & security")}</label>
+                  <select
+                    id={`${tokenId}-tls`}
+                    value={smtp.tls_mode}
+                    onChange={(e) =>
+                      setSmtp((cur) => ({
+                        ...cur,
+                        tls_mode: e.target.value as TlsMode,
+                        port: String(portFor(e.target.value as TlsMode)),
+                      }))
+                    }
+                    className="field w-full mt-1"
+                    disabled={busy}
                   >
-                    {p.label}
-                  </Button>
-                ))}
-              </div>
-              <p className="text-micro text-ink-500 break-words" data-hint={smtpPreset.id}>
-                {smtpPreset.hint}
-              </p>
+                    <option value="implicit">{t("465 — SSL/TLS")}</option>
+                    <option value="starttls">{t("587 — STARTTLS")}</option>
+                  </select>
+                </div>
+              </>
+            )}
+          </fieldset>
+          )}
+          <fieldset className="space-y-2">
+            <legend className="text-label font-medium text-ink-200">{t("Account")}</legend>
+            <div>
+              <label htmlFor={accountId} className="text-label text-ink-300">
+                {smtpShape ? t("Email account name") : t("Account")}
+              </label>
+              <input
+                id={accountId}
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={account}
+                onChange={(e) => setAccount(e.target.value)}
+                placeholder={
+                  provider === "agenticos_external"
+                    ? "ws_…"
+                    : smtpShape
+                      ? "newsletter"
+                      : "account name"
+                }
+                className="field w-full mt-1"
+                disabled={busy}
+              />
+              {provider === "agenticos_external" && (
+                <p className="text-micro text-ink-500 mt-1 break-words">
+                  {t("The exact workspace ID from the device exchange —")} <span className="num">{t("ws_")}</span>
+                  {t("followed by the lowercase UUID.")}
+                </p>
+              )}
+            </div>
+          </fieldset>
+          <fieldset className="space-y-2">
+            <legend className="text-label font-medium text-ink-200">{t("Credentials")}</legend>
+            {!smtpShape && (
               <div>
-                <label htmlFor={`${tokenId}-username`} className="text-label text-ink-300">
-                  Your email address
-                </label>
-                <input
-                  id={`${tokenId}-username`}
-                  type="text"
-                  autoComplete="off"
-                  spellCheck={false}
-                  value={smtp.username}
-                  onChange={(e) => setSmtp((cur) => ({ ...cur, username: e.target.value }))}
-                  placeholder="you@yourcompany.com"
-                  className="field w-full mt-1"
-                  disabled={busy}
-                />
+                <p className="text-label text-ink-300">
+                  {t("Permissions")}{" "}
+                  <span className="text-ink-500 font-normal">{t("(declare only what the provider granted)")}</span>
+                </p>
+                {hint.length === 0 ? (
+                  <p className="text-micro text-ink-500 mt-1 break-words">{t("This provider declares no reviewed permission scopes — there is nothing to enroll safely.")}</p>
+                ) : (
+                  <div className="mt-1 space-y-1">
+                    {hint.map((s) => (
+                      <label key={s} className="flex items-start gap-2 text-label text-ink-300">
+                        <input
+                          type="checkbox"
+                          checked={scopePicks.has(s)}
+                          onChange={() => toggleScope(s)}
+                          disabled={busy}
+                          className="mt-0.5"
+                        />
+                        <span className="num">{s}</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+                <p className="text-micro text-ink-500 mt-1 break-words">{t("These declarations select which reviewed capabilities the account enrolls — they do not grant new upstream scopes.")}</p>
               </div>
+            )}
+            {smtpShape ? (
+              <>
+                <div>
+                  <label htmlFor={`${tokenId}-username`} className="text-label text-ink-300">
+                    {customSmtp ? t("SMTP username") : t("Your email address")}
+                  </label>
+                  <input
+                    id={`${tokenId}-username`}
+                    type="text"
+                    autoComplete="off"
+                    spellCheck={false}
+                    value={smtp.username}
+                    onChange={(e) => setSmtp((cur) => ({ ...cur, username: e.target.value }))}
+                    placeholder={customSmtp ? "smtp username" : "you@yourcompany.com"}
+                    className="field w-full mt-1"
+                    disabled={busy}
+                  />
+                </div>
+                <div>
+                  <label htmlFor={tokenId} className="text-label text-ink-300">
+                    {customSmtp ? t("SMTP password") : t("App password")}
+                  </label>
+                  <input
+                    id={tokenId}
+                    type="password"
+                    autoComplete="off"
+                    spellCheck={false}
+                    value={token}
+                    onChange={(e) => setToken(e.target.value)}
+                    className="field w-full mt-1"
+                    disabled={busy}
+                  />
+                  <p className="text-micro text-ink-500 mt-1 break-words">{t("The password travels inside this one request to daemon custody and is cleared from this form afterwards. Never paste a credential anywhere else on this board.")}</p>
+                </div>
+              </>
+            ) : (
               <div>
-                <label htmlFor={tokenId} className="text-label font-medium text-ink-200">
-                  App password
-                </label>
+                <label htmlFor={tokenId} className="text-label text-ink-300">{t("Token")}</label>
                 <input
                   id={tokenId}
                   type="password"
@@ -1497,111 +2085,41 @@ export function AddConnection({
                   className="field w-full mt-1"
                   disabled={busy}
                 />
-                <p className="text-micro text-ink-500 mt-1 break-words">
-                  The password travels inside this one request to daemon custody and is
-                  cleared from this form afterwards. Never paste a credential anywhere else
-                  on this board.
-                </p>
+                <p className="text-micro text-ink-500 mt-1 break-words">{t("The token travels inside this one request to daemon custody and is cleared from this form afterwards. Never paste a credential anywhere else on this board.")}</p>
               </div>
-              <div>
-                <label htmlFor={`${tokenId}-sender`} className="text-label text-ink-300">
-                  Sender address (verified)
-                </label>
-                <input
-                  id={`${tokenId}-sender`}
-                  type="text"
-                  autoComplete="off"
-                  spellCheck={false}
-                  value={smtp.sender}
-                  onChange={(e) => setSmtp((cur) => ({ ...cur, sender: e.target.value }))}
-                  placeholder="news@example.com"
-                  className="field w-full mt-1"
-                  disabled={busy}
-                />
-              </div>
-              <div>
-                <label htmlFor={`${tokenId}-sender_name`} className="text-label text-ink-300">
-                  Sender name (optional)
-                </label>
-                <input
-                  id={`${tokenId}-sender_name`}
-                  type="text"
-                  autoComplete="off"
-                  spellCheck={false}
-                  value={smtp.sender_name}
-                  onChange={(e) => setSmtp((cur) => ({ ...cur, sender_name: e.target.value }))}
-                  className="field w-full mt-1"
-                  disabled={busy}
-                />
-              </div>
-              {smtpPreset.id !== "other" && (
-                <p className="text-micro text-ink-500 num break-words" data-server>
-                  {smtp.host} · port {portFor(smtp.tls_mode)} ·{" "}
-                  {smtp.tls_mode === "implicit" ? "SSL/TLS" : "STARTTLS"}
-                </p>
-              )}
-              {smtpPreset.id === "other" && (
-                <>
-                  <div>
-                    <label htmlFor={`${tokenId}-host`} className="text-label text-ink-300">
-                      Mail server
-                    </label>
-                    <input
-                      id={`${tokenId}-host`}
-                      type="text"
-                      autoComplete="off"
-                      spellCheck={false}
-                      value={smtp.host}
-                      onChange={(e) => setSmtp((cur) => ({ ...cur, host: e.target.value }))}
-                      placeholder="mail.example.com"
-                      className="field w-full mt-1"
-                      disabled={busy}
-                    />
-                  </div>
-                  <div>
-                    <label htmlFor={`${tokenId}-tls`} className="text-label text-ink-300">
-                      Port &amp; security
-                    </label>
-                    <select
-                      id={`${tokenId}-tls`}
-                      value={smtp.tls_mode}
-                      onChange={(e) =>
-                        setSmtp((cur) => ({
-                          ...cur,
-                          tls_mode: e.target.value as TlsMode,
-                          port: String(portFor(e.target.value as TlsMode)),
-                        }))
-                      }
-                      className="field w-full mt-1"
-                      disabled={busy}
-                    >
-                      <option value="implicit">465 — SSL/TLS</option>
-                      <option value="starttls">587 — STARTTLS</option>
-                    </select>
-                  </div>
-                </>
-              )}
-            </fieldset>
-          ) : (
+            )}
+          </fieldset>
+          {smtpShape && (
+          <fieldset className="space-y-2">
+            <legend className="text-label font-medium text-ink-200">{t("Sender")}</legend>
             <div>
-              <label htmlFor={tokenId} className="text-label font-medium text-ink-200">
-                Token
-              </label>
+              <label htmlFor={`${tokenId}-sender`} className="text-label text-ink-300">{t("Sender address")}</label>
               <input
-                id={tokenId}
-                type="password"
+                id={`${tokenId}-sender`}
+                type="text"
                 autoComplete="off"
                 spellCheck={false}
-                value={token}
-                onChange={(e) => setToken(e.target.value)}
+                value={smtp.sender}
+                onChange={(e) => setSmtp((cur) => ({ ...cur, sender: e.target.value }))}
+                placeholder="news@example.com"
                 className="field w-full mt-1"
                 disabled={busy}
               />
-              <p className="text-micro text-ink-500 mt-1 break-words">
-                The token travels inside this one request to daemon custody and is cleared from
-                this form afterwards. Never paste a credential anywhere else on this board.
-              </p>
             </div>
+            <div>
+              <label htmlFor={`${tokenId}-sender_name`} className="text-label text-ink-300">{t("Sender name (optional)")}</label>
+              <input
+                id={`${tokenId}-sender_name`}
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={smtp.sender_name}
+                onChange={(e) => setSmtp((cur) => ({ ...cur, sender_name: e.target.value }))}
+                className="field w-full mt-1"
+                disabled={busy}
+              />
+            </div>
+          </fieldset>
           )}
           </>
           )}
@@ -1613,9 +2131,7 @@ export function AddConnection({
              at the point of action — and it is never pre-selected. */}
           {!riskNeeded && (
             <details className="text-label">
-              <summary className="cursor-pointer select-none text-ink-400">
-                Advanced: custody risk acceptance
-              </summary>
+              <summary className="cursor-pointer select-none text-ink-400">{t("Advanced: custody risk acceptance")}</summary>
               <label className="flex items-start gap-2 text-ink-300 mt-2">
                 <input
                   type="checkbox"
@@ -1624,53 +2140,49 @@ export function AddConnection({
                   disabled={busy}
                   className="mt-0.5"
                 />
-                <span>
-                  This server cannot isolate saved credentials from agents using the same
-                  system account. I accept storing this credential here. Leave this off
-                  unless you knowingly accept it — it is never pre-selected.
-                </span>
+                <span>{t("This server cannot isolate saved credentials from agents using the same system account. I accept storing this credential here. Leave this off unless you knowingly accept it — it is never pre-selected.")}</span>
               </label>
             </details>
           )}
           {error && (
             <p className="text-label text-fail break-words" role="alert">
-              {error}
+              {t(error)}
             </p>
           )}
           {riskNeeded && (
-            <label
-              className="flex items-start gap-2 text-ink-200 border border-warn/40 rounded px-3 py-2 bg-warn/10"
+            <div
+              className="conn-risk text-ink-200 border border-warn/40 rounded px-3 py-2 bg-warn/10"
               data-risk-needed
             >
-              <input
-                type="checkbox"
-                checked={acceptRisk}
-                onChange={(e) => setAcceptRisk(e.target.checked)}
-                disabled={busy}
-                className="mt-0.5"
-              />
-              <span>
-                <strong>Storage consent required:</strong> this server cannot isolate saved
-                SMTP passwords from agents using the same system account. I accept storing
-                this password here. This is never pre-selected.
-              </span>
-            </label>
+              <div className="conn-risk-title">
+                <IconWarning size={14} />
+                <strong>{t("Storage consent required")}</strong>
+              </div>
+              <p className="conn-risk-desc">{t("This server cannot isolate saved SMTP passwords from agents using the same system account.")}</p>
+              <label className="flex items-start gap-2">
+                <input
+                  type="checkbox"
+                  checked={acceptRisk}
+                  onChange={(e) => setAcceptRisk(e.target.checked)}
+                  disabled={busy}
+                  className="mt-0.5"
+                />
+                <span>{t("I accept storing this password here.")}</span>
+              </label>
+              <p className="conn-risk-hint">{t("This is never pre-selected.")}</p>
+            </div>
           )}
-          <div className="flex flex-wrap gap-2">
-            <Button variant="primary" size="sm" type="submit" loading={busy} disabled={cannotSubmit}>
-              {busy ? "Adding…" : "Add connection"}
+          <div className="conn-actions flex flex-wrap gap-2">
+            <Button variant="primary" type="submit" loading={busy} disabled={cannotSubmit}>
+              {busy ? t("Saving…") : primaryLabel}
             </Button>
-            <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>
-              Cancel
-            </Button>
+            <Button variant="ghost" onClick={onClose} disabled={busy}>{t("Cancel")}</Button>
           </div>
         </form>
       )}
       {candidates.length === 0 && (
         <div className="flex flex-wrap gap-2 mt-2">
-          <Button variant="ghost" size="sm" onClick={onClose}>
-            Close
-          </Button>
+          <Button variant="ghost" size="sm" onClick={onClose}>{t("Close")}</Button>
         </div>
       )}
     </section>

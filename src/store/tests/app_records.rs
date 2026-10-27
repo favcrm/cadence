@@ -9,6 +9,111 @@ fn record_file(dir: &TempDir, install: &str) -> RecordStore {
     RecordStore::open(dir.path(), install).unwrap()
 }
 
+#[test]
+fn readonly_list_reads_a_legacy_social_layout_without_migrating() {
+    let dir = TempDir::new().unwrap();
+    let install = "install-legacy";
+    let path = record_db_path(dir.path(), install).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE record_schema(version INTEGER NOT NULL);
+         INSERT INTO record_schema VALUES(1);
+         CREATE TABLE record_identity(install_id TEXT NOT NULL, created REAL NOT NULL);
+         INSERT INTO record_identity VALUES('install-legacy', 0);
+         CREATE TABLE app_social_drafts(draft_id TEXT PRIMARY KEY, install_id TEXT NOT NULL,
+           context_id TEXT NOT NULL, revision INTEGER NOT NULL, caption TEXT NOT NULL,
+           source_json TEXT NOT NULL, asset_id TEXT, created REAL NOT NULL, updated REAL NOT NULL);
+         CREATE TABLE app_social_effects( effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL,
+           context_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL,
+           request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, frozen_json TEXT NOT NULL,
+           state TEXT NOT NULL CHECK(state IN ('waiting','approved','declined','sending','posted','refused')),
+           approval_id TEXT NOT NULL, outcome_json TEXT, created REAL NOT NULL, updated REAL NOT NULL);
+         INSERT INTO app_social_effects VALUES('eff-legacy','install-legacy','ctx',
+           'draft-legacy',1,'req-legacy','digest-legacy','{}','waiting','approval-legacy',NULL,1,1);",
+    )
+    .unwrap();
+    drop(conn);
+    let before = std::fs::read(&path).unwrap();
+    let records = RecordStore::open_readonly(dir.path(), install)
+        .unwrap()
+        .unwrap();
+    let list = records
+        .app_social_effect_list_state("ctx", "waiting", 0)
+        .unwrap();
+    assert_eq!(list["effects"].as_array().unwrap().len(), 1);
+    assert_eq!(list["effects"][0]["effect_id"], "eff-legacy");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn readonly_list_returns_empty_when_social_tables_are_absent() {
+    let dir = TempDir::new().unwrap();
+    let install = "install-empty";
+    let path = record_db_path(dir.path(), install).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE record_schema(version INTEGER NOT NULL);
+         INSERT INTO record_schema VALUES(1);
+         CREATE TABLE record_identity(install_id TEXT NOT NULL, created REAL NOT NULL);
+         INSERT INTO record_identity VALUES('install-empty', 0);",
+    )
+    .unwrap();
+    drop(conn);
+    let before = std::fs::read(&path).unwrap();
+    let records = RecordStore::open_readonly(dir.path(), install)
+        .unwrap()
+        .unwrap();
+    assert!(records
+        .app_social_effect_list_state("ctx", "waiting", 0)
+        .unwrap()["effects"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn readonly_list_rejects_an_unknown_social_effect_layout() {
+    let dir = TempDir::new().unwrap();
+    let install = "install-foreign";
+    let path = record_db_path(dir.path(), install).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE record_schema(version INTEGER NOT NULL);
+         INSERT INTO record_schema VALUES(1);
+         CREATE TABLE record_identity(install_id TEXT NOT NULL, created REAL NOT NULL);
+         INSERT INTO record_identity VALUES('install-foreign', 0);
+         CREATE TABLE app_social_effects(effect_id TEXT PRIMARY KEY);",
+    )
+    .unwrap();
+    drop(conn);
+    let records = RecordStore::open_readonly(dir.path(), install)
+        .unwrap()
+        .unwrap();
+    let error = records
+        .app_social_effect_list_state("ctx", "waiting", 0)
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown"), "{error}");
+}
+
+#[test]
+fn readonly_open_never_creates_a_missing_record_store() {
+    let dir = TempDir::new().unwrap();
+    assert!(RecordStore::open_readonly(dir.path(), "install-missing")
+        .unwrap()
+        .is_none());
+    let path = record_db_path(dir.path(), "install-missing").unwrap();
+    assert!(!path.exists());
+    assert!(!path.parent().unwrap().exists());
+    let _open = record_file(&dir, "install-a");
+    assert!(RecordStore::open_readonly(dir.path(), "install-a")
+        .unwrap()
+        .is_some());
+}
+
 fn customer(name: &str, email: &str) -> CustomerProfile {
     CustomerProfile::parse(&json!({"schema": 1, "display_name": name, "email": email, "tags": [], "consent": {"email": "granted"}})).unwrap()
 }
@@ -534,15 +639,29 @@ fn cad780_open_waits_out_a_held_write_lock_then_succeeds() {
         .unwrap();
     let path = record_db_path(dir.path(), "install-locked").unwrap();
     let holder = rusqlite::Connection::open(&path).unwrap();
+    // An already-WAL file can be opened read-only without waiting on a
+    // writer. Force the WAL transition this contention check is about.
+    holder
+        .pragma_update(None, "journal_mode", "DELETE")
+        .unwrap();
     holder
         .execute_batch("BEGIN IMMEDIATE; INSERT INTO app_suppressions(context_id,kind,key,reason,at) VALUES('ctx-1','email','held@example.com','test',0.0);")
         .unwrap();
     let opened = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| RecordStore::open(dir.path(), "install-locked"));
-        // The opener's first attempts meet the held write lock; the
-        // holder commits inside the bounded wait.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let worker = scope.spawn(|| {
+            crate::store::wait_probe::WAITING
+                .with(|observer| *observer.borrow_mut() = Some(waiting_tx));
+            crate::store::wait_probe::RELEASED
+                .with(|release| *release.borrow_mut() = Some(released_rx));
+            RecordStore::open(dir.path(), "install-locked")
+        });
+        waiting_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opener never encountered the held native lock");
         holder.execute_batch("COMMIT;").unwrap();
+        released_tx.send(()).unwrap();
         worker.join().unwrap()
     });
     let store = opened.unwrap();
@@ -571,10 +690,15 @@ fn cad780_open_sees_an_initializing_file_then_converges() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     rusqlite::Connection::open(&path).unwrap();
     let opened = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| RecordStore::open(dir.path(), "install-initializing"));
-        // The opener's first reads land before any table exists; the
-        // initializer commits inside the bounded wait.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let worker = scope.spawn(|| {
+            crate::store::wait_probe::WAITING
+                .with(|observer| *observer.borrow_mut() = Some(waiting_tx));
+            RecordStore::open(dir.path(), "install-initializing")
+        });
+        waiting_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opener never observed incomplete initialization");
         let init = rusqlite::Connection::open(&path).unwrap();
         init.execute_batch(
             "BEGIN IMMEDIATE;
@@ -851,6 +975,11 @@ fn cad1172_records_are_not_capped_at_the_pilot_hundred() {
         "one page holds the page bound"
     );
     assert_eq!(listed["truncated"], json!(true), "150 rows page");
+    assert_eq!(
+        listed["total"],
+        json!(150),
+        "the page reports the full count"
+    );
     // The context really holds all 150: page past the bound.
     let cursor = listed["next_cursor"].as_str().unwrap().to_string();
     let second = store
@@ -858,6 +987,18 @@ fn cad1172_records_are_not_capped_at_the_pilot_hundred() {
         .unwrap();
     assert_eq!(second["records"].as_array().unwrap().len(), 50);
     assert_eq!(second["truncated"], json!(false));
+    assert_eq!(
+        second["total"],
+        json!(150),
+        "the count is independent of the cursor"
+    );
+    // A filtered search reports the filtered total, not the page size.
+    let filtered = store
+        .app_record_list_paged("ctx-1", Some("c149@example.com"), 20, None)
+        .unwrap();
+    assert_eq!(filtered["records"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["total"], json!(1), "the count follows the filter");
+    assert_eq!(filtered["truncated"], json!(false));
 }
 
 #[test]
@@ -900,4 +1041,115 @@ fn cad1172_commit_reason_names_the_record_limit() {
         "stale revision"
     );
     assert_eq!(refusal_reason("anything else"), "record refused");
+}
+
+#[test]
+fn cad1374_owner_human_is_stored_on_the_revision_in_the_same_write() {
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-a");
+    let human =
+        json!({"sub": "user-owner-a", "company": "acme", "session": "s-1", "display": "Ada"});
+    // A verified owner create/update persists its human on the row it
+    // writes; a legacy call (no human) leaves the column NULL.
+    store
+        .app_record_create_as(
+            "ctx-1",
+            "customer-a",
+            &customer("A", "a@example.com"),
+            None,
+            Some(&human),
+        )
+        .unwrap();
+    store
+        .app_record_create("ctx-1", "customer-b", &customer("B", "b@example.com"))
+        .unwrap();
+    let conn = store.conn();
+    let stored_a: Option<String> = conn
+        .query_row(
+            "SELECT human FROM app_record_revisions WHERE record_id='customer-a' AND revision=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let stored_b: Option<String> = conn
+        .query_row(
+            "SELECT human FROM app_record_revisions WHERE record_id='customer-b' AND revision=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&stored_a.unwrap()).unwrap(),
+        human
+    );
+    assert!(
+        stored_b.is_none(),
+        "legacy write must stay honestly unknown"
+    );
+}
+
+#[test]
+fn cad1808_notes_are_idempotent_and_soft_deleted() {
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-notes");
+    let profile = CustomerProfile::parse(&json!({
+        "schema":1,"display_name":"Ada","email":"ada@example.test","tags":[],
+        "consent":{"email":"granted"}
+    }))
+    .unwrap();
+    store.app_record_create("ctx", "cust-a", &profile).unwrap();
+
+    let first = store
+        .app_note_create(
+            "ctx",
+            "cust-a",
+            "note-1",
+            "Called about the renewal.",
+            "agent:master",
+        )
+        .unwrap();
+    assert_eq!(first["note"]["body"], "Called about the renewal.");
+    assert_eq!(first["note"]["actor"], "agent:master");
+
+    let replay = store
+        .app_note_create(
+            "ctx",
+            "cust-a",
+            "note-1",
+            "Called about the renewal.",
+            "agent:master",
+        )
+        .unwrap();
+    assert_eq!(replay["note"]["created"], first["note"]["created"]);
+    assert!(store
+        .app_note_create(
+            "ctx",
+            "cust-a",
+            "note-1",
+            "A different note.",
+            "agent:master",
+        )
+        .is_err());
+
+    let listed = store.app_note_list("ctx", "cust-a", 50).unwrap();
+    assert_eq!(listed["count"], 1);
+    let shown = store.app_record_show("ctx", "cust-a").unwrap();
+    assert_eq!(shown["record"]["notes"].as_array().map(Vec::len), Some(1));
+
+    store
+        .app_note_delete("ctx", "cust-a", "note-1", "agent:master")
+        .unwrap();
+    assert_eq!(
+        store.app_note_list("ctx", "cust-a", 50).unwrap()["count"],
+        0
+    );
+    assert_eq!(
+        store.app_record_show("ctx", "cust-a").unwrap()["record"]["notes"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    assert!(store
+        .app_note_create("ctx", "cust-z", "note-2", "unknown record", "agent:master")
+        .is_err());
 }

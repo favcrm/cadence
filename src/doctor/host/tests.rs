@@ -1686,13 +1686,13 @@ fn temp_dirs_never_list_the_pinned_runner() {
     let root = TempDir::new().unwrap();
     let scan = fake_scan(&root);
     let tmp = scan.temp_dir.clone();
-    let runner = tmp.join("cadence-nextest-0.9.145");
+    let runner = tmp.join("cadence-nextest-0.9.150");
     real_bytes(&runner.join("cargo-nextest"), 64);
     std::fs::create_dir_all(tmp.join("cadence-nextest-0.9.146")).unwrap();
     std::fs::create_dir_all(tmp.join("cadence-nextest-contract.AbC")).unwrap();
     real_bytes(&tmp.join("cadence-nextest-contract.AbC/cargo-nextest"), 8);
     for name in [
-        "cadence-nextest-0.9.145",
+        "cadence-nextest-0.9.150",
         "cadence-nextest-0.9.146",
         "cadence-nextest-contract.AbC",
     ] {
@@ -1701,7 +1701,7 @@ fn temp_dirs_never_list_the_pinned_runner() {
     let c = check_temp_dirs(&scan);
     assert_eq!(c.value["count"].as_u64().unwrap(), 2, "{}", c.value);
     assert!(
-        !c.remedy.contains("cadence-nextest-0.9.145"),
+        !c.remedy.contains("cadence-nextest-0.9.150"),
         "{}",
         c.remedy
     );
@@ -3358,10 +3358,51 @@ fn exit_code_maps_worst_level() {
 }
 
 #[test]
+fn provider_command_record_never_substitutes_shell_health() {
+    let root = TempDir::new().unwrap();
+    let scan = fake_scan(&root);
+    let file = scan.state_dir.join(crate::doctor::PROVIDER_COMMANDS_FILE);
+    let level = || provider_state::check_provider_commands(&scan).level;
+    assert_eq!(level(), Level::Warn);
+    std::fs::write(&file, "not json").unwrap();
+    assert_eq!(level(), Level::Warn);
+    let starttime = crate::peer::proc_starttime(std::process::id());
+    let mut record = json!({
+        "pid": std::process::id(),
+        "starttime": starttime,
+        "pi": {"resolved": null, "reason": "pi absent from daemon PATH"}
+    });
+    std::fs::write(&file, record.to_string()).unwrap();
+    if starttime.is_none() {
+        // Without process-start evidence, report unknown rather than
+        // pretending the saved record proves a live daemon result.
+        assert_eq!(level(), Level::Warn);
+        return;
+    }
+    assert_eq!(level(), Level::Fail);
+    record["pi"] = json!({"resolved": "/fixture/pi", "reason": null});
+    std::fs::write(&file, record.to_string()).unwrap();
+    assert_eq!(level(), Level::Ok);
+    record["starttime"] = json!(0);
+    std::fs::write(&file, record.to_string()).unwrap();
+    assert_eq!(level(), Level::Warn);
+}
+
+#[test]
 fn run_emits_all_checks() {
     let root = TempDir::new().unwrap();
     let mut scan = fake_scan(&root);
-    scan.pm_dir = None; // nothing anywhere — cleanest possible host
+    scan.pm_dir = None; // no tracker data
+                        // A known startup resolution makes this the healthy-record fixture;
+                        // missing/malformed/stale records are checked separately above.
+    let starttime = crate::peer::proc_starttime(std::process::id());
+    std::fs::write(
+        scan.state_dir.join(crate::doctor::PROVIDER_COMMANDS_FILE),
+        json!({"pid": std::process::id(), "starttime": starttime,
+               "pi": {"resolved": "/fixture/pi", "reason": null}})
+        .to_string(),
+    )
+    .unwrap();
     let report = run(&scan);
     let names: Vec<&str> = report["checks"]
         .as_array()
@@ -3374,6 +3415,7 @@ fn run_emits_all_checks() {
         vec![
             "disk",
             "provider-state",
+            "provider-pi-command",
             "cadence-store",
             "pipes",
             "memory",
@@ -3412,7 +3454,22 @@ fn run_emits_all_checks() {
             _ => 0,
         })
         .unwrap_or("ok");
-    assert_eq!(worst, "ok", "{}", render(&report));
+    if starttime.is_some() {
+        assert_eq!(worst, "ok", "{}", render(&report));
+    } else {
+        // No process-start evidence on this platform: only this
+        // diagnostic must warn, rather than claiming daemon health.
+        for c in report["checks"].as_array().unwrap() {
+            if c["name"] != "agent-uid" {
+                let expected = if c["name"] == "provider-pi-command" {
+                    "warn"
+                } else {
+                    "ok"
+                };
+                assert_eq!(c["level"], expected, "{}", render(&report));
+            }
+        }
+    }
     let task = report["checks"]
         .as_array()
         .unwrap()
@@ -4453,11 +4510,16 @@ fn load_check_levels_and_slot_detail() {
     let c = check_load(&scan);
     assert_eq!(c.level, Level::Fail, "{}", c.detail);
     // Unset, the warn line derives from the slot plan — the
-    // farm's own (3+1)×4 jobs on this box: warn only above it.
+    // farm's own (3+1)×jobs_per_lane jobs on this box: warn only
+    // above it.
     scan.thresholds.load_warn_ratio = None;
-    let derived = ((3.0 + 1.0) * 4.0 * 1.25 / cpus).max(1.0);
-    // The fixture's slot config (3/1/4) equals the defaults, so
-    // the derived ratio matches either way; below it → ok.
+    // The fixture's slots payload carries no resolved config, so
+    // the check's SlotConfig::default() stand-in applies — mirror
+    // it here rather than restating the constants.
+    let d = crate::slots::SlotConfig::default();
+    let derived =
+        ((d.build_slots + d.suite_slots) as f64 * d.jobs_per_lane as f64 * 1.25 / cpus).max(1.0);
+    // Below the derived warn line → ok.
     proc_load(&scan, cpus * derived * 0.9, Some(2.0));
     let c = check_load(&scan);
     assert_eq!(c.level, Level::Ok, "below plan: {}", c.detail);

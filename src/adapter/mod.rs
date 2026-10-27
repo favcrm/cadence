@@ -49,32 +49,77 @@ pub fn daemon_context_env(env: &ProviderEnv) -> Vec<(String, String)> {
         })
         .collect()
 }
+/// CAD-1249: one provider log per agent is capped to this many bytes.
+/// Opening a log first keeps only its newest `PROVIDER_LOG_MAX_BYTES`, so
+/// a chatty or abandoned provider cannot grow an unbounded file.
+pub const PROVIDER_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Open an agent's provider log for append, first trimming it to the
+/// newest [`PROVIDER_LOG_MAX_BYTES`]. The trim is best-effort: a log is
+/// not authoritative state, and a concurrent writer can race the read
+/// and truncate; the next open converges.
+pub fn open_provider_log(path: &std::path::Path) -> crate::error::Result<std::fs::File> {
+    cap_provider_log(path, PROVIDER_LOG_MAX_BYTES)?;
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?)
+}
+
+fn cap_provider_log(path: &std::path::Path, max: u64) -> crate::error::Result<()> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    let len = meta.len();
+    if len <= max {
+        return Ok(());
+    }
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(len - max))?;
+    let mut tail = Vec::with_capacity(max as usize);
+    // Byte-bounded even if another process appends between metadata and read.
+    file.take(max).read_to_end(&mut tail)?;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    out.write_all(&tail)?;
+    Ok(())
+}
+
 pub mod codex;
 pub mod fake;
 pub mod link;
 pub mod pi;
-// The protected managed-Pi launch seam requires the Linux x86_64 constructor
-// (held exec, kernel custody and NSS topology). Other targets retain only the
-// fail-closed prerequisite probe; they never reach a protected spawn.
-#[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+// The protected managed-Pi launch seam is Linux-only (openat2 + fd-exec +
+// NSS account topology). On other targets the whole module is a stub whose
+// `protected_prereqs_satisfied` still fails closed — a non-Linux build never
+// reaches a spawn through the split path.
+#[cfg(all(unix, target_os = "linux"))]
 pub(crate) mod pi_guest;
 
-#[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
+#[cfg(not(all(unix, target_os = "linux")))]
 pub(crate) mod pi_guest {
     use crate::error::{Error, Result};
-    /// Unsupported builds fail closed: no constructor means eligibility is
-    /// permanently UNKNOWN.
+    /// Non-Linux builds fail closed: the protected launch seam does not exist
+    /// off Linux, so eligibility is permanently UNKNOWN.
     pub(crate) fn protected_prereqs_satisfied() -> Result<()> {
         Err(Error::rejected(
-            "protected managed-Pi launch requires Linux x86_64 constructor \
-             custody; eligibility UNKNOWN and refused",
+            "protected managed-Pi launch is Linux-only — openat2/fd-exec \
+             unavailable; eligibility UNKNOWN and refused",
         ))
     }
 }
 pub mod pty;
 pub mod registry;
+pub mod sandbox;
 pub mod stdio;
 pub mod ws;
+
+// CAD-1526: the message-window acceptance for the pi turn guard.
+#[cfg(test)]
+mod pi_turn_guard_acceptance;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -112,7 +157,12 @@ pub const REFUSED_COMMAND: &str = "false";
 /// set their mocks here — the environment is shared by every daemon
 /// in the process, so a mock installed there reaches all of them.
 #[derive(Clone, Default)]
-pub struct ProviderEnv(Arc<RwLock<BTreeMap<String, String>>>);
+pub struct ProviderEnv(
+    Arc<RwLock<BTreeMap<String, String>>>,
+    Option<std::path::PathBuf>,
+    Option<crate::platform::deployments::HostedCompanyMaster>,
+    Option<Arc<crate::store::Store>>,
+);
 
 impl ProviderEnv {
     /// An env whose every provider command is [`REFUSED_COMMAND`]: for
@@ -125,11 +175,139 @@ impl ProviderEnv {
         env
     }
 
+    /// Fail-closed seal for an armed test-fixture daemon only —
+    /// `Shared::new_leased` invokes it when the test seam is armed: a
+    /// fixture that forgot a provider-command mock gets
+    /// [`REFUSED_COMMAND`], never a silent fall-through to the
+    /// installed CLI. Production daemons never reach it.
+    ///
+    /// For every [`PROVIDER_COMMAND_VARS`] name:
+    /// - an explicit nonempty value set on this env (the supported
+    ///   mock-override channel) is preserved;
+    /// - a nonempty value inherited from the process environment is
+    ///   snapshotted into this env, fixing [`Self::var`]'s resolution
+    ///   to the value seen at seal time instead of tracking mutable
+    ///   ambient env. [`Self::vars`] then *exposes* the entry — an
+    ///   env-local mock still reaches a spawned or restarted daemon
+    ///   only through an explicit handoff by the harness that spawns
+    ///   it; nothing here adds that transport;
+    /// - a blank value (whitespace-only counts), whether set here or
+    ///   inherited, is a hard error: adapters treat blank as unset and
+    ///   fall through to the installed CLI;
+    /// - a name resolving nowhere becomes [`REFUSED_COMMAND`].
+    ///
+    /// All entries are validated before any is written, so a refused
+    /// env is never left half-sealed.
+    ///
+    /// Limitation: a missing or blank override can no longer fall
+    /// through to a real CLI, but an explicit nonempty override — set
+    /// on this env or exported to the process — may still name a real
+    /// binary. The seam proves the daemon is a fixture, not what a
+    /// command points at; this is provider-command fail-closed
+    /// behavior, not network isolation.
+    pub fn isolate_for_test(&self) -> Result<()> {
+        // `.ok()` maps unset and non-UTF-8 alike to `None` → sealed to
+        // `false`; neither can reach the real CLI.
+        self.isolate_for_test_with(|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::isolate_for_test`] with the inherited-environment
+    /// lookup injected, so tests exercise every branch without
+    /// touching the shared process environment.
+    fn isolate_for_test_with(&self, inherited: impl Fn(&str) -> Option<String>) -> Result<()> {
+        let mut seal: Vec<(&str, String)> = Vec::new();
+        for name in PROVIDER_COMMAND_VARS {
+            match self.own(name) {
+                Some(own) if own.trim().is_empty() => {
+                    return Err(Error::rejected(format!(
+                        "test fixture: {name} is set but blank — a blank provider \
+                         command override falls through to the installed CLI; set a \
+                         mock or leave it unset for {REFUSED_COMMAND}"
+                    )));
+                }
+                Some(_) => {}
+                None => match inherited(name) {
+                    Some(value) if value.trim().is_empty() => {
+                        return Err(Error::rejected(format!(
+                            "test fixture: {name} is blank in the process environment \
+                             — a blank provider command override falls through to the \
+                             installed CLI; set a mock or unset it for {REFUSED_COMMAND}"
+                        )));
+                    }
+                    Some(value) => seal.push((name, value)),
+                    None => seal.push((name, REFUSED_COMMAND.to_string())),
+                },
+            }
+        }
+        for (name, value) in seal {
+            self.set(name, value);
+        }
+        Ok(())
+    }
+
+    /// Bind this environment to the daemon's immutable, checked workspace.
+    /// The authority is outside the mutable environment map and is inherited
+    /// by clones without being exposed through `set`, `remove` or `vars`.
+    pub(crate) fn with_workspace(&self, workspace: std::path::PathBuf) -> Self {
+        Self(
+            Arc::clone(&self.0),
+            Some(workspace),
+            self.2.clone(),
+            self.3.clone(),
+        )
+    }
+
+    pub(crate) fn workspace(&self) -> Option<&std::path::Path> {
+        self.1.as_deref()
+    }
+
+    /// Immutable image-owned authority; mutable environment values cannot grant it.
+    pub(crate) fn with_company_master(
+        mut self,
+        admission: Option<crate::platform::deployments::HostedCompanyMaster>,
+    ) -> Self {
+        self.2 = admission;
+        self
+    }
+
+    pub(crate) fn company_master(&self) -> bool {
+        self.2.is_some()
+    }
+
+    /// Bind launch policy to the caller's actual workspace store, never an
+    /// environment variable a provider or worker can replace.
+    pub fn with_settings_store(&self, store: Arc<crate::store::Store>) -> Self {
+        Self(
+            Arc::clone(&self.0),
+            self.1.clone(),
+            self.2.clone(),
+            Some(store),
+        )
+    }
+
+    pub(crate) fn settings_store(&self) -> Option<&crate::store::Store> {
+        self.3.as_deref()
+    }
+
     pub fn set(&self, name: &str, value: impl Into<String>) {
         self.0
             .write()
             .unwrap()
             .insert(name.to_string(), value.into());
+    }
+
+    /// A copy whose own map carries `name = value`. The shared map is never
+    /// mutated, so one endpoint's program override (an `omp` agent's
+    /// `CADENCE_PI_COMMAND`) cannot reach a `pi` agent in the same daemon.
+    pub fn with_var(&self, name: &str, value: impl Into<String>) -> Self {
+        let mut vars = self.0.read().unwrap().clone();
+        vars.insert(name.to_string(), value.into());
+        Self(
+            Arc::new(RwLock::new(vars)),
+            self.1.clone(),
+            self.2.clone(),
+            self.3.clone(),
+        )
     }
 
     pub fn remove(&self, name: &str) {
@@ -321,6 +499,13 @@ pub type EventHook = Box<dyn Fn(&str, Value) + Send + Sync>;
 pub type RequestHook = Box<dyn Fn(ProviderRequest) + Send + Sync>;
 
 /// Callbacks the adapter uses to surface provider traffic.
+/// One retained image the provider prompt may see natively.
+/// `media_type` is a static MIME the catalog already proved.
+pub struct TurnImage {
+    pub media_type: &'static str,
+    pub bytes: Vec<u8>,
+}
+
 pub struct AdapterHooks {
     /// Notification events worth recording (turn lifecycle, message items).
     pub on_event: EventHook,
@@ -360,6 +545,19 @@ pub trait ProviderAdapter: Send + Sync {
         client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult>;
+    /// Native image parts for the next prompt. Empty is a no-op.
+    /// Runtimes without a native image prompt refuse before any prompt
+    /// is sent. The refusal is pre-write: the message fails and the
+    /// endpoint stays up. Bytes are never pasted into the text.
+    fn bind_turn_images(&self, images: &[TurnImage]) -> Result<()> {
+        if images.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::pre_write(
+                "this runtime has no native image prompt, so the attached library image was not sent. Use an image-capable Pi session; the selected model was left unchanged.",
+            ))
+        }
+    }
     /// CAD-1009: [`Self::run_turn`] for a prompt that may carry a
     /// scoped-turn token `slot` (a unique marker the daemon left after
     /// the App hint). An adapter that mints its turn token inside
@@ -692,8 +890,21 @@ pub fn build(
             "pi" => Ok(Box::new(pi::PiAdapter::new(
                 hooks, log_path, env, agent_uid,
             ))),
+            // CAD-1624: omp is pi-compatible on every flag the adapter uses, so
+            // it is the same adapter with its own program — and therefore the
+            // same Settings allowlist gate (`PiAdapter::open`), not a bypass.
+            // Only a default program is replaced: a fixture's sealed command
+            // (`refusing_providers`/`isolate_for_test`) or an operator's
+            // explicit command must win, or a test daemon would spawn the real
+            // binary.
+            "omp" => {
+                let env = provider_env_for("omp", env);
+                Ok(Box::new(pi::PiAdapter::new(
+                    hooks, log_path, &env, agent_uid,
+                )))
+            }
             other => Err(crate::error::Error::rejected(format!(
-                "No managed adapter for provider '{other}' (implemented: codex, claude, pi)"
+                "No managed adapter for provider '{other}' (implemented: codex, claude, pi, omp)"
             ))),
         },
         "managed-ws" => match agent.provider.as_str() {
@@ -763,6 +974,22 @@ pub fn build(
     }
 }
 
+/// The environment an endpoint actually launches with. The omp arm runs the
+/// Pi adapter on its own program: an absent, blank or default-`pi` command is
+/// replaced on a copy (never the shared map), and every other command —
+/// including a fixture's sealed one — is preserved. Display code that
+/// recomputes launch policy (confinement) must use this, or it reports the
+/// wrong program's grants.
+pub fn provider_env_for(provider: &str, env: &ProviderEnv) -> ProviderEnv {
+    if provider != "omp" {
+        return env.clone();
+    }
+    match env.var("CADENCE_PI_COMMAND") {
+        Some(value) if !value.trim().is_empty() && value.trim() != "pi" => env.clone(),
+        _ => env.with_var("CADENCE_PI_COMMAND", "omp"),
+    }
+}
+
 fn require_split_launch_path(
     agent_uid: Option<u32>,
     provider: &str,
@@ -771,11 +998,12 @@ fn require_split_launch_path(
     if agent_uid.is_none() {
         return Ok(());
     }
-    // `pty` and `fake` carry their own split proofs. `managed`+`pi` is the
-    // single managed seam under construction (CAD-1012) — it constructs so
-    // `open` can reach the fail-closed protected-prereq gate, never to launch.
-    let allowed =
-        matches!(endpoint_kind, "pty" | "fake") || (endpoint_kind == "managed" && provider == "pi");
+    // `pty` and `fake` carry their own split proofs. A `managed` row of the
+    // Pi family (pi, omp) is the single managed seam under construction
+    // (CAD-1012) — it constructs so `open` can reach the fail-closed
+    // protected-prereq gate, never to launch.
+    let allowed = matches!(endpoint_kind, "pty" | "fake")
+        || crate::adapter::registry::pi_family_managed(provider, endpoint_kind);
     if !allowed {
         return Err(crate::error::Error::rejected(
             "This endpoint does not implement protected agent-UID launch; refusing operator-UID fallback",
@@ -790,10 +1018,10 @@ mod split_launch_tests {
     use crate::store::Agent;
     #[test]
     fn actual_adapter_entrypoint_refuses_every_uncovered_provider_and_master() {
-        // managed/pi is the one constructed seam — it is covered separately
-        // below: build succeeds so `open` can reach the fail-closed
-        // protected-prereq gate, but no launch can occur. Every other
-        // provider/endpoint still refuses at construction.
+        // A managed Pi-family row is the one constructed seam — it is
+        // covered separately below: build succeeds so `open` can reach the
+        // fail-closed protected-prereq gate, but no launch can occur. Every
+        // other provider/endpoint still refuses at construction.
         for (provider, endpoint) in [
             ("claude", "managed"),
             ("codex", "managed"),
@@ -803,6 +1031,7 @@ mod split_launch_tests {
             for alias in ["master", "fixture-worker"] {
                 let agent = Agent {
                     alias: alias.into(),
+                    uid: format!("agt-{alias}"),
                     provider: provider.into(),
                     endpoint_kind: endpoint.into(),
                     role: if alias == "master" {
@@ -828,6 +1057,11 @@ mod split_launch_tests {
                     generation: None,
                     state: "registered".into(),
                     enabled: true,
+                    gc_keep: false,
+                    archived_at: None,
+                    archived_by: None,
+                    archive_reason: None,
+                    lifecycle_rev: 0,
                     error: None,
                     created: 0.0,
                     updated: 0.0,
@@ -853,93 +1087,75 @@ mod split_launch_tests {
             }
         }
     }
-    /// managed+pi constructs under split so `open` reaches the protected
-    /// gate — but `open` itself must fail closed on the unavailable external
-    /// prerequisites. Construction is not launch authority.
+    /// A managed Pi-family row constructs under split so `open` reaches the
+    /// protected gate — but `open` itself must fail closed on the
+    /// unavailable external prerequisites. Construction is not launch
+    /// authority.
     #[test]
-    fn managed_pi_constructs_but_open_fails_closed_on_prereqs() {
-        const MODEL: &str = "openai-codex/gpt-6.1-sol";
-        let pm = tempfile::tempdir().unwrap();
-        let env = ProviderEnv::refusing_providers();
-        // Per-instance override: neither case may read an ambient operator PM.
-        env.set("CADENCE_PM_DIR", pm.path().to_string_lossy().into_owned());
-        let agent = Agent {
-            alias: "fixture-worker".into(),
-            provider: "pi".into(),
-            endpoint_kind: "managed".into(),
-            role: "worker".into(),
-            team_role: None,
-            cwd: "/tmp".into(),
-            sandbox: "".into(),
-            instructions: None,
-            thread_id: None,
-            session_id: None,
-            model: None,
-            effort: None,
-            pid: None,
-            pid_start: None,
-            endpoint: None,
-            params: Some(serde_json::json!({"model":MODEL})),
-            model_selection: None,
-            quota: None,
-            generation: None,
-            state: "registered".into(),
-            enabled: true,
-            error: None,
-            created: 0.0,
-            updated: 0.0,
-        };
-        let hooks = AdapterHooks {
-            on_event: Box::new(|_, _| panic!("refused Pi open emitted traffic")),
-            on_request: Box::new(|_| panic!("refused Pi open requested authority")),
-        };
-        let adapter = build(
-            &agent,
-            hooks,
-            std::path::Path::new("/nonexistent/fixture.log"),
-            &env,
-            Some(21001),
-        )
-        .unwrap_or_else(|e| panic!("managed/pi constructs under split: {e}"));
-        // Preserve actual model-policy refusal before establishing the isolated,
-        // explicitly user-approved policy. Missing policy must still allow nothing.
-        assert!(crate::pi_policy::read(pm.path()).unwrap().is_none());
-        match adapter.open(&agent) {
-            Err(crate::Error::Rejected(message)) => assert_eq!(
-                message,
-                format!(
-                    "pi worker model '{MODEL}' is not on the operator's allowlist (allowed: \
-                     nothing — pm.yaml has no [pi].models.allow entries) — the operator pins \
-                     the pi model set in pm.yaml [pi].models.allow (CAD-559, CAD-575)"
-                )
-            ),
-            Err(e) => panic!("open did not reach the absent-model-policy guard: {e}"),
-            Ok(_) => panic!("open succeeded without a model policy"),
-        }
-        std::fs::write(
-            pm.path().join("pm.yaml"),
-            format!("pi:\n  models:\n    allow: [{MODEL}]\n"),
-        )
-        .unwrap();
-        let policy = crate::pi_policy::read(pm.path()).unwrap();
-        assert!(policy.is_some());
-        crate::pi_policy::require_allowed(policy.as_ref(), "worker", MODEL).unwrap();
-        // Policy approval is not protected authority. This ordinary caller lacks
-        // the fixed supervisor prerequisite; no UID switch, key or permit is supplied.
-        // This is caller refusal only, not crypto/kernel/current qualification.
-        match adapter.open(&agent) {
-            Err(crate::Error::Rejected(message)) => assert_eq!(
-                message,
-                "protected Pi must be provisioned by the fixed supervisor"
-            ),
-            Err(e) => panic!("open did not reach the protected supervisor-caller guard: {e}"),
-            Ok(_) => panic!("open succeeded with the prerequisites unavailable"),
+    fn managed_pi_family_constructs_but_open_fails_closed_on_prereqs() {
+        for provider in ["pi", "omp"] {
+            let agent = Agent {
+                alias: "fixture-worker".into(),
+                uid: "agt-fixture-worker".into(),
+                provider: provider.into(),
+                endpoint_kind: "managed".into(),
+                role: "worker".into(),
+                team_role: None,
+                cwd: "/tmp".into(),
+                sandbox: "".into(),
+                instructions: None,
+                thread_id: None,
+                session_id: None,
+                model: None,
+                effort: None,
+                pid: None,
+                pid_start: None,
+                endpoint: None,
+                params: Some(serde_json::json!({"model":"devin/swe-2-high"})),
+                model_selection: None,
+                quota: None,
+                generation: None,
+                state: "registered".into(),
+                enabled: true,
+                gc_keep: false,
+                archived_at: None,
+                archived_by: None,
+                archive_reason: None,
+                lifecycle_rev: 0,
+                error: None,
+                created: 0.0,
+                updated: 0.0,
+            };
+            let hooks = AdapterHooks {
+                on_event: Box::new(|_, _| {}),
+                on_request: Box::new(|_| {}),
+            };
+            let adapter = build(
+                &agent,
+                hooks,
+                std::path::Path::new("/nonexistent/fixture.log"),
+                &ProviderEnv::refusing_providers(),
+                Some(21001),
+            )
+            .unwrap_or_else(|e| panic!("managed/{provider} constructs under split: {e}"));
+            // open() must fail closed — the protected prerequisites are absent.
+            let e = match adapter.open(&agent) {
+                Err(e) => e,
+                Ok(_) => panic!("{provider}: open succeeded with the prerequisites unavailable"),
+            };
+            assert!(e.to_string().contains("UNKNOWN"), "{provider}: {e}");
         }
     }
     #[test]
     fn split_managed_and_remote_paths_refuse_before_constructors() {
-        // pi/managed constructs; every other managed/remote path refuses.
-        assert!(require_split_launch_path(Some(21001), "pi", "managed").is_ok());
+        // The managed Pi family constructs; every other managed/remote
+        // path refuses.
+        for provider in ["pi", "omp"] {
+            assert!(
+                require_split_launch_path(Some(21001), provider, "managed").is_ok(),
+                "{provider}/managed"
+            );
+        }
         for (provider, endpoint) in [
             ("claude", "managed"),
             ("codex", "managed"),
@@ -948,6 +1164,9 @@ mod split_launch_tests {
             ("pi", "managed-ws"),
             ("pi", "cloud"),
             ("pi", "unknown"),
+            ("omp", "managed-ws"),
+            ("omp", "cloud"),
+            ("omp", "unknown"),
         ] {
             assert!(
                 require_split_launch_path(Some(21001), provider, endpoint).is_err(),
@@ -966,6 +1185,68 @@ mod split_launch_tests {
 
 #[cfg(test)]
 mod tests {
+    /// CAD-1624: omp rides the Pi adapter with its own program. The override
+    /// must stay on the copy — a shared map would silently launch every pi
+    /// agent as omp, and vice versa.
+    #[test]
+    fn with_var_does_not_mutate_the_shared_env() {
+        let env = ProviderEnv::default();
+        env.set("CADENCE_PI_COMMAND", "pi");
+        let omp = env.with_var("CADENCE_PI_COMMAND", "omp");
+        assert_eq!(env.var("CADENCE_PI_COMMAND").as_deref(), Some("pi"));
+        assert_eq!(omp.var("CADENCE_PI_COMMAND").as_deref(), Some("omp"));
+    }
+
+    /// CAD-1624/CAD-1633: the omp endpoint runs its own program only when
+    /// the configured command is absent, blank or the bare default `pi`;
+    /// any explicit command (operator or sealed fixture) wins, and the
+    /// shared map is never mutated. Display code recomputing launch policy
+    /// uses the same rule.
+    #[test]
+    fn provider_env_keeps_explicit_commands_and_defaults_omp() {
+        let absent = ProviderEnv::default();
+        assert_eq!(
+            provider_env_for("omp", &absent)
+                .var("CADENCE_PI_COMMAND")
+                .as_deref(),
+            Some("omp")
+        );
+        for default in ["", "   ", "pi", " pi "] {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_PI_COMMAND", default);
+            assert_eq!(
+                provider_env_for("omp", &env)
+                    .var("CADENCE_PI_COMMAND")
+                    .as_deref(),
+                Some("omp"),
+                "{default:?}"
+            );
+            assert_eq!(
+                env.var("CADENCE_PI_COMMAND").as_deref(),
+                Some(default),
+                "shared env mutated for {default:?}"
+            );
+        }
+        for explicit in ["/bin/false", "/opt/omp/bin/omp --flag"] {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_PI_COMMAND", explicit);
+            assert_eq!(
+                provider_env_for("omp", &env)
+                    .var("CADENCE_PI_COMMAND")
+                    .as_deref(),
+                Some(explicit)
+            );
+        }
+        let env = ProviderEnv::default();
+        env.set("CADENCE_PI_COMMAND", "pi");
+        assert_eq!(
+            provider_env_for("pi", &env)
+                .var("CADENCE_PI_COMMAND")
+                .as_deref(),
+            Some("pi")
+        );
+    }
+
     /// CAD-1009: the slot stands for the token wherever the daemon's
     /// block puts it (many places), all filled with the one token; and
     /// an endpoint that cannot redeem loses the whole block, not just
@@ -973,8 +1254,18 @@ mod tests {
     #[test]
     fn turn_slot_fills_every_token_position_or_drops_the_block() {
         let slot = "<<cadence-turn-slot:abc>>";
-        let block =
-            crate::master::scoped_verb_reference("i", "c", "m1", slot, std::path::Path::new("/t"));
+        let block = crate::master::scoped_verb_reference(
+            "i",
+            "c",
+            "m1",
+            slot,
+            std::path::Path::new("/t"),
+            &crate::app_assistant::Declared {
+                actions: ["segments.save".to_string()].into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let prompt = format!("[App context]\n{block}\n\nhello");
         assert!(prompt.matches(slot).count() >= 2);
         let filled = with_turn_token(&prompt, Some(slot), "pi-1-ff");
@@ -1034,6 +1325,145 @@ mod tests {
         assert_child_lacks_secrets(&mut app);
     }
 
+    /// `isolate_for_test` — the armed-fixture seal `Shared::new_leased`
+    /// invokes. Pure `ProviderEnv` cases only: every scenario is armed
+    /// through the env's own entries and a synthetic inherited lookup,
+    /// never by reading or mutating the shared process environment.
+    mod isolate_for_test {
+        use super::*;
+
+        /// Lookup table → the injected `inherited` closure.
+        fn inherits<'a>(table: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+            move |name| {
+                table
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        }
+
+        /// A fixture that mocked nothing: every provider command
+        /// resolves to `false`, held on this env so `var()` answers
+        /// `REFUSED_COMMAND` without consulting ambient env.
+        #[test]
+        fn missing_commands_seal_to_refused() {
+            let env = ProviderEnv::default();
+            env.isolate_for_test_with(|_| None).unwrap();
+            for name in PROVIDER_COMMAND_VARS {
+                assert_eq!(env.own(name).as_deref(), Some(REFUSED_COMMAND), "{name}");
+            }
+        }
+
+        /// A blank override — the value adapters silently fall past to
+        /// the real CLI — must refuse, whether it sits on the env or
+        /// arrives inherited.
+        #[test]
+        fn blank_overrides_refuse() {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_CLAUDE_COMMAND", "");
+            let err = env.isolate_for_test_with(|_| None).unwrap_err().to_string();
+            assert!(err.contains("CADENCE_CLAUDE_COMMAND"), "{err}");
+
+            let env = ProviderEnv::default();
+            env.set("CADENCE_TMUX_COMMAND", "   ");
+            assert!(env.isolate_for_test_with(|_| None).is_err());
+
+            let env = ProviderEnv::default();
+            let err = env
+                .isolate_for_test_with(inherits(&[("CADENCE_TMUX_COMMAND", "\t")]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("CADENCE_TMUX_COMMAND"), "{err}");
+        }
+
+        /// The supported mock channel, both forms: an explicit fake
+        /// command set on the env survives verbatim, and a nonempty
+        /// inherited fake is snapshotted into the env — `var()`
+        /// resolves it from this env's own entries (visible via
+        /// `vars()`), not from ambient env.
+        #[test]
+        fn explicit_and_inherited_fakes_are_preserved() {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_CLAUDE_COMMAND", "python3 /fixtures/fake-claude.py");
+            env.isolate_for_test_with(inherits(&[("CADENCE_TMUX_COMMAND", "/fixtures/fake-tmux")]))
+                .unwrap();
+            assert_eq!(
+                env.var("CADENCE_CLAUDE_COMMAND").as_deref(),
+                Some("python3 /fixtures/fake-claude.py")
+            );
+            assert_eq!(
+                env.own("CADENCE_TMUX_COMMAND").as_deref(),
+                Some("/fixtures/fake-tmux")
+            );
+            assert!(env.vars().contains(&(
+                "CADENCE_TMUX_COMMAND".to_string(),
+                "/fixtures/fake-tmux".to_string()
+            )));
+        }
+
+        /// An own entry wins over the inherited value — a fixture's
+        /// explicit mock is never displaced by ambient env.
+        #[test]
+        fn own_override_wins_over_inherited() {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_CLAUDE_COMMAND", "/fixture/fake-claude");
+            env.isolate_for_test_with(inherits(&[(
+                "CADENCE_CLAUDE_COMMAND",
+                "/ambient/other-claude",
+            )]))
+            .unwrap();
+            assert_eq!(
+                env.var("CADENCE_CLAUDE_COMMAND").as_deref(),
+                Some("/fixture/fake-claude")
+            );
+        }
+
+        /// Validation precedes every write: a refused env retains
+        /// exactly its prior entries — no half-sealed state.
+        #[test]
+        fn a_refused_env_is_not_partially_sealed() {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_PM_DIR", "/fixture/pm");
+            env.set("CADENCE_TMUX_COMMAND", "");
+            assert!(env.isolate_for_test_with(|_| None).is_err());
+            assert_eq!(env.own("CADENCE_PM_DIR").as_deref(), Some("/fixture/pm"));
+            for name in PROVIDER_COMMAND_VARS {
+                if name != "CADENCE_TMUX_COMMAND" {
+                    assert!(
+                        env.own(name).is_none(),
+                        "{name} was sealed before the error"
+                    );
+                }
+            }
+        }
+
+        /// Non-command configuration rides the same env and is not
+        /// provider-boundary state — the seal leaves it alone.
+        #[test]
+        fn unrelated_config_is_preserved() {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_PM_DIR", "/fixture/pm");
+            env.set("CADENCE_PROFILE", "sandbox:x");
+            env.set("CADENCE_DAEMON_ID", "inst-1");
+            env.isolate_for_test_with(|_| None).unwrap();
+            assert_eq!(env.own("CADENCE_PM_DIR").as_deref(), Some("/fixture/pm"));
+            assert_eq!(env.own("CADENCE_PROFILE").as_deref(), Some("sandbox:x"));
+            assert_eq!(env.own("CADENCE_DAEMON_ID").as_deref(), Some("inst-1"));
+        }
+
+        /// Production behavior is unchanged: a fresh default env
+        /// carries no entries — nothing is refused, injected, or
+        /// rewritten until the armed-seam path asks for it.
+        #[test]
+        fn default_env_is_untouched() {
+            let env = ProviderEnv::default();
+            assert!(env.vars().is_empty());
+            for name in PROVIDER_COMMAND_VARS {
+                assert!(env.own(name).is_none(), "{name}");
+            }
+        }
+    }
+
     /// CAD-310: the tracker and profile a launched agent gets back are
     /// the daemon's own values; an empty one is not re-injected.
     #[test]
@@ -1052,6 +1482,51 @@ mod tests {
         assert_eq!(
             daemon_context_env(&env),
             vec![("CADENCE_PM_DIR".to_string(), "/sbx/pm".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_provider_log_keeps_only_the_newest_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker.provider.log");
+        let cap = PROVIDER_LOG_MAX_BYTES as usize;
+        let mut data = vec![b'x'; cap + 4096];
+        let tail = b"newest-line\n";
+        let at = data.len() - tail.len();
+        data[at..].copy_from_slice(tail);
+        std::fs::write(&path, data).unwrap();
+        drop(open_provider_log(&path).unwrap());
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after.len(), cap);
+        assert!(after.ends_with(tail));
+        // A log under the cap is untouched.
+        std::fs::write(&path, b"short log").unwrap();
+        drop(open_provider_log(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"short log");
+
+        // A scratch agents/ dir: four over-cap logs shrink to the cap each.
+        let agents = dir.path().join("agents");
+        std::fs::create_dir(&agents).unwrap();
+        for i in 0..4 {
+            let log = agents.join(format!("worker-{i}.provider.log"));
+            std::fs::write(&log, vec![b'x'; cap + 1024]).unwrap();
+        }
+        let total = |dir: &std::path::Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().metadata().unwrap().len())
+                .sum::<u64>()
+        };
+        let before = total(&agents);
+        for i in 0..4 {
+            let log = agents.join(format!("worker-{i}.provider.log"));
+            drop(open_provider_log(&log).unwrap());
+        }
+        let after = total(&agents);
+        assert!(after <= 4 * PROVIDER_LOG_MAX_BYTES);
+        eprintln!(
+            "scratch agents/ 4 logs: before={before} bytes, after={after} bytes, cap={}",
+            PROVIDER_LOG_MAX_BYTES
         );
     }
 }

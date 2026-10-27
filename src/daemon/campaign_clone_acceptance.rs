@@ -63,7 +63,7 @@ impl Fixture {
                 })
                 .unwrap();
         }
-        let source = format!("{}/workspace-apps/crm", env!("CARGO_MANIFEST_DIR"));
+        let source = format!("{}/tests/fixtures/apps/crm", env!("CARGO_MANIFEST_DIR"));
         let install = scoped(Asserted::Operator, || {
             shared.dispatch("app_workspace_install", &json!({"source": source}), pid())
         })

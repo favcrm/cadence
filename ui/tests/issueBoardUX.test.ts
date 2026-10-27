@@ -5,6 +5,8 @@ const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/projects/cadence/issues" });
 for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLDialogElement", "HTMLInputElement", "SVGElement", "navigator", "MutationObserver", "Event", "KeyboardEvent", "MouseEvent", "location", "history"])
   Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
+for (const name of ["addEventListener", "removeEventListener"])
+  Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
 const loader = require("module"), originalRequire = loader.prototype.require;
 loader.prototype.require = function (this: unknown, id: string) {
@@ -15,8 +17,16 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const Board = (require("../src/features/projects/Board") as typeof import("../src/features/projects/Board")).default;
-const Drawer = (require("../src/features/projects/Drawer") as typeof import("../src/features/projects/Drawer")).default;
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const BoardComponent = (require("../src/features/projects/Board") as typeof import("../src/features/projects/Board")).default;
+const Board = (props: React.ComponentProps<typeof BoardComponent>) => React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(BoardComponent, props) }));
+const DetailComponent = (require("../src/features/work-items/WorkItemDetail") as typeof import("../src/features/work-items/WorkItemDetail")).default;
+const Detail = (props: React.ComponentProps<typeof DetailComponent>) =>
+  React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(DetailComponent, props) }));
 const { api } = require("../src/lib/api") as typeof import("../src/lib/api");
 const { NO_FILTERS } = require("../src/lib/filters") as typeof import("../src/lib/filters");
 type Card = import("../src/lib/types").IssueCard;
@@ -24,7 +34,7 @@ function assert(value: unknown, what: string): asserts value { if (!value) throw
 const card: Card = {
   id: "CAD-1", title: "Fix onboarding", status: "doing", project: "cadence", status_source: "file", priority: "P1",
   blocked_by: [], relates: [], refs: [], container: false, ready: true, blocked: false,
-  created: "2026-09-27", rev: "fixture", counts: { comments: 0, artifacts: 0, refs: 0 },
+  created: "2026-09-27", rev: "fixture", counts: { comments: 0, artifacts: 0, refs: 0 }, paths: [], tags: [], work: { type: "task", type_source: "implicit", weight: 1 },
   checks: { done: 1, total: 3 },
 };
 const props: React.ComponentProps<typeof Board> = {
@@ -198,34 +208,41 @@ async function run() {
     const close = () => { closed++; };
     const retry = () => { retried++; };
     const href = "/projects/cadence/issues/CAD-1";
-    await React.act(() => drawerRoot.render(React.createElement(Drawer, {
-      id: card.id, detail: null, href, onClose: close, onRetry: retry,
+    const detailProps = { id: card.id, origin: "issue" as const, href, onClose: close, onRetry: retry,
+      readOnly: false, onOpen: () => {} };
+    await React.act(() => drawerRoot.render(React.createElement(Detail, {
+      ...detailProps,
+      detail: null,
       readState: { data: null, status: "failed", error: "offline", asOf: null, inFlight: false },
     })));
-    const dialog = drawerHost.querySelector("dialog");
-    assert(dialog?.open, "quick peek uses a native modal dialog");
-    assert(dialog.querySelector('[role="alert"]')?.textContent?.includes("offline"), "failed preview explains its read error");
-    await React.act(() => Array.from(dialog.querySelectorAll("button")).find((item) => item.textContent === "Retry")?.click());
-    assert(retried === 1, "failed preview can retry");
-    assert(dialog.querySelector('a[href="/projects/cadence/issues/CAD-1"]')?.textContent?.includes("Open full issue"), "full issue remains reachable after preview failure");
+    const drawer = () => drawerHost.querySelector('[role="dialog"]');
+    assert(drawer(), "the shared detail renders its drawer surface");
+    assert(drawer()!.querySelector('[role="alert"]')?.textContent?.includes("offline"), "failed detail explains its read error");
+    await React.act(() => Array.from(drawer()!.querySelectorAll("button")).find((item) => item.textContent === "Retry")?.click());
+    assert(retried === 1, "failed detail can retry");
+    assert(drawer()!.querySelector('a[href="/projects/cadence/issues/CAD-1"]')?.textContent?.includes("Open full issue"), "full issue remains reachable after a failed read");
     const cached: import("../src/lib/types").IssueDetail = {
       ...card, frontmatter: {}, body: "Saved summary", path: "issue.md", comments: [], notes_chain: [], artifacts: [], activity: [],
       links: { children: [], blocked_by: [], blocks: [], relates: [], duplicates: [] },
     };
-    await React.act(() => drawerRoot.render(React.createElement(Drawer, {
-      id: card.id, detail: cached, href, onClose: close, onRetry: retry,
+    await React.act(() => drawerRoot.render(React.createElement(Detail, {
+      ...detailProps,
+      detail: cached,
       readState: { data: cached, status: "ok", error: null, asOf: Date.now(), inFlight: true },
     })));
-    assert(dialog.querySelector('[role="status"]')?.textContent?.includes("Refreshing preview"), "cached detail is labeled while revalidating");
-    await React.act(() => drawerRoot.render(React.createElement(Drawer, {
-      id: card.id, detail: cached, href, onClose: close, onRetry: retry,
+    assert(drawer()!.querySelector('[role="status"]')?.textContent?.includes("Refreshing"), "cached detail is labeled while revalidating");
+    await React.act(() => drawerRoot.render(React.createElement(Detail, {
+      ...detailProps,
+      detail: cached,
       readState: { data: cached, status: "stale", error: "offline", asOf: Date.now(), inFlight: false },
     })));
-    assert(dialog.querySelector('[role="status"]')?.textContent?.includes("out of date"), "stale detail is labeled after failure");
-    await React.act(() => dialog.dispatchEvent(new Event("cancel", { bubbles: false, cancelable: true })));
-    assert(closed === 1, "Escape cancel closes the preview");
+    assert(drawer()!.querySelector('[role="status"]')?.textContent?.includes("out of date"), "stale detail is labeled after a failed refresh");
+    await React.act(() => window.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    for (let i = 0; i < 40 && closed === 0; i++) await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+    assert(closed === 1, "Escape closes the shared detail");
+    await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
     await React.act(() => drawerRoot.unmount());
-    assert(document.activeElement === opener, "closing preview returns focus to its trigger");
+    assert(document.activeElement === opener, "closing the detail returns focus to its trigger");
   }
   console.log(`issueBoardUX ${scenario}: passed`);
 }

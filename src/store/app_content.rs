@@ -1023,6 +1023,20 @@ impl RecordStore {
         expected_revision: Option<i64>,
         draft: &Draft,
     ) -> Result<Value> {
+        self.app_content_save_as(context, campaign, expected_revision, draft, None)
+    }
+
+    /// [`Self::app_content_save`] carrying the verified human behind an
+    /// owner save (CAD-1374). `human` is daemon-derived, never request
+    /// text; it lands on the doc and its revision row in this transaction.
+    pub fn app_content_save_as(
+        &self,
+        context: &str,
+        campaign: &str,
+        expected_revision: Option<i64>,
+        draft: &Draft,
+        human: Option<&Value>,
+    ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(campaign, "campaign ID")?;
         let blocks_text = serde_json::to_string(&draft.canonical_blocks())
@@ -1076,8 +1090,8 @@ impl RecordStore {
                 }
             }
             tx.execute(
-                "INSERT INTO app_content_revisions(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,actor,origin,proposal_id,at,html,text_override) VALUES(?,?,?,?,?,?,?,'operator','operator',NULL,?,?,?)",
-                params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now(), draft.html, draft.text],
+                "INSERT INTO app_content_revisions(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,actor,origin,proposal_id,at,html,text_override,human) VALUES(?,?,?,?,?,?,?,'operator','operator',NULL,?,?,?,?)",
+                params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now(), draft.html, draft.text, human.map(Value::to_string)],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
             Ok(())
@@ -1268,7 +1282,10 @@ impl RecordStore {
     pub fn app_content_show(&self, context: &str, campaign: &str) -> Result<Value> {
         let conn = self.conn();
         let row = self.content_row(&conn, context, campaign)?.ok_or_else(|| {
-            Error::rejected("email content is unavailable for this installation and context")
+            Error::invalid(
+                "app_content_missing",
+                "email content is unavailable for this installation and context",
+            )
         })?;
         Ok(json!({"content": self.content_doc_json(context, campaign, row)}))
     }

@@ -55,6 +55,8 @@ pub enum State {
     Unstaffed,
     /// PASS on `reviewed.sha`; the merge decision waits on green CI.
     Passed,
+    /// Routine delivery evidence is ready; this is never a reviewer PASS.
+    Ready,
     /// The operator enqueued the merge, pinned to `reviewed.sha`.
     Enqueued,
     /// [`MAX_REVISE`] REVISE verdicts — the operator decides.
@@ -72,6 +74,7 @@ impl State {
             State::Reviewing => "reviewing",
             State::Unstaffed => "unstaffed",
             State::Passed => "passed",
+            State::Ready => "ready",
             State::Enqueued => "enqueued",
             State::Escalated => "escalated",
             State::Merged => "merged",
@@ -93,6 +96,7 @@ impl State {
             State::Reviewing,
             State::Unstaffed,
             State::Passed,
+            State::Ready,
             State::Enqueued,
             State::Escalated,
             State::Merged,
@@ -179,6 +183,41 @@ impl TicketDone {
     }
 }
 
+/// Server-collected no-review readiness, distinct from a reviewer verdict.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyEvidence {
+    pub repo: String,
+    pub pr: u64,
+    pub head: String,
+    pub base: String,
+    /// The PR's actual target branch name (CAD-1561) — binds the
+    /// evidence to `staging` vs `main`, not just the base OID.
+    /// `default` keeps pre-1561 serialized records readable; an empty
+    /// bind never matches a named target, which fails closed.
+    #[serde(default)]
+    pub base_ref: String,
+    pub policy_digest: String,
+    pub ci_run_id: u64,
+    pub ci_run_url: String,
+    pub outcome_report: String,
+}
+
+/// Last binding freshly revalidated by the daemon; historical evidence alone
+/// is never sufficient to make a record merge-ready.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyBinding {
+    pub repo: String,
+    pub pr: u64,
+    pub head: String,
+    pub base: String,
+    #[serde(default)]
+    pub base_ref: String,
+    pub policy_digest: String,
+    pub ci_run_id: u64,
+    pub ci_run_url: String,
+    pub outcome_report: String,
+}
+
 /// A ticket's place in the loop — one per dispatched ticket.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Record {
@@ -212,6 +251,15 @@ pub struct Record {
     /// The latest verdict.
     #[serde(default)]
     pub verdict: Option<VerdictRec>,
+    /// Native routine readiness evidence; never a verdict or PASS.
+    #[serde(default)]
+    pub ready_evidence: Option<ReadyEvidence>,
+    /// Current authoritative binding from the most recent fresh validation.
+    #[serde(default)]
+    pub ready_binding: Option<ReadyBinding>,
+    /// Accepted worker outcome report reference for routine readiness retries.
+    #[serde(default)]
+    pub outcome_report: Option<String>,
     /// Done reports the loop has consumed (file names).
     #[serde(default)]
     pub handled: Vec<String>,
@@ -225,6 +273,18 @@ pub struct Record {
     /// Why the operator was brought in, or the decline reason.
     #[serde(default)]
     pub note: Option<String>,
+    /// An unattended operation is held for an explicit operator decision.
+    /// Presentation only; native grant/receipt checks own authorization.
+    #[serde(default, skip_serializing_if = "not_held")]
+    pub unattended_hold: bool,
+    /// Owned unresolved/failed turn behind a completion hold. Presentation
+    /// correlation only: the overview confirms it against the native store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unattended_turn: Option<String>,
+    /// Known authorized request awaiting native queue admission. Decision
+    /// presentation only, never evidence of authority or enqueue.
+    #[serde(default, skip_serializing_if = "not_held")]
+    pub unattended_pending: bool,
     /// Who declined the merge (CAD-140) — the deciding actor, so a
     /// tailnet decline is attributed to the operator's login.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,6 +312,10 @@ pub struct Record {
     pub risk: Option<String>,
 }
 
+fn not_held(held: &bool) -> bool {
+    !held
+}
+
 impl Record {
     pub fn new(issue: &str, project: &str, worker: &str, now: i64) -> Self {
         Record {
@@ -268,10 +332,16 @@ impl Record {
             rounds: 0,
             revisions: 0,
             verdict: None,
+            ready_evidence: None,
+            ready_binding: None,
+            outcome_report: None,
             handled: vec![],
             observed: None,
             disable_auto: false,
             note: None,
+            unattended_hold: false,
+            unattended_turn: None,
+            unattended_pending: false,
             declined_by: None,
             excluded: vec![],
             ticket_done: None,
@@ -313,17 +383,103 @@ impl Record {
         if !self.merge_ready() {
             return None;
         }
+        if !matches!(self.state, State::Ready)
+            && !(self.state == State::Enqueued && self.ready_evidence.is_some())
+        {
+            let sha = self.passed_sha()?;
+            return Some(format!("{}/{sha}@{}", self.issue, self.ready_epoch));
+        }
+        let binding = self.ready_binding.as_ref()?;
         Some(format!(
-            "{}/{}@{}",
+            "{}/{}:{}:{}:{}:{}:{}:{}:{}@{}",
             self.issue,
-            self.passed_sha()?,
+            binding.repo,
+            binding.pr,
+            binding.head,
+            binding.base,
+            binding.base_ref,
+            binding.policy_digest,
+            binding.ci_run_id,
+            binding.outcome_report,
             self.ready_epoch
         ))
     }
 
-    /// The merge decision is ready: a PASS, and the operator's process
-    /// saw that very head open with green CI.
+    /// The merge decision is ready: either a PASS plus its observed green
+    /// head, or a routine receipt plus its freshly validated exact binding.
     pub fn merge_ready(&self) -> bool {
+        if self.unattended_pending {
+            return false;
+        }
+        if self.state == State::Ready {
+            return self
+                .ready_evidence
+                .as_ref()
+                .zip(self.ready_binding.as_ref())
+                .is_some_and(|(e, b)| {
+                    let valid_sha = |s: &str| {
+                        s.len() == 40
+                            && s.bytes()
+                                .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+                    };
+                    let run_url =
+                        format!("https://github.com/{}/actions/runs/{}", b.repo, b.ci_run_id);
+                    let digest_valid = b.policy_digest.strip_prefix("sha256:").is_some_and(|hex| {
+                        hex.len() == 64
+                            && hex
+                                .bytes()
+                                .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+                    });
+                    let report_prefix = format!("{}/reports/", self.issue);
+                    let report_valid =
+                        b.outcome_report
+                            .strip_prefix(&report_prefix)
+                            .is_some_and(|name| {
+                                !name.is_empty()
+                                    && name.ends_with(".md")
+                                    && !name.contains('/')
+                                    && !name.contains("..")
+                            });
+                    let repo_valid = b.repo.split_once('/').is_some_and(|(owner, name)| {
+                        !owner.is_empty()
+                            && !name.is_empty()
+                            && b.repo == b.repo.to_ascii_lowercase()
+                    });
+                    e.repo == b.repo
+                        && e.pr == b.pr
+                        && e.head == b.head
+                        && e.base == b.base
+                        // CAD-1561: evidence must name its actual target
+                        // branch — a pre-1561 record deserializes base_ref
+                        // empty and can never merge-ready without a fresh
+                        // binding.
+                        && e.base_ref == b.base_ref
+                        && !b.base_ref.is_empty()
+                        && e.policy_digest == b.policy_digest
+                        && e.ci_run_id == b.ci_run_id
+                        && e.ci_run_url == b.ci_run_url
+                        && e.outcome_report == b.outcome_report
+                        && repo_valid
+                        && e.pr > 0
+                        && valid_sha(&e.head)
+                        && valid_sha(&e.base)
+                        && digest_valid
+                        && b.ci_run_id > 0
+                        && b.ci_run_url == run_url
+                        && report_valid
+                        && self.outcome_report.as_deref() == Some(b.outcome_report.as_str())
+                        && self
+                            .pr
+                            .as_deref()
+                            .and_then(pr_ref)
+                            .is_some_and(|r| r == format!("{}#{}", b.repo, b.pr))
+                        && self.head.as_deref() == Some(b.head.as_str())
+                        && self
+                            .observed
+                            .as_ref()
+                            .is_some_and(|o| o.head == b.head && o.ci_green && o.pr_state == "OPEN")
+                });
+        }
         let Some(sha) = self.passed_sha() else {
             return false;
         };
@@ -788,7 +944,12 @@ pub fn review_kickoff(
              pinned to the sha, and if the head moves the daemon sends a new review. File \
              the verdict: `cadence report file --task {issue} --kind verdict --file <f>` \
              with frontmatter `verdict: pass` or `verdict: revise` and `sha: {sha}`, the \
-             findings in the body. Only you can file it, and only for this head.",
+             findings in the body. Include the actual policy class in `risk:`: `auto`, \
+             `human (<triggers>)` or `delegated (<triggers>)`, according to the change and \
+             repository rules, not the diff-size Risk above. An unattended PASS needs an \
+             explicit, genuinely eligible `risk: auto`; protected or sensitive work must \
+             retain its actual classification and operator hold. Only you can file it, \
+             and only for this head.",
             note = note.display()
         )
     };
@@ -903,18 +1064,35 @@ pub fn project_pr_refusal(pm_dir: &Path, project: &str, pr: &str) -> Result<Opti
 /// Observe one ticket's PR — the row [`sync`] reports for it, with
 /// `error` set when reading or reporting it failed.
 pub fn sync_pr(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Value {
-    match sync_one(state_dir, issue, url, gh_bin) {
+    sync_pr_counted(state_dir, issue, url, gh_bin).0
+}
+
+/// [`sync_pr`] and how many `gh` processes it started (the view, plus the
+/// `--disable-auto` write when the observation asks for it), so the
+/// board's pass can hold itself to a process budget (CAD-1751).
+pub fn sync_pr_counted(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> (Value, usize) {
+    let mut spawned = 0;
+    let row = match sync_one(state_dir, issue, url, gh_bin, &mut spawned) {
         Ok(v) => v,
         Err(e) => json!({"issue": issue, "error": e.to_string()}),
-    }
+    };
+    (row, spawned)
 }
 
 /// One bounded `gh pr view` — the read half every GitHub touch
 /// shares (the sync and the approve-and-land transaction). Returned
 /// parsed; the caller stamps `read_at` (CAD-564: the read starts now).
 pub(crate) fn pr_view(gh_bin: &str, slug: &str, number: u64) -> Result<Value> {
-    let view = gh(
+    pr_view_via(gh_bin, slug, number, false)
+}
+
+/// [`pr_view`], optionally through the rate-limit pause. Only the board's
+/// polling sync passes `polled`; the approve, landing and requirements
+/// paths are user-triggered gate reads and stay unguarded.
+fn pr_view_via(gh_bin: &str, slug: &str, number: u64, polled: bool) -> Result<Value> {
+    let view = gh_via(
         gh_bin,
+        polled,
         &[
             "pr",
             "view",
@@ -922,20 +1100,27 @@ pub(crate) fn pr_view(gh_bin: &str, slug: &str, number: u64) -> Result<Value> {
             "-R",
             slug,
             "--json",
-            "headRefOid,state,statusCheckRollup,additions,deletions,changedFiles,autoMergeRequest",
+            "headRefOid,baseRefOid,baseRefName,state,statusCheckRollup,additions,deletions,changedFiles,autoMergeRequest",
         ],
     )?;
     serde_json::from_str(&view)
         .map_err(|e| Error::rejected(format!("gh pr view: unreadable ({e})")))
 }
 
-fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Value> {
+fn sync_one(
+    state_dir: &Path,
+    issue: &str,
+    url: &str,
+    gh_bin: &str,
+    spawned: &mut usize,
+) -> Result<Value> {
     let (slug, number) = crate::issue::task_report::parse_pr_url(url)?;
     // CAD-564: the read starts now — whatever this call returns was
     // true at `read_at`, and a record change applied after it (a done
     // report's new head) is newer than anything the observation shows.
     let read_at = crate::issue::time::now_epoch();
-    let pr = pr_view(gh_bin, &slug, number)?;
+    *spawned += 1;
+    let pr = pr_view_via(gh_bin, &slug, number, true)?;
     let rollup = pr["statusCheckRollup"]
         .as_array()
         .cloned()
@@ -953,6 +1138,7 @@ fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Va
     });
     let mut answer = crate::client::rpc(state_dir, "delivery_observe", observed)?;
     if answer["disable_auto"] == true {
+        *spawned += 1;
         gh(
             gh_bin,
             &[
@@ -987,8 +1173,22 @@ pub fn resolve_gh(path: Option<std::ffi::OsString>) -> std::path::PathBuf {
 }
 
 pub(crate) fn gh(gh_bin: &str, args: &[&str]) -> Result<String> {
-    let out = crate::proc::run_bounded(Command::new(gh_bin).args(args), GH_TIMEOUT)
-        .map_err(|e| Error::rejected(format!("gh {}: {e}", args.join(" "))))?;
+    gh_via(gh_bin, false, args)
+}
+
+/// `polled` runs `gh` through [`crate::gh_guard`]: while GitHub's rate
+/// limit is paused no process starts and the read fails like any failed
+/// read, so the sync records no evidence.
+fn gh_via(gh_bin: &str, polled: bool, args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new(gh_bin);
+    cmd.args(args);
+    let out = if polled {
+        crate::gh_guard::run(&mut cmd, GH_TIMEOUT)
+            .map_err(|e| Error::rejected(format!("gh {}: {e}", args.join(" "))))?
+    } else {
+        crate::proc::run_bounded(&mut cmd, GH_TIMEOUT)
+            .map_err(|e| Error::rejected(format!("gh {}: {e}", args.join(" "))))?
+    };
     if !out.status.success() {
         return Err(Error::rejected(format!(
             "gh {}: {}",
@@ -999,6 +1199,8 @@ pub(crate) fn gh(gh_bin: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+#[cfg(test)]
+mod cad1751_pause_refusal_acceptance;
 #[cfg(test)]
 mod tests {
     use super::*;

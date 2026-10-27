@@ -86,8 +86,8 @@ pub(crate) fn fenced_next(alias: &str, error: &str, unknown: i64) -> Value {
         })
     } else if unknown > 0 {
         json!({
-            "inspect": cadence_agent::daemon::unknown_inspect_lead(),
-            "decision": cadence_agent::daemon::unknown_recovery_note(),
+            "inspect": cadence_agent::store::unknown_inspect_lead(),
+            "decision": cadence_agent::store::unknown_recovery_note(),
         })
     } else {
         json!({"resume": format!("cadence agent resume {alias}")})
@@ -134,8 +134,8 @@ pub(crate) fn resume_one(state_dir: &Path, alias: &str) -> Value {
         "state": agent["state"],
         "hint": format!(
             "fenced by an unreconciled unknown message — not resumed. {} {}",
-            cadence_agent::daemon::unknown_inspect_lead(),
-            cadence_agent::daemon::unknown_recovery_note()
+            cadence_agent::store::unknown_inspect_lead(),
+            cadence_agent::store::unknown_recovery_note()
         )});
     }
     // Any other `attention` fence gates resume exactly the way it gates

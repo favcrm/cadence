@@ -16,6 +16,8 @@ use serde_json::json;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod settings_authority;
+pub use settings_authority::{ProfileBody, SettingsDoc, SettingsSnapshot};
 mod platform;
 pub(crate) use platform::{scope_list, scope_name};
 pub use platform::{
@@ -30,60 +32,106 @@ pub use effects::{
 };
 mod threads;
 pub use threads::{
-    tool_result_summary, tool_summary, ConversationKind, NewEntry, Sender, Thread, ThreadEntry,
-    CONVERSATION_LIMIT, KIND_ASSISTANT_TEXT, KIND_MESSAGE, KIND_TOOL_CALL, KIND_TOOL_RESULT,
-    KIND_TURN_RESULT, PAGE_MAX as THREAD_PAGE_MAX, ROLE_AGENT, ROLE_OPERATOR, ROLE_SYSTEM,
-    SUBJECT_CAMPAIGN,
+    operator_only_kind, tool_result_summary, tool_summary, ConversationKind, NewEntry, Sender,
+    Thread, ThreadEntry, CONVERSATION_LIMIT, KIND_ARTIFACT, KIND_ASSISTANT_TEXT,
+    KIND_HIRE_PROPOSAL, KIND_MESSAGE, KIND_TOOL_CALL, KIND_TOOL_RESULT, KIND_TURN_RESULT,
+    PAGE_MAX as THREAD_PAGE_MAX, RECRUIT_INSTALL, ROLE_AGENT, ROLE_OPERATOR, ROLE_SYSTEM,
+    SUBJECT_CAMPAIGN, SUBJECT_WHATSAPP,
 };
+pub use threads::{CliAuthority, MemberAuthority};
 pub use threads::{COMPACTED_EVENT as THREAD_COMPACTED_EVENT, PACK_EVENT as THREAD_PACK_EVENT};
 
 mod agents;
 mod cloud_dispatch_outbox;
+#[cfg(test)]
+mod wait_probe;
+pub(crate) use agents::AGENT_GC_RECORDS_ONLY;
 pub use agents::{Agent, ModelDefaultsSnapshot, NewAgent, AGENT_STATES};
+
+pub const MAX_INSTRUCTIONS_BYTES: usize = 32_000;
+pub mod activity;
 mod delivery;
+pub(crate) use delivery::UNKNOWN_GENERIC_REASON;
+pub use delivery::{unknown_inspect_lead, unknown_recovery_note};
 mod events;
 pub use events::{
-    default_approval_id, Event, NewApproval, NewDelegated, APPROVAL_RECORDED_EVENT,
-    APPROVAL_REVOKED_EVENT, APPROVAL_STREAM, APP_APPROVED_EVENT, AUTO_RESUME_EVENT,
-    AUTO_RESUME_FAILED_EVENT, AUTO_STOP_EVENT, AUTO_STOP_MARKER_KINDS, DELIVERY_ROLLUP_EVENT,
-    DESIGNATION_EVENT, EVENT_ROLLUP_AGE_SECS, EVENT_ROLLUP_BATCH, ROLLABLE_EVENT_KINDS,
-    VERDICT_RECORDED_EVENT, VERDICT_STREAM, WORKFLOW_APPROVED_EVENT, WORK_APPROVED_EVENT,
+    board_revocable, default_approval_id, Event, NewApproval, NewDelegated,
+    APPROVAL_RECORDED_EVENT, APPROVAL_RECORDED_VIA, APPROVAL_REVOKED_EVENT, APPROVAL_STREAM,
+    APP_APPROVED_EVENT, AUTO_RESUME_EVENT, AUTO_RESUME_FAILED_EVENT, AUTO_STOP_EVENT,
+    AUTO_STOP_MARKER_KINDS, DELIVERY_ROLLUP_EVENT, DESIGNATION_EVENT, EVENT_ROLLUP_AGE_SECS,
+    EVENT_ROLLUP_BATCH, ROLLABLE_EVENT_KINDS, UNATTENDED_MERGE_ENQUEUED_EVENT,
+    UNATTENDED_MERGE_INTENT_EVENT, UNATTENDED_RUN_EVENT, VERDICT_RECORDED_EVENT, VERDICT_STREAM,
+    WORKFLOW_APPROVED_EVENT, WORK_APPROVED_EVENT,
 };
 // CAD-316: the rollup's read-only counts for `doctor --host`.
 pub(crate) use events::event_store_stats;
+pub mod conversations;
+pub mod human_threads;
+mod topics;
+pub use topics::{
+    delivery_id as topic_delivery_id, post_id as topic_post_id, request_id as topic_request_id,
+    topic_id, Topic, TopicDelivery, TopicPost, POST_MAX_BYTES as TOPIC_POST_MAX_BYTES,
+};
 mod inbox;
 mod kickoff;
+pub(crate) use kickoff::last_sha_line;
 pub use kickoff::{check_commit_sha, job_kickoff, kickoff_ceiling, omit_host_paths};
 mod messages;
 #[cfg(test)]
 pub(crate) use messages::take_decoded_messages;
 pub use messages::{
-    report_timeout_secs, Message, Priority, Steer, DEFAULT_REPORT_TIMEOUT_SECS, ENQUEUE_BYTES,
-    NUDGE_SOURCE,
+    report_timeout_secs, IssueSelection, Message, MessageIndex, MessageIndexQuery, Priority, Steer,
+    DEFAULT_REPORT_TIMEOUT_SECS, ENQUEUE_BYTES, NUDGE_SOURCE,
 };
 mod monitors;
 pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
+mod business_templates;
+pub(crate) use business_templates::SCHEMA as BUSINESS_TEMPLATE_SCHEMA;
+pub use business_templates::{BusinessDocument, TemplateVersion};
+mod artifacts;
+pub use artifacts::{
+    valid_id as artifact_id, Artifact, ArtifactStore, HostedArtifacts, LocalArtifacts, PutArtifact,
+    ARTIFACT_KINDS, ARTIFACT_MAX_BYTES,
+};
+mod chat_files;
+pub use chat_files::{
+    text_kind as chat_text_kind, valid_id as chat_file_id, ChatFile, ChatFileOperationalRoots,
+    ChatFileStorageRoots, CHAT_FILE_MAX_BYTES, CHAT_FILE_MAX_PER_MESSAGE, CHAT_FILE_SCOPE_HOME,
+    CHAT_FILE_TEXT_CAP, CHAT_QUOTA_CODE,
+};
+mod assistants;
+pub use assistants::{
+    AssistDispatchExpect, AssistRecipient, AssistRequest, AssistantBinding,
+    AssistantBootstrapUpdate,
+};
 pub mod app_audiences;
 pub use app_audiences::{AudienceBase, Predicate};
 pub mod app_content;
 pub mod app_content_html;
 pub use app_content::{Block, Draft};
 pub mod app_bindings;
+pub mod app_campaign_work;
 pub mod app_capabilities;
 pub mod app_contexts;
 pub mod app_effects;
 pub mod app_explorer;
+pub mod app_media;
 pub mod app_records;
 pub mod app_runs;
 pub mod app_sends;
+pub mod app_social_drafts;
+pub mod app_tools;
+pub mod app_works;
 pub mod crm_sends;
 pub mod crm_smtp;
 mod plans;
 pub mod social_publish;
-pub use plans::{current_verdict, Job, Task, Verdict, JOB_STATES};
+pub(crate) use plans::DispatchPlan;
+pub use plans::{current_verdict, AssigneeTask, Job, Task, Verdict, JOB_STATES};
 mod quota;
 mod schema;
 pub(crate) mod seal;
+pub(crate) mod wiki_transfers;
 pub(crate) use schema::open_read_only;
 pub use schema::{AdoptEntry, ConsumedMarker, RecoveryOutcome, Take};
 pub(crate) use seal::owner::StoreOwnerGrant;
@@ -97,10 +145,10 @@ pub use seal::OpenMode;
 // needs, and there is no `commit`/`rollback`/`Connection` escape.
 pub use seal::WriteTxn;
 pub(crate) use seal::{preflight_writer_guard, require_legacy_writer_tx, StoreConn};
+#[cfg(all(test, target_os = "linux", feature = "test-seam"))]
+pub(crate) mod cad1128_commit_refusal;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod writer_census;
 
 /// How long a connection waits on another process's lock before
 /// SQLITE_BUSY (CAD-256). The daemon's writer and every out-of-process
@@ -201,6 +249,16 @@ fn take_bytes(text: &str, limit: usize) -> String {
 }
 
 impl Store {
+    /// CAD-1212 test seam: rows inserted, updated or deleted on the daemon
+    /// store connection since it opened (SQLite `total_changes`). A check
+    /// reads it before and after a call and asserts it did not move, to
+    /// prove a callback switched to the lock-free
+    /// `workspace::with_runtime_read` writes nothing. Compiled out of release.
+    #[cfg(test)]
+    pub(crate) fn total_changes_for_test(&self) -> u64 {
+        self.conn().total_changes()
+    }
+
     /// The only way to take the connection lock (CAD-256). A panic while
     /// another caller held the guard poisons the mutex; `lock().unwrap()`
     /// would then panic on every later call and take the daemon down

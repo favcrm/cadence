@@ -12,9 +12,10 @@ import Select from "../../ui/Select";
 import { IconChevron, IconRefresh, IconSearch } from "../../ui/icons";
 import { useWriteBlock } from "../auth/WriteGate";
 import "./permissions.css";
+import { useTranslate } from "../../lib/locale";
 
 type Viewer = {
-  operator: boolean;
+  operator: boolean | null;
   readOnly: boolean;
   boardReadOnly: boolean;
   signedIn: boolean;
@@ -36,6 +37,22 @@ function savedDate(at: number) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+// Saved-rules count line: whole-sentence keys per shape so zh-TW word order stays intact.
+function ruleCountLine(visible: number, total: number, lastKnown: boolean, refreshing: boolean, t: (english: string) => string): string {
+  const one = total === 1;
+  let line: string;
+  if (lastKnown) {
+    line = refreshing
+      ? (one ? t("Last known · {visible} of {total} saved rule · Refreshing…") : t("Last known · {visible} of {total} saved rules · Refreshing…"))
+      : (one ? t("Last known · {visible} of {total} saved rule") : t("Last known · {visible} of {total} saved rules"));
+  } else {
+    line = refreshing
+      ? (one ? t("{visible} of {total} saved rule · Refreshing…") : t("{visible} of {total} saved rules · Refreshing…"))
+      : (one ? t("{visible} of {total} saved rule") : t("{visible} of {total} saved rules"));
+  }
+  return line.replace("{visible}", String(visible)).replace("{total}", String(total));
+}
+
 function RuleRow({
   rule,
   confirming,
@@ -53,6 +70,7 @@ function RuleRow({
   onCancel: () => void;
   onRevoke: () => void;
 }) {
+  const t = useTranslate();
   const id = useId();
   const row = useRef<HTMLLIElement>(null);
   const wasConfirming = useRef(false);
@@ -83,16 +101,16 @@ function RuleRow({
       <div className="permission-row-main">
         <div className="permission-row-labels">
           <span className="permission-effect" data-effect={rule.effect}>
-            {rule.effect === "allow" ? "Allow" : "Deny"}
+            {rule.effect === "allow" ? t("Allow") : t("Deny")}
           </span>
-          <span>{scopeLabel(rule)}</span>
+          <span>{t(scopeLabel(rule))}</span>
         </div>
         <code className="permission-command">{command(rule)}</code>
         <p className="permission-folder">
-          <span>Working folder</span> <code>{rule.cwd || "Not recorded"}</code>
+          <span>{t("Working folder")}</span> <code>{rule.cwd || t("Not recorded")}</code>
         </p>
         <div className="permission-provenance">
-          <span>Saved by {rule.by || "Not recorded"}</span>
+          <span>{t("Saved by {by}").replace("{by}", () => String(rule.by || t("Not recorded")))}</span>
           {date ? (
             <time dateTime={date.toISOString()} title={date.toISOString()}>
               {date.toLocaleDateString(undefined, {
@@ -103,44 +121,42 @@ function RuleRow({
               })}
             </time>
           ) : (
-            <span>Date not recorded</span>
+            <span>{t("Date not recorded")}</span>
           )}
           <details className="permission-details">
             <summary>
-              Rule details <IconChevron />
+              {t("Rule details")} <IconChevron />
             </summary>
             <dl>
               <div>
-                <dt>Rule ID</dt>
+                <dt>{t("Rule ID")}</dt>
                 <dd>
                   <code>{rule.id}</code>
                 </dd>
               </div>
               <div>
-                <dt>Match</dt>
+                <dt>{t("Match")}</dt>
                 <dd>
-                  {rule.scope === "exact"
-                    ? "Every command argument and the working folder must match exactly."
-                    : "The command head matches literally. Each remaining argument must match its saved pattern, with the same argument count and exact working folder. A trailing * matches only at a path boundary."}
+                  {rule.scope === "exact" ? t("Every command argument and the working folder must match exactly.") : t("The command head matches literally. Each remaining argument must match its saved pattern, with the same argument count and exact working folder. A trailing * matches only at a path boundary.")}
                 </dd>
               </div>
               <div>
-                <dt>Command arguments</dt>
+                <dt>{t("Command arguments")}</dt>
                 <dd>
                   <code>{JSON.stringify(rule.argv)}</code>
                 </dd>
               </div>
               {rule.scope === "prefix" && (
                 <div>
-                  <dt>Argument patterns</dt>
+                  <dt>{t("Argument patterns")}</dt>
                   <dd>
                     <code>{JSON.stringify(rule.tail)}</code>
                   </dd>
                 </div>
               )}
               <div>
-                <dt>Saved at</dt>
-                <dd>{date ? date.toISOString() : "Not recorded"}</dd>
+                <dt>{t("Saved at")}</dt>
+                <dd>{date ? date.toISOString() : t("Not recorded")}</dd>
               </div>
             </dl>
           </details>
@@ -153,17 +169,12 @@ function RuleRow({
             aria-describedby={`${id}-confirm`}
           >
             <p id={`${id}-confirm`}>
-              Revoke this {rule.effect} rule?{" "}
-              {rule.effect === "deny"
-                ? "This removes this restriction; an allow rule may then apply."
-                : "The master may need permission again."}{" "}
-              Takes effect on the next check.
+              {t("Revoke this {effect} rule?").replace("{effect}", () => String(rule.effect ?? ""))} {rule.effect === "deny" ? t("This removes this restriction; an allow rule may then apply.") : t("The master may need permission again.")}{" "}
+              {t("Takes effect on the next check.")}
             </p>
             <div>
-              <Button onClick={onCancel}>Cancel</Button>
-              <Button variant="danger" disabled={disabled} onClick={onConfirm}>
-                Confirm revoke
-              </Button>
+              <Button onClick={onCancel}>{t("Cancel")}</Button>
+              <Button variant="danger" disabled={disabled} onClick={onConfirm}>{t("Confirm revoke")}</Button>
             </div>
           </div>
         ) : (
@@ -172,10 +183,10 @@ function RuleRow({
             size="sm"
             disabled={disabled}
             loading={busy}
-            aria-label={`Revoke ${rule.effect} rule ${rule.id}`}
+            aria-label={t("Revoke {effect} rule {id}").replace("{effect}", () => String(rule.effect ?? "")).replace("{id}", () => String(rule.id ?? ""))}
             onClick={onRevoke}
           >
-            {busy ? "Revoking…" : "Revoke"}
+            {busy ? t("Revoking…") : t("Revoke")}
           </Button>
         )}
       </div>
@@ -196,10 +207,11 @@ function RuleWorkspace({
   readOnly: boolean;
   flight: Flight;
 }) {
+  const t = useTranslate();
   const [rules, setRules] = useState<MasterPermissionRule[] | null>(null);
   const [readError, setReadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ key: "revoked"; id: string } | null>(null);
   const [fetching, setFetching] = useState(true);
   const [confirm, setConfirm] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -280,7 +292,7 @@ function RuleWorkspace({
       setRules(
         (previous) => previous?.filter((saved) => saved.id !== rule.id) ?? null,
       );
-      setNotice(`Rule revoked: ${rule.id}. Takes effect on the next check.`);
+      setNotice({ key: "revoked", id: rule.id });
     } catch (error) {
       if (alive.current) setActionError(errorText(error));
     } finally {
@@ -306,43 +318,43 @@ function RuleWorkspace({
     <>
       <div className="permissions-tools" ref={tools}>
         <div className="permission-filter permission-search">
-          <label htmlFor={`${filterId}-query`}>Search rules</label>
+          <label htmlFor={`${filterId}-query`}>{t("Search rules")}</label>
           <div className="permission-search-field">
             <IconSearch size={14} />
             <input
               id={`${filterId}-query`}
               type="search"
               className="field"
-              placeholder="Command, folder, ID or author"
+              placeholder={t("Command, folder, ID or author")}
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
           </div>
         </div>
         <div className="permission-filter">
-          <label htmlFor={`${filterId}-effect`}>Effect</label>
+          <label htmlFor={`${filterId}-effect`}>{t("Effect")}</label>
           <Select
             id={`${filterId}-effect`}
             value={effect}
             onChange={setEffect}
             options={[
-              { value: "", label: "All effects" },
-              { value: "allow", label: "Allow" },
-              { value: "deny", label: "Deny" },
+              { value: "", label: t("All effects") },
+              { value: "allow", label: t("Allow") },
+              { value: "deny", label: t("Deny") },
             ]}
             full
           />
         </div>
         <div className="permission-filter">
-          <label htmlFor={`${filterId}-scope`}>Match</label>
+          <label htmlFor={`${filterId}-scope`}>{t("Match")}</label>
           <Select
             id={`${filterId}-scope`}
             value={scope}
             onChange={setScope}
             options={[
-              { value: "", label: "All matches" },
-              { value: "exact", label: "Exact command" },
-              { value: "prefix", label: "Argument pattern" },
+              { value: "", label: t("All matches") },
+              { value: "exact", label: t("Exact command") },
+              { value: "prefix", label: t("Argument pattern") },
             ]}
             full
           />
@@ -353,82 +365,57 @@ function RuleWorkspace({
           disabled={!!flight.busy}
           onClick={() => void load()}
         >
-          {readError ? "Retry rules" : "Refresh rules"}
+          {readError ? t("Retry rules") : t("Refresh rules")}
         </Button>
       </div>
       {blocked && (
         <p className="permission-access">
-          {blocked} Saved rules remain available to inspect.
-        </p>
+          {t("{blocked} Saved rules remain available to inspect.").replace("{blocked}", () => String(blocked ?? ""))}</p>
       )}
       <p className="permission-feedback" role="status">
-        {notice}
+        {notice ? t("Rule revoked: {id}. Takes effect on the next check.").replace("{id}", () => notice.id) : null}
       </p>
       {actionError && (
         <p className="permission-error" role="alert">
-          <strong>Couldn’t revoke the rule.</strong> {actionError}
+          <strong>{t("Couldn’t revoke the rule.")}</strong> {actionError}
         </p>
       )}
       {readError && (
         <div className="permission-error" role="alert">
           <strong>
-            {rules === null ? "Rules unavailable." : "Last known rules."}
+            {rules === null ? t("Rules unavailable.") : t("Last known rules.")}
           </strong>{" "}
           {readError}{" "}
           {rules !== null &&
-            "Refresh to verify the remaining rules before revoking."}
+            t("Refresh to verify the remaining rules before revoking.")}
         </div>
       )}
       <div className="permission-results">
         <span>
-          {rules === null
-            ? readError
-              ? "Rules haven’t been loaded"
-              : flight.busy
-                ? "Waiting for revocation…"
-                : "Loading saved rules…"
-            : `${readError ? "Last known · " : ""}${visible.length} of ${rules.length} saved ${rules.length === 1 ? "rule" : "rules"}${fetching ? " · Refreshing…" : ""}`}
+          {rules === null ? readError ? t("Rules haven’t been loaded") : flight.busy ? t("Waiting for revocation…") : t("Loading saved rules…") : ruleCountLine(visible.length, rules.length, readError !== null, fetching, t)}
         </span>
         {filtered && (
-          <Button variant="ghost" size="sm" onClick={clear}>
-            Clear filters
-          </Button>
+          <Button variant="ghost" size="sm" onClick={clear}>{t("Clear filters")}</Button>
         )}
       </div>
       {rules === null ? (
         <div className="permission-state" aria-busy={fetching}>
           <h2>
-            {readError
-              ? "Couldn’t load saved rules"
-              : flight.busy
-                ? "Waiting for revocation…"
-                : "Loading rules…"}
+            {readError ? t("Couldn’t load saved rules") : flight.busy ? t("Waiting for revocation…") : t("Loading rules…")}
           </h2>
           <p>
-            {readError
-              ? "Use Retry rules to try again."
-              : flight.busy
-                ? "The saved rules will refresh when the current revoke request finishes."
-                : "Reading the operator’s saved rules for the master."}
+            {readError ? t("Use Retry rules to try again.") : flight.busy ? t("The saved rules will refresh when the current revoke request finishes.") : t("Reading the operator’s saved rules for the master.")}
           </p>
         </div>
       ) : visible.length === 0 ? (
         <div className="permission-state">
           <h2>
-            {readError
-              ? "No last known matches"
-              : filtered
-                ? "No matching rules"
-                : "No saved rules"}
+            {readError ? t("No last known matches") : filtered ? t("No matching rules") : t("No saved rules")}
           </h2>
           <p>
-            {readError
-              ? "Retry to check the current rules."
-              : filtered
-                ? "Try another search or clear the filters."
-                : "Saved allow and deny rules appear here. Respond to live permission requests in Home."}
+            {readError ? t("Retry to check the current rules.") : filtered ? t("Try another search or clear the filters.") : t("Saved allow and deny rules appear here. Respond to live permission requests in Home.")}
           </p>
-          {filtered && <Button onClick={clear}>Show all rules</Button>}
+          {filtered && <Button onClick={clear}>{t("Show all rules")}</Button>}
         </div>
       ) : (
         <ul className="permission-list" role="list" aria-busy={fetching}>
@@ -457,6 +444,7 @@ function RuleWorkspace({
 
 /** Saved rules only. Live permission-request decisions stay in Home. */
 export default function MasterPermissions({ viewer }: { viewer: Viewer }) {
+  const t = useTranslate();
   const locked = useRef(false);
   const [busy, setBusy] = useState<string | null>(null);
   const begin = useCallback((id: string) => {
@@ -472,11 +460,8 @@ export default function MasterPermissions({ viewer }: { viewer: Viewer }) {
   return (
     <main className="permissions-workspace" data-settings="permissions">
       <header className="permissions-heading">
-        <h1>Master permissions</h1>
-        <p>
-          Saved command rules for the master. A deny takes precedence over an
-          allow; every rule applies within its working folder.
-        </p>
+        <h1>{t("Master permissions")}</h1>
+        <p>{t("Saved command rules for the master. A deny takes precedence over an allow; every rule applies within its working folder.")}</p>
       </header>
       {viewer.operator || (viewer.boardReadOnly && viewer.signedIn) ? (
         <RuleWorkspace
@@ -489,11 +474,8 @@ export default function MasterPermissions({ viewer }: { viewer: Viewer }) {
         />
       ) : (
         <div className="permission-state">
-          <h2>Operator access required</h2>
-          <p>
-            Sign in as the operator to inspect and revoke saved rules. Live
-            permission requests appear in Home.
-          </p>
+          <h2>{t("Operator access required")}</h2>
+          <p>{t("Sign in as the operator to inspect and revoke saved rules. Live permission requests appear in Home.")}</p>
         </div>
       )}
     </main>

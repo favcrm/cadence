@@ -3,7 +3,7 @@ export {};
 declare function require(name: string): any;
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/" });
-for (const key of ["window", "document", "navigator", "HTMLElement", "Node", "Event", "KeyboardEvent", "location", "localStorage"]) {
+for (const key of ["window", "document", "navigator", "HTMLElement", "Node", "Event", "KeyboardEvent", "location", "history", "localStorage"]) {
   Object.defineProperty(globalThis, key, { value: key === "window" ? win : win[key], configurable: true });
 }
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
@@ -24,7 +24,10 @@ moduleLoader.prototype.require = function (this: unknown, id: string) {
 };
 const { createElement, act } = require("react");
 const { createRoot } = require("react-dom/client");
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
 const { default: AccountMenu } = require("../src/ui/AccountMenu") as typeof import("../src/ui/AccountMenu");
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { default: VersionLine } = require("../src/ui/VersionLine") as typeof import("../src/ui/VersionLine");
 const { releaseLabel, runningRelease } = require("../src/lib/fmt") as typeof import("../src/lib/fmt");
 const { routePath } = require("../src/lib/router") as typeof import("../src/lib/router");
@@ -36,7 +39,8 @@ function mount(node: unknown) {
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
-  act(() => root.render(node));
+  act(() => root.render(createElement(LocaleProvider, null,
+    createElement(NavigationProvider, { adapter: hostNavigation, children: node }))));
   return { host, done: () => { act(() => root.unmount()); host.remove(); } };
 }
 const href = routePath({ screen: "settings", section: "update" });
@@ -92,6 +96,7 @@ assert(runningRelease(null) === null, "no meta -> fallback");
   assert(host.querySelector("[role=dialog] [data-version-line]"), "version line is inside the open dialog");
   act(() => (host.querySelector("[data-version-line]") as HTMLElement).click());
   assert(!host.querySelector("[role=dialog]"), "clicking the version line closes the dialog");
+  assert(win.location.pathname === "/settings/update", `version link navigates to update settings: ${win.location.pathname}`);
   done();
 }
 console.log("versionLine tests passed");

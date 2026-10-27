@@ -127,8 +127,12 @@ pub(super) fn answer_route(path: &str) -> Option<&str> {
 /// operator. The same checks `operator::admit` runs on an operator-only
 /// write, minus the browser write guards: a writable board, a live
 /// operator session (CAD-313) presented by a caller tied to no agent,
-/// and the positive proof on the peer. Anything unprovable is `false`.
-/// The UI's answer is a courtesy; every write still runs the full check.
+/// and the positive proof on the peer. `None` when a dependency could
+/// not answer inside the metadata budget — an unknown the UI must show
+/// as unavailable, never as a resolved non-operator. `Some(false)`
+/// only when the request is proven NOT the operator's (no session, an
+/// agent caller, a refused proof). The UI's answer is a courtesy;
+/// every write still runs the full check.
 ///
 /// The board relays decisions over its OWN daemon connection, so the
 /// board process must be the operator's too ([`board_is_operator`]): a
@@ -138,23 +142,51 @@ pub(super) fn operator_viewer(
     request: &Request,
     state_dir: &std::path::Path,
     opts: &ServeOpts,
-) -> bool {
+    budget: &client::MetaBudget,
+) -> Option<bool> {
     if opts.read_only {
-        return false;
+        return Some(false);
     }
-    match operator::board_caller(request, state_dir, opts, false) {
+    match operator::board_caller(request, state_dir, opts, false, Some(budget)) {
         // CAD-526: a public session's verified `owner` role is the
         // operator claim on that surface — the platform relay's peer is
         // not a process this host can prove, and need not be.
         Ok(operator::Caller::Named(named)) => {
-            named.operator && board_is_operator(state_dir, opts.seam.is_some())
+            if !named.operator {
+                return Some(false);
+            }
+            board_is_operator(state_dir, opts.seam.is_some(), Some(budget))
         }
         Ok(operator::Caller::Operator(_)) => {
-            prove_operator_peer(request, state_dir, opts, "reading the operator role").is_ok()
-                && board_is_operator(state_dir, opts.seam.is_some())
+            let peer = prove_operator_peer(
+                request,
+                state_dir,
+                opts,
+                "reading the operator role",
+                Some(budget),
+            );
+            match peer {
+                Ok(()) => board_is_operator(state_dir, opts.seam.is_some(), Some(budget)),
+                Err(resp) if deny_carrying(&resp) => Some(false),
+                Err(_) => None,
+            }
         }
-        _ => false,
+        // Proven negatives stay negatives: an agent caller, a stolen
+        // session, a sessionless request on a live attribution, or a
+        // refused session check are answers. Only a dependency that
+        // could not answer at all (a timed-out identity read) is
+        // unknown.
+        Ok(operator::Caller::Agent(_)) => Some(false),
+        Err(resp) if deny_carrying(&resp) => Some(false),
+        Err(_) => None,
     }
+}
+
+/// A refusal the client is responsible for (a session/writer rule the
+/// request itself broke) is a resolved negative; a 5xx is an
+/// unavailable dependency — unknown, never `false`.
+fn deny_carrying(resp: &HttpResp) -> bool {
+    resp.status_code().0 < 500
 }
 
 /// The board process itself passes the operator proof the daemon will
@@ -169,32 +201,48 @@ pub(super) fn operator_viewer(
 /// fixture board an agent started, identical in a pane and in CI).
 /// `armed` answers live, so a board started before its daemon mints
 /// becomes operator's when the token lands.
-pub(super) fn board_is_operator(state_dir: &std::path::Path, seam_armed: bool) -> bool {
+/// `budget`: `Some` bounds the two required identity reads for a
+/// courtesy metadata answer (CAD-1193); `None` — every write gate —
+/// keeps the full RPC bound. Either way an unanswered read proves
+/// nothing: `None` (unknown) for the bounded caller.
+pub(super) fn board_is_operator(
+    state_dir: &std::path::Path,
+    seam_armed: bool,
+    budget: Option<&client::MetaBudget>,
+) -> Option<bool> {
     if seam_armed && crate::test_seam::armed(state_dir) {
         // An unparseable CADENCE_TEST_AS (Err) is not the operator —
         // a misspelled assertion refuses loudly, never ambient.
-        return matches!(
+        return Some(matches!(
             crate::test_seam::env_asserted(),
             Ok(None) | Ok(Some(crate::test_seam::Asserted::Operator))
-        );
+        ));
     }
-    let Some(daemon_pid) = client::rpc(state_dir, "health", json!({}))
-        .ok()
-        .and_then(|h| h["pid"].as_u64())
-        .and_then(|p| u32::try_from(p).ok())
-    else {
-        return false;
+    // The daemon's pid comes from `daemon_info`, the daemon-owned cheap
+    // reply — never `health`, whose adopted-process and inflight-turn
+    // collection can outlast a metadata request (CAD-1193), and never a
+    // request field. A daemon that predates the field or cannot answer
+    // in budget proves nothing: the fact is unknown, not denied.
+    let info = match budget {
+        Some(b) => b.read(state_dir, "daemon_info", json!({})).ok(),
+        None => client::rpc(state_dir, "daemon_info", json!({})).ok(),
     };
-    let Ok(roots) = agent_roots(state_dir) else {
-        return false;
+    let daemon_pid = info
+        .and_then(|h| h["pid"].as_u64())
+        .and_then(|p| u32::try_from(p).ok())?;
+    let roots = match agent_roots(state_dir, budget.copied()) {
+        Ok(roots) => roots,
+        Err(_) => return None,
     };
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
     // Fenced deny lists (CAD-385): a reused pid denies nothing, a row
     // with no recorded start keeps denying.
-    roots
-        .operator_proof(std::process::id(), uid, daemon_pid)
-        .is_ok()
+    Some(
+        roots
+            .operator_proof(std::process::id(), uid, daemon_pid)
+            .is_ok(),
+    )
 }
 
 /// CAD-276's positive operator proof, run on the board's TCP peer — the
@@ -209,11 +257,17 @@ pub(super) fn board_is_operator(state_dir: &std::path::Path, seam_armed: bool) -
 /// peer is tailscaled. Anything unprovable — a daemon that cannot say
 /// its pid, agents it cannot list — refuses with 403 `operator_proof`,
 /// before anything is written.
+/// `budget`: `Some` bounds the required identity reads for a courtesy
+/// metadata answer; `None` — every write gate — keeps the full RPC
+/// bound. A fact that cannot be read is `identity_unavailable` (503),
+/// which a bounded caller reports as unknown rather than a resolved
+/// negative.
 pub(super) fn prove_operator_peer(
     request: &Request,
     state_dir: &std::path::Path,
     opts: &ServeOpts,
     what: &str,
+    budget: Option<&client::MetaBudget>,
 ) -> std::result::Result<(), HttpResp> {
     let refuse = |why: String| {
         guard_fail(
@@ -223,6 +277,17 @@ pub(super) fn prove_operator_peer(
                  Decide from the operator's own browser or shell, outside every pane \
                  and managed endpoint"
             ),
+        )
+    };
+    let unavailable = |why: String| {
+        coded_response(
+            503,
+            "identity_unavailable",
+            &format!(
+                "{what} cannot be checked within the metadata bound — {why}. \
+                 Retry; the operator role is reported only when it is proven"
+            ),
+            None,
         )
     };
     // CAD-482: a seam assertion answers here exactly as it does on the
@@ -240,15 +305,42 @@ pub(super) fn prove_operator_peer(
     if matches!(tailnet_proxy(request, opts), Some(Ok(()))) {
         return Ok(());
     }
-    let daemon_pid = client::rpc(state_dir, "health", json!({}))
-        .ok()
-        .and_then(|h| h["pid"].as_u64())
-        .and_then(|p| u32::try_from(p).ok())
-        .ok_or_else(|| refuse("the daemon's pid cannot be read".to_string()))?;
-    let roots = agent_roots(state_dir).map_err(refuse)?;
+    // The daemon's pid is the daemon-owned fact in `daemon_info` — the
+    // same value `health` reports, read without `health`'s fleet-wide
+    // collection (CAD-1193). Absent or unanswerable in budget it is an
+    // unavailable fact (503 → `operator: null`), never a refusal of a
+    // caller that did nothing wrong.
+    // A bounded courtesy read reports an unreadable fact as
+    // `identity_unavailable` (503 → `operator: null`); an unbounded
+    // guard caller gets the same plain `operator_proof` refusal it
+    // always did.
+    let dependency_fail = |why: String| {
+        if budget.is_some() {
+            unavailable(why)
+        } else {
+            refuse(why)
+        }
+    };
+    let daemon_pid = match budget {
+        Some(b) => b.read(state_dir, "daemon_info", json!({})),
+        None => client::rpc(state_dir, "daemon_info", json!({})),
+    }
+    .ok()
+    .and_then(|h| h["pid"].as_u64())
+    .and_then(|p| u32::try_from(p).ok())
+    .ok_or_else(|| dependency_fail("the daemon's pid cannot be read".to_string()))?;
+    let roots = agent_roots(state_dir, budget.copied()).map_err(dependency_fail)?;
     let peer = request
         .remote_addr()
         .ok_or_else(|| refuse("the request has no peer address".to_string()))?;
+    // A signed-in operator whose browser is reached through an ssh
+    // forward: the socket is still open, but its process is not in this
+    // pid namespace. A closed socket and every visible process still go
+    // through the positive proof below. Callers of this function already
+    // require the operator session.
+    if crate::peer::loopback_ownerless(opts.port, *peer) {
+        return Ok(());
+    }
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
     crate::peer::tcp_peer_operator_proof(opts.port, *peer, uid, daemon_pid, &roots).map_err(refuse)
@@ -267,6 +359,10 @@ pub(super) fn rpc_err(e: &Error, method: &str) -> HttpResp {
             &format!("this daemon does not support {method}"),
             None,
         );
+    }
+    // CAD-1218: the approver rule refused the relayed actor.
+    if e.code() == Some("approver_not_allowed") {
+        return guard_fail("approver_not_allowed", &text);
     }
     // The daemon's own operator gate refused the board's connection.
     if text.contains("operator action") || text.contains("not provably the operator") {
@@ -724,7 +820,7 @@ pub(super) fn agent_action_route(path: &str) -> Option<(&str, &str)> {
     (!alias.is_empty() && !verb.contains('/')).then_some((alias, verb))
 }
 
-/// `POST /api/agents/<alias>/resume|unfence` — operator-only on the
+/// `POST /api/agents/<alias>/resume|unfence|instructions` — operator-only on the
 /// board (`operator::admit`); the daemon's own rules still apply
 /// (`agent_unfence` is operator-only by connection, `agent_resume` the
 /// target's SelfService). `resume` takes no body; `unfence` takes
@@ -785,6 +881,35 @@ pub(super) fn agent_action(
                 json!({"alias": alias, "status": status, "resume": true}),
             )
         }
+        // CAD-1752: replace the agent's standing instructions. The daemon
+        // proves the operator connection; the body is `{instructions}` only.
+        "instructions" => {
+            let body: Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => return err_response(400, "instructions takes {\"instructions\": …}"),
+            };
+            let obj = body.as_object();
+            let Some(text) = obj
+                .and_then(|o| o.get("instructions"))
+                .and_then(Value::as_str)
+            else {
+                return err_response(400, "instructions needs the new text");
+            };
+            if let Some(extra) = obj.and_then(|o| o.keys().find(|k| k.as_str() != "instructions")) {
+                return err_response(
+                    400,
+                    &format!("instructions takes the text only — '{extra}' is not accepted"),
+                );
+            }
+            let params = json!({"alias": alias, "instructions": text});
+            return match client::rpc(state_dir, "agent_instructions_set", params) {
+                Ok(mut out) => {
+                    crate::briefing::deliver_job_update(state_dir, alias, text, &mut out);
+                    json_response(out)
+                }
+                Err(e) => rpc_err(&e, "agent_instructions_set"),
+            };
+        }
         _ => return err_response(404, "no such agent route"),
     };
     match client::rpc(state_dir, method, params) {
@@ -814,9 +939,14 @@ pub(super) fn master_summary(
 /// chips (model/effort/context) and in-flight turn. A plain read like
 /// `/api/threads/<alias>`; a daemon without `master_state` answers 501
 /// and the UI falls back to the agents payload.
-pub(super) fn master_state(state_dir: &std::path::Path) -> HttpResp {
+pub(super) fn master_state(state_dir: &std::path::Path, operator: bool) -> HttpResp {
     match client::rpc(state_dir, "master_state", json!({})) {
-        Ok(out) => json_response(out),
+        Ok(mut out) => {
+            if !operator {
+                super::member_view::redact_master_state(&mut out);
+            }
+            json_response(out)
+        }
         Err(e) => rpc_err(&e, "master_state"),
     }
 }
@@ -853,12 +983,40 @@ pub(super) fn master_models(
 /// is asked, so a poisoned page can never smuggle a provider command
 /// through the relay.
 const BOARD_COMMANDS: &[&str] = &[
-    "state", "stats", "models", "model", "levels", "effort", "compact", "new", "stop",
+    "state", "stats", "models", "model", "levels", "effort", "compact", "new", "stop", "cancel",
 ];
 
-/// `POST /api/master/command` `{"command": "…", "arg": "…"}` —
+/// CAD-1700: the relay's accepted fields and its `message` rule — a known
+/// field list (so a poisoned page cannot smuggle one through) and a
+/// non-empty id of at most 128 characters. Runs before the daemon is asked.
+fn command_message(body: &Value) -> Result<Option<&str>, HttpResp> {
+    let known = ["command", "arg", "wait", "message"];
+    if let Some(key) = body
+        .as_object()
+        .and_then(|o| o.keys().find(|k| !known.contains(&k.as_str())))
+    {
+        return Err(err_response(400, &format!("unknown field '{key}'")));
+    }
+    match body.get("message") {
+        None => Ok(None),
+        Some(message) => match message.as_str() {
+            Some(id) if !id.is_empty() && id.chars().count() <= 128 => Ok(Some(id)),
+            _ => Err(coded_response(
+                400,
+                "message_invalid",
+                "message must be a non-empty string of at most 128 characters",
+                None,
+            )),
+        },
+    }
+}
+
+/// `POST /api/master/command` `{"command": "…", "arg": "…", "message": "…"}` —
 /// operator-only (`operator::WRITE_ROUTES`), relayed to the daemon's
 /// `master_command`; `/stop` lands on the daemon's `interrupt` path.
+/// CAD-1700: `message` (a message id, ≤128 chars) scopes `/stop` to one
+/// running turn and names the queued message `/cancel` removes; the
+/// daemon's refusal codes map to 409 so the board can show the reason.
 pub(super) fn master_command(request: &mut Request, state_dir: &std::path::Path) -> HttpResp {
     let bytes = match read_body(request, BODY_CAP) {
         Ok(bytes) => bytes,
@@ -868,16 +1026,12 @@ pub(super) fn master_command(request: &mut Request, state_dir: &std::path::Path)
         Ok(v) => v,
         Err(_) => return err_response(400, "body must be a JSON object"),
     };
-    // Only `command`, `arg` and `wait` cross the relay — anything else
-    // is refused whole, so an identity-shaped or unexpected field never
-    // silently reaches the daemon.
-    let known = ["command", "arg", "wait"];
-    if let Some(key) = body
-        .as_object()
-        .and_then(|o| o.keys().find(|k| !known.contains(&k.as_str())))
-    {
-        return err_response(400, &format!("unknown field '{key}'"));
-    }
+    // Only `command`, `arg`, `wait` and `message` cross the relay, and the
+    // id is bounded — checked before the daemon is asked.
+    let message = match command_message(&body) {
+        Ok(message) => message,
+        Err(resp) => return resp,
+    };
     let command = body.get("command").and_then(Value::as_str).unwrap_or("");
     if !BOARD_COMMANDS.contains(&command) {
         return coded_response(
@@ -905,9 +1059,91 @@ pub(super) fn master_command(request: &mut Request, state_dir: &std::path::Path)
     if let Some(wait) = body.get("wait") {
         params["wait"] = wait.clone();
     }
+    if let Some(message) = message {
+        params["message"] = json!(message);
+    }
     match client::rpc(state_dir, "master_command", params) {
         Ok(out) => json_response(out),
-        Err(e) => rpc_err(&e, "master_command"),
+        Err(e) => master_command_err(&e),
+    }
+}
+
+/// CAD-1700: the daemon's scoped `/stop` and `/cancel` refusals are
+/// conflicts with the master's live state (the turn ended, the message is
+/// not queued), so they answer 409 with the reason; everything else falls
+/// through to the shared mapping.
+fn master_command_err(e: &Error) -> HttpResp {
+    match e.code() {
+        Some(
+            code @ ("turn_not_running"
+            | "message_running"
+            | "message_not_queued"
+            | "message_not_cancellable"
+            | "message_required"),
+        ) => coded_response(409, code, &e.to_string(), None),
+        _ => rpc_err(e, "master_command"),
+    }
+}
+
+/// `POST /api/master/identity` (CAD-1817) — the operator's bounded workspace
+/// identity write, relayed to the daemon's `master_identity_set`.
+///
+/// The relay is no wider than the native verb: the closed field set, the
+/// required revision, a string-only name/tone and the canonical look list are
+/// checked here before the daemon is asked, and the daemon re-proves the
+/// operator connection (an agent cannot reach it).
+pub(super) fn master_identity(request: &mut Request, state_dir: &std::path::Path) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let body: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return err_response(400, "body must be a JSON object"),
+    };
+    let Some(object) = body.as_object() else {
+        return err_response(400, "body must be a JSON object");
+    };
+    const FIELDS: [&str; 4] = ["expected_revision", "name", "tone", "look"];
+    if let Some(field) = object.keys().find(|key| !FIELDS.contains(&key.as_str())) {
+        return err_response(400, &format!("unknown field '{field}'"));
+    }
+    let Some(expected_revision) = object
+        .get("expected_revision")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    else {
+        return err_response(400, "expected_revision must be a non-empty string");
+    };
+    let mut params = json!({"expected_revision": expected_revision});
+    for key in ["name", "tone"] {
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        let Some(text) = value.as_str() else {
+            return err_response(400, &format!("{key} must be a string"));
+        };
+        if text.chars().count() > 240 {
+            return err_response(400, &format!("{key} is too long"));
+        }
+        params[key] = json!(text);
+    }
+    if let Some(value) = object.get("look") {
+        let Some(text) = value.as_str() else {
+            return err_response(400, "look must be a string");
+        };
+        let Some(look) = crate::agent_roles::canonical_look(text.trim()) else {
+            return err_response(400, &format!("unknown look '{text}'"));
+        };
+        params["look"] = json!(look);
+    }
+    if !object.contains_key("name") && !object.contains_key("tone") && !object.contains_key("look")
+    {
+        return err_response(400, "at least one of name, tone, look is required");
+    }
+    match client::rpc(state_dir, "master_identity_set", params) {
+        Ok(out) => json_response(out),
+        Err(e) => rpc_err(&e, "master_identity_set"),
     }
 }
 
@@ -949,9 +1185,9 @@ pub(super) fn outbox_gate(
     opts: &ServeOpts,
     what: &str,
 ) -> std::result::Result<(), HttpResp> {
-    match operator::board_caller(request, state_dir, opts, false) {
+    match operator::board_caller(request, state_dir, opts, false, None) {
         Ok(operator::Caller::Operator(_)) => {
-            prove_operator_peer(request, state_dir, opts, what)?;
+            prove_operator_peer(request, state_dir, opts, what, None)?;
         }
         // CAD-526: the verified `owner` role is the operator claim on
         // the public surface — the platform relay's peer is not a
@@ -979,7 +1215,7 @@ pub(super) fn outbox_gate(
         }
         Err(resp) => return Err(resp),
     }
-    if !board_is_operator(state_dir, opts.seam.is_some()) {
+    if board_is_operator(state_dir, opts.seam.is_some(), None) != Some(true) {
         return Err(guard_fail(
             "operator_proof",
             &format!(
@@ -1118,5 +1354,50 @@ mod busy_status_tests {
                 .0,
             400
         );
+    }
+
+    /// CAD-1700: the relay's mapping for the scoped stop/cancel refusals —
+    /// each daemon code answers 409, so the pane can show the reason, and an
+    /// unknown daemon failure keeps the shared mapping.
+    #[test]
+    fn scoped_command_refusals_map_to_409() {
+        for (code, status) in [
+            ("turn_not_running", 409),
+            ("message_running", 409),
+            ("message_not_queued", 409),
+            ("message_not_cancellable", 409),
+            ("message_required", 409),
+            ("message_not_allowed", 400),
+            ("message_invalid", 400),
+        ] {
+            let error = Error::invalid(code, "refused for the test");
+            assert_eq!(
+                master_command_err(&error).status_code().0,
+                status,
+                "{code} maps to {status}"
+            );
+        }
+    }
+
+    /// CAD-1700: the relay's `message` validation — an unknown field, a
+    /// non-string or an over-long id is refused before the daemon is asked;
+    /// a valid id passes through.
+    #[test]
+    fn scoped_command_message_is_validated_before_the_relay() {
+        let body = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        assert!(
+            command_message(&body(r#"{"command":"cancel","message":"m-1","extra":1}"#)).is_err()
+        );
+        assert!(command_message(&body(r#"{"command":"cancel","message":7}"#)).is_err());
+        let long = format!(r#"{{"command":"cancel","message":"{}"}}"#, "x".repeat(129));
+        assert!(command_message(&body(&long)).is_err());
+        assert!(matches!(
+            command_message(&body(r#"{"command":"cancel","message":"m-1"}"#)),
+            Ok(Some("m-1"))
+        ));
+        assert!(matches!(
+            command_message(&body(r#"{"command":"cancel"}"#)),
+            Ok(None)
+        ));
     }
 }

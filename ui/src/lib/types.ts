@@ -1,116 +1,35 @@
+import type * as Api from "./generated/board-api";
+
 export type StatusSource = "file" | "notes" | "rollup" | "job";
 
 /** One bound agent on an issue card/drawer — from the job binding,
- *  never a text scan. */
-export interface CardAgent {
-  alias: string;
-  task: string;
-  task_state: string;
-  state: string;
-  /** Running kickoff message id for this task, if live. */
-  message?: string | null;
-  /** Concrete resume command for a stopped pane. */
-  resume?: string | null;
-}
+ *  never a text scan. Generated from the daemon's Rust type. */
+export type CardAgent = Api.CardAgent;
 
-export interface Ref {
-  kind: string;
-  url?: string;
-  path?: string;
-  label?: string;
-  closed?: boolean;
-}
+export type Ref = Api.Ref;
 
-export interface IssueCard {
-  id: string;
-  project: string;
-  title: string;
-  status: string;
-  status_source: StatusSource;
-  priority: string;
-  owner?: string;
-  component?: string;
-  /** Sorted, de-duplicated slicing labels. */
-  tags?: string[];
-  parent?: string;
-  blocked_by: string[];
-  relates: string[];
-  duplicate_of?: string;
-  refs: Ref[];
-  container: boolean;
-  ready: boolean;
-  blocked: boolean;
-  /** Why the card is flagged blocked beyond deps — e.g. "job blocked". */
-  blocked_reason?: string | null;
-  /** Agents bound to this issue through a job (tasks × jobs.issue_id). */
-  agents?: CardAgent[];
-  created: string;
-  /** Content hash of issue.md — send as `if_rev` on writes. */
-  rev: string;
-  counts: { comments: number; artifacts: number; refs: number };
-  checks: { done: number; total: number };
-  /** CAD-405 work model: type, milestone, size; stage/progress/health on epics. */
-  work?: WorkBlock;
-}
+/** CAD-1817: the canonical avatar catalog slug — the daemon's closed union,
+ *  matching `AVATAR_LOOKS` in `features/agents/AgentAvatar.tsx`. */
+export type AvatarLook = Api.AvatarLook;
+
+/** CAD-1817: the workspace coordinator's committed identity projection. */
+export type MasterIdentity = Api.MasterIdentity;
+
+/** A board card (`GET /api/issues` row): the core card, its work block and
+ *  the bound-agent strip. Generated from the daemon's Rust type. */
+export type IssueCard = Api.IssueListItem;
 
 /** CAD-405 epic health. `stalled` is time in stage, not child activity. */
 export type HealthState = "on_track" | "at_risk" | "stalled";
 
 /** One reason an epic or milestone is not on track, with its next action. */
-export interface HealthReason {
-  cause: string;
-  issue: string;
-  owner?: string | null;
-  detail: string;
-  next: string;
-}
-
-export interface WorkProgress {
-  done_weight: number;
-  total_weight: number;
-  ratio: number;
-  counts: Record<string, number>;
-}
-
+export type HealthReason = Api.HealthReason;
+export type WorkProgress = Api.WorkProgress;
 /** One move `epic_stage` accepts from the epic's current stage. */
-export interface StageMove {
-  to: string;
-  forward: boolean;
-  /** Only the proven operator may make it. */
-  needs_operator: boolean;
-}
-
-export interface WorkStage {
-  id: string;
-  source: string;
-  since: string | null;
-  exit: string | null;
-  next: string | null;
-  next_needs_operator: boolean;
-  terminal: boolean;
-  stages: string[];
-  /** CAD-432: the legal moves; absent from a server that predates it. */
-  moves?: StageMove[];
-}
-
+export type StageMove = Api.StageMove;
+export type WorkStage = Api.WorkStage;
 /** The `work` block on `/api/issues` cards and `/api/issues/:id`. */
-export interface WorkBlock {
-  type: string;
-  milestone: string | null;
-  milestone_source?: "field" | "tag" | "parent" | null;
-  size: string | null;
-  weight: number;
-  stage: WorkStage | null;
-  progress: WorkProgress | null;
-  health: {
-    state: HealthState;
-    days_in_stage: number | null;
-    limit_days: number;
-    reasons: HealthReason[];
-  } | null;
-  config_error?: string;
-  config_unapproved?: string;
-}
+export type WorkBlock = Api.WorkBlock;
 
 /** `GET /api/milestones` — one (project, milestone) roll-up. */
 export interface MilestoneRow {
@@ -219,7 +138,9 @@ export interface IssueHistoryEntry {
   note?: string | null;
 }
 
-export interface IssueDetail extends IssueCard {
+/** `GET /api/issues/<id>`: the issue-detail contract. Unlike a board card it
+ *  has no `counts`; its comments are the recorded `comments` rows. */
+export interface IssueDetail extends Omit<IssueCard, "counts"> {
   frontmatter: Record<string, unknown>;
   body: string;
   path: string;
@@ -286,6 +207,11 @@ export interface TaskReport {
   body?: string;
   open?: boolean;
   error?: string;
+  /** Reviewed head and verdict, emitted for daemon-filed reviews. */
+  sha?: string | null;
+  verdict?: string | null;
+  /** Pull request recorded by a completion report. */
+  pr?: string | null;
 }
 
 export interface Project {
@@ -368,6 +294,10 @@ export interface ProjectContext {
 export interface NeedsMe {
   kind: string;
   title: string;
+  /** CAD-1219: optional plain-words card title (about 50 characters) and
+   *  one-sentence reason. Display text only; older rows omit them. */
+  short_title?: string;
+  why?: string;
   /** Seconds in this state. */
   age: number;
   project: string;
@@ -565,23 +495,7 @@ export interface Overview {
 }
 
 /** A task assignment an agent is bound to through its job. */
-export interface AgentTask {
-  task: string;
-  task_state: string;
-  issue: string;
-  /** Task title from the job ledger, when one was supplied. */
-  title?: string | null;
-  /** Job id/title/state are the source of current-work context. */
-  job?: string | null;
-  job_title?: string | null;
-  job_state?: string | null;
-  message?: {
-    id: string;
-    task?: string;
-    created?: string;
-    summary?: string | null;
-  } | null;
-}
+export type AgentTask = Api.AgentTask;
 
 export type UsageState =
   | "available"
@@ -623,88 +537,101 @@ export interface UsageLimit {
   } | null;
 }
 
-export interface Agent {
+/**
+ * `POST /api/agents` body. `location` is the only setup choice: `cloud`
+ * sends no provider or endpoint kind (the daemon sets `sandbox`/`sandbox`);
+ * `local` sends the existing provider and endpoint kind plus cwd. No
+ * per-issue location exists.
+ */
+/** CAD-1752: a hire from the built-in role catalogue sends `catalogue` and
+ *  no location, provider or endpoint kind — the install picks the runtime. */
+export interface AgentRegisterBody {
   alias: string;
+  location?: "local" | "cloud";
+  catalogue?: string;
+  look?: string;
+  provider?: string;
+  endpoint_kind?: string;
+  role?: string;
+  team_role?: string;
+  model_policy?: string;
+  cwd?: string;
+  sandbox?: string;
+  instructions?: string;
+  params?: string;
+}
+
+/** One role of `GET /api/agent-roles`. */
+export interface AgentRole {
+  id: string;
+  category: string;
+  title: string;
+  look: string;
+  team_role: string;
+  kind: "tickets" | "apps";
+  job: string;
+  does: string[];
+  skills: string[];
+  tools: string[];
+  first_tasks: string[];
+  /** The text a hire stores as the agent's instructions. */
+  instructions: string;
+  /** The model a hire would launch on, or why none resolves. */
+  model: { id: string; source: string } | { error: string };
+}
+
+export interface AgentRolesPayload {
+  categories: { id: string; label: string }[];
+  roles: AgentRole[];
+  install: { hosted: boolean; provider: string; endpoint_kind: string };
+}
+
+/** `POST /api/agents/<alias>/instructions` reply. `applies` says when the
+ *  agent sees the new text. */
+export interface InstructionsResult {
+  alias: string;
+  state: string;
+  applies: "next_turn" | "next_launch" | "not_delivered";
+  briefing?: string | { error: string };
+  old_sha256?: string | null;
+  new_sha256?: string;
+}
+
+/** One `/api/agents` row. Generated from the daemon's Rust type, except the
+ *  fields re-declared here: a registered agent always reports `provider`,
+ *  `endpoint_kind` and `state` (only the Rust row type is lenient), the board
+ *  reads the allowance record as the wider `UsageLimit`, and the detail read
+ *  merges the launch `params` in. */
+export type Agent = Omit<
+  Api.AgentRow,
+  "provider" | "endpoint_kind" | "state" | "quota" | "usage_limit" | "model_selection" | "last_activity"
+> & {
   provider: string;
   endpoint_kind: string;
   state: string;
-  role?: string | null;
-  /** Model-preference role. Independent of runtime `role`. */
-  team_role?: string | null;
-  model_lookup_role?: string | null;
+  /** Launch params; the detail read carries them. */
+  params?: Record<string, unknown>;
   model_selection?: {
     source?: string | null;
     lookup_role?: string | null;
     revision?: number | null;
     model?: string | null;
   } | null;
-  group: string;
-  group_root?: boolean;
-  /** Provider evidence: reported effective value beside launch config. */
-  model?: string | null;
-  model_reported?: string | null;
-  model_configured?: string | null;
-  model_source?: string | null;
-  effort?: string | null;
-  effort_reported?: string | null;
-  effort_source?: string | null;
-  effort_applicable?: boolean | null;
-  /** Optional account/pool allowance view; absent means unavailable. */
   quota?: UsageLimit | null;
   usage_limit?: UsageLimit | null;
-  running: number;
-  queued: number;
-  unknown: number;
-  parked: number;
-  fenced: boolean;
-  /** Issue ids bound through jobs — exact, not text-derived. */
-  on: string[];
-  tasks?: AgentTask[];
-  /** First running message, reduced. */
-  message?: {
-    id: string;
-    task?: string;
-    /** Epoch seconds — the daemon serializes Message.created as f64. */
-    created?: number | string;
-    summary?: string | null;
-  } | null;
-  running_messages?: {
-    id: string;
-    task?: string;
-    created?: number | string;
-    summary?: string | null;
-  }[];
-  /** The daemon's fence text — already names the recovery commands. */
-  recovery?: string | null;
-  /** Concrete resume command for a stopped pane, e.g. `devin -r devin-x`. */
-  resume?: string | null;
-  /** When `resume` applies — the pane is gone until then. */
-  resume_hint?: string;
-  dead?: boolean;
-  inbox?: boolean;
   /** Daemon messages use epoch seconds; older observations may use ISO text. */
   last_activity?: string | number | null;
-  /** Seconds since the running turn's last observed activity. */
-  silent_secs?: number;
-  /** The daemon declared this running turn stalled. */
-  stalled?: boolean;
-  /** CAD-96: `stopped (auto, idle 72m)` when the idle timer stopped it. */
-  state_label?: string | null;
-  event_cursor?: number;
-}
+};
 
-export interface AgentsPayload {
-  daemon: "reachable" | "unreachable";
-  agents: Agent[];
-  totals: {
-    running: number;
-    queued: number;
-    fenced: number;
-    parked: number;
-    inboxes: number;
-  } | null;
-  /** issue id → bound agent strip, for cards and drawers. */
-  by_issue?: Record<string, CardAgent[]>;
+/** `GET /api/agents` (the roster beside its snapshot's freshness). */
+export type AgentsPayload = Omit<Api.AgentsResponse, "agents"> & { agents: Agent[] };
+
+/** Best-effort destination for a verified app-scoped master turn. This is
+ * navigation metadata only; the app route proves its binding independently. */
+export interface MasterAppOrigin {
+  install_id: string;
+  context_id: string;
+  conversation_id: string;
 }
 
 /** `GET /api/master/state` (CAD-551) — the master's provider session for
@@ -739,11 +666,25 @@ export interface MasterState {
   turn?: {
     state: "working" | "queued";
     message: string;
+    /** The persisted message's conversation, when its enqueue entry exists. */
+    conversation?: string | null;
+    /** Current verified app scope; null when no origin can be re-proved. */
+    app_origin?: MasterAppOrigin | null;
     summary?: string | null;
     /** Epoch seconds the message started (working) or was created (queued). */
     since?: number | null;
+    /** 1-based queue position of a queued message; null while working. */
+    position?: number | null;
   } | null;
+  /** Queued master messages in delivery order (max 20). */
+  queue?: { message: string; conversation?: string | null }[];
   queued?: number;
+  /** CAD-1817: the workspace coordinator's committed identity — its own
+   *  protected IDENTITY/SOUL projection, never a member's private profile.
+   *  Generated as `MasterIdentity` from the daemon's Rust type. */
+  identity: MasterIdentity;
+  /** Hosted-only actor projection, bound to its selected conversation. */
+  actor_identity?: Api.MasterState["actor_identity"];
 }
 
 /** `POST /api/master/command` — one allowlisted session verb's answer. */
@@ -810,15 +751,31 @@ export interface AgentDetail {
     stalled?: boolean;
     capabilities?: Record<string, unknown> | null;
     tasks?: string[];
+    /** CAD-1752: the project of the task this agent is running now. */
+    turn_project?: string | null;
+    /** The stored job, when the board serves it. */
+    instructions?: string | null;
+    team_role?: string | null;
   };
   queued: number;
   unknown: number;
+  /** The agent page's figures; a null one is genuinely absent. */
+  stats?: {
+    hired_at: number | null;
+    tasks_done: number;
+    reports: number;
+    avg_turn_secs: number | null;
+    prs_merged: number | null;
+    drafts_sent: number | null;
+  } | null;
   running: {
     id: string;
     task?: string;
     created?: string;
     summary?: string | null;
   }[];
+  /** Why `events` is empty when the daemon's event read failed. */
+  events_error?: string | null;
   events: {
     seq: number;
     alias: string;
@@ -840,47 +797,7 @@ export interface AgentDetail {
  *  plus the build identity of the serving binary and the daemon's when
  *  reachable. Tailnet-shared boards resolve the actor from Tailscale
  *  identity headers; `read_only` boards refuse every write. */
-export interface Meta {
-  platform_account_configured?: boolean;
-  read_only: boolean;
-  /** CAD-313: this browser holds a live operator session. Absent on a
-   *  server that predates sessions. */
-  signed_in?: boolean;
-  session?: {
-    id: string;
-    origin: "loopback" | "tailnet" | "public";
-    user?: { sub: string; name: string; email: string; role: "operator" | "member"; handle: string } | null;
-    created: number;
-    last_used: number;
-    idle_expires_at: number;
-    expires_at: number;
-    user_agent: string;
-  } | null;
-  /** The command that signs this origin in (`cadence ui login [--tailnet]`). */
-  login_hint?: string;
-  /** CAD-777: remote device-grant sign-in is configured on this board
-   *  (and this origin may use it — loopback/tailnet only). */
-  device_login?: boolean;
-  /** This browser holds the session cookie but this tab has no live
-   *  session key — a new tab: each tab signs in on its own. */
-  tab_signed_out?: boolean;
-  actor: string;
-  /** Served through a configured public board name, not inferred from URL. */
-  hosted?: boolean;
-  /** CAD-432 (only with `?operator=1`): this client may make the
-   *  operator's decisions — a live session (CAD-313) plus the board's
-   *  operator proof on the peer and on the board process. */
-  operator?: boolean;
-  tailnet_url: string | null;
-  version: string;
-  build_commit: string;
-  build_time: string;
-  daemon?: {
-    build_commit: string;
-    build_time: string;
-    started_at: number;
-  } | null;
-}
+export type Meta = Api.MetaResponse;
 
 export interface Health {
   ok: boolean;
@@ -902,9 +819,9 @@ export interface MemoryQuorum {
   /** Whether this current revision is available to agents. */
   eligible: boolean;
   reason?: string | null;
-  /** Whether proposal receipts are ready for PM finalization. */
+  /** Whether the candidate's policy permits native finalization. */
   accept?: MemoryQuorumCheck | null;
-  /** Whether verification receipts are ready for PM finalization. */
+  /** Whether revalidation requirements permit native finalization. */
   verify?: MemoryQuorumCheck | null;
 }
 
@@ -918,7 +835,7 @@ export interface MemoryFinalization {
 
 /** A lesson's freshness as retrieval reads it (CAD-395). */
 export interface MemoryEvidence {
-  /** verified (inside the window) | unverified | withheld (stale mark). */
+  /** verified | unverified | withheld (stale or unused-expired). */
   state: "verified" | "unverified" | "withheld" | string;
   /** "verified <date>", "unverified (last verified <date>)", "unverified" or "withheld". */
   label: string;
@@ -927,6 +844,30 @@ export interface MemoryEvidence {
   /** The verify finalization time — not the raw verified_at field. */
   last_verified?: string | null;
   window_days?: number | null;
+}
+
+/** Bounded policy projection; canonical audit history stays in project memory. */
+export interface MemoryPolicyV2 {
+  revision: number;
+  nature: string;
+  provenance: string;
+  audience: string;
+  roles: string[];
+  author_vendor?: string | null;
+  contributors_count: number;
+  evidence_refs_count: number;
+  requirements: string[];
+  verification_condition?: {
+    check_id: string;
+    source_revision?: string | null;
+    target_revision?: string | null;
+  } | null;
+  feedback: {
+    used_reports: number;
+    wrong_reports: number;
+    reread_reports: number;
+    last_used_at?: string | null;
+  };
 }
 
 export interface MemoryCard {
@@ -956,7 +897,10 @@ export interface MemoryCard {
   /** Immutable receipts retained across review cycles. */
   review_count?: number | null;
   finalization_count?: number | null;
+  /** V2 returns the latest eight decisions; full counts/history are retained. */
   finalized_operations?: MemoryFinalization[] | null;
+  /** Absent on older daemons or for an existing legacy record. */
+  policy?: MemoryPolicyV2 | null;
   /** Absent on older daemons; absence means verification is unavailable. */
   quorum?: MemoryQuorum | null;
   fact: string;
@@ -968,43 +912,117 @@ export interface MemoryDetail extends MemoryCard {
   body: string;
 }
 
-export interface ModelSelector {
-  mode: "model" | "provider_default";
-  model?: string;
-}
+/** CAD-1548 Settings > Agents. Field names match the approved draft document. */
+export type AgentScope = "off" | "allow" | "master" | "worker";
+export type AgentProviderKind = "Pi extension" | "native CLI";
 
-export interface ProviderModelDefaults {
-  default: ModelSelector;
-  roles: Record<string, ModelSelector>;
-}
-
-export interface ModelDefaultsConfig {
-  schema: number;
-  providers: Record<string, ProviderModelDefaults>;
-}
-
-export interface ModelProviderInfo {
+export interface AgentHarness {
   id: string;
   label: string;
-  eligible: boolean;
-  kinds: string[];
-  suggestions: string[];
-  suggestions_note: string;
-  limitation?: string | null;
+  cli: string;
+  note: string;
 }
 
-export interface ModelRoleInfo {
+export interface AgentProvider {
   id: string;
   label: string;
+  kind: AgentProviderKind;
+  pin: string;
+  gate: boolean;
+  paid: boolean;
+  note: string;
 }
 
-/** GET/POST /api/settings/model-defaults */
-export interface ModelDefaultsSnapshot {
-  revision: number;
-  config: ModelDefaultsConfig;
-  providers: ModelProviderInfo[];
-  roles: ModelRoleInfo[];
+export interface AgentModel {
+  id: string;
+  provider: string;
+  ctx: string;
+  out: string;
+  thinking: boolean | null;
+  images: boolean | null;
+}
+
+export interface AgentProfile {
+  id: string;
+  role: string;
+  model: string;
+  job: string;
+}
+
+export interface AgentPin {
+  pkg: string;
+  pinned: string;
+}
+
+export interface AgentSettingsConfig {
+  harnesses: AgentHarness[];
+  providers: AgentProvider[];
+  models: AgentModel[];
+  profiles: AgentProfile[];
+  scope: Record<string, AgentScope>;
+  roleDefaults: Record<string, string>;
+  pins: AgentPin[];
+}
+
+export interface AgentHarnessObservation {
+  installed: boolean | null;
+  version: string | null;
+  live: number;
+}
+
+export interface AgentProfileFile {
+  path: string;
+  status: "not written" | "in sync" | "needs sync" | "unmanaged";
+}
+
+export interface AgentProfileObservation {
+  version: string;
+  usedBy: string[];
+  history: Array<{ at: string; what: string }>;
+  files: AgentProfileFile[];
+}
+
+export interface AgentSettingsObservations {
+  harnesses: Record<string, AgentHarnessObservation>;
+  models: Record<string, { live: number }>;
+  profiles: Record<string, AgentProfileObservation>;
+}
+
+export interface AgentCatalogModel {
+  id: string;
+  ctx: string;
+  out: string;
+  thinking: boolean | null;
+  images: boolean | null;
+}
+
+export interface AgentCatalog {
+  source: string;
+  fetchedAt: string;
+  models: AgentCatalogModel[];
+  error?: string;
+}
+
+export interface AgentSettingsSnapshot {
+  revision: string;
   read_only: boolean;
+  config: AgentSettingsConfig;
+  observations: AgentSettingsObservations;
+  catalogs: Record<string, AgentCatalog>;
+}
+
+export interface AgentSyncResult {
+  snapshot: AgentSettingsSnapshot;
+  files: Array<{ profile: string; path: string; status: string }>;
+}
+
+export interface AgentPreviewResult {
+  command: string | null;
+  model: string | null;
+  source: string;
+  allowed: boolean;
+  reasons: string[];
+  profile_revision: string;
 }
 
 /** One declared `inputs:` entry in a workflow's frontmatter (CAD-496). */
@@ -1231,7 +1249,8 @@ export interface AppRunPlan {
   decided_at?: string | null;
   reason?: string | null;
   tickets: RunTicket[];
-  progress: WorkProgress;
+  /** `plan.rs` counts by status (backlog, ready, doing, ...), not by bucket. */
+  progress: Omit<WorkProgress, "counts"> & { counts: Record<string, number> };
 }
 
 /**

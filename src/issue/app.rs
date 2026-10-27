@@ -50,6 +50,8 @@ use crate::issue::model;
 use crate::issue::parse;
 use crate::issue::{app_view, board, plan, project, workflow, write, Pm};
 
+use cadence_core::app_compat::{self, Compat};
+
 /// `<pm>/<project>/apps/` — beside PROJECT.md and `workflows/`.
 pub const DIR: &str = "apps";
 
@@ -85,11 +87,583 @@ const TOP_DIRS: &[&str] = &[
     "screens",
     "views",
     "assets",
+    "storage",
 ];
 
 /// Largest single file in a bundle — workflows render to plans, so the
 /// plan cap applies; the same bound keeps every other file small.
 const MAX_FILE_BYTES: u64 = plan::MAX_PLAN_BYTES as u64;
+
+/// CAD-1254: a declared screen's JS/CSS asset (`screens/<tag>/<stem>.js|css`)
+/// gets its own 384 KiB per-file cap; nothing else is raised.
+pub(crate) const MAX_SCREEN_ASSET_BYTES: u64 = 384 * 1024;
+
+/// The per-file cap for bundle member `rel`: [`MAX_SCREEN_ASSET_BYTES`] for a
+/// screen JS/CSS leaf, else [`MAX_FILE_BYTES`].
+pub(crate) fn file_cap(rel: &str) -> u64 {
+    let screen_leaf = rel
+        .strip_prefix("screens/")
+        .is_some_and(|r| r.split('/').count() == 2 && (r.ends_with(".js") || r.ends_with(".css")));
+    if screen_leaf {
+        MAX_SCREEN_ASSET_BYTES
+    } else {
+        MAX_FILE_BYTES
+    }
+}
+
+/// The root files admitted beside `app.md`. One list for the source loader,
+/// the catalogue importer and the board's files-mode transport. CAD-1415 added
+/// `app-actions.json` to the first two and missed the third, so a bundle the
+/// daemon accepts was refused before it ever reached the daemon.
+pub(crate) const ROOT_MEMBERS: &[&str] = &[
+    MANIFEST,
+    crate::issue::app_chat::FILE,
+    crate::issue::app_assistant::FILE,
+    crate::issue::app_action::FILE,
+    "app-storage.json",
+];
+
+pub(crate) fn root_member(name: &str) -> bool {
+    ROOT_MEMBERS.contains(&name)
+}
+
+/// Visible, ASCII, flat leaf name — no dotfile, no separator, no escape.
+fn plain_leaf_ok(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg.is_ascii()
+        && !seg.starts_with('.')
+        && seg != ".."
+        && !seg.contains('\\')
+        && !seg.contains('\0')
+}
+
+/// A workflow leaf: `<tag>.md`, the installer's own tag rule. Every trailing
+/// `.md` is stripped before the tag check, which the published document states
+/// explicitly.
+fn workflow_leaf_ok(seg: &str) -> bool {
+    plain_leaf_ok(seg)
+        && seg.ends_with(WORKFLOW_SUFFIX)
+        && crate::issue::model::valid_tag(seg.trim_end_matches(WORKFLOW_SUFFIX))
+}
+
+/// How one flat top-level directory admits its leaves.
+#[derive(Clone, Copy)]
+pub(crate) enum DirRule {
+    /// `<tag>.md`, the installer's own tag rule.
+    WorkflowMdTag,
+    /// One tag-shaped stem and exactly one declared suffix.
+    TaggedLeaf { suffix: &'static str },
+    /// Exactly this leaf name.
+    Exact(&'static str),
+    /// Any visible, ASCII, flat leaf.
+    VisibleLeaf,
+    /// A visible flat `<leaf>.svg`, bounded in bytes.
+    SvgLeaf { max_leaf_bytes: usize },
+    /// A `screens/<tag>/` package: the declaration or a tag-shaped stem plus
+    /// `js|css|svg|json`.
+    ScreensPackage,
+}
+
+/// The directory half of the grammar, in one table. [`bundle_path_ok`]
+/// evaluates it and [`bundle_grammar_json`] publishes it; there is no second
+/// list to keep in step.
+pub(crate) const DIR_RULES: &[(&str, DirRule)] = &[
+    ("workflows", DirRule::WorkflowMdTag),
+    ("views", DirRule::Exact(crate::issue::app_view::FILE)),
+    ("rubrics", DirRule::VisibleLeaf),
+    ("templates", DirRule::VisibleLeaf),
+    // CAD-1129: catalog icons and screenshots are flat SVG leaves.
+    (
+        "assets",
+        DirRule::SvgLeaf {
+            max_leaf_bytes: ASSET_MAX_LEAF_BYTES,
+        },
+    ),
+    ("screens", DirRule::ScreensPackage),
+    ("storage", DirRule::TaggedLeaf { suffix: ".json" }),
+];
+
+/// Version of the published grammar document. Bump only for a shape change.
+#[cfg(test)]
+pub(crate) const GRAMMAR_VERSION: u32 = 2;
+
+/// The lexical pieces the published document must state normatively. They are
+/// constants so the predicate and the document cannot disagree.
+const WORKFLOW_SUFFIX: &str = ".md";
+const ASSET_SUFFIX: &str = ".svg";
+const ASSET_MAX_LEAF_BYTES: usize = 128;
+#[cfg(test)]
+const SCREEN_ASSET_EXTS: &[&str] = &["js", "css", "svg", "json"];
+/// `model::valid_tag`: every byte drawn from this set, 1..=32 bytes, never
+/// leading with `-`. Stated as a charset, not a regex: `$` admits a trailing
+/// line terminator in JavaScript, which would let a consumer accept a tag the
+/// host refuses.
+#[cfg(test)]
+const VALID_TAG_CHARSET: &str = "abcdefghijklmnopqrstuvwxyz0123456789-";
+#[cfg(test)]
+const VALID_TAG_MAX_BYTES: usize = 32;
+
+fn dir_rule(directory: &str) -> Option<DirRule> {
+    DIR_RULES
+        .iter()
+        .find(|(name, _)| *name == directory)
+        .map(|(_, rule)| *rule)
+}
+
+/// The one bundle path grammar. The board's files-mode transport (install and
+/// upgrade) admits every member through this, and the source loader and the
+/// catalogue importer share [`root_member`] for the root set while keeping
+/// their own directory walkers. The root list is therefore one fact, and the
+/// transport can no longer refuse a member the daemon accepts.
+///
+/// It is lexical only: it says which paths may exist, never whether their bytes
+/// are valid. Splitting on literal `/` and refusing empty, `.` and `..`
+/// segments matters for the upload transport: `Path::components` folds `a//b`,
+/// `a/./b` and `a/../b` onto one staged file and would defeat duplicate
+/// detection.
+pub(crate) fn bundle_path_ok(path: &str) -> bool {
+    if path.is_empty() || !path.is_ascii() || path.contains('\\') || path.contains('\0') {
+        return false;
+    }
+    let segs: Vec<&str> = path.split('/').collect();
+    if segs.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
+        return false;
+    }
+    match segs.as_slice() {
+        [name] => root_member(name),
+        [directory, leaf] => match dir_rule(directory) {
+            Some(DirRule::WorkflowMdTag) => workflow_leaf_ok(leaf),
+            Some(DirRule::TaggedLeaf { suffix }) => {
+                plain_leaf_ok(leaf)
+                    && leaf
+                        .strip_suffix(suffix)
+                        .is_some_and(crate::issue::model::valid_tag)
+            }
+            Some(DirRule::Exact(name)) => *leaf == name,
+            Some(DirRule::VisibleLeaf) => plain_leaf_ok(leaf),
+            Some(DirRule::SvgLeaf { max_leaf_bytes }) => {
+                plain_leaf_ok(leaf) && leaf.ends_with(ASSET_SUFFIX) && leaf.len() <= max_leaf_bytes
+            }
+            // A screens package is a directory, never a flat leaf.
+            Some(DirRule::ScreensPackage) | None => false,
+        },
+        // CAD-1006: one tag-named package dir per screen.
+        ["screens", tag, leaf] => {
+            crate::issue::model::valid_tag(tag) && crate::issue::app_screen_pkg::leaf_ok(leaf)
+        }
+        _ => false,
+    }
+}
+
+/// The published grammar document, generated from [`ROOT_MEMBERS`],
+/// [`DIR_RULES`] and the caps. `contracts/bundle-grammar/v2/grammar.json` must
+/// equal this byte for byte; the test below refuses drift. The v1 document
+/// stays as the historical artifact a v1 reader already carries.
+#[cfg(test)]
+pub(crate) fn bundle_grammar_json() -> String {
+    let directories: Vec<serde_json::Value> = DIR_RULES
+        .iter()
+        .map(|(directory, rule)| match rule {
+            DirRule::WorkflowMdTag => {
+                serde_json::json!({ "dir": directory, "rule": "workflow_md_tag" })
+            }
+            DirRule::TaggedLeaf { suffix } => {
+                serde_json::json!({ "dir": directory, "rule": "tagged_leaf", "suffix": suffix })
+            }
+            DirRule::Exact(name) => {
+                serde_json::json!({ "dir": directory, "rule": "exact", "name": name })
+            }
+            DirRule::VisibleLeaf => serde_json::json!({ "dir": directory, "rule": "visible_leaf" }),
+            DirRule::SvgLeaf { max_leaf_bytes } => serde_json::json!({
+                "dir": directory,
+                "rule": "svg_leaf",
+                "maxLeafBytes": max_leaf_bytes,
+            }),
+            DirRule::ScreensPackage => serde_json::json!({
+                "dir": directory,
+                "rule": "screens_package",
+                "declaration": crate::issue::app_screen_pkg::SCREEN_MANIFEST,
+                "leaf": "tag_stem.(js|css|svg|json)",
+            }),
+        })
+        .collect();
+    let document = serde_json::json!({
+        "version": GRAMMAR_VERSION,
+        "rootFiles": ROOT_MEMBERS,
+        "segments": {
+            "asciiOnly": true,
+            "nonEmpty": true,
+            "forbidExact": [".", ".."],
+            "forbidLeadingDot": true,
+            "forbidBackslash": true,
+            "forbidNul": true,
+        },
+        "definitions": {
+            "validTag": {
+                "wholeInput": true,
+                "minBytes": 1,
+                "maxBytes": VALID_TAG_MAX_BYTES,
+                "charset": VALID_TAG_CHARSET,
+                "forbidLeading": "-",
+            },
+            "workflowMdTag": {
+                "segment": true,
+                "suffix": WORKFLOW_SUFFIX,
+                "stem": "validTag of the leaf with every trailing suffix removed",
+            },
+            "visibleLeaf": { "segment": true },
+            "svgLeaf": {
+                "segment": true,
+                "suffix": ASSET_SUFFIX,
+                "maxLeafBytes": ASSET_MAX_LEAF_BYTES,
+            },
+            "screensPackage": {
+                "path": "screens/<tag>/<leaf>",
+                "tag": "validTag",
+                "declaration": crate::issue::app_screen_pkg::SCREEN_MANIFEST,
+                "assetStem": "validTag",
+                "extensions": SCREEN_ASSET_EXTS,
+            },
+            "exact": { "leaf": "the name carried by the directory entry" },
+        },
+        "directories": directories,
+        "caps": {
+            "fileBytes": MAX_FILE_BYTES,
+            "screenAssetBytes": MAX_SCREEN_ASSET_BYTES,
+            "bundleBytes": MAX_APP_BYTES,
+            "files": MAX_FILES,
+        },
+    });
+    serde_json::to_string_pretty(&document).expect("grammar document serializes") + "\n"
+}
+
+#[cfg(test)]
+mod bundle_grammar_tests {
+    use super::*;
+
+    #[test]
+    fn admits_every_member_the_daemon_accepts() {
+        for path in [
+            "app.md",
+            "app-chat.json",
+            "app-assistant.json",
+            "app-actions.json",
+            "workflows/post.md",
+            "views/app-views-v1.json",
+            "rubrics/brand.md",
+            "templates/base.liquid",
+            "assets/crm.svg",
+            "screens/crm/screens.json",
+            "screens/crm/client.js",
+            "screens/crm/styles.css",
+        ] {
+            assert!(bundle_path_ok(path), "{path}");
+        }
+        // The descriptor the board transport used to refuse.
+        assert!(root_member(crate::issue::app_action::FILE));
+    }
+
+    #[test]
+    fn refuses_members_outside_the_grammar() {
+        for path in [
+            "",
+            "readme.md",
+            "app-actions/actions.json",
+            "assets/crm.png",
+            "assets/nested/icon.svg",
+            "workflows/UPPER.md",
+            "views/other.json",
+            "screens/crm/deep/file.js",
+            "../secret",
+            "app.md/inner",
+            "./app-actions.json",
+        ] {
+            assert!(!bundle_path_ok(path), "{path}");
+        }
+        // The snapshot and catalogue walkers cap an asset leaf at 128 bytes.
+        assert!(bundle_path_ok(&format!("assets/{}.svg", "a".repeat(124))));
+        assert!(!bundle_path_ok(&format!("assets/{}.svg", "a".repeat(125))));
+    }
+
+    /// The live artifact. Parity is checked against v2 only: the v1 document
+    /// is historical and stays untouched, so a v1 reader keeps the shape it
+    /// was published with.
+    fn grammar_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("contracts/bundle-grammar/v2/grammar.json")
+    }
+
+    /// The published document is generated, never hand-written: this test is
+    /// the only thing keeping `contracts/bundle-grammar/v2/grammar.json` equal
+    /// to the predicate consumers are expected to apply.
+    #[test]
+    fn published_artifact_matches_the_predicate() {
+        let path = grammar_path();
+        let published = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        assert_eq!(
+            published,
+            bundle_grammar_json(),
+            "regenerate with `cargo test --lib regenerate_bundle_grammar -- --ignored`"
+        );
+    }
+
+    /// Regenerates the artifact. Ignored so an ordinary run can never bless
+    /// drifted bytes by rewriting them before comparing.
+    #[test]
+    #[ignore = "writes the checked-in grammar artifact"]
+    fn regenerate_bundle_grammar() {
+        let path = grammar_path();
+        std::fs::create_dir_all(path.parent().expect("grammar dir")).expect("create grammar dir");
+        std::fs::write(&path, bundle_grammar_json()).expect("write grammar");
+    }
+
+    /// The document's normative claims must match the functions that enforce
+    /// them, not just the table it was serialized from.
+    #[test]
+    fn published_definitions_match_the_predicate() {
+        for byte in VALID_TAG_CHARSET.bytes() {
+            let tag = format!("a{}", byte as char);
+            assert!(crate::issue::model::valid_tag(&tag), "{tag}");
+        }
+        assert!(crate::issue::model::valid_tag(
+            &"a".repeat(VALID_TAG_MAX_BYTES)
+        ));
+        // A trailing line terminator is the case a `$`-anchored regex would
+        // wrongly admit in JavaScript; the host refuses it.
+        for tag in ["", "-a", "A", "a_b", "a.b", "a ", "a\n"] {
+            assert!(!crate::issue::model::valid_tag(tag), "{tag}");
+        }
+        assert!(!crate::issue::model::valid_tag(
+            &"a".repeat(VALID_TAG_MAX_BYTES + 1)
+        ));
+        for ext in SCREEN_ASSET_EXTS {
+            assert!(
+                crate::issue::app_screen_pkg::leaf_ok(&format!("x.{ext}")),
+                "{ext}"
+            );
+        }
+        assert!(!crate::issue::app_screen_pkg::leaf_ok("x.txt"));
+        // The workflow rule strips every trailing suffix, as the document says.
+        assert!(bundle_path_ok("workflows/post.md.md"));
+        // The asset rule is bounded by the published leaf cap.
+        assert!(bundle_path_ok(&format!("assets/{}.svg", "a".repeat(124))));
+        assert!(!bundle_path_ok(&format!("assets/{}.svg", "a".repeat(125))));
+    }
+
+    /// CAD-1848: `storage/` holds one flat `<validTag>.json` migration per
+    /// file, and `app-storage.json` is its root declaration. The tag rule is
+    /// the manifest tag rule (`model::valid_tag`): 1..=32 lowercase ASCII
+    /// letters, digits or hyphens, never leading with a hyphen.
+    #[test]
+    fn admits_app_storage_root_and_flat_migration_members() {
+        assert!(root_member("app-storage.json"));
+        for path in [
+            "app-storage.json",
+            "storage/a.json",
+            "storage/001-init.json",
+            "storage/a-b0.json",
+        ] {
+            assert!(bundle_path_ok(path), "{path}");
+        }
+        // The bound is the published 32 bytes, and a trailing hyphen is
+        // still a tag.
+        assert!(bundle_path_ok(&format!("storage/{}.json", "a".repeat(32))));
+        assert!(bundle_path_ok("storage/a-.json"));
+    }
+
+    /// Everything the flat shape does not admit refuses: traversal, empty
+    /// segments, nesting, a second suffix, an unsupported or uppercase
+    /// extension, and any stem the tag rule rejects.
+    #[test]
+    fn refuses_storage_members_outside_the_flat_tag_json_shape() {
+        for path in [
+            "",
+            "storage",
+            "storage/",
+            "storage//a.json",
+            "storage/../a.json",
+            "storage/a/../b.json",
+            "storage/nested/a.json",
+            // Exactly one `.json` suffix.
+            "storage/a",
+            "storage/a.txt",
+            "storage/a.JSON",
+            "storage/a.json.json",
+            // One tag-shaped stem.
+            "storage/.json",
+            "storage/.a.json",
+            "storage/-a.json",
+            "storage/a_b.json",
+            "storage/a.b.json",
+            "storage/a b.json",
+            "storage/aß.json",
+            // The segment rules hold inside `storage/` too.
+            "storage\\a.json",
+            "storage/a.json\0b",
+        ] {
+            assert!(!bundle_path_ok(path), "{path}");
+        }
+        // One byte past the published tag cap refuses.
+        assert!(!bundle_path_ok(&format!("storage/{}.json", "a".repeat(33))));
+    }
+
+    /// The workflow half of the guard bundle: the CAD-1254 acceptance
+    /// fixture's plan template, which the real `app::validate` gate already
+    /// accepts (an unregistered `agent:` is a note at install, never an
+    /// error).
+    const STORAGE_GUARD_WORKFLOW: &str = "---\ntitle: \"Post: {{topic}}\"\ngoal: \"Publish {{topic}}\"\n\
+inputs:\n  topic: { ask: \"About what?\" }\n---\n\n\
+Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance\n- [ ] brief written\n";
+
+    /// Lay a genuinely valid workflow app out at `root`. With `majors`, the
+    /// manifest also declares
+    /// `needs.requires.contracts: {app-storage: [<majors>]}`.
+    fn write_workflow_app(root: &Path, majors: Option<&str>) {
+        std::fs::create_dir_all(root.join("workflows")).unwrap();
+        let requires = match majors {
+            Some(majors) => format!("  requires: {{contracts: {{app-storage: [{majors}]}}}}\n"),
+            None => String::new(),
+        };
+        std::fs::write(
+            root.join(MANIFEST),
+            format!(
+                "---\napp: storage-guard\ntitle: Storage guard\nversion: '1'\n\
+                 needs:\n  connections: []\n{requires}---\n\nGuide.\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("workflows/do.md"), STORAGE_GUARD_WORKFLOW).unwrap();
+    }
+
+    fn write_member(root: &Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("member parent")).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// Real source validation over `root`, with the refusal text or `()`.
+    fn validate_source(root: &Path) -> std::result::Result<(), String> {
+        match validate(root, &HashSet::new(), &[]) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// The fixture the storage guards start from is a valid package on its
+    /// own: a refusal below is storage's, never a broken baseline.
+    #[test]
+    fn the_storage_guard_baseline_is_a_valid_app() {
+        let root = tempfile::tempdir().unwrap();
+        write_workflow_app(root.path(), None);
+        assert_eq!(validate_source(root.path()), Ok(()));
+    }
+
+    /// Storage members are admitted only for a package that declares the
+    /// exact host contract it needs: `needs.requires.contracts.app-storage:
+    /// [1]`. Absent, a different major, or an extra major all refuse.
+    #[test]
+    fn storage_members_refuse_without_the_exact_app_storage_declaration() {
+        let member_only: &[&str] = &["storage/a.json"];
+        let root_only: &[&str] = &["app-storage.json"];
+        let root_and_member: &[&str] = &["app-storage.json", "storage/a.json"];
+        for (label, majors, files) in [
+            ("member only", None, member_only),
+            ("root only", None, root_only),
+            ("root and member", None, root_and_member),
+            ("major 2", Some("2"), root_and_member),
+            ("majors 1 and 2", Some("1, 2"), root_and_member),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            write_workflow_app(root.path(), majors);
+            for &rel in files {
+                write_member(root.path(), rel, "{}");
+            }
+            let error = validate_source(root.path())
+                .expect_err(&format!("{label}: storage must refuse without [1]"));
+            assert!(
+                error.contains(
+                    "app storage members require needs.requires.contracts.app-storage: [1]"
+                ),
+                "{label}: {error}"
+            );
+        }
+    }
+
+    /// A declaration without its root member refuses — the pairing runs
+    /// both ways, so `requires` alone cannot promise storage.
+    #[test]
+    fn storage_declaration_without_its_root_member_refuses() {
+        let no_members: &[&str] = &[];
+        let member_only: &[&str] = &["storage/a.json"];
+        for files in [no_members, member_only] {
+            let root = tempfile::tempdir().unwrap();
+            write_workflow_app(root.path(), Some("1"));
+            for &rel in files {
+                write_member(root.path(), rel, "{}");
+            }
+            let error = validate_source(root.path())
+                .expect_err("a declared app-storage still needs app-storage.json");
+            assert!(
+                error.contains("app-storage requires app-storage.json"),
+                "{error}"
+            );
+        }
+    }
+
+    /// Recognizing inert members is not a native storage capability: the
+    /// exact pairing is admitted by the bundle checks, and the package still
+    /// refuses for the runtime this host does not have — never a fabricated
+    /// native success.
+    #[test]
+    fn declared_storage_fails_for_the_missing_native_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        write_workflow_app(root.path(), Some("1"));
+        write_member(root.path(), "app-storage.json", "{}");
+        write_member(root.path(), "storage/001-init.json", "{}");
+        let error = validate_source(root.path()).expect_err("no native app-storage runtime");
+        assert!(error.contains("app is not installable"), "{error}");
+        assert!(
+            error.contains("app requires host contract 'app-storage' major 1"),
+            "{error}"
+        );
+        assert!(
+            error.contains("this host supports none (unknown contract)"),
+            "{error}"
+        );
+        // The refusal is the missing runtime, not the bundle pairing.
+        assert!(
+            !error.contains("app storage members require"),
+            "the exact [1] declaration pairs with the members: {error}"
+        );
+        assert!(!error.contains("requires app-storage.json"), "{error}");
+    }
+
+    /// Source validation refuses a storage member that is a link or sits in
+    /// a nested directory before any bytes are read.
+    #[test]
+    fn storage_source_refuses_links_and_nested_directories() {
+        let linked = tempfile::tempdir().unwrap();
+        write_workflow_app(linked.path(), Some("1"));
+        write_member(linked.path(), "app-storage.json", "{}");
+        write_member(linked.path(), "storage/a.json", "{}");
+        std::os::unix::fs::symlink(
+            linked.path().join("storage/a.json"),
+            linked.path().join("storage/b.json"),
+        )
+        .unwrap();
+        let error = validate_source(linked.path()).expect_err("a link is not app content");
+        assert!(error.contains("storage/b.json"), "{error}");
+        assert!(error.contains("symlink"), "{error}");
+
+        let nested = tempfile::tempdir().unwrap();
+        write_workflow_app(nested.path(), Some("1"));
+        write_member(nested.path(), "app-storage.json", "{}");
+        write_member(nested.path(), "storage/nested/a.json", "{}");
+        let error = validate_source(nested.path()).expect_err("storage/ is flat");
+        assert!(error.contains("storage/nested"), "{error}");
+    }
+}
 
 /// Most files a bundle may carry.
 const MAX_FILES: usize = 128;
@@ -115,10 +689,26 @@ pub struct Manifest {
     /// when the manifest declared it; the file and declaration pair up
     /// at `validate`/`validate_texts` (either alone refuses).
     pub view_contract: Option<String>,
+    /// Host requirements declared under `needs.requires`. Absent means
+    /// a legacy package; malformed declarations fail manifest parsing.
+    pub requires: Compat,
     /// CAD-1129 §3: the display-only catalog block (`listing:`), plain
     /// JSON already host-validated — it can declare no capability.
     pub listing: Option<crate::issue::app_listing::Listing>,
     pub guide: String,
+}
+
+impl Manifest {
+    /// The installation's reserved `file.upload` declaration, if any
+    /// (CAD-1168/CAD-1114 subset). A declaration is not a grant: the
+    /// chat upload service re-proves the current exact-digest consent and
+    /// this declaration at every upload, reference and read, never from a
+    /// browser projection.
+    pub fn file_upload(&self) -> Option<&CapabilityNeed> {
+        self.capabilities
+            .values()
+            .find(|need| need.is_file_upload())
+    }
 }
 
 /// The app names the result it needs. Reviewed providers own exact tools,
@@ -134,12 +724,42 @@ pub struct CapabilityNeed {
     pub effect: String,
 }
 impl CapabilityNeed {
+    /// The reserved `file.upload` capability name (CAD-1168/CAD-1114
+    /// subset): the host may stage a source for that approved
+    /// installation's chat. It grants no provider connection, import,
+    /// release, publish, send or worker dispatch action, and host custody
+    /// is local draft material, not external-send authority. There is
+    /// exactly one accepted tuple for this name — see `is_file_upload`.
+    pub const FILE_UPLOAD: &'static str = "file.upload";
+
+    /// Exactly the reserved `file.upload` declaration: schema 1, version 1,
+    /// action `attach`, resource_kind `installation`, effect `draft`. The
+    /// name alone is not the declaration — a variant tuple of the same name
+    /// is refused by `validate` and is not this predicate. Later runtime
+    /// reference checks must re-prove this declaration against the exact
+    /// consented digest; this predicate is not itself an authority.
+    pub fn is_file_upload(&self) -> bool {
+        self.schema == 1
+            && self.capability == Self::FILE_UPLOAD
+            && self.version == 1
+            && self.action == "attach"
+            && self.resource_kind == "installation"
+            && self.effect == "draft"
+    }
+
     pub fn validate(&self) -> Result<()> {
+        // The reserved `file.upload` name is exact-tuple-only: it never
+        // falls through to the generic read/draft `connection_account`
+        // broker slot, so a wrong effect/resource/action/schema/version
+        // refuses instead of being accepted as a different capability.
+        let file_upload = self.is_file_upload();
         let publication = self.capability == "text.publish"
             && self.version == 1
             && self.action == "publish"
-            && self.effect == "send";
+            && self.effect == "send"
+            && self.resource_kind == "connection_account";
         let bounded_read_or_draft = self.capability != "text.publish"
+            && self.capability != Self::FILE_UPLOAD
             && matches!(self.effect.as_str(), "read" | "draft")
             && self.version == 1
             && self.capability.len() <= 64
@@ -150,11 +770,9 @@ impl CapabilityNeed {
             && self
                 .action
                 .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-        if self.schema != 1
-            || self.resource_kind != "connection_account"
-            || !(publication || bounded_read_or_draft)
-        {
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            && self.resource_kind == "connection_account";
+        if self.schema != 1 || !(file_upload || publication || bounded_read_or_draft) {
             return Err(Error::rejected("unsupported app capability contract"));
         }
         Ok(())
@@ -206,6 +824,21 @@ pub struct Record {
     /// then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purge_after: Option<i64>,
+    /// Catalogue release this installation was checked against. Absence
+    /// is a path, Git or other non-catalogue install — never a guessed
+    /// label. The locator is provenance, not a grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalogue: Option<CatalogueOrigin>,
+}
+
+/// A published catalogue release named by id, version and digest.
+/// Matching bytes do not make the caller trusted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogueOrigin {
+    pub id: String,
+    pub version: String,
+    pub digest: String,
 }
 
 /// Where an installed bundle came from. `git` records the exact commit
@@ -438,10 +1071,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         };
         for key in needs.keys() {
             let k = key.as_str().unwrap_or_default();
-            if !matches!(k, "connections" | "capabilities" | "views") {
+            if !matches!(k, "connections" | "capabilities" | "views" | "requires") {
                 return Err(Error::rejected(format!(
                     "app.md `needs.{k}` is unknown — v0 knows `needs.connections`, \
-                     `needs.capabilities`, `needs.views`"
+                     `needs.capabilities`, `needs.views`, `needs.requires`"
                 )));
             }
         }
@@ -536,6 +1169,8 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             Some(crate::issue::app_listing::parse(value, yaml_len, &slots)?)
         }
     };
+    let requires =
+        app_compat::parse_requires(get("needs").and_then(serde_yaml::Value::as_mapping))?;
     Ok(Manifest {
         app,
         title,
@@ -544,6 +1179,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         capabilities,
         summary,
         view_contract,
+        requires,
         listing,
         guide: body.to_string(),
     })
@@ -610,8 +1246,9 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             files.push((name.to_string(), entry.path()));
             continue;
         }
-        // CAD-1110: the data-only chat descriptor sits beside app.md.
-        if name == crate::issue::app_chat::FILE || name == crate::issue::app_assistant::FILE {
+        // CAD-1110/CAD-1415: the data-only descriptors sit beside app.md —
+        // one list with the source loader and the upload transport.
+        if root_member(name) {
             if !ft.is_file() {
                 return Err(entry_err(name, "app-chat.json is a regular file"));
             }
@@ -637,10 +1274,15 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             root.display()
         )));
     }
-    if !dirs.iter().any(|(d, _)| d == "workflows") {
+    // CAD-1177: an app bundles workflows and/or screens — a standalone
+    // tools plugin ships only `screens/` (the v2 tool declarations are
+    // its unit of work, checked later in `validate_texts`); a
+    // workflow-driven app ships `workflows/`. One of the two must be
+    // present or the bundle installs nothing usable.
+    if !dirs.iter().any(|(d, _)| d == "workflows" || d == "screens") {
         return Err(Error::rejected(
-            "an app needs workflows/ — the workflows it bundles; an app with \
-             none installs nothing runnable",
+            "an app needs workflows/ or screens/ — an app with neither installs \
+             nothing runnable",
         ));
     }
     for (top, dir) in &dirs {
@@ -703,7 +1345,14 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
                     "views/ holds exactly app-views-v1.json",
                 ));
             }
-            files.push((format!("{top}/{name}"), entry.path()));
+            let relative = format!("{top}/{name}");
+            if top == "storage" && !bundle_path_ok(&relative) {
+                return Err(entry_err(
+                    &relative,
+                    "storage migrations are flat <tag>.json files",
+                ));
+            }
+            files.push((relative, entry.path()));
         }
         // screens/<tag>/<leaf> — the one nested level v1 allows: each
         // `<tag>` is a tag-named subdir holding the declaration and flat
@@ -788,9 +1437,10 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
     let mut total = 0u64;
     for (rel, path) in &files {
         let len = path.symlink_metadata().map(|m| m.len()).unwrap_or(0);
-        if len > MAX_FILE_BYTES {
+        if len > file_cap(rel) {
             return Err(Error::rejected(format!(
-                "{rel} is {len} bytes — a file is at most {MAX_FILE_BYTES}"
+                "{rel} is {len} bytes — a file is at most {}",
+                file_cap(rel)
             )));
         }
         total += len;
@@ -835,14 +1485,14 @@ fn workflow_slots(text: &str) -> Result<Vec<String>> {
     Ok(slots)
 }
 
-/// What `validate` returns on success: the parsed manifest, the
-/// verified file texts (`rel-path → text`, sorted), the secret guard's
-/// warnings and the workflow checks' notes.
+/// Integrity-checked package bytes and observations, not execution authority.
+/// Native validation additionally enforces the actual host requirements.
 pub(crate) struct Validated {
     pub(crate) manifest: Manifest,
     pub(crate) files: Vec<(String, String)>,
     pub(crate) secret_warnings: Vec<crate::secret::Finding>,
     pub(crate) notes: Vec<String>,
+    pub(crate) compatibility: Value,
 }
 
 /// Read a bundle's files as UTF-8 text and validate them: the manifest
@@ -861,10 +1511,11 @@ pub(crate) fn validate(
     for (rel, path) in paths {
         let bytes = std::fs::read(&path)
             .map_err(|e| Error::rejected(format!("cannot read app file {rel}: {e}")))?;
-        if bytes.len() as u64 > MAX_FILE_BYTES {
+        if bytes.len() as u64 > file_cap(&rel) {
             return Err(Error::rejected(format!(
-                "{rel} is {} bytes — a file is at most {MAX_FILE_BYTES}",
-                bytes.len()
+                "{rel} is {} bytes — a file is at most {}",
+                bytes.len(),
+                file_cap(&rel)
             )));
         }
         let text = match String::from_utf8(bytes) {
@@ -882,7 +1533,14 @@ pub(crate) fn validate(
         }
         files.push((rel, text));
     }
-    validate_contents(files, secret_warnings, errors, agents, agent_sources)
+    validate_contents(
+        files,
+        secret_warnings,
+        errors,
+        agents,
+        agent_sources,
+        CompatibilityCheck::RequireNative,
+    )
 }
 
 /// Validate an immutable descriptor-read snapshot before workspace publication.
@@ -890,6 +1548,40 @@ pub(crate) fn validate_texts(
     files: Vec<(String, String)>,
     agents: &HashSet<String>,
     agent_sources: &[String],
+) -> Result<Validated> {
+    validate_snapshot(
+        files,
+        agents,
+        agent_sources,
+        CompatibilityCheck::RequireNative,
+    )
+}
+
+/// Inspect immutable bytes without claiming that their target contracts are
+/// implemented by Native. Unknown contract payload semantics remain target-owned.
+pub(crate) fn inspect_texts(
+    files: Vec<(String, String)>,
+    agents: &HashSet<String>,
+    agent_sources: &[String],
+) -> Result<Validated> {
+    validate_snapshot(
+        files,
+        agents,
+        agent_sources,
+        CompatibilityCheck::ReportNative,
+    )
+}
+
+enum CompatibilityCheck {
+    RequireNative,
+    ReportNative,
+}
+
+fn validate_snapshot(
+    files: Vec<(String, String)>,
+    agents: &HashSet<String>,
+    agent_sources: &[String],
+    compatibility: CompatibilityCheck,
 ) -> Result<Validated> {
     if files.len() > MAX_FILES {
         return Err(Error::rejected("app bundle exceeds its file limit"));
@@ -900,13 +1592,55 @@ pub(crate) fn validate_texts(
         ));
     }
     let mut warnings = Vec::new();
+    // Portable inspection must not consult a machine's state or inherit its
+    // operator exceptions. Native validation retains its existing allowlist.
+    let no_host_exceptions = crate::secret::Allowlist::default();
     for (name, text) in &files {
-        if text.len() as u64 > MAX_FILE_BYTES {
+        if text.len() as u64 > file_cap(name) {
             return Err(Error::rejected("app bundle file exceeds its limit"));
         }
-        warnings.extend(crate::secret::guard(&format!("app file {name}"), text)?);
+        let findings = match &compatibility {
+            CompatibilityCheck::RequireNative => {
+                crate::secret::guard(&format!("app file {name}"), text)?
+            }
+            CompatibilityCheck::ReportNative => {
+                crate::secret::guard_with(&format!("app file {name}"), text, &no_host_exceptions)?
+            }
+        };
+        warnings.extend(findings);
     }
-    validate_contents(files, warnings, Vec::new(), agents, agent_sources)
+    validate_contents(
+        files,
+        warnings,
+        Vec::new(),
+        agents,
+        agent_sources,
+        compatibility,
+    )
+}
+
+/// Storage members and their requirement are one package contract, including
+/// when already-installed bytes are explicitly approved again.
+pub(crate) fn validate_storage_members<'a>(
+    manifest: &Manifest,
+    paths: impl Iterator<Item = &'a str>,
+) -> Result<()> {
+    let declared = manifest.requires.contracts.get("app-storage");
+    let mut root = false;
+    let mut members = false;
+    for path in paths {
+        root |= path == "app-storage.json";
+        members |= path.starts_with("storage/");
+    }
+    if (root || members) && declared.is_none_or(|majors| majors.as_slice() != [1]) {
+        return Err(Error::rejected(
+            "app storage members require needs.requires.contracts.app-storage: [1]",
+        ));
+    }
+    if declared.is_some() && !root {
+        return Err(Error::rejected("app-storage requires app-storage.json"));
+    }
+    Ok(())
 }
 
 fn validate_contents(
@@ -915,6 +1649,7 @@ fn validate_contents(
     mut errors: Vec<String>,
     agents: &HashSet<String>,
     agent_sources: &[String],
+    compatibility: CompatibilityCheck,
 ) -> Result<Validated> {
     let manifest = match files.iter().find(|(rel, _)| rel == MANIFEST) {
         Some((_, text)) => match parse_manifest(text) {
@@ -931,6 +1666,7 @@ fn validate_contents(
                     capabilities: BTreeMap::new(),
                     summary: None,
                     view_contract: None,
+                    requires: Compat::legacy(),
                     listing: None,
                     guide: String::new(),
                 }
@@ -944,10 +1680,16 @@ fn validate_contents(
             capabilities: BTreeMap::new(),
             summary: None,
             view_contract: None,
+            requires: Compat::legacy(),
             listing: None,
             guide: String::new(),
         },
     };
+    if let Err(error) =
+        validate_storage_members(&manifest, files.iter().map(|(path, _)| path.as_str()))
+    {
+        errors.push(error.to_string());
+    }
     // CAD-1129 §3: every asset `listing` references must be in this
     // bundle's own inventory — `assets/` flat *.svg, nothing outside.
     if let Some(listing) = &manifest.listing {
@@ -966,6 +1708,14 @@ fn validate_contents(
         .find(|(rel, _)| rel == crate::issue::app_chat::FILE)
     {
         if let Err(e) = crate::issue::app_chat::validate(text, &manifest.app) {
+            errors.push(e.to_string());
+        }
+    }
+    if let Some((_, text)) = files
+        .iter()
+        .find(|(rel, _)| rel == crate::issue::app_action::FILE)
+    {
+        if let Err(e) = crate::issue::app_action::validate_customer_bundle(text, &manifest.app) {
             errors.push(e.to_string());
         }
     }
@@ -1057,9 +1807,67 @@ fn validate_contents(
             Err(e) => errors.push(format!("{rel}: {e}")),
         }
     }
-    if workflow_count == 0 {
+    // CAD-1270 item 3: every `screens/<tag>/` member group is a screen
+    // package — integrity-check each through the same
+    // `app_screen_pkg::extract` → `app_screen_decl::validate_map` the
+    // mount RPC re-runs, so a malformed declaration, an
+    // undeclared/tampered asset or a tag dir without `screens.json`
+    // refuses at install, not first mount. `tags_in` additionally
+    // enforces the ≤8 declared-package bound; the member-prefix scan
+    // also collects an orphan tag dir (no screens.json), which
+    // `tags_in` cannot see. This shared check is what install,
+    // install-check and the offline `app check` all inherit — no second
+    // parser.
+    {
+        let screen_map: BTreeMap<String, String> = files.iter().cloned().collect();
+        if let Err(e) = crate::issue::app_screen_pkg::tags_in(&screen_map) {
+            errors.push(format!("screens: {e}"));
+        }
+        let mut candidates: Vec<&str> = Vec::new();
+        for rel in screen_map.keys() {
+            if let Some(rest) = rel.strip_prefix("screens/") {
+                if let Some((tag, _)) = rest.split_once('/') {
+                    if !candidates.contains(&tag) {
+                        candidates.push(tag);
+                    }
+                }
+            }
+        }
+        for tag in candidates {
+            match crate::issue::app_screen_pkg::extract(&screen_map, tag) {
+                // Same binding the mount RPC enforces: the package's
+                // declared `app` must be this bundle's manifest app —
+                // a package cannot claim a different app.
+                Ok(pkg) if pkg.app != manifest.app => errors.push(format!(
+                    "screens/{tag}: screen package declares an app that is not the installation"
+                )),
+                Err(e) => errors.push(format!("screens/{tag}: {e}")),
+                Ok(_) => {}
+            }
+        }
+    }
+    // CAD-1177: an app may ship no workflows only when it is a genuine
+    // standalone-tools plugin — it carries at least one integrity-checked
+    // `app-screens/v2` screen whose declared `tools` map resolves every
+    // alias to a real `needs.capabilities` slot. That is the v2
+    // no-workflow-file path: the tool, not a run, is the unit of work.
+    // An empty app, a screen that fails integrity, or a tool whose slot
+    // the manifest never declares cannot substitute for workflows and
+    // still refuses.
+    if workflow_count == 0 && !has_tools_only_screen(&files, &manifest) {
         errors.push("workflows/ holds no *.md workflow".to_string());
     }
+    let host = app_compat::host(env!("CARGO_PKG_VERSION"))?;
+    let compatibility = match compatibility {
+        CompatibilityCheck::ReportNative => manifest.requires.report(&host),
+        CompatibilityCheck::RequireNative => match manifest.requires.check(&host) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                errors.push(error.to_string());
+                Value::Null
+            }
+        },
+    };
     if !errors.is_empty() {
         return Err(Error::rejected(format!(
             "app is not installable — {}",
@@ -1071,6 +1879,53 @@ fn validate_contents(
         files,
         secret_warnings,
         notes,
+        compatibility,
+    })
+}
+
+/// CAD-1177: whether the bundle carries a genuine standalone-tools
+/// screen — an integrity-checked `app-screens/v2` package whose
+/// declared `tools` map is non-empty AND resolves every alias to a
+/// `needs.capabilities` slot with a `read`/`draft` effect (the only
+/// effects a standalone, approval-free invoke may run). Its `may` is
+/// `tools.invoke`, optionally plus the exact `media.read` permission a
+/// `screen-media.v1` screen declares (CAD-1365). This is the
+/// install-time proof that lets a workflow-free plugin install; it is
+/// deliberately strict so an empty or malformed bundle cannot borrow
+/// the exception. Returns false on any integrity/parse failure — a
+/// broken screen never satisfies the exception (its own error is
+/// reported by the screen validators elsewhere).
+fn has_tools_only_screen(files: &[(String, String)], manifest: &Manifest) -> bool {
+    let map: BTreeMap<String, String> = files.iter().cloned().collect();
+    let Ok(tags) = crate::issue::app_screen_pkg::tags_in(&map) else {
+        return false;
+    };
+    tags.iter().any(|tag| {
+        let Ok(pkg) = crate::issue::app_screen_pkg::extract(&map, tag) else {
+            return false;
+        };
+        pkg.contract == "app-screens/v2"
+            // The screen must be FOR this app — a package declaring a
+            // different app can never satisfy this bundle's exception.
+            && pkg.app == manifest.app
+            && !pkg.tools.is_empty()
+            // `tools.invoke` alone, plus — only under the media host
+            // contract — the exact `media.read`/`media.publish`
+            // declarations. No other `may` member and no media right on
+            // an actions-contract screen qualifies.
+            && pkg.may.iter().all(|m| {
+                m == crate::issue::app_screen_decl::MAY_TOOLS_INVOKE
+                    || ((m == crate::issue::app_screen_decl::MAY_MEDIA_READ
+                        || m == crate::issue::app_screen_decl::MAY_MEDIA_PUBLISH)
+                        && pkg.host_contract.as_deref()
+                            == Some(crate::issue::app_screen_decl::HOST_CONTRACT_MEDIA))
+            })
+            && pkg.tools.values().all(|slot| {
+                manifest
+                    .capabilities
+                    .get(slot)
+                    .is_some_and(|decl| matches!(decl.effect.as_str(), "read" | "draft"))
+            })
     })
 }
 
@@ -1114,11 +1969,29 @@ fn write_verified(file: &Path, text: &str) -> Result<std::fs::File> {
 /// Copy a verified bundle into `target`, 0644 files — no mode bits,
 /// exec or otherwise, travel with app content.
 fn copy_verified(files: &[(String, String)], target: &Path) -> Result<()> {
+    // The install/update target is itself part of the checked tree. Do not
+    // assume it is safe merely because its caller validated the bundle.
+    mkdir_verified(target)?;
     for (rel, text) in files {
-        let to = target.join(rel);
-        if let Some(parent) = to.parent() {
-            mkdir_verified(parent)?;
+        let relative = Path::new(rel);
+        let components: Vec<_> = relative.components().collect();
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(Error::rejected(format!(
+                "{} is not a normalized relative bundle path",
+                rel
+            )));
         }
+
+        let mut to = target.to_path_buf();
+        for component in &components[..components.len() - 1] {
+            to.push(component.as_os_str());
+            mkdir_verified(&to)?;
+        }
+        to.push(components[components.len() - 1].as_os_str());
         let f = write_verified(&to, text)?;
         #[cfg(unix)]
         {
@@ -1172,6 +2045,7 @@ fn digest_over(pm_dir: &Path, project: &str, name: &str, over: &[(&str, &str)]) 
             serde_json::to_string(&manifest.capabilities)?
         ));
     }
+    keys.push_str(&manifest.requires.digest_line());
     for slot in &manifest.connections {
         keys.push_str(&format!(
             "bind.{slot}={}\n",
@@ -1497,6 +2371,7 @@ pub fn install(
         files,
         secret_warnings,
         notes,
+        ..
     } = validate(&src_dir, &agents, &agent_sources)?;
     let name = manifest.app.clone();
     let apps = dir_of(&pm.dir, project_key)?;
@@ -1560,6 +2435,7 @@ pub fn install(
         removed: None,
         restore_after: None,
         purge_after: None,
+        catalogue: None,
     };
     if let Err(e) = write_record(&record_path, &record) {
         rollback(false);
@@ -1722,6 +2598,7 @@ pub fn update(
         files,
         secret_warnings,
         notes,
+        ..
     } = validate(&src_dir, &agents, &agent_sources)?;
     if manifest.app != name {
         return Err(Error::rejected(format!(
@@ -2273,91 +3150,6 @@ pub fn team_roles(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec<St
     }
     roles.sort();
     Ok(roles)
-}
-
-/// One slot an app's workflow steps declare with `uses:` and the
-/// connection it is bound to — the raw material of the app's grant
-/// policy (CAD-577). `binding` is the effective connection name
-/// (`None` when the slot is explicitly unbound).
-#[derive(Clone, Debug, PartialEq)]
-pub struct SlotUse {
-    pub slot: String,
-    pub binding: Option<String>,
-}
-
-/// Every distinct slot some workflow step declares with `uses:`, with
-/// the slot's effective binding — sorted by slot. This is what
-/// `app_approve` turns into the app's grant policy: each used slot
-/// declares its own name as the scope it needs on the bound
-/// connection (the local adapter's `publish` tool declares exactly
-/// that scope).
-pub fn slot_uses(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec<SlotUse>> {
-    let dir = app_dir(pm_dir, project_key, name)?;
-    let record = read_record(pm_dir, project_key, name)?;
-    let manifest = read_manifest(pm_dir, project_key, name)?;
-    let mut slots: Vec<String> = Vec::new();
-    for (rel, path) in bundle_files(&dir)? {
-        if rel
-            .strip_prefix("workflows/")
-            .and_then(|n| n.strip_suffix(".md"))
-            .is_none()
-        {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
-        for slot in workflow_slots(&text).unwrap_or_default() {
-            if manifest.connections.iter().any(|s| s == &slot) && !slots.contains(&slot) {
-                slots.push(slot);
-            }
-        }
-    }
-    slots.sort();
-    Ok(slots
-        .into_iter()
-        .map(|slot| SlotUse {
-            binding: record.binding(&slot).map(str::to_string),
-            slot,
-        })
-        .collect())
-}
-
-/// The per-ticket `(agent, uses-slots)` a rendered plan declares — the
-/// agents a run assigns to each step and the slots those steps use.
-/// Parsed from the rendered text's ticket metadata, so it names the
-/// aliases the run actually carries (an input placeholder already
-/// substituted).
-pub fn run_uses(text: &str) -> Vec<(Option<String>, Vec<String>)> {
-    let Ok((_, body)) = parse::split_front(text) else {
-        return Vec::new();
-    };
-    let Ok(metas) = workflow::ticket_meta(body) else {
-        return Vec::new();
-    };
-    metas
-        .into_iter()
-        .map(|meta| {
-            let mut agent = None;
-            let mut slots = Vec::new();
-            for (key, value) in meta {
-                match key.as_str() {
-                    "agent" => agent = Some(value),
-                    "uses" => {
-                        for tok in value
-                            .trim_start_matches('[')
-                            .trim_end_matches(']')
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|t| !t.is_empty())
-                        {
-                            slots.push(tok.to_string());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            (agent, slots)
-        })
-        .collect()
 }
 
 /// One derived grant the app's approval records: `agent` may call
@@ -3138,8 +3930,34 @@ pub fn doctor(pm_dir: &Path, known: Option<&HashSet<String>>) -> Value {
 }
 
 #[cfg(test)]
+#[path = "app_nested_copy_acceptance.rs"]
+mod nested_copy_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Manifest admission retains supplied requirements and refuses malformed ones.
+    #[test]
+    fn manifest_wires_requires() {
+        let legacy = "---\napp: x\ntitle: t\nversion: '1'\nneeds:\n  connections: []\n---\n\nG\n";
+        let m = parse_manifest(legacy).unwrap();
+        assert!(!m.requires.declared(), "absent requires is legacy");
+
+        let declared = "---\napp: x\ntitle: t\nversion: '1'\nneeds:\n  requires: {core: \">=0.0.0\", contracts: {app-chat: [1]}}\n---\n\nG\n";
+        let m = parse_manifest(declared).unwrap();
+        assert!(m.requires.declared());
+        assert_eq!(m.requires.contracts["app-chat"], vec![1]);
+
+        let malformed = "---\napp: x\ntitle: t\nversion: '1'\nneeds:\n  requires: {contracts: {app-chat: [0]}}\n---\n\nG\n";
+        assert!(parse_manifest(malformed).is_err());
+        let nonmap = "---\napp: x\ntitle: t\nversion: '1'\nneeds:\n  requires: ''\n---\n\nG\n";
+        assert!(parse_manifest(nonmap).is_err());
+        let bad_ver = "---\napp: x\ntitle: t\nversion: '1'\nneeds:\n  requires: {core: '>=1.0.0-alpha..1'}\n---\n\nG\n";
+        assert!(parse_manifest(bad_ver).is_err());
+        let bad_build = "---\napp: x\ntitle: t\nversion: '1'\nneeds:\n  requires: {core: '>=1.0.0+'}\n---\n\nG\n";
+        assert!(parse_manifest(bad_build).is_err());
+    }
 
     #[test]
     fn cad692_publication_declaration_is_provider_neutral_and_bounded() {
@@ -3376,5 +4194,97 @@ installed_at: '2026-09-27T00:00:00Z'\ninstalled_by: operator\n",
         assert_eq!(split_ref("a/"), None);
         assert_eq!(split_ref("/b"), None);
         assert_eq!(split_ref("A/b"), None);
+    }
+    /// CAD-1177: a workflow-free app installs only when it is a genuine
+    /// standalone-tools plugin — an integrity-checked `app-screens/v2`
+    /// screen whose `tools` all resolve to declared read/draft
+    /// capability slots. An empty app, a failing-integrity screen, or a
+    /// tool naming an undeclared/send slot cannot substitute for
+    /// workflows and still refuses.
+    #[test]
+    fn cad1177_workflow_free_app_installs_only_with_a_real_v2_tools_screen() {
+        let agents = HashSet::new();
+        let js = "console.log('x')";
+        let sha = |b: &str| format!("sha256:{:x}", Sha256::digest(b.as_bytes()));
+        let manifest = "---\napp: studio\ntitle: Studio\nversion: '1'\nneeds:\n  capabilities:\n    source: {schema: 1, capability: social.read, version: 1, action: posts, resource_kind: connection_account, effect: read}\n---\nGuide\n";
+        let screen = |tools: serde_json::Value| {
+            serde_json::json!({
+                "contract":"app-screens/v2","app":"studio","entry":"client.js",
+                "host_contract":"screen-actions.v1","may":["tools.invoke"],
+                "tools":tools,
+                "assets":[{"name":"client.js","media_type":"text/javascript","sha256":sha(js),"size":js.len()}],
+                "provenance":{"source_digest":sha("s"),"sdk_digest":sha("k"),"toolchain_digest":sha("t")}
+            }).to_string()
+        };
+        let files = |decl: String| {
+            vec![
+                ("app.md".to_string(), manifest.to_string()),
+                ("screens/composer/screens.json".to_string(), decl),
+                ("screens/composer/client.js".to_string(), js.to_string()),
+            ]
+        };
+        // A valid tools screen mapped to the declared `source` slot installs.
+        validate_texts(
+            files(screen(serde_json::json!({"instagram.read":"source"}))),
+            &agents,
+            &[],
+        )
+        .unwrap();
+        // Empty app (no workflows, no qualifying screen) refuses.
+        let empty = vec![("app.md".to_string(), manifest.to_string())];
+        assert!(validate_texts(empty, &agents, &[]).is_err());
+        // A v1 (read-only) screen is not a tools plugin.
+        let mut v1: serde_json::Value =
+            serde_json::from_str(&screen(serde_json::json!({"a.b":"source"}))).unwrap();
+        v1["contract"] = serde_json::json!("app-screens/v1");
+        v1.as_object_mut().unwrap().remove("tools");
+        v1.as_object_mut().unwrap().remove("host_contract");
+        v1["may"] = serde_json::json!([]);
+        assert!(validate_texts(files(v1.to_string()), &agents, &[]).is_err());
+        // A tool naming an undeclared slot refuses.
+        assert!(validate_texts(
+            files(screen(serde_json::json!({"a.b":"nosuchslot"}))),
+            &agents,
+            &[]
+        )
+        .is_err());
+        // A tool resolving to a send-effect slot cannot stand alone.
+        let send_manifest = manifest.replace("effect: read", "effect: send");
+        let send_files = vec![
+            ("app.md".to_string(), send_manifest),
+            (
+                "screens/composer/screens.json".to_string(),
+                screen(serde_json::json!({"a.b":"source"})),
+            ),
+            ("screens/composer/client.js".to_string(), js.to_string()),
+        ];
+        assert!(validate_texts(send_files, &agents, &[]).is_err());
+        // A broken-integrity screen (tampered client.js) refuses.
+        let mut tampered = files(screen(serde_json::json!({"a.b":"source"})));
+        tampered[2].1 = "tampered()".to_string();
+        assert!(validate_texts(tampered, &agents, &[]).is_err());
+    }
+
+    /// CAD-1177: the `ig-tools-fixture` bundle ships NO `workflows/` —
+    /// it is the real on-disk tools-only app QA mounts and installs
+    /// against. This proves the shipped fixture validates (the
+    /// acceptance assertions about it belong to QA).
+    #[test]
+    fn cad1177_ig_tools_fixture_is_a_valid_workflow_free_app() {
+        let agents = HashSet::new();
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/apps/ig-tools-fixture");
+        let validated = validate(&dir, &agents, &[]).unwrap();
+        assert_eq!(validated.manifest.app, "ig-tools-fixture");
+        // No workflows members — the screen is the unit of work.
+        assert!(validated
+            .files
+            .iter()
+            .all(|(rel, _)| !rel.starts_with("workflows/")));
+        // Its v2 screen integrity-checks and maps the alias to `source`.
+        let map: BTreeMap<String, String> = validated.files.iter().cloned().collect();
+        let pkg = crate::issue::app_screen_pkg::extract(&map, "feed").unwrap();
+        assert_eq!(pkg.contract, "app-screens/v2");
+        assert_eq!(pkg.tools["instagram.read"], "source");
     }
 }

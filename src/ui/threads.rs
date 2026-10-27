@@ -22,11 +22,14 @@
 //! - `?conversation=<id>` on the thread read and stream selects that
 //!   conversation's entries (an unknown id is 404; home when absent).
 //! - `POST /api/threads/<alias>/messages` `{"text", "message"?, "app"?,
-//!   "conversation"?}` —
+//!   "conversation"?, "expected_recipient_uid"?}` —
 //!   the operator's message, queued to the agent like `cadence send`.
 //!   `app` (`{install_id, context_id}`, CAD-802) is never authority:
 //!   the daemon proves both against its store and stamps the verified
-//!   binding on the entry.
+//!   binding on the entry. `expected_recipient_uid` (CAD-1591) is a
+//!   recipient-identity constraint, never authority either: the relay
+//!   carries it through and the daemon's enqueue transaction refuses
+//!   before any write when the alias's current uid differs.
 //!
 //! The POST instructs an agent. It passes the board's write guards, and
 //! a caller the board attributes to an agent (a pane, or a managed
@@ -37,68 +40,59 @@
 //! for the web UI.
 
 use std::io::Write;
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use serde::Deserialize;
+use cadence_core::board_api::{ConversationReq, ThreadMessageReq};
 use serde_json::{json, Value};
 use tiny_http::Request;
 
 use super::{
-    busy_response, err_response, header_value, json_response, parse_json, read_body, HttpResp,
+    busy_response, err_response, header_value, json_response, parse_json, read_body, write_err,
+    HttpResp,
 };
 use crate::client;
 use crate::error::Error;
 
 /// A chat message body is at most the queue's 48 000 bytes plus JSON.
 const MESSAGE_CAP: u64 = 64 * 1024;
-/// Seconds one stream long-poll waits on the daemon before a keepalive.
-const STREAM_WAIT: u64 = 15;
+/// Keep each read within the two-second absolute daemon-read bound, so a
+/// stalled long-poll cannot indefinitely hold an authenticated stream.
+const STREAM_WAIT: u64 = 1;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ThreadMessageReq {
-    text: String,
-    /// Client-chosen id: a retried POST is the same message, not two.
-    message: Option<String>,
-    /// CAD-802: the shell chat's current installation/context. Never
-    /// authority — the daemon resolves both against its store and
-    /// refuses unknown installs, unknown/archived contexts and any
-    /// extra key (including a browser-stamped `verified`).
-    app: Option<ThreadApp>,
-    /// CAD-574: needs-me subjects the message cites (the rail's "Ask
-    /// master"). The daemon's `thread_refs` is the strict side — this
-    /// field only carries `{kind,id}` pairs through the relay.
-    refs: Option<Vec<ThreadRef>>,
-    /// CAD-1098: a selector among the conversations of `app`'s
-    /// installation — never authority; the daemon checks it.
-    conversation: Option<String>,
+/// Maximum simultaneous multipart bodies held by this board process.
+/// This bounds this HTTP ingress only; it is not a host-wide job limit.
+const CHAT_UPLOAD_INGRESS_MAX: usize = 2;
+static CHAT_UPLOAD_INGRESS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII admission for a board upload body. Acquired before `read_body` and
+/// retained until the request has removed its owned staging file.
+pub(crate) struct ChatUploadIngressPermit;
+
+impl ChatUploadIngressPermit {
+    pub(crate) fn try_acquire() -> Option<Self> {
+        let mut active = CHAT_UPLOAD_INGRESS.load(Ordering::Acquire);
+        loop {
+            if active >= CHAT_UPLOAD_INGRESS_MAX {
+                return None;
+            }
+            match CHAT_UPLOAD_INGRESS.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(observed) => active = observed,
+            }
+        }
+    }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConversationReq {
-    install_id: Option<String>,
-    context_id: Option<String>,
-    subject: Option<String>,
-    general: Option<bool>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ThreadRef {
-    kind: String,
-    id: String,
-}
-
-/// CAD-802: the shell chat's current App. The shape alone travels
-/// here — the daemon proves the installation and context against its
-/// own store and stamps the verified binding on the entry.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ThreadApp {
-    install_id: String,
-    /// Absent for an installation-only binding (no context selected).
-    context_id: Option<String>,
+impl Drop for ChatUploadIngressPermit {
+    fn drop(&mut self) {
+        CHAT_UPLOAD_INGRESS.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Alias grammar checked before it reaches the daemon — the same one
@@ -157,11 +151,14 @@ fn cursor_arg(raw: Option<String>, what: &str) -> std::result::Result<i64, HttpR
     }
 }
 
-/// `GET /api/threads/<alias>` — one page after `after`.
+/// `GET /api/threads/<alias>` — one page after `after`. `operator` is the
+/// board's proven-operator verdict for this request; anything else gets the
+/// member view ([`member_view`]).
 pub(super) fn read(
     state_dir: &std::path::Path,
     alias: &str,
     query: &dyn Fn(&str) -> Option<String>,
+    operator: bool,
 ) -> HttpResp {
     if !valid_alias(alias) {
         return err_response(400, "bad agent alias");
@@ -209,7 +206,12 @@ pub(super) fn read(
         params["conversation"] = Value::String(conversation);
     }
     match client::rpc(state_dir, "thread_read", params) {
-        Ok(page) => json_response(page),
+        Ok(mut page) => {
+            if !operator {
+                super::member_view::member_view(&mut page);
+            }
+            json_response(page)
+        }
         Err(e) => rpc_err(&e),
     }
 }
@@ -224,6 +226,8 @@ pub(super) fn stream(
     state_dir: &std::path::Path,
     alias: &str,
     query: &dyn Fn(&str) -> Option<String>,
+    mut admission: super::operator::ReadAdmission,
+    operator: bool,
 ) {
     if !valid_alias(alias) {
         let _ = request.respond(err_response(400, "bad agent alias"));
@@ -247,12 +251,44 @@ pub(super) fn stream(
     };
     // Fail before the stream opens when the alias or daemon is wrong —
     // a 404/501/503 beats an event stream that only ever errors.
-    if let Err(e) = client::rpc(
+    let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+    let first = match budget.read(
         state_dir,
         "thread_read",
         with_conversation(json!({"alias": alias, "after": cursor, "limit": 1})),
     ) {
-        let _ = request.respond(rpc_err(&e));
+        Ok(page) => page,
+        Err(e) => {
+            let _ = request.respond(rpc_err(&e));
+            return;
+        }
+    };
+    // The same private read as GET /api/master/state. Put the authoritative
+    // turn on this connection before any resumed entries, not on a racing
+    // board stream whose asynchronous refresh may still hold the old turn.
+    // Whether this IS the master is the daemon's answer (the resolved
+    // alias), not the URL's spelling.
+    let master = if first["alias"]
+        .as_str()
+        .is_some_and(crate::master::is_master)
+    {
+        match budget.read(state_dir, "master_state", json!({})) {
+            Ok(mut state) => {
+                // CAD-1767: a non-operator never gets the operator's turn text.
+                if !operator {
+                    super::member_view::redact_master_state(&mut state);
+                }
+                Some(state)
+            }
+            Err(e) => {
+                let _ = request.respond(rpc_err(&e));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    if !admission.still_live(state_dir) {
         return;
     }
     let mut w = request.into_writer();
@@ -262,27 +298,55 @@ pub(super) fn stream(
     let frame = |w: &mut dyn Write, bytes: &[u8]| -> bool {
         w.write_all(bytes).and_then(|_| w.flush()).is_ok()
     };
-    if !frame(&mut w, head.as_bytes()) || !frame(&mut w, b": ping\n\n") {
+    if !frame(&mut w, head.as_bytes()) {
+        return;
+    }
+    if let Some(master) = master {
+        let bytes = format!("event: master\ndata: {master}\n\n");
+        if !frame(&mut w, bytes.as_bytes()) {
+            return;
+        }
+    }
+    if !frame(&mut w, b": ping\n\n") {
         return;
     }
     loop {
-        let started = Instant::now();
-        match client::rpc(
+        let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+        let page = budget.read(
             state_dir,
             "thread_read",
             with_conversation(
                 json!({"alias": alias, "after": cursor, "limit": 100, "wait": STREAM_WAIT}),
             ),
-        ) {
-            Ok(page) => {
+        );
+        if !admission.still_live(state_dir) {
+            return;
+        }
+        match page {
+            Ok(mut page) => {
+                // The cursor follows the whole page, hidden entries included,
+                // so a page that is all operator-only never stalls the poll.
+                let seqs: Vec<i64> = page["entries"]
+                    .as_array()
+                    .map(|rows| rows.iter().filter_map(|e| e["seq"].as_i64()).collect())
+                    .unwrap_or_default();
+                if !operator {
+                    super::member_view::member_view(&mut page);
+                }
                 let entries = page["entries"].as_array().cloned().unwrap_or_default();
                 if entries.is_empty() && !frame(&mut w, b": ping\n\n") {
                     return;
+                }
+                if let Some(top) = seqs.iter().max() {
+                    cursor = cursor.max(*top);
                 }
                 for entry in entries {
                     let Some(seq) = entry["seq"].as_i64() else {
                         continue;
                     };
+                    if !admission.still_live(state_dir) {
+                        return;
+                    }
                     let bytes = format!("id: {seq}\nevent: entry\ndata: {entry}\n\n");
                     if !frame(&mut w, bytes.as_bytes()) {
                         return;
@@ -290,17 +354,7 @@ pub(super) fn stream(
                     cursor = cursor.max(seq);
                 }
             }
-            Err(e) => {
-                let data = json!({"error": e.to_string()});
-                if !frame(&mut w, format!("event: error\ndata: {data}\n\n").as_bytes()) {
-                    return;
-                }
-                // A down daemon answers at once — never spin on it.
-                let spent = started.elapsed();
-                if spent < Duration::from_secs(2) {
-                    std::thread::sleep(Duration::from_secs(2) - spent);
-                }
-            }
+            Err(_) => return,
         }
     }
 }
@@ -314,6 +368,8 @@ pub(super) fn post_message(
     request: &mut Request,
     state_dir: &std::path::Path,
     alias: &str,
+    session_proof: Option<Value>,
+    relay: super::operator::PublicRelay,
 ) -> HttpResp {
     if !valid_alias(alias) {
         return err_response(400, "bad agent alias");
@@ -327,6 +383,14 @@ pub(super) fn post_message(
         Err(resp) => return resp,
     };
     let mut params = json!({"alias": alias, "text": req.text});
+    // The upload-account proof and public owner proof are server-held;
+    // neither identity proof is accepted from the request body.
+    if let Some(proof) = session_proof {
+        params["session"] = proof;
+    }
+    if let Err(resp) = super::operator::relay_owner_proof(&mut params, relay) {
+        return resp;
+    }
     if let Some(message) = req.message {
         params["message"] = Value::String(message);
     }
@@ -345,9 +409,204 @@ pub(super) fn post_message(
     if let Some(conversation) = req.conversation {
         params["conversation"] = Value::String(conversation);
     }
+    if let Some(media_refs) = req.media_refs {
+        params["media_refs"] = json!(media_refs
+            .iter()
+            .map(|r| json!({"asset_id": r.asset_id, "revision": r.revision, "sha256": r.sha256}))
+            .collect::<Vec<_>>());
+    }
+    if let Some(attachments) = req.attachments {
+        params["attachments"] = json!(attachments
+            .iter()
+            .map(|a| json!({"id": a.id}))
+            .collect::<Vec<_>>());
+    }
+    if let Some(expected_uid) = req.expected_recipient_uid {
+        params["expected_recipient_uid"] = Value::String(expected_uid);
+    }
     match client::rpc(state_dir, "thread_send", params) {
         Ok(receipt) => json_response(receipt),
         Err(e) => rpc_err(&e),
+    }
+}
+
+/// The multipart selector fields the chat upload admits beside `file`:
+/// the display hint `name`/`filename` and the explicit app scope
+/// `install_id`, `context_id`, `conversation`. Anything else — a
+/// caller-supplied `scope`, `sha256`, `path`, actor or digest field —
+/// refuses the whole request; the daemon re-proves every value, and a
+/// partial app selector (install without conversation, or the reverse)
+/// is refused here before any staging.
+fn valid_app_selector(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+const UPLOAD_SELECTOR_FIELDS: &[&str] = &[
+    "name",
+    "filename",
+    "install_id",
+    "context_id",
+    "conversation",
+];
+
+/// `POST /api/chat/upload` — CAD-1168: the composer's retained-file
+/// upload. The board admits it OperatorOnly (WRITE_ROUTES), streams the
+/// multipart `file` part into the daemon's upload-staging dir under an
+/// exclusively created canonical name and relays `chat_file_upload` —
+/// the daemon re-hashes, caps, sniffs and retains. The caller's
+/// filename is a display hint only; no scope, digest or path field is
+/// forwarded. An explicit app selector (`install_id`, `conversation`,
+/// optional `context_id`) rides through as the daemon's `app` +
+/// `conversation` params — never as authority: the daemon proves the
+/// installation, the context, the conversation and the current
+/// exact-approved declaration again. The minted name is created with
+/// `create_new` before it is written or claimed: an occupied name is
+/// refused, never truncated or deleted, and only a path this request
+/// created is cleaned up. The response carries the daemon's stored
+/// row — no filesystem path, cookie or raw URL.
+pub(super) fn post_upload(
+    request: &mut Request,
+    state_dir: &Path,
+    session_proof: Option<Value>,
+) -> HttpResp {
+    let Some(session_proof) = session_proof else {
+        return err_response(401, "chat upload needs a live authenticated session");
+    };
+    let Some(_ingress) = ChatUploadIngressPermit::try_acquire() else {
+        return err_response(429, "chat upload ingress is busy; retry shortly");
+    };
+    let ct = header_value(request, "Content-Type").unwrap_or_default();
+    let Some(boundary) = ct
+        .trim()
+        .strip_prefix("multipart/form-data; boundary=")
+        .map(str::trim)
+        .map(|b| b.trim_matches('"'))
+    else {
+        return err_response(400, "chat upload needs a multipart/form-data boundary");
+    };
+    if boundary.is_empty() || boundary.len() > 100 {
+        return err_response(400, "bad multipart boundary");
+    }
+    // The cap is the daemon's own plus the multipart envelope — refuse
+    // here before any daemon call.
+    let cap = crate::store::CHAT_FILE_MAX_BYTES.saturating_add(64 * 1024);
+    let body = match read_body(request, cap) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let (fields, file) = match super::parse_multipart(&body, boundary) {
+        Ok(v) => v,
+        Err(why) => return err_response(400, &why),
+    };
+    let Some(bytes) = file else {
+        return err_response(400, "chat upload needs a 'file' part");
+    };
+    if bytes.is_empty() {
+        return err_response(400, "chat upload: the file part is empty");
+    }
+    // Unknown selector fields refuse whole, never silently dropped: a
+    // browser-supplied scope, digest, path or actor field is not a
+    // transport field here.
+    if let Some(field) = fields
+        .keys()
+        .find(|k| !UPLOAD_SELECTOR_FIELDS.contains(&k.as_str()))
+    {
+        return err_response(400, &format!("chat upload field '{field}' is not accepted"));
+    }
+    // Selector presence is meaningful: only genuinely absent fields
+    // select legacy Home. Present-empty, malformed, or partial app
+    // intent is refused before staging rather than normalized to Home.
+    let install = match fields.get("install_id") {
+        None => None,
+        Some(value) if valid_app_selector(value) => Some(value),
+        Some(_) => return err_response(400, "bad chat upload install_id"),
+    };
+    let conversation = match fields.get("conversation") {
+        None => None,
+        Some(value) if crate::proto::identifier(value, "conversation ID").is_ok() => Some(value),
+        Some(_) => return err_response(400, "bad chat upload conversation"),
+    };
+    let context = match fields.get("context_id") {
+        None => None,
+        Some(value) if valid_app_selector(value) => Some(value),
+        Some(_) => return err_response(400, "bad chat upload context_id"),
+    };
+    if context.is_some() && install.is_none() {
+        return err_response(400, "chat upload context_id needs an install_id");
+    }
+    match (install, conversation) {
+        (None, _) => {}
+        (Some(_), Some(_)) => {}
+        (Some(_), None) => {
+            return err_response(400, "chat upload install_id needs its conversation");
+        }
+    }
+    // The name is the part's declared filename, or a `name` field — a
+    // display hint the daemon sanitizes (basename, no control chars).
+    let name = fields
+        .get("filename")
+        .or_else(|| fields.get("name"))
+        .cloned()
+        .unwrap_or_else(|| "attachment.txt".to_string());
+    let uploads = state_dir.join(crate::wiki::UPLOAD_DIR);
+    if let Err(e) = std::fs::create_dir_all(&uploads) {
+        return err_response(500, &format!("upload staging failed: {e}"));
+    }
+    let tmp = uploads.join(format!("upload-{}", uuid::Uuid::new_v4().simple()));
+    // Exclusive create is the ownership proof: a minted UUID alone does
+    // not prove this request created the path, so an occupied name is
+    // refused without truncating or deleting it. Only after the create
+    // succeeds may this request clean up — including a partial write.
+    let mut staged = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(f) => f,
+        Err(e) => return err_response(500, &format!("upload staging failed: {e}")),
+    };
+    if let Err(e) = staged.write_all(&bytes) {
+        drop(staged);
+        let _ = std::fs::remove_file(&tmp);
+        return err_response(500, &format!("upload staging failed: {e}"));
+    }
+    if let Err(e) = staged.sync_all() {
+        drop(staged);
+        let _ = std::fs::remove_file(&tmp);
+        return err_response(500, &format!("upload staging failed: {e}"));
+    }
+    drop(staged);
+    // The daemon copies the staged bytes into its own custody before it
+    // answers, so this request's staging is removed on every path —
+    // success, refusal or an unreachable daemon. Only the tmp this
+    // request created is touched. The selector travels as the daemon's
+    // own `app`/`conversation` shape; the daemon re-proves all of it.
+    let mut params = json!({"name": name, "tmp": tmp, "session": session_proof});
+    if let Some(conversation) = conversation {
+        params["conversation"] = json!(conversation);
+    }
+    if let (Some(install), Some(context)) = (install, context) {
+        let mut app = json!({"install_id": install});
+        app["context_id"] = json!(context);
+        params["app"] = app;
+    } else if let Some(install) = install {
+        params["app"] = json!({"install_id": install});
+    }
+    let outcome = client::rpc(state_dir, "chat_file_upload", params);
+    let _ = std::fs::remove_file(&tmp);
+    match outcome {
+        Ok(v) => json_response(v),
+        Err(Error::Structured(details)) if details.kind == "busy" => {
+            err_response(429, &details.message)
+        }
+        Err(Error::Structured(details)) if details.code == crate::store::CHAT_QUOTA_CODE => {
+            err_response(413, &details.message)
+        }
+        Err(e) => write_err(&e),
     }
 }
 
@@ -383,6 +642,7 @@ pub(super) fn post_conversation(
     state_dir: &std::path::Path,
     alias: &str,
     path_install: Option<&str>,
+    relay: super::operator::PublicRelay,
 ) -> HttpResp {
     if !valid_alias(alias) {
         return err_response(400, "bad agent alias");
@@ -397,6 +657,24 @@ pub(super) fn post_conversation(
     };
     // On `/api/app-installations/<id>/conversations` the path names the
     // installation and a body `install_id` is refused, never reconciled.
+    if let Some(kind) = req.kind {
+        if path_install.is_some()
+            || req.install_id.is_some()
+            || req.context_id.is_some()
+            || req.subject.is_some()
+            || req.general.is_some()
+        {
+            return err_response(400, "kind takes no install, context, subject or general");
+        }
+        let mut params = json!({"alias": alias, "kind": kind});
+        if let Err(resp) = super::operator::relay_owner_proof(&mut params, relay) {
+            return resp;
+        }
+        return match client::rpc(state_dir, "conversation_create", params) {
+            Ok(created) => json_response(created),
+            Err(e) => rpc_err(&e),
+        };
+    }
     let install = match (path_install, req.install_id) {
         (Some(_), Some(_)) => return err_response(400, "install_id is named by the path"),
         (Some(path), None) => path.to_string(),
@@ -415,6 +693,10 @@ pub(super) fn post_conversation(
     }
     if let Some(general) = req.general {
         params["general"] = Value::Bool(general);
+    }
+    // CAD-1374: the server-held public session bearer, never a body field.
+    if let Err(resp) = super::operator::relay_owner_proof(&mut params, relay) {
+        return resp;
     }
     match client::rpc(state_dir, "conversation_create", params) {
         Ok(created) => json_response(created),

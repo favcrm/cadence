@@ -1,5 +1,7 @@
 import { ApiError } from "../../lib/api";
+import { errorMessage } from "../../lib/apiError";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch, withPrivateOperation } from "../../lib/privateSession";
 
 /** CAD-787 product client for the publish decision surface.
  *
@@ -257,18 +259,21 @@ session; transport mirrors workspaceApps/hostActions (same-origin
 credentials, session headers, board marker on writes). */
 async function request<T>(path: string, signal?: AbortSignal, body?: Record<string, unknown>, allowed: readonly string[] = SCHEDULE_KEYS): Promise<T> {
   if (body !== undefined) assertCleanBody(body, allowed);
-  const response = await fetch(sameOrigin(path), {
-    method: body === undefined ? "GET" : "POST", signal,
-    credentials: "same-origin", cache: "no-store",
-    headers: body === undefined ? sessionHeaders() : {
-      "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders(),
-    },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-  });
-  const value = await response.json().catch(() => null);
-  if (!response.ok) throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status);
-  if (value === null) throw new ApiError("The server returned an invalid publish receipt", 502);
-  return value as T;
+  return withPrivateOperation(async (op) => {
+    const response = await privateFetch(sameOrigin(path), {
+      method: body === undefined ? "GET" : "POST", signal,
+      credentials: "same-origin", cache: "no-store",
+      headers: body === undefined ? sessionHeaders() : {
+        "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders(),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    }, op);
+    const value = await response.json().catch(() => null);
+    op.assertCurrent();
+    if (!response.ok) throw new ApiError(errorMessage(value, `${response.status} ${response.statusText}`), response.status);
+    if (value === null) throw new ApiError("The server returned an invalid publish receipt", 502);
+    return value as T;
+  }, signal);
 }
 
 export const socialPublish = {
@@ -310,14 +315,14 @@ export const socialPublish = {
   },
 };
 
-export function publishStateText(state: PublishState): string {
+export function publishStateText(state: PublishState, t: (english: string) => string = (english) => english): string {
   switch (state) {
-    case "queued": return "Queued";
-    case "processing": return "Processing";
-    case "posted": return "Posted · verified";
-    case "refused": return "Refused";
-    case "cancelled": return "Cancelled";
-    case "held": return "Held · needs human";
+    case "queued": return t("Queued");
+    case "processing": return t("Processing");
+    case "posted": return t("Posted · verified");
+    case "refused": return t("Refused");
+    case "cancelled": return t("Cancelled");
+    case "held": return t("Held · needs human");
   }
 }
 
@@ -341,9 +346,9 @@ export function showsUncertainReading(intent: PublishIntent): boolean {
 /** Guidance for the two states the uncertain question can mean. Held
  *  needs a human decision (intent held vs provider reconnect_needed are
  *  different layers — the intent never auto-resumes). */
-export function reconcileReading(state: PublishState): string | null {
+export function reconcileReading(state: PublishState, t: (english: string) => string = (english) => english): string | null {
   if (state === "held")
-    return "Needs a human decision: the intent is held after a recheck mismatch (provider reconnect_needed is a separate layer). Reconnect, then re-approve — never auto-resume.";
+    return t("Needs a human decision: the intent is held after a recheck mismatch (provider reconnect_needed is a separate layer). Reconnect, then re-approve — never auto-resume.");
   return null;
 }
 
@@ -365,47 +370,50 @@ export function reconcileReading(state: PublishState): string | null {
  * exact-binding digest (writer/reviewer resolve via a relay read-only run
  * join); destination_id is echoed only, never handle-vouched.
  */
-export function refusalCopy(refusal: PublishRefusal): string {
+export function refusalCopy(
+  refusal: PublishRefusal,
+  t: (english: string) => string = (english) => english,
+): string {
   switch (refusal.code) {
     case "send_disabled":
-      return "Send dispatch is not enabled (refusal code, not a state). The intent validated and changed nothing — no provider was called.";
+      return t("Send dispatch is not enabled (refusal code, not a state). The intent validated and changed nothing — no provider was called.");
     case "grant_bounds":
-      return "The send grant allows 1 to 10 uses. This grant is outside that bound — nothing was published.";
+      return t("The send grant allows 1 to 10 uses. This grant is outside that bound — nothing was published.");
     case "grant_exhausted":
-      return "The send grant has no uses left. Nothing was published.";
+      return t("The send grant has no uses left. Nothing was published.");
     case "grant_revoked":
-      return "The send grant was revoked. Nothing was published.";
+      return t("The send grant was revoked. Nothing was published.");
     case "grant_mismatch":
-      return "The grant id does not match this binding. Nothing was published.";
+      return t("The grant id does not match this binding. Nothing was published.");
     case "grant_binding_mismatch":
-      return "The binding does not match this grant and destination. Nothing was published.";
+      return t("The binding does not match this grant and destination. Nothing was published.");
     case "grant_window":
-      return "The send grant is outside its validity window. Nothing was published.";
+      return t("The send grant is outside its validity window. Nothing was published.");
     case "grant_approval":
-      return "The grant names no usable operator approval (empty or over 120 characters). Nothing was published.";
+      return t("The grant names no usable operator approval (empty or over 120 characters). Nothing was published.");
     case "bad_caption_digest":
-      return "The caption digest is not 64 lowercase hex. Nothing was published.";
+      return t("The caption digest is not 64 lowercase hex. Nothing was published.");
     case "bad_image_digest":
-      return "The image digest is not 64 lowercase hex. Nothing was published.";
+      return t("The image digest is not 64 lowercase hex. Nothing was published.");
     case "bad_destination":
     case "wrong_destination":
-      return "The destination does not match the discovered owner-authorized account. Nothing was published.";
+      return t("The destination does not match the discovered owner-authorized account. Nothing was published.");
     case "wrong_connection":
-      return "The binding names a different connection than discovery. Nothing was published.";
+      return t("The binding names a different connection than discovery. Nothing was published.");
     case "wrong_toolkit":
-      return "The binding toolkit differs from the discovered destination. Nothing was published.";
+      return t("The binding toolkit differs from the discovered destination. Nothing was published.");
     case "not_publishable":
-      return "The destination is not active, linked and open. Nothing was published.";
+      return t("The destination is not active, linked and open. Nothing was published.");
     case "bad_key":
-      return "The idempotency key shape is invalid. Nothing was stored.";
+      return t("The idempotency key shape is invalid. Nothing was stored.");
     case "key_conflict":
-      return "The same key carries changed content or destination — it fails instead of sending twice.";
+      return t("The same key carries changed content or destination — it fails instead of sending twice.");
     case "unknown_key":
-      return "No intent or ledger row matches that key. Nothing to reconcile.";
+      return t("No intent or ledger row matches that key. Nothing to reconcile.");
     case "cancel_closed":
-      return "Only a queued intent can cancel — this one already left queued.";
+      return t("Only a queued intent can cancel — this one already left queued.");
     case "cross_workspace":
-      return "The credential workspace does not match. Cross-workspace sends are refused.";
+      return t("The credential workspace does not match. Cross-workspace sends are refused.");
     case "bad_connection":
     case "bad_grant":
     case "bad_run":
@@ -413,17 +421,17 @@ export function refusalCopy(refusal: PublishRefusal): string {
     case "bad_intent":
     case "bad_revision":
     case "bad_timezone":
-      return `An identity shape is invalid (${refusal.code}). Nothing was stored.`;
+      return t("An identity shape is invalid ({code}). Nothing was stored.").replace("{code}", () => refusal.code);
     case "approval_replay":
-      return "This approval already authorized another post. Review again to approve this one — nothing was published.";
+      return t("This approval already authorized another post. Review again to approve this one — nothing was published.");
     case "bad_approval":
-      return "The approval id is not one this panel minted. Review again — nothing was published.";
+      return t("The approval id is not one this panel minted. Review again — nothing was published.");
     case "image_required":
-      return "Instagram needs a reviewed provider-accessible image. Nothing was published.";
+      return t("Instagram needs a reviewed provider-accessible image. Nothing was published.");
     default:
       return refusal.message
-        ? `${refusal.message} (${refusal.code}). Nothing was published.`
-        : `Refused (${refusal.code}). Nothing was published.`;
+        ? `${refusal.message} (${refusal.code}). ${t("Nothing was published.")}`
+        : t("Refused ({code}). Nothing was published.").replace("{code}", () => refusal.code);
   }
 }
 

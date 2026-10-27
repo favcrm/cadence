@@ -28,7 +28,7 @@ pub fn check_commit_sha(sha: &str) -> Result<String> {
 /// call `message result --sha`, so the kickoff asks the agent to end
 /// its answer with this line. The LAST line wins — a worker discussing
 /// SHAs mid-answer cannot shadow the trailer it ends with.
-pub(super) fn last_sha_line(text: &str) -> Option<String> {
+pub(crate) fn last_sha_line(text: &str) -> Option<String> {
     text.lines().rev().find_map(|line| {
         let hex = line
             .trim()
@@ -149,7 +149,12 @@ pub(super) fn cloud_hold_exit(message: &str, alias: &str, session: &str) -> Stri
     )
 }
 
-pub(super) fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> Result<String> {
+pub(super) fn cloud_kickoff_body(
+    job: &Job,
+    task: &Task,
+    revision: i64,
+    ceiling: usize,
+) -> Result<String> {
     let spec = task.spec_path.as_deref().unwrap_or(job.spec_path.as_str());
     let raw = std::fs::read_to_string(spec)
         .unwrap_or_else(|_| "(spec text was not available to inline)".to_string());
@@ -175,8 +180,10 @@ pub(super) fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> Resul
         .map(|id| format!(" This job tracks issue {id}."))
         .unwrap_or_default();
     let head = format!(
-        "Cadence task {} (job {}, revision {}). You are a Devin cloud session and cannot \
-         read host paths or invoke the cadence CLI. Spec text follows. ",
+        "Cadence task {} (job {}, revision {}). You are a cloud session and cannot \
+         read host paths or invoke the cadence CLI. For company questions, use wiki/guide \
+         access only if this session has it; otherwise report knowledge not consulted and \
+         ask for authorized source material, inventing no policy. Spec text follows. ",
         task.id, job.id, revision
     );
     let bridge = format!(".{scope}{issue}");
@@ -184,17 +191,17 @@ pub(super) fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> Resul
     // cut. Criteria that cannot fit whole beside the fixed head refuse
     // the dispatch; everything else (the inlined spec first) gives way.
     let kept = acceptance.len() + SHA_TRAILER.len();
-    if head.len() + kept > ENQUEUE_BYTES {
+    if head.len() + kept > ceiling {
         return Err(criteria_too_long(
             &task.id,
             "kickoff",
             head.len() + kept,
             acceptance.len(),
-            ENQUEUE_BYTES,
+            ceiling,
             spec,
         ));
     }
-    let budget = ENQUEUE_BYTES - kept;
+    let budget = ceiling - kept;
     let fixed = head.len() + bridge.len();
     let spec_text = if fixed + cleaned.len() <= budget {
         cleaned
@@ -203,13 +210,13 @@ pub(super) fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> Resul
         format!("{}{SPEC_NOTE}", take_bytes(&cleaned, room))
     };
     let mut body = format!("{head}{spec_text}{bridge}{acceptance}{SHA_TRAILER}");
-    // Scope and issue text can already exceed the enqueue limit. Drop
+    // Scope and issue text can already exceed the delivery limit. Drop
     // the spec, say so, and keep the criteria and SHA trailer inside
-    // 48_000 bytes.
-    if body.len() > ENQUEUE_BYTES {
+    // the assignee's ceiling.
+    if body.len() > ceiling {
         const OMITTED: &str = "… (spec text omitted; the prompt was cut to fit)";
         let tail = format!("{OMITTED}{acceptance}{SHA_TRAILER}");
-        let room = ENQUEUE_BYTES.saturating_sub(tail.len());
+        let room = ceiling.saturating_sub(tail.len());
         let prefix = take_bytes(&format!("{head}{bridge}"), room);
         body = format!("{prefix}{tail}");
     }
@@ -245,14 +252,18 @@ pub(super) fn criteria_too_long(
 /// A Devin cloud session: it cannot read host paths, so its kickoff
 /// inlines the spec text ([`cloud_kickoff_body`]).
 fn cloud_session(provider: &str, endpoint_kind: &str) -> bool {
-    provider == "devin" && endpoint_kind == "cloud"
+    (provider == "devin" && endpoint_kind == "cloud")
+        || (provider == "sandbox" && endpoint_kind == "sandbox")
 }
 
 /// CAD-160: the size a `job dispatch` kickoff must fit for an assignee
-/// on `provider`/`endpoint_kind` — the enqueue limit for a Devin cloud
-/// session (its kickoff inlines the spec), else the pty ceiling.
+/// on `provider`/`endpoint_kind` — the AOS `spec` cap for a sandbox
+/// runner, the enqueue limit for a Devin cloud session (its kickoff
+/// inlines the spec), else the pty ceiling.
 pub fn kickoff_ceiling(provider: &str, endpoint_kind: &str) -> usize {
-    if cloud_session(provider, endpoint_kind) {
+    if provider == "sandbox" && endpoint_kind == "sandbox" {
+        crate::adapter::sandbox::SANDBOX_SPEC_BYTES
+    } else if cloud_session(provider, endpoint_kind) {
         ENQUEUE_BYTES
     } else {
         pty::MAX_BODY
@@ -283,13 +294,24 @@ pub(super) fn kickoff_body(
         message_id,
         &assignee.provider,
         &assignee.endpoint_kind,
+        false,
     )
 }
+
+/// CAD-1373: one short discovery pointer shared by the full and compact
+/// job envelopes, so the compact form keeps it. It names the document's
+/// installed path and section — `cadence skill status` prints the path
+/// for the session's own `$HOME`, so the pointer needs no install.
+const KNOWLEDGE_POINTER: &str = " Company questions: read the \"Business knowledge\" section of \
+    $HOME/.agents/skills/cadence/SKILL.md.";
 
 /// The `job dispatch` kickoff for an assignee on `provider`/
 /// `endpoint_kind`. Public so `cadence dispatch --job` can build the
 /// same text before `issue start` and refuse a list that will not fit
 /// (CAD-160) instead of leaving a worktree and job behind.
+/// When `contract_in_context` is true, the complete captured spec and
+/// acceptance are already mandatory context; the envelope keeps scope and the
+/// report obligation without copying those source bodies.
 pub fn job_kickoff(
     job: &Job,
     task: &Task,
@@ -297,9 +319,15 @@ pub fn job_kickoff(
     message_id: &str,
     provider: &str,
     endpoint_kind: &str,
+    contract_in_context: bool,
 ) -> Result<String> {
-    if cloud_session(provider, endpoint_kind) {
-        return cloud_kickoff_body(job, task, revision);
+    if !contract_in_context && cloud_session(provider, endpoint_kind) {
+        let ceiling = if provider == "sandbox" && endpoint_kind == "sandbox" {
+            crate::adapter::sandbox::SANDBOX_SPEC_BYTES
+        } else {
+            ENQUEUE_BYTES
+        };
+        return cloud_kickoff_body(job, task, revision, ceiling);
     }
     let spec = task.spec_path.as_deref().unwrap_or(&job.spec_path);
     let clean = |s: &str| -> String {
@@ -320,12 +348,19 @@ pub fn job_kickoff(
     if !scope.is_empty() {
         scope.pop(); // trailing comma
         scope = format!(" Scope:{}.", scope);
+        // CAD-1752: an agent hired without a repo starts in its home dir.
+        if task.worktree.is_some() {
+            scope += " Do the work inside that worktree (cd there first).";
+        }
     }
-    let acceptance = task
-        .acceptance
-        .as_deref()
-        .map(|a| format!(" Acceptance: {}.", clean(a)))
-        .unwrap_or_default();
+    let acceptance = if contract_in_context {
+        String::new()
+    } else {
+        task.acceptance
+            .as_deref()
+            .map(|a| format!(" Acceptance: {}.", clean(a)))
+            .unwrap_or_default()
+    };
     let issue = job
         .issue_id
         .as_deref()
@@ -355,13 +390,20 @@ pub fn job_kickoff(
              HEAD)\"` — `cadence self` shows the turn_id."
         )
     };
-    let head = format!(
-        "Cadence task {} (job {}, revision {}): implement per spec at {}.",
-        task.id,
-        job.id,
-        revision,
-        clean(spec)
-    );
+    let head = if contract_in_context {
+        format!(
+            "Cadence task {} (job {}, revision {}): implement the complete task contract supplied in context.",
+            task.id, job.id, revision
+        )
+    } else {
+        format!(
+            "Cadence task {} (job {}, revision {}): implement per spec at {}.",
+            task.id,
+            job.id,
+            revision,
+            clean(spec)
+        )
+    };
     // Explicit envelopes end with the per-message correlation: the
     // screen probe slices the body's tail, and without it every
     // kickoff shares the same boilerplate ending. Managed envelopes
@@ -371,8 +413,13 @@ pub fn job_kickoff(
     } else {
         kickoff_correlation(message_id)
     };
+    // CAD-1373: the discovery pointer sits before the report contract
+    // in both envelopes, so the managed full form still ends on the
+    // reminder, the managed compact form on the report contract, and
+    // the explicit form on the correlation tail.
+    let discovery = KNOWLEDGE_POINTER;
     let full = format!(
-        "{head}{scope}{acceptance}{issue}{report} Do not report a SHA you have not \
+        "{head}{scope}{acceptance}{discovery}{issue}{report} Do not report a SHA you have not \
          committed.{correlation}"
     );
     if full.len() <= pty::MAX_BODY {
@@ -382,7 +429,7 @@ pub fn job_kickoff(
     // shrinks to its id and the closing reminder goes — while the
     // pointers, every acceptance criterion, the report contract and
     // the correlation stay whole. If that still cannot fit, refuse.
-    let compact = format!("{head}{scope}{acceptance}{issue_short}{report}{correlation}");
+    let compact = format!("{head}{scope}{acceptance}{discovery}{issue_short}{report}{correlation}");
     if compact.len() <= pty::MAX_BODY {
         return Ok(compact);
     }
@@ -394,4 +441,169 @@ pub fn job_kickoff(
         pty::MAX_BODY,
         spec,
     ))
+}
+
+#[cfg(test)]
+mod cad1373_kickoff_pointer_tests {
+    use super::*;
+
+    fn job(spec: &str) -> Job {
+        Job {
+            id: "j1".into(),
+            title: None,
+            spec_path: spec.into(),
+            spec_sha256: None,
+            pm_alias: "pm".into(),
+            issue_id: None,
+            repo: None,
+            base_ref: None,
+            state: "open".into(),
+            max_revisions: 2,
+            stall_secs: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        }
+    }
+
+    fn task(spec: &str, acceptance: &str) -> Task {
+        Task {
+            id: "t1".into(),
+            job_id: "j1".into(),
+            title: None,
+            role: "worker".into(),
+            assignee: Some("cloud-1".into()),
+            spec_path: Some(spec.into()),
+            acceptance: Some(acceptance.into()),
+            worktree: None,
+            branch: None,
+            base_sha: None,
+            state: "draft".into(),
+            head_sha: None,
+            revision: 0,
+            dispatch_message: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        }
+    }
+
+    #[test]
+    fn sandbox_uses_an_inlined_cloud_kickoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.md");
+        std::fs::write(&spec, "Do the sandbox task.").unwrap();
+        let spec = spec.display().to_string();
+        assert!(cloud_session("sandbox", "sandbox"));
+        assert_eq!(
+            kickoff_ceiling("sandbox", "sandbox"),
+            crate::adapter::sandbox::SANDBOX_SPEC_BYTES
+        );
+        let body = job_kickoff(
+            &job(&spec),
+            &task(&spec, "the sandbox task is done"),
+            1,
+            "m1",
+            "sandbox",
+            "sandbox",
+            false,
+        )
+        .unwrap();
+        assert!(body.contains("Do the sandbox task."), "{body}");
+        assert!(body.len() <= ENQUEUE_BYTES, "{} bytes", body.len());
+    }
+
+    /// CAD-1373: the cloud kickoff carries the business-knowledge
+    /// pointer, keeps its acceptance and SHA trailer, and stays inside
+    /// the enqueue budget.
+    #[test]
+    fn cloud_kickoff_points_company_questions_and_keeps_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.md");
+        std::fs::write(&spec, "Do the cloud task.").unwrap();
+        let spec = spec.display().to_string();
+        let body =
+            cloud_kickoff_body(&job(&spec), &task(&spec, "the task is done"), 1, 48_000).unwrap();
+        assert!(body.len() <= ENQUEUE_BYTES, "{} bytes", body.len());
+        assert!(
+            body.contains("use wiki/guide access only if this session has it"),
+            "{body}"
+        );
+        assert!(body.contains("report knowledge not consulted"), "{body}");
+        assert!(body.contains(" Acceptance: the task is done."), "{body}");
+        assert!(body.contains("`SHA: <40-hex>`"), "{body}");
+    }
+
+    /// CAD-1373: an acceptance sized so the full envelope crosses the
+    /// pty ceiling while the compact one fits; the compact result must
+    /// keep the discovery pointer, the whole criteria and the
+    /// correlation, and must carry the short issue id, not the long
+    /// issue note or the closing reminder the compact form drops.
+    #[test]
+    fn compact_job_kickoff_keeps_the_knowledge_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.md");
+        std::fs::write(&spec, "Do the pty task.").unwrap();
+        let spec = spec.display().to_string();
+        let mut j = job(&spec);
+        j.issue_id = Some("CAD-9".into());
+        let worker = Agent {
+            uid: "agt-worker".into(),
+            alias: "pty-1".into(),
+            provider: "pi".into(),
+            endpoint_kind: "pty".into(),
+            role: "worker".into(),
+            team_role: None,
+            cwd: dir.path().display().to_string(),
+            sandbox: "read-only".into(),
+            instructions: None,
+            thread_id: None,
+            session_id: None,
+            model: None,
+            effort: None,
+            pid: None,
+            pid_start: None,
+            endpoint: None,
+            params: None,
+            model_selection: None,
+            quota: None,
+            generation: None,
+            state: "starting".into(),
+            enabled: true,
+            gc_keep: false,
+            archived_at: None,
+            archived_by: None,
+            archive_reason: None,
+            lifecycle_rev: 0,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        // Size the criterion deterministically: measure the envelope
+        // with a one-char criterion (it returns the full form), then
+        // grow it so the full form crosses the ceiling while the
+        // compact form — shorter by the long issue note and the
+        // closing reminder it drops — still fits.
+        let full0 = kickoff_body(&j, &task(&spec, "x"), 1, "mid-cad1373", &worker).unwrap();
+        assert!(full0.len() <= pty::MAX_BODY);
+        let long_note = " This job tracks issue CAD-9 — if you write an agent-note, \
+                         put the header line `Issue: CAD-9` in it.";
+        let reminder = " Do not report a SHA you have not committed.";
+        assert!(full0.contains(long_note), "{full0}");
+        assert!(full0.contains(reminder), "{full0}");
+        let compact0 = full0.len() - long_note.len() + " Issue: CAD-9.".len() - reminder.len();
+        let criteria = "c".repeat(pty::MAX_BODY - compact0);
+        let t = task(&spec, &criteria);
+        let body = kickoff_body(&j, &t, 1, "mid-cad1373", &worker).unwrap();
+        // The compact form is provably taken: the full-only prose is
+        // gone, the short issue id survives.
+        assert!(!body.contains(long_note), "{body}");
+        assert!(!body.contains(reminder), "{body}");
+        assert!(body.contains(" Issue: CAD-9."), "{body}");
+        assert!(body.len() <= pty::MAX_BODY, "{} bytes", body.len());
+        assert!(body.contains(" Acceptance: "), "{body}");
+        assert!(body.contains(criteria.as_str()), "{body}");
+        assert!(body.contains("Business knowledge"), "{body}");
+        assert!(body.contains(" Correlation: "), "{body}");
+    }
 }

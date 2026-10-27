@@ -81,7 +81,7 @@ PATH_ALLOWLIST = [
     "ls", "wc", "awk", "diff", "touch", "true", "false", "hostname",
     "whoami", "df", "du",
 ]
-FORBIDDEN_ON_PATH = ["rustc", "cargo", "rustup", "node", "npm", "pnpm", "gh"]
+FORBIDDEN_ON_PATH = ["rustc", "cargo", "rustup", "node", "npm", "pnpm", "bun", "gh"]
 
 
 # --- strict metadata -------------------------------------------------------
@@ -263,16 +263,21 @@ def recorded_sha256(text, label, filename=None):
     return fields[0].lower()
 
 
-def zip_members(zip_path, expected_names):
+def zip_members(zip_path, expected_names, also_allow=None):
     """An artifact ZIP with exactly the expected safe regular entries:
-    no duplicates, no traversal, no directories-as-files, bounded size."""
+    no duplicates, no traversal, no directories-as-files, bounded size.
+    `also_allow` lists other complete entry sets that are acceptable in
+    place of `expected_names` — never a superset or ignore-unknown path."""
     require(zipfile.is_zipfile(zip_path), f"{zip_path} is not a ZIP")
     require(Path(zip_path).stat().st_size <= BLOB_LIMIT, "ZIP too large")
+    allowed = {frozenset(expected_names)}
+    for alt in also_allow or ():
+        allowed.add(frozenset(alt))
     with zipfile.ZipFile(zip_path) as zf:
         infos = zf.infolist()
         names = [i.filename for i in infos]
         require(len(names) == len(set(names)), "duplicate ZIP entries")
-        require(set(names) == set(expected_names),
+        require(frozenset(names) in allowed,
                 f"unexpected ZIP entries: {sorted(names)}")
         require(sum(i.file_size for i in infos) <= BLOB_LIMIT,
                 "ZIP contents too large")
@@ -558,9 +563,24 @@ def acquire_candidate(tag, sha, target, run_id, attempt, out):
         gh("api", f"repos/{REPO}/actions/artifacts/{artifact_id}/zip",
            binary=True))
     asset = f"cadence-{tag}-{target}.tar.gz"
-    files = zip_members(zip_path, [asset, f"{asset}.sha256"])
+    expected = [asset, f"{asset}.sha256"]
+    # CAD-1272: since the app-toolchain ship, the x86 leg's ZIP also holds
+    # the exact versioned toolchain pair. Both complete inventories are
+    # accepted on x86 so pre-CAD-1272 two-entry artifacts still verify;
+    # any other entry, missing pair half or extra file is still refused.
+    toolchain = f"cadence-app-toolchain-{tag}.tar.gz"
+    also_allow = ([expected + [toolchain, f"{toolchain}.sha256"]]
+                  if target == "x86_64-linux" else None)
+    files = zip_members(zip_path, expected, also_allow=also_allow)
     verified = verify_tarball(files[asset], files[f"{asset}.sha256"].decode(),
                               tag, target, sha, run_id, attempt)
+    if toolchain in files:
+        # The paired checksum proves the toolchain archive's bytes are
+        # the release-build's; the archive is verified, never executed.
+        recorded = recorded_sha256(files[f"{toolchain}.sha256"].decode(),
+                                   f"{toolchain}.sha256", toolchain)
+        require(hashlib.sha256(files[toolchain]).hexdigest() == recorded,
+                f"outer checksum mismatch for {toolchain}")
     for filename, blob in files.items():
         (out / filename).write_bytes(blob)
 

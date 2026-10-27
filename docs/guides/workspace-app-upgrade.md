@@ -12,11 +12,63 @@ cadence app catalog upgrade-check <install-id> <absolute-source-path-or-git-url>
 ```
 
 An upgrade keeps the installation ID, contexts, bindings, and
-historical runs; it never creates a project. In the board, open the app's
-**Settings → App package**, enter the source path or Git URL, select **Check
-update**, inspect the proposed version, digest and changed files, then select
-**Apply checked update**. The board sends the same pinned arguments as the
-CLI; a stale proposal is refused.
+historical runs; it never creates a project. A verified operator in a writable
+session can check and apply updates for any installed app at
+`/apps/manage/<id>`: enter a source, select **Check update**, inspect the
+proposed version, digest, changed files and compatibility/notes, then select
+**Apply checked update**. The page pins the installed digest, catalog
+generation, and checked new digest, and refuses stale proposals. The package
+path or Git URL on that page and on **Settings → App package** is a
+non-catalogue source: the check and apply send `catalogue_resolution: "manual"`
+so an installation that recorded a catalogue locator can still be replaced
+from those controls, and the locator is cleared on purpose rather than left
+pointing at different bytes. Omitting both the locator and that resolution
+refuses the update when a locator is already stored. A catalogue locator on
+the upgrade itself must match the new package and an installable directory
+release, and it cannot move the installation to an older ordered version.
+Git installs are prefilled with their recorded URL, and other installs start empty for an
+absolute path or Git URL. A historical built-in install (CAD-1422 retired
+the embedded catalog) updates from the app's detached repository — name its
+trusted path or Git URL.
+The Social Content **Settings → App package** panel remains available.
+
+`cadence app catalog upgrade-check` and `cadence app catalog upgrade` accept
+absolute source paths and Git URLs. The `builtin:<catalog_id>` source form is
+retired (CAD-1422) and refused. On a selected hosted workspace those source-based
+CLI commands are refused rather than uploading or installing locally. The
+`release-check` / `release-update` journey supports exact immutable published
+releases with explicit review, digest, generation and operation pins; see
+[the app catalog guide](app-catalog.md#selected-remote-immutable-published-releases).
+The Manage page remains the board path for source-based updates there.
+
+## Test a Git-sourced update
+
+Use a throwaway Cadence instance and a public HTTPS repository you control; do
+not use a production workspace. The board's Git check accepts public HTTPS
+repositories only, with the app bundle (including `app.md`) at the repository
+root. Keep the app identity the same between versions and change the manifest
+version and at least one bundle file so the new digest differs.
+
+1. Push a valid v1 bundle to the repository's default branch, then install it
+   from the Apps page using the Git-source check/install flow.
+2. Push a v2 bundle to that same branch and repository.
+3. Open the installed app's `/apps/manage/<install-id>` page. Its package source
+   should be prefilled with the repository URL. Select **Check update**, review
+   the v2 proposal and changed files, then select **Apply checked update**.
+4. Confirm the installed version is v2. Repeating **Check update** without
+   another bundle change should report that the package is up to date.
+
+Use a public repository without embedded credentials. For a branch other than
+the default branch, select the Git ref supported by the Git-source check when
+installing and checking the update.
+
+Installing or updating is the operator's consent for the exact installed
+digest when the bundle passes local execution validation. `cadence app catalog
+approve <install-id> --digest <digest>` explicitly approves the exact current
+digest for supported local artifact steps; `revoke` with the same arguments
+withdraws local capabilities for that digest and does not change legacy
+project approvals. Either command refuses a stale digest. Approval of an app
+bundle does not approve an individual run or authorize outward effects.
 
 ```sh
 cadence app catalog upgrade <install-id> <absolute-source-path-or-git-url> \
@@ -30,11 +82,28 @@ The operator must call this from an operator connection. The same operation is
 available to an authenticated operator through `POST
 /api/app-installations/<install-id>/upgrade`. The read-only preview is `POST
 /api/app-installations/<install-id>/upgrade/check`; it accepts `source`,
-`expected_digest`, and `expected_generation`. Apply also requires
+`expected_digest`, and `expected_generation`, plus either a `catalogue`
+locator or `catalogue_resolution: "manual"`. Apply also requires
 `expected_new_digest` and `request_id`. Identity, approval,
 and actor fields are never accepted from the caller. A repeat of the exact
 request returns the committed result; a changed proposed bundle, stale digest, stale generation, or
 reused request ID with different material is refused.
+
+For files-mode HTTP requests, send the complete `files` map instead of `source`.
+The canonical root files `app.md`, optional `app-chat.json` and
+`app-assistant.json` travel unchanged and participate in the bundle digest.
+Native validation still checks the assistant descriptor; unknown root members
+and aliased or nested assistant paths are refused before staging.
+
+Every check receipt carries a `readiness` object. `install-check` reports
+`{"ready": true, "reason": null}` once the bundle validates — a fresh install
+has no active work. `upgrade-check` re-reads the installation's live state:
+`{"ready": true, "reason": null}` when apply would be admitted, or
+`{"ready": false, "reason": "active_work_or_grants"}` when a nonterminal run,
+an unresolved effect or derived grants block it. A false readiness is a
+check answer, not an error: apply re-verifies the same gate under the lock
+and refuses then. Store failures are never reported as busy — the check
+fails instead.
 
 An installation with a run in `awaiting_approval`, `approved`, or `running`
 state, or an unresolved Local effect in `waiting`, `decided`, `executing` or `reconcile`,
@@ -48,8 +117,13 @@ binding rows are retained. A context whose defaults are incompatible with the ne
 cannot authorize a new run until its defaults are updated. Binding receipts
 pin the old bundle and cannot silently grant a new run authority. A second
 configured binding for the new digest may use the same slot and context;
-updating an old-version binding into a new digest is refused. The new
-bundle digest is unapproved, so approve it separately before creating new runs.
+updating an old-version binding into a new digest is refused. A successful
+operator update records consent for the new digest when it passes the local
+execution checks. If local capabilities were later revoked, use the
+digest-pinned `cadence app catalog approve` command above to restore them after
+reviewing the bundle. Approval still validates the local execution contract; it
+cannot bypass a failed check. Run approval and outward-effect permissions remain
+separate.
 
 A completed, reviewed draft may still be released to Local from its exact
 retained old bundle, and a retained Instagram source receipt may be selected
@@ -79,7 +153,47 @@ There is no in-place rollback after a committed upgrade. To return to earlier
 bytes, submit a new upgrade from those bytes with the current digest and
 generation, then review and approve that digest again.
 
+The built-in catalog is retired (CAD-1422): the Cadence binary embeds no app
+bundles or catalog index. Canonical apps live in their own repositories and
+release artifacts. The board lists them at `/apps/explore`. A new app version arrives as a
+detached release — update an installation from its trusted path or Git URL.
+The Explorer's operator-only `update_available` flag means a check for the installed
+app found a different bundle digest and cached that result; members do not see
+the flag. The remote CLI (`cadence --org …`) has no app-management verbs. In a hosted
+AgenticOS container, operators can update any installed app from its
+`/apps/manage/<id>` page.
+
 This transport currently handles the package bundle and Cadence-owned app
 metadata. Host-managed per-install SQLite storage and staged schema/data
 migrations belong to the separate App storage contract; they must be integrated
 before an app upgrade that changes its data schema is allowed.
+
+## Hosted lifecycle correlation (CAD-1739)
+
+Hosted installation, update and revoke requests still execute through the
+native installation owner. The hosted ledger records transport, exact package
+pins and consent/reconciliation metadata; it is not another installation,
+run, CRM or business-record writer. Installing a package does not register an
+agent or grant tool, send, deployment or run authority.
+
+The board relay signs and forwards `x-cadence-hosted-operation-id` with the
+request. This operation ID is correlation, never an operator credential.
+Native RPC and HTTP still require their existing operator proof. A hosted
+revoke also pins `expected_generation`, checked under the same catalog lock
+as the consent mutation; a stale generation cannot revoke a newer consent.
+Standalone revoke without hosted correlation keeps its existing behavior.
+
+Only a correlated `hosted-app-mutation.v1` refusal with `mutation:
+"not_started"` establishes that a native precondition prevented mutation.
+An error after entering the consent writer or staging the upgrade journal is
+not that evidence. A lost reply, generic refusal or post-staging failure
+retains an unresolved hosted operation: inspect the native installation and
+use the existing recovery path before another intent. Durable receipt never
+means execution, and no exactly-once external-effect guarantee is made.
+
+The independent `cad1739_hosted_app_public_acceptance` target exercises the
+actual scratch daemon RPC and authenticated loopback HTTP: stale generation,
+new active work, operation-ID privilege refusal, preserved consent/scopes,
+post-journal recovery and failure inside the consent writer. Its test-seam
+personas and injected scratch faults are not production authentication or
+deployed-provider proof.

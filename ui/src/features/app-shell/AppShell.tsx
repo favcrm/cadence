@@ -1,19 +1,108 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { navigate, useHref } from "../../lib/useLocation";
+import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
+import { ErrorNotice, Loading, Notice } from "./shared/States";
 import type { Viewer } from "../projects/work";
-import { workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
-import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
-import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
+import { dropWorkspaceAppSnapshot, readWorkspaceAppSnapshot, workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
+import { WorkspaceAppCachedPreview } from "../workspace-apps/WorkspaceApp";
+import { chatScreenFor } from "./chatScreen";
+import { screenTag } from "../workspace-apps/screen/screenProjection";
+import ScreenUnavailable from "../workspace-apps/screen/ScreenUnavailable";
+import { isSocialContent } from "../workspace-apps/socialContentSupport";
+import { sectionFromSearch } from "./appNav";
 import Conversation from "./chat/Conversation";
-import { useAppChat } from "./chat/descriptorClient";
-import type { ChatBinding, ChatScope } from "./chat/types";
+import { beginLibraryImagePin, composerScope, settleLibraryImagePin } from "./chat/composerStore";
+import { useAppChatProjection } from "./chat/descriptorClient";
+import type { ChatBinding, ChatScope, MediaComposerTarget } from "./chat/types";
 import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
-import { useChatCollapsed } from "./conversationClient";
+import { resolveChatCollapsed, useChatCollapsed, selectConversation, setDraftSubject, campaignSubject, whatsappSubject, conversationList, type ConversationLinkRequest } from "./conversationClient";
+import { installedAppHref } from "../apps/appViewModel";
+import { useLocale } from "../../lib/locale";
+import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
+import type { ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
+import RunLauncher from "./RunLauncher";
+import type { MediaChatAttach } from "../workspace-apps/screen/screenLifecycle";
+import { parseRoutePatch, type RoutePatch } from "../workspace-apps/screen/screenRoute";
+import type { HostCommand } from "../workspace-apps/screen/screenServices";
+import { purgeDisplayCache } from "../workspace-apps/screen/screenDisplayCache";
 import "./app-shell.css";
+
+type ParsedConversationLink = Omit<ConversationLinkRequest, "visit"> & { key: string };
+type OutletView = "list" | "new";
+
+function rawQueryValues(rawQuery: string, parameter: string): (string | null)[] {
+  const values: (string | null)[] = [];
+  for (const part of rawQuery.split("&")) {
+    const separator = part.indexOf("=");
+    const rawName = separator < 0 ? part : part.slice(0, separator);
+    let name: string;
+    try {
+      name = decodeURIComponent(rawName.replace(/\+/g, " "));
+    } catch {
+      continue;
+    }
+    if (name !== parameter) continue;
+    const rawValue = separator < 0 ? "" : part.slice(separator + 1);
+    try {
+      values.push(decodeURIComponent(rawValue.replace(/\+/g, " ")));
+    } catch {
+      values.push(null);
+    }
+  }
+  return values;
+}
+
+/** Read host selectors only. Membership and current scope are checked
+ *  separately against the installation's list and verified shell binding. */
+function parseConversationLink(href: string): ParsedConversationLink | null {
+  const queryStart = href.indexOf("?");
+  if (queryStart < 0) return null;
+  const rawQuery = href.slice(queryStart + 1).split("#", 1)[0];
+  const params = new URLSearchParams(rawQuery);
+  const values = params.getAll("conversation");
+  if (values.length === 0) return null;
+  const rawValues = rawQueryValues(rawQuery, "conversation");
+  const contextValues = params.getAll("ctx");
+  const rawContexts = rawQueryValues(rawQuery, "ctx");
+  let contextTarget: string | null = null;
+  let contextError: string | null = null;
+  if (contextValues.length > 1 || rawContexts.length > 1) {
+    contextError = "This conversation link names more than one context — nothing was opened.";
+  } else if (contextValues.length === 1 && (rawContexts.length !== 1 || rawContexts[0] === null)) {
+    contextError = "This conversation link has a malformed context — nothing was opened.";
+  } else if (contextValues.length === 1 && contextValues[0] === "") {
+    contextError = "This conversation link does not name an active context — nothing was opened.";
+  } else if (contextValues.length === 1) {
+    contextTarget = contextValues[0];
+  }
+  const invalid = (error: string): ParsedConversationLink => ({
+    key: JSON.stringify(["invalid", values, rawValues, contextTarget, contextError, error]),
+    target: null,
+    error,
+    contextTarget,
+    contextError,
+  });
+  if (values.length > 1 || rawValues.length > 1) {
+    return invalid("This link names more than one conversation — nothing was opened.");
+  }
+  if (values.length !== 1 || rawValues.length !== 1 || rawValues[0] === null) {
+    return invalid("This link has a malformed conversation id — nothing was opened.");
+  }
+  if (values[0] === "") {
+    return invalid("This link does not name a conversation — nothing was opened.");
+  }
+  return {
+    key: JSON.stringify(["target", values[0], contextTarget, contextError]),
+    target: values[0],
+    error: null,
+    contextTarget,
+    contextError,
+  };
+}
 
 /**
  * The trusted shared App shell (CAD-802): host-owned board surface for
@@ -44,6 +133,7 @@ export interface ActiveInstallation {
   installId: string;
   kind: string;
   title: string;
+  navigation?: ScreenNavigation | null;
 }
 
 export default function AppShell({
@@ -54,49 +144,394 @@ export default function AppShell({
 }: {
   installId: string;
   viewer: Viewer;
-  /** Social-content's existing screen; other Apps use the generic outlet. */
-  children?: React.ReactNode;
+  /** Installed screen receives only the trusted native chat handoff and
+   *  the shell's one verified app scope (CAD-1560). */
+  children?: (onMediaAttach: MediaChatAttach, contextId: string, screen: {
+    /** CAD-1615 / CAD-1777 — the board-wide drawer the app screen may ask
+     *  for. Absent for a read-only or screen-reader view, so its frames
+     *  cannot drive it. `independent` marks a negotiated
+     *  `screen-surfaces.v1` request, which the shell mounts as its own
+     *  fixed child overlay instead of promoting the primary. */
+    onScreenDrawer?: (mode: "outlet" | "drawer", surface?: string, independent?: boolean) => void;
+    presentation: "outlet" | "drawer";
+    /** CAD-1777 — the fixed overlay target the primary portals its child
+     *  drawer frame into; null while the overlay is closed. */
+    drawerTarget: HTMLElement | null;
+    /** The screen went away: the drawer closes with it. */
+    onScreenClosed: () => void;
+  }) => React.ReactNode;
   /** Board menu wiring: receives the verified installation (or null
    *  while loading, failed, or switched away). The parent matches
    *  installId to its route and compares values before storing. */
   onInstallation?: (info: ActiveInstallation | null) => void;
 }) {
+  const { t } = useLocale();
   const href = useHref();
   const query = useMemo(() => new URLSearchParams(href.split("?")[1] ?? ""), [href]);
+  const parsedConversationLink = useMemo(() => parseConversationLink(href), [href]);
+  const conversationVisit = useRef(0);
+  const conversationRequestRef = useRef<{ key: string | null; request: ConversationLinkRequest | null }>({
+    key: null,
+    request: null,
+  });
+  const requestKey = parsedConversationLink === null
+    ? null
+    : JSON.stringify([installId, parsedConversationLink.key]);
+  if (conversationRequestRef.current.key !== requestKey) {
+    conversationRequestRef.current = {
+      key: requestKey,
+      request: parsedConversationLink === null
+        ? null
+        : {
+            visit: ++conversationVisit.current,
+            target: parsedConversationLink.target,
+            error: parsedConversationLink.error,
+            contextTarget: parsedConversationLink.contextTarget,
+            contextError: parsedConversationLink.contextError,
+          },
+    };
+  }
+  const conversationRequest = conversationRequestRef.current.request;
+  const [screenNavigation, setScreenNavigation] = useState<ScreenNavigation | null>(null);
+  // CAD-1537: the operator, or a proven member/read-only viewer, loads the
+  // receipts and mounts the screen; General setup and diagnostics stay the
+  // operator's.
+  const screenViewer = viewer.operator === true || viewer.screenReader === true;
+  useEffect(() => { if (!screenViewer) purgeDisplayCache(); }, [screenViewer]);
   const [installation, setInstallation] = useState<Installation | null>(null);
   const [contexts, setContexts] = useState<AppContext[]>([]);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loadFailure, setLoadFailure] = useState<{ key: string; message: string } | null>(null);
+  const [requestLoading, setRequestLoading] = useState(true);
+  const [completedReceiptKey, setCompletedReceiptKey] = useState<string | null>(null);
+  const [generalSetup, setGeneralSetup] = useState<{ key: string; error: string | null } | null>(null);
+  const [generalSetupAttempt, setGeneralSetupAttempt] = useState(0);
   const [contextId, setContextId] = useState("");
+  // CAD-1615 — the legacy embedded drawer: an older presentation peer asks
+  // for it, and the shell promotes the app outlet (kept unchanged).
+  const [screenDrawer, setScreenDrawer] = useState<string | null>(null);
+  // CAD-1777 — the independent drawer: a `screen-surfaces.v1` frame asks
+  // for a detail surface. The primary list frame never moves; the shell
+  // owns a fixed panel/scrim and hands the primary its portal target, so the
+  // drawer is a separate child mount.
+  const [independentDrawer, setIndependentDrawer] = useState<string | null>(null);
+  const [drawerTarget, setDrawerTarget] = useState<HTMLElement | null>(null);
+  const attachDrawerTarget = useCallback((node: HTMLElement | null) => setDrawerTarget(node), []);
+  // CAD-1615: the drawer is a write-shaped action. A read-only or
+  // screen-reader view may render the screen, but it never drives the shell
+  // drawer — the frame's callback and the presentation are withheld, so the
+  // verb refuses at the host instead of presenting a surface for a viewer
+  // who cannot act on it.
+  const canDriveScreen = viewer.operator === true && !viewer.readOnly;
+  const onScreenDrawer = useCallback((mode: "outlet" | "drawer", surface?: string, independent?: boolean) => {
+    // The callback re-checks the capability, so a frame mounted while the
+    // operator could drive one never leaves a drawer behind once access drops.
+    if (!canDriveScreen) return;
+    // `independent` is stamped by the channel from the frame's negotiated
+    // capability; it is never a caller choice. The two drawers are
+    // exclusive: the new mechanism never promotes the primary frame.
+    if (independent) {
+      setScreenDrawer(null);
+      setIndependentDrawer(mode === "drawer" ? (surface ?? "") : null);
+      return;
+    }
+    setIndependentDrawer(null);
+    setScreenDrawer(mode === "drawer" ? (surface ?? "") : null);
+  }, [canDriveScreen]);
+  const closeScreenDrawer = useCallback(() => setScreenDrawer(null), []);
+  const closeIndependentDrawer = useCallback(() => setIndependentDrawer(null), []);
+  // A different installation or scope is a different screen: the drawer never
+  // outlives the frame that opened it.
+  useEffect(() => { setScreenDrawer(null); setIndependentDrawer(null); }, [installId, contextId]);
+  // A read-only or signed-out view lends no drawer callback, so any drawer a
+  // stale frame asked for closes with that capability.
+  useEffect(() => { if (!canDriveScreen) { setScreenDrawer(null); setIndependentDrawer(null); } }, [canDriveScreen]);
+  const outletRef = useRef<HTMLElement | null>(null);
+  const drawerPanelRef = useRef<HTMLDivElement | null>(null);
+  const drawerScrimRef = useRef<HTMLDivElement | null>(null);
+  const drawerReturn = useRef<{ focus: HTMLElement | null; windowX: number; windowY: number; outletTop: number } | null>(null);
+  const independentReturn = useRef<{ focus: HTMLElement | null; windowX: number; windowY: number; outletTop: number } | null>(null);
+  const restoringFocus = useRef(false);
+  const drawerOpen = screenDrawer !== null;
+  const independentOpen = independentDrawer !== null;
+  // CAD-1777 — remember where the operator was (both board and outlet
+  // scroll, and focus) when the app asked for the drawer, and put it back
+  // exactly once the drawer closes. Promotion never moves focus: the frame
+  // is the same mounted node, so the app keeps its own focus, draft and its
+  // in-frame Escape chain (menu, then edit, then the drawer).
+  useLayoutEffect(() => {
+    if (!drawerOpen) return;
+    const outlet = outletRef.current;
+    const active = document.activeElement;
+    drawerReturn.current = {
+      focus: active instanceof HTMLElement && active !== document.body ? active : null,
+      windowX: window.scrollX,
+      windowY: window.scrollY,
+      outletTop: outlet?.scrollTop ?? 0,
+    };
+    // CAD-1777 — the drawer is modal over the WHOLE board, not only this
+    // shell: every sibling along the chain from the shell up to the board
+    // root (the app rail, the header, any workspace peers) is inert while it
+    // is open, and the document cannot scroll behind the scrim. Only
+    // attributes on OTHER nodes change — the promoted outlet, its mounted
+    // iframe and the app's own scrolling are untouched.
+    const boardChrome: HTMLElement[] = [];
+    for (let node: Element | null = outlet?.closest(".app-shell") ?? null;
+         node && node !== document.body; node = node.parentElement) {
+      if ((node as HTMLElement).hasAttribute("data-app-shell")) break;
+      for (const sibling of Array.from(node.parentElement?.children ?? [])) {
+        if (sibling === node || !(sibling instanceof HTMLElement) || sibling.hasAttribute("inert")) continue;
+        sibling.setAttribute("inert", "");
+        boardChrome.push(sibling);
+      }
+    }
+    const rootOverflow = document.documentElement.style.overflow;
+    const bodyOverflow = document.body.style.overflow;
+    document.documentElement.style.overflow = "hidden";
+    document.body.style.overflow = "hidden";
+    return () => {
+      for (const node of boardChrome) node.removeAttribute("inert");
+      document.documentElement.style.overflow = rootOverflow;
+      document.body.style.overflow = bodyOverflow;
+      const saved = drawerReturn.current;
+      drawerReturn.current = null;
+      if (!saved) return;
+      const node = outletRef.current;
+      if (node && node.scrollTop !== saved.outletTop) node.scrollTop = saved.outletTop;
+      if (window.scrollX !== saved.windowX || window.scrollY !== saved.windowY) window.scrollTo(saved.windowX, saved.windowY);
+      if (saved.focus?.isConnected) saved.focus.focus({ preventScroll: true });
+    };
+  }, [drawerOpen]);
+  // Background interaction exclusion for the keyboard: the board's own panes
+  // are inert, and this pulls focus back if anything outside the promoted
+  // panel (the rail or header) still takes it. Focus INSIDE the frame is
+  // within the panel, so the app's own controls and draft keep working.
+  useEffect(() => {
+    if (!drawerOpen) return;
+    const outlet = outletRef.current;
+    if (!outlet) return;
+    const contain = (event: FocusEvent) => {
+      const target = event.target;
+      if (target instanceof Node && outlet.contains(target)) return;
+      outlet.focus({ preventScroll: true });
+    };
+    document.addEventListener("focusin", contain);
+    return () => document.removeEventListener("focusin", contain);
+  }, [drawerOpen]);
+  // CAD-1777 — the independent drawer is modal over the whole board while
+  // the primary list keeps its exact box. The shell saves focus/scroll,
+  // marks the board chrome (and the workspace outlet itself) inert,
+  // reserves the scrollbar gutter so hiding document scroll does not jump
+  // the layout, and puts focus + scroll back on close.
+  useLayoutEffect(() => {
+    if (!independentOpen) return;
+    const outlet = outletRef.current;
+    const active = document.activeElement;
+    independentReturn.current = {
+      focus: active instanceof HTMLElement && active !== document.body ? active : null,
+      windowX: window.scrollX,
+      windowY: window.scrollY,
+      outletTop: outlet?.scrollTop ?? 0,
+    };
+    const boardChrome: HTMLElement[] = [];
+    for (let node: Element | null = outlet?.closest(".app-shell") ?? null;
+         node && node !== document.body; node = node.parentElement) {
+      if ((node as HTMLElement).hasAttribute("data-app-shell")) break;
+      for (const sibling of Array.from(node.parentElement?.children ?? [])) {
+        if (sibling === node || !(sibling instanceof HTMLElement) || sibling.hasAttribute("inert")) continue;
+        sibling.setAttribute("inert", "");
+        boardChrome.push(sibling);
+      }
+    }
+    const root = document.documentElement;
+    const body = document.body;
+    const gutter = Math.max(0, window.innerWidth - root.clientWidth);
+    const rootOverflow = root.style.overflow;
+    const bodyOverflow = body.style.overflow;
+    const bodyPad = body.style.paddingRight;
+    root.style.overflow = "hidden";
+    body.style.overflow = "hidden";
+    if (gutter > 0) body.style.paddingRight = `${(Number.parseFloat(getComputedStyle(body).paddingRight) || 0) + gutter}px`;
+    drawerPanelRef.current?.focus({ preventScroll: true });
+    return () => {
+      for (const node of boardChrome) node.removeAttribute("inert");
+      root.style.overflow = rootOverflow;
+      body.style.overflow = bodyOverflow;
+      body.style.paddingRight = bodyPad;
+      const saved = independentReturn.current;
+      independentReturn.current = null;
+      if (!saved) return;
+      const node = outletRef.current;
+      if (node && node.scrollTop !== saved.outletTop) node.scrollTop = saved.outletTop;
+      if (window.scrollX !== saved.windowX || window.scrollY !== saved.windowY) window.scrollTo(saved.windowX, saved.windowY);
+      // The passive focus guard is still attached during this layout
+      // cleanup; let the operator's opener take focus back.
+      restoringFocus.current = true;
+      if (saved.focus?.isConnected) saved.focus.focus({ preventScroll: true });
+      restoringFocus.current = false;
+    };
+  }, [independentOpen]);
+  // Keyboard containment targets the overlay panel (the child frame is
+  // inside it); the primary outlet stays untouched and inert.
+  useEffect(() => {
+    if (!independentOpen) return;
+    const contain = (event: FocusEvent) => {
+      if (restoringFocus.current) return;
+      const panel = drawerPanelRef.current;
+      if (!panel) return;
+      const target = event.target;
+      if (target instanceof Node && panel.contains(target)) return;
+      panel.focus({ preventScroll: true });
+    };
+    document.addEventListener("focusin", contain);
+    return () => document.removeEventListener("focusin", contain);
+  }, [independentOpen]);
+  // The shell itself may be a scroll container (`.app-shell` in a bounded
+  // workspace). A wheel or touch over the scrim/panel must not chain into
+  // it: the primary list keeps its scroll position untouched, and only the
+  // child frame scrolls. React's wheel listener is passive, so this is a
+  // native non-passive guard on the two host-owned nodes.
+  useEffect(() => {
+    if (!independentOpen) return;
+    const roots = [drawerScrimRef.current, drawerPanelRef.current].filter((node): node is HTMLDivElement => node !== null);
+    if (!roots.length) return;
+    const block = (event: Event) => event.preventDefault();
+    for (const node of roots) {
+      node.addEventListener("wheel", block, { passive: false });
+      node.addEventListener("touchmove", block, { passive: false });
+    }
+    return () => {
+      for (const node of roots) {
+        node.removeEventListener("wheel", block);
+        node.removeEventListener("touchmove", block);
+      }
+    };
+  }, [independentOpen]);
+  useEffect(() => {
+    if (screenDrawer === null && !independentOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      // The app's own Escape chain (menu, then edit, then the drawer) runs
+      // inside the frame and asks the host to close last; this listener only
+      // sees Escape the host document owns.
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      // CAD-1777: only a MODAL host dialog owns Escape. Its native cancel/close
+      // runs on the same keypress, so the drawer (and the child frame's draft)
+      // must survive it, and the next Escape closes the drawer. A nonmodal
+      // dialog left open elsewhere on the board (a popover in the chrome) is
+      // not modal and never swallows the drawer's dismissal.
+      const modal = Array.from(document.querySelectorAll("dialog[open]"))
+        .some((dialog) => dialog.matches(":modal"));
+      if (modal) return;
+      setScreenDrawer(null);
+      setIndependentDrawer(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [screenDrawer, independentOpen]);
   const [linkNotice, setLinkNotice] = useState<string | null>(null);
-  // Social-content's picker owns its selection; the shell observes it
-  // in the same tab so chat sends carry the current scope, never the
-  // one from the shell's last render.
-  const [socialContext, setSocialContext] = useState<string | null>(null);
+  // CAD-1560: one shell-owned scope for every active app view. The
+  // in-workspace selection (Social's picker, a screen's saved-context
+  // verb) persists and emits through contextSelection; the subscription
+  // below applies it here, so chat, screen and launcher share exactly
+  // this value — never a second render-time writer.
+  const emitByHost = useRef(false);
+  const [launcherRun, setLauncherRun] = useState<{ name: string; contextId: string; installDigest: string; contextRevision: number | null; contextDigest: string | null } | null>(null);
+  // Context receipts are per operator/install/selection and per scoped
+  // conversation visit. The browser selection only invalidates a receipt;
+  // membership still comes exclusively from the fresh server response.
+  const scopedConversationVisit =
+    conversationRequest !== null &&
+    conversationRequest.target !== null &&
+    conversationRequest.contextTarget !== null
+      ? conversationRequest.visit
+      : null;
+  const readInputKey = JSON.stringify([
+    installId,
+    viewer.operator,
+    screenViewer,
+    // The shell's one scope is part of the receipt key: a workspace-emitted
+    // selection (the same mechanism a URL adoption uses) re-proves the
+    // install/context membership instead of trusting the emitted id.
+    contextId,
+    scopedConversationVisit,
+  ]);
+  const readVersionRef = useRef({ inputKey: "", version: 0 });
+  if (readVersionRef.current.inputKey !== readInputKey) {
+    readVersionRef.current = {
+      inputKey: readInputKey,
+      version: readVersionRef.current.version + 1,
+    };
+  }
+  const receiptKey = JSON.stringify([readInputKey, readVersionRef.current.version]);
+  const setupScopeKey = JSON.stringify([receiptKey, query.get("ctx")]);
+  const currentReceiptKeyRef = useRef(receiptKey);
+  currentReceiptKeyRef.current = receiptKey;
+  const currentReadComplete = completedReceiptKey === receiptKey;
+  const loadError = loadFailure?.key === receiptKey ? loadFailure.message : null;
+  const loading = screenViewer
+    ? requestLoading || !currentReadComplete
+    : requestLoading;
+  const receiptReady =
+    screenViewer &&
+    currentReadComplete &&
+    loadError === null &&
+    installation?.install_id === installId;
   // Outlet state lives in the URL (`ctx`, `appview`, `record`) so
   // direct links and browser back keep scope.
   const view: OutletView = query.get("appview") === "new" ? "new" : "list";
   const recordId = query.get("record");
-  // CRM nested sections (CAD-784): Apps → CRM → Customers/Segments/
-  // Campaigns. Only the CRM outlet reads this — every other App keeps
-  // its generic list/detail/new shape untouched.
-  const rawSection = query.get("crm");
-  const crmSection: CrmSection =
-    rawSection === "segments" || rawSection === "campaigns" ? rawSection : "customers";
-  const [chatOpen, setChatOpen] = useState(false);
+  // Narrow widths: one full-width panel at a time (the approved mock's
+  // Assistant | Workspace switch). Both stay mounted — only CSS hides the
+  // other — so draft, stream and workspace state survive switching.
+  const [panel, setPanel] = useState<"chat" | "work">("chat");
+  const mediaTarget = useRef<MediaComposerTarget | null>(null);
+  const registerMediaTarget = useCallback((target: MediaComposerTarget) => {
+    mediaTarget.current = target;
+    return () => { if (mediaTarget.current === target) mediaTarget.current = null; };
+  }, []);
   // CAD-1051: desktop rail. Narrow widths keep the drawer above.
   // CAD-1098: collapse state is per app installation.
-  const [chatCollapsed, setChatCollapsed] = useChatCollapsed(installId);
+  const [chatChoice, setChatCollapsed] = useChatCollapsed(installId);
+  const [pendingDecision, setPendingDecision] = useState(false);
+  // A pending decision survives an installation switch only as long as the
+  // assistant that reported it is the one on screen.
+  useEffect(() => { setPendingDecision(false); }, [installId]);
+  const chatCollapsed = resolveChatCollapsed(chatChoice, installId, pendingDecision);
   // CAD-861: the app-views/v1 contract preview is a dev-only overlay
   // keyed by `contract-preview` in the URL — it never mounts in a
   // production bundle and never replaces the trusted outlet by default.
   const previewKey = isDev ? contractPreviewKey(query) : null;
-  const chatPaneRef = useRef<HTMLDivElement | null>(null);
-  const chatOpenRef = useRef<HTMLButtonElement | null>(null);
   // Installation switches reset outlet state but keep the chat: the
   // first mount preserves direct links, later switches strip them.
   const firstInstall = useRef(installId);
   const handledQuery = useRef<string | undefined>(undefined);
+  const [adoptedContextKey, setAdoptedContextKey] = useState<string | null>(null);
+
+  // CAD-1193: the render right after an installId switch still holds
+  // the departed installation's receipt state — React commits the new
+  // route before the reset effect below runs. That state is pending
+  // receipts for THIS route: nothing may read it as the new
+  // installation's binding, scope or contexts. Resetting here (before
+  // `activeIds`, `binding` and `scope` are computed) is React's
+  // documented adjust-state-during-render pattern — the states settle
+  // in the same commit, so the stale install/context pair never
+  // reaches Conversation, AssistantOperations or the outlet. The
+  // effect below still does the real cleanup (query strip, notice).
+  // `loadError` is keyed to the departed route's receiptKey, so the
+  // keyed `loadFailure` needs no clearing here — the new route's
+  // `loadError` computes to null and the stale entry is overwritten
+  // by the switch effect's `setLoadFailure(null)`.
+  if (firstInstall.current !== installId && (installation !== null || contexts.length > 0 || contextId !== "" || linkNotice !== null || loadError !== null || launcherRun !== null)) {
+    setInstallation(null);
+    setScreenNavigation(null);
+    setContexts([]);
+    setContextId("");
+    setLinkNotice(null);
+    setLauncherRun(null);
+  }
+  // Receipts count only when they are the current route's verified
+  // ones: a departed install's `installation`/`contexts`, or a load
+  // that has not answered yet, leaves the scope unresolved.
+  const receiptsPending = !receiptReady || installation === null || installation.install_id !== installId || loading || loadError !== null;
 
   // Every internal query write marks the resulting key as handled, so
   // the adoption effect below only answers external URL changes
@@ -105,25 +540,24 @@ export default function AppShell({
     ctx: string | null,
     record: string | null,
     appview: string | null,
-    crm: string | null,
-  ) => `${installId}|${ctx ?? ""}|${record ?? ""}|${appview ?? ""}|${crm ?? ""}`;
+  ) => JSON.stringify([installId, ctx, record, appview]);
   const writeQuery = useCallback(
     (
       patch: {
-        ctx?: string | null;
         appview?: OutletView | null;
         record?: string | null;
-        crm?: CrmSection | null;
+        conversation?: string | null;
         clearContractPreview?: boolean;
+        screenRoute?: { patch: RoutePatch; navigation: ScreenNavigation };
       },
       opts?: { replace?: boolean },
     ) => {
       const [path, search] = href.split("?");
       const q = new URLSearchParams(search ?? "");
-      if (patch.ctx !== undefined) {
-        if (patch.ctx === null || patch.ctx === "") q.delete("ctx");
-        else q.set("ctx", patch.ctx);
-      }
+      // Single-context mode: the URL never carries a context selector for
+      // new work. A conversation link keeps its `ctx` claim only so the
+      // conversation gate can verify or refuse it; the scope itself is
+      // resolved independently of the URL.
       if (patch.appview !== undefined) {
         if (patch.appview === null || patch.appview === "list") q.delete("appview");
         else q.set("appview", patch.appview);
@@ -135,83 +569,161 @@ export default function AppShell({
         if (patch.record === null) q.delete("record");
         else q.set("record", patch.record);
       }
-      if (patch.crm !== undefined) {
-        if (patch.crm === null || patch.crm === "customers") q.delete("crm");
-        else q.set("crm", patch.crm);
+      if (patch.conversation !== undefined) {
+        if (patch.conversation === null) q.delete("conversation");
+        else q.set("conversation", patch.conversation);
+      }
+      if (!q.has("conversation")) q.delete("ctx");
+      if (patch.screenRoute) {
+        const { patch: route, navigation } = patch.screenRoute;
+        // Closed app-local selectors only. Native scope, session, conversation
+        // and recovery parameters cannot be named by this adapter.
+        const safe = parseRoutePatch({ ...route }, navigation);
+        if (!safe) return;
+        if (safe.section !== undefined) {
+          if (safe.section === navigation.default_section) q.delete(navigation.section_query);
+          else q.set(navigation.section_query, safe.section);
+        }
+        if (safe.view !== undefined) {
+          if (safe.view === "list") { q.delete("appview"); q.delete("segment"); }
+          else q.set("appview", "new");
+        }
+        for (const [field, parameter] of [["record_id", "record"], ["segment_id", "segment"]] as const) {
+          if (safe[field] !== undefined) { if (safe[field] === null) q.delete(parameter); else q.set(parameter, safe[field]); }
+        }
       }
       if (patch.clearContractPreview) {
         q.delete("contract-preview");
         q.delete("contract-preview-view");
       }
-      handledQuery.current = queryKey(q.get("ctx"), q.get("record"), q.get("appview"), q.get("crm"));
+      const adoptedKey = queryKey(q.get("ctx"), q.get("record"), q.get("appview"));
+      handledQuery.current = adoptedKey;
+      setAdoptedContextKey(adoptedKey);
       const s = q.toString();
       navigate(path + (s ? `?${s}` : ""), { replace: opts?.replace });
     },
     [href, installId],
   );
 
-  // Verified installation/context receipts. An operator-only read: an
-  // unproven viewer sees the sign-in note, never the records.
+  // Verified installation/context receipts. A current key mismatch is
+  // pending synchronously (before this effect runs); stale requests cannot
+  // publish data or settle loading after selection/install/unmount changes.
   useEffect(() => {
-    if (!viewer.operator) {
-      setLoading(false);
-      return;
-    }
+    let current = true;
     const controller = new AbortController();
-    setLoading(true);
-    setLoadError(null);
+    const isCurrent = () =>
+      current &&
+      !controller.signal.aborted &&
+      currentReceiptKeyRef.current === receiptKey;
+    // CAD-1193: `null` (still checking/unavailable) is not a refusal —
+    // wait for the resolved role rather than painting a sign-in, and
+    // never issue the protected detail/context reads before
+    // `operator === true`.
+    if (!screenViewer) {
+      setRequestLoading(false);
+      return () => {
+        current = false;
+        controller.abort();
+      };
+    }
+    setRequestLoading(true);
     Promise.all([
       workspaceApps.detail(installId, controller.signal),
       workspaceApps.contexts(installId, controller.signal),
     ])
       .then(([next, nextContexts]) => {
-        if (controller.signal.aborted) return;
+        if (!isCurrent()) return;
         setInstallation(next);
         setContexts(nextContexts);
-        // CAD-1174: a CRM installation without a scope is unusable — the
-        // record lists, the segments and the email sender all need one,
-        // and asking the operator to invent a scope is the friction this
-        // removes. Create the single `General` scope on first load;
-        // `request_id` is stable, so a second load or a race resolves to
-        // the same row instead of minting another. Apps that run without
-        // a brand context by design (Social) are untouched.
-        if (next.name === "crm" && !nextContexts.some((value) => value.state === "active")) {
-          workspaceApps
-            .createContext(installId, {
-              label: "General",
-              input_defaults: {},
-              request_id: `general-${installId}`,
-            })
-            .then((created) => {
-              // A conforming daemon always answers with the row (a refusal
-              // rejects); anything else — a method-blind mock, a proxy
-              // error page parsed as JSON — must never reach the render's
-              // `value.state` filter, so validate the shape, not just
-              // truthiness.
-              const row =
-                created && typeof created.id === "string" && typeof created.state === "string"
-                  ? created
-                  : null;
-              if (!controller.signal.aborted && row !== null) {
-                setContexts((previous) => [...previous, row]);
-              }
-            })
-            .catch(() => {
-              // The scope-entry notice below already tells the operator
-              // what to do; a failed default never blocks the app.
-            });
-        }
+        setLoadFailure(null);
+        setCompletedReceiptKey(receiptKey);
       })
       .catch((e: unknown) => {
-        if (!controller.signal.aborted) {
-          setLoadError(e instanceof Error ? e.message : "Could not load this app");
+        if (isCurrent()) {
+          if (e instanceof ApiError && [401, 403, 404].includes(e.status)) {
+            dropWorkspaceAppSnapshot(installId);
+          }
+          setLoadFailure({
+            key: receiptKey,
+            message: e instanceof Error ? e.message : "Could not load this app",
+          });
+          setCompletedReceiptKey(receiptKey);
         }
       })
       .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
+        if (isCurrent()) setRequestLoading(false);
       });
-    return () => controller.abort();
-  }, [installId, viewer.operator]);
+    return () => {
+      current = false;
+      controller.abort();
+    };
+  }, [installId, receiptKey, screenViewer]);
+
+  // CAD-1519/CAD-1702: an app that mounts a screen (including Social's
+  // native workspace) and has no active context gets its General context on
+  // the operator's first open. The setup is retriable in place; the request
+  // identity is installation-stable and its result is adopted only while
+  // this verified receipt is still current.
+  useEffect(() => {
+    if (
+      !receiptReady ||
+      !wantsGeneralContext(installation) ||
+      contexts.some((context) => context.state === "active") ||
+      viewer.operator !== true ||
+      viewer.readOnly
+    ) return;
+    let current = true;
+    const isCurrent = () => current && currentReceiptKeyRef.current === receiptKey;
+    const create = (requestId: string) =>
+      workspaceApps.createContext(installId, {
+        label: "General",
+        input_defaults: {},
+        request_id: requestId,
+      });
+    const activeRow = (created: AppContext | null | undefined) =>
+      created && created.install_id === installId && typeof created.id === "string" && created.state === "active"
+        ? created
+        : null;
+    setGeneralSetup({ key: setupScopeKey, error: null });
+    // Recovery identity is derived from the installation's context history,
+    // so it advances past every archived generation: a second recovery after
+    // another archive uses a new id, while concurrent tabs reading the same
+    // history converge on the same one.
+    const recoveryRequestId = () => `general-${installId}-${contexts.length}`;
+    const createGeneral = async () => {
+      try {
+        const row = activeRow(await create(`general-${installId}`));
+        if (row !== null) return row;
+      } catch (error) {
+        // The store rejects a replayed request id whose context was
+        // archived. The HTTP boundary reports that as a generic conflict,
+        // so recover once under a deterministic id: stable across tabs, so
+        // concurrent recoveries still converge on one context.
+        if (!(error instanceof ApiError && error.status === 409)) throw error;
+      }
+      return activeRow(await create(recoveryRequestId()));
+    };
+    createGeneral()
+      .then((row) => {
+        if (!isCurrent()) return;
+        if (row === null) {
+          setGeneralSetup({ key: setupScopeKey, error: "App setup did not return an active context. Retry setup or ask an administrator to review this installation." });
+          return;
+        }
+        handledQuery.current = undefined;
+        setContexts((previous) => previous.some((context) => context.id === row.id) ? previous : [...previous, row]);
+        setGeneralSetup(null);
+      }).catch((error: unknown) => {
+      if (!isCurrent()) return;
+      setGeneralSetup({
+        key: setupScopeKey,
+        error: error instanceof Error
+          ? `App setup failed: ${error.message}`
+          : "App setup failed. Retry setup or ask an administrator to review this installation.",
+      });
+    });
+    return () => { current = false; };
+  }, [contexts, generalSetupAttempt, installation, installId, receiptKey, receiptReady, setupScopeKey, viewer.operator, viewer.readOnly]);
 
   // Board-level App menu identity: report the verified receipt (or
   // null while it is loading, failed, or belongs to another install)
@@ -220,47 +732,76 @@ export default function AppShell({
   // lingering in host navigation.
   useEffect(() => {
     if (!onInstallation) return;
-    if (installation && installation.install_id === installId) {
+    if (receiptReady && installation && installation.install_id === installId) {
       onInstallation({
         installId,
         kind: installation.name,
         title: installation.title || installation.name,
+        navigation: screenNavigation,
       });
     } else {
       onInstallation(null);
     }
     return () => onInstallation(null);
-  }, [installId, installation, onInstallation]);
-
-  useEffect(() => {
-    setSocialContext(rememberedContext(installId));
-    return subscribeContext((changed, next) => {
-      if (changed === installId) setSocialContext(next);
-    });
-  }, [installId]);
-
+  }, [installId, installation, onInstallation, receiptReady, screenNavigation]);
+  // In-workspace scope changes (Social's picker, a screen's saved-context
+  // verb) persist and emit through contextSelection. The shell applies the
+  // emission to its own selection — the one scope chat, screen and the run
+  // launcher share — and keeps the URL truthful: a deliberate in-workspace
+  // pick drops a stale conversation/record view that was bound to the
+  // previous scope. Host-driven writes (URL adoption, setup) flag out so
+  // their emit cannot rewrite the authored URL they came from.
   // Installation switch: stale outlet state must never follow the
   // operator across the boundary. The first mount keeps direct links.
   useEffect(() => {
     if (firstInstall.current === installId) return;
     firstInstall.current = installId;
     handledQuery.current = undefined;
+    // The render-phase reset above already cleared the departed
+    // installation's state on this commit; setting it again here is a
+    // no-op for anything already mounted on the new route, but keeps
+    // the reset self-contained for paths that skipped the render gate.
     setInstallation(null);
     setContexts([]);
-    setLoadError(null);
+    setLoadFailure(null);
     setLinkNotice(null);
     setContextId("");
-    writeQuery({ ctx: null, appview: null, record: null, crm: null, clearContractPreview: true }, { replace: true });
+    writeQuery({ appview: null, record: null, conversation: null, clearContractPreview: true }, { replace: true });
     // The strip marks the emptied query handled: unmark so adoption
     // still runs once the new installation's contexts load.
     handledQuery.current = undefined;
+    setAdoptedContextKey(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [installId]);
 
-  const activeIds = useMemo(
-    () => contexts.filter((c) => c.state === "active").map((c) => c.id),
-    [contexts],
+  const activeContexts = useMemo(
+    () => (receiptReady ? contexts.filter((c) => c.state === "active") : []),
+    [contexts, receiptReady],
   );
+  const activeIds = useMemo(() => activeContexts.map((c) => c.id), [activeContexts]);
+  const needsSetup = receiptReady && wantsGeneralContext(installation) && activeIds.length === 0;
+  const generalSetupError = generalSetup?.key === setupScopeKey ? generalSetup.error : null;
+  const canRetryGeneralSetup = viewer.operator === true && !viewer.readOnly;
+
+  // The default selection for this install's screens: a declared screen
+  // has no in-shell picker moment, so a lone active context wins there
+  // over a fresh/empty remembered choice (`screenContext`); the picker
+  // view keeps remembered choice. Stale nonempty ids resolve to the
+  // stale id itself — the binding refuses, never an auto-retarget.
+  // Storage is read here, once, in the owner — resolvers take data only.
+  // Single-company mode: the workspace has exactly one active app context.
+  // It is the scope for every screen, chat and run; nothing remembers or
+  // switches a selection.
+  const fallbackContext = () => activeIds[0] ?? "";
+  // Host-driven adoption (the effect below and setup): set the one scope.
+  const adoptScope = (next: string) => {
+    emitByHost.current = true;
+    try {
+      setContextId(next);
+    } finally {
+      emitByHost.current = false;
+    }
+  };
 
   // Adopt the URL's context once contexts load, and on later external
   // URL changes (browser back). A linked context must be active here;
@@ -271,15 +812,10 @@ export default function AppShell({
     // switch commit the state still holds the previous install while
     // the URL already names the next one — adopting there would clear
     // or poison the wrong scope.
-    if (loading || installation === null || installation.install_id !== installId) return;
-    // Social-content owns its context end to end (the shell renders
-    // no selector there): adoption must not read, write, or clear its
-    // remembered selection.
-    if (installation.name === "social-content") return;
+    if (!receiptReady || loading || installation === null || installation.install_id !== installId) return;
     const urlCtx = query.get("ctx");
     const urlRecord = query.get("record");
     const urlView = query.get("appview");
-    const urlCrm = query.get("crm");
     // A rewrite this pass emits is still "external" until adoption has
     // run against it: marking only the pre-write URL handled and
     // returning would let the next pass re-enter, and marking the
@@ -287,12 +823,13 @@ export default function AppShell({
     // never adopt the surviving ctx (the cold deep-link defect). So
     // adoption is fall-through, not early-return: normalize each
     // param, then act on the still-valid remainder.
-    if (handledQuery.current === queryKey(urlCtx, urlRecord, urlView, urlCrm)) return;
-    handledQuery.current = queryKey(urlCtx, urlRecord, urlView, urlCrm);
-    // An unknown CRM section never renders: strip it back to the
-    // default instead of guessing a section. The explicit default
-    // (`crm=customers`) is already canonical, so it is not rewritten.
-    const badCrm = urlCrm !== null && urlCrm !== "customers" && urlCrm !== "segments" && urlCrm !== "campaigns";
+    const incomingQueryKey = queryKey(urlCtx, urlRecord, urlView);
+    if (handledQuery.current === incomingQueryKey) {
+      setAdoptedContextKey(incomingQueryKey);
+      return;
+    }
+    handledQuery.current = incomingQueryKey;
+    setAdoptedContextKey(incomingQueryKey);
     let badRecord = false;
     if (urlRecord !== null) {
       try {
@@ -306,119 +843,90 @@ export default function AppShell({
     // record link is unambiguous, so it resolves to that context.
     const soleContext = urlCtx === null && urlRecord !== null && !badRecord && activeIds.length === 1;
     const scopelessRecord = urlCtx === null && urlRecord !== null && !badRecord && !soleContext;
+    let legacyMismatch = false;
     if (staleCtx) {
-      setContextId(fallbackContext());
-      setLinkNotice(
-        installation.name === "crm"
-          ? "This link names a scope that is not active in this CRM installation, so nothing was opened. Ask an administrator to review the installation's CRM setup."
-          : "The linked context is not active in this installation — the selection was cleared.",
-      );
+      // The linked context died since the link was authored: adopt the
+      // fallback (like returning to the app) and say so.
+      adoptScope(fallbackContext());
+      setLinkNotice("The linked context is not active in this installation — the selection was cleared.");
     } else if (soleContext) {
-      setContextId(activeIds[0]);
-      rememberContext(installId, activeIds[0]);
+      adoptScope(activeIds[0]);
       setLinkNotice(null);
     } else if (scopelessRecord) {
       // A record link without scope is ambiguous: refuse it with a
       // notice rather than guessing which context it names.
-      setLinkNotice(
-        installation.name === "crm"
-          ? "This link does not say which scope the record belongs to, so nothing was opened. Ask an administrator to review the installation's CRM setup."
-          : "The record link names no context — the selection was cleared.",
-      );
-      setContextId(fallbackContext());
+      adoptScope(fallbackContext());
+      setLinkNotice("The record link names no context — the selection was cleared.");
     } else if (urlCtx !== null) {
-      // The URL's ctx+record/appview are adopted verbatim: they were
-      // authored together — a deep link, a scoped-entry link, or a
-      // history entry — never split or cleared here. Stale scope is
-      // prevented at the transition origin (the scoped-entry links
-      // emit a bare `?ctx=` and the section links drop record/appview),
-      // not by guessing which arriving params are intentional.
-      setContextId(urlCtx);
-      rememberContext(installId, urlCtx);
-      setLinkNotice(null);
+      // A legacy `?ctx=` selector is validation evidence, never an
+      // alternate scope: the workspace's single active context is the
+      // authority, so a link cannot bind new work to a different one.
+      const resolved = fallbackContext();
+      adoptScope(resolved);
+      legacyMismatch = urlCtx !== resolved;
+      setLinkNotice(
+        urlCtx === resolved
+          ? null
+          : "The linked context is not this workspace's active scope — the workspace context was used.",
+      );
     } else {
-      setContextId(fallbackContext());
+      adoptScope(fallbackContext());
     }
-    // One normalized write emits every strip at once. Marking the
-    // pre-write URL handled (done above) plus this write's own
-    // handled mark leaves the surviving ctx adoptable on the next
-    // pass — but adoption already ran on it above, so no second
-    // effect turn is needed and the URL settles in a single replace.
-    if (badCrm || badRecord || staleCtx || scopelessRecord || soleContext) {
+    // One normalized write emits every strip at once. A conversation link
+    // keeps its `ctx` claim (writeQuery preserves it while a conversation
+    // param exists) so the gate can verify or refuse it; everything else
+    // loses its selector here.
+    if (badRecord || staleCtx || scopelessRecord || soleContext || legacyMismatch || urlCtx !== null) {
       writeQuery(
         {
-          ctx: soleContext ? activeIds[0] : staleCtx ? null : undefined,
-          crm: badCrm ? null : undefined,
-          record: badRecord || staleCtx || scopelessRecord ? null : undefined,
-          appview: staleCtx ? null : undefined,
+          record: badRecord || staleCtx || scopelessRecord || legacyMismatch ? null : undefined,
+          appview: staleCtx || legacyMismatch ? null : undefined,
         },
         { replace: true },
       );
     }
-  }, [loading, installation, activeIds, query, installId, writeQuery]);
-
-  // The default selection, without persisting an empty choice when
-  // this installation has no active contexts to choose from.
-  const fallbackContext = () =>
-    activeIds.length > 0 ? initialContext(installId, activeIds) : "";
-
-  // The context picker is removed (operator review): context follows
-  // the URL, not a selector.
-
-  // Narrow drawer focus: opening moves into the pane, closing returns
-  // to the trigger. The closed drawer is `visibility: hidden`, so it
-  // stays out of the tab order with the draft intact.
-  //
-  // Observed defect (baseline in d379ae54, real Chrome): a synchronous
-  // commit-phase `.focus()` ran before the open activation's own focus
-  // (the toggle is focused on mousedown / Enter) was applied, so the
-  // composer never received focus. A single rAF still fired too early —
-  // before `data-open` propagated. Deferring two frames clears the open
-  // commit in both real and synthesized input; the `data-open` guard
-  // means the callback never focuses a still-hidden pane. Both frame
-  // ids are tracked so cleanup cancels whichever is still pending — a
-  // rapid close can never refocus once the user has moved on. A
-  // disabled (read-only) composer yields to the enabled Close control.
-  useEffect(() => {
-    if (!chatOpen) return;
-    let inner = 0;
-    const focusComposer = () => {
-      const pane = chatPaneRef.current;
-      if (!pane || !pane.hasAttribute("data-open")) return;
-      const composer = pane.querySelector<HTMLElement>("textarea");
-      const target = composer && !composer.hasAttribute("disabled")
-        ? composer
-        : pane.querySelector<HTMLElement>(".app-shell-chat-close") ?? composer;
-      target?.focus();
-    };
-    const outer = requestAnimationFrame(() => {
-      inner = requestAnimationFrame(focusComposer);
-    });
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setChatOpen(false);
-    };
-    addEventListener("keydown", onKey);
-    return () => {
-      cancelAnimationFrame(outer);
-      cancelAnimationFrame(inner);
-      removeEventListener("keydown", onKey);
-      chatOpenRef.current?.focus();
-    };
-  }, [chatOpen]);
-
-  // The App binding for chat sends: install plus the concrete context
-  // the shell owns (generic outlet) or the workspace screen owns
-  // (social, observed live via subscription). Empty context sends
-  // plain chat — there is no App scope to bind. A selected context
-  // that is no longer active blocks the send early with a clear
-  // message; the server re-proves every binding on send regardless.
-  const binding = chatBinding({
-    installId,
-    wanted: (installation?.name === "social-content" ? socialContext || "" : contextId),
-    known: installation !== null && !loading && loadError === null,
-    activeIds,
-  });
-  const scope: HostScope = { installId, contextId };
+  }, [loading, receiptReady, installation, activeIds, query, installId, writeQuery]);
+  // The App binding for chat sends: install plus the one verified
+  // shell scope (every app view, social included). CAD-1193: receipts
+  // pending (loading, a failed load, or a departed installation still
+  // held on this commit) mean the wanted context is "" — no
+  // install/context pair is exposed, so AssistantOperations runs zero
+  // scoped reads instead of querying the new install with the old
+  // context. Plain chat stays; nothing invents or auto-binds a
+  // context. A selected context that is no longer active blocks the
+  // send early with a clear message; the server re-proves every
+  // binding on send regardless.
+  const verified = receiptReady === true && installation !== null && installation.install_id === installId;
+  const contextAdoptionReady = adoptedContextKey === queryKey(query.get("ctx"), query.get("record"), query.get("appview"));
+  const wantedContext = receiptsPending || !contextAdoptionReady ? "" : contextId;
+  const bindingUnavailableError = loadError ??
+    (viewer.operator === false
+      ? "Sign in as the operator to verify this app context before sending."
+      : viewer.operator === null
+        ? viewer.access === "unavailable"
+          ? "Access could not be confirmed. Retry the access check before sending."
+          : "The board is still checking access. Wait before sending."
+        : loading || !contextAdoptionReady
+          ? "The current app context is still being verified. Wait before sending."
+          : "The current app context could not be verified. Retry before sending.");
+  const binding: ChatBinding = verified && contextAdoptionReady
+    ? chatBinding({ installId, wanted: wantedContext, known: true, activeIds })
+    : { scope: null, error: bindingUnavailableError };
+  const contextProofStatus = loadError !== null || (viewer.operator === false && !loading)
+    ? "failed"
+    : loading || !verified || !contextAdoptionReady
+      ? "pending"
+      : "ready";
+  const conversationContextProof = {
+    status: contextProofStatus as "pending" | "ready" | "failed",
+    contextId: binding.scope?.context_id ?? null,
+    error: contextProofStatus === "failed"
+      ? loadError ?? "The current app context could not be verified."
+      : binding.error ?? (binding.scope === null ? "No active app context is available." : null),
+  };
+  // The outlet's scope follows the same rule — a context id is only
+  // ever named alongside an installation receipt that proved it.
+  const scope: HostScope = { installId, contextId: receiptsPending || !contextAdoptionReady ? "" : contextId };
   // CAD-813: the Campaigns page mints assistant proposal requests
   // against the operator's most recent chat message stamped by the
   // daemon with exactly this scope. The id travels as ordinary
@@ -426,49 +934,196 @@ export default function AppShell({
   // never a global — so a message bound to another install or
   // context can never mint here.
 
+  const screenRoute = (patch: RoutePatch, navigation: ScreenNavigation) => {
+    // CAD-1537: a route patch only rewrites this page's URL, so a read-only
+    // screen viewer may navigate too.
+    if (receiptReady && contextAdoptionReady && scope.contextId && (viewer.operator === true && !viewer.readOnly || viewer.screenReader === true)) writeQuery({ screenRoute: { patch, navigation } }, { replace: patch.replace });
+  };
+  const attachMediaReference: MediaChatAttach = async (selected, actionToken, isCurrent) => {
+    const target = mediaTarget.current;
+    if (!isCurrent() || !receiptReady || !contextAdoptionReady || !scope.contextId ||
+        viewer.operator !== true || viewer.readOnly || !target ||
+        target.scope.install_id !== scope.installId || target.scope.context_id !== scope.contextId)
+      throw new Error("The current chat draft is not ready for an image.");
+    const owner = composerScope(target.composerKey);
+    if (owner !== undefined && (owner === null || owner.install_id !== target.scope.install_id ||
+        owner.context_id !== target.scope.context_id))
+      throw new Error("Return to this draft's original app context before attaching an image.");
+    const request = beginLibraryImagePin(target.composerKey);
+    if (request === null) throw new Error("Wait for the current message to finish before attaching an image.");
+    setPanel("chat");
+    setChatCollapsed(false);
+    try {
+      const out = await workspaceApps.mediaChatAttach({
+        action_token: actionToken,
+        asset_id: selected.asset_id,
+        expected_revision: selected.expected_revision,
+        conversation_id: target.conversationId,
+      });
+      const command = out.host_command;
+      const pin = command?.args;
+      if (!isCurrent() || Object.keys(out).sort().join() !== "asset_id,host_command,revision" ||
+          out.asset_id !== selected.asset_id || out.revision !== selected.expected_revision ||
+          !command || Object.keys(command).sort().join() !== "args,conversation_id,operation" ||
+          command.operation !== "media.chat.attach" || command.conversation_id !== target.conversationId ||
+          !pin || Object.keys(pin).sort().join() !== "asset_id,context_id,install_id,media_type,preview,revision,sha256,title" ||
+          pin.install_id !== target.scope.install_id || pin.context_id !== target.scope.context_id ||
+          pin.asset_id !== selected.asset_id || pin.revision !== selected.expected_revision ||
+          typeof pin.sha256 !== "string" || !/^sha256:[a-f0-9]{64}$/.test(pin.sha256) ||
+          !["image/png", "image/jpeg", "image/webp"].includes(pin.media_type) ||
+          typeof pin.title !== "string" || typeof pin.preview !== "string" || pin.preview.length > 131100 ||
+          !/^data:image\/jpeg;base64,[A-Za-z0-9+/]+={0,2}$/.test(pin.preview))
+        throw new Error("The host did not accept that image for this chat.");
+      if (!settleLibraryImagePin(request, {
+        asset_id: pin.asset_id, revision: pin.revision, sha256: pin.sha256,
+        media_type: pin.media_type, title: pin.title || "Library image", preview: pin.preview,
+      })) throw new Error("That image attachment was replaced or removed.");
+      return { asset_id: out.asset_id, revision: out.revision };
+    } catch (error) {
+      settleLibraryImagePin(request, null);
+      throw error;
+    }
+  };
+  const screenCommand = (command: HostCommand) => {
+    if (!receiptReady || !contextAdoptionReady || !scope.contextId || viewer.operator !== true || viewer.readOnly) return;
+    if (command.operation === "smtp.manage") { navigate("/settings/email"); return; }
+    if (command.operation === "chat.campaign.open" || command.operation === "chat.campaign.brief") {
+      const campaign = command.args.campaign_id;
+      if (typeof campaign !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(campaign)) return;
+      // Selection only. The protected server executor has already validated
+      // scope and, for a brief, enqueued the host-minted message under its fence.
+      if (command.conversation_id) selectConversation(installId, command.conversation_id);
+      else setDraftSubject(installId, campaignSubject(campaign));
+      if (command.operation === "chat.campaign.brief") void conversationList(installId).refresh();
+      setPanel("chat");
+    }
+    if (command.operation === "chat.whatsapp.open" || command.operation === "chat.whatsapp.brief") {
+      // CAD-1636: the subject chat of one WhatsApp conversation; same selection-only rule.
+      const conversation = command.args.conversation_id;
+      if (typeof conversation !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/.test(conversation)) return;
+      if (command.conversation_id) selectConversation(installId, command.conversation_id);
+      else setDraftSubject(installId, whatsappSubject(conversation));
+      if (command.operation === "chat.whatsapp.brief") void conversationList(installId).refresh();
+      setPanel("chat");
+    }
+  };
   const title = installation?.title || installation?.name || "App";
-  const isSocial = installation !== null && installation.name === "social-content";
+  const isSocial = isSocialContent(installation);
+  // An app whose approved, executable package declares one screen mounts
+  // that screen (presentation only; authorization stays in the
+  // session/epoch/digest gates). Social keeps its legacy outlet.
+  const hasPortableScreen = installation !== null && screenTag(installation) !== null;
+  const screenOutlet = isSocial || hasPortableScreen;
+  const cachedPreviewSnapshot = !receiptReady && viewer.operator === true && loadError === null
+    ? readWorkspaceAppSnapshot(installId)
+    : null;
+  const cachedPreviewContextId = (() => {
+    if (!cachedPreviewSnapshot) return null;
+    const active = cachedPreviewSnapshot.contexts.filter((context) =>
+      context.install_id === installId && context.state === "active",
+    );
+    const values = query.getAll("ctx");
+    if (values.length === 0) return active.length === 1 ? active[0].id : null;
+    if (values.length !== 1) return null;
+    return active.some((context) => context.id === values[0]) ? values[0] : null;
+  })();
   // The chat's descriptor comes from the installation's own approved package
   // (served pinned to its digest); with none, the pane is plain shared chat.
-  const verified = installation !== null && installation.install_id === installId;
   // CAD-1174: with a single active scope the context concept is not a
-  // choice — the operator never sees it. `General` is the one scope a
-  // CRM installation gets (created below when it has none); every
-  // other app keeps the surfaces it has today.
-  const activeContexts = contexts.filter((value) => value.state === "active");
-  const singleScope = verified && installation.name === "crm" && activeContexts.length <= 1;
-  const chatDescriptor = useAppChat(
+  // choice — the operator never sees it. `General` is the one scope an
+  // installation gets when it has none (created above).
+  const singleScope = verified && activeContexts.length <= 1;
+  const chatProjection = useAppChatProjection(
     installId,
     verified ? installation.digest : null,
     verified ? installation.name : null,
   );
-  // The shell's own screen ids (D5): the CRM outlet's sections, or the generic
-  // outlet's `list` and `new`; the private-screen app owns its own and has none.
-  const chatScreen = !verified || isSocial ? null : installation.name === "crm" ? crmSection : view;
-  // `open-view` card action: navigate within this installation and context.
+  const chatDescriptor = chatProjection.projection?.chat ?? null;
+  // The chat descriptor's screen id (D5): the mounted screen's declared
+  // section when it declares navigation, else its screen tag.
+  const section = screenNavigation ? sectionFromSearch(href.split("?")[1] ?? "", screenNavigation) : null;
+  const chatScreen = chatScreenFor(installation, verified, section, view);
+  // `open-view` card action: a declared section of the mounted screen, or
+  // the generic list/new view, within this installation and context.
   const openView = useCallback(
     (target: string) => {
-      if (installation?.name === "crm") {
-        if (target === "customers" || target === "segments" || target === "campaigns") {
-          writeQuery({ crm: target, appview: null, record: null });
+      if (screenNavigation) {
+        if (screenNavigation.sections.some((s) => s.id === target)) {
+          writeQuery({ screenRoute: { patch: { section: target, view: "list", record_id: null }, navigation: screenNavigation } });
         }
       } else if (target === "list" || target === "new") {
         writeQuery({ appview: target === "list" ? null : target, record: null });
       }
     },
-    [installation, writeQuery],
+    [screenNavigation, writeQuery],
   );
 
+  // Capability-free local-text workflows reuse the guarded start lifecycle.
+  // Host execution and priced capability calls keep their existing approval UI.
+  // `scope.contextId` is exactly the context the run binds to; "" is the
+  // install scope itself.
+  const launchableWorkflows = verified && contextAdoptionReady && !isSocialContent(installation)
+    ? (installation?.workflows ?? []).filter((flow) =>
+      (flow.execution ?? "agent") !== "host" && (flow.capability_slots ?? []).length === 0)
+    : [];
+  const canLaunch = viewer.operator === true && !viewer.readOnly;
+  const launchFlow = launcherRun !== null
+    ? launchableWorkflows.find((flow) => flow.name === launcherRun.name) ?? null
+    : null;
+  const launcherOwnership = useRef<{ intent: typeof launcherRun; current: boolean }>({ intent: null, current: false });
+  const launchContext = launcherRun === null ? undefined : contexts.find((c) => c.id === launcherRun.contextId);
+  const launcherIsCurrent = canLaunch && launchFlow !== null && launcherRun !== null &&
+    installation !== null && installation.install_id === installId && installation.digest === launcherRun.installDigest &&
+    contextId === launcherRun.contextId &&
+    (launcherRun.contextRevision === null
+      ? launcherRun.contextId === ""
+      : launchContext?.state === "active" && launchContext.revision === launcherRun.contextRevision && launchContext.digest === launcherRun.contextDigest);
+  useLayoutEffect(() => {
+    launcherOwnership.current.intent = launcherRun;
+    launcherOwnership.current.current = launcherIsCurrent;
+    if (launcherRun !== null && !launcherIsCurrent) {
+      setLauncherRun((open) => open === launcherRun ? null : open);
+    }
+    return () => { launcherOwnership.current.current = false; };
+  }, [launcherRun, launcherIsCurrent]);
+
   return (
-    <div className="app-shell" data-app-shell-outlet={installId}>
-      <div className="app-shell-crumb">
+    <div className="app-shell" data-app-shell-outlet={installId} data-screen-drawer={drawerOpen ? "true" : undefined} data-screen-drawer-surface={screenDrawer || undefined}>
+      {(drawerOpen || independentOpen) && <div ref={independentOpen ? drawerScrimRef : undefined} className="app-shell-screen-scrim" aria-hidden="true" onClick={independentOpen ? closeIndependentDrawer : closeScreenDrawer} />}
+      <div className="app-shell-crumb" inert={drawerOpen || independentOpen}>
         <Link href="/apps" className="lnk text-label">
-          ← All apps
+          ← {t("All apps")}
         </Link>
         <span className="truncate text-ink-100 text-cardtitle" aria-current="page">
-          {loading ? "Loading…" : title}
+          {loading ? t("Loading…") : title}
         </span>
+        {!loading && installation?.version && (
+          <span className="text-micro text-ink-500" data-app-version={installation.version}>
+            v{installation.version}
+          </span>
+        )}
+
         <span className="flex-1" />
+        {launchableWorkflows.map((flow) => (
+          <Button
+            key={flow.name}
+            size="sm"
+            disabled={!canLaunch}
+            onClick={() => {
+              const scopeContext = contexts.find((c) => c.id === scope.contextId) ?? null;
+              setLauncherRun({
+                name: flow.name,
+                contextId: scope.contextId,
+                installDigest: installation?.digest ?? "",
+                contextRevision: scopeContext?.revision ?? null,
+                contextDigest: scopeContext?.digest ?? null,
+              });
+            }}
+          >
+            {flow.label?.trim() || `New ${flow.name}`}
+          </Button>
+        ))}
+
         {isDev && installation !== null && (
           <a
             href={contractPreviewHref(href, previewKey === null ? "crm" : null)}
@@ -479,39 +1134,28 @@ export default function AppShell({
               navigate(contractPreviewHref(href, previewKey === null ? "crm" : null));
             }}
           >
-            {previewKey === null ? "Contract preview (dev)" : "Exit contract preview"}
+            {t(previewKey === null ? "Contract preview (dev)" : "Exit contract preview")}
           </a>
         )}
-        <button
-          ref={chatOpenRef}
-          type="button"
-          className="btn btn-secondary btn-sm app-shell-chat-toggle"
-          aria-expanded={chatOpen}
-          aria-controls="app-shell-chat"
-          onClick={() => setChatOpen((o) => !o)}
-        >
-          Assistant chat
-        </button>
       </div>
 
-      <div className="app-shell-grid" data-chat-collapsed={chatCollapsed || undefined}>
-        <div
-          id="app-shell-chat"
-          ref={chatPaneRef}
-          className="app-shell-chat"
-          aria-label="Assistant chat"
-          data-open={chatOpen || undefined}
-        >
-          <div className="app-shell-chat-head">
-            <strong className="text-cardtitle text-ink-100">Assistant</strong>
-            <button
-              type="button"
-              className="btn btn-secondary btn-sm app-shell-chat-close"
-              onClick={() => setChatOpen(false)}
-            >
-              Close chat
-            </button>
-          </div>
+      <div className="app-shell-panels" role="group" aria-label={t("Panel")} inert={drawerOpen || independentOpen}>
+        {(["chat", "work"] as const).map((p) => (
+          <button
+            key={p}
+            type="button"
+            className="app-shell-panel-tab"
+            aria-pressed={panel === p}
+            aria-controls={p === "chat" ? "app-shell-chat" : "app-shell-workspace"}
+            onClick={() => setPanel(p)}
+          >
+            {t(p === "chat" ? "Assistant" : "Workspace")}
+          </button>
+        ))}
+      </div>
+
+      <div className="app-shell-grid" data-chat-collapsed={chatCollapsed || undefined} data-shell-panel={panel}>
+        <div id="app-shell-chat" className="app-shell-chat" aria-label={t("Assistant chat")} inert={drawerOpen || independentOpen}>
           <Conversation
             mode={{
               kind: "app",
@@ -519,132 +1163,114 @@ export default function AppShell({
               contextId: binding.scope?.context_id ?? "",
               screen: chatScreen,
               recordOpen: recordId !== null,
-              contextName: singleScope ? null : contextLabel(contexts, contextId),
+              contextName: singleScope ? null : contextLabel(activeContexts, contextId),
+              scopeLabel: (singleScope ? null : contextLabel(activeContexts, contextId)) || title,
               descriptor: chatDescriptor,
+              conversationRequest,
+              contextProof: conversationContextProof,
+              // CAD-1438: shareable links spell the canonical key route. The
+              // shell only mounts after the route proved the key unique for
+              // this install, so the verified receipt's name is its path.
+              appPath: verified && installation ? installedAppHref(installation.name) : null,
+              fileUpload: chatProjection.projection?.fileUpload ?? { declared: false, available: false },
+              fileUploadLoading: chatProjection.loading || !verified || loading || loadError !== null,
             }}
             density="compact"
             viewer={viewer}
             binding={binding}
+            onFileUploadUnavailable={() => void chatProjection.refresh()}
+            onMediaTarget={registerMediaTarget}
             collapsed={chatCollapsed}
             onCollapsed={setChatCollapsed}
+            onPendingDecision={setPendingDecision}
             onOpenView={openView}
           />
         </div>
-        <section className="app-shell-outlet" aria-label={`${title} workspace`}>
-          {loading && (
-            <p className="card px-4 py-5 text-secondary text-ink-400" role="status">
-              Loading this app…
-            </p>
-          )}
+        <section id="app-shell-workspace" ref={outletRef} className="app-shell-outlet" data-screen-drawer={drawerOpen ? "true" : undefined} inert={independentOpen} aria-label={`${title} ${t("workspace")}`} role={drawerOpen ? "dialog" : undefined} aria-modal={drawerOpen ? true : undefined} tabIndex={drawerOpen ? -1 : undefined}>
+          {cachedPreviewSnapshot?.installation.install_id === installId &&
+            isSocialContent(cachedPreviewSnapshot.installation) && loading ? (
+              <WorkspaceAppCachedPreview
+                snapshot={cachedPreviewSnapshot}
+                contextId={cachedPreviewContextId}
+              />
+            ) : loading ? (
+              <p className="card px-4 py-5 text-secondary text-ink-400" role="status">
+                {t("Loading this app…")}
+              </p>
+            ) : null}
           {loadError && (
             <p className="card px-4 py-5 text-secondary text-fail border-fail/40" role="alert">
-              {loadError}{" "}
+              {t(loadError)}{" "}
               <Button size="sm" onClick={() => location.reload()}>
-                Retry
+                {t("Retry")}
               </Button>
             </p>
           )}
-          {!loading && !installation && !loadError && !viewer.operator && (
-            <main className="card px-4 py-5" aria-label="App">
+          {!loading && !installation && !loadError && viewer.operator === null && (
+            <main className="card px-4 py-5" aria-label={t("App")} role="status">
+              <h2 className="text-cardtitle font-medium text-ink-100">
+                {title}
+              </h2>
+              {viewer.access === "unavailable" ? (
+                // CAD-1193: a completed check that could not answer is
+                // unavailable, not still checking and not a sign-out —
+                // the retry re-runs the real metadata probe, never a
+                // reload and never a login.
+                <p className="text-secondary text-ink-400 mt-1">
+                  {t("Access could not be confirmed — the board's access check did not answer. Write controls stay off and no records load until it does.")}{" "}
+                  {viewer.onRetryAccess && (
+                    <Button size="sm" onClick={viewer.onRetryAccess}>
+                      {t("Retry access check")}
+                    </Button>
+                  )}
+                </p>
+              ) : (
+                <p className="text-secondary text-ink-400 mt-1">
+                  {t("Checking whether this session may inspect this installation… If access was denied, the board will say so here.")}
+                </p>
+              )}
+            </main>
+          )}
+          {!loading && !installation && !loadError && viewer.operator === false && (
+            <main className="card px-4 py-5" aria-label={t("App")}>
               <h2 className="text-cardtitle font-medium text-ink-100">
                 {title}
               </h2>
               <p className="text-secondary text-ink-400 mt-1">
-                Sign in as the operator to inspect this installation.
+                {t("Sign in as the operator to inspect this installation.")}
               </p>
               <p className="mt-2">
                 <Link href="/apps" className="lnk text-label">
-                  ← All apps
+                  ← {t("All apps")}
                 </Link>
               </p>
             </main>
           )}
-          {installation && (
-            <>
-              {isSocial ? (
+          {receiptReady && installation && (
+            needsSetup ? (
+              generalSetupError !== null ? (
+                <ErrorNotice
+                  onRetry={canRetryGeneralSetup ? () => {
+                    setGeneralSetup({ key: setupScopeKey, error: null });
+                    setGeneralSetupAttempt((attempt) => attempt + 1);
+                  } : undefined}
+                >
+                  {generalSetupError}
+                </ErrorNotice>
+              ) : canRetryGeneralSetup ? (
+                <Loading>{t("Setting up this app's General context…")}</Loading>
+              ) : (
+                <Notice state="read-only">
+                  {t("This app needs setup before it can open. Setup is unavailable in this read-only view; ask an administrator to review the installation.")}
+                </Notice>
+              )
+            ) : <>
+              {screenOutlet ? (
                 // The private-screen frame owns its own chrome — the
                 // shell shows no installId/version/context subtitle.
                 null
-              ) : installation.name === "crm" ? (
-                // Single-company CRM (CAD-1008): a bound scope shows no
-                // context/scope subtitle at all — the page is the
-                // company's records. Only the exceptional unbound
-                // ambiguous state below names a setup action.
-                contextId === "" && activeIds.length > 1 ? (
-                  <p className="text-micro text-ink-500">CRM setup is required before records open.</p>
-                ) : null
               ) : (
-                <p className="num text-micro text-ink-500">
-                  {contexts.find((c) => c.id === contextId)?.config.label ?? "No context"} · {installation.version}
-                </p>
-              )}
-              {/* Scoped entry: a multi-context install with no linked
-                  or remembered scope stays unselected rather than
-                  silently picking a client. Each context is an explicit
-                  `?ctx=` link — a real URL write, deep-linkable, never a
-                  hidden default. The removed header picker stays gone.
-                  The same links stay available after a scope is bound
-                  (chosen, linked or remembered): without them the only
-                  way to reach a second context would be hand-editing
-                  the URL — the regression the header picker's removal
-                  introduced. The bound context keeps its link but
-                  carries `aria-current`, so the current scope is still
-                  announced and never a dead control — and its href is
-                  the current URL itself, so following it is a
-                  `navigate` no-op that keeps the open record, the New
-                  view and any unsaved draft instead of resetting the
-                  outlet. Single-context installs keep the entry hidden
-                  — no link clutter.
-                  CAD-1008: a bound CRM scope shows no switch links at
-                  all — the single-company surface never offers a scope
-                  control. Only the exceptional unbound multi-context
-                  legacy install keeps the explicit entry; Social and
-                  generic Apps are unchanged. */}
-              {!isSocial && activeIds.length > 1 && (installation?.name !== "crm" || contextId === "") && (
-                <nav
-                  className={
-                    contextId === ""
-                      ? "app-shell-scope card px-4 py-4"
-                      : "app-shell-switch"
-                  }
-                  aria-label={contextId === "" ? "Choose a context" : "Switch context"}
-                >
-                  <p
-                    className={
-                      contextId === "" ? "text-label text-ink-300" : "text-label text-ink-500"
-                    }
-                  >
-                    {contextId === ""
-                      ? installation.name === "crm"
-                        ? "This CRM installation is not bound to a scope yet — administrator CRM setup is required before records open."
-                        : `Choose a context to open ${title}'s records.`
-                      : installation.name === "crm"
-                        ? "Scope:"
-                        : "Context:"}
-                  </p>
-                  <ul
-                    className={
-                      contextId === ""
-                        ? "app-shell-scope-list"
-                        : "app-shell-scope-list app-shell-switch-list"
-                    }
-                  >
-                    {contexts
-                      .filter((c) => c.state === "active")
-                      .map((c) => (
-                        <li key={c.id}>
-                          <Link
-                            href={scopedEntryHref(href, c.id, contextId)}
-                            className="lnk text-label"
-                            data-scope-link={c.id}
-                            aria-current={c.id === contextId ? "page" : undefined}
-                          >
-                            {c.config.label}
-                          </Link>
-                        </li>
-                      ))}
-                  </ul>
-                </nav>
+                <p className="num text-micro text-ink-500">{installation.version}</p>
               )}
               {linkNotice && (
                 <p className="self-start rounded border border-warn/40 px-3 py-1.5 text-label text-warn" role="alert" data-link-notice>
@@ -656,37 +1282,58 @@ export default function AppShell({
                   exampleKey={previewKey}
                   installationKind={installation.name}
                 />
-              ) : isSocial && children ? (
-                children
+              ) : isSocial && children && contextAdoptionReady ? (
+                // Social keeps its legacy native workspace (and its
+                // `?screen=native` back door). Every other app mounts the
+                // screen its own package ships, through
+                // InstalledScreenOutlet below — which is exactly what
+                // `hasPortableScreen` detects. `screenOutlet` is the union
+                // of the two and only drives the chrome above, so keying
+                // this branch on it sent any other screen-shipping app to
+                // the social-only workspace, which then rendered its
+                // "no supported board workspace" guide instead of the
+                // screen the package declared.
+                children(attachMediaReference, scope.contextId, { onScreenDrawer: canDriveScreen ? onScreenDrawer : undefined, presentation: canDriveScreen && screenDrawer !== null ? "drawer" : "outlet", drawerTarget: independentOpen ? drawerTarget : null, onScreenClosed: closeScreenDrawer })
               ) : (
-                <CrmOutlet
-                  key={`${installId}:${contextId}`}
-                  scope={scope}
-                  installationTitle={title}
-                  appKind={installation.name === "crm" ? "crm" : "generic"}
-                  view={view}
-                  recordId={recordId}
-                  section={crmSection}
-                  viewer={viewer}
-                  onView={(v) => writeQuery({ appview: v === "list" ? null : v })}
-                  onSelect={(id) => writeQuery({ record: id })}
-                  // Section moves ride real submenu links (CrmOutlet):
-                  // their hrefs already clear the record view and
-                  // drafts, so no callback is needed here.
-                  // Created records land on list + details in ONE query
-                  // write. Two sequential writes would each start from the
-                  // stale render's href, so the second would re-apply the
-                  // first's pre-image and retain `appview=new` (CAD-781 F1).
-                  onRecordCreated={(id) => writeQuery({ appview: null, record: id })}
-                />
+                <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}
+                  onScreenDrawer={canDriveScreen ? onScreenDrawer : undefined} presentation={canDriveScreen && screenDrawer !== null ? "drawer" : "outlet"}
+                  drawerTarget={independentOpen ? drawerTarget : null}
+                  admitted={receiptReady && contextAdoptionReady && (viewer.operator === true && !viewer.readOnly || viewer.screenReader === true)}
+                  onRoute={screenRoute} onCommand={screenCommand} onNavigation={(navigation) => { setScreenNavigation(navigation); if (navigation === null) closeScreenDrawer(); }} onMediaAttach={attachMediaReference}
+                  fallback={contextAdoptionReady
+                    ? <ScreenUnavailable installation={installation} contexts={contexts} contextId={scope.contextId}
+                        admitted={viewer.operator === true && !viewer.readOnly} operator={viewer.operator === true} />
+                    : <Loading>{t("Loading this app…")}</Loading>} />
               )}
             </>
           )}
         </section>
       </div>
-
-      {chatOpen && (
-        <div className="app-shell-scrim" onClick={() => setChatOpen(false)} aria-hidden="true" />
+      {/* CAD-1777 — the one trusted host overlay for an independent drawer.
+          The primary list keeps its normal box; only this fixed panel (and
+          the scrim above) is modal. The close control lives above the child
+          frame, so it survives a failed child mount. */}
+      {independentOpen && (
+        <div ref={drawerPanelRef} className="app-shell-screen-drawer" role="dialog" aria-modal="true" tabIndex={-1}
+             aria-label={`${title} ${t("Details")}`}>
+          <div className="app-shell-screen-drawer-bar">
+            <span className="truncate text-label text-ink-300">{t("Details")}</span>
+            <Button size="sm" variant="ghost" onClick={closeIndependentDrawer} aria-label={t("Close")}>×</Button>
+          </div>
+          <div ref={attachDrawerTarget} className="app-shell-screen-drawer-body" />
+        </div>
+      )}
+      {receiptReady && installation && !needsSetup && launcherIsCurrent && launchFlow !== null && launcherRun !== null && (
+        <RunLauncher
+          key={`${installId}:${launcherRun.name}:${launcherRun.contextId}:${launcherRun.installDigest}:${launcherRun.contextRevision}`}
+          installation={installation}
+          workflow={launchFlow}
+          contextId={launcherRun.contextId}
+          context={contexts.find((c) => c.id === launcherRun.contextId) ?? null}
+          viewer={viewer}
+          stillCurrent={() => launcherOwnership.current.intent === launcherRun && launcherOwnership.current.current}
+          onClose={() => setLauncherRun((open) => open === launcherRun ? null : open)}
+        />
       )}
     </div>
   );
@@ -713,28 +1360,19 @@ export function chatBinding({ installId, wanted, known, activeIds }: {
   return { scope: { install_id: installId, context_id: wanted }, error: null };
 }
 
+/** The apps the shell sets up a General context for: an installation that
+ *  mounts a screen (portable or Social's native workspace) and has none. */
+function wantsGeneralContext(installation: Installation | null): installation is Installation {
+  return (
+    installation !== null &&
+    installation.removed == null &&
+    (isSocialContent(installation) || screenTag(installation) !== null)
+  );
+}
+
 function contextLabel(contexts: AppContext[], contextId: string): string | null {
   if (!contextId) return null;
   return contexts.find((c) => c.id === contextId)?.config.label ?? null;
-}
-
-/** A scoped-entry link: sets `ctx` and clears any carried record /
- *  new-view / section state so entering a scope never lands on the
- *  prior scope's drawer or draft. Re-entering the already-bound
- *  scope keeps the outlet exactly as it is: the link resolves to the
- *  current URL, so `navigate` no-ops and an open record, the New
- *  view and unsaved drafts survive — the link stays real (copiable,
- *  openable in a new tab), never a dead control. Pure — unit-tested
- *  via the shell. */
-export function scopedEntryHref(href: string, contextId: string, boundId: string): string {
-  if (contextId === boundId) return href;
-  const [path, search] = href.split("?");
-  const q = new URLSearchParams(search ?? "");
-  q.set("ctx", contextId);
-  q.delete("record");
-  q.delete("appview");
-  const s = q.toString();
-  return path + (s ? `?${s}` : "");
 }
 
 /** The daemon-stamped App binding on an entry's payload, if verified. */
