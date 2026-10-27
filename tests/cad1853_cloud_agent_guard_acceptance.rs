@@ -176,34 +176,80 @@ impl Stub {
         std::fs::write(
             &ext,
             "subjectAltName=DNS:issuer.board.localhost\nbasicConstraints=CA:FALSE\n",
-        ).unwrap();
+        )
+        .unwrap();
         let run = |command: &mut std::process::Command| {
             let result = command.stdin(std::process::Stdio::null()).output().unwrap();
-            assert!(result.status.success(), "ephemeral fixture PKI failed: {}", result.status);
+            assert!(
+                result.status.success(),
+                "ephemeral fixture PKI failed: {}",
+                result.status
+            );
         };
         run(std::process::Command::new("openssl")
-            .args(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-                "-nodes", "-days", "1", "-subj", "/CN=c1853-boundary-ca", "-keyout"])
-            .arg(&ca_key).arg("-out").arg(&ca));
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=c1853-boundary-ca",
+                "-keyout",
+            ])
+            .arg(&ca_key)
+            .arg("-out")
+            .arg(&ca));
         run(std::process::Command::new("openssl")
-            .args(["req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-                "-nodes", "-subj", "/CN=issuer.board.localhost", "-keyout"])
-            .arg(&key).arg("-out").arg(&csr));
+            .args([
+                "req",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
+                "-nodes",
+                "-subj",
+                "/CN=issuer.board.localhost",
+                "-keyout",
+            ])
+            .arg(&key)
+            .arg("-out")
+            .arg(&csr));
         run(std::process::Command::new("openssl")
-            .args(["x509", "-req", "-days", "1", "-in"]).arg(&csr)
-            .arg("-CA").arg(&ca).arg("-CAkey").arg(&ca_key).arg("-CAcreateserial")
-            .arg("-extfile").arg(&ext).arg("-out").arg(&cert));
+            .args(["x509", "-req", "-days", "1", "-in"])
+            .arg(&csr)
+            .arg("-CA")
+            .arg(&ca)
+            .arg("-CAkey")
+            .arg(&ca_key)
+            .arg("-CAcreateserial")
+            .arg("-extfile")
+            .arg(&ext)
+            .arg("-out")
+            .arg(&cert));
         for path in [&ca, &ca_key, &key] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         let chain = rustls_pemfile::certs(&mut std::io::BufReader::new(
             std::fs::File::open(cert).unwrap(),
-        )).collect::<Result<Vec<_>, _>>().unwrap();
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
         let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
             std::fs::File::open(key).unwrap(),
-        )).unwrap().unwrap();
-        let config = Arc::new(rustls::ServerConfig::builder()
-            .with_no_client_auth().with_single_cert(chain, key).unwrap());
+        ))
+        .unwrap()
+        .unwrap();
+        let config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .unwrap(),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -215,16 +261,23 @@ impl Stub {
             while !halted.load(SeqCst) {
                 match listener.accept() {
                     Ok((socket, _)) => {
-                        socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-                        socket.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        socket
+                            .set_write_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
                         let closer = socket.try_clone().unwrap();
                         let stream = rustls::StreamOwned::new(
-                            rustls::ServerConnection::new(Arc::clone(&config)).unwrap(), socket,
+                            rustls::ServerConnection::new(Arc::clone(&config)).unwrap(),
+                            socket,
                         );
                         let script = Arc::clone(&shared);
-                        thread::spawn(move || serve_io(stream, script, move || {
-                            let _ = closer.shutdown(std::net::Shutdown::Both);
-                        }));
+                        thread::spawn(move || {
+                            serve_io(stream, script, move || {
+                                let _ = closer.shutdown(std::net::Shutdown::Both);
+                            })
+                        });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -397,8 +450,14 @@ fn serve_io(mut stream: impl Read + Write, script: Arc<Mutex<Script>>, close: im
         .next()
         .and_then(|line| line.split(' ').nth(1))
         .unwrap_or_default();
-    let method = head.lines().next().unwrap_or_default()
-        .split_whitespace().next().unwrap_or_default().to_string();
+    let method = head
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
     let authorization = head
         .lines()
         .find_map(|line| {
@@ -415,13 +474,20 @@ fn serve_io(mut stream: impl Read + Write, script: Arc<Mutex<Script>>, close: im
     if path == "/v1/hosted-cadence/cli-session/renew" {
         let mut recorded = script.lock().unwrap_or_else(|e| e.into_inner());
         recorded.seen.push(Seen {
-            method, action: "renew".into(), body, authorization,
+            method,
+            action: "renew".into(),
+            body,
+            authorization,
         });
         let answer = recorded.renewal_answer.clone();
         drop(recorded);
         match answer {
-            Some(answer) => { reply(&mut stream, 200, &answer); }
-            None => { reply(&mut stream, 500, &json!({"error":"unexpected_renewal"})); }
+            Some(answer) => {
+                reply(&mut stream, 200, &answer);
+            }
+            None => {
+                reply(&mut stream, 500, &json!({"error":"unexpected_renewal"}));
+            }
         }
         return;
     }
@@ -4455,7 +4521,9 @@ fn a_deadline_exhausting_head_does_not_starve_the_next_accepted_turn() {
         draft.thread_id = format!("{home}-deadline-{index:04}");
         draft.conversation_id = format!("conv-deadline-{index:04}");
         draft.remote_session_id = conversation_object(&draft.conversation_id)["remote_session_id"]
-            .as_str().unwrap().to_string();
+            .as_str()
+            .unwrap()
+            .to_string();
         draft.source_uid = "stub-subject".into();
         draft.registration_epoch = 0;
         draft.remote_operation_id = None;
@@ -4463,17 +4531,28 @@ fn a_deadline_exhausting_head_does_not_starve_the_next_accepted_turn() {
         draft.reply_text = None;
         draft.reply_message_id = None;
         // Retain real prior canonical threads without replacing the current home.
-        connection.execute(
-            "INSERT INTO threads(id, archived_alias, created, updated) \
+        connection
+            .execute(
+                "INSERT INTO threads(id, archived_alias, created, updated) \
              SELECT ?1, COALESCE(alias, archived_alias), created, updated \
              FROM threads WHERE id=?2",
-            rusqlite::params![draft.thread_id, home],
-        ).unwrap();
-        store.cloud_agent_bind_session(
-            &id, &draft.source_kind, &draft.source_uid, draft.registration_epoch,
-            &draft.owner, &draft.thread_id, &draft.conversation_id,
-            &draft.remote_session_id, None, None,
-        ).unwrap();
+                rusqlite::params![draft.thread_id, home],
+            )
+            .unwrap();
+        store
+            .cloud_agent_bind_session(
+                &id,
+                &draft.source_kind,
+                &draft.source_uid,
+                draft.registration_epoch,
+                &draft.owner,
+                &draft.thread_id,
+                &draft.conversation_id,
+                &draft.remote_session_id,
+                None,
+                None,
+            )
+            .unwrap();
         store.cloud_agent_operation_begin(&draft).unwrap();
         store
             .cloud_agent_operation_set(
@@ -9312,13 +9391,18 @@ fn due_cloud_login_renews_at_the_wire_boundary_and_read_only_consent_sends_nothi
     // its resolver refuses every non-fixture host, not just real cloud hosts.
     for (key, value) in [
         ("CADENCE_TEST_TLS_CA", ca.into_os_string()),
-        ("CADENCE_TEST_TLS_CONNECT", OsString::from(address.to_string())),
+        (
+            "CADENCE_TEST_TLS_CONNECT",
+            OsString::from(address.to_string()),
+        ),
     ] {
         fx._env.0.push((key, std::env::var_os(key)));
         std::env::set_var(key, value);
     }
     let at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let capabilities = ["bridge.enroll", "cloud_agent.read", "cloud_agent.write"];
     let old_refresh = format!("hcr_{}", "R".repeat(43));
     let new_access = format!("hct_{}", "N".repeat(43));
@@ -9329,9 +9413,14 @@ fn due_cloud_login_renews_at_the_wire_boundary_and_read_only_consent_sends_nothi
         "idle_expires_at": at + 1000, "absolute_expires_at": at + 10_000,
     });
     write_login_owner(LoginSpec {
-        org: ORG, org_id: ORG_ID, endpoint: &fx.stub.url,
-        capabilities: &capabilities, expires: at + 600,
-        subject: "stub-subject", issuer: &fx.stub.url, token_char: "a",
+        org: ORG,
+        org_id: ORG_ID,
+        endpoint: &fx.stub.url,
+        capabilities: &capabilities,
+        expires: at + 600,
+        subject: "stub-subject",
+        issuer: &fx.stub.url,
+        token_char: "a",
     });
     let path = login_path(ORG);
     let mut saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -9341,7 +9430,11 @@ fn due_cloud_login_renews_at_the_wire_boundary_and_read_only_consent_sends_nothi
     std::fs::write(&pin, format!("{}\n", fx.stub.url)).unwrap();
     std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o600)).unwrap();
     let connected = fx.connect();
-    assert_eq!(fx.stub.calls("renew"), 0, "fresh discovery unnecessarily renewed");
+    assert_eq!(
+        fx.stub.calls("renew"),
+        0,
+        "fresh discovery unnecessarily renewed"
+    );
 
     // Make the SAME login due only after connection discovery. The next real
     // operator send, not a direct renewal helper, must rotate before its POST.
@@ -9377,22 +9470,49 @@ fn due_cloud_login_renews_at_the_wire_boundary_and_read_only_consent_sends_nothi
         "cloud_agent_id":cloud_agent_id(&connected), "thread_id":thread,
         "operation_id":OPERATION, "text":TEXT, "wake":true,
     });
-    let first = fx.call(Asserted::Operator, "cloud_agent_send", params.clone()).unwrap();
+    let first = fx
+        .call(Asserted::Operator, "cloud_agent_send", params.clone())
+        .unwrap();
     assert_eq!(first["operation"]["status"], json!("completed"));
-    assert_eq!(first["operation"]["reply"]["text"], json!("reply after cloud-only renewal"));
-    let replay = fx.call(Asserted::Operator, "cloud_agent_send", params).unwrap();
+    assert_eq!(
+        first["operation"]["reply"]["text"],
+        json!("reply after cloud-only renewal")
+    );
+    let replay = fx
+        .call(Asserted::Operator, "cloud_agent_send", params)
+        .unwrap();
     assert_eq!(replay["operation"]["operation_id"], json!(OPERATION));
     assert_eq!(replay["operation"]["status"], json!("completed"));
-    let results: Vec<_> = fx.store().thread_entries_of(&thread, 0, 100).unwrap()
-        .into_iter().filter(|entry| entry.kind == "turn_result").collect();
-    assert_eq!(results.len(), 1, "renewal/replay duplicated canonical completion");
+    let results: Vec<_> = fx
+        .store()
+        .thread_entries_of(&thread, 0, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.kind == "turn_result")
+        .collect();
+    assert_eq!(
+        results.len(),
+        1,
+        "renewal/replay duplicated canonical completion"
+    );
     assert_eq!(results[0].text, "reply after cloud-only renewal");
     fx.stop_daemon();
     {
         let script = fx.stub.script.lock().unwrap();
-        assert_eq!(script.calls("renew"), 1, "one due login must renew exactly once");
-        assert_eq!(script.calls("submit"), 1, "renewal/replay duplicated model submit");
-        assert!(script.seen.len() >= 2, "renewal never reached a contract POST");
+        assert_eq!(
+            script.calls("renew"),
+            1,
+            "one due login must renew exactly once"
+        );
+        assert_eq!(
+            script.calls("submit"),
+            1,
+            "renewal/replay duplicated model submit"
+        );
+        assert!(
+            script.seen.len() >= 2,
+            "renewal never reached a contract POST"
+        );
         let renewal = &script.seen[0];
         assert_eq!(renewal.action, "renew", "contract POST preceded renewal");
         assert_eq!(renewal.method, "POST");
@@ -9400,47 +9520,83 @@ fn due_cloud_login_renews_at_the_wire_boundary_and_read_only_consent_sends_nothi
         let operation = &renewal.body["operation_id"];
         let suffix = operation.as_str().unwrap().strip_prefix("op_").unwrap();
         assert!((32..=80).contains(&suffix.len()));
-        assert!(suffix.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)));
-        assert_eq!(renewal.body, json!({
-            "version":"hosted-cadence-cli-session.v1",
-            "session_id":session["session_id"], "operation_id":operation,
-            "expected_generation":7, "organization_id":ORG_ID, "organization_slug":ORG,
-            "audience":fx.stub.url, "subject_id":"stub-subject",
-            "device_label":session["device_label"], "capabilities":capabilities,
-        }));
+        assert!(suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)));
+        assert_eq!(
+            renewal.body,
+            json!({
+                "version":"hosted-cadence-cli-session.v1",
+                "session_id":session["session_id"], "operation_id":operation,
+                "expected_generation":7, "organization_id":ORG_ID, "organization_slug":ORG,
+                "audience":fx.stub.url, "subject_id":"stub-subject",
+                "device_label":session["device_label"], "capabilities":capabilities,
+            })
+        );
         for contract in &script.seen[1..] {
             assert_eq!(contract.method, "POST");
-            assert_eq!(contract.authorization, format!("bearer {new_access}"),
-                "contract POST used stale access token or refresh token");
+            assert_eq!(
+                contract.authorization,
+                format!("bearer {new_access}"),
+                "contract POST used stale access token or refresh token"
+            );
         }
     }
 
     // A valid, due renewable READ-only login cannot perform a WRITE action.
     // Reuse the actual submit body and exercise the public send boundary:
     // scope refusal must precede both issuer renewal and the contract POST.
-    let submit = fx.stub.seen().into_iter()
+    let submit = fx
+        .stub
+        .seen()
+        .into_iter()
         .find(|body| body["action"] == "submit")
         .expect("the positive half recorded its real submit body");
     let negative_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     // Keep the newly issued access/session pair, not the spent refresh token.
     saved = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     saved["capabilities"] = json!(["cloud_agent.read"]);
-    saved["cli_session"] = fx.stub.script.lock().unwrap().renewal_answer
-        .as_ref().unwrap()["cli_session"].clone();
+    saved["cli_session"] = fx
+        .stub
+        .script
+        .lock()
+        .unwrap()
+        .renewal_answer
+        .as_ref()
+        .unwrap()["cli_session"]
+        .clone();
     saved["expires_at"] = json!(negative_at + 45);
     std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
     fx.stub.set(|script| script.seen.clear());
     let target = cadence_agent::remote_cli::RemoteTarget {
-        identity:None, org:ORG.into(), org_id:ORG_ID.into(), endpoint:fx.stub.url.clone(),
+        identity: None,
+        org: ORG.into(),
+        org_id: ORG_ID.into(),
+        endpoint: fx.stub.url.clone(),
     };
     let refused = cadence_agent::remote_cli::cloud_agent_post(
-        &target, CONTRACT_PATH,
+        &target,
+        CONTRACT_PATH,
         &submit,
         "cloud_agent.write",
-    ).expect_err("read-only consent must be refused before either wire boundary");
-    assert_eq!(fx.stub.calls("renew"), 0, "narrowed consent contacted issuer");
-    assert!(fx.stub.seen().is_empty(), "narrowed consent reached contract transport");
+    )
+    .expect_err("read-only consent must be refused before either wire boundary");
+    assert_eq!(
+        fx.stub.calls("renew"),
+        0,
+        "narrowed consent contacted issuer"
+    );
+    assert!(
+        fx.stub.seen().is_empty(),
+        "narrowed consent reached contract transport"
+    );
     println!("CLOUD_RENEWAL_BOUNDARY positive: renew=1 submit=1 canonical_result=1 new_access_only; negative: kind={} code={:?} renew=0 contract=0 (expected cloud_agent_scope_revoked)", refused.kind(), code(&refused));
-    assert_eq!(code(&refused), Some("cloud_agent_scope_revoked"), "{refused}");
+    assert_eq!(
+        code(&refused),
+        Some("cloud_agent_scope_revoked"),
+        "{refused}"
+    );
 }

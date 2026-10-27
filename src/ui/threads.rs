@@ -305,7 +305,10 @@ pub(super) fn stream(
     }
     let cloud_notice = |w: &mut dyn Write, reason: Option<&str>| {
         let data = json!({"cloud_withheld": reason});
-        frame(w, format!("event: cloud_withheld\ndata: {data}\n\n").as_bytes())
+        frame(
+            w,
+            format!("event: cloud_withheld\ndata: {data}\n\n").as_bytes(),
+        )
     };
     let mut cloud_withheld = first["cloud_withheld"].as_str().map(str::to_owned);
     if cloud_withheld.is_some() && !cloud_notice(&mut w, cloud_withheld.as_deref()) {
