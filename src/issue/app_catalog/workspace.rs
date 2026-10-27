@@ -451,11 +451,12 @@ fn resolved_bundle(
     Ok((files, validated, provenance))
 }
 
-/// CAD-1271: one immutable, descriptor-relative local snapshot validated by
-/// the same install-check path. Offline preview consumers must keep using this
-/// map rather than reopening package members after validation.
+/// One immutable descriptor-relative snapshot for offline static previews.
+/// Integrity-only previews still validate all known content, but observe rather
+/// than enforce Native requirements. They grant no execution or admission.
 pub(crate) fn snapshot_validated_local(
     source: &Path,
+    integrity_only: bool,
 ) -> Result<(BTreeMap<String, String>, app::Validated)> {
     if source
         .symlink_metadata()
@@ -473,14 +474,15 @@ pub(crate) fn snapshot_validated_local(
         .map_err(|error| Error::rejected(format!("cannot resolve app source: {error}")))?;
     let root = Root::open(&dir)?;
     let files = snapshot(&root, Path::new(""), true)?;
-    let validated = app::validate_texts(
-        files
-            .iter()
-            .map(|(name, text)| (name.clone(), text.clone()))
-            .collect(),
-        &Default::default(),
-        &[],
-    )?;
+    let texts = files
+        .iter()
+        .map(|(name, text)| (name.clone(), text.clone()))
+        .collect();
+    let validated = if integrity_only {
+        app::inspect_texts(texts, &Default::default(), &[])?
+    } else {
+        app::validate_texts(texts, &Default::default(), &[])?
+    };
     Ok((files, validated))
 }
 
@@ -731,6 +733,16 @@ fn check_host_block() -> Result<Value> {
 /// offline refusal. A bundle relying on that registry still meets it at
 /// install-check time — offline validation weakens nothing there.
 pub fn check_offline(source: &str) -> Result<Value> {
+    check_package(source, false)
+}
+
+/// Inspect full package integrity without claiming target compatibility.
+/// Contract-specific payload semantics remain the target validator's concern.
+pub fn inspect_offline(source: &str) -> Result<Value> {
+    check_package(source, true)
+}
+
+fn check_package(source: &str, inspection: bool) -> Result<Value> {
     let mut report = json!({
         "schema": 1,
         "check": "app-package/1",
@@ -742,6 +754,19 @@ pub fn check_offline(source: &str) -> Result<Value> {
             and consents to nothing",
         "host": check_host_block()?,
     });
+    let compatibility_key = if inspection {
+        report["check"] = json!("app-package-inspection/1");
+        report["validation"] = json!("package-integrity");
+        report["secret_policy"] = json!("no-host-allowlist");
+        report["target_compatibility"] = Value::Null;
+        report["stateful_admission"] = json!(
+            "not assessed — inspection installs, approves and consents to nothing; \
+             target contract/schema validation and runtime acceptance are separate"
+        );
+        "native_compatibility"
+    } else {
+        "compatibility"
+    };
     // A remote source is a transport step — the offline check never
     // fetches, clones or opens the network.
     if source.contains("://") || source.starts_with("git@") {
@@ -828,15 +853,16 @@ pub fn check_offline(source: &str) -> Result<Value> {
         "cap": app::MAX_APP_BYTES,
     });
 
-    // ---- content: the same `validate_texts` install-check runs, with
-    // the empty registry an offline check always has (see the doc). A
-    // concrete `agent:` name stays an unverifiable note here; install
-    // admission still resolves it against the PM registry.
-    match app::validate_texts(
-        files.iter().map(|(n, t)| (n.clone(), t.clone())).collect(),
-        &Default::default(),
-        &[],
-    ) {
+    // Both paths validate the complete snapshot; only Native admission requires
+    // the observed host requirements. Target-owned contract semantics are not
+    // inferred from an integrity pass.
+    let texts = files.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
+    let validated = if inspection {
+        app::inspect_texts(texts, &Default::default(), &[])
+    } else {
+        app::validate_texts(texts, &Default::default(), &[])
+    };
+    match validated {
         Ok(validated) => {
             report["ok"] = json!(true);
             report["name"] = json!(validated.manifest.app);
@@ -848,7 +874,7 @@ pub fn check_offline(source: &str) -> Result<Value> {
                 .listing
                 .as_ref()
                 .map(|listing| &listing.value));
-            report["compatibility"] = validated.compatibility;
+            report[compatibility_key] = validated.compatibility;
             report["notes"] = json!(validated.notes);
             report["secret_warnings"] = crate::secret::warnings_json(&validated.secret_warnings);
             Ok(report)
@@ -860,7 +886,7 @@ pub fn check_offline(source: &str) -> Result<Value> {
                 .get("app.md")
                 .and_then(|text| app::parse_manifest(text).ok())
             {
-                report["compatibility"] = manifest
+                report[compatibility_key] = manifest
                     .requires
                     .report(&app_compat::host(env!("CARGO_PKG_VERSION"))?);
             }

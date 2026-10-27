@@ -19,7 +19,18 @@ const OUTPUT_CAP: usize = 8 * 1024 * 1024;
 const STDERR_CAP: usize = 32 * 1024;
 
 /// Write a fresh export directory, optionally mounting a checked local bundle.
-pub fn write_frame_kit(out: &Path, bundle: Option<&Path>, parent_origin: &str) -> Result<i32> {
+pub fn write_frame_kit(
+    out: &Path,
+    bundle: Option<&Path>,
+    parent_origin: &str,
+    integrity_only: bool,
+) -> Result<i32> {
+    if integrity_only && bundle.is_none() {
+        return Err(Error::invalid(
+            "bundle_required",
+            "--integrity-only requires --bundle",
+        ));
+    }
     validate_origin(parent_origin)?;
     if out.exists() {
         return Err(Error::rejected(
@@ -35,7 +46,10 @@ pub fn write_frame_kit(out: &Path, bundle: Option<&Path>, parent_origin: &str) -
         ),
         Some(path) => {
             let (files, validated) =
-                crate::issue::app_catalog::workspace::snapshot_validated_local(path)?;
+                crate::issue::app_catalog::workspace::snapshot_validated_local(
+                    path,
+                    integrity_only,
+                )?;
             let tags = crate::issue::app_screen_pkg::tags_in(&files)?;
             if tags.len() != 1 {
                 return Err(Error::rejected(
@@ -68,12 +82,15 @@ pub fn write_frame_kit(out: &Path, bundle: Option<&Path>, parent_origin: &str) -
                 .collect::<Vec<_>>()
                 .join("\n");
             let digest = crate::issue::app_catalog::workspace::bundle_digest(&files);
-            let metadata = json!({
+            let mut metadata = json!({
                 "screen":{"tag":pkg.tag,"app":pkg.app,"contract":pkg.contract,"may":pkg.may,
                     "tools":pkg.tools,"entry":FRAME_KIT_ENTRY,"bundle_digest":digest},
                 "projection_fixture_contract":FIXTURE_CONTRACT,
                 "kit":SCREEN_KIT_VERSION
             });
+            if integrity_only {
+                metadata["qualification"] = preview_qualification(validated.compatibility);
+            }
             (pkg.tag, css, js, metadata)
         }
     };
@@ -179,7 +196,7 @@ fn validate_origin(origin: &str) -> Result<()> {
 
 /// Generate labelled, synthetic canonical PUSH values without daemon, PM,
 /// provider, installation state or execution of package assets.
-pub fn write_fixtures(bundle: &Path, json_output: bool) -> Result<i32> {
+pub fn write_fixtures(bundle: &Path, json_output: bool, integrity_only: bool) -> Result<i32> {
     if !json_output {
         return Err(Error::invalid(
             "json_required",
@@ -187,7 +204,7 @@ pub fn write_fixtures(bundle: &Path, json_output: bool) -> Result<i32> {
         ));
     }
     let (files, validated) =
-        crate::issue::app_catalog::workspace::snapshot_validated_local(bundle)?;
+        crate::issue::app_catalog::workspace::snapshot_validated_local(bundle, integrity_only)?;
     let tags = crate::issue::app_screen_pkg::tags_in(&files)?;
     if tags.len() != 1 {
         return Err(Error::rejected(
@@ -216,14 +233,27 @@ pub fn write_fixtures(bundle: &Path, json_output: bool) -> Result<i32> {
         return Err(Error::rejected("fixture producer input exceeds its bound"));
     }
     let output = run_producer(&bytes)?;
-    let result: Value = serde_json::from_slice(&output)
+    let mut result: Value = serde_json::from_slice(&output)
         .map_err(|_| Error::internal("trusted fixture producer returned invalid JSON"))?;
+    if integrity_only {
+        result["qualification"] = preview_qualification(validated.compatibility);
+    }
     println!(
         "{}",
         serde_json::to_string(&result)
             .map_err(|e| Error::internal(format!("encode fixture output: {e}")))?
     );
     Ok(0)
+}
+
+fn preview_qualification(native_compatibility: Value) -> Value {
+    let mut qualification = json!({
+        "validation": "package-integrity",
+        "target_compatibility": null,
+        "authority": "static-preview-only; no installation, approval or runtime admission"
+    });
+    qualification["native_compatibility"] = native_compatibility;
+    qualification
 }
 
 struct Captured {
