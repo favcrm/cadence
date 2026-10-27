@@ -1896,6 +1896,27 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
           WHERE json_valid(payload)",
         [],
     )?;
+    // Two coordination events COPY that screen line into their own `reason`
+    // before persisting it: a blocked delivery says which approval menu is
+    // open, and a refused recovery says the same. Keep the event, the
+    // message and the static verdict; drop the copied subject.
+    tx.execute(
+        "UPDATE events SET payload=json_remove(payload,'$.reason') \
+          WHERE kind IN ('gate_wait','submit_recover_refused') \
+            AND json_valid(payload)",
+        [],
+    )?;
+    // A monitor alert materializes the scoped event payload it fired on, so the
+    // same screen prose can sit one level down in `monitor_alerts.payload`.
+    // The alert keeps its identity, task, kind, state and fingerprint; the
+    // copied transcript does not.
+    tx.execute(
+        "UPDATE monitor_alerts SET payload=json_remove(payload, \
+           '$.payload.before','$.payload.after','$.payload.line', \
+           '$.payload.probe.reason','$.payload.claim_probe','$.payload.reprobe') \
+          WHERE json_valid(payload)",
+        [],
+    )?;
     tx.execute(
         &format!(
             "{cloud_messages} DELETE FROM messages WHERE id IN (SELECT id FROM cloud_message)"
