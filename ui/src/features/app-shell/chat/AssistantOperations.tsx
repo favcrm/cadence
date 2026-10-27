@@ -55,6 +55,10 @@ interface PermissionRequest {
   reason: string;
   scope: { install_id: string; context_id: string; action_id: string; resource_id: string };
   allow_always: boolean;
+  // The server-stated lifetime of an "Always allow" grant (CAD-1868):
+  // "installation" for a Standalone board's local operator, "session" for a
+  // hosted owner. Absent on cards parked before it existed.
+  allowAlwaysScope: "installation" | "session" | null;
   preview: TagPreview | null;
   recordPreview: RecordPreview | null;
   mediaPreview: MediaRefinePreview | null;
@@ -229,7 +233,7 @@ function parsePermissionRequest(value: unknown): PermissionRequest | null {
   const scope = record(v?.scope);
   if (!v || !scope || typeof v.allow_always !== "boolean") return null;
   if (v.preview_kind !== undefined && v.preview_kind !== null && v.preview_kind !== "record" && v.preview_kind !== "media_refine") return null;
-  if (v.preview_kind === "media_refine" && v.allow_always !== false) return null;
+  if (v.allow_always_scope !== undefined && v.allow_always_scope !== "installation" && v.allow_always_scope !== "session") return null;
   const fields = [scope.install_id, scope.context_id, scope.action_id, scope.resource_id];
   if (!fields.every((field) => typeof field === "string" && field.length > 0 && field.length <= 128)) return null;
   const reason = text(v.reason, 300);
@@ -245,6 +249,7 @@ function parsePermissionRequest(value: unknown): PermissionRequest | null {
       resource_id: scope.resource_id as string,
     },
     allow_always: v.allow_always,
+    allowAlwaysScope: v.allow_always_scope === "installation" || v.allow_always_scope === "session" ? v.allow_always_scope : null,
     preview: v.preview_kind === "media_refine" ? null : parseTagPreview(v.preview),
     recordPreview: v.preview_kind === "media_refine" ? null : parseRecordPreview(v.preview),
     mediaPreview,
@@ -313,9 +318,24 @@ function resultValues(value: unknown, depth = 0): Array<[string, string]> {
   return rows;
 }
 
-/** Actions the operator may allow always: tags per customer, and the paid
- *  Social actions for this installation (CAD-1852). Media refine stays allow-once. */
-const STANDING_ACTIONS: ReadonlySet<string> = new Set(["customer.tags.update", "social.posts.fetch", "social.draft.create"]);
+/** Actions the operator may allow always, each with the label that states
+ *  the grant's real scope: tags per customer, the paid Social actions for the
+ *  whole installation (CAD-1852), and library image refine while the granting
+ *  owner stays signed in on this board (CAD-1868). */
+const STANDING_LABELS: Readonly<Record<string, string>> = {
+  "customer.tags.update": "Always allow for this customer",
+  "social.posts.fetch": "Always allow — any post in this installation",
+  "social.draft.create": "Always allow — any post in this installation",
+  "media.refine.prepare": "Always allow image edits while I'm signed in",
+};
+/** The button label for this card: the server's stated lifetime wins; a card
+ *  without one keeps the hosted wording. */
+function standingLabel(request: PermissionRequest, actionId: string): string {
+  if (actionId === "media.refine.prepare" && request.allowAlwaysScope === "installation") {
+    return "Always allow image edits — this installation";
+  }
+  return STANDING_LABELS[actionId];
+}
 
 function AssistantOperationCard({ operation, installId, contextId, busy, decide, appPath }: {
   operation: Operation;
@@ -330,7 +350,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
   const request = operation.permission_request;
   const requestMatches = request !== null && request.scope.install_id === installId &&
     request.scope.context_id === contextId && request.scope.action_id === operation.action_id &&
-    (!request.allow_always || STANDING_ACTIONS.has(operation.action_id));
+    (!request.allow_always || Object.hasOwn(STANDING_LABELS, operation.action_id));
   const requiresTagPreview = operation.action_id === "customer.tags.update";
   // A declared record change is decided only from its authoritative typed
   // preview, which must name this request's record. Legacy tag preview and
@@ -344,7 +364,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
   const mediaPreview = request?.mediaPreview ?? null;
   const mediaPreviewReady = mediaKind && mediaPreview !== null && request !== null &&
     mediaPreview.asset_id === request.scope.resource_id && mediaPreview.allow_once === true &&
-    request.allow_always === false && operation.action_id === "media.refine.prepare";
+    operation.action_id === "media.refine.prepare";
   const recordPreviewMissing = recordKind && !recordPreviewReady;
   const previewReady = requiresTagPreview
     ? request?.preview !== null && request?.preview !== undefined
@@ -392,7 +412,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
                   <div><dt>{t("Original")}</dt><dd>{mediaPreview.sha256}</dd></div>
                   <div><dt>{t("Instructions")}</dt><dd>{mediaPreview.instructions}</dd></div>
                   <div><dt>{t("Model")}</dt><dd>{mediaPreview.model}</dd></div>
-                  <div><dt>{t("Estimated price")}</dt><dd>{t("about")} {formatUsdMicros(mediaPreview.quote.total_price_micros)}</dd></div>
+                  <div><dt>{t("Estimated price")}</dt><dd>{t("about {price}").replace("{price}", formatUsdMicros(mediaPreview.quote.total_price_micros))}</dd></div>
                 </dl>
               </div>
             )}
@@ -408,7 +428,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
             )}
             <div className="app-assistant-controls">
               <Button size="sm" variant="primary" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_once")}>{t("Allow once")}</Button>
-              {request.allow_always && !mediaKind && <Button size="sm" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_always")}>{operation.action_id === "customer.tags.update" ? t("Always allow for this customer") : t("Always allow")}</Button>}
+              {request.allow_always && Object.hasOwn(STANDING_LABELS, operation.action_id) && <Button size="sm" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_always")}>{t(standingLabel(request, operation.action_id))}</Button>}
               <Button size="sm" variant="danger" disabled={busy || !previewReady} onClick={() => decide(operation, "deny")}>{t("Deny this request")}</Button>
             </div>
           </>}

@@ -471,13 +471,19 @@ impl AgenticosExternalAdapter {
             let definite_refusal = envelope["ok"] == false
                 && (400..500).contains(&status)
                 && !matches!(status, 408 | 409 | 425 | 429);
-            return Err(if definite_refusal {
-                AppCapabilityError::Refused(format!("AgenticOS source read refused: {code}"))
-            } else {
-                AppCapabilityError::Uncertain(format!(
-                    "AgenticOS source read outcome is uncertain: {code}"
-                ))
-            });
+            return Err(
+                if status == 402 && definite_refusal && code == "insufficient_funds" {
+                    AppCapabilityError::InsufficientFunds(format!(
+                        "AgenticOS source read refused: {code}"
+                    ))
+                } else if definite_refusal {
+                    AppCapabilityError::Refused(format!("AgenticOS source read refused: {code}"))
+                } else {
+                    AppCapabilityError::Uncertain(format!(
+                        "AgenticOS source read outcome is uncertain: {code}"
+                    ))
+                },
+            );
         }
         let data = envelope.get("data").ok_or_else(|| {
             AppCapabilityError::Uncertain(
@@ -702,6 +708,11 @@ impl AgenticosExternalAdapter {
             }
             if status >= 500 || status == 0 {
                 return Err(AppCapabilityError::Uncertain(UNCERTAIN.into()));
+            }
+            if status == 402 && envelope["ok"] == false && code == "insufficient_funds" {
+                return Err(AppCapabilityError::InsufficientFunds(format!(
+                    "AgenticOS text generation refused: {code}"
+                )));
             }
             return Err(AppCapabilityError::Refused(format!(
                 "AgenticOS text generation refused: {code}"

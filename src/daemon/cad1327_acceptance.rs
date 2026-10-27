@@ -3,7 +3,7 @@
 //! weaken it). It drives the real `Shared::dispatch` guards — the live-turn
 //! verifier on `app_assistant_invoke`, the operator-connection proof on
 //! `app_assistant_decision`, the install-time `app-assistant/v1` validator,
-//! the registry allow-list and the confirmed-price ceiling — against a door
+//! the registry allow-list and the live-quote charge ceiling — against a door
 //! that counts every provider call. Every "nothing was charged" assertion is
 //! paired with a positive control in the same fixture that moves the counter.
 #![cfg(feature = "test-seam")]

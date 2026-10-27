@@ -168,7 +168,8 @@ impl Shared {
         }) {
             return Err(Error::rejected("inputs must be a string map"));
         }
-        let created = self.create_app_run_as(params, team.as_ref(), Some(expected), human)?;
+        let created =
+            self.create_app_run_as(params, team.as_ref(), Some(expected), human, false)?;
         let id = created["id"]
             .as_str()
             .ok_or_else(|| Error::internal("created run has no id"))?
@@ -289,6 +290,58 @@ impl Shared {
         })
     }
 
+    /// CAD-1868: who a run acts as. Without `sealed_grant` it is the relayed
+    /// browser credential (`run_creator`, `account_image_actor`). With it, the
+    /// run belongs to a refine standing grant and acts as the grant's sealed
+    /// owner `human`: re-proven fresh (`fresh_run_human`), its live public
+    /// row read by session reference, the account actor taken from that row's
+    /// current hash (`account_image_actor_for_session`) and required to be
+    /// that same owner. Any refusal refuses the run; there is no operator
+    /// fallback, and a relayed credential cannot ride along.
+    fn run_actors(
+        &self,
+        params: &Value,
+        human: Option<&Value>,
+        sealed_grant: bool,
+    ) -> Result<(Value, Value)> {
+        if !sealed_grant {
+            return Ok((self.run_creator(params)?, self.account_image_actor(params)?));
+        }
+        if ["token", "key", "origin", "public_session"]
+            .iter()
+            .any(|field| params.get(field).is_some())
+        {
+            return Err(Error::rejected(
+                "a standing-grant run carries no session credential",
+            ));
+        }
+        let lapsed = || {
+            Error::gate_coded(
+                "human_authority_revoked",
+                "the board session that allowed this is no longer current; the run is refused",
+            )
+        };
+        let human = human.ok_or_else(lapsed)?;
+        self.fresh_run_human(human)?;
+        let (Some(sub), Some(company), Some(session)) = (
+            human["sub"].as_str(),
+            human["company"].as_str(),
+            human["session"].as_str(),
+        ) else {
+            return Err(lapsed());
+        };
+        let hash = self
+            .operator_auth()
+            .public_snapshot_by_session_id(session, self.operator_now())
+            .map(|snapshot| snapshot.hash)
+            .ok_or_else(lapsed)?;
+        let actor = self.account_image_actor_for_session(&hash)?;
+        if actor["kind"] != "user" || actor["id"] != sub || actor["workspace_id"] != company {
+            return Err(lapsed());
+        }
+        Ok((json!({"kind": "user", "id": sub}), actor))
+    }
+
     /// The one run-creation path: `app_run_create` (owner and workers named by
     /// the caller) and `app_run_start` (owner and workers from the install's
     /// default team, quotes checked against `expected`). Operator proof is the
@@ -299,6 +352,7 @@ impl Shared {
         team: Option<&super::app_teams_rpc::Team>,
         expected: Option<&Value>,
         human: Option<&Value>,
+        sealed_grant: bool,
     ) -> Result<Value> {
         // CAD-1171: a host-execution run names no owner PM — the operator's
         // own click executes its capability steps. An agent run still needs
@@ -309,8 +363,7 @@ impl Shared {
         // `{kind:"operator"}`; a relayed credential must fully verify
         // through `tool_session` — partial or invalid proofs refuse,
         // never an operator fallback.
-        let creator = self.run_creator(params)?;
-        let account_actor = self.account_image_actor(params)?;
+        let (creator, account_actor) = self.run_actors(params, human, sealed_grant)?;
         // Owner resolution needs the installed template's declared
         // execution, so it happens inside the runtime snapshot below.
         if params.get("source_receipt_id").is_some() != params.get("selected_post_id").is_some() {
@@ -545,9 +598,8 @@ impl Shared {
             .into_iter()
             .map(|(slot, request)| Ok((slot, request.fetch()?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        if self.run_creator(params)? != creator
-            || self.account_image_actor(params)? != account_actor
-        {
+        let (creator_now, actor_now) = self.run_actors(params, human, sealed_grant)?;
+        if creator_now != creator || actor_now != account_actor {
             return Err(Error::rejected(
                 "native run creator changed during price discovery",
             ));
@@ -905,7 +957,7 @@ impl Shared {
                     "revoke",
                 )
             }
-            "app_run_create" => self.create_app_run_as(params, None, None, human),
+            "app_run_create" => self.create_app_run_as(params, None, None, human, false),
             "app_run_start" => self.start_app_run(params, human),
             "app_run_approve" => {
                 let id = required_str(params, "run_id")?;
@@ -1001,8 +1053,6 @@ impl Shared {
     /// proof of authority loss, and the final locked receipt check remains
     /// authoritative. Price drift is accepted, so a fresh quote is not
     /// compared with the frozen one.
-    /// Kept as the CAD-1142 re-quote witness: it only observes that every
-    /// slot still quotes; the result is never compared with the frozen price.
     pub(super) fn probe_app_run_prices(&self, run: &Value) -> Result<()> {
         if let Ok(requests) = self.prepare_app_run_quotes(run) {
             for request in requests.into_values() {
@@ -1520,14 +1570,9 @@ impl Shared {
                             error.kind(),
                             &message,
                         )?;
-                        return Err(match error {
-                            crate::platform::AppCapabilityError::Refused(_) => {
-                                Error::provider(message)
-                            }
-                            crate::platform::AppCapabilityError::Uncertain(_) => {
-                                Error::unknown(message)
-                            }
-                        });
+                        return Err(super::app_capabilities_rpc::run_capability_error(
+                            &error, message,
+                        ));
                     }
                 };
                 // CAD-1258 interleaving point: a revoke or upgrade may land here.

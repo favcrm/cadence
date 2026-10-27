@@ -164,6 +164,16 @@ impl Error {
             revision: None,
         })
     }
+    /// An explicit provider refusal with a stable code. The wire kind stays
+    /// `provider` (CAD-1868: the typed 402 `insufficient_funds`).
+    pub fn provider_coded(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Structured(Structured {
+            kind: "provider",
+            code: code.to_string(),
+            message: message.into(),
+            revision: None,
+        })
+    }
     /// Invalid input with a stable code. The wire kind stays `rejected`.
     pub fn invalid(code: &'static str, message: impl Into<String>) -> Self {
         Self::Structured(Structured {

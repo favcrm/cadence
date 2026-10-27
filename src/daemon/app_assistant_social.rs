@@ -1,16 +1,17 @@
 //! CAD-1327: the Social Content assistant actions (`social.posts.fetch`,
 //! `social.draft.create`, `social.drafts.status`) as reviewed host handlers.
 //!
-//! Authority split. The agent turn only resolves and validates, quotes the
-//! price and parks a `pending_permission` operation; it never spends. The
-//! paid work runs inside `decide_assistant_operation`, which is reachable
-//! only with the operator proof (daemon RPC and the OperatorOnly board
-//! route) or under that operator's standing grant (CAD-1852). Every paid step
-//! goes through `app_tool_execute`, the same guarded core the screen uses; the
+//! Authority split. The agent turn resolves and validates, quotes the price
+//! and parks a `pending_permission` operation; it spends only under the
+//! operator's standing grant (CAD-1852). Otherwise the paid work runs inside
+//! `decide_assistant_operation`, which is reachable only with the operator
+//! proof (daemon RPC and the OperatorOnly board route). Every paid step goes
+//! through `app_tool_execute`, the same guarded core the screen uses; the
 //! live quote is the provider's `max_charge_minor` and no confirmed price is
 //! compared. Balance is the only cost stop. The request id is derived from
-//! (install, context, operation, step), so a replay can never charge twice. Publish, approve, send, discard and
-//! settings are not registered here at all.
+//! (install, context, operation, step), so a replay can never charge twice.
+//! Publish, approve, send, discard and settings are not registered here at
+//! all.
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -338,8 +339,9 @@ impl Shared {
         Ok(selected)
     }
 
-    /// Agent turn: park the paid action with its exact scope and the price
-    /// the operator will confirm. Nothing is spent here.
+    /// Agent turn: park the paid action with its exact scope and estimated
+    /// price. Under the operator's standing grant it then runs and spends;
+    /// without one nothing is spent here.
     pub(super) fn social_request_permission(
         self: &std::sync::Arc<Self>,
         records: &RecordStore,
@@ -415,6 +417,21 @@ impl Shared {
                 "the note is too long to show in full on the confirmation card; shorten it",
             ));
         }
+        // Every lookup that can fail runs before the card is parked, so a
+        // failure never leaves a pending card behind (CAD-1869 item 4).
+        let (descriptor_digest, _) = super::app_assistant_rpc::install_descriptor(self, install)?;
+        let meta = crate::app_assistant::registered_action(action)
+            .ok_or_else(|| Error::rejected("unknown assistant action"))?;
+        let pinned = super::app_assistant_rpc::grant_digest(action, &meta, &descriptor_digest);
+        // Standing grant (CAD-1852): the operator's earlier "Always allow" for
+        // this action in this installation runs it without a new card. A
+        // revoked grant, or one whose action semantics changed, parks the card.
+        let granted = records
+            .app_assistant_permission_find(context, action, STANDING_RESOURCE, "allow")?
+            .is_some_and(|p| {
+                p["state"].as_str() == Some("active")
+                    && p["semantics_digest"].as_str() == Some(pinned.as_str())
+            });
         let parked = records.app_assistant_operation_set(crate::store::app_records::AssistantOperationUpdate {
             operation_id,
             context,
@@ -431,22 +448,7 @@ impl Shared {
             }),
             error: None,
         })?;
-        // Standing grant (CAD-1852): the operator's earlier "Always allow" for
-        // this action in this installation runs it without a new card. A
-        // revoked grant, or one whose action semantics changed, parks the card.
-        let (descriptor_digest, _) = super::app_assistant_rpc::install_descriptor(self, install)?;
-        let meta = crate::app_assistant::registered_action(action)
-            .ok_or_else(|| Error::rejected("unknown assistant action"))?;
-        let grant_digest = crate::store::app_runs::material_digest(
-            &json!({"contract":crate::issue::app_assistant::CONTRACT,"action":action,"schema":meta.input_schema,"handler_version":meta.handler_version,"descriptor_digest":descriptor_digest}),
-        );
-        let granted = records
-            .app_assistant_permission_find(context, action, STANDING_RESOURCE, "allow")?
-            .filter(|p| {
-                p["state"].as_str() == Some("active")
-                    && p["semantics_digest"].as_str() == Some(grant_digest.as_str())
-            });
-        if granted.is_some() {
+        if granted {
             let private = records.app_assistant_operation_get(operation_id, context)?;
             return self.social_run(records, install, context, &private, input);
         }
