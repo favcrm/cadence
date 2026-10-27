@@ -12,8 +12,10 @@ interface ContextProps {
   actor: string;
   onToast: WikiProps["onToast"];
   navHref: (route: Route) => string;
-  /** A hosted tenant does not serve the wiki; the project context is wiki-backed. */
-  hosted?: boolean;
+  /** The board does not serve the wiki (see wikiAvailable); the project context is wiki-backed. */
+  noWiki?: boolean;
+  /** Upload through POST /api/wiki/upload (hosted) instead of transfer jobs. */
+  multipartUpload?: boolean;
 }
 
 export default function Context({
@@ -22,12 +24,13 @@ export default function Context({
   actor,
   onToast,
   navHref,
-  hosted = false,
+  noWiki = false,
+  multipartUpload = false,
 }: ContextProps) {
   const t = useTranslate();
   const href = useHref();
   const scope = useMemo(() => ({ root: projectWikiRoot(project), label: "Context" }), [project]);
-  if (hosted) {
+  if (noWiki) {
     return (
       <main className="context-workspace" aria-label={`${project} context`}>
         <div className="p-5 text-secondary text-ink-400">{t("The wiki isn’t available on this board.")}</div>
@@ -39,7 +42,7 @@ export default function Context({
   return (
     <main className="context-workspace" aria-label={`${project} context`}>
       {project === "all" ? <div className="p-5 text-secondary text-ink-400">{t("Choose a project to open its context.")}</div> : route ? (
-        <Wiki key={project} scope={scope} route={route} navHref={wikiHref} readOnly={readOnly} actor={actor} onToast={onToast} />
+        <Wiki key={project} multipartUpload={multipartUpload} scope={scope} route={route} navHref={wikiHref} readOnly={readOnly} actor={actor} onToast={onToast} />
       ) : <div className="p-5" role="alert">{t("This page is outside the project’s context.")} <Link className="lnk" href={`/projects/${encodeURIComponent(project)}/context`}>{t("Open project context")}</Link></div>}
     </main>
   );

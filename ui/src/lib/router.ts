@@ -95,12 +95,13 @@ export const NAV: { screen: Screen; label: string; route: Route }[] = [
 ];
 
 /**
- * The nav a board carries. A hosted tenant does not serve the wiki (the shared
- * UI's requests answer 501), so it is not advertised there; a local board keeps
- * it. The route still explains itself if reached by a deep link.
+ * The nav a board carries. A board that does not serve the wiki (a hosted
+ * tenant without `wiki: true`; the shared UI's requests answer 501) does not
+ * advertise it; a local board keeps it. The route still explains itself if
+ * reached by a deep link.
  */
-export function navItems(hosted: boolean): typeof NAV {
-  return hosted ? NAV.filter((item) => item.screen !== "wiki") : NAV;
+export function navItems(noWiki: boolean): typeof NAV {
+  return noWiki ? NAV.filter((item) => item.screen !== "wiki") : NAV;
 }
 
 /**

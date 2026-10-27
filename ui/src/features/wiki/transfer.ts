@@ -232,6 +232,50 @@ export async function importFile(
   return { outcome, extraction, index: text(status.index) ?? "pending", ...(rev ? { rev } : {}), ...(error ? { error } : {}) };
 }
 
+/**
+ * Hosted boards (whose Worker advertises `wiki: true`) serve no transfer-job
+ * protocol: one multipart `POST /api/wiki/upload` carries the file (`file`)
+ * and its destination (`path`, plus `if_rev`) — the same shape
+ * the local board accepts. Progress is all-or-nothing.
+ */
+export async function uploadMultipart(
+  root: string,
+  file: File,
+  update: boolean,
+  onProgress: (percent: number) => void,
+  operation: PrivateOperation,
+): Promise<ImportResult> {
+  if (file.name.includes("/") || file.name.includes("\\") || file.name === "." || file.name === "..") {
+    throw new WikiError("Use a file name inside this folder", 400);
+  }
+  const cap = entryKind(file.name) === "text" ? MAX_TEXT_BYTES : MAX_FILE_BYTES;
+  if (file.size > cap) throw new WikiError(`over ${Math.round(cap / (1024 * 1024))} MB — rejected`, 400);
+  const ifRev = await destinationRev(root, file.name, update);
+  operation.assertCurrent();
+  const form = new FormData();
+  form.append("path", root ? `${root}/${file.name}` : file.name);
+  form.append("if_rev", ifRev); // "none" = create only, never clobber
+  form.append("file", file, file.name);
+  onProgress(0);
+  const resp = await privateFetch("/api/wiki/upload", {
+    method: "POST",
+    headers: { "X-Cadence-Board": "1", ...sessionHeaders() },
+    body: form,
+  }, operation);
+  const body: unknown = await resp.json().catch(() => null);
+  operation.assertCurrent();
+  if (resp.status === 401) notifyPrivateSessionRequired(resp.status, body, operation);
+  const row = record(body);
+  if (!resp.ok) {
+    // Hosted refusals nest as {error:{code,message}}; local ones are {error:"…"}.
+    const nested = record(row?.error);
+    throw wikiErrorFrom(resp.status, nested ? { ...row, error: text(nested.message), code: text(row?.code) ?? text(nested.code) } : body);
+  }
+  onProgress(100);
+  const rev = text(row?.rev) ?? undefined;
+  return { outcome: text(row?.outcome) ?? "applied", extraction: text(row?.extraction) ?? "not_applicable", index: text(row?.index) ?? "covered", ...(rev ? { rev } : {}) };
+}
+
 export async function exportOriginal(path: string, at: string, operation: PrivateOperation): Promise<Blob> {
   if (!at) throw new WikiError("This revision is unavailable", 404);
   const parts: Uint8Array[] = [];
