@@ -1766,9 +1766,16 @@ fn a_replacement_owner_cannot_read_retained_cloud_pair_content() {
     println!("V11_OWNER_STAGE stage=seed-owner-a");
     let saved_a = std::fs::read(login_path(ORG)).unwrap();
     let (pair, routed) = v8_routed_pair(&fx, "https://issuer.example.test", REPLY_A);
-    let original = fx.call(Asserted::Operator, "cloud_agent_list", json!({})).unwrap();
-    let id_a = original["agents"].as_array().unwrap().iter()
-        .find(|agent| agent["alias"] == json!(ALIAS)).unwrap()["id"].clone();
+    let original = fx
+        .call(Asserted::Operator, "cloud_agent_list", json!({}))
+        .unwrap();
+    let id_a = original["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["alias"] == json!(ALIAS))
+        .unwrap()["id"]
+        .clone();
     let owner_b = json!({
         "issuer":"https://replacement-issuer.example.test", "subject":"replacement-owner-b",
     });
@@ -1809,22 +1816,32 @@ fn a_replacement_owner_cannot_read_retained_cloud_pair_content() {
     assert_eq!(connected_b["agent"]["alias"], json!(ALIAS));
     assert_eq!(connected_b["agent"]["organization_id"], json!(ORG_ID));
     let grant_b = connected_b["agent"]["sources"]
-        .as_array().unwrap().iter()
+        .as_array()
+        .unwrap()
+        .iter()
         .find(|source| source["kind"] == json!("user") && source["owner"] == owner_b)
         .expect("B must acquire its own explicit user grant");
     assert_eq!(grant_b["state"], json!("active"));
     assert_eq!(grant_b["invoker_id"], json!(invoker_b));
     let sessions = connected_b["agent"]["sessions"].as_array().unwrap();
-    let session_b = sessions.iter()
+    let session_b = sessions
+        .iter()
         .find(|row| row["source"]["kind"] == json!("user") && row["source"]["owner"] == owner_b)
         .expect("B must establish its own session");
-    let session_a = sessions.iter()
-        .find(|row| row["source"]["kind"] == json!("user")
-            && row["source"]["owner"] == json!({"issuer":"https://issuer.example.test", "subject":"stub-subject"}))
+    let session_a = sessions
+        .iter()
+        .find(|row| {
+            row["source"]["kind"] == json!("user")
+                && row["source"]["owner"]
+                    == json!({"issuer":"https://issuer.example.test", "subject":"stub-subject"})
+        })
         .expect("A's original session must remain retained");
     assert_eq!(session_b["remote_session_id"], json!(SESSION_B));
     assert_eq!(session_b["invoker_id"], json!(invoker_b));
-    assert_ne!(session_b["remote_session_id"], session_a["remote_session_id"]);
+    assert_ne!(
+        session_b["remote_session_id"],
+        session_a["remote_session_id"]
+    );
     assert_eq!(fx.stub.calls("submit"), 1, "connect spent a model turn");
     println!("V11_OWNER_CHECKPOINT stage=connect-owner-b own_grant=true own_session=true own_token=true submit_delta=0");
 
@@ -1834,17 +1851,28 @@ fn a_replacement_owner_cannot_read_retained_cloud_pair_content() {
     let id = cloud_agent_id(&connected_b);
     let home = thread_of(&connected_b);
     let wire = fx.stub.seen().len();
-    fx.call(Asserted::Operator, "cloud_agent_send", json!({
-        "cloud_agent_id":id, "thread_id":home, "operation_id":OPERATION_B,
-        "text":"B's own legitimate request", "wake":true,
-    })).unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id":id, "thread_id":home, "operation_id":OPERATION_B,
+            "text":"B's own legitimate request", "wake":true,
+        }),
+    )
+    .unwrap();
     assert_eq!(fx.stub.seen().len() - wire, 1);
     assert_eq!(&fx.stub.auths()[wire..], std::slice::from_ref(&token_b));
     let proof = proof_before(&fx.stub);
     let wire = fx.stub.seen().len();
-    let own_b = fx.call(Asserted::Operator, "cloud_agent_read", json!({
-        "cloud_agent_id":id, "operation_id":OPERATION_B,
-    })).expect("B's own current read authority must work");
+    let own_b = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_read",
+            json!({
+                "cloud_agent_id":id, "operation_id":OPERATION_B,
+            }),
+        )
+        .expect("B's own current read authority must work");
     assert_proof_delta(&fx.stub, proof, &[OPERATION_B], 1);
     assert_eq!(fx.stub.seen().len() - wire, 1);
     assert_eq!(&fx.stub.auths()[wire..], std::slice::from_ref(&token_b));
@@ -1856,7 +1884,11 @@ fn a_replacement_owner_cannot_read_retained_cloud_pair_content() {
     println!("V11_OWNER_CHECKPOINT stage=owner-b-own-read own_reply=true own_owner=true own_session=true readbacks=1 own_token=true");
 
     for original in [false, true] {
-        let stage = if original { "original-a" } else { "replacement-b" };
+        let stage = if original {
+            "original-a"
+        } else {
+            "replacement-b"
+        };
         if original {
             // Restore A's original credential, not a new consent or reseeded
             // result: the exact retained rows must still be readable by A.
@@ -1876,30 +1908,51 @@ fn a_replacement_owner_cannot_read_retained_cloud_pair_content() {
             } else {
                 json!({"include_system":true})
             };
-            let page = fx.call(Asserted::Operator, method, params)
+            let page = fx
+                .call(Asserted::Operator, method, params)
                 .expect("owner filtering must preserve the pair page");
-            let proofs = if method == "work_conversation_read" { 2 } else { 1 };
+            let proofs = if method == "work_conversation_read" {
+                2
+            } else {
+                1
+            };
             let operation = if original { OPERATION } else { OPERATION_B };
             assert_proof_delta(&fx.stub, proof, &vec![operation; proofs], proofs);
-            assert_eq!(fx.stub.seen().len() - wire, proofs, "extra transport: {stage}/{method}");
+            assert_eq!(
+                fx.stub.seen().len() - wire,
+                proofs,
+                "extra transport: {stage}/{method}"
+            );
             let token = if original { &token_a } else { &token_b };
             assert!(fx.stub.auths()[wire..].iter().all(|auth| auth == token));
             assert_eq!(fx.stub.calls("submit"), 2, "a pair read spent a model turn");
             if !original {
-                assert!(!page.to_string().contains(V8_REQUEST), "A request leaked: {page}");
-                assert!(!page.to_string().contains(REPLY_A), "A reply leaked: {page}");
+                assert!(
+                    !page.to_string().contains(V8_REQUEST),
+                    "A request leaked: {page}"
+                );
+                assert!(
+                    !page.to_string().contains(REPLY_A),
+                    "A reply leaked: {page}"
+                );
             }
             if method == "work_conversation_read" {
                 let messages = page["messages"].as_array().unwrap();
                 assert_eq!(messages.len(), 3, "the retained pair lost metadata: {page}");
-                let ordinary = messages.iter()
-                    .find(|row| row["id"] == json!("m-v8-pair-ordinary")).unwrap();
+                let ordinary = messages
+                    .iter()
+                    .find(|row| row["id"] == json!("m-v8-pair-ordinary"))
+                    .unwrap();
                 assert_eq!(ordinary["body"], json!(V8_ORDINARY));
                 assert!(ordinary["cloud_withheld"].is_null());
-                let request = messages.iter()
-                    .find(|row| row["id"] == json!(V8_PEER_OPERATION)).unwrap();
-                let report = messages.iter()
-                    .find(|row| row["id"] == json!(routed)).unwrap();
+                let request = messages
+                    .iter()
+                    .find(|row| row["id"] == json!(V8_PEER_OPERATION))
+                    .unwrap();
+                let report = messages
+                    .iter()
+                    .find(|row| row["id"] == json!(routed))
+                    .unwrap();
                 if original {
                     assert_eq!(request["body"], json!(V8_REQUEST));
                     assert!(request["cloud_withheld"].is_null());
@@ -1922,14 +1975,21 @@ fn a_replacement_owner_cannot_read_retained_cloud_pair_content() {
                     }
                 }
             } else {
-                let row = page["conversations"].as_array().unwrap().iter()
-                    .find(|row| row["id"] == json!(pair)).unwrap();
+                let row = page["conversations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["id"] == json!(pair))
+                    .unwrap();
                 if original {
                     assert!(!row["last"]["preview"].as_str().unwrap().is_empty());
                     assert!(row["last"]["cloud_withheld"].is_null());
                 } else {
                     assert_eq!(row["last"]["preview"], json!(""));
-                    assert_eq!(row["last"]["cloud_withheld"], json!("cloud_agent_owner_changed"));
+                    assert_eq!(
+                        row["last"]["cloud_withheld"],
+                        json!("cloud_agent_owner_changed")
+                    );
                 }
             }
             println!("V11_OWNER_CHECKPOINT stage={stage} method={method} passed=true readbacks={proofs} own_token=true ordinary=true submit_delta=0");
