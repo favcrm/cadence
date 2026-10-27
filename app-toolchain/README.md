@@ -45,6 +45,37 @@ HTTP `localhost`/`*.localhost` origin with a port, not a loopback IP literal.
 
 The default exported frame is an empty offline reference. For an app smoke test, serve the exported frame and mount your application using the actual `--parent-origin` and `--bundle` values. Do not patch generated renderer bytes, replace the host bridge, or treat the empty reference as a running app integration.
 
+## Package integrity is not runtime admission
+
+Use the matching, archive-verified CLI for the complete immutable bundle:
+
+```sh
+cadence app inspect ./path/to/app-bundle --json
+cadence app frame-kit --out /tmp/my-app-static-frame \
+  --bundle ./path/to/app-bundle --parent-origin http://localhost:5173 --integrity-only
+cadence app fixtures --bundle ./path/to/app-bundle --json --integrity-only
+```
+
+`inspect` emits `app-package-inspection/1`: the same inventory, byte limits,
+secret scans, manifest, known descriptors, workflows, screens and storage/member
+pairing checks as `app check`. Its digest binds every original member.
+Inspection reports `secret_policy: no-host-allowlist`: it uses the same scanner
+without loading or inheriting a machine's Native secret exceptions. Native
+validation retains its existing operator exception policy.
+`native_compatibility` reports the actual Native registry; `target_compatibility`
+is null, never an inferred hosted compatibility verdict. Unknown contract payload
+semantics, including the `app-storage/v1` migration DSL, need their target's
+validator and runtime acceptance. Inspection installs, approves and consents to
+nothing.
+
+`--integrity-only` is explicit static preview, not permission to run unsupported
+contracts. Both preview commands retain their Native-checked defaults. Default
+`app check`, install, execution approval and run still refuse a requirement
+Native does not implement; recognizing storage files does not implement storage.
+These commands require a CLI release containing `app inspect` and the explicit
+preview flags; an older released CLI must refuse, not be treated as a pass.
+
+
 ## Screen bridge receiver
 
 `app-kit/` is the receiver an app screen uses for the private MessagePort

@@ -41,6 +41,15 @@ pub(crate) enum AppAction {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect complete package integrity without claiming target compatibility.
+    /// Observes Native requirements; installs, approves and consents to nothing.
+    Inspect {
+        /// Package directory.
+        source: String,
+        /// Emit the machine-readable inspection receipt.
+        #[arg(long)]
+        json: bool,
+    },
     /// Host-managed per-installation customer records with scoped revisions.
     Record {
         #[command(subcommand)]
@@ -92,6 +101,9 @@ pub(crate) enum AppAction {
         /// Exact parent origin allowed by the frame bridge.
         #[arg(long, default_value = "http://127.0.0.1")]
         parent_origin: String,
+        /// Static preview only: inspect integrity without requiring Native support.
+        #[arg(long, requires = "bundle")]
+        integrity_only: bool,
     },
     /// Emit canonical screen PUSH fixtures from a local validated app bundle.
     Fixtures {
@@ -101,6 +113,9 @@ pub(crate) enum AppAction {
         /// Require the machine-readable fixture envelope.
         #[arg(long)]
         json: bool,
+        /// Synthetic fixtures only; does not prove target runtime compatibility.
+        #[arg(long)]
+        integrity_only: bool,
     },
     /// Run the app's declared local preview. In a detached app repository,
     /// `--package .` reads `package.json.cadence` and runs the app-owned
@@ -2720,15 +2735,25 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
             out,
             bundle,
             parent_origin,
+            integrity_only,
         } => {
             return cadence_agent::app_preview_export::write_frame_kit(
                 out,
                 bundle.as_deref(),
                 parent_origin,
+                *integrity_only,
             );
         }
-        AppAction::Fixtures { bundle, json } => {
-            return cadence_agent::app_preview_export::write_fixtures(bundle, *json);
+        AppAction::Fixtures {
+            bundle,
+            json,
+            integrity_only,
+        } => {
+            return cadence_agent::app_preview_export::write_fixtures(
+                bundle,
+                *json,
+                *integrity_only,
+            );
         }
         AppAction::Dev {
             name,
@@ -2747,9 +2772,10 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                 allow_host,
             );
         }
-        // CAD-1270: `check` is dispatched before org/state-dir
-        // resolution — it never reaches the daemon path.
-        AppAction::Check { .. } => unreachable!("app check dispatches before state-dir resolution"),
+        // Offline package commands dispatch before org/state-dir resolution.
+        AppAction::Check { .. } | AppAction::Inspect { .. } => {
+            unreachable!("offline app validation dispatches before state-dir resolution")
+        }
         AppAction::Install { source, project } => {
             let pm = cadence_agent::issue::Pm::open_default()?;
             app::install(&pm, project, source, state_dir, "")?
@@ -2826,7 +2852,16 @@ pub(super) fn run(state_dir: PathBuf, action: AppAction) -> Result<i32> {
 /// report prints to stdout; the exit code is the verdict (0 pass, 3
 /// refusal — `rejected` in the kind table).
 pub(super) fn run_check(source: &str, _json: bool) -> Result<i32> {
-    let report = cadence_agent::issue::app_catalog::workspace::check_offline(source)?;
+    print_package_report(cadence_agent::issue::app_catalog::workspace::check_offline(
+        source,
+    )?)
+}
+
+pub(super) fn run_inspect(source: &str, _json: bool) -> Result<i32> {
+    print_package_report(cadence_agent::issue::app_catalog::workspace::inspect_offline(source)?)
+}
+
+fn print_package_report(report: serde_json::Value) -> Result<i32> {
     let ok = report["ok"].as_bool() == Some(true);
     print_json(&report);
     Ok(if ok { 0 } else { 3 })

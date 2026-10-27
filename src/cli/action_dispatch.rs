@@ -500,6 +500,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 out,
                 bundle,
                 parent_origin,
+                integrity_only,
             },
     } = &cli.command
     {
@@ -507,13 +508,19 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             out,
             bundle.as_deref(),
             parent_origin,
+            *integrity_only,
         );
     }
     if let Commands::App {
-        action: app::AppAction::Fixtures { bundle, json },
+        action:
+            app::AppAction::Fixtures {
+                bundle,
+                json,
+                integrity_only,
+            },
     } = &cli.command
     {
-        return cadence_agent::app_preview_export::write_fixtures(bundle, *json);
+        return cadence_agent::app_preview_export::write_fixtures(bundle, *json, *integrity_only);
     }
     if let Commands::App {
         action:
@@ -544,6 +551,12 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     } = &cli.command
     {
         return app::run_check(source, *json);
+    }
+    if let Commands::App {
+        action: app::AppAction::Inspect { source, json },
+    } = &cli.command
+    {
+        return app::run_inspect(source, *json);
     }
     let tracker = std::env::var_os("CADENCE_PM_DIR")
         .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))

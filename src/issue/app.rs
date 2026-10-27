@@ -1485,9 +1485,8 @@ fn workflow_slots(text: &str) -> Result<Vec<String>> {
     Ok(slots)
 }
 
-/// What `validate` returns on success: the parsed manifest, the
-/// verified file texts (`rel-path → text`, sorted), the secret guard's
-/// warnings and the workflow checks' notes.
+/// Integrity-checked package bytes and observations, not execution authority.
+/// Native validation additionally enforces the actual host requirements.
 pub(crate) struct Validated {
     pub(crate) manifest: Manifest,
     pub(crate) files: Vec<(String, String)>,
@@ -1534,7 +1533,14 @@ pub(crate) fn validate(
         }
         files.push((rel, text));
     }
-    validate_contents(files, secret_warnings, errors, agents, agent_sources)
+    validate_contents(
+        files,
+        secret_warnings,
+        errors,
+        agents,
+        agent_sources,
+        CompatibilityCheck::RequireNative,
+    )
 }
 
 /// Validate an immutable descriptor-read snapshot before workspace publication.
@@ -1542,6 +1548,40 @@ pub(crate) fn validate_texts(
     files: Vec<(String, String)>,
     agents: &HashSet<String>,
     agent_sources: &[String],
+) -> Result<Validated> {
+    validate_snapshot(
+        files,
+        agents,
+        agent_sources,
+        CompatibilityCheck::RequireNative,
+    )
+}
+
+/// Inspect immutable bytes without claiming that their target contracts are
+/// implemented by Native. Unknown contract payload semantics remain target-owned.
+pub(crate) fn inspect_texts(
+    files: Vec<(String, String)>,
+    agents: &HashSet<String>,
+    agent_sources: &[String],
+) -> Result<Validated> {
+    validate_snapshot(
+        files,
+        agents,
+        agent_sources,
+        CompatibilityCheck::ReportNative,
+    )
+}
+
+enum CompatibilityCheck {
+    RequireNative,
+    ReportNative,
+}
+
+fn validate_snapshot(
+    files: Vec<(String, String)>,
+    agents: &HashSet<String>,
+    agent_sources: &[String],
+    compatibility: CompatibilityCheck,
 ) -> Result<Validated> {
     if files.len() > MAX_FILES {
         return Err(Error::rejected("app bundle exceeds its file limit"));
@@ -1552,13 +1592,31 @@ pub(crate) fn validate_texts(
         ));
     }
     let mut warnings = Vec::new();
+    // Portable inspection must not consult a machine's state or inherit its
+    // operator exceptions. Native validation retains its existing allowlist.
+    let no_host_exceptions = crate::secret::Allowlist::default();
     for (name, text) in &files {
         if text.len() as u64 > file_cap(name) {
             return Err(Error::rejected("app bundle file exceeds its limit"));
         }
-        warnings.extend(crate::secret::guard(&format!("app file {name}"), text)?);
+        let findings = match &compatibility {
+            CompatibilityCheck::RequireNative => {
+                crate::secret::guard(&format!("app file {name}"), text)?
+            }
+            CompatibilityCheck::ReportNative => {
+                crate::secret::guard_with(&format!("app file {name}"), text, &no_host_exceptions)?
+            }
+        };
+        warnings.extend(findings);
     }
-    validate_contents(files, warnings, Vec::new(), agents, agent_sources)
+    validate_contents(
+        files,
+        warnings,
+        Vec::new(),
+        agents,
+        agent_sources,
+        compatibility,
+    )
 }
 
 /// Storage members and their requirement are one package contract, including
@@ -1591,6 +1649,7 @@ fn validate_contents(
     mut errors: Vec<String>,
     agents: &HashSet<String>,
     agent_sources: &[String],
+    compatibility: CompatibilityCheck,
 ) -> Result<Validated> {
     let manifest = match files.iter().find(|(rel, _)| rel == MANIFEST) {
         Some((_, text)) => match parse_manifest(text) {
@@ -1798,14 +1857,16 @@ fn validate_contents(
     if workflow_count == 0 && !has_tools_only_screen(&files, &manifest) {
         errors.push("workflows/ holds no *.md workflow".to_string());
     }
-    let compatibility = match app_compat::host(env!("CARGO_PKG_VERSION"))
-        .and_then(|host| manifest.requires.check(&host))
-    {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            errors.push(error.to_string());
-            Value::Null
-        }
+    let host = app_compat::host(env!("CARGO_PKG_VERSION"))?;
+    let compatibility = match compatibility {
+        CompatibilityCheck::ReportNative => manifest.requires.report(&host),
+        CompatibilityCheck::RequireNative => match manifest.requires.check(&host) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                errors.push(error.to_string());
+                Value::Null
+            }
+        },
     };
     if !errors.is_empty() {
         return Err(Error::rejected(format!(
