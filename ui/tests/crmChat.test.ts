@@ -118,6 +118,21 @@ assert(steps[0].querySelector(".steps-body") && steps[0].querySelector(".steps-h
 assert(host.querySelector('[data-chat-card="directive"]'), "CSV confirm renders as a card");
 for (const bad of [SECRET, "req-9", "confirm_token", "cadence_csv_import", "ctx-a", "{"]) assert(!text().includes(bad), `chat never shows ${bad}`);
 assert(text().includes("Customer import"), "card reads as a human summary");
+// CAD-1865: the pane's header copy hands back what the row shows, not what the
+// daemon stored — the internal context id must not survive the copy either.
+{
+  const copied: string[] = [];
+  Object.defineProperty(win.navigator, "clipboard", {
+    value: { writeText: async (t: string) => { copied.push(t); } },
+    configurable: true,
+  });
+  const copy = host.querySelector("[data-chat-header-copy]") as HTMLButtonElement | null;
+  assert(copy !== null, "the pane offers a copy action for its newest answer");
+  await React.act(async () => { copy!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  equal(copied.length, 1, "one clipboard write");
+  assert(copied[0].includes("VIP customers") && copied[0].includes("this workspace"), "the copy carries the projected answer text");
+  assert(!copied[0].includes("ctx-a"), "the copy never carries the internal context id the row hides");
+}
 // CAD-1168/CAD-1174: no default chip or prompt row, one shared compact
 // composer. App Attach stays off until the native capability contract.
 assert(!host.querySelector("[data-chat-context]") && !host.querySelector(".app-chat-prompt"), "no default chip or prompt row");
