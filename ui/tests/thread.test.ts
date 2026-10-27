@@ -348,6 +348,54 @@ async function main() {
     );
   }
 
+  // CAD-1853: availability is independent of rows and never retains cached
+  // cloud history. Server provenance, not kind/alias/text, selects eviction.
+  {
+    const ordinary = entry(20, "operator", "message", "cloud_agent is just text");
+    const cloud = entry(10, "agent", "turn_result", "private", { payload: { cloud_agent: {} } });
+    const request = entry(11, "operator", "message", "cloud request", { payload: { source: "cloud_agent" } });
+    let s = addPending(mergePage(null, {
+      thread: { id: "t1" }, entries: [cloud, request, ordinary], reply_seq: 50,
+    }), "waiting", "ordinary pending", 1);
+    s = { ...s, cursor: 100, older: 10, moreBefore: true };
+    s = mergePage(s, { entries: [], cloud_withheld: "revoked" });
+    equal(
+      [s.cloudWithheld, s.entries.map((e) => e.seq), s.pending.map((p) => p.message), s.cursor, s.older, s.replySeq],
+      ["revoked", [20], ["waiting"], 100, 10, 50],
+      "denial evicts both cloud provenance shapes but preserves ordinary history, pending and watermarks",
+    );
+    s = reduceFrame(s, { type: "entry", data: JSON.stringify(cloud), id: "10" });
+    equal(s.entries.map((e) => e.seq), [20], "a replay cannot put cloud history back while withheld");
+    s = reduceFrame(s, {
+      type: "entry", data: JSON.stringify({ ...ordinary, text: "ordinary delivery updated" }), id: "20",
+    });
+    equal(s.entries[0].text, "ordinary delivery updated", "overlapping entries still update while cloud is denied");
+    for (const data of ['{"cloud_withheld":"future-code"}', "{}", "null", "not json", '{"cloud_withheld":false}', '{"cloud_withheld":""}']) {
+      s = reduceFrame(s, { type: "cloud_withheld", data, id: null });
+      equal(s.cloudWithheld != null && s.entries.every((e) => e.seq === 20), true, "unknown/malformed status never restores cloud access");
+    }
+    s = reduceFrame(s, { type: "cloud_withheld", data: '{"cloud_withheld":null}', id: null });
+    equal([s.cloudWithheld, s.cloudRefreshNeeded], [null, true], "explicit null clears the notice and requests restoration");
+    const calls: string[] = [];
+    s = await loadThread({
+      after: async () => { throw new Error("restoration must not skip evicted rows via catch-up"); },
+      tail: async () => {
+        calls.push("tail");
+        return { thread: { id: "t1" }, entries: [cloud, request], cursor: 100, more_before: true, scanned_before: 10 };
+      },
+      before: async () => { throw new Error("unexpected earlier read"); },
+    }, s);
+    equal(
+      [calls, s.cloudWithheld, s.cloudRefreshNeeded, s.entries.map((e) => e.seq), s.pending.map((p) => p.message), s.replySeq],
+      [["tail"], null, false, [10, 11, 20], ["waiting"], 50],
+      "restoration rereads the tail and merges ordinary rows/pending without lowering the complete reply watermark",
+    );
+    const empty = reduceFrame(null, { type: "cloud_withheld", data: '{"cloud_withheld":"unreachable"}', id: null });
+    equal([empty.cloudWithheld, empty.entries, empty.pending], ["unreachable", [], []], "status-only frames work before any entry");
+    const clean = mergePage(empty, { thread: { id: "t1" }, entries: [ordinary] });
+    equal([clean.cloudWithheld, clean.entries.map((e) => e.seq)], [null, [20]], "a clean page also clears unavailable status");
+  }
+
   // Plan cards: each epic once, at its first mention.
   {
     equal(planRef(entry(1, "agent", "tool_result", '{"epic": "D-2", "tickets": ["D-3"]}')), "D-2", "json epic");

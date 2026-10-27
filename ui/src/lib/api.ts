@@ -127,6 +127,8 @@ export interface ThreadPage {
   scanned_before?: number;
   /** Forward reads: the scan filled the page, so raw rows may remain. */
   more_after?: boolean;
+  /** Cloud content is incomplete/unavailable; ordinary rows and cursors remain usable. */
+  cloud_withheld?: string;
   /** CAD-1700: the complete thread's newest visible assistant reply seq
    *  (0 when none), independent of the page cursor. */
   reply_seq?: number;

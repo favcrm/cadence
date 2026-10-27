@@ -626,6 +626,10 @@ impl Shared {
                 // say why. The read still answers, so the page loads and the
                 // reader is told the cloud history is unavailable rather than
                 // shown it.
+                #[cfg(feature = "test-seam")]
+                if let Some(observer) = &self.cloud_projection_observer {
+                    observer(verb, Some("cloud_agent_authority_missing"));
+                }
                 return Ok(CloudProjection {
                     withheld: Some("cloud_agent_authority_missing".to_string()),
                     ..CloudProjection::default()
@@ -714,6 +718,10 @@ impl Shared {
         }
         let mut projection = CloudProjection::cloud(scopes);
         projection.withheld = withheld;
+        #[cfg(feature = "test-seam")]
+        if let Some(observer) = &self.cloud_projection_observer {
+            observer(verb, projection.withheld.as_deref());
+        }
         Ok(projection)
     }
 

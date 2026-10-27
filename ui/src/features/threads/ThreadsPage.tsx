@@ -19,7 +19,7 @@ import { IconClose, IconRefresh, IconSearch, IconThreads } from "../../ui/icons"
 import type { Agent } from "../../lib/types";
 import Composer from "../app-shell/chat/Composer";
 import { attachItems, removeAttach, setComposerContent } from "../app-shell/chat/composerStore";
-import { asEntry, newMessageId, type ThreadEntry } from "../home/thread";
+import { asEntry, isCloudEntry, newMessageId, pageCloudWithheld, type ThreadEntry } from "../home/thread";
 import AgentAvatar, { lookFor } from "../agents/AgentAvatar";
 import { activeTasks } from "../agents/AgentBlocks";
 import { lifecycleBadge, lifecycleOf } from "../agents/agentView";
@@ -719,6 +719,12 @@ function Timeline({
   const [before, setBefore] = useState<number | null>(null);
   const [more, setMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [withheld, setWithheld] = useState<string | null>(null);
+  const cloudStatus = useRef<string | null>(null);
+  const cloudRead = useRef(0);
+  const cloudAppliedRead = useRef(0);
+  // Retain the window start so clean refreshes can restore evicted rows.
+  const cloudWindowStart = useRef<number | null>(null);
   const [tick, setTick] = useState(0);
   const scopeKey = `${scope.project ?? ""}|${scope.agent ?? ""}|${scope.include_system ? 1 : 0}`;
 
@@ -726,9 +732,12 @@ function Timeline({
   const pull = async (at: ReadPageOptions): Promise<Pulled> => {
     if (dm) {
       // Operator DM: the agent's home thread, read by its conversation id.
+      const read = ++cloudRead.current;
       const p = await api.thread(dm, { ...at, limit: PAGE, conversation: row.id });
       return {
         entries: threadEntries(p.entries),
+        withheld: pageCloudWithheld(p),
+        read,
         cursor: p.cursor ?? at.after ?? 0,
         more_before: p.more_before === true,
         // The backward continuation the daemon SCANNED past its projection.
@@ -753,8 +762,23 @@ function Timeline({
       full: p.cursor > (at.after ?? 0),
     };
   };
-  const absorb = ({ entries: e, posts: po, messages: m }: Pulled) => {
-    if (e) setEntries((cur) => mergeBySeq(cur, e));
+  const absorb = ({ entries: e, posts: po, messages: m, withheld, read }: Pulled) => {
+    if (e) {
+      // Older history may overlap a refresh, but its status cannot undo a
+      // newer observation. A pending read alone does not erase a denial.
+      if (read !== undefined && read >= cloudAppliedRead.current) {
+        cloudAppliedRead.current = read;
+        cloudStatus.current = withheld ?? null;
+        setWithheld(cloudStatus.current);
+      }
+      setEntries((cur) => {
+        const merged = mergeBySeq(cur, e);
+        if (cloudStatus.current !== null && merged.length > 0) {
+          cloudWindowStart.current = Math.min(cloudWindowStart.current ?? merged[0].seq, merged[0].seq);
+        }
+        return cloudStatus.current === null ? merged : merged.filter((entry) => !isCloudEntry(entry));
+      });
+    }
     if (po) setPosts((cur) => mergeBySeq(cur, po));
     if (m) setMessages((cur) => mergeBySeq(cur, m));
   };
@@ -765,6 +789,7 @@ function Timeline({
   // `loadEarlier` is gated by the epoch only, so a live tick does not drop it.
   const epoch = useRef({ id: "", n: 0 });
   const live = useRef(0);
+  useEffect(() => () => { epoch.current.n++; live.current++; }, []);
   const identity = `${row.id}|${scopeKey}`;
   useEffect(() => {
     const reset = epoch.current.id !== identity;
@@ -775,13 +800,21 @@ function Timeline({
       setMessages(null);
       setBefore(null);
       setMore(false);
+      setWithheld(null);
+      cloudStatus.current = null;
+      cloudAppliedRead.current = ++cloudRead.current;
+      cloudWindowStart.current = null;
+      setError(null);
     }
     const n = epoch.current.n;
     const g = ++live.current;
     const current = () => g === live.current && epoch.current.n === n;
     const loaded = reset ? null : dm ? entries : isGroup ? posts : messages;
     // Pages are ascending, so the window's first row is its oldest seq.
-    const oldest = loaded && loaded.length > 0 ? loaded[0].seq : null;
+    const first = loaded && loaded.length > 0 ? loaded[0].seq : null;
+    const oldest = !reset && cloudWindowStart.current !== null
+      ? Math.min(first ?? cloudWindowStart.current, cloudWindowStart.current)
+      : first;
     const fail = (e: unknown) => {
       if (current()) setError(e instanceof ApiError ? e.message : String(e));
     };
@@ -795,7 +828,7 @@ function Timeline({
       const more = p.more_after ?? p.full;
       if (more && p.cursor > after) await step(p.cursor);
     };
-    if (oldest === null && before !== null) {
+    if (!reset && oldest === null && before !== null) {
       // An empty window that already knows where it continues: every row it
       // holds was filtered out. Refreshing must not reopen the tail, because
       // that would throw away the backward progress the boundary carries —
@@ -866,6 +899,9 @@ function Timeline({
       </header>
       {dm && <DmContext alias={dm} agents={agents} issueProjects={issueProjects} />}
       <div className="threads-messages" aria-live="polite">
+        {withheld !== null && (
+          <p className="threads-note" role="status">{t("Cloud content unavailable")}</p>
+        )}
         {error ? (
           <p className="threads-note" role="status">{t("This conversation could not load:")} {error}</p>
         ) : (dm ? entries : isGroup ? posts : messages) === null ? (
@@ -890,7 +926,7 @@ function Timeline({
                   ))}
             {isGroup
               ? (posts ?? []).length === 0 && <p className="threads-note">{t("No posts yet.")}</p>
-              : (dm ? entries ?? [] : messages ?? []).length === 0 && <p className="threads-note">{t("No messages yet.")}</p>}
+              : withheld === null && (dm ? entries ?? [] : messages ?? []).length === 0 && <p className="threads-note">{t("No messages yet.")}</p>}
           </>
         )}
       </div>
@@ -930,6 +966,9 @@ type Pulled = {
   entries?: ThreadEntry[];
   posts?: TopicPost[];
   messages?: ThreadMessage[];
+  withheld?: string | null;
+  /** The DM read's issue order, separate from entry sequence/cursors. */
+  read?: number;
   cursor: number;
   /** Raw rows remain below the backward boundary. */
   more_before: boolean;
@@ -1454,7 +1493,13 @@ function DraftDm({
 }) {
   const [entries, setEntries] = useState<ThreadEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [withheld, setWithheld] = useState<string | null>(null);
   const t = useTranslate();
+  useEffect(() => {
+    setEntries(null);
+    setWithheld(null);
+    setError(null);
+  }, [alias]);
   useEffect(() => {
     let live = true;
     // No `conversation` selector: the home read of an alias with no thread is empty.
@@ -1463,7 +1508,9 @@ function DraftDm({
       .then((p) => {
         if (!live) return;
         setError(null);
-        setEntries(threadEntries(p.entries));
+        const status = pageCloudWithheld(p);
+        setWithheld(status);
+        setEntries(threadEntries(p.entries).filter((entry) => status === null || !isCloudEntry(entry)));
       })
       .catch((e: unknown) => {
         if (live) setError(e instanceof ApiError ? e.message : String(e));
@@ -1480,6 +1527,9 @@ function DraftDm({
       </header>
       <DmContext alias={alias} agents={agents} issueProjects={issueProjects} />
       <div className="threads-messages" aria-live="polite">
+        {withheld !== null && (
+          <p className="threads-note" role="status">{t("Cloud content unavailable")}</p>
+        )}
         {error ? (
           <p className="threads-note" role="status">This conversation could not load: {error}</p>
         ) : entries === null ? (
@@ -1487,7 +1537,7 @@ function DraftDm({
         ) : (
           <>
             {entries.map((e) => <EntryRow key={e.seq} entry={e} issueProjects={issueProjects} />)}
-            {entries.length === 0 && <p className="threads-note">{t("No messages yet. Sending starts the thread.")}</p>}
+            {withheld === null && entries.length === 0 && <p className="threads-note">{t("No messages yet. Sending starts the thread.")}</p>}
           </>
         )}
       </div>

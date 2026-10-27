@@ -87,6 +87,12 @@ export interface ThreadState {
    *  it may not move at all — so "earlier" continues below this boundary
    *  instead. Absent on a daemon that predates it. */
   older?: number;
+  /** A server code means cloud history is incomplete, even with no entries. */
+  cloudWithheld?: string | null;
+  /** Orders availability observations independently of entry sequence. */
+  cloudRevision?: number;
+  /** Restoration needs a fresh tail, not catch-up past the evicted rows. */
+  cloudRefreshNeeded?: boolean;
   entries: ThreadEntry[];
   pending: PendingMessage[];
 }
@@ -114,6 +120,34 @@ export function asEntry(value: unknown): ThreadEntry | null {
         : typeof v.created === "number" && Number.isFinite(v.created)
           ? new Date(v.created * 1000).toISOString()
           : null,
+  };
+}
+
+/** Only server provenance marks a cloud row, including routed local copies. */
+export function isCloudEntry(entry: ThreadEntry): boolean {
+  return entry.payload != null &&
+    (Object.prototype.hasOwnProperty.call(entry.payload, "cloud_agent") ||
+      entry.payload.source === "cloud_agent");
+}
+
+/** Absent page metadata is clean; a present malformed/unknown code is not. */
+export function pageCloudWithheld(page: { cloud_withheld?: unknown }): string | null {
+  if (!Object.prototype.hasOwnProperty.call(page, "cloud_withheld")) return null;
+  return typeof page.cloud_withheld === "string" && page.cloud_withheld.trim() !== ""
+    ? page.cloud_withheld
+    : "unknown";
+}
+
+function withCloudWithheld(state: ThreadState, code: string | null): ThreadState {
+  const entries = code === null ? state.entries : state.entries.filter((e) => !isCloudEntry(e));
+  return {
+    ...state,
+    cloudWithheld: code,
+    cloudRevision: (state.cloudRevision ?? 0) + 1,
+    cloudRefreshNeeded: code === null
+      ? state.cloudRefreshNeeded || state.cloudWithheld != null
+      : false,
+    entries,
   };
 }
 
@@ -158,7 +192,8 @@ export function mergeEntries(state: ThreadState | null, incoming: ThreadEntry[])
   const previousReply = base.replySeq ?? 0;
   let replySeq = previousReply;
   for (const e of incoming) {
-    if (!bySeq.has(e.seq)) changed = true;
+    if (base.cloudWithheld != null && isCloudEntry(e)) continue;
+    if (bySeq.get(e.seq) !== e) changed = true;
     bySeq.set(e.seq, e);
     if (isReplyEntry(e) && e.seq > replySeq) replySeq = e.seq;
   }
@@ -181,9 +216,23 @@ export function mergeEntries(state: ThreadState | null, incoming: ThreadEntry[])
   };
 }
 
-/** `streamInto`'s reducer: an `entry` frame merges; anything else is ignored. */
+/** Fold entries and independent cloud-availability frames from the stream. */
 export function reduceFrame(state: ThreadState | null, event: SseEvent): ThreadState {
   const base = state ?? EMPTY_THREAD;
+  if (event.type === "cloud_withheld") {
+    let status: unknown;
+    try {
+      status = JSON.parse(event.data);
+    } catch {
+      return withCloudWithheld(base, "unknown");
+    }
+    const wire = status !== null && typeof status === "object"
+      ? status as { cloud_withheld?: unknown }
+      : { cloud_withheld: undefined };
+    return withCloudWithheld(base, wire.cloud_withheld === null
+      ? null
+      : pageCloudWithheld({ cloud_withheld: wire.cloud_withheld }));
+  }
   if (event.type !== "entry") return base;
   let parsed: unknown;
   try {
@@ -198,10 +247,10 @@ export function reduceFrame(state: ThreadState | null, event: SseEvent): ThreadS
 /** A page from `GET /api/threads/<alias>` folded into the state. */
 export function mergePage(
   state: ThreadState | null,
-  page: { thread?: unknown; entries?: unknown[]; reply_seq?: unknown },
+  page: { thread?: unknown; entries?: unknown[]; reply_seq?: unknown; cloud_withheld?: unknown },
 ): ThreadState {
   const entries = (page.entries ?? []).map(asEntry).filter((e): e is ThreadEntry => e !== null);
-  const merged = mergeEntries(state, entries);
+  const merged = mergeEntries(withCloudWithheld(state ?? EMPTY_THREAD, pageCloudWithheld(page)), entries);
   // The page reports the COMPLETE thread's reply watermark, so keep the
   // maximum: a bounded, forward or older page (and a live frame that
   // carries only an entry) can never erase a reply it does not hold.
@@ -604,6 +653,7 @@ export interface ThreadPageLike {
    *  remain beyond it. `false` is exhaustion; absent on a daemon that
    *  predates it. */
   more_after?: boolean;
+  cloud_withheld?: string;
 }
 
 /** How the store reads pages: forward after a seq, the newest page, or
@@ -639,15 +689,16 @@ export async function loadThread(
   limit = PAGE,
 ): Promise<ThreadState> {
   const held = current ?? EMPTY_THREAD;
+  let state = held;
   try {
-    const resume = resumeSeq(held);
+    const resume = held.cloudRefreshNeeded ? null : resumeSeq(held);
     if (resume !== null) {
       let after: number = resume;
-      let state = held;
       for (let i = 0; i < CATCH_UP_PAGES; i++) {
         const page = await read.after(after, limit);
         const visible = (page.entries ?? []).length;
         state = mergePage(state, page);
+        if (state.cloudRefreshNeeded) break;
         // CAD-1853: resume past every row the daemon scanned, not just the
         // ones it kept. A page of another source's cloud entries is filtered
         // out of the projection, shows nothing, and still carries the cursor
@@ -676,7 +727,9 @@ export async function loadThread(
     }
     const page = await read.tail(limit);
     const fresh = mergePage(
-      { ...EMPTY_THREAD, pending: held.pending, replySeq: held.replySeq },
+      state.cloudRefreshNeeded || state.cloudWithheld != null
+        ? state
+        : { ...EMPTY_THREAD, pending: held.pending, replySeq: state.replySeq },
       page,
     );
     const scanned = Math.max(
@@ -697,6 +750,7 @@ export async function loadThread(
         : null;
     return {
       ...fresh,
+      cloudRefreshNeeded: false,
       ...(scanned > 0 ? { cursor: scanned } : {}),
       ...(older !== null ? { older } : {}),
       moreBefore: typeof page.more_before === "boolean" ? page.more_before : null,

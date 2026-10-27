@@ -721,6 +721,16 @@ function AnswerSurface({
   );
 }
 
+/** Independent of visible entries: a denied empty page is not empty history. */
+export function CloudContentNotice({ withheld }: { withheld: string | null | undefined }) {
+  const t = useTranslate();
+  return (
+    <div role="status" className="text-label text-ink-400" data-kind="cloud-withheld">
+      {withheld != null ? t("Cloud content unavailable") : null}
+    </div>
+  );
+}
+
 /**
  * Reconnecting (CAD-1782): one quiet line at the top of the thread. The last
  * saved turn stays readable exactly as it was — no stale answer border, no

@@ -595,6 +595,8 @@ type MembershipLookupForTest = Box<
 
 pub struct Shared {
     pub store: Arc<Store>,
+    #[cfg(feature = "test-seam")]
+    cloud_projection_observer: Option<CloudProjectionObserver>,
     /// Broadcast on any queue/event change.
     changed: Notify,
     /// CAD-1700: the master's push revision (see `bump_master_rev`).
@@ -1208,6 +1210,8 @@ impl Shared {
             state_dir: state_dir.to_path_buf(),
             upload_workspace_dir,
             agent_uid: opts.agent_uid,
+            #[cfg(feature = "test-seam")]
+            cloud_projection_observer: opts.cloud_projection_observer.clone(),
             open_attach: Mutex::new(HashMap::new()),
             adoptions_pending: Mutex::new(adoptions_pending),
             adoptions_notify: Notify::new(),
@@ -5459,10 +5463,18 @@ pub type DoneRetrySavedHook = Arc<dyn Fn(&str) + Send + Sync>;
 pub type FlushGate = Arc<dyn Fn() + Send + Sync>;
 
 /// Per-instance daemon configuration.
+/// Test-seam-only observer: called with (verb, withheld reason) after every
+/// cloud projection decision, so a guard case can prove that a denied read was
+/// decided locally without a platform call. Never sourced from an RPC.
+#[cfg(feature = "test-seam")]
+pub type CloudProjectionObserver = std::sync::Arc<dyn Fn(&str, Option<&str>) + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub struct ServeOptions {
     #[cfg(test)]
     pub(crate) custody_acceptance_shared: Option<Arc<Mutex<Option<Arc<Shared>>>>>,
+    #[cfg(feature = "test-seam")]
+    pub cloud_projection_observer: Option<CloudProjectionObserver>,
     /// In-process fixture override; `serve()` leaves this unset and
     /// resolves the private state record. Never sourced from an RPC.
     pub agent_uid: Option<u32>,

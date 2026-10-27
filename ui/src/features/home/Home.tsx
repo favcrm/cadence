@@ -47,7 +47,7 @@ import { turnBarState } from "../app-shell/chat/turnBarState";
 import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
 import MemberChat from "./MemberChat";
 import { memberScope } from "./memberThread";
-import { StreamBanner, ThreadTurn, time } from "./ThreadView";
+import { CloudContentNotice, StreamBanner, ThreadTurn, time } from "./ThreadView";
 import {
   initialFollow,
   motionBehavior,
@@ -589,7 +589,7 @@ const ThreadList = memo(function ThreadList({
   const fallbackItem =
     working && anchorItem === null && shown.length > 0 ? shown[shown.length - 1] : null;
   const activityItem = anchorItem ?? fallbackItem;
-  if (items.length === 0) return null;
+  if (items.length === 0 && !moreBefore) return null;
   return (
     <>
       {stale && <StreamBanner onRetry={() => window.location.reload()} />}
@@ -1397,12 +1397,13 @@ function MasterHome({
             onScroll={onPanelScroll}
             data-chat-scroll
           >
-            {showNotStarted && items.length === 0 && (
+            <CloudContentNotice withheld={thread.data?.cloudWithheld} />
+            {thread.data?.cloudWithheld == null && showNotStarted && items.length === 0 && (
               <div className="chat-empty">
                 <NotStarted status={status} hosted={hosted} />
               </div>
             )}
-            {empty && !showNotStarted && (
+            {thread.data?.cloudWithheld == null && empty && !showNotStarted && (
               <div className="chat-empty">
                 <Examples onPick={(t) => setSeed((s) => ({ text: t, n: s.n + 1 }))} disabled={!!block} />
               </div>
