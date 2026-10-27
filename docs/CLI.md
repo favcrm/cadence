@@ -304,7 +304,13 @@ Connect performs identity/capability discovery, not a model invocation.
 Existing `cli.*`, wiki or settings permission does not imply cloud consent.
 
 The login requests `bridge.enroll`, `cloud_agent.read` and
-`cloud_agent.write`. An operator can enroll a managed local peer with
+`cloud_agent.write` — exactly those three, and the issuer may not narrow or
+widen them. That grant is saved as the workspace's login, so CLI, wiki and
+settings verbs for the same workspace need `cadence login <slug>` again; the
+cloud grant carries no `cli.*` authority and renewal never adds any. Cloud
+calls renew it under the cloud purpose: the saved renewable session rotates
+the 300 s access token, and the renewed capability set must still be the same
+three. An operator can enroll a managed local peer with
 `cloud-agent enroll-peer <connection-id> --agent <alias>`. It requires the
 supported split-UID process boundary and live registration proof; same-UID
 peers are refused before cloud access. Each peer uses its own cloud-only child

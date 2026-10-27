@@ -764,6 +764,55 @@ fn renewed_credential_with(
         Instant,
     ) -> Result<crate::remote_enrollment::IssuerAnswer>,
 ) -> Result<Credential> {
+    renewed_credential_for(dir, target, deadline, CredentialPurpose::Cli, post)
+}
+
+/// CAD-1853: the explicit cloud-assistant purpose. The saved login is the
+/// cloud grant, so renewal rotates that consent; it never borrows the CLI
+/// purpose, and a CLI login is never renewed as cloud consent.
+fn renewed_cloud_credential_with(
+    dir: &Path,
+    target: &RemoteTarget,
+    deadline: Instant,
+    post: impl FnOnce(
+        &Path,
+        &str,
+        &str,
+        &str,
+        Value,
+        Instant,
+    ) -> Result<crate::remote_enrollment::IssuerAnswer>,
+) -> Result<Credential> {
+    renewed_credential_for(dir, target, deadline, CredentialPurpose::CloudAgent, post)
+}
+
+/// The cloud transport boundary's custody: rotate the saved cloud-purpose
+/// login when it is due and return the credential whose token is actually
+/// sent. Not due means no wire call. The lock is taken here, so the frozen
+/// owner and the saved consent are re-read after any concurrent replacement.
+fn renewed_cloud_credential(dir: &Path, target: &RemoteTarget) -> Result<Credential> {
+    renewed_cloud_credential_with(
+        dir,
+        target,
+        Instant::now() + RENEWAL_WAIT,
+        crate::remote_enrollment::cli_session_post_detailed,
+    )
+}
+
+fn renewed_credential_for(
+    dir: &Path,
+    target: &RemoteTarget,
+    deadline: Instant,
+    purpose: CredentialPurpose,
+    post: impl FnOnce(
+        &Path,
+        &str,
+        &str,
+        &str,
+        Value,
+        Instant,
+    ) -> Result<crate::remote_enrollment::IssuerAnswer>,
+) -> Result<Credential> {
     let _lock = private_lock(dir, &target.org, deadline)?;
     if Instant::now() >= deadline {
         return Err(Error::busy_coded(
@@ -772,7 +821,7 @@ fn renewed_credential_with(
         ));
     }
     let cred = load_credential(dir, target)?;
-    renew_credential_locked(dir, target, deadline, cred, post)
+    renew_credential_locked(dir, target, deadline, cred, purpose, post)
 }
 
 /// Caller holds the source lock, including any frozen-identity check.
@@ -781,6 +830,7 @@ fn renew_credential_locked(
     target: &RemoteTarget,
     deadline: Instant,
     mut cred: Credential,
+    purpose: CredentialPurpose,
     post: impl FnOnce(
         &Path,
         &str,
@@ -791,22 +841,31 @@ fn renew_credential_locked(
     ) -> Result<crate::remote_enrollment::IssuerAnswer>,
 ) -> Result<Credential> {
     let at = now()?;
+    // A cloud-purpose credential is only ever created by `cadence login
+    // --cloud-agent`, so its saved consent is checked even when the access
+    // token is still fresh: a grant that was narrowed or widened upstream is
+    // never rotated under this purpose. The CLI purpose keeps the legacy
+    // tolerance — a login without a renewable session is refused only once
+    // renewal is actually due.
+    if purpose == CredentialPurpose::CloudAgent && !purpose.admits(&cred.capabilities) {
+        return Err(purpose_refusal(purpose));
+    }
     let due = cred.pending.is_some() || cred.expires_at <= at.saturating_add(RENEW_BEFORE);
     if !due {
         return Ok(cred);
     }
     let Some(session) = cred.cli_session.clone() else {
-        return Err(reject(
-            "remote credential has no renewable session — run `cadence login` again",
-        ));
+        return Err(purpose_refusal(purpose));
     };
-    let issuer = cred
-        .issuer
-        .as_deref()
-        .ok_or_else(|| reject("renewable session issuer missing — run `cadence login` again"))?;
+    let issuer = cred.issuer.as_deref().ok_or_else(|| {
+        reject(format!(
+            "renewable session issuer missing — run `{}` again",
+            purpose.login_hint()
+        ))
+    })?;
     if cred.organization_slug.as_deref() != Some(target.org.as_str())
         || cred.subject_id.as_deref().is_none_or(|s| !valid_id(s))
-        || !valid_capabilities(&cred.capabilities)
+        || !purpose.admits(&cred.capabilities)
         || session.idle_expires_at <= at
         || session.absolute_expires_at <= at
         || session.idle_expires_at > session.absolute_expires_at
@@ -818,9 +877,7 @@ fn renew_credential_locked(
         || session.device_label.len() > 120
         || session.generation == 0
     {
-        return Err(reject(
-            "renewable CLI session is invalid or expired — run `cadence login` again",
-        ));
+        return Err(purpose_refusal(purpose));
     }
     let pending = match cred.pending.clone() {
         Some(pending) => pending,
@@ -1026,6 +1083,57 @@ fn validate_renewal_response(
         return Err(reject("remote renewal returned invalid session expiry"));
     }
     Ok(())
+}
+
+/// CAD-1853: which saved consent a renewal may rotate. The purpose comes
+/// from the caller's boundary, never from the credential's contents, so a
+/// cloud-only grant is never rotated into CLI authority and a CLI login is
+/// never rotated as cloud consent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredentialPurpose {
+    /// The default CLI/wiki/settings login: the CLI pair is required.
+    Cli,
+    /// The explicit `cadence login --cloud-agent` grant: exactly
+    /// [`crate::remote_enrollment::CLOUD_AGENT_LOGIN_SCOPES`], no CLI scope.
+    CloudAgent,
+}
+
+impl CredentialPurpose {
+    fn login_hint(self) -> &'static str {
+        match self {
+            CredentialPurpose::Cli => "cadence login",
+            CredentialPurpose::CloudAgent => "cadence login --cloud-agent",
+        }
+    }
+
+    /// Known, unique capabilities this purpose may renew. The renewal
+    /// response must still match the saved set exactly; this predicate is
+    /// what refuses a saved consent that purpose may never rotate.
+    fn admits(self, values: &[String]) -> bool {
+        match self {
+            CredentialPurpose::Cli => valid_capabilities(values),
+            CredentialPurpose::CloudAgent => {
+                let scopes = crate::remote_enrollment::CLOUD_AGENT_LOGIN_SCOPES;
+                values.len() == scopes.len()
+                    && values.iter().all(|v| scopes.contains(&v.as_str()))
+                    && scopes
+                        .iter()
+                        .all(|c| values.iter().filter(|v| v.as_str() == *c).count() == 1)
+            }
+        }
+    }
+}
+
+fn purpose_refusal(purpose: CredentialPurpose) -> Error {
+    match purpose {
+        CredentialPurpose::Cli => {
+            reject("renewable CLI session is invalid or expired — run `cadence login` again")
+        }
+        CredentialPurpose::CloudAgent => reject(
+            "the saved login is not the explicit cloud-assistant grant, or its renewable \
+             session is invalid or expired — run `cadence login --cloud-agent` again",
+        ),
+    }
 }
 
 /// Known, unique capabilities that include the CLI pair. Wiki scopes are
@@ -2238,8 +2346,10 @@ pub fn cloud_agent_enroll_post(
     let dir = auth_dir(None).map_err(|_| reject("remote credential directory unavailable"))?;
     // ONE credential snapshot: the same verified owner and token that prove
     // the parent also perform the enrollment POST, so a login replaced in
-    // between cannot enroll a child under a different human.
-    let cred = load_credential(&dir, target)?;
+    // between cannot enroll a child under a different human. Renewal is
+    // cloud-purpose: a cloud-only grant refreshes under its own consent, and
+    // a refusal here is definite (nothing was sent), never `unknown`.
+    let cred = renewed_cloud_credential(&dir, target)?;
     let pin = identity_of(&cred, target)?;
     let issuer = pin.issuer.trim_end_matches('/').to_string();
     post(
@@ -2305,10 +2415,11 @@ pub fn cloud_agent_post(
     let dir = auth_dir(None).map_err(|_| {
         reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
     })?;
-    // ONE load supplies both the proof and the token actually sent. The
-    // target pins the verified owner, so a login replaced between the
-    // daemon's early check and this request is refused here instead of
-    // being charged under the new human.
+    // The scope refusal is decided on the saved login before custody touches
+    // the issuer, so a narrowed grant is a revoked scope (nothing sent), not
+    // a failed renewal. The target pins the verified owner, so a login
+    // replaced between the daemon's early check and this request is refused
+    // here instead of being charged under the new human.
     let cred = load_credential(&dir, target)?;
     if !cred.capabilities.iter().any(|cap| cap == scope) {
         return Err(Error::gate_coded(
@@ -2316,6 +2427,12 @@ pub fn cloud_agent_post(
             "this saved login does not carry the action's cloud-agent scope",
         ));
     }
+    // CAD-1853: the access token lives 300 s, so custody renews the saved
+    // cloud consent here, under its own purpose and the same source lock.
+    // The action's scope was just proven on this login, and renewal can only
+    // return the identical capability set, so the token sent is admitted for
+    // the same action. A cloud-only grant never reaches the CLI purpose.
+    let cred = renewed_cloud_credential(&dir, target)?;
     // The saved audience is an origin without a trailing slash; normalize so
     // one slash joins it to the contract path (never `//__platform/...`).
     let origin = target.endpoint.trim_end_matches('/');
@@ -3007,6 +3124,7 @@ pub fn account_image_request(
             &target,
             deadline,
             cred,
+            CredentialPurpose::Cli,
             crate::remote_enrollment::cli_session_post_detailed,
         )?;
     }

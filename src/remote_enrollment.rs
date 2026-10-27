@@ -2326,11 +2326,35 @@ fn slug(value: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// CAD-1853: the explicit cloud-assistant device grant. `bridge.enroll` is
+/// the narrow extra authority that lets this consent enroll one managed
+/// local peer; the cloud pair is what the human login itself may spend. The
+/// enrolled child requests only the pair.
+pub(crate) const CLOUD_AGENT_LOGIN_SCOPES: [&str; 3] =
+    ["bridge.enroll", "cloud_agent.read", "cloud_agent.write"];
+
 /// The issuer may narrow the consent: a grant is the CLI pair (always) plus
 /// any unique subset of the other requested capabilities. It never names an
 /// unrequested or duplicate capability, and it never drops a CLI scope.
+///
+/// The cloud-assistant purpose is the one exception: its grant is exactly
+/// [`CLOUD_AGENT_LOGIN_SCOPES`], neither narrowed nor widened. Renewal
+/// rotates that saved consent under the same exact-set rule, so a narrowed
+/// grant saved here could never refresh — it is refused before it is
+/// written.
 fn consented_caps(caps: &[Value], requested: &[&str]) -> bool {
     let mut seen = BTreeSet::new();
+    if requested.len() == CLOUD_AGENT_LOGIN_SCOPES.len()
+        && CLOUD_AGENT_LOGIN_SCOPES
+            .iter()
+            .all(|c| requested.contains(c))
+    {
+        return caps.len() == requested.len()
+            && caps.iter().all(|c| {
+                c.as_str()
+                    .is_some_and(|c| requested.contains(&c) && seen.insert(c))
+            });
+    }
     caps.iter().all(|c| {
         c.as_str()
             .is_some_and(|c| requested.contains(&c) && seen.insert(c))
@@ -2644,12 +2668,7 @@ impl LoginScope {
                 "settings.read",
                 "settings.write",
             ],
-            LoginScope::CloudAgent => {
-                // CAD-1853: bridge.enroll is the narrow extra authority that
-                // lets this explicit consent enroll a cloud-purpose peer;
-                // the child requests only the cloud-agent subset.
-                vec!["bridge.enroll", "cloud_agent.read", "cloud_agent.write"]
-            }
+            LoginScope::CloudAgent => CLOUD_AGENT_LOGIN_SCOPES.to_vec(),
         }
     }
 }
