@@ -55,7 +55,7 @@ def mapping(src, rels):
     return table
 
 
-def rewrite(text, table):
+def rewrite(text, table, page):
     def swap(match):
         attr, quote, value = match.group(1), match.group(2), match.group(3)
         if not value or value.startswith(("#", "//", "data:", "mailto:", "tel:")):
@@ -63,15 +63,16 @@ def rewrite(text, table):
         parts = urlsplit(value)
         if parts.scheme or parts.netloc:
             return match.group(0)
+        # A reference resolves against the page that contains it, not the
+        # source root: pages/about.html's `../logo.png` is the root logo.
+        directory = posixpath.dirname(page) or "."
         absolute = parts.path.startswith("/")
-        rel = posixpath.normpath(parts.path.lstrip("/"))
-        if rel.startswith(".."):
+        rel = posixpath.normpath(
+            parts.path.lstrip("/") if absolute else posixpath.join(directory, parts.path)
+        )
+        if rel.startswith("..") or rel not in table:
             return match.group(0)
-        if rel not in table:
-            return match.group(0)
-        new = table[rel]
-        if absolute:
-            new = "/" + new
+        new = "/" + table[rel] if absolute else posixpath.relpath(table[rel], directory)
         suffix = ("?" + parts.query if parts.query else "") + (
             "#" + parts.fragment if parts.fragment else ""
         )
@@ -191,7 +192,7 @@ def main():
                 data = handle.read()
         if os.path.splitext(rel)[1].lower() == ".html":
             text = data.decode("utf-8")
-            data = rewrite(text, table).encode("utf-8")
+            data = rewrite(text, table, rel).encode("utf-8")
         target = os.path.join(out, table[rel])
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "wb") as handle:

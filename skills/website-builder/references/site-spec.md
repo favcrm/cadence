@@ -5,7 +5,8 @@ What a site built by this playbook must be.
 - Plain static files: `index.html` plus CSS, JS, SVG and PNG. No build step, no
   server code, no npm.
 - One source folder holds `index.html`. Every local reference is relative or
-  root-relative and points at a file in that folder.
+  root-relative and points at a file in that folder. A reference resolves
+  against the page that contains it, so `pages/about.html` may use `../logo.png`.
 - `build.py` writes each asset as `<sha256>.<ext>` in its own directory and rewrites
   `href`, `src`, `content` and stylesheet asset `url(...)` references to match.
   `index.html` keeps its name. CSS imports are unsupported; combine stylesheets

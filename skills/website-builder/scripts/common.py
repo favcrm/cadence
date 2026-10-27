@@ -152,8 +152,58 @@ def validate(state):
             refuse(f"malformed run.json: {step} must be an object or null")
         if position < current and value is None:
             refuse(f"malformed run.json: {step} is missing although the run is past it")
+        if position < current and value is not None:
+            problem = completed_record_problem(step, value)
+            if problem:
+                refuse(f"malformed run.json: {step} {problem}")
         if position > current and value is not None:
             refuse(f"malformed run.json: {step} is recorded before its step")
+
+
+def completed_record_problem(step, data):
+    """Why a completed step's record is incomplete, or None when it is sound.
+
+    Resume reads the file, so a record the run has already passed must still
+    carry the fields its own step requires. Filesystem evidence (the build
+    manifest) is not re-read here: it may legitimately be gone.
+    """
+
+    def yes(key):
+        return None if data.get(key) is True else f"needs {key} true"
+
+    def text(key):
+        value = data.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return f"needs a non-empty {key}"
+        return None
+
+    def slug(key):
+        value = data.get(key)
+        if not isinstance(value, str) or not SLUG.fullmatch(value):
+            return f"needs {key} to be a slug"
+        return None
+
+    def count(key):
+        value = data.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return f"needs a non-negative integer {key}"
+        return None
+
+    if step == "brief":
+        return yes("owner_confirmed") or text("goal") or slug("name")
+    if step == "content":
+        return text("src") or yes("facts_from_owner")
+    if step == "build":
+        return text("out") or count("files") or count("bytes")
+    if step == "review":
+        return yes("owner_approved")
+    if step == "publish":
+        return yes("owner_approved") or text("release") or slug("slug")
+    if step == "verify":
+        if data.get("status") != 200 or data.get("bytes_match") is not True:
+            return "needs the recorded passing check (status 200, bytes_match true)"
+        return yes("owner_accepted")
+    return None
 
 
 def load(run_dir):

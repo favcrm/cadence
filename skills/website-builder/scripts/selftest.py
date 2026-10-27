@@ -9,6 +9,7 @@ a temporary directory and 127.0.0.1.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -42,7 +43,7 @@ def expect(label, condition):
 
 def is_digest_name(name):
     stem, ext = os.path.splitext(os.path.basename(name))
-    return len(stem) == 64 and all(c in "0123456789abcdef" for c in stem) and ext in (".css", ".png")
+    return len(stem) == 64 and all(c in "0123456789abcdef" for c in stem) and ext in (".css", ".png", ".html")
 
 
 def write_json(path, value):
@@ -88,7 +89,12 @@ def build_and_check(root, run):
     src = os.path.join(root, "site")
     os.makedirs(os.path.join(src, "css"))
     with open(os.path.join(src, "index.html"), "wb") as handle:
-        handle.write(b'<!doctype html><html><head><link rel="stylesheet" href="css/site.css"></head><body><img src="css/logo.png"></body></html>\n')
+        handle.write(b'<!doctype html><html><head><link rel="stylesheet" href="css/site.css"></head><body><a href="pages/about.html">About</a><img src="css/logo.png"></body></html>\n')
+    os.makedirs(os.path.join(src, "pages"))
+    with open(os.path.join(src, "pages", "about.html"), "wb") as handle:
+        handle.write(b'<!doctype html><html><body><img src="../logo.png"></body></html>\n')
+    with open(os.path.join(src, "logo.png"), "wb") as handle:
+        handle.write(b"\x89PNG\r\n\x1a\nroot")
     with open(os.path.join(src, "css", "site.css"), "wb") as handle:
         handle.write(b'body{margin:0;background:url("logo.png")} .label::after{content:"url(logo.png)"}\n')
     with open(os.path.join(src, "css", "logo.png"), "wb") as handle:
@@ -98,7 +104,7 @@ def build_and_check(root, run):
     out_b = os.path.join(root, "dist-b")
     first = parse(script("build.py", "--run", run, "--src", src, "--out", out_a))
     second = parse(script("build.py", "--run", run, "--src", src, "--out", out_b))
-    expect("build reports files and bytes", first["files"] == 3 and first["bytes"] > 0)
+    expect("build reports files and bytes", first["files"] == 5 and first["bytes"] > 0)
     expect("second build reports the same totals", (first["files"], first["bytes"]) == (second["files"], second["bytes"]))
     tree_a = sorted(os.path.relpath(os.path.join(d, f), out_a) for d, _, fs in os.walk(out_a) for f in fs)
     tree_b = sorted(os.path.relpath(os.path.join(d, f), out_b) for d, _, fs in os.walk(out_b) for f in fs)
@@ -118,6 +124,24 @@ def build_and_check(root, run):
     built_png = [name for name in os.listdir(os.path.join(out_a, "css")) if name.endswith(".png")][0]
     expect("css url points to the built image", f'url("{built_png}")' in css)
     expect("css string content is unchanged", 'content:"url(logo.png)"' in css)
+    nested = [
+        os.path.join(d, f)
+        for d, _, files in os.walk(os.path.join(out_a, "pages"))
+        for f in files
+        if f.endswith(".html")
+    ]
+    expect("nested page is built", len(nested) == 1)
+    with open(nested[0], "rb") as handle:
+        nested_html = handle.read().decode()
+    found = re.search(r'src="([^"]+)"', nested_html)
+    expect("nested page image is rewritten", found is not None and "../logo.png" not in nested_html)
+    resolved = os.path.normpath(os.path.join(os.path.dirname(nested[0]), found.group(1)))
+    expect("nested page image resolves inside dist", os.path.isfile(resolved))
+    with open(os.path.join(out_a, "index.html"), "rb") as handle:
+        root_html = handle.read().decode()
+    link = re.search(r'href="([^"]+)"', root_html)
+    expect("root page link resolves inside dist", link is not None and os.path.isfile(
+        os.path.normpath(os.path.join(out_a, link.group(1)))))
 
     return out_a
 
@@ -178,11 +202,31 @@ def check_fixture(root, dist):
         server.server_close()
 
 
+def resume_validation(root):
+    run = os.path.join(root, "bad-run")
+    parse(script("next.py", "--run", run))
+    data = os.path.join(root, "bad-brief.json")
+    write_json(
+        data,
+        {"step": "brief", "data": {"owner_confirmed": True, "goal": "Ship the site", "name": "demo-site"}},
+    )
+    expect("brief submits before the resume check", script("submit.py", "--run", run, "--data", data).returncode == 0)
+    path = os.path.join(run, "run.json")
+    with open(path, encoding="utf-8") as handle:
+        state = json.load(handle)
+    state["brief"] = {}
+    write_json(path, state)
+    resumed = script("next.py", "--run", run)
+    expect("refuses a malformed completed checkpoint", resumed.returncode == 2)
+    expect("malformed checkpoint refusal is one line", len(resumed.stderr.strip().splitlines()) == 1)
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="website-builder-selftest-") as root:
         run = state_machine(root)
         dist = build_and_check(root, run)
         check_fixture(root, dist)
+        resume_validation(root)
     print("selftest: all checks passed")
     return 0
 
