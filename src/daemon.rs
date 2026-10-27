@@ -3185,7 +3185,7 @@ impl Shared {
                     if params.get("board").and_then(Value::as_bool) == Some(true)
                         && registry::has_actor(&agent.provider, &agent.endpoint_kind)
                     {
-                        j["board"] = self.board_view(&agent.alias)?;
+                        j["board"] = self.board_view(&agent.alias, peer_pid)?;
                     }
                     agents.push(j);
                 }

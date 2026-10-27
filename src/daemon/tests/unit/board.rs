@@ -156,7 +156,7 @@ fn cad627_board_poll_does_not_decode_terminal_history() {
     store::take_decoded_messages();
     let started = Instant::now();
     for _ in 0..10 {
-        let view = shared.board_view("w1").unwrap();
+        let view = shared.board_view("w1", std::process::id()).unwrap();
         assert_eq!(view["messages"].as_array().unwrap().len(), 1);
         assert_eq!(view["messages"][0]["id"], "live");
         assert!(view["messages"][0].get("turn_id").is_none());
@@ -236,7 +236,7 @@ fn cad627_board_summary_matches_history_semantics() {
             row
         })
         .collect();
-    let view = shared.board_view("w1").unwrap();
+    let view = shared.board_view("w1", std::process::id()).unwrap();
     assert_eq!(view["messages"], json!(expected));
     assert_eq!(view["parked"], 2);
     assert_eq!(view["queued"], 1);

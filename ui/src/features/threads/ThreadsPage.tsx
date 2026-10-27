@@ -734,6 +734,7 @@ function Timeline({
         // The backward continuation the daemon SCANNED past its projection.
         scanned_before: p.scanned_before ?? null,
         // Raw row count: a malformed row dropped by threadEntries is still a row the daemon sent.
+        more_after: p.more_after,
         full: p.entries.length >= PAGE,
       };
     }
@@ -784,6 +785,24 @@ function Timeline({
     const fail = (e: unknown) => {
       if (current()) setError(e instanceof ApiError ? e.message : String(e));
     };
+    const step = async (after: number): Promise<void> => {
+      const p = await pull({ after });
+      if (!current()) return;
+      absorb(p);
+      setError(null);
+      // Continue while the daemon says it scanned more, not while rows came
+      // back: a fully filtered page keeps nothing and is not the end.
+      const more = p.more_after ?? p.full;
+      if (more && p.cursor > after) await step(p.cursor);
+    };
+    if (oldest === null && before !== null) {
+      // An empty window that already knows where it continues: every row it
+      // holds was filtered out. Refreshing must not reopen the tail, because
+      // that would throw away the backward progress the boundary carries —
+      // continue forward from just below it instead.
+      step(before - 1).catch(fail);
+      return;
+    }
     if (oldest === null) {
       pull({ tail: true })
         .then((p) => {
@@ -804,13 +823,6 @@ function Timeline({
     // `after` cursor is exclusive), to the current end. Rows already held are
     // replaced by seq, so a queued row's later state is seen. `before` and
     // `more_before` are left alone: they belong to earlier history.
-    const step = async (after: number): Promise<void> => {
-      const p = await pull({ after });
-      if (!current()) return;
-      absorb(p);
-      setError(null);
-      if (p.full && p.cursor > after) await step(p.cursor);
-    };
     step(oldest - 1).catch(fail);
   }, [identity, liveStamp, threadsTick, tick]);
 
@@ -924,7 +936,13 @@ type Pulled = {
   /** The LOWEST seq this page scanned: the backward continuation, present
    *  even when the page kept nothing (the daemon's `scanned_before`). */
   scanned_before: number | null;
-  /** A forward read may have rows past `cursor`. */
+  /** The daemon scanned a full page: raw rows may remain past `cursor`.
+   *  This is the continuation decision now that a projection can filter a
+   *  whole page away — a page can be full without keeping a single row, and
+   *  empty without being the end. Absent on an older daemon. */
+  more_after?: boolean;
+  /** A forward read may have rows past `cursor`. Fallback only, for a
+   *  daemon that does not report `more_after`. */
   full: boolean;
 };
 

@@ -1157,12 +1157,37 @@ impl Shared {
     /// CAD-325: the slice of `agent_show` the board renders an agent row
     /// from — running messages, the parked count, queue and fence counts
     /// and the event cursor — without the whole message history.
-    pub(super) fn board_view(&self, alias: &str) -> Result<Value> {
+    pub(super) fn board_view(&self, alias: &str, peer_pid: u32) -> Result<Value> {
         let messages = self.store.running_messages(alias)?;
+        // CAD-1853: a routed cloud reply is a `worker_result` on the
+        // invoker's ordinary alias, and this view carries running message
+        // bodies. Apply the same operator-or-matching-verified-UID binding
+        // the projection applies, or the board list becomes the body reader
+        // that `agent_show` refuses to be.
+        let derived = self.store.cloud_derived_messages(alias)?;
+        let (viewer, operator) = match self.connection_caller(peer_pid) {
+            Ok(caller_rule::Who::Operator) => (None, true),
+            Ok(caller_rule::Who::Agent(caller)) => {
+                (self.store.agent(&caller).ok().map(|agent| agent.uid), false)
+            }
+            Ok(caller_rule::Who::Unproven(_)) | Err(_) => (None, false),
+        };
+        let may_read = |m: &crate::store::Message| -> bool {
+            if !derived.iter().any(|row| row.message_id == m.id) {
+                return true;
+            }
+            if operator {
+                return true;
+            }
+            viewer.as_deref().is_some_and(|uid| {
+                m.sender_uid.as_deref() == Some(uid) || m.recipient_uid.as_deref() == Some(uid)
+            })
+        };
         // Never the turn token: it is the credential `message result`
         // checks, and the board has no use for it.
         let running: Vec<Value> = messages
             .iter()
+            .filter(|m| may_read(m))
             .map(|m| {
                 let mut j = m.to_json();
                 if let Some(o) = j.as_object_mut() {
