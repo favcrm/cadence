@@ -160,6 +160,16 @@ struct CloudScope {
     admitted: std::collections::BTreeMap<String, Admission>,
 }
 
+/// One alias' cloud rows as a non-thread reader sees them: which ids are
+/// cloud content, which of those this caller may project, and why the rest
+/// were withheld. Produced by [`Shared::admit_cloud_rows`] from a single
+/// snapshot of the same predicate the thread readers use.
+pub(super) struct CloudRowAdmission {
+    pub(super) cloud: std::collections::BTreeSet<String>,
+    pub(super) readable: std::collections::BTreeSet<String>,
+    pub(super) withheld: Option<String>,
+}
+
 /// The caller's own admitted view of one alias.
 ///
 /// THE RULE, enforced by construction in [`CloudProjection::row`]: a
@@ -704,6 +714,38 @@ impl Shared {
         let projection = self.cloud_projection_decision(alias, peer_pid, verb, None)?;
         self.observe_cloud_projection(alias, &projection);
         Ok(projection)
+    }
+
+    /// One cloud-row admission for a reader that is not the thread
+    /// projection — the cross-agent work-conversation readers. It answers,
+    /// from ONE snapshot, which ids are cloud content, which of those this
+    /// caller may project, and why the rest were withheld. The rule is the
+    /// same predicate the thread readers use, so a revoked scope, a replaced
+    /// credential or an unverifiable answer cannot be read around through a
+    /// different verb.
+    pub(super) fn admit_cloud_rows(
+        &self,
+        alias: &str,
+        peer_pid: u32,
+        verb: &str,
+    ) -> Result<CloudRowAdmission> {
+        let projection = self.admit_cloud_projection(alias, peer_pid, verb)?;
+        let cloud: std::collections::BTreeSet<String> = projection
+            .known
+            .iter()
+            .chain(projection.derived.keys())
+            .cloned()
+            .collect();
+        let readable = cloud
+            .iter()
+            .filter(|id| !matches!(projection.row(id), Row::Never))
+            .cloned()
+            .collect();
+        Ok(CloudRowAdmission {
+            cloud,
+            readable,
+            withheld: projection.withheld.clone(),
+        })
     }
 
     fn observe_cloud_projection(&self, _alias: &str, _projection: &CloudProjection) {
