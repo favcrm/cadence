@@ -64,19 +64,25 @@ impl std::error::Error for AppArtifactError {}
 pub enum AppCapabilityError {
     Refused(String),
     Uncertain(String),
+    /// A refusal known not to have executed: the provider answered 402
+    /// `insufficient_funds` and charged nothing (CAD-1868). Typed so callers
+    /// never classify out-of-credit from text.
+    InsufficientFunds(String),
 }
 
 impl AppCapabilityError {
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Refused(_) => "refused",
+            Self::Refused(_) | Self::InsufficientFunds(_) => "refused",
             Self::Uncertain(_) => "uncertain",
         }
     }
 
     pub fn reason(&self) -> &str {
         match self {
-            Self::Refused(reason) | Self::Uncertain(reason) => reason,
+            Self::Refused(reason) | Self::Uncertain(reason) | Self::InsufficientFunds(reason) => {
+                reason
+            }
         }
     }
 }
@@ -209,7 +215,9 @@ impl ImageFailure {
 
 impl From<ImageFailure> for AppCapabilityError {
     fn from(failure: ImageFailure) -> Self {
-        if failure.not_executed {
+        if failure.not_executed && failure.reason == ImageReason::InsufficientFunds {
+            Self::InsufficientFunds(failure.detail)
+        } else if failure.not_executed {
             Self::Refused(failure.detail)
         } else {
             Self::Uncertain(failure.detail)
@@ -333,6 +341,9 @@ pub trait PlatformAdapter: Send + Sync {
             .map_err(|error| match error {
                 AppCapabilityError::Refused(m) => {
                     ImageFailure::refused(ImageReason::SubmitRefused, m)
+                }
+                AppCapabilityError::InsufficientFunds(m) => {
+                    ImageFailure::refused(ImageReason::InsufficientFunds, m)
                 }
                 AppCapabilityError::Uncertain(m) => {
                     ImageFailure::uncertain(ImageReason::ProviderUncertain, m)

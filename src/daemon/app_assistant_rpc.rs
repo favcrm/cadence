@@ -117,6 +117,18 @@ fn is_paid_social(action: &str) -> bool {
     matches!(action, "social.posts.fetch" | "social.draft.create")
 }
 
+/// The action semantics a standing grant is pinned to: a changed contract,
+/// schema, handler or consented descriptor voids the grant (CAD-1869).
+pub(super) fn grant_digest(
+    action: &str,
+    meta: &crate::app_assistant::RegisteredAction,
+    descriptor_digest: &str,
+) -> String {
+    crate::store::app_runs::material_digest(
+        &json!({"contract":crate::issue::app_assistant::CONTRACT,"action":action,"schema":meta.input_schema,"handler_version":meta.handler_version,"descriptor_digest":descriptor_digest}),
+    )
+}
+
 pub(super) fn assistant_error_is_definite_refusal(error: &Error) -> bool {
     match error {
         Error::Rejected(_) => true,
@@ -126,13 +138,13 @@ pub(super) fn assistant_error_is_definite_refusal(error: &Error) -> bool {
 }
 
 /// The only cost stop (CAD-1852): AgenticOS answers 402 `insufficient_funds`
-/// and nothing is charged. The text carries either the provider code (text
-/// and source calls) or "insufficient credit" (image submit).
+/// and nothing is charged. The adapter types it
+/// (`AppCapabilityError::InsufficientFunds`) and the daemon carries it as the
+/// error code `insufficient_funds` (CAD-1868); text is never matched.
 pub(super) const OUT_OF_CREDIT: &str = "Not enough credit — top up to continue";
 
 pub(super) fn assistant_error_is_out_of_credit(error: &Error) -> bool {
-    let text = error.to_string();
-    text.contains("insufficient_funds") || text.contains("insufficient credit")
+    error.code() == Some("insufficient_funds")
 }
 
 fn normalize_interrupted_operation(
@@ -456,9 +468,7 @@ impl Shared {
                     .cloned()
                     .ok_or_else(|| Error::rejected("customer tags are invalid"))?;
                 let preview = json!({"customer_label":old.pointer("/record/profile/display_name").and_then(Value::as_str).unwrap_or("Customer"),"before_tags":before_tags,"after_tags":after_tags,"expected_revision":old_revision});
-                let grant_digest = crate::store::app_runs::material_digest(
-                    &json!({"contract":crate::issue::app_assistant::CONTRACT,"action":action_id,"schema":meta.input_schema,"handler_version":meta.handler_version,"descriptor_digest":descriptor_digest}),
-                );
+                let pinned = grant_digest(action_id, &meta, &descriptor_digest);
                 if records
                     .app_assistant_permission_find(&scoped.context, action_id, customer, "deny")?
                     .is_some_and(|p| p["state"].as_str() == Some("active"))
@@ -480,7 +490,7 @@ impl Shared {
                     .app_assistant_permission_find(&scoped.context, action_id, customer, "allow")?
                     .filter(|p| p["state"].as_str() == Some("active"))
                 {
-                    if grant["semantics_digest"].as_str() != Some(grant_digest.as_str()) {
+                    if grant["semantics_digest"].as_str() != Some(pinned.as_str()) {
                         op = records.app_assistant_operation_set(AssistantOperationUpdate {
                             operation_id,
                             context: &scoped.context,
@@ -988,9 +998,7 @@ impl Shared {
                 }
                 let meta = crate::app_assistant::registered_action(action)
                     .ok_or_else(|| Error::rejected("unknown assistant action"))?;
-                let digest = crate::store::app_runs::material_digest(
-                    &json!({"contract":crate::issue::app_assistant::CONTRACT,"action":action,"schema":meta.input_schema,"handler_version":meta.handler_version,"descriptor_digest":descriptor_digest}),
-                );
+                let digest = grant_digest(action, &meta, &descriptor_digest);
                 let permission_id = uuid::Uuid::new_v4().to_string();
                 let permission =
                     records.app_assistant_permission_save(AssistantPermissionWrite {
@@ -1001,6 +1009,7 @@ impl Shared {
                         effect: "deny",
                         semantics_digest: &digest,
                         scope_label: "This customer is blocked for tag updates",
+                        sealed_human: None,
                     })?;
                 Ok(json!({"permission":permission}))
             }
@@ -1038,6 +1047,14 @@ impl Shared {
         {
             return Err(Error::rejected(
                 "assistant operation is not pending at the expected revision",
+            ));
+        }
+        // CAD-1869 item 8: "Always allow" only where the card offered it.
+        if decision == "allow_always"
+            && op.pointer("/permission_request/allow_always") != Some(&json!(true))
+        {
+            return Err(Error::rejected(
+                "this request did not offer Always allow; allow it once or deny it",
             ));
         }
         if decision == "deny" {
@@ -1107,10 +1124,13 @@ impl Shared {
             ));
         }
         if action == "media.refine.prepare" {
-            if decision != "allow_once" {
-                return Err(Error::rejected(
-                    "a library image refinement is allowed one time only",
-                ));
+            if decision == "allow_always" {
+                self.refine_grant_save(
+                    records,
+                    context,
+                    &grant_digest(action, &meta, &descriptor_digest),
+                    human,
+                )?;
             }
             return self.refine_run(
                 records,
@@ -1132,14 +1152,13 @@ impl Shared {
                     action_id: action,
                     resource_id: super::app_assistant_social::STANDING_RESOURCE,
                     effect: "allow",
-                    semantics_digest: &crate::store::app_runs::material_digest(
-                        &json!({"contract":crate::issue::app_assistant::CONTRACT,"action":action,"schema":meta.input_schema,"handler_version":meta.handler_version,"descriptor_digest":descriptor_digest}),
-                    ),
+                    semantics_digest: &grant_digest(action, &meta, &descriptor_digest),
                     scope_label: if action == "social.posts.fetch" {
                         "Reading Instagram posts — this installation"
                     } else {
                         "Drafting posts — this installation"
                     },
+                    sealed_human: None,
                 })?;
             }
             return self.social_run(records, install, context, &op, &input);
@@ -1161,9 +1180,7 @@ impl Shared {
                 "customer changed since permission preview; review the updated impact",
             ));
         }
-        let grant_digest = crate::store::app_runs::material_digest(
-            &json!({"contract":crate::issue::app_assistant::CONTRACT,"action":action,"schema":meta.input_schema,"handler_version":meta.handler_version,"descriptor_digest":descriptor_digest}),
-        );
+        let pinned = grant_digest(action, &meta, &descriptor_digest);
         let existing = records.app_assistant_permission_find(context, action, customer, "deny")?;
         if existing
             .as_ref()
@@ -1189,8 +1206,9 @@ impl Shared {
                 action_id: action,
                 resource_id: customer,
                 effect: "allow",
-                semantics_digest: &grant_digest,
+                semantics_digest: &pinned,
                 scope_label: &scope_label,
+                sealed_human: None,
             })?;
         }
         let result = records.app_assistant_operation_set(AssistantOperationUpdate {
@@ -1207,9 +1225,117 @@ impl Shared {
         Ok(json!({"operation":result}))
     }
 
-    /// Park a reference-edit quote. No provider submit happens here.
-    fn refine_request_permission(
+    /// CAD-1868: save the refine standing grant, sealed to the human who
+    /// decided it. Only the operator-proofed decide path calls this. A public
+    /// owner's grant stores that owner's board session; a local operator's
+    /// grant stores the explicit local marker, never on a hosted board.
+    fn refine_grant_save(
         &self,
+        records: &RecordStore,
+        context: &str,
+        digest: &str,
+        human: Option<&Value>,
+    ) -> Result<()> {
+        let (sealed, scope_label) = match human {
+            Some(human) => {
+                let sealed = json!({"sub":human["sub"],"company":human["company"],
+                    "session":human["session"],"role":human["role"],"display":human["display"]});
+                if !public_grant_human(&sealed) {
+                    return Err(Error::rejected(
+                        "the board owner's session cannot carry a standing grant",
+                    ));
+                }
+                (
+                    sealed.to_string(),
+                    "Refining library images — while you stay signed in on this board",
+                )
+            }
+            None if self.membership_native() => {
+                return Err(Error::rejected(
+                    "Always allow on a hosted board needs the signed-in board owner",
+                ));
+            }
+            None => (
+                LOCAL_OPERATOR_GRANT.to_owned(),
+                "Refining library images — this installation",
+            ),
+        };
+        records.app_assistant_permission_save(AssistantPermissionWrite {
+            permission_id: &uuid::Uuid::new_v4().to_string(),
+            context,
+            action_id: "media.refine.prepare",
+            resource_id: super::app_assistant_social::STANDING_RESOURCE,
+            effect: "allow",
+            semantics_digest: digest,
+            scope_label,
+            sealed_human: Some(&sealed),
+        })?;
+        Ok(())
+    }
+
+    fn membership_native(&self) -> bool {
+        matches!(
+            self.membership_mode,
+            super::public_membership::MembershipMode::Native(_)
+        )
+    }
+
+    /// CAD-1868: the refine standing grant as an agent turn may use it now.
+    /// The stored human is re-proven here, at run time: a public owner through
+    /// the unchanged `fresh_run_human`, the local marker only while the board
+    /// is not hosted. A missing, malformed or lapsed human pauses the grant.
+    fn refine_grant(
+        &self,
+        records: &RecordStore,
+        install: &str,
+        context: &str,
+    ) -> Result<RefineGrant> {
+        let action = "media.refine.prepare";
+        let (descriptor_digest, _) = install_descriptor(self, install)?;
+        let meta = crate::app_assistant::registered_action(action)
+            .ok_or_else(|| Error::rejected("unknown assistant action"))?;
+        let pinned = grant_digest(action, &meta, &descriptor_digest);
+        let Some(grant) = records
+            .app_assistant_permission_find(
+                context,
+                action,
+                super::app_assistant_social::STANDING_RESOURCE,
+                "allow",
+            )?
+            .filter(|p| {
+                p["state"].as_str() == Some("active")
+                    && p["semantics_digest"].as_str() == Some(pinned.as_str())
+            })
+        else {
+            return Ok(RefineGrant::None);
+        };
+        let stored =
+            records.app_assistant_permission_sealed_human(context, required_str(&grant, "id")?)?;
+        if stored.as_deref() == Some(LOCAL_OPERATOR_GRANT) {
+            return Ok(if self.membership_native() {
+                RefineGrant::Paused
+            } else {
+                RefineGrant::Local
+            });
+        }
+        Ok(
+            match stored.and_then(|text| serde_json::from_str::<Value>(&text).ok()) {
+                Some(human) if public_grant_human(&human) => {
+                    if self.fresh_run_human(&human).is_ok() {
+                        RefineGrant::Owner(human)
+                    } else {
+                        RefineGrant::Paused
+                    }
+                }
+                _ => RefineGrant::Paused,
+            },
+        )
+    }
+
+    /// Park a reference-edit quote. Under a usable standing grant the edit
+    /// then runs sealed to the grant's human; otherwise the card waits.
+    fn refine_request_permission(
+        self: &Arc<Self>,
         records: &RecordStore,
         install: &str,
         context: &str,
@@ -1226,19 +1352,24 @@ impl Shared {
             .ok_or_else(|| Error::rejected("reference-edit quote is missing its price"))?;
         let model = crate::platform::agenticos_external::reviewed_image_model();
         let reason = "Review one library image reference edit. The card freezes the source pin, instructions and model. The price shown is an estimate. Charged once. The source stays unchanged.";
-        records
+        let grant = self.refine_grant(records, install, context)?;
+        let parked = records
             .app_assistant_operation_set(crate::store::app_records::AssistantOperationUpdate {
                 operation_id,
                 context,
                 expected_revision: 1,
                 status: "pending_permission",
-                summary: "Review this reference edit before it costs anything",
+                summary: if matches!(grant, RefineGrant::Paused) {
+                    "Always allow is paused; review this reference edit"
+                } else {
+                    "Review this reference edit before it costs anything"
+                },
                 result: &Value::Null,
                 resource_refs: &json!([{"kind":"media","id":asset_id,"label":"Library image"}]),
                 permission_request: &json!({
                     "reason": reason,
                     "scope": {"install_id":install,"context_id":context,"action_id":"media.refine.prepare","resource_id":asset_id},
-                    "allow_always": false,
+                    "allow_always": true,
                     "preview_kind": "media_refine",
                     "preview": {
                         "asset_id": asset_id,
@@ -1257,8 +1388,24 @@ impl Shared {
                     },
                 }),
                 error: None,
-            })
-            .map(|op| json!({"operation": public_operation(op)}))
+            })?;
+        let human = match grant {
+            RefineGrant::None | RefineGrant::Paused => {
+                return Ok(json!({"operation": public_operation(parked)}))
+            }
+            RefineGrant::Local => None,
+            RefineGrant::Owner(human) => Some(human),
+        };
+        let private = records.app_assistant_operation_get(operation_id, context)?;
+        match self.refine_run(records, install, context, &private, human.as_ref(), None) {
+            Ok(done) => Ok(done),
+            // Refused before the run was submitted (lapsed owner, changed
+            // source or tool): the card stays parked for the operator.
+            Err(_) => {
+                let current = records.app_assistant_operation_get(operation_id, context)?;
+                Ok(json!({"operation": public_operation(current)}))
+            }
+        }
     }
 
     fn refine_source_current(
@@ -1399,7 +1546,9 @@ impl Shared {
             .ok_or_else(|| Error::rejected("assistant permission preview is unavailable"))?;
         let (asset_id, revision, sha256, instructions) = refine_input(input)?;
         if op.pointer("/permission_request/preview_kind") != Some(&json!("media_refine"))
-            || op.pointer("/permission_request/allow_always") != Some(&json!(false))
+            || !op
+                .pointer("/permission_request/allow_always")
+                .is_some_and(Value::is_boolean)
             || preview["asset_id"] != asset_id
             || preview["revision"] != revision
             || preview["sha256"] != sha256
@@ -1446,7 +1595,12 @@ impl Shared {
             params["origin"] = json!("public");
         }
         let expected_quote = json!({slot: live});
-        let created = self.create_app_run_as(&params, None, Some(&expected_quote), human)?;
+        // CAD-1868: a human with no browser credential is the sealed owner of
+        // a refine standing grant (an agent turn); the run acts as that owner.
+        // A decide always relays its credential with its human.
+        let sealed_grant = human.is_some() && public_session.is_none();
+        let created =
+            self.create_app_run_as(&params, None, Some(&expected_quote), human, sealed_grant)?;
         let run_id = created["id"]
             .as_str()
             .ok_or_else(|| Error::rejected("image run id is missing"))?
@@ -1602,16 +1756,10 @@ impl Shared {
                 }
             }
             Err(error) => {
-                let unknown = error.kind() != "rejected";
+                let (status, summary) = refine_failure(&error);
                 (
-                    if unknown { "unknown" } else { "failed" },
-                    if unknown {
-                        "Reference edit outcome is uncertain; retry reuses the same run".to_owned()
-                    } else if assistant_error_is_out_of_credit(&error) {
-                        OUT_OF_CREDIT.to_owned()
-                    } else {
-                        "Reference edit was refused".to_owned()
-                    },
+                    status,
+                    summary.to_owned(),
                     json!({"run_id": run_id, "source_asset_id": asset_id}),
                     failure.as_deref(),
                 )
@@ -1630,6 +1778,39 @@ impl Shared {
         })?;
         Ok(json!({"operation": public_operation(done)}))
     }
+}
+
+/// The stored human of a local operator's refine grant (CAD-1868). Honoured
+/// only while the board is not in hosted (Native) membership mode.
+const LOCAL_OPERATOR_GRANT: &str = r#"{"kind":"local_operator"}"#;
+
+/// What an agent-turn refine may do under the standing grant.
+enum RefineGrant {
+    /// No active grant for the current action semantics: park the card.
+    None,
+    /// A grant exists but its human is missing, malformed or no longer
+    /// current: park the card; never fall back to the operator.
+    Paused,
+    /// The local operator's grant on a non-hosted board.
+    Local,
+    /// The public owner's grant, re-proven fresh just now.
+    Owner(Value),
+}
+
+/// A public owner's sealed human: exactly the five fields `decision_human`
+/// builds, with a non-empty sub, company and session.
+fn public_grant_human(human: &Value) -> bool {
+    human.as_object().is_some_and(|fields| {
+        fields.len() == 5
+            && ["sub", "company", "session"].iter().all(|key| {
+                fields
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            })
+            && fields.contains_key("role")
+            && fields.contains_key("display")
+    })
 }
 
 /// Canonical owner for a decision. Absent `public_session` is the
@@ -1654,6 +1835,23 @@ fn decision_human(shared: &Shared, params: &Value, peer_pid: u32) -> Result<Opti
                 })
             }))
         }
+    }
+}
+
+/// How a failed reference edit reads. A typed 402 inside the run is a known
+/// non-execution with nothing charged (CAD-1868); it is checked before the
+/// uncertain branch, because the run reports a provider refusal as
+/// `provider`, not `rejected`.
+fn refine_failure(error: &Error) -> (&'static str, &'static str) {
+    if assistant_error_is_out_of_credit(error) {
+        ("failed", OUT_OF_CREDIT)
+    } else if error.kind() != "rejected" {
+        (
+            "unknown",
+            "Reference edit outcome is uncertain; retry reuses the same run",
+        )
+    } else {
+        ("failed", "Reference edit was refused")
     }
 }
 
@@ -1812,5 +2010,40 @@ mod campaign_scope_tests {
             Some("c2")
         );
         assert_eq!(campaign_scope(Some("c2"), None).unwrap(), Some("c2"));
+    }
+}
+
+#[cfg(test)]
+mod refine_out_of_credit_tests {
+    use super::{refine_failure, OUT_OF_CREDIT};
+    use crate::platform::{AppCapabilityError, ImageFailure, ImageReason};
+    use crate::Error;
+
+    /// CAD-1868: a 402 `insufficient_funds` from the image submit inside a
+    /// reference-edit run stays typed through the adapter and the run, and
+    /// reads as out of credit with nothing charged; a provider refusal whose
+    /// text merely mentions the code does not.
+    #[test]
+    fn a_typed_402_inside_a_reference_edit_run_reads_not_enough_credit() {
+        let submit = ImageFailure::refused(
+            ImageReason::InsufficientFunds,
+            "AgenticOS workspace has insufficient credit",
+        );
+        let typed = AppCapabilityError::from(submit);
+        assert!(
+            matches!(typed, AppCapabilityError::InsufficientFunds(_)),
+            "a 402 image submit lost its type: {typed:?}"
+        );
+        // The daemon's own run mapping for that variant.
+        let run_error = super::super::app_capabilities_rpc::run_capability_error(
+            &typed,
+            typed.reason().to_owned(),
+        );
+        assert_eq!(run_error.kind(), "provider");
+        assert_eq!(refine_failure(&run_error), ("failed", OUT_OF_CREDIT));
+
+        let untyped = Error::provider("AgenticOS image submit refused: insufficient_funds");
+        assert_ne!(refine_failure(&untyped).1, OUT_OF_CREDIT);
+        assert_eq!(refine_failure(&untyped).0, "unknown");
     }
 }

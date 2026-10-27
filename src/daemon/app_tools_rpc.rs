@@ -211,13 +211,25 @@ enum GenerationSettlement {
 
 fn generation_settlement(error: &AppCapabilityError) -> GenerationSettlement {
     match error {
-        AppCapabilityError::Refused(_) => GenerationSettlement::Refused,
+        AppCapabilityError::Refused(_) | AppCapabilityError::InsufficientFunds(_) => {
+            GenerationSettlement::Refused
+        }
         // `idempotency_in_progress` is the provider's own typed code, carried
         // in the uncertain reason; it only picks the pending sub-state.
         AppCapabilityError::Uncertain(reason) if reason.contains("idempotency_in_progress") => {
             GenerationSettlement::Pending
         }
         AppCapabilityError::Uncertain(_) => GenerationSettlement::Uncertain,
+    }
+}
+
+/// A tool-call refusal for the assistant: a 402 keeps its typed code.
+fn tool_refusal(error: &AppCapabilityError) -> Error {
+    match error {
+        AppCapabilityError::InsufficientFunds(_) => {
+            Error::invalid("insufficient_funds", error.to_string())
+        }
+        _ => Error::rejected(error.to_string()),
     }
 }
 
@@ -1245,7 +1257,7 @@ impl Shared {
                                 None,
                                 Some("verified_provider_refusal"),
                             )?;
-                            return Err(Error::rejected(error.to_string()));
+                            return Err(tool_refusal(&error));
                         }
                         let pending = settlement == GenerationSettlement::Pending;
                         let state = if pending { "pending" } else { "uncertain" };
@@ -1266,7 +1278,7 @@ impl Shared {
                             json!({"generation_intent":{"request_id":request_id,"operation":scope["operation"],"draft_id":scope["draft_id"],"revision":scope["revision"],"input_digest":app_runs::material_digest(plan),"input":plan,"state":state,"updated_at":crate::issue::time::now_epoch()},"replayed":true}),
                         );
                     }
-                    return Err(Error::rejected(error.to_string()));
+                    return Err(tool_refusal(&error));
                 }
             };
             crate::platform::refuse_leak(

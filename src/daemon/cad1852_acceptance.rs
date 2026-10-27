@@ -359,8 +359,9 @@ fn d_after_an_operator_revoke_the_next_call_parks_and_does_not_run() {
     assert_eq!(fx.door.reads.load(SeqCst), 2, "a replay charged again");
 }
 
-/// (e) Designer image refine still refuses "Always allow" (the deliberate
-/// CAD-1868 scope limit), and no grant is created.
+/// (e) A refine card that did not offer "Always allow" refuses it (CAD-1868
+/// / CAD-1869 item 8: decide honours the card's own flag), and no grant is
+/// created.
 #[test]
 fn e_media_refine_still_refuses_allow_always() {
     const REFINE: &str = r#"{ "id": "media.refine.prepare", "description": "Refine a library image.", "input_schema": { "type": "object", "properties": { "asset_id": { "type": "string", "minLength": 1, "maxLength": 64 }, "revision": { "type": "integer", "minimum": 1 }, "sha256": { "type": "string", "minLength": 71, "maxLength": 71 }, "instructions": { "type": "string", "minLength": 1, "maxLength": 2000 } }, "required": ["asset_id", "revision", "sha256", "instructions"], "additionalProperties": false }, "effect": "draft", "confirmation": "permission_required", "availability": "requires_context" }"#;
@@ -408,7 +409,7 @@ fn e_media_refine_still_refuses_allow_always() {
         .unwrap();
     refused(
         fx.decide(Asserted::Operator, &parked, "allow_always"),
-        "allowed one time only",
+        "did not offer Always allow",
         "an operator Always allow on a reference edit",
     );
     assert!(grants(&fx).is_empty(), "a refine grant was created");
