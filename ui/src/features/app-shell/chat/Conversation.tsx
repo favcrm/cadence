@@ -1117,7 +1117,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       .finally(() => void masterSource.refresh());
   };
   const turnActions = {
-    onStop: canControlTurns ? (message: string) => turnCommand("stop", message) : undefined,
     onCancel: canControlTurns ? (message: string) => turnCommand("cancel", message) : undefined,
     onRetry: canSend ? retryAction : undefined,
     onView:
@@ -1133,6 +1132,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       (card ?? listRef.current)?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });
     },
   };
+  // CAD-1880: Stop in the composer's send slot while this conversation's
+  // own turn runs; the working row above the dock is gone.
+  const runningMessage =
+    turnState.kind === "working" || turnState.kind === "writing" ? turnState.stopMessage : null;
+  const canStop = canControlTurns && !streamDown && runningMessage !== null;
   // After a reload or navigation the selected conversation may still be
   // waiting on another conversation's turn: read the master's state once
   // (the `master` stream frame keeps it live while it is queued).
@@ -1591,6 +1595,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                   className="app-chat-conv truncate text-ink-500 text-label"
                   data-chat-conv-label
                   data-state={streamDown ? "offline" : undefined}
+                  data-stale={streamDown || undefined}
                 >
                   · {streamDown ? t("Reconnecting…") : convLabel}
                 </span>
@@ -1795,7 +1800,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
             />
           </li>
         ))}
-        {(turnState.kind === "sending" || turnState.kind === "working") && (
+        {(turnState.kind === "sending" || turnState.kind === "working" || turnState.kind === "writing") && (
           <li className="text-secondary text-ink-300 break-words" data-chat-typing>
             <ThreadTurn items={[]} running density={density} />
           </li>
@@ -1933,11 +1938,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           ))}
         </div>
       )}
-      <TurnBar state={turnState} since={masterState.data?.turn?.since ?? null} actions={turnActions} reconnecting={streamDown} />
+      <TurnBar state={turnState} actions={turnActions} reconnecting={streamDown} />
       <Composer
         key={composerKey}
         density="compact"
         block={canSend && binding.error === null ? null : "read-only"}
+        stop={canStop ? { onStop: () => { if (runningMessage) turnCommand("stop", runningMessage); } } : null}
         blockedPlaceholder={binding.error ?? sendBlockedReason}
         storeKey={composerKey}
         onSend={({ body, refs, attachments, mediaRefs }) => send(body, refs, attachments, mediaRefs)}

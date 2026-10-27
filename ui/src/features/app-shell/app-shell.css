@@ -767,15 +767,33 @@
   stroke-linejoin: round;
 }
 
+/* CAD-1880: the running turn's Stop in the send slot. Declared after every
+   Send rule so its danger tint and solid glyph win the cascade. */
+.app-chat-stop {
+  border-color: color-mix(in srgb, var(--color-fail) 45%, transparent);
+  background: transparent;
+  color: var(--color-fail);
+}
+
+.app-chat-stop:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-fail) 12%, transparent);
+  color: var(--color-fail);
+}
+
+.app-chat-stop svg {
+  fill: currentColor;
+  stroke: none;
+}
+
 @media (max-width: 1023.98px) {
-  /* Mock's mobile rule: 40px touch targets and a 16px box (no iOS
+  /* Mock's mobile rule: 44px touch targets and a 16px box (no iOS
      focus zoom). */
   .app-chat-send,
   .app-chat-attach,
   .app-chat-remove,
   .app-chat-chip-slot {
-    width: 2.5rem;
-    height: 2.5rem;
+    width: 2.75rem;
+    height: 2.75rem;
   }
   .app-chat-remove svg {
     width: 1rem;
@@ -1321,19 +1339,6 @@
   .app-chat-pulse {
     animation: none;
   }
-}
-.app-chat-stop {
-  margin-left: auto;
-  padding: 0.25rem 0.55rem;
-  border: 1px solid var(--color-edge);
-  border-radius: 0.25rem;
-  background: transparent;
-  color: var(--color-ink-200);
-  font-size: 0.625rem;
-}
-.app-chat-stop:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
 }
 .app-chat-jump {
   align-self: center;

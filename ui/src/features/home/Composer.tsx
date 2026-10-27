@@ -25,6 +25,7 @@ export default function Composer({
   attachEnabled = true,
   attachDestination,
   attachReason = "A writable Home conversation is required to attach files.",
+  stop = null,
 }: {
   block: string | null;
   seed: { text: string; n: number; refs?: ThreadRef[] };
@@ -34,6 +35,8 @@ export default function Composer({
   attachEnabled?: boolean;
   attachDestination?: AttachDestination;
   attachReason?: string;
+  /** CAD-1880: this pane's running turn — Stop takes the send slot. */
+  stop?: { onStop: () => void } | null;
 }) {
   const { placeholder, ariaLabel } = useAssistantComposerLabels();
   return (
@@ -48,6 +51,7 @@ export default function Composer({
         void sendToMaster(body, newMessageId(), refs, attachments, attachDestination?.conversation, undefined, mediaRefs);
       }}
       refocusAfterSend
+      stop={stop}
       attach={{
         enabled: attachEnabled,
         reason: attachReason,

@@ -262,19 +262,23 @@ equal(createPosts.map((p) => p.body), [{ context_id: "ctx-a" }, { context_id: "c
 const bar = () => host.querySelector("[data-turn-bar]") as HTMLElement | null;
 const barButton = (label: string) =>
   Array.from(bar()?.querySelectorAll("button") ?? []).find((b) => b.textContent === label) ?? null;
+// CAD-1880: the running turn's Stop is the composer's send slot; a working
+// turn paints no dock row at all.
+const stopButton = () => host.querySelector<HTMLButtonElement>('[aria-label="Stop this turn"]');
+const typingBubble = () => host.querySelector('[data-kind="typing"]');
 await pick("Spring launch");
 turn = { state: "working", message: "m-gen-elsewhere", conversation: "c-gen" };
 await React.act(async () => { await resources.masterState.refresh(); });
 await settle();
-assert(bar()?.dataset.state !== "working" && bar()?.dataset.state !== "queued", `another conversation's running turn never shows Working or Queued here (got ${bar()?.dataset.state})`);
+assert(bar()?.dataset.state !== "working" && bar()?.dataset.state !== "queued" && stopButton() === null, `another conversation's running turn shows no Working row and no Stop here (got ${bar()?.dataset.state})`);
 turn = null;
 await React.act(async () => { await resources.masterState.refresh(); });
 await settle();
 
 // The selected conversation's own turn: Sending while its POST is in flight;
 // Queued (with Cancel, never Stop) once the daemon queues it behind another
-// conversation's turn; Working with Stop carrying this exact message once it
-// runs. Nothing bleeds into another conversation.
+// conversation's turn; Working with Stop in the composer carrying this exact
+// message once it runs. Nothing bleeds into another conversation.
 await pick("Spring launch");
 {
   let resolveSend: ((r: Response) => void) | null = null;
@@ -293,7 +297,7 @@ await pick("Spring launch");
   await settle();
   equal(bar()?.dataset.state, "queued", "an owned queued message shows Queued");
   assert(bar()!.textContent!.includes("after General"), `Queued names what is ahead; got ${bar()?.textContent}`);
-  assert(barButton("Stop") === null, "a queued message offers no Stop");
+  assert(barButton("Stop") === null && stopButton() === null, "a queued message offers no Stop");
   turn = { state: "working", message: "m-home", conversation: "home-thread" };
   await React.act(async () => {
     await resources.masterThread.refresh();
@@ -324,8 +328,9 @@ await pick("Spring launch");
   // No timer: a `master` stream frame invalidates the state (CAD-1700).
   await React.act(async () => { await resources.masterState.invalidate(); });
   await settle();
-  equal(bar()?.dataset.state, "working", "the owned running turn shows Working after a master frame");
-  assert(bar()!.textContent!.includes("customers.search"), "Working names the live step");
+  assert(bar() === null, "the owned running turn paints no dock row after a master frame");
+  assert(typingBubble() !== null, "the owned running turn shows its inline typing bubble");
+  assert(stopButton() !== null, "the owned running turn offers Stop in the composer");
   // CAD-1859: the app pane paints the same inline typing bubble as Home, at
   // the tail of its own list, and takes it away when the turn stops working.
   const typingRows = Array.from(host.querySelectorAll(".app-chat-list [data-chat-typing]")) as HTMLElement[];
@@ -333,6 +338,17 @@ await pick("Spring launch");
   assert(typingRows[0].querySelector('[data-kind="typing"]') !== null, "the appended row is the assistant typing bubble");
   const paneRows = Array.from(host.querySelectorAll(".app-chat-list > li")) as HTMLElement[];
   assert(paneRows.length > 0 && paneRows[paneRows.length - 1] === typingRows[0], "the typing row is the last row in the pane");
+  // CAD-1880: `writing` is the same running turn with its assistant text
+  // last. The dock row is gone, so the bubble must survive that transition
+  // or the pane would show nothing at all while it writes.
+  threads["c-camp"].push(ent(4, "agent", "assistant_text", "Drafting the brief", sentMessage));
+  await React.act(async () => { await conversationThread("c-camp").refresh(); });
+  await settle();
+  assert(bar() === null, "a writing turn paints no dock row");
+  assert(
+    host.querySelector('.app-chat-list [data-chat-typing] [data-kind="typing"]') !== null,
+    "a writing turn keeps the inline typing bubble in the pane",
+  );
   // The store state the daemon's own operator entry produces: the optimistic
   // row retires, so nothing is left sending or working for this pane.
   turn = null;
@@ -358,7 +374,7 @@ await pick("Spring launch");
   const { noteMasterChanged } = require("../src/lib/masterChanged");
   await React.act(async () => { noteMasterChanged(); });
   await settle();
-  assert(barButton("Review") !== null && barButton("Stop") === null, "a pushed operation permission replaces Stop with Review");
+  assert(barButton("Review") !== null && barButton("Stop") === null && stopButton() === null, "a pushed operation permission replaces Stop with Review");
   const approval = host.querySelector('[data-operation-status="pending_permission"]') as HTMLElement;
   assert(approval, "the actionable app approval card is mounted");
   assert(host.querySelector('[data-permission-thread="permission-old"] [data-permission-decided]'), "a decided historic permission precedes the current operation");
@@ -374,7 +390,7 @@ await pick("Spring launch");
   operations = [];
   await React.act(async () => { noteMasterChanged(); });
   await settle();
-  await React.act(async () => { barButton("Stop")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await React.act(async () => { stopButton()!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   await settle();
   equal(commandPosts.at(-1), { command: "stop", message: sentMessage }, "Stop names exactly this conversation's running turn");
 
@@ -553,7 +569,7 @@ await pick("General");
 turn = { state: "working", message: "m-gen", conversation: "c-gen" };
 await React.act(async () => { await resources.masterState.refresh(); });
 await settle();
-assert(bar() && !barButton("Stop"), "a read-only pane observes its working turn without offering a mutating Stop");
+assert(bar() === null && !stopButton() && typingBubble() !== null, "a read-only pane observes its working turn through the inline bubble, without offering a mutating Stop");
 turn = { state: "working", message: "m-elsewhere", conversation: "c-camp" };
 queue = [{ message: "m-gen", conversation: "c-gen" }];
 await React.act(async () => { await resources.masterState.refresh(); });
@@ -583,13 +599,13 @@ controlledTranscript = true;
 turn = { state: "working", message: "m-reconnect", conversation: "c-gen" };
 await renderPane("ctx-a");
 await pick("General");
-assert(barButton("Stop"), "the connected General pane has its own live turn");
+assert(stopButton(), "the connected General pane has its own live turn");
 holdReconnect = true;
 await React.act(async () => { disconnectTranscript?.(); });
 await settle();
-assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "the actual stream disconnect hides turn actions");
+assert(host.querySelector('[data-chat-conv-label][data-stale="true"]')?.textContent?.includes("Reconnecting…") && !stopButton(), "the actual stream disconnect marks the link last known and hides turn actions");
 await renderPane("ctx-b");
-assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "a same-conversation context change must not declare the disconnected stream live");
+assert(host.querySelector('[data-chat-conv-label][data-stale="true"]') !== null && !stopButton(), "a same-conversation context change must not declare the disconnected stream live");
 
 // A fresh snapshot is not actionable until this scope's operation read
 // has reconciled. A failed read remains stale, then a real Retry recovers.
@@ -597,13 +613,13 @@ await React.act(async () => { root.render(null); });
 holdReconnect = false;
 heldOperations = [];
 await renderPane("ctx-a");
-assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "a turn snapshot cannot enable Stop before scoped approval reconciliation");
+assert(host.querySelector('[data-chat-conv-label][data-stale="true"]') !== null && !stopButton(), "a turn snapshot cannot enable Stop before scoped approval reconciliation");
 // Settle the discarded pre-snapshot batch, then its fenced follow-up.
 for (let batch = 0; batch < 2; batch++) {
   await React.act(async () => { heldOperations!.splice(0).forEach((resolve) => resolve(json({ error: "Unavailable" }, 503))); });
   await settle();
 }
-assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "failed post-reconnect operation reads keep actions hidden");
+assert(host.querySelector('[data-chat-conv-label][data-stale="true"]') !== null && !stopButton(), "failed post-reconnect operation reads keep actions hidden");
 operations = [{
   id: "op-reconnected", action_id: "customer.tags.update", status: "pending_permission", revision: 1,
   summary: "Review the reconnected change", resource_refs: [],
@@ -616,7 +632,7 @@ const retryActivity = Array.from(host.querySelectorAll(".app-assistant-activity 
 assert(retryActivity, "the failed activity read offers its existing Retry");
 await React.act(async () => { (retryActivity as HTMLButtonElement).click(); });
 await settle();
-assert(!bar()?.dataset.stale && barButton("Review") && !barButton("Stop") && host.querySelector('[data-operation-status="pending_permission"]'), "reconciliation exposes the real approval card and Review, never a transient Stop");
+assert(!bar()?.dataset.stale && barButton("Review") && !barButton("Stop") && !stopButton() && host.querySelector('[data-operation-status="pending_permission"]'), "reconciliation exposes the real approval card and Review, never a transient Stop");
 
 // AOS-378: a failed canonical identity refresh cannot leave a stale private
 // profile labelled current, nor borrow Home/the coordinator as a fallback.
@@ -634,16 +650,16 @@ assert(host.querySelector("[data-identity-state]")?.getAttribute("data-identity-
 turn = { state: "working", message: "m-gen", conversation: "c-gen", summary: "customers.search" };
 await React.act(async () => { await resources.masterConversation("c-gen").refresh(); });
 await settle();
-assert(bar()?.dataset.state === "working" && barButton("Stop"), "a hosted app shows its own working turn while Home is idle");
-await React.act(async () => { barButton("Stop")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+assert(bar() === null && stopButton(), "a hosted app shows its own working turn while Home is idle");
+await React.act(async () => { stopButton()!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle();
 equal(commandPosts.at(-1), { command: "stop", message: "m-gen" }, "hosted Stop controls the selected app message");
-assert(!barButton("Stop"), "Stop refreshes the selected hosted conversation after the operation ends");
+assert(!stopButton(), "Stop refreshes the selected hosted conversation after the operation ends");
 turn = { state: "working", message: "m-other", conversation: "c-camp" };
 queue = [{ message: "m-gen", conversation: "c-gen" }];
 await React.act(async () => { await resources.masterConversation("c-gen").refresh(); });
 await settle();
-assert(bar()?.dataset.state === "queued" && barButton("Cancel") && !barButton("Stop"), "a hosted app shows its own queued turn without borrowing idle Home");
+assert(bar()?.dataset.state === "queued" && barButton("Cancel") && !barButton("Stop") && !stopButton(), "a hosted app shows its own queued turn without borrowing idle Home");
 await React.act(async () => { barButton("Cancel")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle();
 equal(commandPosts.at(-1), { command: "cancel", message: "m-gen" }, "hosted Cancel controls the selected queued app message");

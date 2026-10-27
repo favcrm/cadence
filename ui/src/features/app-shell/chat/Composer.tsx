@@ -125,6 +125,13 @@ export interface ComposerProps {
   onResolveOriginal?: () => void;
   /** Compact only: host actions (CAD-1431) listed in a More actions menu. */
   actions?: ComposerAction[];
+  /**
+   * CAD-1880: this pane's turn is stoppable. Stop takes the send slot while
+   * a turn runs — the dock no longer carries a working row, so the action
+   * that interrupts the turn sits where the next message would be sent.
+   * Absent while the stream is down (last known state) and in read-only.
+   */
+  stop?: { onStop: () => void } | null;
 }
 
 /** One host action behind the compact composer's More actions menu. */
@@ -320,6 +327,26 @@ function IconSend({ disabled, title }: { disabled: boolean; title: string }) {
   );
 }
 
+/** The running turn's Stop (CAD-1880): same slot and footprint as Send,
+ *  danger-tinted so the interruption never reads as the primary action. */
+function IconStop({ onStop }: { onStop: () => void }) {
+  const { t } = useLocale();
+  return (
+    <button
+      type="button"
+      className="app-chat-send app-chat-stop"
+      aria-label={t("Stop this turn")}
+      title={t("Stop")}
+      onClick={onStop}
+    >
+      <span className="sr-only">{t("Stop")}</span>
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="8" y="8" width="8" height="8" rx="1.5" />
+      </svg>
+    </button>
+  );
+}
+
 export default function Composer({
   density,
   block,
@@ -340,6 +367,7 @@ export default function Composer({
   originalUnresolved = false,
   onResolveOriginal,
   actions,
+  stop = null,
 }: ComposerProps) {
   const { t } = useLocale();
   const compact = density === "compact";
@@ -725,7 +753,7 @@ export default function Composer({
             {attachInput}
             {attachButton}
             {actions && actions.length > 0 && <ComposerActions actions={actions} disabled={!!block} />}
-            <IconSend disabled={sendBlocked} title={t(sendTitle ?? "Send")} />
+            {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? "Send")} />}
           </div>
         </div>
       </form>
@@ -789,7 +817,7 @@ export default function Composer({
         ) : (
           <span className="flex-1" />
         )}
-        <IconSend disabled={sendBlocked} title={t(sendTitle ?? (slash ? "Run command" : "Send"))} />
+        {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? (slash ? "Run command" : "Send"))} />}
       </div>
     </form>
   );
