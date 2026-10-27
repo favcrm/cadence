@@ -16,11 +16,11 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-VERSION = "0.9.145"
+VERSION = "0.9.150"
 PROBE = r'''#!/usr/bin/python3
 import json, os, pathlib, sys, time
 if sys.argv[1:] == ["--version"]:
-    print("cargo-nextest 0.9.145")
+    print("cargo-nextest 0.9.150")
     sys.exit(0)
 root = pathlib.Path(os.environ["PROBE_ROOT"])
 def record(kind):
@@ -80,7 +80,8 @@ class Fixture:
         self.scripts.mkdir(parents=True)
         config = self.workspace / ".config"
         config.mkdir()
-        for name in ("cadence-nextest", "run-result-tests", "suite-lock-config", "result-test-args"):
+        for name in ("cadence-nextest", "run-result-tests", "suite-lock-config",
+                     "result-test-args", "check-test-junit.py"):
             source = ROOT / "scripts" / name
             shutil.copy2(source, self.scripts / name)
             print(f"source sha256 {name}: {hashlib.sha256(source.read_bytes()).hexdigest()}")

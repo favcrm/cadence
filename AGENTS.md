@@ -271,7 +271,11 @@ the code you just wrote.
   before every push buys nothing.
 - sccache is the host-wide rustc wrapper (`~/.cargo/config.toml`). Do not
   override `RUSTC_WRAPPER`; if a build fails oddly, rerun it once with
-  `RUSTC_WRAPPER=` to rule sccache out.
+  `RUSTC_WRAPPER=` to rule sccache out. Force `SCCACHE_DIR` (and
+  `SCCACHE_CACHE_SIZE`) in that cargo config so a lane's rewritten
+  `HOME`/`XDG_CACHE_HOME` cannot start the shared `:4226` server against a
+  tmp cache. The durable dir is `~/.cache/sccache`.
+
 - Many lanes share this host. Use `CARGO_BUILD_JOBS=4` and
   `--test-threads 2`, and run only filtered test groups; CI runs the full
   suite.

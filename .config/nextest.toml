@@ -1,6 +1,11 @@
 # CAD-1073: reduced profile from the clean-slate transition (ended by CAD-1102).
 # Overrides and test-groups for deleted binaries are removed; they would
 # fail nextest config validation ("no binary IDs matched").
+#
+# GHSA-vc25-qg58-w57c: refuse 0.9.125–0.9.149, which recorded raw Cargo
+# args in portable reruns. scripts/cadence-nextest pins the same floor.
+nextest-version = "0.9.150"
+
 [profile.cadence]
 retries = 0
 fail-fast = false

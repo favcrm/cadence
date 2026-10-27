@@ -513,7 +513,7 @@ fn run_registered_runner_cases(
         provider.display(),
         compiler_path.to_string_lossy()
     );
-    let nextest_name = "cadence/tools/cadence-nextest-0.9.145/cargo-nextest";
+    let nextest_name = "cadence/tools/cadence-nextest-0.9.150/cargo-nextest";
     let source_data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));

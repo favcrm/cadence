@@ -3355,7 +3355,7 @@ test_command = "cargo test --test {target} -- {test}"
     fn runner_refusal_is_its_own_blocked_reason() {
         let r = json!({"merge": {}, "prepare": [], "gates": [], "open_pr_conflicts": [],
             "full_suite": {"outcome": "fail", "tail": ["",
-                "cadence-nextest: pinned cargo-nextest 0.9.145 is not installed"]},
+                "cadence-nextest: pinned cargo-nextest 0.9.150 is not installed"]},
             "failures": [{"source": "full_suite", "result": "unknown",
                 "reason": "JUnit report x unavailable"}],
             "stress": [{"test": "t", "runs": 5, "failures": 0, "unknown": 5}]});
