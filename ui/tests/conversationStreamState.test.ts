@@ -6,6 +6,7 @@ import type * as Locale from "../src/lib/locale";
 import type * as Client from "../src/features/app-shell/conversationClient";
 import type * as Engine from "../src/features/app-shell/chat/conversationThread";
 import type * as Bar from "../src/features/app-shell/chat/TurnBar";
+import type * as Composer from "../src/features/app-shell/chat/Composer";
 import type * as States from "../src/features/app-shell/chat/turnBarState";
 import type * as Queries from "../src/lib/useResource";
 import type * as Resources from "../src/lib/resources";
@@ -25,6 +26,7 @@ const { LocaleProvider } = require<typeof Locale>("../src/lib/locale");
 const { conversationThread } = require<typeof Client>("../src/features/app-shell/conversationClient");
 const { useThreadStream } = require<typeof Engine>("../src/features/app-shell/chat/conversationThread");
 const { TurnBar } = require<typeof Bar>("../src/features/app-shell/chat/TurnBar");
+const ComposerDefault = require<typeof Composer>("../src/features/app-shell/chat/Composer").default;
 const { turnBarState } = require<typeof States>("../src/features/app-shell/chat/turnBarState");
 const { useResource } = require<typeof Queries>("../src/lib/useResource");
 const { resources } = require<typeof Resources>("../src/lib/resources");
@@ -52,10 +54,19 @@ function Harness() {
   const [link, setLink] = React.useState<"live" | SseErrorState>("reconnecting");
   useThreadStream(thread, "/api/threads/master/stream?conversation=conv-stream", true, setLink);
   const state = turnBarState({ master: master.data, entries: data.data?.entries ?? [], pendingMessages: [], awaitingApproval: false, reconnecting: link !== "live" }, "conv-stream");
-  return React.createElement("main", { "data-link": link }, React.createElement(TurnBar, {
-    state, since: null, reconnecting: link !== "live",
-    actions: { onStop: () => undefined, onCancel: () => undefined, onReview: () => undefined },
-  }));
+  // CAD-1880: the running turn paints no dock row; Stop is the composer's
+  // send slot, enabled only once the stream is live.
+  const stoppable = (state.kind === "working" || state.kind === "writing") && link === "live";
+  return React.createElement("main", { "data-link": link },
+    React.createElement(TurnBar, {
+      state, reconnecting: link !== "live",
+      actions: { onCancel: () => undefined, onReview: () => undefined },
+    }),
+    React.createElement(ComposerDefault, {
+      density: "compact", block: null, onSend: () => undefined,
+      stop: stoppable ? { onStop: () => undefined } : null,
+    }),
+  );
 }
 function assert(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason); }
 // A finished turn has no bar state at all: the reply is the completion
@@ -65,8 +76,8 @@ function assert(value: unknown, reason: string): asserts value { if (!value) thr
   const { renderToStaticMarkup } = require<typeof import("react-dom/server")>("react-dom/server");
   const bar = (state: Parameters<typeof TurnBar>[0]["state"], reconnecting = false) =>
     renderToStaticMarkup(React.createElement(TurnBar, {
-      state, since: null, reconnecting,
-      actions: { onStop: () => undefined, onCancel: () => undefined, onReview: () => undefined },
+      state, reconnecting,
+      actions: { onCancel: () => undefined, onReview: () => undefined },
     }));
   const finished: ThreadEntry = { seq: 20, role: "agent", kind: "turn_result", text: "Done.", message: "m-done", created: new Date().toISOString() };
   assert(
@@ -74,8 +85,10 @@ function assert(value: unknown, reason: string): asserts value { if (!value) thr
     "a completed turn reads as idle: no bar state carries a duration nobody renders",
   );
   assert(bar({ kind: "idle" }) === "", "an idle conversation has no bar");
-  assert(bar({ kind: "working", step: "planning", since: 1000, stopMessage: "m-1" }).includes('data-state="working"'), "a working turn still paints its bar");
-  assert(bar({ kind: "working", step: "planning", since: 1000, stopMessage: "m-1" }, true).includes('data-stale="true"'), "a reconnect marks the bar stale");
+  assert(bar({ kind: "working", step: "planning", since: 1000, stopMessage: "m-1" }) === "", "a running turn paints no dock row: the typing bubble is the loading indicator");
+  assert(bar({ kind: "writing", since: 1000, stopMessage: "m-1" }) === "", "a writing turn paints no dock row either");
+  assert(bar({ kind: "queued", ahead: "", aheadConversation: null, cancelMessage: null }) !== "", "a queued turn still paints its bar");
+  assert(bar({ kind: "queued", ahead: "", aheadConversation: null, cancelMessage: null }, true).includes('data-stale="true"'), "a reconnect marks the remaining bar stale");
 }
 async function main() {
   const unthreaded = snapshot("m-unthreaded");

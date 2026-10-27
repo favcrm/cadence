@@ -1,10 +1,9 @@
-import { useEffect, useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { useTranslate } from "../../../lib/locale";
 import type { TurnBarState } from "./turnBarState";
 
 export interface TurnBarActions {
   /** Mutating actions are absent when the viewer cannot write. */
-  onStop?: (message: string) => void;
   onCancel?: (message: string) => void;
   /** Absent when there is no captured envelope to resend: Retry is hidden. */
   onRetry?: () => void;
@@ -19,33 +18,30 @@ export interface TurnBarActions {
  * While the stream is down the bar shows the last known state, dimmed and
  * prefixed "last known", with its actions hidden. A finished turn renders
  * nothing: the reply itself is the completion signal.
+ *
+ * A running turn renders nothing either (CAD-1880): the assistant's typing
+ * bubble at the transcript tail is the loading indicator, and Stop lives in
+ * the composer. This row is left to the states that need words or an action
+ * the bubble cannot carry — queued, sending, approval, failed, stopped.
  */
 export function TurnBar({
   state,
-  since,
   actions,
   reconnecting,
 }: {
   state: TurnBarState;
-  /** Epoch seconds the running turn started (master_state.turn.since). */
-  since: number | null;
   actions: TurnBarActions;
   reconnecting: boolean;
 }) {
   const t = useTranslate();
-  const live = state.kind === "working" || state.kind === "writing";
-  const elapsed = useElapsed(live ? since : null);
-  if (state.kind === "idle") return null;
+  if (state.kind === "idle" || state.kind === "working" || state.kind === "writing") return null;
 
-  const button = (label: string, onClick: () => void, danger = false, ariaLabel?: string) => (
-    <button type="button" className={danger ? "tb-btn danger" : "tb-btn"} aria-label={ariaLabel} onClick={onClick}>
+  const button = (label: string, onClick: () => void) => (
+    <button type="button" className="tb-btn" onClick={onClick}>
       {t(label)}
     </button>
   );
-  const { onStop, onCancel } = actions;
-  const stop = (message: string | null) =>
-    message === null || onStop === undefined ? null : button("Stop", () => onStop(message), true, t("Stop this turn"));
-
+  const { onCancel } = actions;
   let title: string;
   let detail = "";
   let tone: string = state.kind;
@@ -63,16 +59,6 @@ export function TurnBar({
           {state.cancelMessage !== null && onCancel ? button("Cancel", () => onCancel(state.cancelMessage!)) : null}
         </>
       );
-      break;
-    case "working":
-      title = t("Working");
-      detail = [state.step ?? t("planning"), clock(elapsed)].filter(Boolean).join(" · ");
-      controls = stop(state.stopMessage);
-      break;
-    case "writing":
-      title = t("Writing");
-      detail = clock(elapsed);
-      controls = stop(state.stopMessage);
       break;
     case "approval":
       title = t("Needs your approval");
@@ -106,21 +92,4 @@ export function TurnBar({
       {!reconnecting && controls && <span className="tb-actions">{controls}</span>}
     </div>
   );
-}
-
-/** Seconds since `since`, ticking once a second while a turn runs (a clock, not a fetch). */
-function useElapsed(since: number | null): number | null {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (since === null) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [since]);
-  return since === null ? null : Math.max(0, Math.floor(now / 1000 - since));
-}
-
-function clock(seconds: number | null): string {
-  if (seconds === null) return "";
-  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 }

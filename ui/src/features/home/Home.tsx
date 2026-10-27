@@ -782,6 +782,11 @@ function MasterHome({
     turnBar.kind === "approval" ||
     turnBar.kind === "sending" ||
     turnBar.kind === "queued";
+  // CAD-1880: Stop sits in the composer's send slot while this pane's own
+  // turn runs. Never while the stream is down: that state is last known.
+  const runningMessage =
+    turnBar.kind === "working" || turnBar.kind === "writing" ? turnBar.stopMessage : null;
+  const canStop = writeBlock === null && !streamReconnecting && runningMessage !== null;
   const aheadHref = useConversationDestination(
     turnBar.kind === "queued" ? turnBar.aheadConversation : null,
     master.data,
@@ -1265,7 +1270,7 @@ function MasterHome({
                 </span>
                 <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
                 {streamReconnecting && activeTurn && status.kind === "running" && (
-                  <span className="text-micro text-ink-500">{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
+                  <span className="text-micro text-ink-500" data-stale>{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
                 )}
               </div>
               <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
@@ -1342,9 +1347,7 @@ function MasterHome({
             <TurnBar
               state={turnBar}
               reconnecting={streamReconnecting && activeTurn}
-              since={serverTurn?.since ?? null}
               actions={{
-                onStop: writeBlock === null ? (message) => runTurnCommand("stop", message) : undefined,
                 onCancel: writeBlock === null ? (message) => runTurnCommand("cancel", message) : undefined,
                 onRetry:
                   writeBlock === null && failedEntry !== null
@@ -1398,6 +1401,7 @@ function MasterHome({
               seed={seed}
               onCommand={runCommand}
               onSent={engage}
+              stop={canStop ? { onStop: () => { if (runningMessage) runTurnCommand("stop", runningMessage); } } : null}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
               attachReason={readOnly

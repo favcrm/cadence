@@ -432,8 +432,6 @@ pre {
   border: 0;
   background: transparent;
 }
-.turnbar[data-state="working"],
-.turnbar[data-state="writing"] { --tb: var(--color-accent); }
 .turnbar[data-state="queued"],
 .turnbar[data-state="needs_approval"] { --tb: var(--color-warn); }
 .turnbar[data-state="failed"] { --tb: var(--color-fail); }
@@ -444,10 +442,6 @@ pre {
   height: .5rem;
   border-radius: 9999px;
   background: var(--tb);
-}
-.turnbar[data-state="working"] .tb-dot,
-.turnbar[data-state="writing"] .tb-dot {
-  animation: work-pulse 1.4s ease-in-out infinite;
 }
 .tb-text {
   display: flex;
@@ -489,8 +483,6 @@ pre {
   cursor: pointer;
 }
 .tb-btn:hover { background: var(--color-ink-800); color: var(--color-ink-100); }
-.tb-btn.danger { color: var(--color-fail); }
-.tb-btn.danger:hover { background: color-mix(in srgb, var(--color-fail) 12%, transparent); }
 .tb-btn:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
 /* CAD-1700: an assistant reply waits unseen — a dot, not a count. */
 .navlink .navdot {
@@ -504,10 +496,6 @@ pre {
 .navlink .navbadge + .navdot { margin-left: .375rem; }
 @media (max-width: 1023.98px) {
   .tb-btn { height: 2.25rem; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .turnbar[data-state="working"] .tb-dot,
-  .turnbar[data-state="writing"] .tb-dot { animation: none; }
 }
 .stopbtn {
   padding: .12rem .55rem;

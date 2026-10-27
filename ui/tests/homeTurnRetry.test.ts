@@ -30,16 +30,28 @@ const { LocaleProvider } = require<typeof Locale>("../src/lib/locale");
 const { resources } = require<typeof Stores>("../src/lib/resources");
 const { setImmediate: nextTurn } = require<{ setImmediate: () => Promise<void> }>("node:timers/promises");
 const posts: Record<string, unknown>[] = [];
+// The stream's own master frame: the fixture emits it on open, so a turn the
+// test wants the stream to report must be in this object, not only the store.
+const streamMaster: Record<string, unknown> = {
+  alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true,
+  identity: { name: null, tone: null, look: "robot", revision: "fixture" },
+  turn: null, queue: [],
+};
+const commands: { command?: string; message?: string }[] = [];
 const refs = [{ kind: "issue", id: "CAD-B" }];
 const attachments = [{ id: "file-b" }];
 const entries: ThreadEntry[] = [{ seq: 1, role: "operator", kind: "message", message: "turn-b", text: "Retry turn B", payload: { refs, attachments, conversation: "home-thread" } }];
 const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { "Content-Type": "application/json" } });
 globalThis.fetch = async (input, init) => {
   const url = new URL(String(input), "http://localhost");
-  if (url.pathname.endsWith("/stream")) return streamFixture(url.href, undefined, init?.signal);
+  if (url.pathname.endsWith("/stream")) return streamFixture(url.href, streamMaster as never, init?.signal);
   if (url.pathname === "/api/threads/master/messages") {
     posts.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
     return json({ message: posts.at(-1)?.message, state: "queued", duplicate: false });
+  }
+  if (url.pathname === "/api/master/command") {
+    commands.push(JSON.parse(String(init?.body)) as { command?: string; message?: string });
+    return json({ ok: true, state: "stopped" });
   }
   if (url.pathname === "/api/threads/master") return json({ thread: { id: "home-thread", alias: "master" }, entries, more_before: false });
   if (url.pathname === "/api/master/state") return json({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] });
@@ -76,14 +88,49 @@ async function main() {
   assert(sent?.text === "Retry turn B" && sent.message !== "transport-a" && sent.message !== "turn-b", "Home's failed-turn bar retries B with a fresh id, never unrelated transport failure A");
   assert(JSON.stringify(sent.refs) === JSON.stringify(refs) && JSON.stringify(sent.attachments) === JSON.stringify(attachments) && sent.conversation === "home-thread", "Home turn Retry preserves its references, files and captured conversation");
   assert(resources.masterThread.get().data?.pending.some((row) => row.message === "transport-a" && row.state === "failed"), "unrelated A remains available for its own row Retry");
-  await render(true);
+
+  // CAD-1880: a writable Home turn runs with no dock row and Stop in the
+  // composer's send slot; the click posts the same command the bar used to.
+  commands.length = 0;
+  // The composer's Stop needs a live stream and a writable board: seed the
+  // agent row the mount's /api/agents answer would carry, let that reopen the
+  // stream, then publish the running turn so the frame cannot overwrite it.
   await React.act(async () => {
-    resources.masterState.write(() => ({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true,
-      identity: { name: null, tone: null, look: "robot", revision: "fixture" },
+    resources.agents.write(() => ({ daemon: "reachable", agents: [{ alias: "master", state: "running" }], totals: null }) as never);
+  });
+  await settle();
+  await React.act(async () => {
+    streamMaster.turn = { state: "working", message: "turn-b", conversation: "home-thread" };
+    streamMaster.queue = [];
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true,
       turn: { state: "working", message: "turn-b", conversation: "home-thread" }, queue: [] }));
   });
   await settle();
-  assert(host.querySelector("[data-turn-bar]") && !host.querySelector('[aria-label="Stop this turn"]'), "read-only Home observes its working turn without a mutating Stop");
+  assert(host.querySelector("[data-turn-bar]") === null, "a running turn paints no dock row");
+  const stop = host.querySelector<HTMLButtonElement>('[aria-label="Stop this turn"]');
+  assert(stop !== null, "a writable Home turn offers Stop in the composer");
+  assert(host.querySelector(".app-chat-send") === stop, "Stop occupies the composer's send slot");
+  await React.act(async () => { stop.click(); });
+  await settle();
+  assert(commands.at(-1)?.command === "stop" && commands.at(-1)?.message === "turn-b", "the composer's Stop posts the stop for the running turn's own message");
+
+  await render(true);
+  // A fresh running message: the earlier turn-b already carries a failed
+  // result, and a turn with an answer is not streaming.
+  entries.push({ seq: 3, role: "operator", kind: "message", message: "turn-c", text: "Read-only turn C" });
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({ ...state!, entries: [...entries] }));
+    resources.masterState.write(() => ({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true,
+      identity: { name: null, tone: null, look: "robot", revision: "fixture" },
+      turn: { state: "working", message: "turn-c", conversation: "home-thread" }, queue: [] }));
+  });
+  await settle();
+  assert(
+    host.querySelector('[data-kind="typing"]') !== null
+      && host.querySelector('[data-turn-bar][data-state="working"]') === null
+      && !host.querySelector('[aria-label="Stop this turn"]'),
+    "read-only Home observes its working turn through the inline bubble, without a dock row or a mutating Stop",
+  );
   await React.act(async () => {
     resources.masterState.write(() => ({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true,
       identity: { name: null, tone: null, look: "robot", revision: "fixture" },
@@ -118,7 +165,7 @@ async function main() {
     host.querySelector('[data-turn-bar][data-state="sending"]') !== null,
     "the dock bar reports the send as sending, not as a working banner",
   );
-  assert(host.querySelector('[data-turn-bar] [aria-label="Stop this turn"]') === null, "nothing is stoppable before the daemon runs the turn");
+  assert(host.querySelector('[aria-label="Stop this turn"]') === null, "nothing is stoppable before the daemon runs the turn");
   const listItems = Array.from(host.querySelectorAll("ol[role='log'] > li")) as HTMLElement[];
   const typingIndex = listItems.findIndex((row) => row.contains(typingRows[0]));
   const operatorIndex = listItems.findIndex((row) => row.querySelector('[data-chat-message="user"]'));
@@ -128,6 +175,7 @@ async function main() {
   });
   await settle();
   assert(host.querySelectorAll('[data-kind="typing"]').length === 0, "the typing bubble clears once the send settles out of submitting");
+
 
   await React.act(async () => { root.unmount(); });
   await win.happyDOM.close();
