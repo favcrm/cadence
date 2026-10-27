@@ -76,6 +76,12 @@ export type Route =
   | { screen: "outbox" }
   | { screen: "setup" }
   | { screen: "settings"; section: SettingsSection; page?: ConnectionPage }
+  /** CAD-1085: the trusted credential entry page for one metadata request.
+   *  The id is a server-issued selector; no credential rides the URL. */
+  | { screen: "credentialEntry"; requestId: string }
+  /** CAD-1085: the ordinary Board page that authorizes one handoff to the
+   *  pinned credential-entry origin. Selector only; no nonce in the URL. */
+  | { screen: "credentialAuthorize"; requestId: string }
   | { screen: "login" }
   | { screen: "notFound"; path: string };
 
@@ -193,10 +199,20 @@ function matchWiki(parts: string[]): Route {
   return { screen: "wiki", mode: "browse", path: pathFrom(parts, 1) || null, query: null };
 }
 
+const REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 export function matchRoute(pathname: string): Route {
   const parts = pathname.split("/").filter(Boolean);
   const [head, a, b, ...rest] = parts;
   if (head === "wiki") return matchWiki(parts);
+  // CAD-1085: the trusted credential-entry page. Only a canonical lowercase
+  // request UUID is a route; the page itself proves the session.
+  if (head === "connections" && a === "enroll" && b && rest.length === 0 && REQUEST_ID.test(b)) {
+    return { screen: "credentialEntry", requestId: b };
+  }
+  if (head === "connections" && a === "authorize" && b && rest.length === 0 && REQUEST_ID.test(b)) {
+    return { screen: "credentialAuthorize", requestId: b };
+  }
   if (head === "projects" && b === "issues" && rest.length === 1) {
     const slug = a ? segment(a) : null;
     const issueId = segment(rest[0]);
@@ -347,6 +363,10 @@ export function routePath(route: Route): string {
     }
     case "setup":
       return "/setup";
+    case "credentialEntry":
+      return `/connections/enroll/${encodeURIComponent(route.requestId)}`;
+    case "credentialAuthorize":
+      return `/connections/authorize/${encodeURIComponent(route.requestId)}`;
     case "login":
       return "/login";
     case "overview":

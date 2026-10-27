@@ -8,6 +8,16 @@ use crate::adapter::Probe;
 use crate::issue;
 use crate::peer::PeerTies;
 
+/// A server-derived send binding, never selected by message parameters.
+pub(super) enum SendBinding<'a> {
+    IssueLane {
+        issue: &'a str,
+        worktree: &'a str,
+        authorized_until: f64,
+    },
+    TopicPost(&'a str),
+}
+
 /// CAD-565: the largest window one `message read` returns — Unicode
 /// scalars, matching the pty paste ceiling so a single page can carry
 /// anything a pane could.
@@ -406,7 +416,11 @@ impl Shared {
             steer_refused,
             None,
             None,
-            Some((issue, lane.as_str(), authorized_until)),
+            Some(SendBinding::IssueLane {
+                issue,
+                worktree: lane.as_str(),
+                authorized_until,
+            }),
         )?;
         Ok(true)
     }
@@ -443,9 +457,9 @@ impl Shared {
     /// performer. `thread_send` passes both; every other caller reaches
     /// this through a wrapper above with `None`/`None` for whichever it
     /// does not derive.
-    /// CAD-225: `bound_lane` is `(issue, worktree, authorized_until)`,
-    /// derived server-side by `send_issue_followup`. Other paths pass
-    /// `None`; request fields cannot set lane tags or the grant deadline.
+    /// The server-owned binding supplies either a bounded issue lane or the
+    /// room/topic post whose request is committed atomically with this queue.
+    /// Request fields cannot set either binding or the grant deadline.
     pub(super) fn send_with_human_expected(
         self: &Arc<Self>,
         params: &Value,
@@ -453,8 +467,17 @@ impl Shared {
         steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
         human: Option<&Value>,
         expected_uid: Option<&str>,
-        bound_lane: Option<(&str, &str, f64)>,
+        binding: Option<SendBinding<'_>>,
     ) -> Result<Value> {
+        let (bound_lane, request_post) = match binding {
+            Some(SendBinding::IssueLane {
+                issue,
+                worktree,
+                authorized_until,
+            }) => (Some((issue, worktree, authorized_until)), None),
+            Some(SendBinding::TopicPost(post)) => (None, Some(post)),
+            None => (None, None),
+        };
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
         let target = self.store.agent_opt(&alias)?;
@@ -899,6 +922,7 @@ impl Shared {
             media_refs.as_ref(),
             bound_lane.map(|(_, _, until)| until),
             None,
+            request_post,
         )?;
         // Each superseded row's `reply_to` got a notice in the same
         // transaction — wake those recipients like `message cancel` does.

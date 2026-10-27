@@ -76,6 +76,7 @@ pub mod pi_policy;
 pub mod platform;
 pub mod proc;
 pub(crate) mod protected_pi_profile;
+pub mod protected_runtime;
 pub mod proto;
 pub mod reaper;
 pub mod releases;
@@ -112,6 +113,8 @@ pub mod worktree;
 // from every non-test build.
 #[cfg(test)]
 extern crate self as cadence_agent;
+#[cfg(test)]
+mod cad1085_entry_authority_acceptance;
 #[cfg(test)]
 mod test_web_issuer_tls;
 #[cfg(test)]

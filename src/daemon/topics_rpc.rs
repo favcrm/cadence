@@ -439,13 +439,23 @@ impl Shared {
         // caller-derived, id-idempotent).
         let send =
             json!({"alias": target, "text": body, "message": request_id, "source": "operator"});
-        let receipt = self.send_as(&send, &|_| Ok(crate::store::Sender::OperatorChat))?;
+        let receipt = self.send_with_human_expected(
+            &send,
+            &|_| Ok(crate::store::Sender::OperatorChat),
+            &|verb| {
+                Err(Error::rejected(format!(
+                    "{verb} refused: this send carries no caller to steer with"
+                )))
+            },
+            None,
+            Some(&target_uid),
+            Some(super::messages_rpc::SendBinding::TopicPost(&post)),
+        )?;
         let request = receipt
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or(&request_id)
             .to_string();
-        self.store.topic_post_bind_request(&post, &request)?;
         Ok(json!({
             "topic": topic.id,
             "message": post,

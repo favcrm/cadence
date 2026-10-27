@@ -10,14 +10,12 @@
 //! flips `disconnected` and resolves every pending request with
 //! `OutcomeUnknown` — callers must not retry blindly.
 
-#[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -105,47 +103,21 @@ pub struct StdioAdapter {
     /// The child's stdin, locked apart from [`Inner`]: a write blocked
     /// on a full pipe must never hold up a signal, an exit poll or the
     /// close that would unblock it (CAD-323).
-    stdin: Mutex<Option<PipeInput>>,
+    stdin: Mutex<Option<ChildStdin>>,
+    /// CAD-1085 protected console attachment: when present the transport
+    /// speaks to an owned OCI runtime's console instead of a spawned child.
+    /// Exactly one of `stdin`/`console_stdin` is ever armed.
+    console_stdin: Mutex<Option<std::os::unix::net::UnixStream>>,
+    /// The measured guest pid for a console attachment (0 when a child).
+    console_pid: std::sync::atomic::AtomicU32,
     pending: Pending,
     disconnected: AtomicBool,
     /// Raw newline-delimited event stream (no JSON-RPC framing).
     raw_lines: bool,
 }
 
-enum PipeInput {
-    Local(ChildStdin),
-    #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-    Protected(File),
-}
-impl Write for PipeInput {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Local(pipe) => pipe.write(bytes),
-            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-            Self::Protected(pipe) => pipe.write(bytes),
-        }
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Local(pipe) => pipe.flush(),
-            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-            Self::Protected(pipe) => pipe.flush(),
-        }
-    }
-}
-impl AsRawFd for PipeInput {
-    fn as_raw_fd(&self) -> RawFd {
-        match self {
-            Self::Local(pipe) => pipe.as_raw_fd(),
-            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-            Self::Protected(pipe) => pipe.as_raw_fd(),
-        }
-    }
-}
 struct Inner {
     child: Option<Child>,
-    #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-    remote: Option<Arc<crate::protected_pi_profile::authority::RemoteControl>>,
 }
 
 impl StdioAdapter {
@@ -182,12 +154,10 @@ impl StdioAdapter {
             env_scrub,
             on_message,
             on_disconnect,
-            inner: Mutex::new(Inner {
-                child: None,
-                #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-                remote: None,
-            }),
+            inner: Mutex::new(Inner { child: None }),
             stdin: Mutex::new(None),
+            console_stdin: Mutex::new(None),
+            console_pid: std::sync::atomic::AtomicU32::new(0),
             pending: Pending::new(),
             disconnected: AtomicBool::new(false),
             raw_lines,
@@ -205,10 +175,7 @@ impl StdioAdapter {
         stderr_log: &std::path::Path,
         env: &[(String, String)],
     ) -> Result<u32> {
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(stderr_log)?;
+        let log = super::open_provider_log(stderr_log)?;
         let mut command = Command::new(&self.command[0]);
         command
             .args(&self.command[1..])
@@ -258,51 +225,30 @@ impl StdioAdapter {
         self.adopt_child(crate::reaper::spawn(&mut command)?)
     }
 
-    /// Adopt ONLY the fixed root-created helper's validated stdio and retained
-    /// finite control channel. No local SUID exec, PID adoption or signal path.
-    #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-    pub(crate) fn adopt_protected(
+    /// Typed protected transport. No command/env/cwd from agent params enters
+    /// this path; only the owned context can yield a bound helper exec plan.
+    #[cfg(all(unix, target_os = "linux"))]
+    pub(crate) fn launch_protected(
         self: &Arc<Self>,
-        launch: crate::protected_pi_profile::authority::RemoteLaunch,
+        context: super::pi_guest::GuestCtx,
+        routing: &crate::protected_pi_profile::Routing,
         stderr_log: &std::path::Path,
     ) -> Result<u32> {
-        let mut log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(stderr_log)?;
-        let (stdin, stdout, mut stderr, control) = launch.into_parts();
-        let pid = control.pid(); // observation ONLY, never local ownership
-        let mut inner = self.inner.lock().unwrap();
-        if inner.child.is_some() || inner.remote.is_some() {
-            return Err(Error::rejected("provider already owns a transport"));
-        }
-        *self.stdin.lock().unwrap() = Some(PipeInput::Protected(stdin));
-        inner.remote = Some(Arc::new(control));
-        drop(inner);
-        if let Err(e) = crate::thread_budget::spawn(move || {
-            let _ = std::io::copy(&mut stderr, &mut log);
-        })
-        .map(|thread| thread.detach())
-        .map_err(|e| Error::internal(format!("protected stderr drain not started: {e}")))
+        let plan = context.spawn_plan(routing)?;
         {
-            self.inner.lock().unwrap().remote = None;
-            *self.stdin.lock().unwrap() = None;
-            return Err(e);
+            let log = super::open_provider_log(stderr_log)?;
+            // Not a pathname fallback: pre_exec must consume the verified fd.
+            // This deliberately nonexistent target refuses if fd-exec cannot run.
+            let mut command = Command::new("/cadence-protected-fd-exec-only");
+            command
+                .env_clear()
+                .current_dir("/")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::from(log));
+            plan.attach(&mut command);
+            self.adopt_child(crate::reaper::spawn(&mut command)?)
         }
-        let adapter = Arc::clone(self);
-        if let Err(e) = crate::thread_budget::spawn(move || adapter.read_loop(stdout))
-            .map(|thread| thread.detach())
-            .map_err(|e| Error::internal(format!("protected reader not started: {e}")))
-        {
-            // Drop the retained control/stdio before refusing: a protected
-            // transport must never survive without its reader.
-            let mut inner = self.inner.lock().unwrap();
-            inner.remote = None;
-            drop(inner);
-            *self.stdin.lock().unwrap() = None;
-            return Err(e);
-        }
-        Ok(pid)
     }
 
     fn adopt_child(self: &Arc<Self>, mut child: std::process::Child) -> Result<u32> {
@@ -316,33 +262,15 @@ impl StdioAdapter {
             .take()
             .ok_or_else(|| Error::internal("provider stdout unavailable"))?;
         {
-            *self.stdin.lock().unwrap() = Some(PipeInput::Local(stdin));
+            *self.stdin.lock().unwrap() = Some(stdin);
             self.inner.lock().unwrap().child = Some(child);
         }
         let adapter = Arc::clone(self);
-        if let Err(e) = crate::thread_budget::spawn(move || adapter.read_loop(stdout))
-            .map(|thread| thread.detach())
-            .map_err(|e| Error::internal(format!("provider reader not started: {e}")))
-        {
-            // No reader means the child would be an unowned writer with no
-            // supervision: stop it and release the transport before refusing.
-            let child = self.inner.lock().unwrap().child.take();
-            if let Some(mut child) = child {
-                // `launch` gave this child its own session/process group
-                // (setsid), so kill the group: the leader alone can leave
-                // provider stragglers running.
-                let pid = child.id();
-                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            *self.stdin.lock().unwrap() = None;
-            return Err(e);
-        }
+        thread::spawn(move || adapter.read_loop(stdout));
         Ok(pid)
     }
 
-    fn read_loop(self: Arc<Self>, stdout: impl Read) {
+    fn read_loop<R: Read + Send + 'static>(self: Arc<Self>, stdout: R) {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
@@ -380,6 +308,39 @@ impl StdioAdapter {
         (self.on_disconnect)();
     }
 
+    /// CAD-1085: adopt an already-opened owned-console attachment. No
+    /// command, environment or working directory is involved: the guest Pi
+    /// process runs inside the measured OCI runtime, and this transport only
+    /// carries its stdin/stdout. The reader thread demultiplexes stdout; a
+    /// console EOF marks the endpoint disconnected exactly like a child exit.
+    pub(crate) fn adopt_console(
+        self: &Arc<Self>,
+        console: crate::protected_runtime::console::OwnerConsole,
+    ) -> Result<u32> {
+        if self.disconnected.load(Ordering::SeqCst) {
+            return Err(Error::provider("Provider connection is closed"));
+        }
+        let parts = console.into_parts()?;
+        {
+            let mut guard = self
+                .console_stdin
+                .lock()
+                .map_err(|_| Error::internal("console stdin lock poisoned"))?;
+            if guard.is_some() {
+                return Err(Error::internal("console stdin is already armed"));
+            }
+            *guard = Some(parts.stdin);
+        }
+        self.console_pid.store(parts.pid, Ordering::SeqCst);
+        let adapter = Arc::clone(self);
+        thread::spawn(move || adapter.read_loop(parts.stdout));
+        Ok(parts.pid)
+    }
+
+    fn console_attached(&self) -> bool {
+        self.console_pid.load(Ordering::SeqCst) != 0
+    }
+
     /// Write one outbound frame. When the transport is already
     /// disconnected or stdin is already gone, provably no bytes left —
     /// a provider error, not `OutcomeUnknown`. Only a failed
@@ -388,6 +349,23 @@ impl StdioAdapter {
     pub fn send(&self, message: Value) -> Result<()> {
         if self.disconnected.load(Ordering::SeqCst) {
             return Err(Error::provider("Provider connection is closed"));
+        }
+        if self.console_attached() {
+            let mut payload = message.to_string();
+            payload.push('\n');
+            let mut guard = self
+                .console_stdin
+                .lock()
+                .map_err(|_| Error::internal("console stdin lock poisoned"))?;
+            let stream = guard
+                .as_mut()
+                .ok_or_else(|| Error::provider("Provider connection is closed"))?;
+            return stream
+                .write_all(payload.as_bytes())
+                .and_then(|()| stream.flush())
+                .map_err(|e| {
+                    Error::unknown(format!("Provider connection closed while writing: {e}"))
+                });
         }
         let mut guard = self.stdin.lock().unwrap();
         let stdin = guard
@@ -417,6 +395,16 @@ impl StdioAdapter {
         if payload.len() > libc::PIPE_BUF {
             return Err(Error::provider("frame too large for a non-blocking write"));
         }
+        if self.console_attached() {
+            let Ok(guard) = self.console_stdin.try_lock() else {
+                return Err(Error::provider("provider stdin is busy with another write"));
+            };
+            let stream = guard
+                .as_ref()
+                .ok_or_else(|| Error::provider("Provider connection is closed"))?;
+            let fd = stream.as_raw_fd();
+            return write_nonblocking(fd, payload.as_bytes());
+        }
         let Ok(guard) = self.stdin.try_lock() else {
             return Err(Error::provider("provider stdin is busy with another write"));
         };
@@ -424,29 +412,7 @@ impl StdioAdapter {
             .as_ref()
             .ok_or_else(|| Error::provider("Provider connection is closed"))?;
         let fd = stdin.as_raw_fd();
-        // SAFETY: fcntl/write on a pipe fd this adapter owns and holds
-        // locked; the original flags are restored before unlocking.
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags < 0 {
-                return Err(Error::provider("provider stdin flags unreadable"));
-            }
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            let n = libc::write(fd, payload.as_ptr().cast(), payload.len());
-            let err = std::io::Error::last_os_error();
-            libc::fcntl(fd, libc::F_SETFL, flags);
-            if n == payload.len() as isize {
-                Ok(())
-            } else if n < 0 && err.kind() == std::io::ErrorKind::WouldBlock {
-                Err(Error::provider(
-                    "provider stdin is full — the write would block",
-                ))
-            } else {
-                Err(Error::unknown(format!(
-                    "Provider connection closed while writing: {err}"
-                )))
-            }
-        }
+        write_nonblocking(fd, payload.as_bytes())
     }
 
     /// [`Self::request_timeout`] whose frame goes out through
@@ -473,12 +439,11 @@ impl StdioAdapter {
     }
 
     pub fn pid(&self) -> Option<u32> {
-        let inner = self.inner.lock().unwrap();
-        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-        if let Some(remote) = &inner.remote {
-            return Some(remote.pid());
+        let console = self.console_pid.load(Ordering::SeqCst);
+        if console != 0 {
+            return Some(console);
         }
-        inner.child.as_ref().map(Child::id)
+        self.inner.lock().unwrap().child.as_ref().map(Child::id)
     }
 
     pub fn disconnected(&self) -> bool {
@@ -488,6 +453,12 @@ impl StdioAdapter {
     /// Signal the process group with `sig` (SIGINT interrupts a turn,
     /// SIGTERM ends the process). No-op once the child has exited.
     fn signal_group(&self, sig: libc::c_int) {
+        if self.console_attached() {
+            // A console attachment has no process group here: the Pi RPC
+            // `abort` frame is the primary interrupt, and signalling would
+            // reach some unrelated host process group.
+            return;
+        }
         let mut inner = self.inner.lock().unwrap();
         if let Some(child) = inner.child.as_mut() {
             if child.try_wait().ok().flatten().is_none() {
@@ -501,18 +472,6 @@ impl StdioAdapter {
     /// Interrupt the running turn without killing the process (SIGINT
     /// to the provider's own process group).
     pub fn interrupt(&self) {
-        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-        {
-            let remote = self.inner.lock().unwrap().remote.clone();
-            if let Some(remote) = remote {
-                if remote.interrupt().is_err() {
-                    self.disconnected.store(true, Ordering::SeqCst);
-                    self.pending
-                        .fail_all("Protected provider interrupt UNKNOWN");
-                }
-                return; // NEVER signal its observed PID locally
-            }
-        }
         self.signal_group(libc::SIGINT);
     }
 
@@ -521,6 +480,12 @@ impl StdioAdapter {
     /// A writer blocked on a full pipe keeps the pipe; [`Self::close`]'s
     /// signals end the child and so unblock it.
     pub fn close_stdin(&self) {
+        if let Ok(mut guard) = self.console_stdin.try_lock() {
+            if let Some(stream) = guard.take() {
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                return;
+            }
+        }
         // A short frame in flight lets go at once; wait briefly for it.
         let deadline = std::time::Instant::now() + Duration::from_millis(200);
         loop {
@@ -537,26 +502,17 @@ impl StdioAdapter {
 
     /// Poll for child exit up to `timeout`; true when the process ended.
     pub fn wait_exit(&self, timeout: Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-        {
-            let remote = self.inner.lock().unwrap().remote.clone();
-            if let Some(remote) = remote {
-                loop {
-                    if std::time::Instant::now() >= deadline {
-                        return false;
-                    }
-                    match remote.status_until(deadline) {
-                        Ok(crate::protected_pi_profile::authority::ProcessPhase::Exited) => {
-                            return true
-                        }
-                        Ok(crate::protected_pi_profile::authority::ProcessPhase::Running) => {}
-                        _ => return false, // lost authority/IO is UNKNOWN, NOT exit
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
+        if self.console_attached() {
+            let deadline = std::time::Instant::now() + timeout;
+            while std::time::Instant::now() < deadline {
+                if self.disconnected.load(Ordering::SeqCst) {
+                    return true;
                 }
+                std::thread::sleep(Duration::from_millis(50));
             }
+            return self.disconnected.load(Ordering::SeqCst);
         }
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             {
                 let mut inner = self.inner.lock().unwrap();
@@ -576,25 +532,12 @@ impl StdioAdapter {
     /// Graceful terminate, then kill — scoped to this adapter's own process
     /// group only.
     pub fn close(&self) {
-        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-        {
-            let remote = self.inner.lock().unwrap().remote.clone();
-            if let Some(remote) = remote {
-                if remote.retire().is_ok() {
-                    self.inner.lock().unwrap().remote.take();
-                } else {
-                    // Keep the UNKNOWN control state; no-child must not become
-                    // false physical exit evidence and no guessed PID is killed.
-                    self.disconnected.store(true, Ordering::SeqCst);
-                    self.pending
-                        .fail_all("Protected provider retirement UNKNOWN");
-                }
-                if let Ok(mut stdin) = self.stdin.try_lock() {
-                    stdin.take();
-                }
-                return;
+        if let Ok(mut guard) = self.console_stdin.try_lock() {
+            if let Some(stream) = guard.take() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
             }
         }
+        self.console_pid.store(0, Ordering::SeqCst);
         let mut inner = self.inner.lock().unwrap();
         if let Some(mut child) = inner.child.take() {
             if child.try_wait().ok().flatten().is_none() {
@@ -621,6 +564,33 @@ impl StdioAdapter {
         // the pipe open) holds its own lock; never wait on it here.
         if let Ok(mut stdin) = self.stdin.try_lock() {
             stdin.take();
+        }
+    }
+}
+
+/// One non-blocking all-or-nothing write of a bounded frame.
+fn write_nonblocking(fd: std::os::unix::io::RawFd, payload: &[u8]) -> Result<()> {
+    // SAFETY: fcntl/write on a fd this adapter owns and holds locked; the
+    // original flags are restored before returning.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return Err(Error::provider("provider stdin flags unreadable"));
+        }
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        let n = libc::write(fd, payload.as_ptr().cast(), payload.len());
+        let err = std::io::Error::last_os_error();
+        libc::fcntl(fd, libc::F_SETFL, flags);
+        if n == payload.len() as isize {
+            Ok(())
+        } else if n < 0 && err.kind() == std::io::ErrorKind::WouldBlock {
+            Err(Error::provider(
+                "provider stdin is full — the write would block",
+            ))
+        } else {
+            Err(Error::unknown(format!(
+                "Provider connection closed while writing: {err}"
+            )))
         }
     }
 }
@@ -664,7 +634,14 @@ mod tests {
         // A blocking writer parked on the full pipe.
         let writer = Arc::clone(&adapter);
         let blocked = std::thread::spawn(move || writer.send(json!({"big": "x".repeat(1 << 16)})));
-        std::thread::sleep(Duration::from_millis(200));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while adapter.stdin.try_lock().is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "writer never acquired the full pipe"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let t = Instant::now();
         assert!(adapter.try_send(frame.clone()).is_err());
         adapter.interrupt(); // the SIGINT fallback: child lock only

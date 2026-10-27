@@ -1,0 +1,217 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PrincipalBindingV1",
+  "description": "The persisted principal binding. Untrusted selectors never reach this\nshape; it is built by the trusted adapter from durable rows.",
+  "type": "object",
+  "properties": {
+    "agent_uid": {
+      "$ref": "#/$defs/AgentUid"
+    },
+    "alias": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Ident"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "binding": {
+      "$ref": "#/$defs/RuntimeBindingV1"
+    },
+    "conversation_generation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Revision"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "custody_domain": {
+      "$ref": "#/$defs/Ident"
+    },
+    "enrollment_generation": {
+      "$ref": "#/$defs/Revision"
+    },
+    "kind": {
+      "$ref": "#/$defs/PrincipalKindV1"
+    },
+    "native_session": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NativeSessionV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "principal_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "session_authority_ref": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Ident"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "session_generation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Revision"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "workspace_id": {
+      "$ref": "#/$defs/Ident"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "custody_domain",
+    "workspace_id",
+    "kind",
+    "principal_id",
+    "agent_uid",
+    "enrollment_generation",
+    "binding"
+  ],
+  "$defs": {
+    "AgentUid": {
+      "description": "Stable hosted agent UID: `agt-` plus the 32 lowercase hex UUID digits.",
+      "type": "string"
+    },
+    "Digest": {
+      "description": "`sha256:` plus 64 lowercase hex digits.",
+      "type": "string"
+    },
+    "HostedBindingKindV1": {
+      "type": "string",
+      "enum": [
+        "hosted"
+      ]
+    },
+    "HostedRuntimeBindingV1": {
+      "type": "object",
+      "properties": {
+        "activation_id": {
+          "$ref": "#/$defs/UuidV1"
+        },
+        "custody_epoch": {
+          "$ref": "#/$defs/Revision"
+        },
+        "kind": {
+          "$ref": "#/$defs/HostedBindingKindV1"
+        },
+        "placement_epoch": {
+          "$ref": "#/$defs/Revision"
+        },
+        "restore_epoch": {
+          "$ref": "#/$defs/Revision"
+        },
+        "session_object_id": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "session_object_id",
+        "placement_epoch",
+        "activation_id",
+        "custody_epoch",
+        "restore_epoch"
+      ]
+    },
+    "Ident": {
+      "description": "Bounded printable ASCII identifier (`0x21..=0x7e`, 1..=128 bytes).",
+      "type": "string"
+    },
+    "NativeBindingKindV1": {
+      "type": "string",
+      "enum": [
+        "native"
+      ]
+    },
+    "NativeRuntimeBindingV1": {
+      "type": "object",
+      "properties": {
+        "agent_generation": {
+          "$ref": "#/$defs/Revision"
+        },
+        "continuity_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "kind": {
+          "$ref": "#/$defs/NativeBindingKindV1"
+        },
+        "launch_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "owner_generation": {
+          "$ref": "#/$defs/Revision"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "launch_digest",
+        "continuity_digest",
+        "agent_generation",
+        "owner_generation"
+      ]
+    },
+    "NativeSessionV1": {
+      "type": "object",
+      "properties": {
+        "generation": {
+          "$ref": "#/$defs/Revision"
+        },
+        "session_id": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "generation"
+      ]
+    },
+    "PrincipalKindV1": {
+      "type": "string",
+      "enum": [
+        "agent",
+        "human"
+      ]
+    },
+    "Revision": {
+      "description": "Positive canonical decimal revision (0 refuses).",
+      "type": "string"
+    },
+    "RuntimeBindingV1": {
+      "description": "Native launch/continuity or hosted object/placement/activation/restore.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NativeRuntimeBindingV1"
+        },
+        {
+          "$ref": "#/$defs/HostedRuntimeBindingV1"
+        }
+      ]
+    },
+    "UuidV1": {
+      "description": "Canonical lowercase UUID selector (`8-4-4-4-12`).",
+      "type": "string"
+    }
+  }
+}

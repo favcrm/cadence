@@ -263,7 +263,7 @@ impl Shared {
         // refuses if the alias now belongs to another uid (no reassignment race).
         let send =
             json!({"alias": alias, "text": queued, "message": request_id, "source": "operator"});
-        let receipt = self.send_with_expected(
+        let receipt = self.send_with_human_expected(
             &send,
             &|_| Ok(crate::store::Sender::OperatorChat),
             &|verb| {
@@ -271,13 +271,14 @@ impl Shared {
                     "{verb} refused: this send carries no caller to steer with"
                 )))
             },
+            None,
             Some(agent_uid),
+            Some(super::messages_rpc::SendBinding::TopicPost(&post.id)),
         )?;
         let duplicate = receipt
             .get("duplicate")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        self.store.topic_post_bind_request(&post.id, &request_id)?;
         Ok(json!({
             "request": request_id,
             "post": post_json(&post),

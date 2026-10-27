@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 
+mod agent_access;
 mod app_assistant;
 mod app_audiences;
 mod app_chat;
@@ -54,6 +55,7 @@ mod cloud_agents;
 #[cfg(all(test, feature = "cli-runtime-test"))]
 pub(crate) use cli_route::prime_jwks_for_test as prime_cli_jwks_for_test;
 mod connections;
+mod credential_entry;
 mod crm_send;
 mod crm_smtp;
 pub mod delivery_sync;
@@ -630,6 +632,16 @@ pub struct ServeOpts {
     /// `None` is this board's own binary. Never set from the command
     /// line — tests inject a fake helper.
     pub update_helper: Option<PathBuf>,
+    /// CAD-1085: the root-profile-pinned credential-entry origin,
+    /// resolved once by [`serve`] from the daemon. `None` means this
+    /// deployment has no separate trusted credential origin: the form is
+    /// explicitly unsupported, never served on the ordinary board origin.
+    /// Never set from the command line or `ui.json` — tests inject it.
+    pub credential_entry_origin: Option<String>,
+    /// CAD-1085: the root profile is installed (configured/protected), so
+    /// the legacy directly-typed credential transports are refused even
+    /// when the owner is down or the pinned origin cannot be used.
+    pub protected_profile: bool,
 }
 
 pub(crate) fn opts_file(state_dir: &Path) -> PathBuf {
@@ -670,6 +682,74 @@ pub fn serve_has_target(target: &str) -> Option<bool> {
         return Some(false);
     }
     Some(String::from_utf8_lossy(&out.stdout).contains(target))
+}
+
+/// CAD-1085: the server-selected base URL of this deployment's trusted
+/// credential entry page — the root-pinned `https://` origin, never the
+/// ordinary board, a caller-chosen origin, a CLI flag or `ui.json`.
+///
+/// `None` means this deployment has no separate trusted credential origin
+/// (no protected profile, or the daemon cannot prove one). Callers must
+/// report the entry as unsupported; they must never fall back to the board
+/// origin, where the form does not exist.
+pub fn credential_entry_base(state_dir: &Path) -> Option<String> {
+    credential_entry_origin(state_dir)
+}
+
+/// CAD-1085: the deployment-pinned credential-entry origin from the root
+/// profile, read through the daemon's operator-proven metadata RPC. The
+/// answer needs no agent or loaded guest: it is the profile's exact
+/// `https://host[:port]` plus live owner/core history evidence.
+pub fn credential_entry_origin(state_dir: &Path) -> Option<String> {
+    credential_entry_config(state_dir).1
+}
+
+/// `(root profile installed, pinned entry origin?)`. The daemon answers
+/// from the live root profile and owner/core history; no agent or loaded
+/// guest is required. `configured`/`protected` mean the profile is
+/// installed — not qualified or ready — so the legacy directly-typed
+/// transports are refused even while the owner is down.
+pub fn credential_entry_config(state_dir: &Path) -> (bool, Option<String>) {
+    // An unprovable answer fails CLOSED: an unknown/older daemon or a
+    // transport error is not evidence that this is an unprotected board,
+    // so the legacy secret paths stay refused until the daemon answers.
+    credential_entry_config_proven(state_dir).unwrap_or((true, None))
+}
+
+/// The same answer as a `Result`, for callers (the CLI) that must
+/// distinguish a positive operator-proven daemon reply from an unavailable
+/// one before auto-opening a human-browser URL.
+pub fn credential_entry_config_proven(state_dir: &Path) -> Result<(bool, Option<String>)> {
+    let value = crate::client::rpc(state_dir, "credential_entry_config", json!({}))?;
+    let entry = &value["entry"];
+    let installed =
+        entry["configured"].as_bool() == Some(true) && entry["protected"].as_bool() == Some(true);
+    if !installed {
+        return Ok((false, None));
+    }
+    let origin = entry["origin"].as_str().and_then(|origin| {
+        let rest = origin.strip_prefix("https://")?;
+        (rest.len() <= 200
+            && !rest.is_empty()
+            && !origin.bytes().any(|b| b.is_ascii_whitespace())
+            && !rest.contains(['/', '?', '#', '@']))
+        .then(|| origin.to_string())
+    });
+    Ok((true, origin))
+}
+
+/// Is a protected root profile installed, regardless of whether its pinned
+/// origin is usable right now? Legacy secret collection is refused on this
+/// answer alone.
+pub fn protected_profile_configured(state_dir: &Path) -> bool {
+    credential_entry_config(state_dir).0
+}
+
+/// The ordinary board origin — the metadata and management surface. Never
+/// the trusted credential origin.
+pub fn board_base(state_dir: &Path) -> String {
+    let port = load_opts(state_dir).port.unwrap_or(3010);
+    format!("http://{}", operator::board_host(port))
 }
 
 pub(crate) fn load_opts(state_dir: &Path) -> UiOpts {
@@ -1154,6 +1234,10 @@ pub(crate) fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         // CAD-561 r2: a real board spawns its own binary as the update
         // helper; only tests inject a fake.
         update_helper: None,
+        // CAD-1085: `serve` resolves the root-pinned entry origin from
+        // the daemon; an in-process fixture sets it directly.
+        credential_entry_origin: None,
+        protected_profile: false,
     })
 }
 

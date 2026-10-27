@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CredentialRequestArgsV1",
+  "description": "Metadata-only guest intent. Actor, conversation, custody and request state\nare derived by the trusted parent; no credential field is accepted.",
+  "type": "object",
+  "properties": {
+    "connection_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "provider": {
+      "type": "string"
+    },
+    "scopes": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "verb": {
+      "$ref": "#/$defs/HumanVerbV1"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "provider",
+    "verb"
+  ],
+  "$defs": {
+    "HumanVerbV1": {
+      "type": "string",
+      "enum": [
+        "enroll",
+        "rotate",
+        "verify"
+      ]
+    }
+  }
+}

@@ -716,9 +716,27 @@ impl Shared {
                                 &message.id,
                                 &on_started,
                             )?;
-                            if nudge || !adapter.reset_rejected_session(&first)? {
+                            let reset = if nudge {
+                                false
+                            } else {
+                                adapter.reset_rejected_session(&first)?
+                            };
+                            if !reset {
                                 return Ok(first);
                             }
+                            // A reset retry replaces the visible outcome.
+                            // Record fixed metadata only: the adapter's error
+                            // text can carry raw provider JSON, so the event
+                            // never copies it. The refusal category is
+                            // observable through the adapter's own fixed events.
+                            let _ = self.store.event_public(
+                                alias,
+                                "turn_retry",
+                                json!({
+                                    "message": message.id,
+                                    "first_status": first.status,
+                                }),
+                            );
                             // CAD-1076: one retry on a fresh session.
                             // Offered only for a master history refusal
                             // before any tool. A serialized-body refusal

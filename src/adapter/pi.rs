@@ -15,9 +15,6 @@
 //!   verdict; the turn's output streams afterwards and `agent_settled`
 //!   — emitted unconditionally once no retry/compaction/queued
 //!   continuation remains — ends the turn.
-//! - OMP uses a correlated `prompt_result`, then `session_settled` if
-//!   background work remains. Its first success response is only an ack;
-//!   a later scheduling/auth failure must still close the durable turn.
 //! - `message_end` for an assistant message is the authoritative text;
 //!   `stopReason` `aborted`/`error` maps to interrupted/failed.
 //! - A master `400` `invalid_request` before any tool is the CAD-1076
@@ -305,11 +302,6 @@ struct TurnAcc {
     tools: bool,
 }
 
-struct OmpPrompt {
-    id: String,
-    yielded: bool,
-}
-
 struct Shared {
     hooks: AdapterHooks,
     pending: Pending,
@@ -339,9 +331,6 @@ struct Shared {
     transport: Mutex<Option<Arc<StdioAdapter>>>,
     dead: AtomicBool,
     guard_ready: AtomicBool,
-    /// OMP completes correlated prompts, then may settle background work later.
-    omp: AtomicBool,
-    omp_prompt: Mutex<Option<OmpPrompt>>,
     guard_receipts: Mutex<HashMap<String, GuardReceipt>>,
     /// CAD-1076: the last master turn the provider refused before any
     /// work — the one turn [`ProviderAdapter::reset_rejected_session`]
@@ -372,8 +361,10 @@ pub struct PiAdapter {
     agent_uid: Option<u32>,
     /// CAD-1098: the tool profile the next `open` launches with.
     profile: Mutex<crate::master::Profile>,
-    /// OMP mints its session path before creating the file on its first turn.
-    pending_session_file: Mutex<Option<(String, String)>>,
+    /// CAD-1085: the closed caller identity of the attached owned console.
+    protected_caller: Mutex<Option<Arc<crate::protected_runtime::RuntimeCaller>>>,
+    /// CAD-1085: the stable agent uid whose owned runtime is attached.
+    protected_agent_uid: Mutex<Option<String>>,
 }
 
 /// Identity evidence must include an actual namespace and model id;
@@ -444,8 +435,6 @@ impl PiAdapter {
             transport: Mutex::new(None),
             dead: AtomicBool::new(false),
             guard_ready: AtomicBool::new(false),
-            omp: AtomicBool::new(false),
-            omp_prompt: Mutex::new(None),
             guard_receipts: Mutex::new(HashMap::new()),
             rejected_turn: Mutex::new(None),
             turn_images: Mutex::new(Vec::new()),
@@ -472,20 +461,9 @@ impl PiAdapter {
                 .unwrap_or_else(|| PathBuf::from(".")),
             agent_uid,
             profile: Mutex::new(crate::master::Profile::Home),
-            pending_session_file: Mutex::new(None),
+            protected_caller: Mutex::new(None),
+            protected_agent_uid: Mutex::new(None),
         }
-    }
-
-    fn persist_pending_session_file(&self) {
-        let mut pending = self.pending_session_file.lock().unwrap();
-        let Some((alias, file)) = pending.as_ref() else {
-            return;
-        };
-        if !Path::new(file).is_file() {
-            return;
-        }
-        record_current_session(&self.state_dir, alias, file);
-        *pending = None;
     }
 
     /// The emitted confinement, appended to the provider log so an
@@ -765,12 +743,6 @@ impl PiAdapter {
             .lock()
             .unwrap()
             .insert(id.clone(), tx);
-        if command == "prompt" && self.shared.omp.load(Ordering::SeqCst) {
-            *self.shared.omp_prompt.lock().unwrap() = Some(OmpPrompt {
-                id: id.clone(),
-                yielded: false,
-            });
-        }
         let mut frame = json!({"id": id, "type": command});
         if let Some(obj) = fields.as_object() {
             for (k, v) in obj {
@@ -827,22 +799,6 @@ impl Shared {
         // Any parsed line is proof of life.
         *self.last_activity.lock().unwrap() = Instant::now();
         if method == "response" {
-            if self.omp.load(Ordering::SeqCst)
-                && params.get("command").and_then(Value::as_str) == Some("prompt")
-                && params.get("success").and_then(Value::as_bool) == Some(true)
-                && params
-                    .pointer("/data/agentInvoked")
-                    .and_then(Value::as_bool)
-                    == Some(false)
-            {
-                let mut pending = self.omp_prompt.lock().unwrap();
-                if pending.as_ref().is_some_and(|prompt| {
-                    params.get("id").and_then(Value::as_str) == Some(prompt.id.as_str())
-                }) {
-                    *pending = None;
-                    self.finish_turn();
-                }
-            }
             self.pending.resolve(&params);
             return;
         }
@@ -894,52 +850,12 @@ impl Shared {
                     .unwrap_or("pi auto-retry exhausted");
                 self.turn.lock().unwrap().error = Some(err.to_string());
             }
-            "agent_settled" if !self.omp.load(Ordering::SeqCst) => self.finish_turn(),
-            "prompt_result" if self.omp.load(Ordering::SeqCst) => {
-                self.on_omp_prompt_result(&params);
-            }
-            "session_settled" if self.omp.load(Ordering::SeqCst) => {
-                let mut pending = self.omp_prompt.lock().unwrap();
-                if pending.as_ref().is_some_and(|prompt| prompt.yielded) {
-                    *pending = None;
-                    self.finish_turn();
-                }
+            "agent_settled" => {
+                let acc = std::mem::take(&mut *self.turn.lock().unwrap());
+                self.outcomes.lock().unwrap().push_back(acc);
+                self.outcome_cv.notify_all();
             }
             _ => {}
-        }
-    }
-    fn finish_turn(&self) {
-        let acc = std::mem::take(&mut *self.turn.lock().unwrap());
-        self.outcomes.lock().unwrap().push_back(acc);
-        self.outcome_cv.notify_all();
-    }
-
-    fn on_omp_prompt_result(&self, event: &Value) {
-        let mut pending = self.omp_prompt.lock().unwrap();
-        let Some(prompt) = pending.as_mut() else {
-            return;
-        };
-        if event.get("id").and_then(Value::as_str) != Some(prompt.id.as_str()) {
-            return;
-        }
-        match event.get("status").and_then(Value::as_str) {
-            Some("completed") => {}
-            Some("aborted") => self.turn.lock().unwrap().stop = Some("aborted".to_string()),
-            Some("error") => {
-                self.turn.lock().unwrap().error = Some(
-                    event
-                        .pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("OMP prompt failed")
-                        .to_string(),
-                );
-            }
-            _ => return,
-        }
-        prompt.yielded = true;
-        if event.get("sessionSettled").and_then(Value::as_bool) == Some(true) {
-            *pending = None;
-            self.finish_turn();
         }
     }
 
@@ -1113,15 +1029,31 @@ impl ProviderAdapter for PiAdapter {
     /// Pi silently falls back on an unsupported level.
     fn open(&self, agent: &Agent) -> Result<Identity> {
         refuse_confined_devin_agent(agent)?;
-        // A split launch requires the fixed private owner service. Unsupported
-        // hosts refuse before provisioning; selectors never establish authority.
-        #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
-        if self.agent_uid.is_some() {
+        // CAD-1085: when the reviewed root profile is active there is exactly
+        // one native launch path — the owner's measured OCI console. A missing
+        // coordinator/owner refuses; a host same-UID process is never a
+        // fallback. The older split seam (`agent_uid`) keeps its own refusal
+        // only for deployments without the reviewed profile.
+        let protected_profile = crate::protected_runtime::protected_profile_active();
+        #[cfg(not(all(unix, target_os = "linux")))]
+        if self.agent_uid.is_some() || protected_profile {
             super::pi_guest::protected_prereqs_satisfied()?;
-            return Err(Error::rejected(
-                "protected managed-Pi launch requires Linux x86_64",
-            ));
+            return Err(Error::rejected("protected managed-Pi launch is Linux-only"));
         }
+        #[cfg(all(unix, target_os = "linux"))]
+        let protected = if protected_profile {
+            None
+        } else if let Some(uid) = self.agent_uid {
+            let generation = Uuid::new_v4().simple().to_string();
+            Some(super::pi_guest::GuestCtx::establish(
+                agent,
+                &self.env,
+                uid,
+                &generation,
+            )?)
+        } else {
+            None
+        }; // No caller flag/marker/command can construct this context.
         let master = crate::master::is_master(&agent.alias);
         let params = agent.params.clone().unwrap_or(Value::Null);
         // CAD-559: pi launches only on an explicit model the operator
@@ -1147,24 +1079,25 @@ impl ProviderAdapter for PiAdapter {
             if master { "master" } else { "worker" },
             want,
         )?;
-        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-        let protected = if let Some(uid) = self.agent_uid {
-            let generation = Uuid::new_v4().simple().to_string();
-            Some(super::pi_guest::GuestCtx::establish(
-                agent,
-                &self.env,
-                uid,
-                &generation,
+        // CAD-1085: open the owned console before the transport exists so the
+        // adapter's generation tag is the measured runtime's, and so a failed
+        // bootstrap refuses before any prompt state is touched.
+        #[cfg(all(unix, target_os = "linux"))]
+        let mut protected_console = if protected_profile {
+            let provider = crate::daemon::protected_runtime::console_provider()?;
+            Some(provider.open_console(
+                crate::daemon::protected_runtime::ConsoleSubject {
+                    alias: &agent.alias,
+                    agent_uid: &agent.uid,
+                    created: agent.created,
+                },
+                &self.log_path,
             )?)
         } else {
             None
-        }; // Real owner provisions BEFORE verify-only topology walk.
+        };
         self.shared.master.store(master, Ordering::SeqCst);
-        self.shared
-            .omp
-            .store(agent.provider == "omp", Ordering::SeqCst);
-        *self.shared.omp_prompt.lock().unwrap() = None;
-        if master && self.agent_uid.is_none() {
+        if master && self.agent_uid.is_none() && !protected_profile {
             let agenticos_reads = agenticos_read_extension(&self.env)?.is_some();
             write_pi_guard(
                 &self.state_dir,
@@ -1173,12 +1106,12 @@ impl ProviderAdapter for PiAdapter {
             )?;
         }
         self.shared.guard_ready.store(false, Ordering::SeqCst);
-        let guard_path = if self.agent_uid.is_none() {
+        let guard_path = if self.agent_uid.is_none() && !protected_profile {
             Some(write_pi_turn_guard(&self.state_dir, &agent.alias)?.canonicalize()?)
         } else {
             None
         }; // Immutable protected guard/graph policy is not elected here.
-        let (command, confinement) = if self.agent_uid.is_none() {
+        let (command, confinement) = if self.agent_uid.is_none() && !protected_profile {
             launch_command(&self.env, &self.state_dir, agent)?
         } else {
             (vec!["cadence-protected-fd-exec-only".into()], None)
@@ -1187,12 +1120,16 @@ impl ProviderAdapter for PiAdapter {
             let role = if master { "master" } else { "worker" };
             self.log_confinement(role, policy)?;
         }
-        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-        let generation = protected
-            .as_ref()
-            .map(|ctx| ctx.segments().generation_hex())
-            .unwrap_or_else(|| Uuid::new_v4().simple().to_string()[..12].to_string());
-        #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
+        #[cfg(all(unix, target_os = "linux"))]
+        let generation = if let Some(console) = protected_console.as_ref() {
+            console.generation_tag.clone()
+        } else {
+            protected
+                .as_ref()
+                .map(|ctx| ctx.segments().generation_hex())
+                .unwrap_or_else(|| Uuid::new_v4().simple().to_string()[..12].to_string())
+        };
+        #[cfg(not(all(unix, target_os = "linux")))]
         let generation = Uuid::new_v4().simple().to_string()[..12].to_string();
         *self.shared.generation.lock().unwrap() = generation.clone();
         self.shared.dead.store(false, Ordering::SeqCst);
@@ -1284,11 +1221,7 @@ impl ProviderAdapter for PiAdapter {
                     self.env.var("PI_CODING_AGENT_DIR"),
                     self.env.var("HOME"),
                 );
-                if agent.provider == "omp" {
-                    // OMP uses its native agent.db, not Pi's auth.json. Keep its
-                    // login private; never copy the operator's entire database.
-                    ensure_private_dir(&config)?;
-                } else if want.starts_with("agenticos/") {
+                if want.starts_with("agenticos/") {
                     agenticos::seed(&config, &pi_config_dir(&self.state_dir), want)?;
                 } else if let Some(operator) = operator.as_deref() {
                     copy_pi_auth(&config, operator)?;
@@ -1346,19 +1279,22 @@ impl ProviderAdapter for PiAdapter {
         *self.transport.write().unwrap() = Arc::clone(&transport);
         let workdir = launch_workdir(agent).to_string_lossy().into_owned();
         let initialized = (|| {
-            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
-            let pid = match protected {
-                Some(ctx) => {
-                    let routing = crate::protected_pi_profile::Routing::for_agent(master, want)
-                        .map_err(Error::rejected)?;
-                    let launch = ctx.launch(&routing)?;
-                    // Root alone owns creation/retirement. Adopt ONLY its exact
-                    // stdio pipes/control channel, never a returned PID as custody.
-                    transport.adopt_protected(launch, &self.log_path)?
+            #[cfg(all(unix, target_os = "linux"))]
+            let pid = if let Some(console) = protected_console.take() {
+                *self.protected_caller.lock().unwrap() = Some(Arc::new(console.caller));
+                *self.protected_agent_uid.lock().unwrap() = Some(agent.uid.clone());
+                transport.adopt_console(console.console)?
+            } else {
+                match protected {
+                    Some(ctx) => {
+                        let routing = crate::protected_pi_profile::Routing::for_agent(master, want)
+                            .map_err(Error::rejected)?;
+                        transport.launch_protected(ctx, &routing, &self.log_path)?
+                    }
+                    None => transport.launch(&workdir, &self.log_path, &env)?,
                 }
-                None => transport.launch(&workdir, &self.log_path, &env)?,
             };
-            #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
+            #[cfg(not(all(unix, target_os = "linux")))]
             let pid = transport.launch(&workdir, &self.log_path, &env)?;
             // Effort: validate against the model's real levels, then verify
             // what stuck — Pi answers success even on a silent fallback.
@@ -1428,40 +1364,17 @@ impl ProviderAdapter for PiAdapter {
                 return Err(self.command_error("get_state", &state));
             }
             let data = state.get("data").cloned().unwrap_or(Value::Null);
-            let session_id = match data
+            let session_id = data
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-            {
-                Some(id) => id.to_string(),
-                None if agent.provider == "omp" => {
-                    return Err(Error::provider(
-                        "OMP did not report its native session identity",
-                    ));
-                }
-                None => Uuid::new_v4().to_string(),
-            };
-            if agent.provider == "omp"
-                && !master
-                && [agent.thread_id.as_deref(), agent.session_id.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .any(|owned| owned != session_id)
-            {
-                return Err(Error::rejected(
-                    "OMP reopened with a different native identity; refusing session replacement",
-                ));
-            }
-            *self.pending_session_file.lock().unwrap() = None;
+                .map(str::to_string)
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
             // CAD-1752: the session file Pi actually opened (a lane
             // relaunch forks into a new one) is this worker's current one.
             if !master {
                 if let Some(file) = data.get("sessionFile").and_then(Value::as_str) {
                     record_current_session(&self.state_dir, &agent.alias, file);
-                    if agent.provider == "omp" && !Path::new(file).is_file() {
-                        *self.pending_session_file.lock().unwrap() =
-                            Some((agent.alias.clone(), file.to_string()));
-                    }
                 }
             }
             let Some((reported_full, reported_id)) = resolved_pi_model(&data) else {
@@ -1549,8 +1462,8 @@ impl ProviderAdapter for PiAdapter {
         Ok(())
     }
 
-    /// One durable message → one `prompt` command → provider settlement.
-    /// The response gates acceptance; a correlated OMP result may fail later.
+    /// One durable message → one `prompt` command → `agent_settled`.
+    /// The response gates acceptance; the settle carries the outcome.
     fn run_turn(
         &self,
         prompt: &str,
@@ -1567,7 +1480,7 @@ impl ProviderAdapter for PiAdapter {
         &self,
         prompt: &str,
         slot: Option<&str>,
-        _client_message_id: &str,
+        client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
         if !self.shared.turn_images.lock().unwrap().is_empty() {
@@ -1585,6 +1498,10 @@ impl ProviderAdapter for PiAdapter {
         }
         let generation = self.shared.generation.lock().unwrap().clone();
         let turn_id = registry::PI_MANAGED_TURN_TOKENS.mint(&generation);
+        // CAD-1085 r7: bind the durable server-owned model task BEFORE any
+        // prompt frame. No authority comes from prompt text or task args; the
+        // guard is held for the turn and fences on drop/settle/interrupt.
+        let _native_task = self.bind_native_task(client_message_id, &turn_id)?;
         let prompt = &super::with_turn_token(prompt, slot, &turn_id);
         *self.shared.interrupt_at.lock().unwrap() = None;
         // A settled-but-unconsumed turn is stale — it belongs to a
@@ -1711,7 +1628,6 @@ impl ProviderAdapter for PiAdapter {
             }
         })();
         *self.shared.active_turn.lock().unwrap() = None;
-        self.persist_pending_session_file();
         let mut acc = match waited {
             Ok(acc) => acc,
             Err(error) => {
@@ -1904,10 +1820,41 @@ impl ProviderAdapter for PiAdapter {
     fn close(&self) {
         let transport = self.transport.read().unwrap().clone();
         transport.close_stdin();
+        // A console attachment has no local child; its reader thread observes
+        // EOF once the owner closes the console.
         transport.wait_exit(Duration::from_secs(3));
         transport.close();
-        self.persist_pending_session_file();
         self.shared.on_disconnect();
+        // CAD-1085: detach first, then stop exactly this agent's owned runtime.
+        let attached = self.protected_caller.lock().unwrap().take();
+        let uid = self.protected_agent_uid.lock().unwrap().take();
+        if attached.is_some() {
+            if let (Some(uid), Ok(provider)) =
+                (uid, crate::daemon::protected_runtime::console_provider())
+            {
+                provider.stop_agent(&uid, "agent closed");
+            }
+        }
+    }
+}
+
+impl PiAdapter {
+    /// Bind the durable model task before a protected turn's prompt.
+    fn bind_native_task(
+        &self,
+        client_message_id: &str,
+        turn_token: &str,
+    ) -> Result<Option<Box<dyn crate::daemon::protected_runtime::NativeTaskGuard>>> {
+        let Some(caller) = self.protected_caller.lock().unwrap().clone() else {
+            return Ok(None);
+        };
+        let provider = crate::daemon::protected_runtime::console_provider()?;
+        Ok(Some(provider.bind_native_task(
+            &caller,
+            client_message_id,
+            client_message_id,
+            turn_token,
+        )?))
     }
 }
 
@@ -2557,109 +2504,3 @@ for raw in sys.stdin:
             .any(|(method, _)| { method == "cadence/serialized_body_limited" }));
     }
 }
-
-#[cfg(test)]
-mod cad1814_tests {
-    use super::*;
-
-    fn adapter(root: &Path) -> PiAdapter {
-        let adapter = PiAdapter::new(
-            AdapterHooks {
-                on_event: Box::new(|_, _| {}),
-                on_request: Box::new(|_| {}),
-            },
-            &root.join("provider.log"),
-            &ProviderEnv::refusing_providers(),
-            None,
-        );
-        adapter.shared.omp.store(true, Ordering::SeqCst);
-        *adapter.shared.omp_prompt.lock().unwrap() = Some(OmpPrompt {
-            id: "current".to_string(),
-            yielded: false,
-        });
-        adapter
-    }
-
-    fn event(shared: &Shared, method: &str, params: Value) {
-        shared.dispatch(Incoming::Notification {
-            method: method.to_string(),
-            params,
-        });
-    }
-
-    #[test]
-    fn omp_late_prompt_rejection_fails_only_its_matching_turn() {
-        let root = tempfile::tempdir().unwrap();
-        let adapter = adapter(root.path());
-        let shared = &adapter.shared;
-        let mut rejection = json!({
-            "id": "previous",
-            "status": "error",
-            "agentInvoked": false,
-            "sessionSettled": true,
-            "error": {"message": "No API key found", "retryable": false}
-        });
-        event(shared, "prompt_result", rejection.clone());
-        assert!(shared.outcomes.lock().unwrap().is_empty());
-        rejection["id"] = json!("current");
-        event(shared, "prompt_result", rejection.clone());
-        let mut result = shared.outcomes.lock().unwrap().pop_front().unwrap();
-        assert_eq!(settle_pi_turn(&mut result, false, false).status, "failed");
-        event(shared, "prompt_result", rejection);
-        event(shared, "session_settled", json!({}));
-        assert!(shared.outcomes.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn omp_yield_keeps_the_turn_open_until_background_work_settles() {
-        let root = tempfile::tempdir().unwrap();
-        let adapter = adapter(root.path());
-        let shared = &adapter.shared;
-        event(shared, "session_settled", json!({}));
-        event(
-            shared,
-            "prompt_result",
-            json!({"id": "current", "status": "completed", "sessionSettled": false}),
-        );
-        event(shared, "agent_end", json!({}));
-        event(shared, "agent_settled", json!({}));
-        assert!(shared.outcomes.lock().unwrap().is_empty());
-        event(shared, "session_settled", json!({}));
-        let mut result = shared.outcomes.lock().unwrap().pop_front().unwrap();
-        assert_eq!(
-            settle_pi_turn(&mut result, false, false).status,
-            "completed"
-        );
-        event(shared, "session_settled", json!({}));
-        assert!(shared.outcomes.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn omp_local_completion_does_not_wait_for_a_nonexistent_model_turn() {
-        let root = tempfile::tempdir().unwrap();
-        let adapter = adapter(root.path());
-        let shared = &adapter.shared;
-        let mut response = json!({
-            "id": "previous",
-            "command": "prompt",
-            "success": true,
-            "data": {"agentInvoked": false}
-        });
-        event(shared, "response", response.clone());
-        assert!(shared.outcomes.lock().unwrap().is_empty());
-        response["id"] = json!("current");
-        event(shared, "response", response.clone());
-        let mut result = shared.outcomes.lock().unwrap().pop_front().unwrap();
-        assert_eq!(
-            settle_pi_turn(&mut result, false, false).status,
-            "completed"
-        );
-        event(shared, "response", response);
-        event(shared, "session_settled", json!({}));
-        assert!(shared.outcomes.lock().unwrap().is_empty());
-    }
-}
-
-#[cfg(test)]
-#[path = "pi_omp_acceptance.rs"]
-mod cad1814_independent_acceptance;

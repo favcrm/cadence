@@ -6,7 +6,7 @@ import { resources, threadReader } from "../../lib/resources";
 import type { SseErrorState } from "../../lib/sse";
 import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
-import type { Agent, MasterAppOrigin, MasterCommandResult, MasterState, Overview, ThreadRef } from "../../lib/types";
+import type { MasterAppOrigin, MasterCommandResult, Overview, ThreadRef } from "../../lib/types";
 import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import {
@@ -23,14 +23,6 @@ import {
 } from "./master";
 import { useCanvasFeed } from "../canvas/feed";
 import Composer from "./Composer";
-import {
-  AssistantAboutButton,
-  AssistantActorProvider,
-  AssistantFace,
-  useAssistantActor,
-  useConversationActor,
-} from "../assistant/AssistantIdentity";
-import { displayName, readConversationIdentity, scopeDescriptor } from "../assistant/identity";
 import type { AttachDestination } from "../app-shell/chat/attach";
 import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
@@ -47,7 +39,8 @@ import { turnBarState } from "../app-shell/chat/turnBarState";
 import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
 import MemberChat from "./MemberChat";
 import { memberScope } from "./memberThread";
-import { CloudContentNotice, StreamBanner, ThreadTurn, time } from "./ThreadView";
+import { StreamBanner, time } from "./ThreadView";
+import CredentialRequestList from "../connections/CredentialRequestCard";
 import {
   initialFollow,
   motionBehavior,
@@ -152,10 +145,9 @@ function AssistantActivity({ since }: { since: number | null }) {
  *  one header. `at` is the anchored entry's own timestamp. */
 function AssistantNameRow({ at, live }: { at?: string; live: ReactNode }) {
   const t = useTranslate();
-  const actor = useAssistantActor();
   return (
     <div className="flex gap-2 items-center text-micro text-ink-400" data-kind="assistant-name">
-      <span className="text-ink-100 font-medium">{displayName(actor.read, actor.scope, t)}</span>
+      <span className="text-ink-100 font-medium">{t("Assistant")}</span>
       {at ? <span>{at}</span> : null}
       {/* The same `.chat-live` wrapper Bubble uses: right-aligned accent. */}
       <span className="chat-live num">{live}</span>
@@ -197,102 +189,6 @@ export function activityAnchor(items: ThreadItem[], message: string | undefined 
   // An answer bubble carries the indicator on its own timestamped name
   // row — prefer it over in-progress steps/commentary of the same turn.
   return answerKey ?? found ?? cardKey;
-}
-
-/** CAD-1881: on a narrow screen the model, effort and About affordances
- *  move behind one overflow sheet, so the header is a single 56px row
- *  instead of a four-line stack. Desktop keeps the chips inline. */
-function HeaderMenu({
-  master,
-  row,
-  readOnly,
-  scope,
-}: {
-  master: MasterState | null | undefined;
-  row: Agent | undefined;
-  readOnly: boolean;
-  /** The header's scope line, moved here on a narrow screen. */
-  scope: string;
-}) {
-  const t = useTranslate();
-  const [open, setOpen] = useState(false);
-  const trigger = useRef<HTMLButtonElement | null>(null);
-  const panel = useRef<HTMLDivElement | null>(null);
-  // A modal sheet: focus enters it, Tab stays inside, Escape closes it, and
-  // the trigger gets the focus back — the About dialog's mechanics.
-  useEffect(() => {
-    if (!open) return;
-    const root = panel.current;
-    const focusables = () =>
-      Array.from(
-        root?.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), [href], input:not([disabled]), select, textarea, [tabindex]:not([tabindex="-1"])',
-        ) ?? [],
-      );
-    focusables()[0]?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        setOpen(false);
-        return;
-      }
-      if (e.key !== "Tab") return;
-      const items = focusables();
-      if (items.length === 0) return;
-      const first = items[0];
-      const last = items[items.length - 1];
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      trigger.current?.focus();
-    };
-  }, [open]);
-  return (
-    <span className="assistant-menu">
-      <button
-        ref={trigger}
-        type="button"
-        className="assistant-about-trigger assistant-menu-trigger"
-        aria-label={t("Assistant settings")}
-        title={t("Assistant settings")}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        onClick={() => setOpen(true)}
-      >
-        <span aria-hidden>⋯</span>
-      </button>
-      {open && (
-        <>
-          <button
-            type="button"
-            aria-hidden
-            tabIndex={-1}
-            className="assistant-menu-scrim"
-            onClick={() => setOpen(false)}
-          />
-          <div ref={panel} className="assistant-menu-panel" role="dialog" aria-modal="true" aria-label={t("Assistant settings")}>
-            <div className="assistant-menu-head">
-              <span className="text-label font-medium text-ink-200">{t("Assistant settings")}</span>
-              <button type="button" className="lnk text-label" onClick={() => setOpen(false)}>
-                {t("Close")}
-              </button>
-            </div>
-            <p className="assistant-scope" data-menu-scope>{scope}</p>
-            <MasterChips master={master} row={row} readOnly={readOnly} />
-            <AssistantAboutButton className="assistant-menu-about" />
-          </div>
-        </>
-      )}
-    </span>
-  );
 }
 
 /** The dock's one-line turn status (CAD-551, placed in `chatdock` by
@@ -488,10 +384,9 @@ function NotStarted({ status, hosted }: { status: MasterStatus; hosted: boolean 
 
 function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabled: boolean }) {
   const t = useTranslate();
-  const actor = useAssistantActor();
   return (
     <div className="card px-4 py-4" data-empty="thread">
-      <h2 className="text-cardtitle font-semibold text-ink-100">{`${t("Ask")} ${displayName(actor.read, actor.scope, t)}`}</h2>
+      <h2 className="text-cardtitle font-semibold text-ink-100">{t("Ask the master for work")}</h2>
       <p className="text-secondary text-ink-400 mt-1">{t("No conversation yet. Try one of these:")}</p>
       <div className="mt-3 grid gap-2">
         {EXAMPLES.map((ex) => (
@@ -556,7 +451,7 @@ const ThreadList = memo(function ThreadList({
   ) => void;
   /** The live turn: its own `message` id picks the row the activity
    *  belongs to; `since` drives the elapsed clock. Null otherwise. */
-  working: { message: string | null; since: number | null } | null;
+  working: { message: string; since: number | null } | null;
   /** CAD-1782: the thread stream is down, so these rows are a snapshot. */
   stale: boolean;
 }) {
@@ -589,7 +484,7 @@ const ThreadList = memo(function ThreadList({
   const fallbackItem =
     working && anchorItem === null && shown.length > 0 ? shown[shown.length - 1] : null;
   const activityItem = anchorItem ?? fallbackItem;
-  if (items.length === 0 && !moreBefore) return null;
+  if (items.length === 0) return null;
   return (
     <>
       {stale && <StreamBanner onRetry={() => window.location.reload()} />}
@@ -605,7 +500,7 @@ const ThreadList = memo(function ThreadList({
         items={shown}
         readOnly={readOnly}
         liveAfter={liveAfter}
-        running={working?.message ?? null} /* null while a send is only submitting */
+        running={working?.message ?? null}
         legacyTranscript={!items.some((item) => item.type === "answer")}
         onOpenIssue={onOpenIssue}
         onRetry={onRetry}
@@ -629,17 +524,17 @@ const ThreadList = memo(function ThreadList({
           // The answer bubble carries the indicator on its own name row;
           // a standalone row covers in-flight steps/commentary that have
           // none of their own, and the running turn when the row it would
-          // anchor to is another turn's reply (CAD-1533). A turn with no
-          // stored entry yet has nothing to anchor to, so it shows the
-          // inline typing bubble after the operator's own message instead.
+          // anchor to is another turn's reply (CAD-1533). A row that IS
+          // this turn's own — the operator's just-sent message, or the
+          // reply itself — keeps the indicator below it.
           if (item.type === "answer" && anchorItem !== null) return { kind: "header", node: live };
           const below = item.type === "operator" || item.type === "pending" || item.type === "answer";
-          const needsTypingTurn =
-            anchorItem === null || item.type === "operator" || item.type === "pending";
           return {
             kind: "row",
-            node: needsTypingTurn ? <ThreadTurn items={[]} running /> : <AssistantNameRow at={at} live={live} />,
+            node: <AssistantNameRow at={at} live={live} />,
             position: below ? "after" : "before",
+            // A fallback row rides an EARLIER item; the run it lands in
+            // keeps the flat rendering so the row is not folded away.
             ...(anchorItem === null ? { fallback: true as const } : {}),
           };
         }}
@@ -687,23 +582,17 @@ export default function Home({
   permissionsHref,
   resolveAppPath,
   setupNotice = null,
-  operator = null,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
-  /** CAD-1817: the verified session proves operator authority, the only
-   *  viewer that may edit the workspace coordinator's identity. `null`
-   *  is unproven, never an operator. */
-  operator?: boolean | null;
   /** CAD-1485: the verified public session's subject — member or
    *  operator/owner — when the session names one. `?chat=assistant`
    *  keys the owner's private chat on it; a member's default view is
    *  already private. */
   viewerSub?: string | null;
-  /** The verified session's `role === "member"`. Members use the private
-   *  assistant layout; owners/operators keep the master-transport layout
-   *  unless they select the private layout. The backend still determines
-   *  the actual conversation actor. */
+  /** The verified session's `role === "member"`. Members always land on
+   *  their own private assistant; owners/operators keep Master unless
+   *  they explicitly ask for their own assistant. */
   viewerIsMember?: boolean;
   /** The verified session's id — scopes the member-chat store so a
    *  re-login as another member never reads the previous chat. */
@@ -753,13 +642,12 @@ export default function Home({
       permissionsHref={permissionsHref}
       resolveAppPath={resolveAppPath}
       setupNotice={setupNotice}
-      operator={operator}
     />
   );
 }
 
-/** The shared master-transport pane: Native coordinator or verified hosted
- *  actor. The outer Home chooses the layout without changing recipients. */
+/** The Master workspace — unchanged, mounted only when the outer Home
+ *  did NOT route to the member's private assistant. */
 function MasterHome({
   readOnly,
   hosted = null,
@@ -770,11 +658,9 @@ function MasterHome({
   permissionsHref,
   resolveAppPath,
   setupNotice = null,
-  operator = null,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
-  operator?: boolean | null;
   overview: ResourceState<Overview>;
   onOpenIssue: (id: string) => void;
   onOpenDecision: (open: HomeDecisionOpen) => void;
@@ -820,26 +706,7 @@ function MasterHome({
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.data !== null;
   const moreBefore = thread.data?.moreBefore === true;
-  // The default master-state response already resolves Home before its first
-  // transcript exists. Keep that server-issued binding when the empty thread
-  // (or its first streamed entries) does not carry a thread ID yet.
-  const homeProjection = master.status === "ok" ? master.data?.actor_identity : null;
-  const homeConversation = thread.data?.conversation
-    ?? (homeProjection?.scope === "personal"
-      && typeof homeProjection.conversation_id === "string"
-      && readConversationIdentity(master.data, homeProjection.conversation_id).read.state === "ready"
-      ? homeProjection.conversation_id
-      : undefined);
-  useEffect(() => {
-    if (homeConversation === undefined || thread.data === null
-      || thread.data.conversation !== undefined
-      || resources.masterState.get().data !== master.data) return;
-    // Stream admission and turn controls use the same canonical binding.
-    // Never replace a transcript's ID or seed a superseded session's store.
-    resources.masterThread.mutate((current) => current.conversation === undefined
-      ? { ...current, conversation: homeConversation }
-      : current);
-  }, [homeConversation, thread.data, master.data]);
+  const homeConversation = thread.data?.conversation;
   const attachDestination: AttachDestination | undefined = loaded && !missing
     ? homeConversation ? { conversation: homeConversation } : {}
     : undefined;
@@ -878,11 +745,6 @@ function MasterHome({
     turnBar.kind === "approval" ||
     turnBar.kind === "sending" ||
     turnBar.kind === "queued";
-  // CAD-1880: Stop sits in the composer's send slot while this pane's own
-  // turn runs. Never while the stream is down: that state is last known.
-  const runningMessage =
-    turnBar.kind === "working" || turnBar.kind === "writing" ? turnBar.stopMessage : null;
-  const canStop = writeBlock === null && !streamReconnecting && runningMessage !== null;
   const aheadHref = useConversationDestination(
     turnBar.kind === "queued" ? turnBar.aheadConversation : null,
     master.data,
@@ -930,16 +792,10 @@ function MasterHome({
   // row has no stored entry yet, so its row is the anchor while it
   // waits). Once the terminal `turn_result` lands the daemon flips
   // `turn.state` off working and the indicator clears with the reply.
-  // The inline typing bubble starts the moment the send begins: `submitting`
-  // is the composer's own POST in flight (no stored entry to anchor on yet),
-  // `working` the daemon's verified turn. A queued wait keeps the dock's
-  // honest "behind a turn" line instead of claiming to type.
   const workingActivity =
     turn.kind === "working"
       ? { message: turn.message, since: typeof turn.since === "number" ? turn.since : null }
-      : turn.kind === "submitting"
-        ? { message: null, since: null }
-        : null;
+      : null;
   // The ResizeObserver re-subscribes when the name-row indicator appears
   // or clears (its content lives inside the observed list): a running
   // turn with any row to ride, whether it anchors to its own entry or
@@ -951,14 +807,7 @@ function MasterHome({
   // resumes after its last seq — never a replay of the history. On a
   // reconnect `streamInto` resumes with `?after=<last id>` and the
   // reducer dedupes by seq: no gaps, no repeats.
-  useThreadStream(
-    resources.masterThread,
-    `/api/threads/${MASTER}/stream`,
-    loaded && !missing && (master.data === null
-      || !Object.hasOwn(master.data, "actor_identity")
-      || thread.data?.conversation !== undefined),
-    setLink,
-  );
+  useThreadStream(resources.masterThread, `/api/threads/${MASTER}/stream`, loaded && !missing, setLink);
 
   // The seq watermark for the enter animation: items at or below the
   // mount tail are history — they render still; only what lands after
@@ -1021,18 +870,6 @@ function MasterHome({
     setActivity(false);
     setGlideTick((n) => n + 1);
   }, []);
-  const sendPersonalRequest = useCallback(async (text: string) => {
-    if (readOnly || block || homeConversation === undefined) throw new Error("Sending is unavailable.");
-    engage();
-    const receipt = await sendToMaster(text, newMessageId(), undefined, undefined, homeConversation);
-    if (!receipt.ok) throw new Error(receipt.error);
-  }, [readOnly, block, homeConversation, engage]);
-  const actor = useConversationActor(
-    master,
-    operator === true && !readOnly,
-    homeConversation ?? null,
-    readOnly || !!block || homeConversation === undefined ? null : sendPersonalRequest,
-  );
   const onRetrySend = useCallback(
     (
       message: string,
@@ -1317,7 +1154,6 @@ function MasterHome({
   };
 
   return (
-    <AssistantActorProvider actor={actor}>
     <main
       className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
         railCollapsed
@@ -1355,37 +1191,24 @@ function MasterHome({
             bottom. It fills the height below the board header; the page
             itself never scrolls for the chat. */}
         <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
-          <div
-            className="master-heading assistant-heading pb-2.5 border-b border-ink-700/70"
-            data-assistant-identity={actor.scope ?? undefined}
-            data-identity-state={actor.read.state}
-          >
-            <AssistantFace size={30} active={status.kind === "running"} />
-            <div className="assistant-heading-text">
-              <div className="assistant-heading-name">
-                <h1 className="text-section font-semibold text-ink-100" data-assistant-name>{displayName(actor.read, actor.scope, t)}</h1>
-                <span
-                  className={`chip ${
-                    status.kind === "running"
-                      ? "bg-ok/15 text-ok"
-                      : status.kind === "unknown"
-                        ? "bg-ink-800 text-ink-400"
-                        : "bg-warn/10 text-warn"
-                  }`}
-                >
-                  {status.kind === "running" ? status.state : status.kind === "absent" ? t("not started") : status.kind}
-                </span>
-                <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
-                <HeaderMenu master={master.data} row={masterRow} readOnly={readOnly} scope={scopeDescriptor(actor.scope, t)} />
-                {streamReconnecting && activeTurn && status.kind === "running" && (
-                  <span className="text-micro text-ink-500" data-stale>{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
-                )}
-              </div>
-              <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
-            </div>
-            <div className="assistant-heading-actions">
-              <AssistantAboutButton />
-            </div>
+          <div className="master-heading flex items-center gap-2 flex-wrap pb-2.5 border-b border-ink-700/70">
+            <span className="text-accent text-section" aria-hidden>✳</span>
+            <h1 className="text-section font-semibold text-ink-100">{t("Assistant")}</h1>
+            <span
+              className={`chip ${
+                status.kind === "running"
+                  ? "bg-ok/15 text-ok"
+                  : status.kind === "unknown"
+                    ? "bg-ink-800 text-ink-400"
+                    : "bg-warn/10 text-warn"
+              }`}
+            >
+              {status.kind === "running" ? status.state : status.kind === "absent" ? t("not started") : status.kind}
+            </span>
+            <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
+            {streamReconnecting && activeTurn && status.kind === "running" && (
+              <span className="text-micro text-ink-500">{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
+            )}
           </div>
 
           {setupNotice}
@@ -1408,18 +1231,18 @@ function MasterHome({
             onScroll={onPanelScroll}
             data-chat-scroll
           >
-            <CloudContentNotice withheld={thread.data?.cloudWithheld} />
-            {thread.data?.cloudWithheld == null && showNotStarted && items.length === 0 && (
+            {showNotStarted && items.length === 0 && (
               <div className="chat-empty">
                 <NotStarted status={status} hosted={hosted} />
               </div>
             )}
-            {thread.data?.cloudWithheld == null && empty && !showNotStarted && (
+            {empty && !showNotStarted && (
               <div className="chat-empty">
                 <Examples onPick={(t) => setSeed((s) => ({ text: t, n: s.n + 1 }))} disabled={!!block} />
               </div>
             )}
 
+            <CredentialRequestList conversationId={homeConversation} className="mx-1" />
             <ThreadList
               items={items}
               limit={limit}
@@ -1456,7 +1279,9 @@ function MasterHome({
             <TurnBar
               state={turnBar}
               reconnecting={streamReconnecting && activeTurn}
+              since={serverTurn?.since ?? null}
               actions={{
+                onStop: writeBlock === null ? (message) => runTurnCommand("stop", message) : undefined,
                 onCancel: writeBlock === null ? (message) => runTurnCommand("cancel", message) : undefined,
                 onRetry:
                   writeBlock === null && failedEntry !== null
@@ -1510,7 +1335,6 @@ function MasterHome({
               seed={seed}
               onCommand={runCommand}
               onSent={engage}
-              stop={canStop ? { onStop: () => { if (runningMessage) runTurnCommand("stop", runningMessage); } } : null}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
               attachReason={readOnly
@@ -1523,6 +1347,5 @@ function MasterHome({
         </div>
       </section>
     </main>
-    </AssistantActorProvider>
   );
 }

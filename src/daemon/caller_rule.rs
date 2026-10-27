@@ -1145,6 +1145,19 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("issuer bearer, verified live against the daemon-owned device-login config; agent callers refused pre-mint (CAD-777, CAD-841)"),
     ),
     ("operator_session_check", Rule::Bearer),
+    ("credential_entry_session_check", Rule::Bearer),
+    (
+        "credential_entry_config",
+        Rule::Handler("rpc_credential_entry_config: positive operator, pinned deployment metadata only"),
+    ),
+    (
+        "credential_entry_continue_mint",
+        Rule::Handler("rpc_credential_entry_continue_mint: positive operator peer and genuine ordinary human session"),
+    ),
+    (
+        "credential_entry_continue_open",
+        Rule::Handler("rpc_credential_entry_continue_open: positive operator peer and one-use origin/request-bound entry nonce"),
+    ),
     ("operator_session_logout", Rule::Bearer),
     ("operator_session_stolen", Rule::Bearer),
     // CAD-841: the daemon owns the device-login config — boards read
@@ -1339,6 +1352,46 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "connection_custody_status",
         Rule::Handler("rpc_custody: operator_connection (CAD-1128)"),
+    ),
+    (
+        "credential_request_create",
+        Rule::Handler("rpc_credential_entry: positive operator; metadata request only"),
+    ),
+    (
+        "credential_request_show",
+        Rule::Handler("rpc_credential_entry: positive operator"),
+    ),
+    (
+        "credential_request_list",
+        Rule::Handler("rpc_credential_entry: positive operator"),
+    ),
+    (
+        "credential_request_status",
+        Rule::Handler("rpc_credential_entry: positive operator"),
+    ),
+    (
+        "credential_request_cancel",
+        Rule::Handler("rpc_credential_entry: positive operator; metadata cancellation only"),
+    ),
+    (
+        "credential_entry_session",
+        Rule::Handler("rpc_credential_entry: positive operator and live owner session"),
+    ),
+    (
+        "credential_request_submit",
+        Rule::Handler("rpc_credential_entry: positive operator and live owner session"),
+    ),
+    (
+        "protected_management_session",
+        Rule::Handler("rpc_protected_management: positive operator and bound owner session"),
+    ),
+    (
+        "protected_management_status",
+        Rule::Handler("rpc_protected_management: positive operator, metadata status only"),
+    ),
+    (
+        "protected_management_action",
+        Rule::Handler("rpc_protected_management: positive operator and one-use bound management attempt"),
     ),
     ("crm_smtp_bind", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_rebind", Rule::Handler("rpc_crm_smtp")),

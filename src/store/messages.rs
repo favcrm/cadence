@@ -772,6 +772,7 @@ impl Store {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -799,6 +800,7 @@ impl Store {
         media_refs: Option<&Value>,
         authorized_until: Option<f64>,
         selection: Option<IssueSelection>,
+        request_post: Option<&str>,
     ) -> Result<(bool, String)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
@@ -866,6 +868,9 @@ impl Store {
                 media_refs,
                 selection,
             )?;
+            if let Some(post) = request_post {
+                super::topics::bind_request_in(&tx, post, id)?;
+            }
             for old in &superseded {
                 self.supersede_in(&tx, old, id, steer)?;
             }

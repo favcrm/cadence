@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoadedReceiptV1",
+  "type": "object",
+  "properties": {
+    "enrollment_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "expires_at_ms": {
+      "$ref": "#/$defs/EpochMs"
+    },
+    "issued_at_ms": {
+      "$ref": "#/$defs/EpochMs"
+    },
+    "loaded_receipt_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "manifest_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "observed_registry_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "runtime_generation": {
+      "$ref": "#/$defs/Revision"
+    },
+    "snapshot_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "loaded_receipt_id",
+    "snapshot_id",
+    "manifest_digest",
+    "observed_registry_digest",
+    "runtime_generation",
+    "enrollment_id",
+    "issued_at_ms",
+    "expires_at_ms"
+  ],
+  "$defs": {
+    "Digest": {
+      "description": "`sha256:` plus 64 lowercase hex digits.",
+      "type": "string"
+    },
+    "EpochMs": {
+      "description": "Trusted epoch milliseconds: a checked safe JSON integer, never a float.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "Revision": {
+      "description": "Positive canonical decimal revision (0 refuses).",
+      "type": "string"
+    },
+    "UuidV1": {
+      "description": "Canonical lowercase UUID selector (`8-4-4-4-12`).",
+      "type": "string"
+    }
+  }
+}

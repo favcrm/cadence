@@ -1,0 +1,350 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SettlementV1",
+  "type": "object",
+  "properties": {
+    "fence": {
+      "description": "True when the settlement recorded an overrun and the adapter must fence.",
+      "type": "boolean"
+    },
+    "receipt": {
+      "$ref": "#/$defs/DispatchReceiptV1"
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "receipt",
+    "fence"
+  ],
+  "$defs": {
+    "Counter": {
+      "description": "Nonnegative canonical decimal counter (`0|[1-9][0-9]*`, <= i64::MAX).",
+      "type": "string"
+    },
+    "CurrencyV1": {
+      "type": "string",
+      "enum": [
+        "USD"
+      ]
+    },
+    "Digest": {
+      "description": "`sha256:` plus 64 lowercase hex digits.",
+      "type": "string"
+    },
+    "DispatchReceiptV1": {
+      "type": "object",
+      "properties": {
+        "commitment_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "cost": {
+          "$ref": "#/$defs/ReceiptCostV1"
+        },
+        "dispatch_id": {
+          "$ref": "#/$defs/UuidV1"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReceiptErrorV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "payload_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "request_id": {
+          "$ref": "#/$defs/UuidV1"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReceiptResultV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/DispatchStateV1"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "v": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "dispatch_id",
+        "request_id",
+        "payload_digest",
+        "commitment_digest",
+        "state",
+        "cost"
+      ]
+    },
+    "DispatchStateV1": {
+      "type": "string",
+      "enum": [
+        "committed",
+        "done",
+        "refused",
+        "unknown",
+        "overrun"
+      ]
+    },
+    "ErrorCodeV1": {
+      "description": "The closed refusal/admission error set. The wire string and the human\nmessage are fixed per variant; adapters never compose them.",
+      "type": "string",
+      "enum": [
+        "invalid_request",
+        "unsupported_version",
+        "digest_mismatch",
+        "principal_required",
+        "session_expired",
+        "management_forbidden",
+        "operation_not_granted",
+        "runtime_revoked",
+        "data_policy_refused",
+        "destination_refused",
+        "not_found",
+        "method_not_allowed",
+        "stale_revision",
+        "idempotency_conflict",
+        "loaded_state_mismatch",
+        "placement_changed",
+        "approval_required",
+        "price_changed",
+        "payload_too_large",
+        "rate_limit",
+        "spend_limit",
+        "runtime_unqualified",
+        "capability_unavailable",
+        "custody_locked",
+        "pricing_unavailable",
+        "unsupported_verification",
+        "entry_session_required",
+        "already_submitted",
+        "nonce_expired",
+        "request_changed",
+        "request_not_ready",
+        "provider_refused",
+        "reservation_overrun",
+        "clock_regression",
+        "state_conflict",
+        "ledger_mismatch"
+      ]
+    },
+    "ModelId": {
+      "description": "An explicitly named model id; whitespace and control bytes refuse.",
+      "type": "string"
+    },
+    "ReceiptCostV1": {
+      "type": "object",
+      "properties": {
+        "actual_micros": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsdMicros"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "currency": {
+          "$ref": "#/$defs/CurrencyV1"
+        },
+        "reserved_micros": {
+          "$ref": "#/$defs/UsdMicros"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "currency",
+        "reserved_micros"
+      ]
+    },
+    "ReceiptErrorV1": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCodeV1"
+        },
+        "message": {
+          "type": "string"
+        },
+        "v": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "code",
+        "message"
+      ]
+    },
+    "ReceiptResultV1": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TextGeneratedV1"
+        },
+        {
+          "$ref": "#/$defs/SmtpAcceptedV1"
+        },
+        {
+          "$ref": "#/$defs/SmtpVerifiedV1"
+        }
+      ]
+    },
+    "SmtpAcceptanceClaimV1": {
+      "type": "string",
+      "enum": [
+        "server-acceptance-only"
+      ]
+    },
+    "SmtpAcceptedKindV1": {
+      "type": "string",
+      "enum": [
+        "smtp.accepted@1"
+      ]
+    },
+    "SmtpAcceptedV1": {
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "claim": {
+          "description": "Exactly `server-acceptance-only`; no delivery claim exists.",
+          "$ref": "#/$defs/SmtpAcceptanceClaimV1"
+        },
+        "kind": {
+          "$ref": "#/$defs/SmtpAcceptedKindV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "accepted",
+        "claim"
+      ]
+    },
+    "SmtpVerificationClaimV1": {
+      "type": "string",
+      "enum": [
+        "authentication-only"
+      ]
+    },
+    "SmtpVerifiedKindV1": {
+      "type": "string",
+      "enum": [
+        "smtp.verified@1"
+      ]
+    },
+    "SmtpVerifiedV1": {
+      "type": "object",
+      "properties": {
+        "claim": {
+          "description": "Exactly `authentication-only`; verification grants no send/spend.",
+          "$ref": "#/$defs/SmtpVerificationClaimV1"
+        },
+        "kind": {
+          "$ref": "#/$defs/SmtpVerifiedKindV1"
+        },
+        "verified": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "verified",
+        "claim"
+      ]
+    },
+    "TextGeneratedKindV1": {
+      "type": "string",
+      "enum": [
+        "text.generated@1"
+      ]
+    },
+    "TextGeneratedV1": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/TextGeneratedKindV1"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelId"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "model",
+        "text"
+      ]
+    },
+    "UsageV1": {
+      "type": "object",
+      "properties": {
+        "input_tokens": {
+          "$ref": "#/$defs/Counter"
+        },
+        "output_tokens": {
+          "$ref": "#/$defs/Counter"
+        },
+        "reasoning_tokens": {
+          "$ref": "#/$defs/Counter"
+        },
+        "total_tokens": {
+          "$ref": "#/$defs/Counter"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "total_tokens"
+      ]
+    },
+    "UsdMicros": {
+      "description": "Nonnegative exact USD micro-dollars as a canonical decimal string.",
+      "type": "string"
+    },
+    "UuidV1": {
+      "description": "Canonical lowercase UUID selector (`8-4-4-4-12`).",
+      "type": "string"
+    }
+  }
+}

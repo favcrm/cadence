@@ -38,7 +38,10 @@ fn report_register_error(error: &Error, json: bool) {
     );
 }
 
-fn open_login_url(url: &str, no_open: bool) {
+/// Open one server-selected browser URL through the host opener. The URL
+/// carries only a selector (a login nonce in its fragment, or a metadata
+/// request id); a credential, token or key never rides it.
+pub(super) fn open_login_url(url: &str, no_open: bool) {
     if no_open {
         return;
     }

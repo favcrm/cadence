@@ -66,8 +66,11 @@ const KEY_ID_BYTES: usize = 16;
 const SCHEMA_VERSION: i64 = 1;
 const ENVELOPE_VERSION: i64 = 1;
 const ALGORITHM: &str = "xchacha20poly1305";
-const DOMAIN_RECORD: &str = "cadence.connections.custody";
-const DOMAIN_HEADER: &str = "cadence.connections.custody.header";
+// The record/header domain strings and the length-prefixed framing live in
+// the shared custody primitive (`cadence_core::connection_dispatch`), which
+// is byte-identical to this module. Delegating keeps ONE AAD implementation
+// across native and hosted while the frozen CAD-1128 checks keep pinning the
+// bytes: a change there fails them.
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 
@@ -176,41 +179,31 @@ pub struct EncryptedVault {
     inner: Mutex<Inner>,
 }
 
-/// Length-prefix one field per the contract's AAD v1 framing.
-fn aad_push(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-    out.extend_from_slice(bytes);
-}
-
-/// Record AAD v1 — the exact concatenation the contract pins.
+/// Record AAD v1 — the exact concatenation the contract pins. Delegates to
+/// the shared custody primitive so native and hosted cannot drift; the value
+/// is byte-identical and the frozen CAD-1128 checks still pin it.
 fn record_aad(id: &ExpectedIdentity, locator: &[u8; LOCATOR_BYTES]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(256);
-    aad_push(&mut aad, DOMAIN_RECORD.as_bytes());
-    aad.extend_from_slice(&1u32.to_be_bytes()); // schema
-    aad.extend_from_slice(&1u32.to_be_bytes()); // envelope
-    aad_push(&mut aad, ALGORITHM.as_bytes());
-    aad_push(&mut aad, id.workspace_id.as_bytes());
-    aad_push(&mut aad, id.connection_id.as_bytes());
-    aad_push(&mut aad, id.provider.as_bytes());
-    aad_push(&mut aad, id.account.as_bytes());
-    aad.extend_from_slice(&id.credential_revision.to_be_bytes());
-    aad_push(&mut aad, locator);
-    aad_push(&mut aad, &id.key_id);
-    aad_push(&mut aad, id.exchange.as_bytes());
-    aad
+    // Borrow the identity fields straight into the shared AAD builder: the
+    // native bytes are unchanged, and no record just to compute them is
+    // copied.
+    cadence_core::connection_dispatch::native_record_aad_borrowed(
+        cadence_core::connection_dispatch::NativeCustodyIdentityRefV1 {
+            workspace_id: &id.workspace_id,
+            connection_id: &id.connection_id,
+            provider: &id.provider,
+            account: &id.account,
+            credential_revision: id.credential_revision,
+            key_id: &id.key_id,
+            exchange: &id.exchange,
+        },
+        locator,
+    )
 }
 
 /// Header AAD v1 — authenticates the empty-plaintext key-confirmation
-/// row under the same domain discipline.
+/// row under the same domain discipline. Delegated for the same reason.
 fn header_aad(workspace_id: &str, key_id: &[u8; KEY_ID_BYTES]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(128);
-    aad_push(&mut aad, DOMAIN_HEADER.as_bytes());
-    aad.extend_from_slice(&1u32.to_be_bytes());
-    aad.extend_from_slice(&1u32.to_be_bytes());
-    aad_push(&mut aad, ALGORITHM.as_bytes());
-    aad_push(&mut aad, workspace_id.as_bytes());
-    aad_push(&mut aad, key_id);
-    aad
+    cadence_core::connection_dispatch::native_header_aad(workspace_id, key_id)
 }
 
 /// Validate a stored identifier column BEFORE it becomes a Rust
@@ -262,7 +255,7 @@ fn workspace_valid(s: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 fn exchange_valid(s: &str) -> bool {
-    matches!(s, "smtp" | "token" | "consent")
+    matches!(s, "smtp" | "token" | "consent" | "native-model-v1")
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -1256,3 +1249,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "encrypted_sqlite/cad1085_native_purpose_acceptance_20261027.rs"]
+mod cad1085_native_purpose_acceptance_20261027;

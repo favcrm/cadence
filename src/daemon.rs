@@ -57,8 +57,6 @@ mod approvals_rpc;
 mod area_rpc;
 mod business_templates_rpc;
 #[cfg(all(test, feature = "test-seam"))]
-mod cad1141_drift_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
 mod cad1184_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1184_revision_acceptance;
@@ -221,15 +219,15 @@ mod cad1700_acceptance;
 mod cad1777_drawer_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1822_context_refusal_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1852_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1868_acceptance;
-mod cloud_agent_rpc;
 mod connection_test;
 mod connections_rpc;
+mod credential_entry_rpc;
 /// CAD-1128: the `connection_custody_*` operator verbs.
 pub(crate) mod custody_rpc;
+pub(crate) mod native_model_turn;
+pub(crate) mod protected_connections;
+mod protected_management_rpc;
+pub(crate) mod protected_runtime;
 
 // CAD-1128 r2: the frozen acceptance check and its genuine fixture.
 // Both compile only under `test-seam`; production carries neither.
@@ -261,12 +259,8 @@ mod idea_rpc;
 mod identity;
 #[cfg(target_os = "linux")]
 mod installer_client;
-pub(crate) mod installer_enrollment_wire;
+mod installer_enrollment_wire;
 mod lane_relaunch;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-mod native_task;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-mod protected_runtime;
 mod turn_project;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;
@@ -359,6 +353,7 @@ use std::sync::Barrier;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 use uuid::Uuid;
@@ -535,7 +530,7 @@ struct AgentCtl {
     /// force-close it even while initialization is still in flight.
     adapter: Mutex<Option<Arc<dyn ProviderAdapter>>>,
     wake: Notify,
-    thread: Mutex<Option<crate::thread_budget::Budgeted<()>>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
     /// Stall-watch state for the in-flight turn — updated by provider
     /// events, the turn-start hook and the watch's own sampling.
     stall: Mutex<StallWatch>,
@@ -597,8 +592,6 @@ type MembershipLookupForTest = Box<
 
 pub struct Shared {
     pub store: Arc<Store>,
-    #[cfg(feature = "test-seam")]
-    cloud_projection_observer: Option<CloudProjectionObserver>,
     /// Broadcast on any queue/event change.
     changed: Notify,
     /// CAD-1700: the master's push revision (see `bump_master_rev`).
@@ -882,6 +875,9 @@ pub struct Shared {
     /// is operator test configuration, not a caller-controlled
     /// bypass: certificate verification still runs on every send.
     smtp_test_ca: Option<Vec<u8>>,
+    protected: std::sync::OnceLock<Arc<protected_connections::ProtectedConnections>>,
+    protected_runtime: std::sync::OnceLock<Arc<protected_runtime::ProtectedRuntimeCoordinator>>,
+    native_model: std::sync::OnceLock<Arc<native_model_turn::NativeModelBroker>>,
     /// CAD-538: the hosted lease this daemon holds when `hosted.lease`
     /// is configured. The heartbeat renews it; its fence is shared with
     /// `store` (every `write_conn`) and with each [`Self::pm`] handle.
@@ -1043,37 +1039,50 @@ impl Shared {
         if seam.is_some() {
             opts.provider_env.isolate_for_test()?;
         }
-        let HotStart { instance, marker } = hot;
+        let HotStart {
+            instance,
+            mut marker,
+        } = hot;
         let daemon_id = instance.clone();
         let db_path = state_dir.join("cadence.sqlite3");
+        // Validate deployment provenance before opening a writable store.
+        let prepared =
+            protected_runtime::prepare_profile(opts.protected_runtime_profile.as_deref())?;
         // Authorise the holder before the store opens the file
         // read-write and migrates. A direct `daemon run` whose identity
         // does not hold the lease refuses here and leaves the database
         // unchanged. `open_adopting` repeats the same check.
+        crate::rollout::authorize_migration(&db_path)?;
         // CAD-1163: the persistent execution fence is read before the
         // store opens. A malformed or unknown receipt refuses here, so a
         // portable activation in manual mode can never be bypassed.
         let execution_mode = crate::backup::portable_fence::load(state_dir)?;
-        let (mut store, recovered) = if state_dir == Path::new("/srv/cadence/protected/store") {
-            // This path only requests protected startup; it is NOT permission.
-            // Authentic fixed-owner issuance selects mode/binding BEFORE SQL,
-            // and unavailable/invalid ownership never falls back to Legacy.
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            let grant = crate::installer_bundle::constructor::StoreOwnerGrant::startup()?;
-            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-            let grant = crate::store::StoreOwnerGrant::startup()?;
-            crate::rollout::authorize_migration(Path::new(&grant.binding().path))?;
-            Store::open_owned(grant)?
+        // The OCI custody profile uses the permitted coordination store, not
+        // the separate sealed-store constructor. Its recovery waits for the
+        // authenticated external ledger floor and checkpoint transport.
+        let (mut store, mut recovered) = if prepared.is_some() {
+            Store::open_unrecovered_mode(&db_path, crate::store::OpenMode::Legacy)?
+        } else if execution_mode.fenced() {
+            Store::open_unrecovered(&db_path)?
         } else {
-            crate::rollout::authorize_migration(&db_path)?;
-            // CAD-1163: a manual execution-disabled mode opens without the
-            // restart sweep, so pending effects stay inert from the first start.
-            if execution_mode.fenced() {
-                Store::open_unrecovered(&db_path)?
-            } else {
-                Store::open_adopting(&db_path, marker)?
-            }
+            Store::open_adopting(&db_path, marker.take())?
         };
+        if let Some(lease) = &lease {
+            store.install_write_fence(lease.fence());
+        }
+        if let Some(prepared) = prepared.as_ref() {
+            let boot = protected_runtime::install_store_gate(&store, prepared)?;
+            if !execution_mode.fenced() {
+                if let protected_runtime::PreparedBoot::Ready { owner_epoch, .. } = boot {
+                    let owner_epoch =
+                        cadence_core::connection_dispatch::primitives::Revision::new(owner_epoch)
+                            .map_err(|_| {
+                            Error::invalid("runtime_unqualified", "owner epoch is invalid")
+                        })?;
+                    recovered = store.run_guarded_recover(marker.as_ref(), owner_epoch)?;
+                }
+            }
+        }
         store.set_shutdown_entries_hook(opts.shutdown_entries_hook.clone())?;
         if let Some(ms) = opts.shutdown_backoff_ms_for_test {
             store.shutdown_backoff_ms = ms;
@@ -1084,11 +1093,6 @@ impl Shared {
         // taken (the predecessor was already dead) and for endpoints
         // the cursors never covered.
         write_recovery_record(state_dir, &daemon_id, &recovered);
-        // CAD-538: the store's write path now shares the lease fence —
-        // one trip refuses every later write.
-        if let Some(lease) = &lease {
-            store.install_write_fence(lease.fence());
-        }
         if let Some(delay) = opts.startup_delay_for_test {
             std::thread::sleep(delay);
         }
@@ -1212,8 +1216,6 @@ impl Shared {
             state_dir: state_dir.to_path_buf(),
             upload_workspace_dir,
             agent_uid: opts.agent_uid,
-            #[cfg(feature = "test-seam")]
-            cloud_projection_observer: opts.cloud_projection_observer.clone(),
             open_attach: Mutex::new(HashMap::new()),
             adoptions_pending: Mutex::new(adoptions_pending),
             adoptions_notify: Notify::new(),
@@ -1326,6 +1328,9 @@ impl Shared {
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
             smtp_test_ca: opts.smtp_test_ca_pem.clone(),
+            protected: std::sync::OnceLock::new(),
+            protected_runtime: std::sync::OnceLock::new(),
+            native_model: std::sync::OnceLock::new(),
             lease,
             hosted_business_documents,
             seam,
@@ -1340,25 +1345,7 @@ impl Shared {
                 wiki_pm_lease,
             ),
         });
-        #[cfg(all(
-            debug_assertions,
-            feature = "test-seam",
-            target_os = "linux",
-            target_arch = "x86_64"
-        ))]
-        if state_dir == Path::new("/srv/cadence/protected/store") {
-            // Only the genuine protected opening can reach this window; path
-            // equality requests it, never admits a caller. The fixed Client
-            // controller additionally requires its original inherited Root FD3.
-            // No hosted lease heartbeat or seam worker may overlap comparison.
-            if shared.lease.is_some() || shared.seam.is_some() {
-                return Err(Error::unknown("retained Store replay window UNKNOWN"));
-            }
-            return crate::installer_bundle::constructor::runtime_child::retained_opening_replay(
-                &shared.store,
-            )
-            .and_then(|never| match never {});
-        }
+        protected_runtime::initialize(&shared, prepared)?;
         #[cfg(test)]
         if let Some(observer) = &opts.custody_acceptance_shared {
             *observer.lock().unwrap() = Some(shared.clone());
@@ -2073,36 +2060,7 @@ impl Shared {
         // conversation switch, which opens a new provider session and
         // rewrites thread_id/generation in the store.
         let current = self.store.agent(&agent.alias)?;
-        // CAD-1846: which native task identity this exact message carries.
-        // Derived only from immutable message provenance — never from the
-        // task's current assignee, which a native reassignment can change
-        // while an ad-hoc follow-up is already queued.
-        let expected_task = match message.task_id.as_deref() {
-            // Native `job_dispatch` kickoff: the message itself owns the
-            // task identity its pin and report contract are pinned to.
-            Some(task) if message.source == "job_dispatch" => Some(task),
-            // Passive internal deliveries ABOUT a task never become the
-            // recipient's assignment: routed worker_result/worker_notice/
-            // job_event, assist job events, and the daemon effect outcome.
-            // Their sources are reserved at enqueue: caller sources reject
-            // `_` (proto::identifier) and the daemon source set — which
-            // includes `effect` — is refused for non-daemon enqueues
-            // (proto::caller_message), so a caller cannot forge them.
-            Some(_)
-                if message.is_routed()
-                    || message.source == "assist_job_event"
-                    || message.source == "effect" =>
-            {
-                message.issue.as_deref()
-            }
-            // Every other explicit task tag is a caller-composed ad-hoc
-            // execution follow-up under any allowed caller source tag. Its
-            // queued intent is immutable, so it stays task-scoped even after
-            // the task is reassigned.
-            Some(task) => Some(task),
-            // No task tag: existing issue/followup identity.
-            None => message.issue.as_deref(),
-        };
+        let expected_task = message.issue.as_deref();
         // A task-bound kickoff's own pin proves opt-in. Its delivery shares
         // the alias's native home conversation, so the enqueue note, provider
         // compaction notes and this receipt all name one real thread id
@@ -2149,46 +2107,13 @@ impl Shared {
         }
         let pin_message = match expected_task {
             Some(_) if task_pin.is_some() => message.id.clone(),
-            Some(task) => match activation.as_ref() {
-                // Nothing is bound in this conversation: an ad-hoc task
-                // message has no pin to restore and adopts nothing.
+            Some(task) => match activation
+                .as_ref()
+                .filter(|activation| activation.get("task").and_then(Value::as_str) == Some(task))
+                .and_then(|activation| activation.get("pin").and_then(Value::as_str))
+            {
+                Some(pin) => pin.to_string(),
                 None => return Ok(None),
-                Some(active) => {
-                    let active_task = active.get("task").and_then(Value::as_str);
-                    let active_pin = active.get("pin").and_then(Value::as_str);
-                    // A different task's binding must never be adopted for
-                    // this message, and silently dropping the requirement is
-                    // just as wrong: fail closed before activation/supply.
-                    if active_task != Some(task) {
-                        return Err(self.context_refusal(
-                            &agent.alias,
-                            message,
-                            crate::context_pack::Refusal::ScopeConflict {
-                                detail: format!(
-                                    "the conversation's active task binding belongs to task \
-                                     '{}' (pin {}), not the message's task '{task}'",
-                                    active_task.unwrap_or("unknown"),
-                                    active_pin.unwrap_or("unavailable")
-                                ),
-                            },
-                        ));
-                    }
-                    match active_pin {
-                        Some(pin) => pin.to_string(),
-                        None => {
-                            return Err(self.context_refusal(
-                                &agent.alias,
-                                message,
-                                crate::context_pack::Refusal::MissingRequiredSource {
-                                    id: "active-task-pin".to_string(),
-                                    state: "unavailable".to_string(),
-                                    reason: "the active task's durable pin is unavailable"
-                                        .to_string(),
-                                },
-                            ))
-                        }
-                    }
-                }
             },
             None => match activation
                 .as_ref()
@@ -2222,39 +2147,10 @@ impl Shared {
                 &agent.alias,
                 message,
                 crate::context_pack::Refusal::ScopeConflict {
-                    detail: "the pinned manifest is malformed or predates complete task contracts; reconcile outstanding work, then explicitly reassign the task".to_string(),
+                    detail: "the pinned manifest is malformed".to_string(),
                 },
             ));
         };
-        // The pin record and its manifest must name the same task and parent
-        // issue; a disagreement is corruption, never a contract to guess.
-        if pin.get("task").and_then(Value::as_str) != Some(manifest.task.task.as_str())
-            || pin.get("issue").and_then(Value::as_str) != Some(manifest.task.issue.as_str())
-        {
-            return Err(self.context_refusal(
-                &agent.alias,
-                message,
-                crate::context_pack::Refusal::ScopeConflict {
-                    detail: "the pinned task/issue identity disagrees with its manifest"
-                        .to_string(),
-                },
-            ));
-        }
-        if let Some(issue) = message.issue.as_deref() {
-            if manifest.task.issue != issue {
-                return Err(self.context_refusal(
-                    &agent.alias,
-                    message,
-                    crate::context_pack::Refusal::ScopeConflict {
-                        detail: format!(
-                            "pin {pin_message} belongs to parent issue '{}', not the \
-                             message's issue '{issue}'",
-                            manifest.task.issue
-                        ),
-                    },
-                ));
-            }
-        }
         if let Some(task) = expected_task {
             if manifest.task.task != task {
                 return Err(self.context_refusal(
@@ -2301,7 +2197,7 @@ impl Shared {
             });
         let pm = self.pm()?;
         let (project, _) =
-            crate::issue::write::issue_dir(&pm, &manifest.task.issue).map_err(|_| {
+            crate::issue::write::issue_dir(&pm, &manifest.task.task).map_err(|_| {
                 self.context_refusal(
                     &agent.alias,
                     message,
@@ -2951,6 +2847,7 @@ impl Shared {
         // with its attribution field stamped to the caller.
         let stamped = self.caller_gate(method, params, peer_pid)?;
         let params = stamped.as_ref().unwrap_or(params);
+        self.refuse_legacy_protected_authority(method, params, peer_pid)?;
         match method {
             // `pid` is the singleton-lock holder: `daemon start` tells
             // the child it spawned from a daemon that already ran.
@@ -3162,14 +3059,12 @@ impl Shared {
                     let (dead, resumable) = self.agent_liveness(&agent);
                     j["dead"] = json!(dead);
                     j["resumable"] = json!(resumable);
-                    // Only queue placement is a mailbox. A hosted runtime
-                    // intentionally has no local actor, but is not an inbox.
-                    let inbox = if registry::placement(&agent.provider, &agent.endpoint_kind)
-                        == registry::Placement::Queue
-                    {
-                        self.store.inbox_status(&agent.alias)?
-                    } else {
+                    // CAD-1266: `inbox_status` answers `None` for any row with
+                    // an actor; skip the store read the answer is known without.
+                    let inbox = if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
                         None
+                    } else {
+                        self.store.inbox_status(&agent.alias)?
                     };
                     if let Some(inbox) = inbox {
                         j["inbox"] = inbox;
@@ -3191,7 +3086,7 @@ impl Shared {
                     if params.get("board").and_then(Value::as_bool) == Some(true)
                         && registry::has_actor(&agent.provider, &agent.endpoint_kind)
                     {
-                        j["board"] = self.board_view(&agent.alias, peer_pid)?;
+                        j["board"] = self.board_view(&agent.alias)?;
                     }
                     agents.push(j);
                 }
@@ -3263,12 +3158,6 @@ impl Shared {
             "agent_show" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
-                // CAD-1853 review: this projection serialises the alias'
-                // messages (cloud requests and their reply text), so it takes
-                // the same source/owner decision as the dedicated cloud read:
-                // current READ authority for the caller's own source, and
-                // only that source's messages.
-                let mut projection = self.admit_cloud_projection(&alias, peer_pid, "agent show")?;
                 let include_profile_instructions = match params.get("include_profile_instructions")
                 {
                     None | Some(Value::Null) => false,
@@ -3346,20 +3235,6 @@ impl Shared {
                 } else {
                     self.store.messages(&alias)?
                 };
-                // This read observes rows, then projects them: anything the
-                // admission snapshot does not cover — a routed cloud result
-                // that resolved since, or mail that arrived meanwhile — is
-                // outside what authority was proven for, so re-resolve the
-                // page once before deciding. Only rows the fresh admission
-                // names are projected; the rest is withheld, never rendered
-                // as ordinary.
-                if projection.needs_readmission(
-                    &self.store,
-                    messages.iter().map(|message| message.id.as_str()),
-                )? {
-                    projection = self.admit_cloud_projection(&alias, peer_pid, "agent show")?;
-                }
-                let messages = projection.messages(&self.store, messages)?;
                 let mut agent_json = agent.to_json();
                 if profile_snapshot || catalogue_snapshot {
                     agent_json["instructions"] = json!(agent.instructions);
@@ -3369,26 +3244,6 @@ impl Shared {
                 agent_json["turn_project"] = json!(self.turn_project(&agent).map(|t| t.key));
                 agent_json["capabilities"] =
                     registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
-                // CAD-1853: a cloud agent's truthful projection. Its remote
-                // identity, runtime, model label, capability ceiling and
-                // canonical Threads links are distinct from local runtime
-                // capabilities; `agent show` never invents a remote PID,
-                // read receipt, stop or execution authority.
-                if agent.provider == crate::cloud_agent::PROVIDER {
-                    let rows = self.store.cloud_agents_for_alias(&agent.alias)?;
-                    let mut views = Vec::new();
-                    for row in &rows {
-                        views.push(crate::cloud_agent::agent_view(&self.store, row)?);
-                    }
-                    agent_json["cloud_agents"] = json!(views);
-                    // Truthful placement/endpoint: a cloud agent has no local
-                    // process and no inbox; the daemon field must not imply
-                    // either just because the adapter registry is unknown.
-                    agent_json["placement"] = json!("cloud");
-                    agent_json["endpoint"] = Value::Null;
-                    agent_json["pid"] = Value::Null;
-                    agent_json["pid_start"] = Value::Null;
-                }
                 agent_json["native_turn_steering_enabled"] = json!(
                     agent.enabled
                         && matches!(agent.state.as_str(), "idle" | "busy")
@@ -3492,28 +3347,6 @@ impl Shared {
                     // `agent unfence` is the only exit.
                     "unknown": self.store.unknown_messages(&alias)?.len(),
                 });
-                if let Some(reason) = projection.withheld {
-                    out["cloud_withheld"] = json!(reason);
-                }
-                // Exact stored task semantics for a reported-dispatch retry.
-                // Same read authority as this alias's existing event history;
-                // return no source body and never recapture a source file.
-                if let Some(mid) = optional_str(params, "context_message") {
-                    let pin = self.store.context_pin(&alias, mid)?;
-                    let contract = pin.and_then(|mut pin| {
-                        let manifest: crate::context_pack::Manifest =
-                            serde_json::from_value(pin.get_mut("manifest")?.take()).ok()?;
-                        (manifest.schema == crate::context_pack::SCHEMA
-                            && pin["message"].as_str() == Some(mid)
-                            && pin["task"].as_str() == Some(manifest.task.task.as_str())
-                            && pin["project"].as_str() == Some(manifest.project.as_str())
-                            && pin["task_revision"].as_str()
-                                == Some(manifest.task.revision.as_str())
-                            && manifest.task.task == manifest.task.issue)
-                            .then(|| manifest.task.semantic_digest())
-                    });
-                    out["context_contract_digest"] = json!(contract);
-                }
                 // CAD-1752: the agent page's figures, only when asked.
                 if params.get("include_stats").and_then(Value::as_bool) == Some(true) {
                     out["stats"] = self.store.agent_stats(&alias)?;
@@ -3538,14 +3371,9 @@ impl Shared {
                 }
                 Ok(out)
             }
-            // CAD-1853: the explicit cloud-agent connection and its durable
-            // operation correlation. Admission is the caller rule inside.
-            method if method.starts_with("cloud_agent_") => {
-                self.rpc_cloud_agent(method, params, peer_pid)
-            }
             "agent_send" => self.rpc_send_from(params, peer_pid),
             "agent_ask" => self.rpc_ask(params, peer_pid),
-            "thread_read" => self.rpc_thread_read(params, peer_pid),
+            "thread_read" => self.rpc_thread_read(params),
             "activity_query" => self.rpc_activity_query(params, peer_pid),
             "activity_export" => self.rpc_activity_export(params, peer_pid),
             "pm_activity_prepare" => self.rpc_pm_activity_prepare(params, peer_pid),
@@ -3685,8 +3513,6 @@ impl Shared {
             "memory_propose" => self.rpc_memory_propose(params, peer_pid),
             "memory_review" => self.rpc_memory_review(params, peer_pid),
             "memory_finalize" => self.rpc_memory_finalize(params, peer_pid),
-            "memory_classify" => self.rpc_memory_classify(params, peer_pid),
-            "memory_feedback" => self.rpc_memory_feedback(params, peer_pid),
             "monitor_register" => self.rpc_monitor_register(params, peer_pid),
             "monitor_list" => self.rpc_monitor_list(),
             "monitor_show" => self.rpc_monitor_show(params),
@@ -4205,7 +4031,6 @@ impl Shared {
             "master_dispatch" => self.rpc_master_dispatch(params, peer_pid),
             "question_escalate" => self.rpc_question_escalate(params, peer_pid),
             "agent_file_write" => self.rpc_agent_file_write(params, peer_pid),
-            "master_identity_set" => self.rpc_master_identity_set(params, peer_pid),
             "master_start" => self.rpc_master_start(params, peer_pid),
             "master_summary" => self.rpc_master_summary(params, peer_pid),
             "master_state" => self.rpc_master_state(params),
@@ -4242,6 +4067,14 @@ impl Shared {
                 self.rpc_operator_session_open_device(params, peer_pid)
             }
             "operator_session_check" => self.rpc_operator_session_check(params),
+            "credential_entry_session_check" => self.rpc_credential_entry_session_check(params),
+            "credential_entry_config" => self.rpc_credential_entry_config(params, peer_pid),
+            "credential_entry_continue_mint" => {
+                self.rpc_credential_entry_continue_mint(params, peer_pid)
+            }
+            "credential_entry_continue_open" => {
+                self.rpc_credential_entry_continue_open(params, peer_pid)
+            }
             "board_session_open" => self.rpc_board_session_open(params, peer_pid),
             "board_session_check" => self.rpc_board_session_check(params),
             "human_actor_check" => self.rpc_human_actor_check(params, peer_pid),
@@ -4296,6 +4129,64 @@ impl Shared {
             "connection_custody_unlock" => self.rpc_connection_custody(method, params, peer_pid),
             "connection_custody_lock" => self.rpc_connection_custody(method, params, peer_pid),
             "connection_custody_status" => self.rpc_connection_custody(method, params, peer_pid),
+            "credential_request_create" => credential_entry_rpc::rpc_credential_entry(
+                self,
+                method,
+                params,
+                peer_pid,
+                |attempt, input| self.apply_human_credential_attempt(attempt, input),
+            ),
+            "credential_request_show" => credential_entry_rpc::rpc_credential_entry(
+                self,
+                method,
+                params,
+                peer_pid,
+                |attempt, input| self.apply_human_credential_attempt(attempt, input),
+            ),
+            "credential_request_list" => credential_entry_rpc::rpc_credential_entry(
+                self,
+                method,
+                params,
+                peer_pid,
+                |attempt, input| self.apply_human_credential_attempt(attempt, input),
+            ),
+            "credential_request_status" => credential_entry_rpc::rpc_credential_entry(
+                self,
+                method,
+                params,
+                peer_pid,
+                |attempt, input| self.apply_human_credential_attempt(attempt, input),
+            ),
+            "credential_request_cancel" => credential_entry_rpc::rpc_credential_entry(
+                self,
+                method,
+                params,
+                peer_pid,
+                |attempt, input| self.apply_human_credential_attempt(attempt, input),
+            ),
+            "credential_entry_session" => credential_entry_rpc::rpc_credential_entry(
+                self,
+                method,
+                params,
+                peer_pid,
+                |attempt, input| self.apply_human_credential_attempt(attempt, input),
+            ),
+            "credential_request_submit" => credential_entry_rpc::rpc_credential_entry(
+                self,
+                method,
+                params,
+                peer_pid,
+                |attempt, input| self.apply_human_credential_attempt(attempt, input),
+            ),
+            "protected_management_session" => {
+                protected_management_rpc::rpc_protected_management(self, method, params, peer_pid)
+            }
+            "protected_management_status" => {
+                protected_management_rpc::rpc_protected_management(self, method, params, peer_pid)
+            }
+            "protected_management_action" => {
+                protected_management_rpc::rpc_protected_management(self, method, params, peer_pid)
+            }
             "crm_smtp_bind" => self.rpc_crm_smtp(method, params, peer_pid),
             "crm_smtp_rebind" => self.rpc_crm_smtp(method, params, peer_pid),
             "crm_smtp_revoke" => self.rpc_crm_smtp(method, params, peer_pid),
@@ -4482,6 +4373,9 @@ but the host could not read their list; do not claim to have read them.]";
         }
         self.closing.store(true, Ordering::SeqCst);
         self.wake();
+        if let Ok(coordinator) = self.protected_runtime() {
+            coordinator.stop_all("daemon shutdown");
+        }
     }
 
     /// CAD-561: is a `cadence update` draining the fleet right now?
@@ -5476,19 +5370,11 @@ pub type DoneRetrySavedHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// its budget. Production leaves it unset.
 pub type FlushGate = Arc<dyn Fn() + Send + Sync>;
 
-/// Test-seam-only observer: called with (alias, final withholding code) after
-/// every completed projection decision, including local denials and empty
-/// admissions. The callback must be nonblocking. Never sourced from an RPC.
-#[cfg(feature = "test-seam")]
-pub type CloudProjectionObserver = std::sync::Arc<dyn Fn(&str, Option<&str>) + Send + Sync>;
-
 /// Per-instance daemon configuration.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
     #[cfg(test)]
     pub(crate) custody_acceptance_shared: Option<Arc<Mutex<Option<Arc<Shared>>>>>,
-    #[cfg(feature = "test-seam")]
-    pub cloud_projection_observer: Option<CloudProjectionObserver>,
     /// In-process fixture override; `serve()` leaves this unset and
     /// resolves the private state record. Never sourced from an RPC.
     pub agent_uid: Option<u32>,
@@ -5734,6 +5620,9 @@ pub struct ServeOptions {
     /// state dir and every ordinary artifact root. `None` keeps the
     /// legacy backend selection. Never sourced from RPC or PM.
     pub encrypted_custody: Option<crate::platform::encrypted_sqlite::EncryptedCustodyConfig>,
+    /// Root-owned protected runtime deployment profile. This is deployment
+    /// metadata, never a model, RPC, PM or environment-selected authority.
+    pub protected_runtime_profile: Option<PathBuf>,
     /// CAD-786: the public origin unsubscribe links mint
     /// (`{origin}/unsubscribe/<token>`). `https://` anywhere or
     /// loopback `http://` for rigs; `None` refuses
@@ -5768,6 +5657,7 @@ pub fn serve(state_dir: &Path) -> Result<()> {
     // build without the feature, so production never consults it.
     let mut opts = ServeOptions {
         test_seam: crate::test_seam::env_armed(),
+        protected_runtime_profile: protected_runtime::default_profile_path()?,
         ..ServeOptions::default()
     };
     // CAD-546: the built-in `local` platform rides the production
@@ -5781,32 +5671,6 @@ pub fn serve(state_dir: &Path) -> Result<()> {
     // daemons stay hermetic and register it only when the test asks.
     crate::platform::smtp::attach(&mut opts);
     serve_with(state_dir, opts)
-}
-
-// Every long-lived daemon thread holds one unit of the process thread budget
-// so the protected runtime stays inside Root's custody cap. Refusal is logged
-// and never panics or falls back to an unbudgeted spawn.
-fn spawn_watch<F>(what: &'static str, f: F)
-where
-    F: FnOnce() + Send + 'static,
-{
-    match crate::thread_budget::spawn(f) {
-        Ok(thread) => thread.detach(),
-        Err(e) => eprintln!("cadence: {what} not started: {e}"),
-    }
-}
-
-fn spawn_watch_joined<F>(what: &'static str, f: F) -> Option<crate::thread_budget::Budgeted<()>>
-where
-    F: FnOnce() + Send + 'static,
-{
-    match crate::thread_budget::spawn(f) {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            eprintln!("cadence: {what} not started: {e}");
-            None
-        }
-    }
 }
 
 /// `serve` with per-instance options — in-process test daemons pass
@@ -5913,14 +5777,11 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // lease is then left to expire.
     let lease_heartbeat = lease
         .as_ref()
-        .map(|lease| serve::LeaseHeartbeat::start(state_dir, lease))
-        .transpose()?;
+        .map(|lease| serve::LeaseHeartbeat::start(state_dir, lease));
     let hot = hot_restart_begin(state_dir);
     let membership =
         public_membership::MembershipMode::capture(&hosted, &|name| opts.provider_env.var(name));
     let shared = Shared::new_leased(state_dir, &opts, hot, lease, seam, membership)?;
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    let protected = protected_runtime::Maintenance::start(&shared);
     if let Some(heartbeat) = &lease_heartbeat {
         heartbeat.attach(&shared);
     }
@@ -5937,16 +5798,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     crate::device_login::migrate(state_dir);
     let shared_socket = if opts.agent_uid.is_some() {
         let (path, gid, fixture) = match &opts.shared_socket {
-            Some((path, gid)) => {
-                // The actual fixed runtime entry never uses the fixture's
-                // relaxed parent-group/mode check for its shared socket.
-                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-                let fixture =
-                    crate::installer_bundle::constructor::runtime_child::control().is_none();
-                #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-                let fixture = true;
-                (path.clone(), *gid, fixture)
-            }
+            Some((path, gid)) => (path.clone(), *gid, true),
             None => (
                 crate::agent_uid::config::shared_socket_path().to_path_buf(),
                 crate::agent_uid::config::shared_gid()?,
@@ -5969,18 +5821,11 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    if protected.is_some() {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
-    }
     // Outcome/config events wake the reporter and explicit workspace bridge.
     // Only pending obligations schedule retries; standalone opens no socket.
     {
         let shared = Arc::clone(&shared);
-        spawn_watch("hosted assignments", move || {
-            shared.run_hosted_assignments()
-        });
+        thread::spawn(move || shared.run_hosted_assignments());
     }
     // Signal-driven shutdown: set the same flag as the rpc. Installed
     // before actors launch so a signal during relaunch — or a relaunch
@@ -5993,7 +5838,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             signal_hook::consts::SIGINT,
         ])
         .map_err(|e| Error::internal(format!("signal hook: {e}")))?;
-        spawn_watch("signal handler", move || {
+        thread::spawn(move || {
             for _ in signals.forever() {
                 shared.begin_closing();
             }
@@ -6038,29 +5883,27 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     let fenced = shared.execution_mode.fenced();
     if !fenced {
         let shared = Arc::clone(&shared);
-        spawn_watch("stall watch", move || shared.run_stall_watch());
+        thread::spawn(move || shared.run_stall_watch());
     }
     // Persistent monitor reconciliation: registrations survive a daemon
     // restart and are checked without an LLM turn or provider invocation.
     // Joined before `serve` returns (CAD-408): the watcher can dispatch,
     // so a stopped daemon must not leave a tick in flight against the
     // store.
-    let monitor_watch = (!fenced)
-        .then(|| {
-            let shared = Arc::clone(&shared);
-            spawn_watch_joined("monitor watch", move || shared.run_monitor_watch())
-        })
-        .flatten();
+    let monitor_watch = (!fenced).then(|| {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_monitor_watch())
+    });
     // WAL watch: provider stores checkpointed while their provider
     // idles — CAD-132, the 30 GiB sessions.db-wal that ate the disk.
     if !fenced {
         let shared = Arc::clone(&shared);
-        spawn_watch("wal watch", move || shared.run_wal_watch());
+        thread::spawn(move || shared.run_wal_watch());
     }
     // Slot watch (CAD-230b): strict holds end with their holder.
     if !fenced {
         let shared = Arc::clone(&shared);
-        spawn_watch("slot watch", move || shared.run_slot_watch());
+        thread::spawn(move || shared.run_slot_watch());
     }
     // CAD-129: cargo test jobs. Limits are published before the thread
     // starts so a submit that races the first tick still keys on the
@@ -6070,64 +5913,51 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     if let Err(e) = crate::test_queue::publish_limits(&shared.state_dir, &test_limits) {
         eprintln!("cadence: test queue limits: {e}");
     }
-    let test_watch = (!fenced)
-        .then(|| {
-            let shared = Arc::clone(&shared);
-            spawn_watch_joined("test queue", move || {
-                let runner = crate::test_queue::runner_for(&shared.state_dir);
-                let mut worker =
-                    match crate::test_queue::Worker::new(&shared.state_dir, test_limits, runner) {
-                        Ok(worker) => worker,
-                        Err(e) => {
-                            eprintln!("cadence: test queue: {e}");
-                            return;
-                        }
-                    };
-                while !shared.closing.load(Ordering::SeqCst) {
-                    if let Err(e) = worker.tick() {
-                        eprintln!("cadence: test queue: {e}");
-                    }
-                    let deadline = Instant::now() + Duration::from_millis(200);
-                    while !shared.closing.load(Ordering::SeqCst) && Instant::now() < deadline {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                }
-                worker.shutdown();
-            })
-        })
-        .flatten();
-    // CAD-1853: the bounded cloud-agent READBACK driver. It resumes
-    // non-terminal operations after a restart and keeps reconciling an
-    // ordinary queued turn until the contract settles it — never a resubmit.
-    if !fenced {
+    let test_watch = (!fenced).then(|| {
         let shared = Arc::clone(&shared);
-        thread::spawn(move || shared.run_cloud_agent_driver());
-    }
+        thread::spawn(move || {
+            let runner = crate::test_queue::runner_for(&shared.state_dir);
+            let mut worker =
+                match crate::test_queue::Worker::new(&shared.state_dir, test_limits, runner) {
+                    Ok(worker) => worker,
+                    Err(e) => {
+                        eprintln!("cadence: test queue: {e}");
+                        return;
+                    }
+                };
+            while !shared.closing.load(Ordering::SeqCst) {
+                if let Err(e) = worker.tick() {
+                    eprintln!("cadence: test queue: {e}");
+                }
+                let deadline = Instant::now() + Duration::from_millis(200);
+                while !shared.closing.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            worker.shutdown();
+        })
+    });
     // Report router (CAD-339): workers' reports and unanswered
     // questions reach the master's thread. Idle without a master.
     if !fenced {
         let shared = Arc::clone(&shared);
-        spawn_watch("report router", move || shared.run_report_router());
+        thread::spawn(move || shared.run_report_router());
     }
     // CAD-1020: the publish driver — claims due intents, sends through
     // the attached sender, reconciles processing rows through status.
     // Joined before `Shared::shutdown` so a tick never outlives the
     // daemon; a SIGKILL mid-send is safe by construction (the row is
     // left `processing` for the next boot's reconcile).
-    let publish_driver = (!fenced)
-        .then(|| {
-            let shared = Arc::clone(&shared);
-            spawn_watch_joined("publish driver", move || shared.run_social_publish_driver())
-        })
-        .flatten();
+    let publish_driver = (!fenced).then(|| {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_social_publish_driver())
+    });
     // CAD-1423: the Web Push initiator. Native placement only; joined with
     // the publish driver before `Shared::shutdown`.
-    let notify_driver = (!fenced && shared.notify_driver_enabled())
-        .then(|| {
-            let shared = Arc::clone(&shared);
-            spawn_watch_joined("notify driver", move || shared.run_notify_driver())
-        })
-        .flatten();
+    let notify_driver = (!fenced && shared.notify_driver_enabled()).then(|| {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_notify_driver())
+    });
 
     // CAD-719: the wiki index refresh worker — a committed wiki
     // mutation kicks one coalesced rebuild; the query-time tree check
@@ -6142,18 +5972,6 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // A loop error is a stop, never a skip: `serve_error` is returned
     // only after the shutdown below has run — the refusals and the
     // marker it writes are the next start's adoption evidence.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    let protected_serving = if protected.is_some() {
-        Some(protected_runtime::publish_serving(
-            &listener,
-            &shared_socket
-                .as_ref()
-                .ok_or_else(|| Error::rejected("protected shared listener unavailable"))?
-                .listener,
-        )?)
-    } else {
-        None
-    };
     let mut serve_error: Option<Error> = None;
     let mut accept_backoff = Duration::ZERO;
     // Persistent pressure (EMFILE) retries every ACCEPT_BACKOFF_MAX:
@@ -6176,10 +5994,6 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             serve_error = Some(Error::internal("injected serve loop fault"));
             break;
         }
-        // Release units of finished handlers only after their join proves
-        // the OS thread is gone, so a finishing handler can never overlap
-        // its replacement under Root's cap.
-        crate::thread_budget::reap_finished();
         let listeners: Vec<&UnixListener> = std::iter::once(&listener)
             .chain(shared_socket.as_ref().map(|socket| &socket.listener))
             .collect();
@@ -6189,13 +6003,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
                 Ok((stream, _)) => {
                     accepted = true;
                     let shared = Arc::clone(&shared);
-                    // Budget the handler: an exhausted budget drops this socket
-                    // and keeps serving, instead of pushing the protected
-                    // runtime past Root's thread cap and getting it killed.
-                    match crate::thread_budget::spawn(move || handle_conn(shared, stream)) {
-                        Ok(thread) => thread.detach(),
-                        Err(_) => accept_suppressed = accept_suppressed.saturating_add(1),
-                    }
+                    thread::spawn(move || handle_conn(shared, stream));
                 }
                 // Both idle and an aborted queued connection are normal.
                 Err(e)
@@ -6243,12 +6051,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             }
         }
     }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    drop(protected_serving); // invalidate serving BEFORE drain/flush; not FINAL
-                             // A loop that ended on error never observed `closing`: set it now
-                             // so the watches and actors drain through the normal stop below.
-                             // `begin_closing` is idempotent — a clean exit keeps the facts
-                             // snapshot taken when its stop was requested.
+    // A loop that ended on error never observed `closing`: set it now
+    // so the watches and actors drain through the normal stop below.
+    // `begin_closing` is idempotent — a clean exit keeps the facts
+    // snapshot taken when its stop was requested.
     shared.begin_closing();
     // Former facts snapshot lived in `shutdown`. A test holds this
     // barrier until it has observed idle actors detach, which is the
@@ -6284,9 +6090,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // mid-flight finishes against the same committed tree it started on;
     // the query-time fallback still covers a daemon that restarts stale.
     shared.wiki_index.close();
-    if let Some(handle) = wiki_index_worker {
-        let _ = handle.join();
-    }
+    let _ = wiki_index_worker.join();
     if let Err(e) = shared.shutdown() {
         // The loop's error still wins — it is why the daemon is leaving.
         serve_error.get_or_insert(e);
@@ -6298,7 +6102,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // now is it stopped and joined, so there is never a window with
     // zero posters (heartbeat dead, flush still running) or two (a
     // late renew racing the release and rewriting a removed lease).
-    let _flushed = release_lease_tail(
+    release_lease_tail(
         &shared,
         &hosted,
         &opts,
@@ -6306,12 +6110,6 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         &socket_path,
         shared_socket,
     );
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    if serve_error.is_none() && _flushed {
-        if let Some(protected) = protected {
-            protected.quiesced()?;
-        }
-    }
     match serve_error {
         Some(error) => Err(error),
         None => Ok(()),
@@ -6342,7 +6140,7 @@ fn release_lease_tail(
     mut heartbeat: Option<serve::LeaseHeartbeat>,
     socket_path: &Path,
     shared_socket: Option<serve::SharedSocket>,
-) -> bool {
+) {
     let flushed = lease_flush(
         shared,
         opts.flush_budget_for_test
@@ -6368,7 +6166,6 @@ fn release_lease_tail(
     }
     let _ = std::fs::remove_file(socket_path);
     drop(shared_socket);
-    flushed
 }
 
 /// Separates a preserved unknown reason from the operator hint. Older

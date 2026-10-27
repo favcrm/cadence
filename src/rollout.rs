@@ -123,7 +123,12 @@ pub use migration::{
 /// release that changes declared access still waits for Apply.
 /// v59 (CAD-1887) adds one operator disposition per succeeded run and at
 /// most one selected ticket. Neither publishes the artifact.
-pub const SCHEMA_VERSION: i64 = 59;
+///
+/// v60 (CAD-1085) adds the protected Connection authority (config, reviewed
+/// operation policy, approved manifest, one-use approval, quotes, immutable
+/// dispatch rows, protected ledger and the metadata-only credential-entry
+/// tables).
+pub const SCHEMA_VERSION: i64 = 60;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

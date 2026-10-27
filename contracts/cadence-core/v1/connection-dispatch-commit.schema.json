@@ -1,0 +1,488 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DispatchCommitV1",
+  "description": "The exact durable `connection_dispatches` row material. Serialize-only in\nthe native Rust API (construct it through the planner); the hosted adapter\nmay read its own row back and must pass [`validate_commit_v1`].",
+  "type": "object",
+  "properties": {
+    "approval_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Ident"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "authorization_revision": {
+      "$ref": "#/$defs/Revision"
+    },
+    "body_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "capability_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "commitment_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "connection_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "connection_incarnation": {
+      "$ref": "#/$defs/Ident"
+    },
+    "credential_revision": {
+      "$ref": "#/$defs/Revision"
+    },
+    "custody_domain": {
+      "$ref": "#/$defs/Ident"
+    },
+    "database_epoch": {
+      "$ref": "#/$defs/Revision"
+    },
+    "destination_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "dispatch_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "enrollment_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "frozen_identity": {
+      "$ref": "#/$defs/FrozenCredentialIdentityV1"
+    },
+    "frozen_quote": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ModelQuoteV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "idempotency_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "idempotency_key": {
+      "$ref": "#/$defs/Ident"
+    },
+    "input_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "ledger_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "ledger_sequence": {
+      "$ref": "#/$defs/Counter"
+    },
+    "loaded_receipt_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "manifest_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "model": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ModelId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "observed_registry_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "operation_kind": {
+      "$ref": "#/$defs/OperationKindV1"
+    },
+    "payload_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "policy_revision": {
+      "$ref": "#/$defs/Revision"
+    },
+    "principal_binding_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "provider_kind": {
+      "$ref": "#/$defs/ProviderKindV1"
+    },
+    "quote_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UuidV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "rate_dimensions": {
+      "$ref": "#/$defs/RateDimensionsV1"
+    },
+    "request_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "request_timestamp_ms": {
+      "$ref": "#/$defs/EpochMs"
+    },
+    "reserved_micros": {
+      "$ref": "#/$defs/UsdMicros"
+    },
+    "runtime_generation": {
+      "$ref": "#/$defs/Revision"
+    },
+    "snapshot_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "state": {
+      "$ref": "#/$defs/DispatchStateV1"
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "workspace_id": {
+      "$ref": "#/$defs/Ident"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "dispatch_id",
+    "request_id",
+    "state",
+    "workspace_id",
+    "custody_domain",
+    "connection_id",
+    "provider_kind",
+    "connection_incarnation",
+    "credential_revision",
+    "authorization_revision",
+    "policy_revision",
+    "idempotency_key",
+    "idempotency_digest",
+    "principal_binding_digest",
+    "snapshot_id",
+    "loaded_receipt_id",
+    "manifest_digest",
+    "observed_registry_digest",
+    "runtime_generation",
+    "enrollment_id",
+    "capability_id",
+    "operation_kind",
+    "input_digest",
+    "payload_digest",
+    "body_digest",
+    "destination_digest",
+    "request_timestamp_ms",
+    "database_epoch",
+    "rate_dimensions",
+    "reserved_micros",
+    "frozen_identity",
+    "commitment_digest",
+    "ledger_sequence",
+    "ledger_digest"
+  ],
+  "$defs": {
+    "Counter": {
+      "description": "Nonnegative canonical decimal counter (`0|[1-9][0-9]*`, <= i64::MAX).",
+      "type": "string"
+    },
+    "CurrencyV1": {
+      "type": "string",
+      "enum": [
+        "USD"
+      ]
+    },
+    "Digest": {
+      "description": "`sha256:` plus 64 lowercase hex digits.",
+      "type": "string"
+    },
+    "DispatchStateV1": {
+      "type": "string",
+      "enum": [
+        "committed",
+        "done",
+        "refused",
+        "unknown",
+        "overrun"
+      ]
+    },
+    "EpochMs": {
+      "description": "Trusted epoch milliseconds: a checked safe JSON integer, never a float.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "FallbackPolicyV1": {
+      "description": "Provider routing is fixed: no fallback and required parameters. The closed\nenums make any other routing shape unrepresentable, so it refuses at parse.",
+      "type": "string",
+      "enum": [
+        "disallowed"
+      ]
+    },
+    "FrozenCredentialIdentityV1": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "$ref": "#/$defs/Ident"
+        },
+        "connection_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "credential_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "custody_domain": {
+          "$ref": "#/$defs/Ident"
+        },
+        "exchange": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ident"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "key_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "provider": {
+          "$ref": "#/$defs/Ident"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "workspace_id",
+        "custody_domain",
+        "connection_id",
+        "provider",
+        "account",
+        "credential_revision",
+        "key_id"
+      ]
+    },
+    "HttpsUrl": {
+      "description": "A fixed-https destination: scheme, host, optional absolute path; no query,\nfragment, userinfo, whitespace or non-https scheme can be represented.",
+      "type": "string"
+    },
+    "Ident": {
+      "description": "Bounded printable ASCII identifier (`0x21..=0x7e`, 1..=128 bytes).",
+      "type": "string"
+    },
+    "ModelId": {
+      "description": "An explicitly named model id; whitespace and control bytes refuse.",
+      "type": "string"
+    },
+    "ModelQuoteV1": {
+      "type": "object",
+      "properties": {
+        "authorization_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "connection_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "context_bound": {
+          "$ref": "#/$defs/Counter"
+        },
+        "credential_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "endpoints": {
+          "description": "Exact fixed routing endpoint set; the destination must be one of them.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HttpsUrl"
+          }
+        },
+        "fallback": {
+          "$ref": "#/$defs/FallbackPolicyV1"
+        },
+        "max_cost_micros": {
+          "$ref": "#/$defs/UsdMicros"
+        },
+        "max_output_bound": {
+          "$ref": "#/$defs/Counter"
+        },
+        "metadata_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "metadata_expires_ms": {
+          "$ref": "#/$defs/EpochMs"
+        },
+        "metadata_observed_ms": {
+          "$ref": "#/$defs/EpochMs"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelId"
+        },
+        "parameters": {
+          "$ref": "#/$defs/ParameterPolicyV1"
+        },
+        "policy_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "price": {
+          "$ref": "#/$defs/QuotePriceV1"
+        },
+        "privacy_policy": {
+          "$ref": "#/$defs/Ident"
+        },
+        "provider_profile": {
+          "$ref": "#/$defs/Ident"
+        },
+        "quote_id": {
+          "$ref": "#/$defs/UuidV1"
+        },
+        "routing_profile": {
+          "$ref": "#/$defs/Ident"
+        },
+        "service_tier": {
+          "$ref": "#/$defs/Ident"
+        },
+        "v": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "quote_id",
+        "connection_id",
+        "credential_revision",
+        "authorization_revision",
+        "policy_revision",
+        "provider_profile",
+        "routing_profile",
+        "model",
+        "endpoints",
+        "fallback",
+        "parameters",
+        "service_tier",
+        "metadata_digest",
+        "metadata_observed_ms",
+        "metadata_expires_ms",
+        "context_bound",
+        "max_output_bound",
+        "price",
+        "privacy_policy",
+        "max_cost_micros"
+      ]
+    },
+    "OperationKindV1": {
+      "description": "The typed operations a protected Connection dispatch may name.",
+      "type": "string",
+      "enum": [
+        "text.generate@1",
+        "smtp.send@1",
+        "smtp.test_send@1",
+        "smtp.verify@1"
+      ]
+    },
+    "ParameterPolicyV1": {
+      "type": "string",
+      "enum": [
+        "required"
+      ]
+    },
+    "PicoUsd": {
+      "description": "Pico-dollar rate (`1e-12 USD`) as a canonical decimal string.",
+      "type": "string"
+    },
+    "ProviderKindV1": {
+      "type": "string",
+      "enum": [
+        "smtp",
+        "openrouter"
+      ]
+    },
+    "QuotePriceV1": {
+      "type": "object",
+      "properties": {
+        "completion_pico_per_token": {
+          "$ref": "#/$defs/PicoUsd"
+        },
+        "currency": {
+          "$ref": "#/$defs/CurrencyV1"
+        },
+        "prompt_pico_per_token": {
+          "$ref": "#/$defs/PicoUsd"
+        },
+        "reasoning_billing": {
+          "$ref": "#/$defs/ReasoningBillingV1"
+        },
+        "request_pico": {
+          "$ref": "#/$defs/PicoUsd"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "currency",
+        "prompt_pico_per_token",
+        "completion_pico_per_token",
+        "request_pico",
+        "reasoning_billing"
+      ]
+    },
+    "RateDimensionsV1": {
+      "type": "object",
+      "properties": {
+        "account_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "window_ms": {
+          "$ref": "#/$defs/Counter"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "principal_id",
+        "account_id",
+        "workspace_id",
+        "window_ms"
+      ]
+    },
+    "ReasoningBillingV1": {
+      "oneOf": [
+        {
+          "description": "Hidden reasoning tokens are billed inside the completion rate. Every\nother billing shape is unrepresentable, so it refuses at parse.",
+          "type": "string",
+          "const": "included_in_completion"
+        }
+      ]
+    },
+    "Revision": {
+      "description": "Positive canonical decimal revision (0 refuses).",
+      "type": "string"
+    },
+    "UsdMicros": {
+      "description": "Nonnegative exact USD micro-dollars as a canonical decimal string.",
+      "type": "string"
+    },
+    "UuidV1": {
+      "description": "Canonical lowercase UUID selector (`8-4-4-4-12`).",
+      "type": "string"
+    }
+  }
+}

@@ -36,20 +36,66 @@ pub(crate) enum ConnectionAction {
         #[arg(long)]
         accept_same_uid_risk: bool,
     },
+    /// Create a metadata-only protected enrollment request and open the
+    /// trusted entry page; the account handle, transport and secret are
+    /// typed there, never here.
+    Enroll {
+        provider: String,
+        #[arg(long = "scope")]
+        scopes: Vec<String>,
+        /// `token` (default), `smtp`, or a native-model source shape
+        /// (`native-model-api-key`, `native-model-devin-credentials` for
+        /// provider `devin`).
+        #[arg(long)]
+        shape: Option<String>,
+        /// Bind the request to this existing agent (the daemon resolves its
+        /// stable UID; the alias is not authority).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Print the entry link without opening a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Replace the credential for this exact connection, preserving its ID.
+    /// By default this creates a protected request and opens the trusted
+    /// entry page; `--token-stdin` selects the legacy direct-stdin path.
     Rotate {
         connection_id: String,
         #[arg(long = "scope")]
         scopes: Vec<String>,
-        #[arg(long, required = true)]
+        /// Legacy: read the replacement token from stdin instead of the
+        /// trusted entry page (explicitly unprotected transport).
+        #[arg(long)]
         token_stdin: bool,
         #[arg(long)]
         accept_same_uid_risk: bool,
+        /// Print the entry link without opening a browser.
+        #[arg(long)]
+        no_open: bool,
     },
+    /// Create a metadata-only human SMTP verification request and open the
+    /// trusted entry page. Sends no mail; the stable request ID is the
+    /// verification ID.
+    Verify {
+        connection_id: String,
+        /// Print the entry link without opening a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
+    /// Read one credential request's metadata-only status by its ID.
+    RequestStatus { request_id: String },
     /// Revoke this incarnation, its grants and pending effects.
     Revoke { connection_id: String },
     /// Check local configuration only; does not test upstream connectivity.
     Check { connection_id: String },
+    /// Open the trusted human management page in the operator's own browser:
+    /// key session, finite limits, manifest/policy approval and UID grants.
+    /// Carries no key, credential or argv/env value.
+    Manage {
+        /// Print the management link without opening a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Explicit owner key-session management; never carries key bytes/paths.
     Custody {
         #[command(subcommand)]
@@ -150,6 +196,123 @@ fn expected_identity(state_dir: &Path, id: &str) -> Result<(String, u64)> {
     Ok((id.to_string(), revision))
 }
 
+/// The exact provider and credential revision one protected rotate/verify
+/// request binds to. A missing or changed row refuses; it is never
+/// re-read after the request records these values.
+fn connection_target(state_dir: &Path, id: &str) -> Result<(String, u64)> {
+    let row = client::rpc(state_dir, "connection_show", json!({"connection_id": id}))?;
+    let connection = &row["connection"];
+    if connection["id"].as_str() != Some(id) {
+        return Err(Error::rejected(
+            "connection identity changed under preflight",
+        ));
+    }
+    let provider = connection["provider"]
+        .as_str()
+        .filter(|provider| {
+            !provider.is_empty()
+                && provider.len() <= 128
+                && provider
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        })
+        .ok_or_else(|| Error::rejected("connection provider is unavailable"))?
+        .to_string();
+    let revision = connection["revision"]
+        .as_u64()
+        .filter(|revision| *revision > 0 && *revision <= i64::MAX as u64)
+        .ok_or_else(|| Error::rejected("connection revision is unavailable"))?;
+    Ok((provider, revision))
+}
+
+fn request_id_shape(value: &str) -> bool {
+    value.len() == 36
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase() || b == b'-')
+        && uuid::Uuid::parse_str(value).is_ok_and(|id| id.to_string() == value)
+}
+
+/// A CLI inside a registered agent pane cannot choose the human's browser:
+/// `xdg-open` there opens whatever that session controls (a guest has no
+/// host browser), which is exactly the operator-profile separation the
+/// credential boundary requires. The URL is still printed for the human.
+fn managed_agent_cli() -> bool {
+    std::env::var_os("CADENCE_ALIAS").is_some_and(|value| !value.is_empty())
+}
+
+/// A protected profile refuses the legacy directly-typed stdin transport
+/// BEFORE reading stdin: the trusted entry origin is the only credential
+/// collector on that deployment.
+fn refuse_legacy_secret_on_protected(state_dir: &Path) -> Result<()> {
+    if cadence_agent::ui::protected_profile_configured(state_dir) {
+        return Err(Error::rejected(
+            "this protected profile collects credentials only on the trusted entry origin — \
+             use `cadence connection enroll` or `connection rotate <id>` and complete the form \
+             there; a secret on stdin is not accepted",
+        ));
+    }
+    Ok(())
+}
+
+/// Attach the server-selected entry URL to a freshly created metadata
+/// request and open it in the operator's own browser. The link carries the
+/// request selector only, and its origin is the deployment-pinned one — a
+/// profile with no separate trusted origin refuses rather than pointing at
+/// the ordinary board.
+fn entry_receipt(
+    state_dir: &Path,
+    request: serde_json::Value,
+    no_open: bool,
+) -> Result<serde_json::Value> {
+    let id = request["request_id"]
+        .as_str()
+        .filter(|id| request_id_shape(id))
+        .ok_or_else(|| Error::internal("the daemon answered no credential request ID"))?;
+    // A positive, operator-proven daemon answer is required before this
+    // CLI claims any browser/entry layout. An unavailable/unknown daemon
+    // is explicit unsupported, never a board-origin fallback.
+    let (installed, origin) = cadence_agent::ui::credential_entry_config_proven(state_dir)
+        .map_err(|error| {
+            Error::rejected(format!(
+                "credential request {id} was created, but the trusted credential origin cannot \
+                 be proven on this CLI ({error}) — open it from the operator's own host session; \
+                 no browser was opened here"
+            ))
+        })?;
+    if !installed {
+        return Err(Error::rejected(format!(
+            "credential request {id} was created, but this deployment has no installed \
+             protected profile — protected credential entry is unsupported here"
+        )));
+    }
+    let base = origin.ok_or_else(|| {
+        Error::rejected(format!(
+            "credential request {id} was created, but this deployment has no separate trusted \
+             credential origin — protected entry is unsupported here"
+        ))
+    })?;
+    let url = format!("{base}/connections/enroll/{id}");
+    if managed_agent_cli() {
+        eprintln!(
+            "This CLI is running inside a managed agent session, so it cannot open the \
+             operator's browser or vouch for its profile. Open the link below in the \
+             operator's separate browser profile (one that agent browser/CDP tools cannot \
+             inspect). It carries only the request ID:\n\n  {url}\n"
+        );
+    } else {
+        if !no_open {
+            super::action_dispatch::open_login_url(&url, false);
+        }
+        eprintln!(
+            "Complete the credential in the operator's own browser profile — a browser that \
+             managed agents and their tools cannot inspect. This link carries only the request \
+             ID:\n\n  {url}\n"
+        );
+    }
+    Ok(json!({"request": request, "entry_url": url}))
+}
+
 pub(super) fn run(state_dir: PathBuf, action: ConnectionAction) -> Result<i32> {
     let (method, params) = match action {
         ConnectionAction::Providers => ("connection_providers", json!({})),
@@ -159,6 +322,32 @@ pub(super) fn run(state_dir: PathBuf, action: ConnectionAction) -> Result<i32> {
         }
         ConnectionAction::Check { connection_id } => {
             ("connection_check", json!({"connection_id":connection_id}))
+        }
+        ConnectionAction::Manage { no_open } => {
+            // Management is the ordinary board's metadata page: the
+            // isolated entry origin does not serve `/settings/connections`.
+            // Require the same positive operator-proven daemon answer
+            // before auto-opening a human-browser URL; an unavailable or
+            // unproven layout is explicit unsupported, not a fallback.
+            cadence_agent::ui::credential_entry_config_proven(&state_dir).map_err(|error| {
+                Error::rejected(format!(
+                    "the protected management layout cannot be proven on this CLI \
+                     ({error}) — open `{}/settings/connections` from the operator's own host session",
+                    cadence_agent::ui::board_base(&state_dir)
+                ))
+            })?;
+            let url = format!(
+                "{}/settings/connections",
+                cadence_agent::ui::board_base(&state_dir)
+            );
+            if !managed_agent_cli() && !no_open {
+                super::action_dispatch::open_login_url(&url, false);
+            }
+            eprintln!(
+                "Manage protected custody and approvals in the operator's own browser. This \
+                 link carries no credential:\n\n  {url}\n"
+            );
+            return Ok(0);
         }
         ConnectionAction::Revoke { connection_id } => {
             let id = validate_connection_id(&connection_id)?;
@@ -179,28 +368,100 @@ pub(super) fn run(state_dir: PathBuf, action: ConnectionAction) -> Result<i32> {
             if !token_stdin {
                 return Err(Error::rejected("use --token-stdin"));
             }
+            refuse_legacy_secret_on_protected(&state_dir)?;
             (
                 "connection_create",
                 json!({"provider":provider,"account":account,"shape":"token","token":stdin_token()?,"scopes":scopes,"accept_same_uid_risk":accept_same_uid_risk}),
             )
+        }
+        ConnectionAction::Enroll {
+            provider,
+            scopes,
+            shape,
+            agent,
+            no_open,
+        } => {
+            let shape = shape.unwrap_or_else(|| {
+                if provider == "smtp" {
+                    "smtp".to_string()
+                } else {
+                    "token".to_string()
+                }
+            });
+            let mut params = json!({"provider":provider,"verb":"enroll",
+                "shape":shape,"scopes":scopes});
+            if let Some(agent) = agent {
+                params["agent"] = json!(agent);
+            }
+            let out = client::rpc(&state_dir, "credential_request_create", params)?;
+            print_json(&entry_receipt(&state_dir, out["request"].clone(), no_open)?);
+            return Ok(0);
         }
         ConnectionAction::Rotate {
             connection_id,
             scopes,
             token_stdin,
             accept_same_uid_risk,
+            no_open,
         } => {
-            if !token_stdin {
-                return Err(Error::rejected("use --token-stdin"));
-            }
             let id = validate_connection_id(&connection_id)?;
-            let (expected_id, revision) = expected_identity(&state_dir, id)?;
-            let mut params = json!({"connection_id":expected_id,"expected_connection_id":expected_id,
+            if token_stdin {
+                // The legacy direct-stdin transport stays explicitly
+                // separate from the protected entry page — and is refused
+                // outright on a protected profile, before stdin is read.
+                refuse_legacy_secret_on_protected(&state_dir)?;
+                let (expected_id, revision) = expected_identity(&state_dir, id)?;
+                let mut params = json!({"connection_id":expected_id,"expected_connection_id":expected_id,
                 "expected_revision":revision,"token":stdin_token()?,"accept_same_uid_risk":accept_same_uid_risk});
-            if !scopes.is_empty() {
-                params["scopes"] = json!(scopes);
+                if !scopes.is_empty() {
+                    params["scopes"] = json!(scopes);
+                }
+                ("connection_rotate", params)
+            } else {
+                if accept_same_uid_risk {
+                    return Err(Error::rejected(
+                        "--accept-same-uid-risk belongs to the legacy direct-stdin rotate",
+                    ));
+                }
+                let (provider, revision) = connection_target(&state_dir, id)?;
+                let mut params = json!({"provider":provider,"verb":"rotate","connection_id":id,
+                    "expected_credential_revision":revision});
+                if !scopes.is_empty() {
+                    params["scopes"] = json!(scopes);
+                }
+                let out = client::rpc(&state_dir, "credential_request_create", params)?;
+                print_json(&entry_receipt(&state_dir, out["request"].clone(), no_open)?);
+                return Ok(0);
             }
-            ("connection_rotate", params)
+        }
+        ConnectionAction::Verify {
+            connection_id,
+            no_open,
+        } => {
+            let id = validate_connection_id(&connection_id)?;
+            let (provider, revision) = connection_target(&state_dir, id)?;
+            let out = client::rpc(
+                &state_dir,
+                "credential_request_create",
+                json!({"provider":provider,"verb":"verify","connection_id":id,
+                    "expected_credential_revision":revision}),
+            )?;
+            let mut receipt = entry_receipt(&state_dir, out["request"].clone(), no_open)?;
+            receipt["verification_request_id"] = out["request"]["verification_request_id"].clone();
+            print_json(&receipt);
+            return Ok(0);
+        }
+        ConnectionAction::RequestStatus { request_id } => {
+            if !request_id_shape(&request_id) {
+                return Err(Error::rejected("request ID is invalid"));
+            }
+            let out = client::rpc(
+                &state_dir,
+                "credential_request_status",
+                json!({"request_id":request_id}),
+            )?;
+            print_json(&out);
+            return Ok(0);
         }
         ConnectionAction::Custody { action } => match action {
             CustodyAction::Initialize {
@@ -234,6 +495,7 @@ pub(super) fn run(state_dir: PathBuf, action: ConnectionAction) -> Result<i32> {
             if !secret_stdin {
                 return Err(Error::rejected("use --secret-stdin"));
             }
+            refuse_legacy_secret_on_protected(&state_dir)?;
             let mut params = json!({"provider":provider,"account":account,"shape":"smtp",
                 "host":host,"port":port,"tls_mode":tls_mode,"username":username,
                 "secret":stdin_token()?,"sender":sender,"scopes":scopes,
@@ -257,6 +519,7 @@ pub(super) fn run(state_dir: PathBuf, action: ConnectionAction) -> Result<i32> {
             if !secret_stdin {
                 return Err(Error::rejected("use --secret-stdin"));
             }
+            refuse_legacy_secret_on_protected(&state_dir)?;
             let id = validate_connection_id(&connection_id)?;
             let (expected_id, revision) = expected_identity(&state_dir, id)?;
             let mut params = json!({"connection_id":expected_id,"expected_connection_id":expected_id,

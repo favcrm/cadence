@@ -1,0 +1,217 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SnapshotV1",
+  "type": "object",
+  "properties": {
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CapabilityV1"
+      }
+    },
+    "connection_bindings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ConnectionBindingV1"
+      }
+    },
+    "expires_at_ms": {
+      "$ref": "#/$defs/EpochMs"
+    },
+    "issued_at_ms": {
+      "$ref": "#/$defs/EpochMs"
+    },
+    "manifest_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "manifest_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "manifest_revision": {
+      "$ref": "#/$defs/Revision"
+    },
+    "policy_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "requester": {
+      "$ref": "#/$defs/RequesterV1"
+    },
+    "snapshot_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "snapshot_id",
+    "requester",
+    "manifest_id",
+    "manifest_revision",
+    "manifest_digest",
+    "policy_digest",
+    "connection_bindings",
+    "capabilities",
+    "issued_at_ms",
+    "expires_at_ms"
+  ],
+  "$defs": {
+    "AgentUid": {
+      "description": "Stable hosted agent UID: `agt-` plus the 32 lowercase hex UUID digits.",
+      "type": "string"
+    },
+    "CallableV1": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/Ident"
+        },
+        "version": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "CapabilityV1": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "callable": {
+          "$ref": "#/$defs/CallableV1"
+        },
+        "capability_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "connection_scope": {
+          "$ref": "#/$defs/Ident"
+        },
+        "effect": {
+          "$ref": "#/$defs/EffectClassV1"
+        },
+        "operation": {
+          "$ref": "#/$defs/OperationKindV1"
+        },
+        "policy_scope": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "capability_id",
+        "callable",
+        "artifact_id",
+        "operation",
+        "effect",
+        "connection_scope",
+        "policy_scope"
+      ]
+    },
+    "ConnectionBindingV1": {
+      "type": "object",
+      "properties": {
+        "allowed_operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OperationKindV1"
+          }
+        },
+        "authorization_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "connection_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "credential_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "provider_kind": {
+          "$ref": "#/$defs/ProviderKindV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "connection_id",
+        "provider_kind",
+        "credential_revision",
+        "authorization_revision",
+        "allowed_operations"
+      ]
+    },
+    "Digest": {
+      "description": "`sha256:` plus 64 lowercase hex digits.",
+      "type": "string"
+    },
+    "EffectClassV1": {
+      "type": "string",
+      "enum": [
+        "read",
+        "draft"
+      ]
+    },
+    "EpochMs": {
+      "description": "Trusted epoch milliseconds: a checked safe JSON integer, never a float.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "Ident": {
+      "description": "Bounded printable ASCII identifier (`0x21..=0x7e`, 1..=128 bytes).",
+      "type": "string"
+    },
+    "OperationKindV1": {
+      "description": "The typed operations a protected Connection dispatch may name.",
+      "type": "string",
+      "enum": [
+        "text.generate@1",
+        "smtp.send@1",
+        "smtp.test_send@1",
+        "smtp.verify@1"
+      ]
+    },
+    "ProviderKindV1": {
+      "type": "string",
+      "enum": [
+        "smtp",
+        "openrouter"
+      ]
+    },
+    "RequesterV1": {
+      "type": "object",
+      "properties": {
+        "agent_uid": {
+          "$ref": "#/$defs/AgentUid"
+        },
+        "runtime_generation": {
+          "$ref": "#/$defs/Revision"
+        },
+        "session_binding_id": {
+          "$ref": "#/$defs/UuidV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent_uid",
+        "session_binding_id",
+        "runtime_generation"
+      ]
+    },
+    "Revision": {
+      "description": "Positive canonical decimal revision (0 refuses).",
+      "type": "string"
+    },
+    "UuidV1": {
+      "description": "Canonical lowercase UUID selector (`8-4-4-4-12`).",
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SnapshotArgsV1",
+  "type": "object",
+  "properties": {
+    "manifest_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "manifest_id"
+  ],
+  "$defs": {
+    "Ident": {
+      "description": "Bounded printable ASCII identifier (`0x21..=0x7e`, 1..=128 bytes).",
+      "type": "string"
+    }
+  }
+}

@@ -17,7 +17,7 @@ fn pretty(schema: schemars::Schema) -> String {
 /// `(path from the repository root, generated schema)` for every committed
 /// contract file.
 pub fn committed_schemas() -> Vec<(&'static str, String)> {
-    vec![
+    let mut schemas = vec![
         (
             "contracts/cadence-core/v1/request.schema.json",
             pretty(schemars::schema_for!(Request)),
@@ -94,5 +94,7 @@ pub fn committed_schemas() -> Vec<(&'static str, String)> {
             "contracts/board-api/v1/request-conversation.schema.json",
             pretty(schemars::schema_for!(ConversationReq)),
         ),
-    ]
+    ];
+    schemas.extend(crate::connection_dispatch::schema::connection_committed_schemas());
+    schemas
 }

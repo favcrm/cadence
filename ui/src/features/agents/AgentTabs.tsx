@@ -1,4 +1,4 @@
-import { useContext, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { fmtTime } from "../../lib/fmt";
@@ -8,7 +8,7 @@ import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import { OPERATOR_HIRE_REASON } from "../auth/gate";
 import { HireBlock, WriteGate } from "../auth/WriteGate";
-import type { Agent, AgentDetail, AgentRole } from "../../lib/types";
+import type { Agent, AgentAccess, AgentDetail, AgentRole } from "../../lib/types";
 import { AgentActivity, AgentQueue, WorkBlock } from "./AgentBlocks";
 import { ProfileBlock } from "./AgentProfile";
 import { appliesText } from "./agentRoles";
@@ -737,6 +737,161 @@ function Settings({ c }: { c: TabContext }) {
   );
 }
 
+/**
+ * CAD-1085: durable Capabilities, Connections and Access & security on the
+ * agent page. Every fact is read from the daemon (grants and connection
+ * metadata) or the already-loaded agent detail; custody facts are stated as
+ * reported, and a locked key makes connection metadata unavailable rather
+ * than claiming a credential works.
+ */
+function Access({ c }: { c: TabContext }) {
+  const t = useTranslate();
+  const [access, setAccess] = useState<AgentAccess | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    setAccess(null);
+    setFailure(null);
+    api
+      .agentAccess(c.alias)
+      .then((data) => {
+        if (live) setAccess(data);
+      })
+      .catch((error: unknown) => {
+        if (live) setFailure(error instanceof ApiError ? error.message : String(error));
+      });
+    return () => {
+      live = false;
+    };
+  }, [c.alias]);
+  const capabilities = c.detail?.agent.capabilities ?? null;
+  const capabilityNames = capabilities ? Object.keys(capabilities).sort() : [];
+  const custody = access?.custody ?? null;
+  const isolated = custody !== null && custody.isolation !== "none";
+  return (
+    <div className="space-y-4">
+      <section>
+        <div className="ap-panel-h">
+          <h3>{t("Capabilities")}</h3>
+        </div>
+        {capabilityNames.length > 0 ? (
+          <ul className="text-label text-ink-300 space-y-0.5">
+            {capabilityNames.map((name) => (
+              <li key={name} className="num break-words">{name}</li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-label text-ink-500">
+            {t("No callable capability inventory is reported for this agent yet.")}
+          </p>
+        )}
+        <div className="flex flex-wrap gap-2 mt-2">
+          <Button size="sm" onClick={() => c.onTab("skills")}>{t("Skills")}</Button>
+          <Button size="sm" onClick={() => c.onTab("tools")}>{t("MCP & tools")}</Button>
+        </div>
+      </section>
+
+      <section>
+        <div className="ap-panel-h">
+          <h3>{t("Connections")}</h3>
+        </div>
+        {failure ? (
+          <p className="text-label text-warn" role="alert">{t(failure)}</p>
+        ) : access === null ? (
+          <p className="text-label text-ink-500">{t("Reading connection access…")}</p>
+        ) : access.grants.length === 0 ? (
+          <p className="text-label text-ink-500">
+            {t("This agent holds no connection grants. Credentials stay in custody; an agent receives only authorized operations.")}
+          </p>
+        ) : (
+          <ul className="space-y-1">
+            {access.grants.map((grant) => {
+              const row = access.connections.find(
+                (candidate) =>
+                  candidate.provider === grant.platform && candidate.account === grant.account,
+              );
+              const usable =
+                row !== undefined &&
+                row.status.adapter_registered &&
+                row.status.descriptor_available &&
+                row.status.custody_available;
+              return (
+                <li key={`${grant.platform}:${grant.account}`} className="text-label min-w-0">
+                  <span className="text-ink-200 num break-words">
+                    {grant.platform} · {grant.account}
+                  </span>
+                  <span className="text-ink-500"> — {grant.scopes.join(", ")}</span>
+                  <span className={usable ? "text-ink-400" : "text-warn"}>
+                    {" · "}
+                    {usable
+                      ? t("connection available")
+                      : row === undefined
+                        ? t("connection not listed")
+                        : t("connection unavailable")}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        {access?.connections_error ? (
+          <p className="text-micro text-warn mt-1" role="status">
+            {t("Connection metadata is unavailable while protected custody is locked — the grants above are still durable.")}
+          </p>
+        ) : null}
+        <p className="text-micro text-ink-500 mt-1">
+          {t("Network access is not checked here. These rows record authority, not a provider probe.")}
+        </p>
+      </section>
+
+      <section>
+        <div className="ap-panel-h">
+          <h3>{t("Access & security")}</h3>
+        </div>
+        {custody === null ? (
+          <p className="text-label text-ink-500">{t("Custody state is not reported.")}</p>
+        ) : (
+          <dl className="text-label space-y-1">
+            <div className="flex flex-wrap gap-x-2">
+              <dt className="text-ink-500">{t("Encrypted store")}</dt>
+              <dd className="text-ink-200">{custody.configured ? t("configured") : t("not configured")}</dd>
+            </div>
+            <div className="flex flex-wrap gap-x-2">
+              <dt className="text-ink-500">{t("Key session")}</dt>
+              <dd className="text-ink-200">
+                {custody.fenced ? t("fenced") : custody.unlocked ? t("unlocked") : t("locked")}
+              </dd>
+            </div>
+            <div className="flex flex-wrap gap-x-2">
+              <dt className="text-ink-500">{t("Runtime isolation")}</dt>
+              <dd className={isolated ? "text-ink-200" : "text-warn"}>
+                {isolated ? custody.isolation : t("none — storage only")}
+              </dd>
+            </div>
+            <div className="flex flex-wrap gap-x-2">
+              <dt className="text-ink-500">{t("Protected execution")}</dt>
+              <dd className={custody.protected && isolated ? "text-ink-200" : "text-warn"}>
+                {custody.protected && isolated ? t("reported protected") : t("unavailable")}
+              </dd>
+            </div>
+          </dl>
+        )}
+        <p className="text-micro text-ink-500 mt-1">
+          {t("Credentials, decryption and management permits never reach this agent. Changing grants or custody is the operator's action in Settings.")}
+        </p>
+        <div className="flex flex-wrap gap-2 mt-2">
+          <Button size="sm" onClick={() => navigate("/settings/permissions")}>
+            {t("Master permissions")}
+          </Button>
+          <Button size="sm" onClick={() => navigate("/settings/connections")}>
+            {t("Connections")}
+          </Button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 export default function AgentTabBody({ tab, c }: { tab: AgentTab; c: TabContext }) {
   switch (tab) {
     case "work":
@@ -751,6 +906,8 @@ export default function AgentTabBody({ tab, c }: { tab: AgentTab; c: TabContext 
       return <Skills c={c} />;
     case "tools":
       return <Tools c={c} />;
+    case "access":
+      return <Access c={c} />;
     case "settings":
       return <Settings c={c} />;
     default:

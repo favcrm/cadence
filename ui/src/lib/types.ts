@@ -1432,6 +1432,90 @@ export interface ConnectionProvidersPayload {
  * or `enrolled` (an operator-enrolled credential). Carries metadata
  * only — never secret bytes.
  */
+/** CAD-1085: one metadata-only human credential request. No credential,
+ *  fragment, digest or entry-session binding is ever a field here — the
+ *  trusted entry page carries the value, never this record. */
+/** GET /api/protected-entry — where the trusted credential form lives. */
+export interface ProtectedEntry {
+  configured: boolean;
+  protected: boolean;
+  origin: string | null;
+  board_origin: string;
+}
+
+export interface CredentialRequest {
+  request_id: string;
+  request_revision: number;
+  provider: string;
+  verb: "enroll" | "rotate" | "verify";
+  connection_id: string | null;
+  /** Opaque target account for a fresh enrollment; the connection id for
+   *  rotate. Human-facing text is `display_alias`. */
+  target_id: string;
+  display_alias: string;
+  shape:
+    | "token"
+    | "smtp"
+    | "native-model-api-key"
+    | "native-model-devin-credentials"
+    | null;
+  scopes: string[];
+  expected_credential_revision: number | null;
+  expected_authorization_revision: number | null;
+  custody_domain: string;
+  custody_epoch: number;
+  context_digest: string;
+  requester_kind: "operator_cli" | "operator_ui" | "agent";
+  requester_participant: string | null;
+  conversation_id: string | null;
+  target_agent_uid: string | null;
+  state: "pending" | "submitting" | "done" | "cancelled" | "expired" | "unknown";
+  status: string;
+  result_code: string | null;
+  verification_request_id: string | null;
+  /** CAD-1085: server-selected absolute URL of the trusted entry page for
+   *  this request. Present only when the deployment has a pinned separate
+   *  origin; never built from the current page origin. */
+  entry_url?: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+  expires_at_ms: number;
+  entry_path: string;
+  /** Read-only reconciliation; a locked key/advanced epoch is a blocker,
+   *  never a success claim. Absent on the create response path only. */
+  readiness?: {
+    ready: boolean;
+    blocker: string | null;
+    custody_epoch: number | null;
+    context_current: boolean;
+  };
+}
+
+/** CAD-1085: an agent's durable connection/access projection — metadata
+ *  only, plus the daemon's reported custody facts. */
+export interface AgentAccess {
+  agent: string;
+  grants: {
+    agent: string;
+    platform: string;
+    account: string;
+    scopes: string[];
+    granted_at: number;
+    by: string;
+  }[];
+  connections: Connection[];
+  connections_error: string | null;
+  custody: {
+    configured: boolean;
+    unlocked: boolean;
+    fenced: boolean;
+    isolation: string;
+    protected: boolean;
+  };
+  network_checked: boolean;
+  execution_authority: boolean;
+}
+
 export interface Connection {
   id: string;
   provider: string;
