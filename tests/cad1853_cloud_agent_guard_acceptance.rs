@@ -211,13 +211,17 @@ impl Stub {
     }
 }
 
-fn reply(stream: &mut TcpStream, status: u16, body: &Value) {
+/// Writes the response and reports whether it actually reached the socket, so
+/// a case can synchronize on a COMPLETED answer instead of a prepared one.
+fn reply(stream: &mut TcpStream, status: u16, body: &Value) -> bool {
     let text = body.to_string();
-    let _ = write!(
+    write!(
         stream,
         "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{text}",
         text.len()
-    );
+    )
+    .and_then(|_| stream.flush())
+    .is_ok()
 }
 
 fn agent_object(script: &Script) -> Value {
@@ -451,11 +455,14 @@ fn serve(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
             json!({"ok": false, "error": {"code": "invalid_request", "message": other}}),
         ),
     };
-    if action == "readback" {
+    // Count only a response that reached the wire: a case that waits on this
+    // is waiting for the platform's proof to COMPLETE.
+    if action == "readback" && reply(&mut stream, status, &answer) {
         let mut script = script.lock().unwrap_or_else(|e| e.into_inner());
         script.answered_readbacks += 1;
+    } else if action != "readback" {
+        let _ = reply(&mut stream, status, &answer);
     }
-    reply(&mut stream, status, &answer);
 }
 
 // ---------- isolated daemon + board fixture ----------
@@ -5456,6 +5463,164 @@ fn a_nonterminal_or_failed_platform_answer_withholds_the_settled_receipt() {
 /// registered agent on the same socket reads neither the message, nor its
 /// thread entry, nor the events naming it — while that alias' ordinary mail
 /// still projects.
+/// The same routed cloud result, read through the two readers that do not go
+/// through a projection: the message body and the metadata-only wait. Both ask
+/// the one cloud-row policy, so an unrelated agent gets neither the body nor
+/// the id, while the delivery's own peer still gets both.
+#[test]
+fn the_body_reader_and_the_wait_do_not_hand_out_a_routed_cloud_result() {
+    use cadence_agent::cloud_agent::{
+        self, CloudTransport, RemoteAgent, RemoteOperation, RemoteStatus, Sender, Source,
+        SubmitRequest,
+    };
+    use cadence_agent::remote_cli::RemoteTarget;
+    use cadence_agent::store::cloud_agent::{CloudSource, Owner};
+
+    const ROUTED: &str = "routed cloud reply for the body reader";
+    const PEER_OPERATION: &str = "peer-operation-body-0009";
+
+    struct PeerReply;
+    impl CloudTransport for PeerReply {
+        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+            Err(cadence_agent::Error::rejected("connect unused"))
+        }
+        fn submit(
+            &self,
+            _: &RemoteTarget,
+            request: &SubmitRequest<'_>,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Ok(RemoteOperation {
+                status: RemoteStatus::Completed,
+                remote_operation_id: Some(request.operation_id.to_string()),
+                remote_session_id: None,
+                provider_session_id: None,
+                reply: Some(ROUTED.into()),
+                error: None,
+                invoker_id: Some("inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+            })
+        }
+        fn read(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Err(cadence_agent::Error::rejected("read unused"))
+        }
+        fn cancel(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<()> {
+            Err(cadence_agent::Error::rejected("cancel unused"))
+        }
+    }
+
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    for alias in ["peer", "outsider"] {
+        fx.call(
+            Asserted::Operator,
+            "agent_register",
+            json!({"alias": alias, "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+        )
+        .unwrap();
+    }
+    let store = fx.store();
+    let cloud = store.cloud_agent(&id).unwrap().expect("cloud agent");
+    let peer = store.agent("peer").unwrap();
+    let stamp = cadence_agent::cloud_agent::registration_epoch(peer.created);
+    let owner = Owner::new("https://issuer.example.test", "stub-subject");
+    store
+        .cloud_agent_source_grant(&CloudSource {
+            cloud_agent_id: id.clone(),
+            kind: "local_peer".into(),
+            uid: peer.uid.clone(),
+            registration_epoch: stamp,
+            owner: owner.clone(),
+            label: "peer".into(),
+            scope: "cloud_agent.write".into(),
+            granted_by: "operator".into(),
+            granted_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+            invoker_id: None,
+            state: "active".into(),
+        })
+        .unwrap();
+    let target = RemoteTarget {
+        org: cloud.org_slug.clone(),
+        endpoint: cloud.endpoint.clone(),
+        org_id: cloud.organization_id.clone(),
+        identity: None,
+    };
+    let source = Source::registered(&peer, owner);
+    cloud_agent::send(
+        &store,
+        &PeerReply,
+        &cloud,
+        &target,
+        &home,
+        &Sender::Agent("peer".into()),
+        &source,
+        PEER_OPERATION,
+        "peer request body",
+        true,
+        None,
+        || Ok(()),
+    )
+    .expect("the admitted peer source settles its own turn");
+    let routed = store
+        .messages("peer")
+        .unwrap()
+        .into_iter()
+        .find(|row| row.source == "worker_result" && row.origin.as_deref() == Some(PEER_OPERATION))
+        .expect("the peer alias should hold the routed cloud result");
+
+    // The unrelated agent: no body, no id.
+    let denied = fx
+        .call(
+            Asserted::Agent("outsider".into()),
+            "message_read",
+            json!({"message": routed.id}),
+        )
+        .expect_err("an unrelated agent must not read another source's cloud result");
+    assert!(
+        !denied.to_string().contains(ROUTED),
+        "the refusal carried the body: {denied}"
+    );
+    let waited = fx.call(
+        Asserted::Agent("outsider".into()),
+        "agent_wait",
+        json!({"alias": "peer", "until": "settled", "seconds": 1}),
+    );
+    if let Ok(value) = &waited {
+        assert!(
+            !value.to_string().contains(&routed.id),
+            "the wait named a message the outsider may not read: {value}"
+        );
+    }
+
+    // The delivery's own peer still reads both.
+    let shown = fx
+        .call(
+            Asserted::Agent("peer".into()),
+            "message_read",
+            json!({"message": routed.id}),
+        )
+        .expect("the delivery's own peer reads its result");
+    assert!(
+        shown.to_string().contains(ROUTED),
+        "the bound peer lost the body: {shown}"
+    );
+}
+
 #[test]
 fn a_routed_cloud_result_is_not_projected_to_an_unrelated_agent() {
     use cadence_agent::cloud_agent::{
