@@ -291,6 +291,12 @@ impl Shared {
         }
         let id = required_str(params, "message")?;
         let token = required_str(params, "token")?;
+        let evidence = optional_str(params, "evidence");
+        if evidence.is_some_and(|evidence| evidence.contains(token)) {
+            return Err(Error::rejected(
+                "feedback evidence must not contain the raw turn token",
+            ));
+        }
         let kind = Self::memory_value(params, "kind")?
             .ok_or_else(|| Error::rejected("feedback kind is required"))?;
         let project = required_str(params, "project")?;
@@ -335,7 +341,7 @@ impl Shared {
                         task: message.task_id,
                         validated_at: crate::issue::time::iso(crate::issue::time::now_epoch()),
                     };
-                    write.save(optional_str(params, "evidence"), proof)
+                    write.save(evidence, proof)
                 });
         write.finish(outcome)
     }

@@ -4154,3 +4154,119 @@ fn cad347_feedback_post_save_lease_loss_restores_before_any_git_commit() {
     assert_eq!(cad347_feedback_metadata(&world), before_feedback);
     assert!(!cad347_feedback_supplied(&world, old_expiry));
 }
+
+#[test]
+fn cad347_feedback_rejects_raw_turn_token_in_evidence_without_partial_effects() {
+    let (world, digest, old_expiry) = cad347_feedback_world();
+    let issue = cad347_feedback_issue(&world, PROJECT);
+    let message = "cad347-feedback-token-evidence";
+    let token = cad347_feedback_turn(
+        &world,
+        "cad347-feedback-worker",
+        message,
+        None,
+        Some(&issue),
+    );
+    let safe = cad347_feedback_params(&digest, message, &token, "used");
+    let active = world.shared.store.message(message).unwrap().unwrap();
+    assert_eq!(active.alias, "cad347-feedback-worker");
+    assert_eq!(active.state, "running");
+    assert!(active.turn_id.as_deref() == Some(token.as_str()));
+    let memory = stored(&world, "cad347-feedback-lesson");
+    let before = world.snap();
+    let before_tree = cad347_memory_tree(&world);
+    let before_bytes = std::fs::read(&memory.path).unwrap();
+    let before_head = crate::issue::git(&world.pm(), &["rev-parse", "HEAD"]).unwrap();
+    let before_feedback = cad347_feedback_metadata(&world);
+    assert_eq!(before_feedback["used_reports"].as_u64(), Some(0));
+    assert!(before_feedback["last_use"].is_null());
+    assert!(cad347_feedback_supplied(&world, old_expiry - 1));
+    assert!(!cad347_feedback_supplied(&world, old_expiry));
+    assert!(!std::fs::read_to_string(&memory.path)
+        .unwrap()
+        .contains(&token));
+
+    // The authenticated token belongs only in its native proof field,
+    // never in durable evidence, including when embedded in prose.
+    let mut unsafe_evidence = safe.clone();
+    unsafe_evidence["evidence"] = json!(format!("Manual use recorded during {token}."));
+    let error = match cad347_vendor_rpc(
+        &world,
+        agent("cad347-feedback-worker"),
+        "memory_feedback",
+        unsafe_evidence,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("native feedback accepted a raw active turn token in durable evidence"),
+    };
+    assert!(
+        !error.to_string().contains(&token),
+        "feedback refusal echoed the raw active turn token"
+    );
+    world.assert_refused(Err(error), &before);
+    // Boolean comparisons deliberately avoid printing token-bearing
+    // canonical data if a future implementation partially writes it.
+    assert!(
+        cad347_memory_tree(&world) == before_tree,
+        "refused token-bearing evidence changed the canonical memory tree"
+    );
+    assert!(
+        std::fs::read(&memory.path).unwrap() == before_bytes,
+        "refused token-bearing evidence changed canonical bytes"
+    );
+    assert_eq!(
+        crate::issue::git(&world.pm(), &["rev-parse", "HEAD"]).unwrap(),
+        before_head
+    );
+    assert!(
+        cad347_feedback_metadata(&world) == before_feedback,
+        "refused token-bearing evidence changed counters or latest receipts"
+    );
+    assert_eq!(digest_of(&world, "cad347-feedback-lesson"), digest);
+    assert!(cad347_feedback_supplied(&world, old_expiry - 1));
+    assert!(!cad347_feedback_supplied(&world, old_expiry));
+    assert!(!std::fs::read_to_string(&memory.path)
+        .unwrap()
+        .contains(&token));
+
+    // The SAME active native turn and token must still accept safe
+    // evidence: neither blanket feedback refusal nor turn retirement
+    // may satisfy the bad-case oracle.
+    let still_active = world.shared.store.message(message).unwrap().unwrap();
+    assert_eq!(still_active.state, "running");
+    assert!(still_active.turn_id.as_deref() == Some(token.as_str()));
+    let accepted = cad347_vendor_rpc(
+        &world,
+        agent("cad347-feedback-worker"),
+        "memory_feedback",
+        safe,
+    )
+    .expect("safe evidence succeeds on the same still-active owned turn");
+    assert_eq!(accepted["committed"].as_bool(), Some(true));
+    let feedback = cad347_feedback_metadata(&world);
+    assert_eq!(feedback["used_reports"].as_u64(), Some(1));
+    assert_eq!(feedback["wrong_reports"], before_feedback["wrong_reports"]);
+    assert_eq!(
+        feedback["reread_reports"],
+        before_feedback["reread_reports"]
+    );
+    assert_eq!(feedback["last_use"]["message"].as_str(), Some(message));
+    assert_eq!(
+        feedback["last_use"]["digest"].as_str(),
+        Some(digest.as_str())
+    );
+    let used_at =
+        crate::issue::time::parse_iso(feedback["last_use"]["recorded_at"].as_str().unwrap())
+            .unwrap();
+    assert!(cad347_feedback_supplied(&world, old_expiry));
+    assert!(cad347_feedback_supplied(&world, used_at + 28 * 86_400 - 1));
+    assert!(!cad347_feedback_supplied(&world, used_at + 28 * 86_400));
+    let retained = stored(&world, "cad347-feedback-lesson");
+    assert_eq!(crate::memory::semantic_digest(&retained), digest);
+    assert_eq!(retained.body, memory.body);
+    assert!(retained.front.verified_at.is_none());
+    assert!(crate::memory::last_verified(&retained).is_none());
+    assert!(!std::fs::read_to_string(&retained.path)
+        .unwrap()
+        .contains(&token));
+}

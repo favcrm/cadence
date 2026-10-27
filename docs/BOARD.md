@@ -1360,6 +1360,8 @@ wrong tokens, stale claim digests and caller-supplied receipts/counters/times
 are refused. Only report aggregates and the latest receipt per kind are kept;
 raw turn tokens are not copied into canonical memory. Counts mean reports,
 not unique uses, observed consumption or proven benefit.
+Do not paste the current token into `--evidence`: feedback containing its raw
+token there is refused before persistence, without echoing or silently redacting it.
 
 Feedback takes the record-scoped tracker lock and rereads/CAS-checks the claim
 before `Store::with_memory_feedback` rechecks current native ownership and
