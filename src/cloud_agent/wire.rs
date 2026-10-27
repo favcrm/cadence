@@ -324,6 +324,11 @@ impl CloudTransport for HostedCloudTransport {
         let capabilities = take_object(&mut answer, "capabilities")?;
         let mut runtime = take_object(&mut answer, "runtime")?;
         let provenance = take_object(&mut agent, "provenance")?;
+        // The provenance verdict comes first: an answer that describes a
+        // different source is a mismatch even when the rest of its metadata
+        // is malformed, and only an answer that does describe this source
+        // must then carry the stable owner id.
+        super::check_discovery_source(source, &provenance)?;
         let invoker_id = invoker_id(&provenance)?.to_string();
         if take_text(&mut conversation, "conversation_id")? != conversation_id {
             return Err(Error::gate_coded(
