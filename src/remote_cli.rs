@@ -799,6 +799,27 @@ fn renewed_cloud_credential(dir: &Path, target: &RemoteTarget) -> Result<Credent
     )
 }
 
+/// What a cloud send actually uses: the saved cloud-purpose login, rotated
+/// under its own purpose only when renewal is due. A login with no renewable
+/// session, or one whose access token is still fresh, is used as it is — a
+/// grant this purpose may not rotate (say, one saved without enrollment
+/// authority) can still serve the scope it carries until it expires. Once
+/// renewal is due the strict purpose rule decides, so an unrecognized grant
+/// is refused instead of being sent with an expired token.
+fn cloud_send_credential(
+    dir: &Path,
+    target: &RemoteTarget,
+    cred: Credential,
+) -> Result<Credential> {
+    let at = now()?;
+    if cred.cli_session.is_none()
+        || (cred.pending.is_none() && cred.expires_at > at.saturating_add(RENEW_BEFORE))
+    {
+        return Ok(cred);
+    }
+    renewed_cloud_credential(dir, target)
+}
+
 fn renewed_credential_for(
     dir: &Path,
     target: &RemoteTarget,
@@ -2349,7 +2370,8 @@ pub fn cloud_agent_enroll_post(
     // between cannot enroll a child under a different human. Renewal is
     // cloud-purpose: a cloud-only grant refreshes under its own consent, and
     // a refusal here is definite (nothing was sent), never `unknown`.
-    let cred = renewed_cloud_credential(&dir, target)?;
+    let cred = load_credential(&dir, target)?;
+    let cred = cloud_send_credential(&dir, target, cred)?;
     let pin = identity_of(&cred, target)?;
     let issuer = pin.issuer.trim_end_matches('/').to_string();
     post(
@@ -2427,12 +2449,13 @@ pub fn cloud_agent_post(
             "this saved login does not carry the action's cloud-agent scope",
         ));
     }
-    // CAD-1853: the access token lives 300 s, so custody renews the saved
-    // cloud consent here, under its own purpose and the same source lock.
-    // The action's scope was just proven on this login, and renewal can only
-    // return the identical capability set, so the token sent is admitted for
-    // the same action. A cloud-only grant never reaches the CLI purpose.
-    let cred = renewed_cloud_credential(&dir, target)?;
+    // CAD-1853: the access token lives 300 s, so custody rotates the saved
+    // cloud consent here, under its own purpose and the same source lock,
+    // whenever renewal is due. The action's scope was just proven on this
+    // login, and renewal can only return the identical capability set, so the
+    // token sent is admitted for the same action. A cloud-only grant never
+    // reaches the CLI purpose.
+    let cred = cloud_send_credential(&dir, target, cred)?;
     // The saved audience is an origin without a trailing slash; normalize so
     // one slash joins it to the contract path (never `//__platform/...`).
     let origin = target.endpoint.trim_end_matches('/');
