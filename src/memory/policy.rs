@@ -390,7 +390,12 @@ pub fn new_policy(
         .any(|reference| reference.kind == EvidenceKind::External)
         || source.is_some_and(|source| {
             let source = source.trim_start();
-            source.starts_with("https://") || source.starts_with("http://")
+            source
+                .get(..8)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+                || source
+                    .get(..7)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
         });
     let provenance = if external {
         Provenance::ExternalDerived

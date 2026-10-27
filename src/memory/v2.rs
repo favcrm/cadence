@@ -536,63 +536,179 @@ pub(crate) fn classify(
     )
 }
 
-pub(crate) fn feedback(
-    pm: &Pm,
-    slug: &str,
+#[cfg(all(test, feature = "test-seam"))]
+thread_local! {
+    static FEEDBACK_AFTER_SAVE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) fn set_feedback_after_save_hook_for_test(hook: Option<Box<dyn FnOnce()>>) {
+    FEEDBACK_AFTER_SAVE_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if hook.is_some() {
+            assert!(slot.is_none(), "feedback save hook is already installed");
+        }
+        *slot = hook;
+    });
+}
+
+#[cfg(all(test, feature = "test-seam"))]
+fn feedback_after_save_for_test() {
+    let hook = FEEDBACK_AFTER_SAVE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Holds the tracker lock before native ownership is fenced. Only the atomic
+/// file save runs under Store's writer; Git hooks run afterwards, without that
+/// mutex. A failed native transaction restores the file before any Git commit.
+pub(crate) struct FeedbackWrite<'a> {
+    pm: &'a Pm,
+    lock: PmLock,
+    mem: Memory,
+    digest: String,
+    previous: Vec<u8>,
     kind: FeedbackKind,
-    evidence: Option<&str>,
-    proof: NativeFeedbackProof,
-) -> Result<Value> {
-    if !valid_identity_proof(&proof.actor)
-        || proof.actor.uid.as_deref().is_none_or(str::is_empty)
-        || proof.message.is_empty()
-        || time::parse_iso(&proof.validated_at).is_none()
-    {
-        return Err(Error::rejected(
-            "authenticated active-turn feedback proof is incomplete",
-        ));
+    saved: bool,
+}
+
+impl<'a> FeedbackWrite<'a> {
+    pub(crate) fn lock(
+        pm: &'a Pm,
+        project: &str,
+        slug: &str,
+        expected: &str,
+        kind: FeedbackKind,
+    ) -> Result<Self> {
+        let (proj, initial) = find(pm, Some(project), slug)?;
+        let lock = pm.lock_for_paths(std::slice::from_ref(&initial.path))?;
+        let (_, mem) = find(pm, Some(&proj.key), slug)?;
+        let digest = digest_matches(&mem, expected)?;
+        if mem.front.policy.is_none() || !retrieval_status(&mem).0 {
+            return Err(Error::rejected(
+                "feedback requires a policy-qualified accepted v2 memory",
+            ));
+        }
+        let previous = std::fs::read(&mem.path)?;
+        Ok(Self {
+            pm,
+            lock,
+            mem,
+            digest,
+            previous,
+            kind,
+            saved: false,
+        })
     }
-    if let Some(evidence) = evidence {
-        bounded_evidence(evidence)?;
+
+    pub(crate) fn save(
+        &mut self,
+        evidence: Option<&str>,
+        proof: NativeFeedbackProof,
+    ) -> Result<Value> {
+        if proof.project != self.mem.project || proof.digest != self.digest {
+            return Err(Error::rejected(
+                "feedback proof does not match the locked memory revision and project",
+            ));
+        }
+        if !valid_identity_proof(&proof.actor)
+            || proof.actor.uid.as_deref().is_none_or(str::is_empty)
+            || proof.message.is_empty()
+            || time::parse_iso(&proof.validated_at).is_none()
+        {
+            return Err(Error::rejected(
+                "authenticated active-turn feedback proof is incomplete",
+            ));
+        }
+        if let Some(evidence) = evidence {
+            bounded_evidence(evidence)?;
+        }
+        let receipt = FeedbackReceipt {
+            digest: proof.digest,
+            actor: proof.actor,
+            message: proof.message,
+            task: proof.task,
+            recorded_at: proof.validated_at,
+            evidence: evidence.map(str::to_owned),
+        };
+        let feedback = &mut self.mem.front.policy.as_mut().expect("v2 record").feedback;
+        let (count, latest) = match self.kind {
+            FeedbackKind::Used => (&mut feedback.used_reports, &mut feedback.last_use),
+            FeedbackKind::Wrong => (&mut feedback.wrong_reports, &mut feedback.last_wrong),
+            FeedbackKind::Reread => (&mut feedback.reread_reports, &mut feedback.last_reread),
+        };
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| Error::rejected("memory feedback counter exhausted"))?;
+        *latest = Some(receipt);
+        self.saved = true;
+        save_mem(&self.mem)?;
+        #[cfg(all(test, feature = "test-seam"))]
+        feedback_after_save_for_test();
+        Ok(
+            json!({"project": self.mem.project, "slug": self.mem.front.id, "kind": self.kind,
+            "digest": self.digest, "feedback": self.mem.front.policy.as_ref().expect("v2 record").feedback}),
+        )
     }
-    let (proj, initial) = find(pm, Some(&proof.project), slug)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&initial.path))?;
-    let (_, mut mem) = find(pm, Some(&proj.key), slug)?;
-    digest_matches(&mem, &proof.digest)?;
-    if mem.front.policy.is_none() || !retrieval_status(&mem).0 {
-        return Err(Error::rejected(
-            "feedback requires a policy-qualified accepted v2 memory",
-        ));
+
+    pub(crate) fn finish(mut self, outcome: Result<Value>) -> Result<Value> {
+        let mut response = match outcome {
+            Ok(response) => response,
+            Err(error) => return Err(self.abort(error)),
+        };
+        let feedback = &self.mem.front.policy.as_ref().expect("v2 record").feedback;
+        let receipt = match self.kind {
+            FeedbackKind::Used => feedback.last_use.as_ref(),
+            FeedbackKind::Wrong => feedback.last_wrong.as_ref(),
+            FeedbackKind::Reread => feedback.last_reread.as_ref(),
+        }
+        .expect("saved feedback receipt");
+        let committed = match commit_mem(
+            self.pm,
+            &self.lock,
+            &self.mem,
+            &format!(
+                "{}/memory/{}: authenticated feedback",
+                self.mem.project, self.mem.front.id
+            ),
+            &receipt.actor.alias,
+        ) {
+            Ok(committed) => committed,
+            Err(error) => return Err(self.abort(error)),
+        };
+        self.saved = false;
+        response["committed"] = json!(committed);
+        Ok(response)
     }
-    let actor = proof.actor.alias.clone();
-    let receipt = FeedbackReceipt {
-        digest: proof.digest,
-        actor: proof.actor,
-        message: proof.message,
-        task: proof.task,
-        recorded_at: proof.validated_at,
-        evidence: evidence.map(str::to_owned),
-    };
-    let feedback = &mut mem.front.policy.as_mut().expect("v2 record").feedback;
-    let (count, latest) = match kind {
-        FeedbackKind::Used => (&mut feedback.used_reports, &mut feedback.last_use),
-        FeedbackKind::Wrong => (&mut feedback.wrong_reports, &mut feedback.last_wrong),
-        FeedbackKind::Reread => (&mut feedback.reread_reports, &mut feedback.last_reread),
-    };
-    *count = count
-        .checked_add(1)
-        .ok_or_else(|| Error::rejected("memory feedback counter exhausted"))?;
-    *latest = Some(receipt);
-    let committed = save_and_commit_mem(
-        pm,
-        &lock,
-        &mem,
-        &format!("{}/memory/{slug}: authenticated feedback", proj.key),
-        &actor,
-    )?;
-    Ok(json!({"project": proj.key, "slug": slug, "kind": kind,
-        "digest": semantic_digest(&mem), "feedback": mem.front.policy.as_ref().expect("v2 record").feedback,
-        "committed": committed}))
+
+    fn restore(&mut self) -> Result<()> {
+        if self.saved {
+            let tmp = self.mem.path.with_extension("md.tmp");
+            std::fs::write(&tmp, &self.previous)?;
+            std::fs::rename(&tmp, &self.mem.path)?;
+            self.saved = false;
+        }
+        Ok(())
+    }
+
+    fn abort(&mut self, error: Error) -> Error {
+        match self.restore() {
+            Ok(()) => error,
+            Err(rollback) => Error::internal(format!(
+                "feedback rollback failed after {error}: {rollback}"
+            )),
+        }
+    }
+}
+
+impl Drop for FeedbackWrite<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            eprintln!("memory feedback rollback failed: {error}");
+        }
+    }
 }
 
 pub(super) fn quorum_status(mem: &Memory, operation: &str) -> (bool, String) {
@@ -653,14 +769,12 @@ pub(super) fn unused_reason(mem: &Memory, now: i64) -> Option<String> {
         return None;
     }
     let decision = policy.finalizations.last()?;
+    // Source classification rotates the digest, not this retained claim's
+    // inactivity lifetime. Revalidation is not a new acceptance or reported use.
     let accepted_at = policy
         .finalizations
         .iter()
-        .filter(|receipt| {
-            receipt.operation == "accept"
-                && receipt.status == "accepted"
-                && receipt.digest == decision.digest
-        })
+        .filter(|receipt| receipt.operation == "accept" && receipt.status == "accepted")
         .filter_map(|receipt| time::parse_iso(&receipt.recorded_at))
         .min();
     let Some(accepted_at) = accepted_at else {

@@ -3486,3 +3486,671 @@ fn cad347_operator_rejected_candidate_is_retained_and_cannot_be_resurrected() {
         *history
     );
 }
+
+#[test]
+fn cad347_accepted_classification_preserves_inactivity_until_authenticated_use() {
+    use crate::memory::{self, policy::ActorSnapshot};
+
+    let world = World::open();
+    cad347_vendor_agent(&world, "cad347-author", "inbox", Some("openai/gpt-5"));
+    cad347_vendor_agent(
+        &world,
+        "cad347-curator",
+        "pi",
+        Some("anthropic/claude-sonnet-4-5"),
+    );
+    cad347_vendor_identity(
+        &world,
+        "cad347-curator",
+        Some("anthropic/claude-sonnet-4-5"),
+        "0123456789abcdef0123456789abcdef",
+    );
+    let slug = "cad347-feedback-lesson";
+    let proposal = cad347_vendor_rpc(
+        &world,
+        agent("cad347-author"),
+        "memory_propose",
+        propose_params(
+            slug,
+            "rule",
+            json!({"project": true}),
+            "CLASSIFICATION FACT — source attestation and review are not reported use",
+        ),
+    )
+    .expect("actual new native agent-claimed judgement");
+    let old_digest = proposal["digest"].as_str().unwrap().to_string();
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params(slug, "accept", &old_digest),
+    )
+    .expect("actual operator acceptance before source classification");
+
+    // Historical-clock fixture only: age the ACTUAL native acceptance.
+    // Do not manufacture any authority, model, usage or check receipt.
+    let mut accepted = stored(&world, slug);
+    assert_eq!(accepted.front.status, "accepted");
+    let accepted_at = crate::issue::time::now_epoch() - 27 * 86_400;
+    let original_expiry = accepted_at + 28 * 86_400;
+    accepted.front.created = crate::issue::time::iso(accepted_at - 86_400);
+    {
+        let policy = accepted.front.policy.as_mut().unwrap();
+        assert_eq!(policy.provenance, memory::policy::Provenance::AgentClaimed);
+        assert_eq!(policy.finalizations.len(), 1);
+        let receipt = &mut policy.finalizations[0];
+        assert_eq!(receipt.operation, "accept");
+        assert_eq!(receipt.status, "accepted");
+        assert_eq!(receipt.digest, old_digest);
+        assert!(matches!(&receipt.finalizer, ActorSnapshot::Operator { .. }));
+        receipt.recorded_at = crate::issue::time::iso(accepted_at);
+    }
+    assert_eq!(memory::semantic_digest(&accepted), old_digest);
+    let pm = crate::issue::Pm::at(&world.pm()).unwrap();
+    {
+        let lock = pm
+            .lock_for_paths(std::slice::from_ref(&accepted.path))
+            .expect("historical timestamp fixture scoped lock");
+        let yaml = serde_yaml::to_string(&accepted.front).unwrap();
+        std::fs::write(
+            &accepted.path,
+            format!("---\n{yaml}---\n\n{}", accepted.body),
+        )
+        .expect("persist only historical timestamp metadata");
+        pm.commit_scoped(
+            &lock,
+            std::slice::from_ref(&accepted.path),
+            "Historical acceptance clock for classification inactivity regression\n\nActor: test\n",
+        )
+        .expect("commit only historical fixture metadata");
+    }
+    let historical = stored(&world, slug);
+    let original_history = historical
+        .front
+        .policy
+        .as_ref()
+        .unwrap()
+        .finalizations
+        .clone();
+    let original_body = historical.body.clone();
+    assert_eq!(memory::semantic_digest(&historical), old_digest);
+    assert!(memory::retrieval_status(&historical).0);
+    assert!(cad347_feedback_supplied(&world, original_expiry - 1));
+    assert!(!cad347_feedback_supplied(&world, original_expiry));
+
+    let digest = cad347_vendor_attest(&world, slug, &old_digest);
+    let classified = stored(&world, slug);
+    assert_eq!(classified.front.status, "pending-revalidation");
+    assert_eq!(classified.body, original_body);
+    assert_eq!(
+        classified.front.policy.as_ref().unwrap().finalizations,
+        original_history
+    );
+    assert!(!cad347_feedback_supplied(&world, original_expiry - 1));
+
+    // Operator source classification cannot replace the first curator.
+    cad347_vendor_refuse(
+        &world,
+        slug,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params(slug, "verify", &digest),
+    );
+    cad347_vendor_rpc(
+        &world,
+        agent("cad347-curator"),
+        "memory_review",
+        review_params(slug, "verify", "pass", &digest),
+    )
+    .expect("current-cycle confirmed cross-vendor curator verification");
+    assert!(
+        !retrieval(&world, slug).0,
+        "review alone is not finalization"
+    );
+    cad347_vendor_rpc(
+        &world,
+        agent("cad347-curator"),
+        "memory_finalize",
+        finalize_params(slug, "verify", &digest),
+    )
+    .expect("qualifying curator finalizes current-cycle revalidation");
+
+    let restored = stored(&world, slug);
+    assert_eq!(restored.front.status, "accepted");
+    assert_eq!(restored.body, original_body);
+    assert_eq!(memory::semantic_digest(&restored), digest);
+    assert!(memory::retrieval_status(&restored).0);
+    assert!(restored.front.verified_at.is_none());
+    assert!(memory::last_verified(&restored).is_none());
+    let policy = restored.front.policy.as_ref().unwrap();
+    assert_eq!(
+        &policy.finalizations[..original_history.len()],
+        original_history.as_slice()
+    );
+    let decision = policy.finalizations.last().unwrap();
+    assert_eq!(decision.operation, "verify");
+    assert_eq!(decision.digest, digest);
+    assert!(crate::issue::time::parse_iso(&decision.recorded_at).unwrap() > accepted_at);
+    assert_eq!(policy.feedback.used_reports, 0);
+    assert!(policy.feedback.last_use.is_none());
+
+    // Expected RED on the reviewed head: successful revalidation must
+    // restore supply, without renewing the original inactivity lifetime.
+    assert!(
+        cad347_feedback_supplied(&world, original_expiry - 1),
+        "current-digest revalidation must restore guidance before its original inactivity expiry"
+    );
+    assert!(!cad347_feedback_supplied(&world, original_expiry));
+    assert!(!cad347_feedback_supplied(&world, original_expiry + 1));
+
+    let issue = cad347_feedback_issue(&world, PROJECT);
+    let message = "cad347-classified-use-turn";
+    let token = cad347_feedback_turn(&world, "cad347-curator", message, None, Some(&issue));
+    for kind in ["wrong", "reread"] {
+        cad347_vendor_rpc(
+            &world,
+            agent("cad347-curator"),
+            "memory_feedback",
+            cad347_feedback_params(&digest, message, &token, kind),
+        )
+        .expect("authenticated non-use feedback on the classified claim");
+        assert!(cad347_feedback_metadata(&world)["last_use"].is_null());
+        assert!(!cad347_feedback_supplied(&world, original_expiry));
+    }
+    cad347_vendor_rpc(
+        &world,
+        agent("cad347-curator"),
+        "memory_feedback",
+        cad347_feedback_params(&digest, message, &token, "used"),
+    )
+    .expect("current owned-turn same-project genuine used report");
+    let feedback = cad347_feedback_metadata(&world);
+    assert_eq!(feedback["used_reports"].as_u64(), Some(1));
+    assert_eq!(
+        feedback["last_use"]["digest"].as_str(),
+        Some(digest.as_str())
+    );
+    assert_eq!(feedback["last_use"]["message"].as_str(), Some(message));
+    let used_at =
+        crate::issue::time::parse_iso(feedback["last_use"]["recorded_at"].as_str().unwrap())
+            .unwrap();
+    assert!(cad347_feedback_supplied(&world, original_expiry + 1));
+    assert!(cad347_feedback_supplied(&world, used_at + 28 * 86_400 - 1));
+    assert!(!cad347_feedback_supplied(&world, used_at + 28 * 86_400));
+    let retained = stored(&world, slug);
+    assert_eq!(memory::semantic_digest(&retained), digest);
+    assert_eq!(retained.body, original_body);
+    assert_eq!(
+        &retained.front.policy.as_ref().unwrap().finalizations[..original_history.len()],
+        original_history.as_slice()
+    );
+    assert!(retained.front.verified_at.is_none());
+    assert!(memory::last_verified(&retained).is_none());
+    assert!(!std::fs::read_to_string(&retained.path)
+        .unwrap()
+        .contains(&token));
+}
+
+#[test]
+fn cad347_mixed_case_http_sources_stay_external_and_operator_only() {
+    for source in [
+        "HTTPS://example.invalid/cad347/external-source",
+        "HTTP://example.invalid/cad347/external-source",
+        "HtTpS://example.invalid/cad347/external-source",
+        "hTtP://example.invalid/cad347/external-source",
+    ] {
+        let world = World::open();
+        cad347_vendor_agent(&world, "cad347-author", "inbox", Some("openai/gpt-5"));
+        cad347_vendor_agent(
+            &world,
+            "cad347-curator",
+            "inbox",
+            Some("anthropic/claude-sonnet-4-5"),
+        );
+        let slug = "cad347-mixed-case-external";
+        let mut params = propose_params(
+            slug,
+            "rule",
+            json!({"project": true}),
+            "External source spelling does not grant native provenance or release authority",
+        );
+        params["source"] = json!(source);
+        let proposal = cad347_vendor_rpc(&world, agent("cad347-author"), "memory_propose", params)
+            .expect("native proposal with a valid mixed-case HTTP source");
+        let digest = proposal["digest"].as_str().unwrap().to_string();
+        assert_eq!(proposal["policy_revision"].as_u64(), Some(2));
+        assert_eq!(
+            proposal["status"].as_str(),
+            Some("quarantined"),
+            "HTTP scheme case must not bypass external quarantine: {source}"
+        );
+        let candidate = stored(&world, slug);
+        let front = serde_json::to_value(&candidate.front).unwrap();
+        assert_eq!(candidate.front.status, "quarantined");
+        assert_eq!(candidate.front.source.as_deref(), Some(source));
+        assert_eq!(
+            front["policy"]["provenance"].as_str(),
+            Some("external-derived")
+        );
+        assert!(front["policy"]["attestations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(front["policy"]["finalizations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(!retrieval(&world, slug).0);
+        assert!(crate::memory::last_verified(&candidate).is_none());
+        let pm = crate::issue::Pm::at(&world.pm()).unwrap();
+        let (rules, errors) = crate::memory::project_rules(&pm, PROJECT, None);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!slugs(&rules).contains(slug));
+        assert!(!crate::memory::render_lessons(&rules)
+            .1
+            .iter()
+            .any(|id| id == slug));
+
+        // Even a positively asserted operator's source-classification verb
+        // cannot convert external evidence into native agent verification.
+        cad347_closed_refuse(
+            &world,
+            Asserted::Operator,
+            "memory_classify",
+            json!({
+                "project": PROJECT,
+                "slug": slug,
+                "digest": digest,
+                "provenance": "agent-verified",
+                "evidence": "External evidence must not become native provenance through scheme spelling",
+            }),
+        );
+        assert_eq!(digest_of(&world, slug), digest);
+        assert_eq!(stored(&world, slug).front.status, "quarantined");
+
+        // A confirmed independent curator may record its review, but that
+        // receipt cannot replace the external source's operator release.
+        cad347_vendor_rpc(
+            &world,
+            agent("cad347-curator"),
+            "memory_review",
+            review_params(slug, "accept", "pass", &digest),
+        )
+        .expect("native independent curator review is not an external release");
+        for who in [
+            agent("cad347-author"),
+            agent("cad347-curator"),
+            Asserted::Unproven,
+        ] {
+            cad347_closed_refuse(
+                &world,
+                who,
+                "memory_finalize",
+                finalize_params(slug, "accept", &digest),
+            );
+        }
+        assert!(!retrieval(&world, slug).0);
+        let unreleased = stored(&world, slug);
+        let unreleased_front = serde_json::to_value(&unreleased.front).unwrap();
+        assert_eq!(unreleased.front.status, "quarantined");
+        assert_eq!(
+            unreleased_front["policy"]["provenance"].as_str(),
+            Some("external-derived")
+        );
+        assert!(unreleased_front["policy"]["attestations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(unreleased_front["policy"]["finalizations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        cad347_vendor_rpc(
+            &world,
+            Asserted::Operator,
+            "memory_finalize",
+            finalize_params(slug, "accept", &digest),
+        )
+        .expect("positive operator release of the exact external judgement");
+        let released = stored(&world, slug);
+        let released_front = serde_json::to_value(&released.front).unwrap();
+        assert_eq!(released.front.status, "accepted");
+        assert_eq!(released.front.source.as_deref(), Some(source));
+        assert_eq!(crate::memory::semantic_digest(&released), digest);
+        assert_eq!(
+            released_front["policy"]["provenance"].as_str(),
+            Some("external-derived")
+        );
+        assert!(released_front["policy"]["attestations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let decision = released_front["policy"]["finalizations"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(decision["operation"].as_str(), Some("accept"));
+        assert_eq!(decision["digest"].as_str(), Some(digest.as_str()));
+        assert_eq!(decision["finalizer"]["kind"].as_str(), Some("operator"));
+        assert!(retrieval(&world, slug).0);
+        assert!(released.front.verified_at.is_none());
+        assert!(crate::memory::last_verified(&released).is_none());
+        let (rules, errors) = crate::memory::project_rules(&pm, PROJECT, None);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(slugs(&rules), BTreeSet::from([slug.to_string()]));
+        assert_eq!(
+            crate::memory::render_lessons(&rules).1,
+            vec![slug.to_string()]
+        );
+    }
+}
+
+#[test]
+fn cad347_feedback_rechecks_turn_retired_while_waiting_for_memory_lock() {
+    for retirement in ["completed", "replaced-endpoint"] {
+        let (world, digest, old_expiry) = cad347_feedback_world();
+        let issue = cad347_feedback_issue(&world, PROJECT);
+        let message = "cad347-feedback-lock-wait";
+        let token = cad347_feedback_turn(
+            &world,
+            "cad347-feedback-worker",
+            message,
+            None,
+            Some(&issue),
+        );
+        let request = cad347_feedback_params(&digest, message, &token, "used");
+        let memory = stored(&world, "cad347-feedback-lesson");
+        let pm = crate::issue::Pm::at(&world.pm()).unwrap();
+        let active = world.shared.store.message(message).unwrap().unwrap();
+        assert_eq!(active.state, "running");
+        assert_eq!(active.turn_id.as_deref(), Some(token.as_str()));
+        assert_eq!(
+            cad347_feedback_metadata(&world)["used_reports"].as_u64(),
+            Some(0)
+        );
+        assert!(cad347_feedback_metadata(&world)["last_use"].is_null());
+        assert!(cad347_feedback_supplied(&world, old_expiry - 1));
+        assert!(!cad347_feedback_supplied(&world, old_expiry));
+
+        let successor_message = "cad347-feedback-lock-successor";
+        let successor_token = std::thread::scope(|scope| {
+            let held = pm
+                .lock_for_paths(std::slice::from_ref(&memory.path))
+                .expect("hold the actual canonical memory write lock");
+            let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+            let feedback_world = &world;
+            let waiter = scope.spawn(move || {
+                crate::issue::set_lock_waiting_observer_for_test(Some(waiting_tx));
+                let result = cad347_vendor_rpc(
+                    feedback_world,
+                    agent("cad347-feedback-worker"),
+                    "memory_feedback",
+                    request,
+                );
+                crate::issue::set_lock_waiting_observer_for_test(None);
+                result
+            });
+            waiting_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("native feedback never contended on the real PM lock");
+
+            // The transition must finish while the PM lock remains held.
+            // Holding the store mutex while waiting for PM would deadlock
+            // this ordering and must not satisfy the refusal oracle.
+            let (retired_tx, retired_rx) = std::sync::mpsc::channel();
+            let lifecycle_world = &world;
+            let retired = scope.spawn(move || {
+                match retirement {
+                    "completed" => {
+                        lifecycle_world
+                            .shared
+                            .store
+                            .finish_running(
+                                message,
+                                "completed",
+                                &json!({"text": "Native turn completed while feedback waited"}),
+                                None,
+                            )
+                            .expect("native completion transaction")
+                            .expect("the previously running turn must actually complete");
+                        let current = lifecycle_world
+                            .shared
+                            .store
+                            .message(message)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(current.state, "completed");
+                    }
+                    "replaced-endpoint" => {
+                        cad347_vendor_identity(
+                            lifecycle_world,
+                            "cad347-feedback-worker",
+                            None,
+                            "fedcba9876543210fedcba9876543210",
+                        );
+                        let current = lifecycle_world
+                            .shared
+                            .store
+                            .message(message)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(current.state, "unknown");
+                        let endpoint = lifecycle_world
+                            .shared
+                            .store
+                            .agent("cad347-feedback-worker")
+                            .unwrap();
+                        assert_eq!(
+                            endpoint.generation.as_deref(),
+                            Some("fedcba9876543210fedcba9876543210")
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                let successor_token = cad347_feedback_turn(
+                    lifecycle_world,
+                    "cad347-feedback-worker",
+                    successor_message,
+                    None,
+                    Some(&issue),
+                );
+                let successor = lifecycle_world
+                    .shared
+                    .store
+                    .message(successor_message)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(successor.state, "running");
+                assert_eq!(successor.turn_id.as_deref(), Some(successor_token.as_str()));
+                retired_tx.send(()).unwrap();
+                successor_token
+            });
+            retired_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("native lifecycle could not advance while feedback waited; do not hold Store before PM");
+            let successor_token = retired.join().expect("native lifecycle transition failed");
+            assert_ne!(successor_token, token);
+            assert!(
+                !waiter.is_finished(),
+                "feedback must still be waiting, not have escaped through a timeout or early refusal"
+            );
+
+            // Snapshot AFTER the intentional native lifecycle writes:
+            // only the pending feedback request must leave no effect.
+            let before = world.snap();
+            let before_files = cad347_memory_tree(&world);
+            let before_bytes = std::fs::read(&memory.path).unwrap();
+            let before_head = crate::issue::git(&world.pm(), &["rev-parse", "HEAD"]).unwrap();
+            let before_feedback = cad347_feedback_metadata(&world);
+            drop(held);
+            let result = waiter.join().expect("native feedback thread failed");
+            world.assert_refused(result, &before);
+            assert_eq!(cad347_memory_tree(&world), before_files);
+            assert_eq!(std::fs::read(&memory.path).unwrap(), before_bytes);
+            assert_eq!(
+                crate::issue::git(&world.pm(), &["rev-parse", "HEAD"]).unwrap(),
+                before_head
+            );
+            assert_eq!(cad347_feedback_metadata(&world), before_feedback);
+            assert_eq!(
+                cad347_feedback_metadata(&world)["used_reports"].as_u64(),
+                Some(0)
+            );
+            assert!(cad347_feedback_metadata(&world)["last_use"].is_null());
+            assert_eq!(digest_of(&world, "cad347-feedback-lesson"), digest);
+            assert!(cad347_feedback_supplied(&world, old_expiry - 1));
+            assert!(!cad347_feedback_supplied(&world, old_expiry));
+            let bytes = std::fs::read_to_string(&memory.path).unwrap();
+            assert!(!bytes.contains(&token));
+            assert!(!bytes.contains(&successor_token));
+            successor_token
+        });
+
+        // A current successor remains able to report genuine use: a
+        // blanket feedback refusal cannot make the negative case pass.
+        cad347_vendor_rpc(
+            &world,
+            agent("cad347-feedback-worker"),
+            "memory_feedback",
+            cad347_feedback_params(&digest, successor_message, &successor_token, "used"),
+        )
+        .expect("the current successor turn can report same-project use");
+        let feedback = cad347_feedback_metadata(&world);
+        assert_eq!(feedback["used_reports"].as_u64(), Some(1));
+        assert_eq!(
+            feedback["last_use"]["message"].as_str(),
+            Some(successor_message)
+        );
+        assert_eq!(
+            feedback["last_use"]["digest"].as_str(),
+            Some(digest.as_str())
+        );
+        assert!(cad347_feedback_supplied(&world, old_expiry));
+        assert_eq!(digest_of(&world, "cad347-feedback-lesson"), digest);
+        assert!(crate::memory::last_verified(&stored(&world, "cad347-feedback-lesson")).is_none());
+        let bytes = std::fs::read_to_string(&memory.path).unwrap();
+        assert!(!bytes.contains(&token));
+        assert!(!bytes.contains(&successor_token));
+    }
+}
+
+#[test]
+fn cad347_feedback_post_save_lease_loss_restores_before_any_git_commit() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let (world, digest, old_expiry) = cad347_feedback_world();
+    let issue = cad347_feedback_issue(&world, PROJECT);
+    let message = "cad347-feedback-post-save";
+    let token = cad347_feedback_turn(
+        &world,
+        "cad347-feedback-worker",
+        message,
+        None,
+        Some(&issue),
+    );
+    let request = cad347_feedback_params(&digest, message, &token, "used");
+    let memory = stored(&world, "cad347-feedback-lesson");
+    let before = world.snap();
+    let before_tree = cad347_memory_tree(&world);
+    let before_bytes = std::fs::read(&memory.path).unwrap();
+    let before_head = crate::issue::git(&world.pm(), &["rev-parse", "HEAD"]).unwrap();
+    let before_feedback = cad347_feedback_metadata(&world);
+    assert_eq!(before_feedback["used_reports"].as_u64(), Some(0));
+    assert!(before_feedback["last_use"].is_null());
+    assert!(cad347_feedback_supplied(&world, old_expiry - 1));
+    assert!(!cad347_feedback_supplied(&world, old_expiry));
+
+    let fence = Arc::new(crate::lease::Fence::default());
+    world.shared.store.install_write_fence(Arc::clone(&fence));
+    let reached = Arc::new(AtomicBool::new(false));
+    let hook_reached = Arc::clone(&reached);
+    let hook_fence = Arc::clone(&fence);
+    let hook_path = memory.path.clone();
+    let hook_before_bytes = before_bytes.clone();
+    let hook_digest = digest.clone();
+    let hook_token = token.clone();
+    crate::memory::v2::set_feedback_after_save_hook_for_test(Some(Box::new(move || {
+        // Inspect canonical FILE bytes only: never re-enter Store here.
+        let saved = std::fs::read(&hook_path).expect("canonical feedback was actually saved");
+        assert_ne!(saved, hook_before_bytes);
+        let saved = String::from_utf8(saved).unwrap();
+        let (front, _) = crate::memory::parse_memory(&saved).unwrap();
+        let policy = front.policy.expect("the saved record remains v2");
+        assert_eq!(policy.feedback.used_reports, 1);
+        let receipt = policy
+            .feedback
+            .last_use
+            .expect("the actual save contains the used receipt");
+        assert_eq!(receipt.message, message);
+        assert_eq!(receipt.digest, hook_digest);
+        assert!(!saved.contains(&hook_token));
+        hook_reached.store(true, Ordering::SeqCst);
+        hook_fence
+            .trip("lease lost after canonical feedback save and before Store callback return");
+    })));
+    let result = cad347_vendor_rpc(
+        &world,
+        agent("cad347-feedback-worker"),
+        "memory_feedback",
+        request.clone(),
+    );
+    crate::memory::v2::set_feedback_after_save_hook_for_test(None);
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "the real native handler must save feedback before the fault; blanket refusal is not evidence"
+    );
+    assert!(fence.tripped());
+    world.assert_refused(result, &before);
+
+    // Store rollback alone cannot undo a canonical file: the armed PM
+    // write guard must restore it before the refused RPC returns.
+    assert_eq!(cad347_memory_tree(&world), before_tree);
+    assert_eq!(std::fs::read(&memory.path).unwrap(), before_bytes);
+    assert_eq!(
+        crate::issue::git(&world.pm(), &["rev-parse", "HEAD"]).unwrap(),
+        before_head
+    );
+    assert_eq!(cad347_feedback_metadata(&world), before_feedback);
+    assert_eq!(
+        cad347_feedback_metadata(&world)["used_reports"].as_u64(),
+        Some(0)
+    );
+    assert!(cad347_feedback_metadata(&world)["last_use"].is_null());
+    assert_eq!(digest_of(&world, "cad347-feedback-lesson"), digest);
+    assert!(cad347_feedback_supplied(&world, old_expiry - 1));
+    assert!(!cad347_feedback_supplied(&world, old_expiry));
+    assert!(crate::memory::last_verified(&stored(&world, "cad347-feedback-lesson")).is_none());
+    assert!(!std::fs::read_to_string(&memory.path)
+        .unwrap()
+        .contains(&token));
+
+    // This is the actual installed native write fence, not a fake
+    // callback error or an observer manufacturing a passing check.
+    world
+        .shared
+        .store
+        .event_public("daemon", "cad347-must-refuse-after-save-loss", json!({}))
+        .expect_err("the installed native Store write fence must now refuse writes");
+
+    // An explicit later call remains fenced and cannot renew inactivity,
+    // add a report or create a tracker commit by replaying the first call.
+    let before_retry = world.snap();
+    let retry = cad347_vendor_rpc(
+        &world,
+        agent("cad347-feedback-worker"),
+        "memory_feedback",
+        request,
+    );
+    world.assert_refused(retry, &before_retry);
+    assert_eq!(cad347_memory_tree(&world), before_tree);
+    assert_eq!(std::fs::read(&memory.path).unwrap(), before_bytes);
+    assert_eq!(
+        crate::issue::git(&world.pm(), &["rev-parse", "HEAD"]).unwrap(),
+        before_head
+    );
+    assert_eq!(cad347_feedback_metadata(&world), before_feedback);
+    assert!(!cad347_feedback_supplied(&world, old_expiry));
+}

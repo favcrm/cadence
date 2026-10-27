@@ -1351,6 +1351,8 @@ without an authenticated reported use, initially measured from acceptance.
 Expiry does not delete or rewrite it. A current owned-turn `used` report can
 renew inactivity after manual reading, including an expired accepted claim.
 Reviews, decisions, `wrong` and `reread` reports do not count as use.
+Source classification may rotate the digest, but classification/revalidation
+retain the original acceptance inactivity anchor; neither starts a new lifetime.
 
 `memory_feedback` derives the reporter and trusted issue/job-task project
 from the live native assignment. Foreign recipients, retired/completed turns,
@@ -1358,6 +1360,14 @@ wrong tokens, stale claim digests and caller-supplied receipts/counters/times
 are refused. Only report aggregates and the latest receipt per kind are kept;
 raw turn tokens are not copied into canonical memory. Counts mean reports,
 not unique uses, observed consumption or proven benefit.
+
+Feedback takes the record-scoped tracker lock and rereads/CAS-checks the claim
+before `Store::with_memory_feedback` rechecks current native ownership and
+assignment inside the fenced writer. The writer covers the atomic canonical
+file save, not Git hooks. A native transaction error restores the original
+bytes before any Git commit; the tracker lock remains held through the later
+audit commit. This prevents a turn retired during lock contention from renewing
+guidance and avoids re-entering Store from a Git hook while its mutex is held.
 
 Policy review age, source provenance, inactivity and mechanical verification
 are distinct. V2 policy decisions never stamp `verified_at` or claim

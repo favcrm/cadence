@@ -291,85 +291,52 @@ impl Shared {
         }
         let id = required_str(params, "message")?;
         let token = required_str(params, "token")?;
-        let message = self
-            .store
-            .message(id)?
-            .ok_or_else(|| Error::rejected("unknown feedback message"))?;
-        let agent = self.store.agent(&verified.agent.alias)?;
-        // Keep the complete verified native snapshot until ownership checks
-        // finish. Endpoint generations compare to endpoint generations; the
-        // separate composite owner generation remains in the durable proof.
-        if message.alias != verified.agent.alias
-            || message.recipient_uid.as_deref() != Some(agent.uid.as_str())
-            || message.state != "running"
-            || message.turn_id.as_deref() != Some(token)
-            || agent.uid != verified.agent.uid
-            || agent.generation != verified.agent.generation
-            || agent.pid != verified.agent.pid
-            || agent.pid_start != verified.agent.pid_start
-            || self.adoption_pending(&message.alias, id, token)
-            || !registry::turn_token_current(
-                &agent.provider,
-                &agent.endpoint_kind,
-                agent.generation.as_deref(),
-                token,
-            )
-        {
-            return Err(Error::rejected(
-                "feedback requires this native agent's current owned active turn",
-            ));
-        }
-        let bound_issue = match message.task_id.as_deref() {
-            Some(task_id) => {
-                let task = self.store.task(task_id)?;
-                let job = self.store.job(&task.job_id)?;
-                if task.assignee.as_deref() != Some(message.alias.as_str())
-                    || task.dispatch_message.as_deref() != Some(id)
-                    || !matches!(task.state.as_str(), "dispatched" | "running")
-                    || job.state != "open"
-                {
-                    return Err(Error::rejected(
-                        "feedback task is not this active native assignment",
-                    ));
-                }
-                let issue = job
-                    .issue_id
-                    .ok_or_else(|| Error::rejected("feedback job has no issue scope"))?;
-                if message.issue.as_deref().is_some_and(|bound| bound != issue) {
-                    return Err(Error::rejected(
-                        "feedback message and native job disagree on issue scope",
-                    ));
-                }
-                issue
-            }
-            None => message
-                .issue
-                .clone()
-                .ok_or_else(|| Error::rejected("feedback message has no trusted issue scope"))?,
-        };
-        let pm = self.pm()?;
-        let issue = crate::issue::board::find_issue(&pm.dir, &bound_issue)?;
-        if issue.project != required_str(params, "project")? {
-            return Err(Error::rejected(
-                "feedback memory is outside the active native issue project",
-            ));
-        }
         let kind = Self::memory_value(params, "kind")?
             .ok_or_else(|| Error::rejected("feedback kind is required"))?;
-        let proof = policy::NativeFeedbackProof {
-            project: issue.project,
-            digest: required_str(params, "digest")?.to_owned(),
-            actor: Self::memory_identity(*verified).proof,
-            message: message.id,
-            task: message.task_id,
-            validated_at: crate::issue::time::iso(crate::issue::time::now_epoch()),
-        };
-        memory::v2::feedback(
+        let project = required_str(params, "project")?;
+        let digest = required_str(params, "digest")?;
+        let pm = self.pm()?;
+        let mut write = memory::v2::FeedbackWrite::lock(
             &pm,
+            project,
             required_str(params, "slug")?,
+            digest,
             kind,
-            optional_str(params, "evidence"),
-            proof,
-        )
+        )?;
+        let super::identity::VerifiedAgent {
+            agent: expected,
+            generation,
+            process_start,
+        } = *verified;
+        let outcome =
+            self.store
+                .with_memory_feedback(&expected, id, token, |agent, message, bound_issue| {
+                    if self.adoption_pending(&message.alias, id, token) {
+                        return Err(Error::rejected(
+                            "feedback requires a settled native turn adoption",
+                        ));
+                    }
+                    let issue = crate::issue::board::find_issue(&pm.dir, &bound_issue)?;
+                    if issue.project != project {
+                        return Err(Error::rejected(
+                            "feedback memory is outside the active native issue project",
+                        ));
+                    }
+                    let proof = policy::NativeFeedbackProof {
+                        project: issue.project,
+                        digest: digest.to_owned(),
+                        actor: Self::memory_identity(super::identity::VerifiedAgent {
+                            agent,
+                            generation,
+                            process_start,
+                        })
+                        .proof,
+                        message: message.id,
+                        task: message.task_id,
+                        validated_at: crate::issue::time::iso(crate::issue::time::now_epoch()),
+                    };
+                    write.save(optional_str(params, "evidence"), proof)
+                });
+        write.finish(outcome)
     }
 }
