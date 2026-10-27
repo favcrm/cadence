@@ -5708,6 +5708,31 @@ pub fn serve(state_dir: &Path) -> Result<()> {
     serve_with(state_dir, opts)
 }
 
+// Every long-lived daemon thread holds one unit of the process thread budget
+// so the protected runtime stays inside Root's custody cap. Refusal is logged
+// and never panics or falls back to an unbudgeted spawn.
+fn spawn_watch<F>(what: &'static str, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    if let Err(e) = crate::thread_budget::spawn(f) {
+        eprintln!("cadence: {what} not started: {e}");
+    }
+}
+
+fn spawn_watch_joined<F>(what: &'static str, f: F) -> Option<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    match crate::thread_budget::spawn(f) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            eprintln!("cadence: {what} not started: {e}");
+            None
+        }
+    }
+}
+
 /// `serve` with per-instance options — in-process test daemons pass
 /// their mock commands here instead of through the shared environment.
 pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
@@ -5812,7 +5837,8 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // lease is then left to expire.
     let lease_heartbeat = lease
         .as_ref()
-        .map(|lease| serve::LeaseHeartbeat::start(state_dir, lease));
+        .map(|lease| serve::LeaseHeartbeat::start(state_dir, lease))
+        .transpose()?;
     let hot = hot_restart_begin(state_dir);
     let membership =
         public_membership::MembershipMode::capture(&hosted, &|name| opts.provider_env.var(name));
@@ -5876,7 +5902,9 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // Only pending obligations schedule retries; standalone opens no socket.
     {
         let shared = Arc::clone(&shared);
-        thread::spawn(move || shared.run_hosted_assignments());
+        spawn_watch("hosted assignments", move || {
+            shared.run_hosted_assignments()
+        });
     }
     // Signal-driven shutdown: set the same flag as the rpc. Installed
     // before actors launch so a signal during relaunch — or a relaunch
@@ -5889,7 +5917,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             signal_hook::consts::SIGINT,
         ])
         .map_err(|e| Error::internal(format!("signal hook: {e}")))?;
-        thread::spawn(move || {
+        spawn_watch("signal handler", move || {
             for _ in signals.forever() {
                 shared.begin_closing();
             }
@@ -5934,27 +5962,29 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     let fenced = shared.execution_mode.fenced();
     if !fenced {
         let shared = Arc::clone(&shared);
-        thread::spawn(move || shared.run_stall_watch());
+        spawn_watch("stall watch", move || shared.run_stall_watch());
     }
     // Persistent monitor reconciliation: registrations survive a daemon
     // restart and are checked without an LLM turn or provider invocation.
     // Joined before `serve` returns (CAD-408): the watcher can dispatch,
     // so a stopped daemon must not leave a tick in flight against the
     // store.
-    let monitor_watch = (!fenced).then(|| {
-        let shared = Arc::clone(&shared);
-        thread::spawn(move || shared.run_monitor_watch())
-    });
+    let monitor_watch = (!fenced)
+        .then(|| {
+            let shared = Arc::clone(&shared);
+            spawn_watch_joined("monitor watch", move || shared.run_monitor_watch())
+        })
+        .flatten();
     // WAL watch: provider stores checkpointed while their provider
     // idles — CAD-132, the 30 GiB sessions.db-wal that ate the disk.
     if !fenced {
         let shared = Arc::clone(&shared);
-        thread::spawn(move || shared.run_wal_watch());
+        spawn_watch("wal watch", move || shared.run_wal_watch());
     }
     // Slot watch (CAD-230b): strict holds end with their holder.
     if !fenced {
         let shared = Arc::clone(&shared);
-        thread::spawn(move || shared.run_slot_watch());
+        spawn_watch("slot watch", move || shared.run_slot_watch());
     }
     // CAD-129: cargo test jobs. Limits are published before the thread
     // starts so a submit that races the first tick still keys on the
@@ -5964,51 +5994,57 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     if let Err(e) = crate::test_queue::publish_limits(&shared.state_dir, &test_limits) {
         eprintln!("cadence: test queue limits: {e}");
     }
-    let test_watch = (!fenced).then(|| {
-        let shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            let runner = crate::test_queue::runner_for(&shared.state_dir);
-            let mut worker =
-                match crate::test_queue::Worker::new(&shared.state_dir, test_limits, runner) {
-                    Ok(worker) => worker,
-                    Err(e) => {
+    let test_watch = (!fenced)
+        .then(|| {
+            let shared = Arc::clone(&shared);
+            spawn_watch_joined("test queue", move || {
+                let runner = crate::test_queue::runner_for(&shared.state_dir);
+                let mut worker =
+                    match crate::test_queue::Worker::new(&shared.state_dir, test_limits, runner) {
+                        Ok(worker) => worker,
+                        Err(e) => {
+                            eprintln!("cadence: test queue: {e}");
+                            return;
+                        }
+                    };
+                while !shared.closing.load(Ordering::SeqCst) {
+                    if let Err(e) = worker.tick() {
                         eprintln!("cadence: test queue: {e}");
-                        return;
                     }
-                };
-            while !shared.closing.load(Ordering::SeqCst) {
-                if let Err(e) = worker.tick() {
-                    eprintln!("cadence: test queue: {e}");
+                    let deadline = Instant::now() + Duration::from_millis(200);
+                    while !shared.closing.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                 }
-                let deadline = Instant::now() + Duration::from_millis(200);
-                while !shared.closing.load(Ordering::SeqCst) && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
-            worker.shutdown();
+                worker.shutdown();
+            })
         })
-    });
+        .flatten();
     // Report router (CAD-339): workers' reports and unanswered
     // questions reach the master's thread. Idle without a master.
     if !fenced {
         let shared = Arc::clone(&shared);
-        thread::spawn(move || shared.run_report_router());
+        spawn_watch("report router", move || shared.run_report_router());
     }
     // CAD-1020: the publish driver — claims due intents, sends through
     // the attached sender, reconciles processing rows through status.
     // Joined before `Shared::shutdown` so a tick never outlives the
     // daemon; a SIGKILL mid-send is safe by construction (the row is
     // left `processing` for the next boot's reconcile).
-    let publish_driver = (!fenced).then(|| {
-        let shared = Arc::clone(&shared);
-        thread::spawn(move || shared.run_social_publish_driver())
-    });
+    let publish_driver = (!fenced)
+        .then(|| {
+            let shared = Arc::clone(&shared);
+            spawn_watch_joined("publish driver", move || shared.run_social_publish_driver())
+        })
+        .flatten();
     // CAD-1423: the Web Push initiator. Native placement only; joined with
     // the publish driver before `Shared::shutdown`.
-    let notify_driver = (!fenced && shared.notify_driver_enabled()).then(|| {
-        let shared = Arc::clone(&shared);
-        thread::spawn(move || shared.run_notify_driver())
-    });
+    let notify_driver = (!fenced && shared.notify_driver_enabled())
+        .then(|| {
+            let shared = Arc::clone(&shared);
+            spawn_watch_joined("notify driver", move || shared.run_notify_driver())
+        })
+        .flatten();
 
     // CAD-719: the wiki index refresh worker — a committed wiki
     // mutation kicks one coalesced rebuild; the query-time tree check
@@ -6066,7 +6102,12 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
                 Ok((stream, _)) => {
                     accepted = true;
                     let shared = Arc::clone(&shared);
-                    thread::spawn(move || handle_conn(shared, stream));
+                    // Budget the handler: an exhausted budget drops this socket
+                    // and keeps serving, instead of pushing the protected
+                    // runtime past Root's thread cap and getting it killed.
+                    if crate::thread_budget::spawn(move || handle_conn(shared, stream)).is_err() {
+                        accept_suppressed = accept_suppressed.saturating_add(1);
+                    }
                 }
                 // Both idle and an aborted queued connection are normal.
                 Err(e)
@@ -6155,7 +6196,9 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // mid-flight finishes against the same committed tree it started on;
     // the query-time fallback still covers a daemon that restarts stale.
     shared.wiki_index.close();
-    let _ = wiki_index_worker.join();
+    if let Some(handle) = wiki_index_worker {
+        let _ = handle.join();
+    }
     if let Err(e) = shared.shutdown() {
         // The loop's error still wins — it is why the daemon is leaving.
         serve_error.get_or_insert(e);

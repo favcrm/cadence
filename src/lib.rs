@@ -50,6 +50,7 @@ mod ident;
 pub mod inbox;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod installer_bundle;
+pub(crate) mod thread_budget;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use installer_bundle::constructor::{helper_image_trust, HelperImageTrust};
 pub mod issue;

@@ -200,7 +200,7 @@ fn entry() -> Result<()> {
         }
         listener.set_nonblocking(true).map_err(|_| refused())?;
         let ctl = c.clone();
-        std::thread::spawn(move || loop {
+        crate::thread_budget::spawn(move || loop {
             match listener.accept() {
                 Ok((stream, _)) => {
                     if private_wire::send(
@@ -219,7 +219,8 @@ fn entry() -> Result<()> {
                 }
                 Err(_) => unsafe { libc::_exit(125) },
             }
-        });
+        })
+        .map_err(|_| refused())?;
     }
     let provider_env = crate::adapter::ProviderEnv::default();
     // Match the helper's fixed mutable company PM leaf; /workspace itself

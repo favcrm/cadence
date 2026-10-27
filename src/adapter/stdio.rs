@@ -18,7 +18,6 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -280,11 +279,13 @@ impl StdioAdapter {
         *self.stdin.lock().unwrap() = Some(PipeInput::Protected(stdin));
         inner.remote = Some(Arc::new(control));
         drop(inner);
-        thread::spawn(move || {
+        crate::thread_budget::spawn(move || {
             let _ = std::io::copy(&mut stderr, &mut log);
-        });
+        })
+        .map_err(|e| Error::internal(format!("protected stderr drain not started: {e}")))?;
         let adapter = Arc::clone(self);
-        thread::spawn(move || adapter.read_loop(stdout));
+        crate::thread_budget::spawn(move || adapter.read_loop(stdout))
+            .map_err(|e| Error::internal(format!("protected reader not started: {e}")))?;
         Ok(pid)
     }
 
@@ -303,7 +304,8 @@ impl StdioAdapter {
             self.inner.lock().unwrap().child = Some(child);
         }
         let adapter = Arc::clone(self);
-        thread::spawn(move || adapter.read_loop(stdout));
+        crate::thread_budget::spawn(move || adapter.read_loop(stdout))
+            .map_err(|e| Error::internal(format!("provider reader not started: {e}")))?;
         Ok(pid)
     }
 

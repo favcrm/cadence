@@ -54,7 +54,7 @@ impl Maintenance {
         let control = runtime_child::control()?;
         let shared = shared.clone();
         let (tx, rx) = mpsc::sync_channel(1);
-        let worker = thread::spawn(move || -> Result<()> {
+        let worker = crate::thread_budget::spawn(move || -> Result<()> {
             let _failure = Failed {
                 shared: shared.clone(),
                 control: control.clone(),
@@ -177,6 +177,13 @@ impl Maintenance {
                 }
             }
         });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(e) => {
+                eprintln!("cadence: protected maintenance not started: {e}");
+                return None;
+            }
+        };
         Some(Self {
             completed: tx,
             worker,

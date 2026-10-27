@@ -103,7 +103,7 @@ impl Task {
         )?);
         let running = adapter.clone();
         let task = id.clone();
-        let worker = thread::spawn(move || -> Result<()> {
+        let worker = crate::thread_budget::spawn(move || -> Result<()> {
             let outcome = (|| -> Result<()> {
                 let identity = running.open(&agent)?;
                 if identity.model.as_deref() != Some(model.as_str()) {
@@ -154,7 +154,8 @@ impl Task {
                 )?;
             }
             outcome
-        });
+        })
+        .map_err(|e| Error::internal(format!("native task worker not started: {e}")))?;
         Ok(Self {
             id,
             adapter,
