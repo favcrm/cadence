@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { Route } from "../../lib/router";
 import { fmtBytes } from "../../lib/fmt";
 import { IconCheck, IconUpload, IconWarning } from "../../ui/icons";
-import { clearTransferResume, importFile, readResume, forgetResume, type ImportResult, type ResumeEntry } from "./transfer";
+import { clearTransferResume, importFile, uploadMultipart, readResume, forgetResume, type ImportResult, type ResumeEntry } from "./transfer";
 import {
   capLabel,
   counts,
@@ -34,12 +34,15 @@ export default function UploadPane({
   readOnly,
   onToast,
   onUploaded,
+  multipart = false,
 }: {
   dir: string;
   navHref: (route: Route) => string;
   readOnly: boolean;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   onUploaded: () => void;
+  /** Hosted boards upload with one multipart POST; local boards use transfer jobs. */
+  multipart?: boolean;
 }) {
   const [items, setItems] = useState<UploadItem[]>([]);
   const [drag, setDrag] = useState(0);
@@ -166,7 +169,7 @@ export default function UploadPane({
       if (operationRef.current === operation) operationRef.current = null;
       running.current = false;
     };
-    importFile(dir, file, updateRef.current, (percent) => {
+    (multipart ? uploadMultipart : importFile)(dir, file, updateRef.current, (percent) => {
       if (!currentAttempt()) return;
       setItems((current) => {
         const next = uploadProgress(current, id, percent);

@@ -797,7 +797,10 @@ export interface AgentDetail {
  *  plus the build identity of the serving binary and the daemon's when
  *  reachable. Tailnet-shared boards resolve the actor from Tailscale
  *  identity headers; `read_only` boards refuse every write. */
-export type Meta = Api.MetaResponse;
+export type Meta = Api.MetaResponse & {
+  /** A hosted board sets this when its Worker serves /api/wiki. */
+  wiki?: boolean;
+};
 
 export interface Health {
   ok: boolean;

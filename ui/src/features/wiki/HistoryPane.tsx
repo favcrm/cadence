@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import type { Route } from "../../lib/router";
 import Link from "../../ui/Link";
-import { navigate } from "../../lib/useLocation";
 import { wiki } from "./api";
 import { versionRows, versionWho, type WikiVersion } from "./history";
 import { diffLabel, unifiedDiffLines } from "./diff";
@@ -12,22 +11,16 @@ import { Failure, Loading, Note, WikiToolbar } from "./shared";
 
 /**
  * A page's history (CAD-581): the revision list, the diff between the
- * selected revision and the current one, and Restore — which writes the
- * old text back as a new revision (never a rewrite).
+ * selected revision and the current one. Restore is not offered: no board
+ * serves a restore route.
  */
 
 export default function HistoryPane({
   path,
   navHref,
-  readOnly,
-  onToast,
-  onChanged,
 }: {
   path: string;
   navHref: (route: Route) => string;
-  readOnly: boolean;
-  onToast: (kind: "ok" | "err" | "warn", text: string) => void;
-  onChanged: () => void;
 }) {
   const t = useTranslate();
   const [entries, setEntries] = useState<WikiVersion[] | null>(null);
@@ -35,7 +28,6 @@ export default function HistoryPane({
   const [selected, setSelected] = useState<string | null>(null);
   const [diff, setDiff] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
   const [canCompare, setCanCompare] = useState(false);
 
   useEffect(() => {
@@ -82,38 +74,13 @@ export default function HistoryPane({
     };
   }, [path, selected, currentRev]);
 
-  const restore = async () => {
-    if (!selected) return;
-    setBusy(true);
-    try {
-      await wiki.restore(path, selected);
-      onToast("ok", `restored rev ${selected}`);
-      onChanged();
-      navigate(navHref({ screen: "wiki", mode: "browse", path, query: null }));
-    } catch (e) {
-      onToast("err", `restore failed — ${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const rows = versionRows(entries ?? [], currentRev);
 
   return (
     <>
       <WikiToolbar path={path} navHref={navHref} label={t("History")} actions={<>
           <Button href={navHref({ screen: "wiki", mode: "browse", path, query: null })}>{t("Back to page")}</Button>
-          {canCompare && <Button
-            variant="primary"
-            disabled={readOnly || busy || !selected || selected === currentRev}
-            title={readOnly ? t("writes are disabled — sign in as the operator") : undefined}
-            onClick={() => void restore()}
-          >
-            {t("Restore this version")}
-          </Button>}
       </>} />
-
-      {readOnly && canCompare && <Note warn>{t("writes are disabled on this board — restore needs the operator.")}</Note>}
 
       {error !== null ? (
         <Failure what="could not load the history" error={error} />

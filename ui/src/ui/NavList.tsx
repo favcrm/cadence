@@ -56,15 +56,15 @@ interface NavListProps {
   onNavigate?: () => void;
   /** Pending To do items for the Home row's badge (CAD-1216); hidden at 0 or unknown. */
   homeCount?: number;
-  /** A hosted tenant does not serve the wiki; do not advertise it there. */
-  hosted?: boolean;
+  /** The board does not serve the wiki (see wikiAvailable); do not advertise it there. */
+  noWiki?: boolean;
 }
 
 /** The one nav row list: the desktop sidebar and the phone menu both
  *  render it, so there is a single row style. */
-export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate, homeCount = 0, hosted = false }: NavListProps) {
+export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate, homeCount = 0, noWiki = false }: NavListProps) {
   const { t } = useLocale();
-  const items = navItems(hosted);
+  const items = navItems(noWiki);
   const prefs = useSidebarPrefs();
   const foldId = useId();
   // CAD-1700: a quiet dot where an assistant reply waits unseen.

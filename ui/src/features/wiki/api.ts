@@ -229,6 +229,4 @@ export const wiki = {
   search: (query: string, type?: string, path?: string) => get<Parameters<typeof normalizeSearch>[0]>(searchQuery(query, type, path)).then(normalizeSearch),
   history: (path: string, from?: string, to?: string) =>
     get<Parameters<typeof normalizeHistory>[0]>(historyQuery(path, from, to)).then(normalizeHistory),
-  restore: (path: string, rev: string) =>
-    send<WikiPage>("POST", "/api/wiki/restore", { path, rev }),
 };
