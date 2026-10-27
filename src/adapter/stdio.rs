@@ -328,6 +328,11 @@ impl StdioAdapter {
             // supervision: stop it and release the transport before refusing.
             let child = self.inner.lock().unwrap().child.take();
             if let Some(mut child) = child {
+                // `launch` gave this child its own session/process group
+                // (setsid), so kill the group: the leader alone can leave
+                // provider stragglers running.
+                let pid = child.id();
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
                 let _ = child.kill();
                 let _ = child.wait();
             }

@@ -222,8 +222,12 @@ impl Shared {
         if removed {
             // The actor cannot join itself. Hand its budget unit to the reaper,
             // which joins after this thread exits and only then releases it.
-            if let Some(thread) = ctl.thread.lock().unwrap().take() {
-                thread.detach();
+            // `try_lock` keeps teardown from blocking on a handle someone else
+            // is joining; a contended lock leaks the unit (fail closed).
+            if let Ok(mut thread) = ctl.thread.try_lock() {
+                if let Some(thread) = thread.take() {
+                    thread.detach();
+                }
             }
         }
         self.wake();
