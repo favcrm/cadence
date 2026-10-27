@@ -55,7 +55,7 @@ fn validate(conn: &Connection, w: &Witness) -> Result<()> {
             .map_err(|_| refused())?;
         rows
     };
-    if versions != [32] {
+    if versions != [crate::store::seal::PROTECTED_SCHEMA_MAX] {
         return Err(refused());
     }
     let identity: (i64, String, String, i64, String) = conn
@@ -114,7 +114,7 @@ fn validate(conn: &Connection, w: &Witness) -> Result<()> {
                 w.attempt.clone(),
                 w.artifact.clone(),
                 w.database_epoch as i64,
-                32,
+                crate::store::seal::PROTECTED_SCHEMA_MAX,
             )
     {
         return Err(refused());
@@ -157,7 +157,7 @@ pub(super) fn check_database_current(conn: &Connection, binding: &Binding) -> Re
             binding.database_epoch as i64,
             binding.operation.clone(),
         )
-        || versions != (1, 32)
+        || versions != (1, crate::store::seal::PROTECTED_SCHEMA_MAX)
         || latch.3 <= 0
         || latch != (1, 0, 0, binding.database_epoch as i64)
     {

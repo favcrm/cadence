@@ -1164,12 +1164,20 @@ mod split_launch_tests {
                 Err(e) => e,
                 Ok(_) => panic!("{provider}: open succeeded with the prerequisites unavailable"),
             };
-            // This branch refuses an ordinary caller at the fixed-supervisor
-            // gate before the UNKNOWN prerequisite probe; both are fail-closed
-            // refusals, and the exact message is what a non-supervisor gets.
+            // x86_64-linux reaches the fixed-supervisor gate; every other
+            // target stops at the unsupported-target stub. Both are
+            // fail-closed, and each asserts its own exact refusal rather than
+            // accepting any earlier error.
+            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
             assert!(
                 e.to_string()
                     .contains("protected Pi must be provisioned by the fixed supervisor"),
+                "{provider}: {e}"
+            );
+            #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
+            assert!(
+                e.to_string()
+                    .contains("protected managed-Pi launch is Linux-only"),
                 "{provider}: {e}"
             );
         }

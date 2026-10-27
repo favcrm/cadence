@@ -246,7 +246,6 @@ fn caller_selected_build_key_pid_and_perfect_diagnostics_cannot_elect_authority(
         fixture.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE schema_version(version INTEGER NOT NULL);
-             INSERT INTO schema_version VALUES(32);
              CREATE TABLE store_incarnation(database_id TEXT NOT NULL,incarnation TEXT NOT NULL,
                  epoch INTEGER NOT NULL,operation TEXT NOT NULL);
              INSERT INTO store_incarnation VALUES('unit-database','unit-incarnation',7,'unit-operation');
@@ -254,6 +253,14 @@ fn caller_selected_build_key_pid_and_perfect_diagnostics_cannot_elect_authority(
                  witness_done INTEGER NOT NULL,epoch INTEGER NOT NULL);
              INSERT INTO closure_state VALUES(1,0,0,7);",
         ).unwrap();
+        // execute_batch cannot bind the reviewed Rust constant, so the schema
+        // row is inserted separately at the value the producer actually writes.
+        fixture
+            .execute(
+                "INSERT INTO schema_version VALUES(?1)",
+                [crate::store::seal::PROTECTED_SCHEMA_MAX],
+            )
+            .unwrap();
         if !setup.is_empty() {
             fixture.execute_batch(setup).unwrap();
         }
@@ -305,7 +312,7 @@ fn caller_selected_build_key_pid_and_perfect_diagnostics_cannot_elect_authority(
                 .query_row("SELECT version FROM schema_version", [], |r| r
                     .get::<_, i64>(0))
                 .unwrap(),
-            32
+            crate::store::seal::PROTECTED_SCHEMA_MAX
         );
         if case == "missing-latch" {
             assert!(before_latch.is_none(), "missing-latch setup retained a row");

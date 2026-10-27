@@ -85,7 +85,7 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// marker and triggers; v55 (CAD-1353) adds `messages.stall_secs`; v56
 /// (CAD-1726) adds the `artifacts` table. None
 /// changes a latch or witness table, so the bound extends to 56.
-const PROTECTED_SCHEMA_MAX: i64 = 56;
+pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 56;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must

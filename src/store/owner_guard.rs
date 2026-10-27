@@ -264,7 +264,7 @@ pub(crate) fn native_retained_opening_replay(store: &crate::store::Store) -> cra
             )?,
             changes: conn.query_row("SELECT total_changes()", [], |row| row.get(0))?,
         };
-        if value.version != 32
+        if value.version != crate::store::seal::PROTECTED_SCHEMA_MAX
             || value.identity.2 <= 0
             || value.highwater < 0
             || value.latch != (0, 0, value.identity.2)
