@@ -939,12 +939,12 @@ fn renew_credential_locked(
         &session.refresh_token,
         request,
         request_deadline,
-    )?;
+    )
+    .map_err(|error| cloud_renewal_error(purpose, error))?;
     if answer.status != 200 {
-        return Err(renewal_refusal(
-            answer.status,
-            &answer.body,
-            answer.correlation.as_ref(),
+        return Err(cloud_renewal_error(
+            purpose,
+            renewal_refusal(answer.status, &answer.body, answer.correlation.as_ref()),
         ));
     }
     let body = answer.body;
@@ -1155,6 +1155,23 @@ fn purpose_refusal(purpose: CredentialPurpose) -> Error {
              session is invalid or expired — run `cadence login --cloud-agent` again",
         ),
     }
+}
+
+/// A cloud send whose saved consent could not be renewed has sent nothing.
+/// That is a cloud-authority outcome, not a generic local failure: a reader
+/// withholds the cloud rows and keeps the rest of its page instead of failing
+/// the whole read, and a writer reports a definite refusal. The issuer's own
+/// text still says why, so a terminal refusal remains actionable. The CLI
+/// purpose is untouched — its callers are CLI verbs, not cloud readers.
+fn cloud_renewal_error(purpose: CredentialPurpose, error: Error) -> Error {
+    if purpose == CredentialPurpose::Cli {
+        return error;
+    }
+    let message = match &error {
+        Error::Rejected(text) | Error::Internal(text) => text.clone(),
+        _ => "the saved cloud login could not be renewed, so nothing was sent".to_string(),
+    };
+    Error::gate_coded("cloud_agent_unavailable", message)
 }
 
 /// Known, unique capabilities that include the CLI pair. Wiki scopes are
