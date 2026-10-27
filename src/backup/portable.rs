@@ -1936,6 +1936,14 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
         "UPDATE messages SET body='' WHERE source='worker_notice'",
         [],
     )?;
+    // The canonical enqueue copies that body into the notice's own thread
+    // entry, so blanking the message alone leaves the prose one table over.
+    // The entry keeps its row, kind and binding; the copied text goes.
+    tx.execute(
+        "UPDATE thread_entries SET text='' \
+          WHERE message_id IN (SELECT id FROM messages WHERE source='worker_notice')",
+        [],
+    )?;
     tx.execute(
         "UPDATE events SET payload=json_remove(payload,'$.reason') \
           WHERE kind='attention' AND json_valid(payload)",
