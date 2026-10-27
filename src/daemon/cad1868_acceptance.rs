@@ -286,9 +286,26 @@ fn refused(result: crate::Result<Value>, needle: &str, what: &str) -> String {
     }
 }
 
+/// The board's membership placement.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    Standalone,
+    Native,
+    /// Hosted placement signalled but its context is partial.
+    RequiredUnavailable,
+}
+
 impl Fx {
     /// `native`: a platform-placed (hosted) board; otherwise Standalone.
     fn boot(native: bool) -> Self {
+        Self::boot_mode(if native {
+            Mode::Native
+        } else {
+            Mode::Standalone
+        })
+    }
+
+    fn boot_mode(mode: Mode) -> Self {
         let dir = tempfile::Builder::new().prefix("c1868").tempdir().unwrap();
         let (state, pm) = (dir.path().to_path_buf(), dir.path().join("pm"));
         crate::issue::Pm::init(&pm).unwrap();
@@ -317,7 +334,12 @@ impl Fx {
         opts.provider_env.set("CADENCE_TEST_MEDIA_POLL_MS", "20");
         opts.provider_env
             .set("CADENCE_TEST_MEDIA_DEADLINE_MS", "8000");
-        if native {
+        if mode == Mode::RequiredUnavailable {
+            // A company marker without its instance: placement is signalled
+            // but incomplete.
+            opts.provider_env.set("AGENTICOS_COMPANY", COMPANY);
+        }
+        if mode == Mode::Native {
             for (name, value) in [
                 ("AGENTICOS_COMPANY", COMPANY),
                 ("AGENTICOS_INSTANCE", INSTANCE),
@@ -339,14 +361,14 @@ impl Fx {
             ),
         );
         let mut shared = Shared::new(&state, &opts).unwrap();
-        assert_eq!(
-            matches!(
-                shared.membership_mode,
-                super::public_membership::MembershipMode::Native(_)
-            ),
-            native,
-            "fixture BLOCKED: wrong membership mode"
-        );
+        let actual = match shared.membership_mode {
+            super::public_membership::MembershipMode::Standalone => Mode::Standalone,
+            super::public_membership::MembershipMode::Native(_) => Mode::Native,
+            super::public_membership::MembershipMode::RequiredUnavailable => {
+                Mode::RequiredUnavailable
+            }
+        };
+        assert_eq!(actual, mode, "fixture BLOCKED: wrong membership mode");
         let role = Arc::new(Mutex::new(Some(Role::Operator)));
         {
             let fresh = Arc::get_mut(&mut shared).expect("fresh unique Shared");
@@ -998,12 +1020,16 @@ fn f_decide_refuses_allow_always_the_card_did_not_offer() {
 
 /// (g) A grant decided from a local operator connection stores the explicit
 /// local marker and runs locally; the same stored marker on a hosted
-/// (Native) board refuses and parks, and a local decide cannot write it
-/// there.
+/// (Native) or a `RequiredUnavailable` board refuses and parks, and a local
+/// decide cannot write it there. Only Standalone honours it.
 #[test]
 fn g_the_local_marker_runs_locally_and_parks_on_a_hosted_board() {
     let local = Fx::boot(false);
     let card = pending(&local.invoke("op-g1").unwrap());
+    assert_eq!(
+        card["permission_request"]["allow_always_scope"], "installation",
+        "a Standalone card states an installation-wide grant: {card}"
+    );
     let done = local
         .decide(Asserted::Operator, &card, "allow_always", None)
         .unwrap();
@@ -1021,6 +1047,7 @@ fn g_the_local_marker_runs_locally_and_parks_on_a_hosted_board() {
 
     let hosted = Fx::boot(true);
     let card = pending(&hosted.invoke("op-g3").unwrap());
+    assert_eq!(card["permission_request"]["allow_always_scope"], "session");
     refused(
         hosted.decide(Asserted::Operator, &card, "allow_always", None),
         "needs the signed-in board owner",
@@ -1037,6 +1064,35 @@ fn g_the_local_marker_runs_locally_and_parks_on_a_hosted_board() {
         hosted.posts(),
         "the local marker on a hosted board",
     );
+
+    // Hosted placement signalled but incomplete (`RequiredUnavailable`) is
+    // not Standalone: the marker is refused when saved and parks when run.
+    let broken = Fx::boot_mode(Mode::RequiredUnavailable);
+    let card = pending(&broken.invoke("op-g5").unwrap());
+    assert_eq!(card["permission_request"]["allow_always_scope"], "session");
+    refused(
+        broken.decide(Asserted::Operator, &card, "allow_always", None),
+        "needs the signed-in board owner",
+        "a local Always allow on a RequiredUnavailable board",
+    );
+    assert!(
+        broken.grants().is_empty(),
+        "a local grant was saved on a RequiredUnavailable board"
+    );
+    assert_eq!(broken.show("op-g5")["status"], "pending_permission");
+    broken.write_grant(Some(&marker));
+    parked_paused(
+        &broken,
+        "op-g6",
+        broken.posts(),
+        "the local marker on a RequiredUnavailable board",
+    );
+    // Control: the operator's allow-once still runs there, so the parks
+    // above are the marker rule, not a broken fixture.
+    let once = broken
+        .decide(Asserted::Operator, &card, "allow_once", None)
+        .unwrap();
+    assert_eq!(once["operation"]["status"], "succeeded", "{once}");
 }
 
 /// (h) An active refine grant whose stored human is missing or malformed
