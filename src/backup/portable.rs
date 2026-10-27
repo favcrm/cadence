@@ -1881,13 +1881,19 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
            'stale_result', 'tool_progress', 'tool_result', 'tool_use')",
         [],
     )?;
-    // A render-failure diagnostic is a coordination event, but its payload
-    // carries the last lines of the pane BEFORE and AFTER the paste — the
-    // screen itself, which can show an earlier private reply. Keep the event
-    // and its retry evidence, drop the captured transcript.
+    // Screen text is transcript material wherever it is stored: a render
+    // failure keeps the pane before and after the paste, an approval menu
+    // keeps the command/subject line it displayed, and a probe's `reason` is
+    // that same extracted line (Claude, Cursor and Devin fill it from the
+    // screen, not from a fixed verdict). Any of those can quote an earlier
+    // private reply while the event names another delivery — or no message at
+    // all. The events stay, with their message, attempt, retry and probe
+    // verdicts; the captured prose does not.
     tx.execute(
-        "UPDATE events SET payload=json_remove(payload,'$.before','$.after') \
-          WHERE kind='paste_not_rendered' AND json_valid(payload)",
+        "UPDATE events SET payload=json_remove(payload, \
+           '$.before','$.after','$.line','$.probe.reason', \
+           '$.claim_probe','$.reprobe') \
+          WHERE json_valid(payload)",
         [],
     )?;
     tx.execute(
