@@ -1222,144 +1222,177 @@ or activity enumeration; an unknown check is not evidence of no live use.
 
 ## Project memory — `cadence memory`
 
-One reviewed fact per file at `<pm>/<project>/memory/<slug>.md`:
-YAML frontmatter (`id`, `type`, `status`, `confidence`, `scope`,
-`author`, authenticated `author_proof`, `source`, `created`,
-`verified_at`, optional `stale`, review cycle/receipts and optional
-`supersedes`)
-plus a body contract — a fact, then `**Why:**` and `**How to apply:**`
-sections. Types are `rule | gotcha | decision | recipe`; statuses are
-`proposed | accepted | rejected | superseded`.
+One claim per canonical file at `<pm>/<project>/memory/<slug>.md`; Wiki
+continues to project those files. There is no second vault or memory database.
+The body remains a fact, `**Why:**` and `**How to apply:**`. Existing types
+`rule | gotcha | decision | recipe` describe the claim's purpose, not its trust.
+
+### Versioned schema and rollout
+
+`src/memory/mod.rs::Front` and `src/memory/policy.rs::PolicyV2` are the
+authoritative serialized schema. New proposals are always server-stamped
+policy revision 2, including proposals read from a file. Imported author,
+approval, verification or usage fields cannot create authority. There is no
+caller-selectable v1 mode and no per-project activation switch.
+
+The optional `policy` distinguishes the existing v1 representation from v2.
+V2 records retain:
+
+- claim nature (`mechanical | judgement`), source provenance, project-local
+  approval audience and optional native team-role restrictions;
+- immutable typed evidence references and an optional declarative check
+  identifier/source revision/target revision — never an executable command;
+- native authorship/contributors, confirmed model evidence where available,
+  operator source attestations, digest/cycle-bound reviews and decisions;
+- bounded latest usage-report receipts and report counts. Full audit history
+  stays in the canonical record, not the default agent context.
+
+Existing v1 records are neither rewritten nor silently adopted. Their native
+two-reviewer/PM lifecycle remains in `memory::submit_review`,
+`memory::finalize_native` and the legacy retrieval evaluator. Incomplete
+historical receipts remain readable but cannot authorize retrieval. Explicit
+legacy adoption belongs to CAD-382.
+
+This is a source rollout, not an installation instruction. After an approved
+installation, every new proposal uses v2; existing files retain their version.
+Mechanical promotion is intentionally blocked until CAD-348 supplies genuine
+native logic-check evidence. A hash, command string, review or operator source
+attestation cannot stand in for a check result. Curator scheduling is CAD-349;
+this change launches no curator or provider.
+
+### Native commands
+
+Example candidate, not pre-approved guidance:
 
 ```bash
-cadence memory propose --project demo --type gotcha \
-    --scope-path 'src/adapter/**' -m "$(cat <<'EOF'
-Retrying a wedged adapter needs daemon restart first.
+cadence memory propose --project demo --type gotcha --nature judgement \
+    --scope-path 'src/adapter/**' -m 'Review a context pack against its recorded revision.
 
-**Why:** the adapter holds the socket.
+**Why:** an unpinned source can change after review.
 
-**How to apply:** `cadence daemon stop` before the retry.
-EOF
-)"
-cadence memory review <slug> --operation accept --verdict pass \
+**How to apply:** inspect the recorded revision before applying this claim.'
+
+cadence memory show <slug> --project demo --json
+cadence memory review <slug> --project demo --operation accept --verdict pass \
     --digest <sha256> --evidence 'source and applicability checks'
-cadence memory accept pipe-drain [--project demo]   # PM finalization only
-cadence memory reject <slug>                       # PM only
-cadence memory supersede <old> <new>               # currently refused
-cadence memory verify <slug>                       # fresh review cycle + PM
-cadence memory ls [--project k]... [--status s]... [--type t]...
-                  [--component c]... [--path f]... [--stale [--days 30]]
-                  [--sort k] [--limit n] [--fields f,…] [--json]
-                                            # value flags repeat/comma-join
-                                            # (any-of); flags AND
-cadence memory show <slug> [--json]
-cadence memory match --issue <ID> [--provider p] [--json]
+cadence memory accept <slug> --project demo --digest <sha256> \
+    --evidence 'decision on this exact judgement'
+cadence memory classify <slug> --project demo --digest <sha256> \
+    --evidence 'operator source-provenance attestation'
+cadence memory revalidate <slug> --project demo --digest <sha256> \
+    --evidence 'why the existing claim must be withheld'
+cadence memory verify <slug> --project demo --digest <sha256> \
+    --evidence 'current-cycle policy decision'
+cadence memory invalidate <slug> --project demo --digest <sha256> \
+    --evidence 'why the claim is no longer valid'
+cadence memory reject <slug> --project demo --digest <sha256> \
+    --evidence 'why the candidate is refused'
+cadence memory supersede <old> <new> --project demo  # refused pending CAD-464
+
+cadence memory feedback <slug> --project demo --digest <sha256> \
+    --message <own-running-message> --token <current-turn> --kind used
+cadence memory ls [--project k]... [--status s]... [--type t]... [--json]
+cadence memory match --issue <ID> [--provider p] [--role dev] [--json]
 cadence memory lint [--project k]
 ```
 
-Every authority-bearing proposal/review/finalization is a daemon RPC.
-The daemon derives exactly one live agent endpoint from the Unix socket
-peer through its one caller-identity verifier (CAD-381): a pty pane by
-current adapter ownership, endpoint generation and process start, or a
-managed (headless claude/codex) endpoint by its daemon-minted CAD-230
-enrollment (provider pid + start time + uid + owner generation), plus the
-registration incarnation. A caller outside every agent tree has no agent
-identity and is refused — which is not operator proof: operator authority
-needs its own positive proof (CAD-276, CAD-313). Two endpoints on one
-ancestry are ambiguous and refused. Request aliases, `CADENCE_ALIAS`,
-operator UI labels and external identities cannot create proof.
-Two distinct non-author PM/worker endpoint identities, displayed with
-unique aliases, must pass the same semantic SHA-256 revision (claim/body,
-trusted author/contributors, type, source, confidence, scope and supersede
-target); an authenticated PM endpoint then finalizes. Body edits, stale
-digests, duplicate aliases, missing evidence, disagreement and reused
-endpoint identities fail closed.
-Legacy accepted records remain visible with a review-blocked reason and
-are excluded from matching until a corrected native proposal is reviewed.
-`verify` opens a fresh receipt cycle; a timestamp alone cannot revalidate.
-Worker receipts do not make a record retrievable: acceptance and each
-verify cycle need a durable PM finalization receipt bound to the same
-semantic digest. A finalized cycle is consumed; a later verify starts the
-next cycle and cannot reuse its receipts.
-Supersede is refused until crash-atomic pair recovery exists. Every write
-is one tracker commit carrying `Memory: <slug>` and `Actor:` trailers —
-never `Issue:`. `issue lint`
-validates memory files with everything else (the pre-commit hook
-covers them); `memory lint` runs the same checks alone. Lint bounds a
-fact block to 5 lines and 512 bytes and a path glob to 200 chars and
-two `**` segments; a file that cannot be parsed at all is a warning —
-every read path already reports it, and an error there would let one
-stray file brick every tracker commit.
+`propose` also accepts `--audience project|role|company`, repeated
+`--scope-role`, typed JSON `--evidence-ref` and typed JSON
+`--verification-condition`. Role audience requires explicit selectors.
+Company audience changes approval requirements, **not** cross-project
+visibility. `accept`, `verify`, `reject`, `classify`, `revalidate` and
+`invalidate` bind the caller's explicit digest; the CLI does not silently
+approve whichever revision happens to be current.
 
-Matching is a union: a memory applies when ANY scope axis intersects
-the dispatch context — `--scope-project` (every dispatch in the
-project), `--scope-component`, `--scope-path` (repo-relative globs
-matched against the issue's recorded-commit paths), `--scope-tag`
-(issue `tags:`), `--scope-provider` (the target worker's provider).
-`match --issue` prints the ranked list: `rule` > `gotcha` > `recipe` >
-`decision`, then confidence, then most recently verified (unverified
-and decayed last), each with its evidence label, followed by withheld
-entries and their reasons (`--json`: `matched[].evidence`,
-`withheld[]`).
+### Authority and decisions
 
-Evidence freshness (CAD-203) is separate from review status. Accepting
-a lesson records the review; it does not re-check the evidence, so only
-a PM-finalized `verify` cycle stamps `verified_at` and clears `stale`.
-Retrieval reads the verify finalization receipt itself, and every
-injected lesson carries an evidence label:
+`src/daemon/memory_rpc.rs` uses the shared native caller verifier: current
+owned pane proof or managed-root enrollment, including native UID, registration,
+generation and process identity. A missing agent identity is not operator
+proof; operator actions require `Shared::proven_operator`. Request labels,
+provider transport names and configured/requested models are not evidence.
+Ready events must match the native endpoint model/generation; managed owner
+generation remains a separate native proof binding.
 
-- `verified <date>` — last finalized verify is inside the project's
-  freshness window: `memory: {stale_days: N}` in `project.yaml`,
-  default 30 days;
-- `unverified (last verified <date>)` — the verify has aged past the
-  window. Age alone never withholds: the lesson decays and is still
-  injected;
-- `unverified` — never verified. Older records whose `verified_at` was
-  stamped at accept time read the same way; the files are not rewritten.
+`memory::policy::qualify` is the approval-matrix evaluator. Read its computed
+requirements and current refusal reason with `memory show --json`
+(`policy.requirements`, `quorum`, `evidence`); the Memory screen reads the same
+projection. Do not substitute a fixed vote count. Unknown underlying model
+vendors do not qualify as independent curators. An operator cannot replace the
+required first curator.
 
-A lesson is **withheld** only when its evidence is explicitly stale —
-`stale: <why>` in its frontmatter (set by a curator today, by CAD-111's
-citation re-check later; the next finalized verify clears it). The
-withholding is recorded with its reason so "why did I not get this?" is
-answerable: in the lessons file (`## Withheld` section), the dispatch
-comment (`Lessons withheld: <slug> (<reason>)`), the dispatch JSON
-(`lessons_withheld`), `memory match` and the `issue context` memory
-manifest. Contradiction is not a withholding reason here.
+Native operator proposals have operator origin, but origin alone is not a
+decision. `classify` is operator-only source attestation on a current
+agent-claimed v2 record; it rotates the semantic digest/cycle and retains
+history. It neither proves a passing check nor approves the company-level
+extra requirement. External-derived candidates remain quarantined until an
+actual operator release; agents cannot assert their own provenance.
 
-Injection happens in two places:
+Review and decision receipts bind the semantic claim digest and cycle.
+Claim/body, applicability, provenance or verification-condition changes
+invalidate old receipts. Review/feedback timestamps and counters do not
+rewrite the claim digest. Writes use the record-scoped PM lock, locked reread
+and scoped commit; stale revisions and refused actors leave no partial record.
+Supersede remains refused until crash-atomic pair recovery exists.
 
-- `dispatch` renders the matched accepted set to
-  `<state>/dispatch/<message-id>-lessons.md` (≤ 12 entries, ≤ 4 KiB),
-  appends `Lessons: <file>.` to the kickoff body, records the slugs in
-  the dispatch comment (`Lessons injected: …`) and returns `lessons`,
-  `lessons_withheld` and `lessons_file` in the JSON. `--no-lessons` skips it; `--job`
-  kickoffs are daemon-templated and never carry the file. Memory
-  failures degrade, never sink the dispatch (the worktree already
-  exists): a memory file that fails to load is excluded and named
-  while valid lessons still inject, and an unwritable lessons file or
-  a suffix that would push the kickoff body over the pty cap drops the
-  file — every case carries a `lessons_error` string naming the
-  reason. The lessons file is written via tmp + rename, so a failed
-  write never leaves a partial artifact.
-- `agent bootstrap`/`join` briefings gain a
-  `## Project memory — accepted rules (<project>)` section listing the
-  project's accepted `rule`s not marked stale (each with its evidence
-  label) for the worker's cwd — ≤ 8 entries and ≤ 4 KiB, same bound
-  as the dispatch lessons file. An over-budget rule is skipped, not a
-  stop; omitted rules are counted.
+HTTP memory curation stays closed. Browser authentication and Origin checks
+do not turn a browser request into native reviewer or operator proof.
 
-Memory readers skip files that fail to load and report them: `ls`,
-`ls --stale` and `match` warn once on stderr and include `load_errors`
-in `--json`; the API returns `memory_errors`. An absent `memory/` dir
-is a valid empty store; a directory that exists but cannot be
-enumerated is a load error. Write-time glob bounds are re-applied at
-load — a hand-edited over-complex path scope is quarantined with an
-error before it can reach matching.
+### Validity, age and authenticated reports
 
-Staleness: `ls --stale` flags an accepted memory not verified within
-the `--days` window (30 default), or whose path globs match files
-changed in a project repo after `verified_at` — informational only;
-`verify` is the refresh. Retrieval labels by its own window as above.
+V2 statuses are `proposed | quarantined | accepted | pending-revalidation |
+invalidated | rejected | superseded`. Pending records are withheld; native
+revalidation decisions can restore accepted state. Rejection and invalidation
+are terminal in place and retain the claim and prior decisions.
+
+`memory::matching::withhold_reason` combines explicit staleness with v2
+inactivity expiry. An accepted v2 claim expires from supply after 28 days
+without an authenticated reported use, initially measured from acceptance.
+Expiry does not delete or rewrite it. A current owned-turn `used` report can
+renew inactivity after manual reading, including an expired accepted claim.
+Reviews, decisions, `wrong` and `reread` reports do not count as use.
+
+`memory_feedback` derives the reporter and trusted issue/job-task project
+from the live native assignment. Foreign recipients, retired/completed turns,
+wrong tokens, stale claim digests and caller-supplied receipts/counters/times
+are refused. Only report aggregates and the latest receipt per kind are kept;
+raw turn tokens are not copied into canonical memory. Counts mean reports,
+not unique uses, observed consumption or proven benefit.
+
+Policy review age, source provenance, inactivity and mechanical verification
+are distinct. V2 policy decisions never stamp `verified_at` or claim
+verification at a SHA. Existing v1 verification labels continue to read their
+native verify receipt; verification age alone decays that label, while an
+explicit stale mark withholds. `ls --stale` remains evidence-age inspection,
+not a synonym for all validity/role refusals; `match --json` lists applicable
+withholding reasons.
+
+### Applicability and efficient context
+
+Existing scope axes retain their union semantics: project-wide, component,
+repo-relative path glob, issue tag or target provider. Native team-role
+restrictions are an additional gate. Dispatch and briefing pass the assigned
+team role, never an authorization-role fallback; an unknown role withholds
+role-restricted guidance. All matching stays within the canonical project.
+
+Revisioned kickoffs select one optional lessons source, bounded by
+`memory::render_lessons` to 12 entries / 4 KiB and omitted whole when the pack
+cannot fit it. Its revision hashes rendered claim/application text and evidence
+labels, not audit receipts or usage counters. Feedback does not cause repeated
+history injection or a counter-only pack revision. `--no-lessons` selects none.
+Legacy non-pack dispatch retains its bounded lessons sidecar; a pack kickoff
+does not inject that same guidance twice.
+
+Briefings supply eligible project-wide rules under their separate 8-entry /
+4-KiB cap. Withheld items disclose identity/reason, never claim/application
+instructions. List/detail JSON and the read-only screen expose bounded policy
+summaries; v2 decision summaries show the latest eight entries plus full counts.
+Canonical/Wiki history remains available for deliberate inspection.
+
+Unreadable files are excluded and reported, not treated as accepted empty
+records. `memory lint` and `issue lint` share `memory::check_front`; readers
+report malformed files and unsafe scope globs as load errors. The existing
+five-line / 512-byte fact and 200-character / two-`**` glob limits are unchanged.
 
 ## `cadence ui` — the reader
 

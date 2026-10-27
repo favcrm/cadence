@@ -1,8 +1,8 @@
 //! Retrieval matching and freshness labelling: which accepted memories
 //! apply to a dispatch context, how they rank, and how their evidence
 //! is labelled or withheld. Scope globs, the freshness window and the
-//! stale-withhold policy all live here; quorum and finalization stay in
-//! the parent — `match_memories` still calls `retrieval_status`.
+//! validity-withhold policy all live here; native policy qualification stays
+//! in the parent — `match_memories` still calls `retrieval_status`.
 
 use std::path::Path;
 
@@ -20,6 +20,8 @@ pub struct MatchCtx {
     pub paths: Vec<String>,
     pub providers: Vec<String>,
     pub tags: Vec<String>,
+    /// Native assigned task/team roles; unknown is an empty set.
+    pub roles: Vec<String>,
 }
 
 /// `*` within a path segment, `**` across segments, `?` one char.
@@ -134,6 +136,10 @@ impl Freshness {
 /// so an accepted lesson with no verify finalization is unverified —
 /// including legacy records whose `verified_at` was stamped at accept.
 pub fn last_verified(mem: &Memory) -> Option<&str> {
+    if mem.front.policy.is_some() {
+        // Policy review/source attestation is not a CAD-348 check receipt.
+        return None;
+    }
     if mem.front.review_cycle < 2 {
         return None;
     }
@@ -175,13 +181,17 @@ pub fn stale_reason(mem: &Memory) -> Option<String> {
     })
 }
 
+pub(super) fn withhold_reason(mem: &Memory, fresh: &Freshness) -> Option<String> {
+    stale_reason(mem).or_else(|| super::v2::unused_reason(mem, fresh.now))
+}
+
 /// A lesson's evidence as retrieval reads it — the one view dispatch,
 /// the board and `memory ls --stale` share: `withheld` with its reason
 /// when explicitly marked stale, else the `evidence_label` (`verified`
 /// only inside the window). `last_verified` is the verify finalization,
 /// never the raw `verified_at` field.
 pub fn evidence_json(mem: &Memory, fresh: &Freshness) -> Value {
-    let (state, label, reason) = match stale_reason(mem) {
+    let (state, label, reason) = match withhold_reason(mem, fresh) {
         Some(reason) => ("withheld", "withheld".to_string(), Some(reason)),
         None if current_verify(mem, fresh).is_some() => {
             ("verified", evidence_label(mem, fresh), None)
@@ -203,8 +213,8 @@ pub fn evidence_json(mem: &Memory, fresh: &Freshness) -> Value {
 pub struct Matched {
     /// Injectable lessons, ranked.
     pub lessons: Vec<Memory>,
-    /// Review-eligible lessons in scope but withheld for stale evidence,
-    /// each with its reason — "why did I not get this?".
+    /// Policy-qualified lessons withheld for validity or unknown target role,
+    /// with the reason needed to explain absent guidance.
     pub withheld: Vec<(Memory, String)>,
     pub fresh: Freshness,
 }
@@ -230,7 +240,16 @@ pub fn match_memories(memories: &[Memory], ctx: &MatchCtx, fresh: &Freshness) ->
         if m.front.status != "accepted" || !retrieval_status(m).0 || !applies(&m.front.scope, ctx) {
             continue;
         }
-        match stale_reason(m) {
+        if !super::v2::role_matches(m, ctx.roles.iter().map(String::as_str)) {
+            if ctx.roles.is_empty() {
+                out.withheld.push((
+                    m.clone(),
+                    "native target role is unavailable for role-scoped guidance".to_owned(),
+                ));
+            }
+            continue;
+        }
+        match withhold_reason(m, fresh) {
             Some(reason) => out.withheld.push((m.clone(), reason)),
             None => out.lessons.push(m.clone()),
         }

@@ -6,7 +6,7 @@
 use serde_json::{json, Value};
 
 use super::{
-    body_parts, evidence_json, fact_line, last_verified, quorum_status, retrieval_status,
+    body_parts, evidence_json, fact_line, last_verified, policy, quorum_status, retrieval_status,
     semantic_digest, Freshness, Matched, Memory,
 };
 
@@ -57,7 +57,7 @@ pub fn render_lessons(matched: &Matched) -> (String, Vec<String>) {
         return (String::new(), vec![]);
     }
     if !matched.withheld.is_empty() {
-        out.push_str("\n## Withheld — stale evidence, not applied\n\n");
+        out.push_str("\n## Withheld — not applied\n\n");
         for (m, reason) in &matched.withheld {
             let entry = format!("- `{}`: {reason}\n", m.front.id);
             if out.len() + entry.len() > LESSON_MAX_BYTES {
@@ -76,6 +76,64 @@ pub fn card_json(m: &Memory, fresh: &Freshness) -> Value {
     let (eligible, reason) = retrieval_status(m);
     let (accept_eligible, accept_reason) = quorum_status(m, "accept");
     let (verify_eligible, verify_reason) = quorum_status(m, "verify");
+    let (review_count, finalization_count, finalized_operations) =
+        if let Some(policy) = &m.front.policy {
+            let operations: Vec<Value> = policy
+                .finalizations
+                .iter()
+                .rev()
+                .take(8)
+                .map(|receipt| {
+                    let finalizer = match &receipt.finalizer {
+                        policy::ActorSnapshot::Agent { identity } => identity.alias.as_str(),
+                        policy::ActorSnapshot::Operator { .. } => "operator",
+                    };
+                    json!({
+                        "operation": receipt.operation, "cycle": receipt.cycle,
+                        "digest": receipt.digest, "finalized_at": receipt.recorded_at,
+                        "finalizer": finalizer,
+                    })
+                })
+                .collect();
+            (policy.reviews.len(), policy.finalizations.len(), operations)
+        } else {
+            let operations = m
+                .front
+                .finalizations
+                .iter()
+                .map(|receipt| {
+                    json!({
+                        "operation": receipt.operation, "cycle": receipt.cycle,
+                        "digest": receipt.digest, "finalized_at": receipt.finalized_at,
+                        "finalizer": receipt.finalizer.alias,
+                    })
+                })
+                .collect();
+            (
+                m.front.reviews.len(),
+                m.front.finalizations.len(),
+                operations,
+            )
+        };
+    let policy_summary = m.front.policy.as_ref().map(|policy| json!({
+        "revision": policy.revision,
+        "nature": policy.nature,
+        "provenance": policy.provenance,
+        "audience": policy.audience,
+        "roles": policy.roles,
+        "author_vendor": policy.author.model.as_ref().and_then(|model| model.vendor.as_deref()),
+        "contributors_count": policy.contributors.len(),
+        "evidence_refs_count": policy.evidence_refs.len()
+            + policy.attestations.iter().map(|item| item.evidence_refs.len()).sum::<usize>(),
+        "requirements": policy::requirements(policy).collect::<Vec<_>>(),
+        "verification_condition": policy.verification_condition,
+        "feedback": {
+            "used_reports": policy.feedback.used_reports,
+            "wrong_reports": policy.feedback.wrong_reports,
+            "reread_reports": policy.feedback.reread_reports,
+            "last_used_at": policy.feedback.last_use.as_ref().map(|item| item.recorded_at.as_str()),
+        },
+    }));
     json!({
         "project": m.project,
         "slug": m.front.id,
@@ -100,15 +158,10 @@ pub fn card_json(m: &Memory, fresh: &Freshness) -> Value {
         "revision_digest": digest,
         "review_cycle": m.front.review_cycle,
         "active_operation": m.front.active_operation,
-        "review_count": m.front.reviews.len(),
-        "finalization_count": m.front.finalizations.len(),
-        "finalized_operations": m.front.finalizations.iter().map(|r| json!({
-            "operation": r.operation.clone(),
-            "cycle": r.cycle,
-            "digest": r.digest.clone(),
-            "finalized_at": r.finalized_at.clone(),
-            "finalizer": r.finalizer.alias.clone(),
-        })).collect::<Vec<_>>(),
+        "review_count": review_count,
+        "finalization_count": finalization_count,
+        "finalized_operations": finalized_operations,
+        "policy": policy_summary,
         "quorum": {
             "eligible": eligible,
             "reason": reason,

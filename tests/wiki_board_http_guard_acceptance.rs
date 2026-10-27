@@ -272,6 +272,103 @@ fn cookie_authenticated_wiki_reads_succeed_and_invalid_sessions_or_paths_refuse(
     );
 }
 
+#[test]
+fn cad347_authenticated_http_memory_curation_remains_closed_after_browser_guards() {
+    let fx = Fixture::start();
+    let session = fx.operator_session();
+    let pm_dir = fx.root.path().join("pm");
+    let pm = cadence_agent::issue::Pm::at(&pm_dir).unwrap();
+    cadence_agent::issue::write::project_add(&pm, "cad347-http", "CHT", &[], &[], &[], None)
+        .expect("isolated project for HTTP memory refusal");
+    let memory_dir = cadence_agent::memory::memory_dir(&pm, "cad347-http");
+    std::fs::create_dir_all(&memory_dir).unwrap();
+    let path = memory_dir.join("cad347-http-lesson.md");
+    // An existing readable legacy candidate is fixture DATA, not a
+    // claimed new-v2 proposal or native approval. HTTP must not curate
+    // either legacy or v2 records, even with a valid browser session.
+    let candidate = "---\nid: cad347-http-lesson\ntype: decision\nstatus: proposed\nscope:\n  project: true\nconfidence: high\ncreated: '2026-10-27T00:00:00Z'\n---\n\nHTTP must not confer native memory authority\n\n**Why:** browser identity is not native curation proof\n\n**How to apply:** use the supported native path\n";
+    std::fs::write(&path, candidate).unwrap();
+    pm.commit(
+        std::slice::from_ref(&path),
+        "CAD-347 HTTP refusal fixture\n",
+    )
+    .unwrap();
+    let head = || {
+        let output = cadence_agent::reaper::output(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&pm_dir)
+                .args(["rev-parse", "HEAD"]),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        output.stdout
+    };
+    let before_head = head();
+    let before_bytes = std::fs::read(&path).unwrap();
+    let (status, detail) = fx.request(
+        "/api/memories/cad347-http/cad347-http-lesson",
+        Some(&session),
+    );
+    assert_eq!(
+        status, 200,
+        "fixture must be readable before curation: {detail}"
+    );
+    let host = format!("cadence-{}.localhost:{}", fx.port, fx.port);
+    let http: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    for operation in ["accept", "reject"] {
+        for valid_origin in [false, true] {
+            let origin = if valid_origin {
+                format!("http://{host}")
+            } else {
+                "http://untrusted.invalid".to_string()
+            };
+            let mut response = http
+                .post(format!(
+                    "http://127.0.0.1:{}/api/memories/cad347-http/cad347-http-lesson/{operation}",
+                    fx.port
+                ))
+                .header("Host", &host)
+                .header("Origin", origin)
+                .header("X-Cadence-Board", "1")
+                .header("Content-Type", "application/json")
+                .header("Cookie", &session.0)
+                .header("X-Cadence-Session", &session.1)
+                .header(AS_HEADER, "operator")
+                .header(TOKEN_HEADER, Seam::token_at(&fx.state()).unwrap())
+                .send("{}")
+                .unwrap();
+            let status = response.status().as_u16();
+            let reply = response.body_mut().read_to_string().unwrap();
+            assert_eq!(
+                status,
+                if valid_origin { 400 } else { 403 },
+                "{operation}, valid_origin={valid_origin}: {reply}"
+            );
+            let reply: Value = serde_json::from_str(&reply).unwrap();
+            if !valid_origin {
+                assert_eq!(reply["check"].as_str(), Some("origin"));
+            } else {
+                assert!(reply["error"]
+                    .as_str()
+                    .is_some_and(|error| !error.is_empty()));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+            assert_eq!(head(), before_head);
+        }
+    }
+    let memories = cadence_agent::memory::load_project(&pm_dir, "cad347-http").unwrap();
+    let memory = memories
+        .iter()
+        .find(|memory| memory.front.id == "cad347-http-lesson")
+        .unwrap();
+    assert_eq!(memory.front.status, "proposed");
+    assert!(!cadence_agent::memory::retrieval_status(memory).0);
+}
+
 const PUBLIC_HOST: &str = "aos137.board.localhost";
 const COMPANY: &str = "aos137-fixture-company";
 const PUBLIC_KEY_SEED: [u8; 32] = [137; 32];

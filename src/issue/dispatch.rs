@@ -852,6 +852,7 @@ fn lesson_selection(
     project: &crate::issue::project::Project,
     front: &Front,
     provider: &str,
+    role: Option<&str>,
 ) -> crate::context_pack::LessonSelection {
     let issue = board::Issue {
         project: project.key.clone(),
@@ -869,7 +870,7 @@ fn lesson_selection(
         required: false,
     };
     let mut withheld = Vec::new();
-    let source = match memory::match_for_issue(pm, &issue, Some(provider)) {
+    let source = match memory::match_for_issue(pm, &issue, Some(provider), role) {
         Err(error) => {
             withheld.push(gap(
                 LESSON_SOURCE_ID,
@@ -880,16 +881,17 @@ fn lesson_selection(
         }
         Ok((matched, errors)) => {
             if !matched.withheld.is_empty() {
-                // Count only, with a fixed reason: a stale note is memory-file
-                // text and must not inflate the mandatory payload. The full
-                // (renderer-capped) reasons ride the optional lesson source.
+                // Count only: untrusted withholding text must not inflate the
+                // mandatory payload. Renderer-capped reasons ride the optional
+                // lesson source instead.
                 withheld.push(gap(
                     LESSON_WITHHELD_ID,
                     "withheld",
                     format!(
-                        "{} in-scope lesson(s) withheld for stale evidence; \
-                         `cadence memory ls --stale` lists them",
-                        matched.withheld.len()
+                        "{} in-scope lesson(s) withheld by validity or role policy; \
+                         `cadence memory match --issue {} --json` lists reasons",
+                        matched.withheld.len(),
+                        front.id,
                     ),
                 ));
             }
@@ -1007,7 +1009,8 @@ pub(crate) fn context_guard<'a>(
         }
         .error());
     }
-    let lessons = (!no_lessons).then(|| lesson_selection(pm, project, front, target.provider));
+    let lessons = (!no_lessons)
+        .then(|| lesson_selection(pm, project, front, target.provider, target.team_role));
     let (contract, body) = make()?;
     admit_context(
         project,
@@ -2310,14 +2313,14 @@ fn lessons(
     args: &DispatchArgs,
     state_dir: &Path,
     provider: &str,
+    role: Option<&str>,
     body: Option<String>,
 ) -> Lessons {
     let mut lessons: Vec<String> = vec![];
     let mut lessons_file: Option<PathBuf> = None;
     let mut lessons_error: Option<String> = None;
-    // CAD-203: in-scope lessons withheld for stale evidence, with the
-    // reason — recorded on the dispatch comment and in the output so
-    // "why did I not get this?" is answerable.
+    // In-scope guidance withheld by validity or role policy carries its
+    // reason in the dispatch comment and output so absence is explainable.
     let mut lessons_withheld: Vec<(String, String)> = vec![];
     let mut body = body;
     if !args.no_lessons {
@@ -2330,7 +2333,7 @@ fn lessons(
                 comments: vec![],
                 artifacts: vec![],
             };
-            match memory::match_for_issue(pm, &issue_obj, Some(provider)) {
+            match memory::match_for_issue(pm, &issue_obj, Some(provider), role) {
                 Err(e) => lessons_error = Some(format!("memory match failed: {e}")),
                 Ok((matched, mem_errors)) => {
                     // Valid records still reach the worker; every file
@@ -2906,7 +2909,16 @@ pub fn run(
             body,
         },
         None => lessons(
-            &mid, pm, &project, &dir, &front, args, state_dir, &provider, body,
+            &mid,
+            pm,
+            &project,
+            &dir,
+            &front,
+            args,
+            state_dir,
+            &provider,
+            agent["team_role"].as_str(),
+            body,
         ),
     };
 

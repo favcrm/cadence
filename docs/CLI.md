@@ -164,6 +164,13 @@ callers' identity restrictions remain in force.
 `target/debug/cadence`. It claims no rollout lease, checks no attestation and
 takes no backup.
 
+For source-build tracker smoke, put the selected build directory on the
+development process's `PATH` as well. Tracker Git hooks invoke
+`cadence issue lint`; an older installed CLI can otherwise reject a new
+schema even though `--build` selected the new daemon. Keep that executable
+binding inside the disposable instance; do not replace the production binary
+to make a local smoke pass.
+
 Daemon and board startup must return valid JSON with a nonempty string
 `state`; malformed or missing startup state is an error, not null success.
 Initialization and stop commands are checked by exit status only.
