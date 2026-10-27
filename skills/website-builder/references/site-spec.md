@@ -7,7 +7,9 @@ What a site built by this playbook must be.
 - One source folder holds `index.html`. Every local reference is relative or
   root-relative and points at a file in that folder.
 - `build.py` writes each asset as `<sha256>.<ext>` in its own directory and rewrites
-  `href`, `src` and `content` references to match. `index.html` keeps its name.
+  `href`, `src`, `content` and stylesheet asset `url(...)` references to match.
+  `index.html` keeps its name. CSS imports are unsupported; combine stylesheets
+  before building.
 - Only owner-supplied text, images and facts appear. No invented clients, testimonials,
   prices or results.
 - A contact form is optional. If requested, it posts JSON to `/__forms/contact`; the

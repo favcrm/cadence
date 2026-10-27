@@ -25,6 +25,7 @@ EXTENSIONS = {
     ".woff", ".woff2", ".ttf", ".otf",
 }
 ATTR = re.compile(r"""\b(href|src|content)\s*=\s*(["'])(.*?)\2""", re.IGNORECASE | re.DOTALL)
+CSS_URL = re.compile(r"""url\(\s*(["']?)([^"')]+)\1\s*\)""")
 
 
 def sources(src):
@@ -79,6 +80,61 @@ def rewrite(text, table):
     return ATTR.sub(swap, text)
 
 
+def rewrite_css(text, table, stylesheet):
+    """Rewrite url(...) references in a stylesheet to the digest names."""
+
+    def swap(match):
+        quote, value = match.group(1), match.group(2).strip()
+        if not value or value.startswith(("#", "//", "data:", "mailto:", "tel:")):
+            return match.group(0)
+        parts = urlsplit(value)
+        if parts.scheme or parts.netloc:
+            return match.group(0)
+        absolute = parts.path.startswith("/")
+        directory = posixpath.dirname(stylesheet) or "."
+        rel = posixpath.normpath(
+            parts.path.lstrip("/") if absolute else posixpath.join(directory, parts.path)
+        )
+        if rel.startswith("..") or rel not in table:
+            return match.group(0)
+        new = "/" + table[rel] if absolute else posixpath.relpath(table[rel], directory)
+        suffix = ("?" + parts.query if parts.query else "") + (
+            "#" + parts.fragment if parts.fragment else ""
+        )
+        return f"url({quote}{new}{suffix}{quote})"
+
+    result = []
+    i = 0
+    while i < len(text):
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            end = len(text) if end < 0 else end + 2
+        elif text[i] in "\"'":
+            quote = text[i]
+            end = i + 1
+            while end < len(text):
+                if text[end] == "\\":
+                    end += 2
+                elif text[end] == quote:
+                    end += 1
+                    break
+                else:
+                    end += 1
+            end = min(end, len(text))
+        elif text[i] == "\\":
+            end = min(i + 2, len(text))
+        else:
+            match = CSS_URL.match(text, i)
+            if match and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "_-")):
+                result.append(swap(match))
+                i = match.end()
+                continue
+            end = i + 1
+        result.append(text[i:end])
+        i = end
+    return "".join(result)
+
+
 def remove_previous(out, names):
     """Delete only files a previous build of this same OUT wrote."""
     for name in names:
@@ -112,12 +168,27 @@ def main():
             previous = prior.get("map", {})
     rels = sources(args.src)
     table = mapping(args.src, rels)
+    # A stylesheet's own name depends on its rewritten content, so hash CSS
+    # after its image references point at their digest names.
+    styles = {}
+    for rel in rels:
+        if os.path.splitext(rel)[1].lower() != ".css":
+            continue
+        with open(os.path.join(args.src, rel), "rb") as handle:
+            rewritten = rewrite_css(handle.read().decode("utf-8"), table, rel).encode("utf-8")
+        styles[rel] = rewritten
+        digest = hashlib.sha256(rewritten).hexdigest()
+        head = posixpath.dirname(rel)
+        table[rel] = posixpath.join(head, f"{digest}.css") if head else f"{digest}.css"
     remove_previous(out, [name for rel, name in previous.items() if table.get(rel) != name])
 
     written = {}
     for rel in rels:
-        with open(os.path.join(args.src, rel), "rb") as handle:
-            data = handle.read()
+        if rel in styles:
+            data = styles[rel]
+        else:
+            with open(os.path.join(args.src, rel), "rb") as handle:
+                data = handle.read()
         if os.path.splitext(rel)[1].lower() == ".html":
             text = data.decode("utf-8")
             data = rewrite(text, table).encode("utf-8")

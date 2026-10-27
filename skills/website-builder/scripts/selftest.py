@@ -90,7 +90,7 @@ def build_and_check(root, run):
     with open(os.path.join(src, "index.html"), "wb") as handle:
         handle.write(b'<!doctype html><html><head><link rel="stylesheet" href="css/site.css"></head><body><img src="css/logo.png"></body></html>\n')
     with open(os.path.join(src, "css", "site.css"), "wb") as handle:
-        handle.write(b"body{margin:0}\n")
+        handle.write(b'body{margin:0;background:url("logo.png")} .label::after{content:"url(logo.png)"}\n')
     with open(os.path.join(src, "css", "logo.png"), "wb") as handle:
         handle.write(b"\x89PNG\r\n\x1a\nfake")
 
@@ -112,6 +112,12 @@ def build_and_check(root, run):
     with open(os.path.join(out_a, "index.html"), "rb") as handle:
         html = handle.read().decode()
     expect("html rewritten to digest names", "css/site.css" not in html and "css/logo.png" not in html)
+    built_css = [name for name in os.listdir(os.path.join(out_a, "css")) if name.endswith(".css")][0]
+    with open(os.path.join(out_a, "css", built_css), "rb") as handle:
+        css = handle.read().decode()
+    built_png = [name for name in os.listdir(os.path.join(out_a, "css")) if name.endswith(".png")][0]
+    expect("css url points to the built image", f'url("{built_png}")' in css)
+    expect("css string content is unchanged", 'content:"url(logo.png)"' in css)
 
     return out_a
 

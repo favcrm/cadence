@@ -267,8 +267,12 @@ pub enum ShowOutput {
 }
 
 pub fn show(name: &str, file: Option<&str>) -> Result<ShowOutput> {
+    // A named skill may bring guidance dependencies (company-outputs ships
+    // business-documents with it). Show the bundle the caller named, never the
+    // first entry of that selection.
     let skill = selected(Some(name))?
-        .first()
+        .iter()
+        .find(|skill| skill.name == name)
         .ok_or_else(|| Error::rejected(format!("unknown bundled skill {name:?}")))?;
     match file {
         None => Ok(ShowOutput::Manifest(json!({
@@ -765,5 +769,31 @@ mod tests {
         let refused = show("website-builder", Some("../../etc/passwd"));
         assert!(refused.is_err());
         assert!(show("no-such-skill", None).is_err());
+    }
+
+    /// company-outputs installs business-documents with it; `show` must name
+    /// the bundle the caller asked for, not the first entry of that selection.
+    #[test]
+    fn skill_show_names_the_requested_bundle_not_its_dependency() {
+        let paths = |value: &Value| -> Vec<String> {
+            value["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["path"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let company = match show("company-outputs", None).unwrap() {
+            ShowOutput::Manifest(value) => value,
+            ShowOutput::File(_) => panic!("manifest expected"),
+        };
+        assert_eq!(company["name"], "company-outputs");
+        assert!(paths(&company).contains(&"references/proposal.md".to_string()));
+        let business = match show("business-documents", None).unwrap() {
+            ShowOutput::Manifest(value) => value,
+            ShowOutput::File(_) => panic!("manifest expected"),
+        };
+        assert_eq!(business["name"], "business-documents");
+        assert!(!paths(&business).contains(&"references/proposal.md".to_string()));
     }
 }

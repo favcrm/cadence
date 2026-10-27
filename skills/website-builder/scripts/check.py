@@ -24,7 +24,7 @@ from common import emit, load, now, refuse, run, save
 # Cloudflare answers its bot check (error 1010) with 403 for Python's default
 # user agent, so a real deployment would never verify. This is an honest,
 # tool-identifying agent that the edge accepts.
-AGENT = "Mozilla/5.0 (compatible; cadence-check/1.0)"
+AGENT = "cadence-check/1.0"
 
 
 def fetch(request):
