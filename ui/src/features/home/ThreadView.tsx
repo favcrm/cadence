@@ -31,6 +31,44 @@ export function time(created: string | null | undefined): string {
  * a call still running shows the pulse instead of a result. Opening and
  * closing animate through the grid-rows height trick (styles.css).
  */
+/** The tool rows themselves, with no disclosure of their own (CAD-1881):
+ *  standalone groups own the `steps-head`, a turn's trace lists them flat
+ *  under its single 44px head. */
+function ToolRows({ entries }: { entries: ThreadEntry[] }) {
+  const t = useTranslate();
+  const steps = useMemo(() => toolSteps(entries), [entries]);
+  return (
+    <ul className="steps-inner">
+      {steps.map((s, i) => (
+        <li key={s.id ?? `s${s.call.seq}-${i}`} className="step-row">
+          <span
+            aria-hidden
+            className={`step-mark ${
+              !s.done
+                ? "step-live"
+                : s.refused
+                  ? "text-warn"
+                  : s.error
+                    ? "text-fail"
+                    : "text-ok"
+            }`}
+          >
+            {s.call.kind === "tool_result" ? "←" : !s.done ? "◌" : s.refused ? "⊘" : s.error ? "✕" : "✓"}
+          </span>
+          <span className="num min-w-0 break-all flex-1">{s.summary}</span>
+          {s.refused && <span className="step-tag text-warn shrink-0">{t("refused")}</span>}
+          {s.error && !s.refused && <span className="step-tag text-fail shrink-0">{t("error")}</span>}
+          {s.result && s.call.kind === "tool_call" && (
+            <span className="num truncate max-w-[40%] text-ink-500" title={s.result.text}>
+              {!s.error && isArtifactPutCall(s.call.text) ? t("in the canvas") : stepSummary(s.result.text)}
+            </span>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function StepsGroup({ entries, density = "full" }: { entries: ThreadEntry[]; density?: Density }) {
   const t = useTranslate();
   const [open, setOpen] = useState(false);
@@ -63,34 +101,7 @@ function StepsGroup({ entries, density = "full" }: { entries: ThreadEntry[]; den
         {last && <span className="num truncate min-w-0 text-ink-500">· {last.summary}</span>}
       </button>
       <div className="steps-body">
-        <ul className="steps-inner">
-          {steps.map((s, i) => (
-            <li key={s.id ?? `s${s.call.seq}-${i}`} className="step-row">
-              <span
-                aria-hidden
-                className={`step-mark ${
-                  !s.done
-                    ? "step-live"
-                    : s.refused
-                      ? "text-warn"
-                      : s.error
-                        ? "text-fail"
-                        : "text-ok"
-                }`}
-              >
-                {s.call.kind === "tool_result" ? "←" : !s.done ? "◌" : s.refused ? "⊘" : s.error ? "✕" : "✓"}
-              </span>
-              <span className="num min-w-0 break-all flex-1">{s.summary}</span>
-              {s.refused && <span className="step-tag text-warn shrink-0">{t("refused")}</span>}
-              {s.error && !s.refused && <span className="step-tag text-fail shrink-0">{t("error")}</span>}
-              {s.result && s.call.kind === "tool_call" && (
-                <span className="num truncate max-w-[40%] text-ink-500" title={s.result.text}>
-                  {!s.error && isArtifactPutCall(s.call.text) ? t("in the canvas") : stepSummary(s.result.text)}
-                </span>
-              )}
-            </li>
-          ))}
-        </ul>
+        <ToolRows entries={entries} />
       </div>
     </div>
   );
@@ -575,14 +586,12 @@ function TurnTrace({
   running,
   summary,
   elapsed,
-  density,
 }: {
   items: ThreadItem[];
   steps: number;
   running: boolean;
   summary: string;
   elapsed: string | null;
-  density: Density;
 }) {
   const t = useTranslate();
   const [open, setOpen] = useState(false);
@@ -613,7 +622,7 @@ function TurnTrace({
               if (item.type === "tools") {
                 return (
                   <li key={item.key} className="turntrace-item">
-                    <StepsGroup entries={item.entries} density={density} />
+                    <ToolRows entries={item.entries} />
                   </li>
                 );
               }
@@ -805,7 +814,6 @@ export function ThreadTurn({
           running={streaming}
           summary={summary}
           elapsed={elapsed}
-          density={density}
         />
       )}
       {shown && <AnswerSurface entry={shown.entry} density={density} onOpenIssue={onOpenIssue} earlier={legacy !== null} />}

@@ -293,7 +293,8 @@ for (const density of ["full", "compact"] as const) {
   ok(complete.includes("Thought for 4s"), "turn: the trace measures the turn");
   ok(complete.includes(">Reasoning<") && complete.includes(">Worker note<"), "turn: reasoning and the worker note are trace rows");
   ok(!complete.includes('data-kind="commentary"'), "turn: no standalone commentary row");
-  ok(count(complete, 'data-kind="tools"') === 1, "turn: the tool run keeps its own disclosure");
+  ok(count(complete, 'data-kind="tools"') === 0, "turn: the tool run adds no second disclosure");
+  ok(count(complete, "step-row") >= 1 && complete.indexOf("step-row") > complete.indexOf("turn-trace"), "turn: tool rows list flat inside the trace");
   // The answer: Markdown through Md, not the raw text.
   ok(count(complete, 'data-kind="answer"') === 1, "turn: one answer surface");
   ok(complete.includes("<strong>One</strong>"), "turn: answer Markdown bold");
