@@ -187,14 +187,22 @@ impl CloudProjection {
     }
 
     /// Whether the delivery binding of a derived row reaches this caller.
-    fn bound(&self, row: &crate::store::cloud_agent::CloudDerivedRow) -> bool {
+    /// THE rule for a routed cloud row: the operator, or a verified agent
+    /// that is the delivery's sender or recipient. Every reader of such a row
+    /// asks this, directly or through [`Self::bound`], so the two cannot
+    /// drift into disagreeing about who may read a cloud result.
+    fn cloud_row_readable(&self, sender_uid: Option<&str>, recipient_uid: Option<&str>) -> bool {
         if self.operator {
             return true;
         }
         let Some(viewer) = self.viewer.as_deref() else {
             return false;
         };
-        row.sender_uid.as_deref() == Some(viewer) || row.recipient_uid.as_deref() == Some(viewer)
+        sender_uid == Some(viewer) || recipient_uid == Some(viewer)
+    }
+
+    fn bound(&self, row: &crate::store::cloud_agent::CloudDerivedRow) -> bool {
+        self.cloud_row_readable(row.sender_uid.as_deref(), row.recipient_uid.as_deref())
     }
 
     /// What this snapshot admits for one message id. Default DENY: a row the
@@ -666,20 +674,14 @@ impl Shared {
         sender_uid: Option<&str>,
         recipient_uid: Option<&str>,
     ) -> Result<bool> {
-        let derived = self.store.cloud_derived_messages(alias)?;
-        if !derived.iter().any(|row| row.message_id == message_id) {
+        // Build the same admission the projection builds and ask the same
+        // predicate: one derivation of the caller, one rule. A row with no
+        // cloud provenance is not this policy's business.
+        let projection = self.admit_derived_cloud_rows(alias, peer_pid)?;
+        if !projection.derived.contains_key(message_id) {
             return Ok(true);
         }
-        match self.connection_caller(peer_pid) {
-            Ok(caller_rule::Who::Operator) => Ok(true),
-            Ok(caller_rule::Who::Agent(caller)) => {
-                let uid = self.store.agent(&caller).ok().map(|agent| agent.uid);
-                Ok(uid.is_some_and(|uid| {
-                    sender_uid == Some(uid.as_str()) || recipient_uid == Some(uid.as_str())
-                }))
-            }
-            Ok(caller_rule::Who::Unproven(_)) | Err(_) => Ok(false),
-        }
+        Ok(projection.cloud_row_readable(sender_uid, recipient_uid))
     }
 
     /// An ordinary alias can still carry cloud content: settling a turn routes
