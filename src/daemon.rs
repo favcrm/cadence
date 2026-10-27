@@ -223,6 +223,8 @@ mod cad1777_drawer_acceptance;
 mod cad1822_context_refusal_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1852_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1868_acceptance;
 mod connection_test;
 mod connections_rpc;
 /// CAD-1128: the `connection_custody_*` operator verbs.
