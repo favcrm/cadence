@@ -97,8 +97,9 @@ struct Script {
     /// Opt-in, stateful first-ack-loss platform fixture; defaults leave every
     /// existing guard's transport script unchanged.
     first_ack: Option<FirstAckRemote>,
-    /// Only the boundary case opts into an actual issuer renewal response.
+    /// Only renewal boundary cases opt into an actual issuer response.
     renewal_answer: Option<Value>,
+    renewal_status: u16,
 }
 
 impl Script {
@@ -125,6 +126,7 @@ impl Script {
             answered_readbacks: 0,
             first_ack: None,
             renewal_answer: None,
+            renewal_status: 200,
         }
     }
     fn calls(&self, action: &str) -> usize {
@@ -480,10 +482,11 @@ fn serve_io(mut stream: impl Read + Write, script: Arc<Mutex<Script>>, close: im
             authorization,
         });
         let answer = recorded.renewal_answer.clone();
+        let status = recorded.renewal_status;
         drop(recorded);
         match answer {
             Some(answer) => {
-                reply(&mut stream, 200, &answer);
+                reply(&mut stream, status, &answer);
             }
             None => {
                 reply(&mut stream, 500, &json!({"error":"unexpected_renewal"}));
@@ -617,6 +620,11 @@ fn serve_io(mut stream: impl Read + Write, script: Arc<Mutex<Script>>, close: im
                 (
                     403,
                     json!({"ok": false, "error": {"code": "forbidden", "message": "read authority revoked upstream for this operation"}}),
+                )
+            } else if script.read_status == 503 {
+                (
+                    503,
+                    json!({"ok": false, "error": {"code": "unavailable", "message": "cloud runtime unavailable"}}),
                 )
             } else if script.read_status != 0 {
                 (
@@ -1291,6 +1299,450 @@ impl cadence_agent::cloud_agent::CloudTransport for SettledFixtureReply {
     ) -> cadence_agent::Result<()> {
         Err(cadence_agent::Error::rejected("cancel unused"))
     }
+}
+
+// V8 reuses the existing already-admitted service producer. This seeds real
+// canonical messages/results/routed copies, NOT a kernel-peer enrollment or a
+// reader admission. Every observation below goes through the actual RPC guard.
+const V8_PEER_OPERATION: &str = "peer-v8-operation-0001";
+const V8_REQUEST: &str = "v8 private peer cloud request";
+const V8_ORDINARY: &str = "ordinary v8 pair mail";
+
+fn v8_routed_pair(fx: &Fx, issuer: &str, reply: &'static str) -> (String, String) {
+    use cadence_agent::cloud_agent::{self, Sender, Source};
+    use cadence_agent::remote_cli::RemoteTarget;
+    use cadence_agent::store::cloud_agent::{CloudSource, Owner};
+
+    let connected = fx.connect();
+    let id = cloud_agent_id(&connected);
+    let home = thread_of(&connected);
+    // The operator's own real HTTP operation is the read-admission receipt;
+    // no fabricated peer credential or missing-receipt permission is borrowed.
+    fx.stub.set(|script| {
+        script.submit_state = "completed".into();
+        script.submit_text = Some("genuine stub reply".into());
+    });
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "agent_register",
+        json!({"alias":"peer", "provider":"fake", "endpoint_kind":"fake", "cwd":fx.cwd()}),
+    )
+    .unwrap();
+    let store = fx.store();
+    store.ensure_thread("peer").unwrap();
+    // Ordinary, non-cloud service mail with the SAME immutable participants,
+    // before the cloud turn. This is a real canonical enqueue, with no cloud
+    // origin; it tests preservation of this pair, not a different operator pair.
+    store
+        .enqueue_sent(
+            "peer",
+            V8_ORDINARY,
+            None,
+            "m-v8-pair-ordinary",
+            "user",
+            None,
+            &cadence_agent::store::Sender::Agent(ALIAS.into()),
+        )
+        .unwrap();
+    let peer = store.agent("peer").unwrap();
+    let source = Source::registered(&peer, Owner::new(issuer, "stub-subject"));
+    store
+        .cloud_agent_source_grant(&CloudSource {
+            cloud_agent_id: id.clone(),
+            kind: "local_peer".into(),
+            uid: peer.uid.clone(),
+            registration_epoch: source.epoch,
+            owner: source.owner.clone(),
+            label: "peer".into(),
+            scope: "cloud_agent.write".into(),
+            granted_by: "operator".into(),
+            granted_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+            invoker_id: None,
+            state: "active".into(),
+        })
+        .unwrap();
+    let cloud = store.cloud_agent(&id).unwrap().unwrap();
+    let target = RemoteTarget {
+        org: cloud.org_slug.clone(),
+        org_id: cloud.organization_id.clone(),
+        endpoint: cloud.endpoint.clone(),
+        identity: None,
+    };
+    cloud_agent::send(
+        &store,
+        &SettledFixtureReply(reply),
+        &cloud,
+        &target,
+        &home,
+        &Sender::Agent("peer".into()),
+        &source,
+        V8_PEER_OPERATION,
+        V8_REQUEST,
+        true,
+        None,
+        || Ok(()),
+    )
+    .unwrap();
+    let routed = store
+        .messages("peer")
+        .unwrap()
+        .into_iter()
+        .find(|row| {
+            row.source == "worker_result" && row.origin.as_deref() == Some(V8_PEER_OPERATION)
+        })
+        .expect("the canonical service completion must route its reply");
+    if !matches!(routed.state.as_str(), "completed" | "failed") {
+        store
+            .finish(
+                &routed,
+                "completed",
+                &json!({"status":"completed", "text":reply}),
+                None,
+            )
+            .unwrap();
+    }
+    assert!(routed.body.contains(reply), "fixture lost the routed reply");
+    let listed = fx
+        .call(
+            Asserted::Operator,
+            "work_conversation_list",
+            json!({"include_system":true}),
+        )
+        .unwrap();
+    let pair = listed["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| {
+            row["kind"] == json!("pair")
+                && [ALIAS, "peer"].iter().all(|alias| {
+                    row["participants"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|participant| participant["alias"] == json!(alias))
+                })
+        })
+        .expect("the real cloud/peer pair must exist")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(fx.stub.calls("submit"), 1);
+    (pair, routed.id)
+}
+
+#[test]
+fn a_transient_cloud_renewal_withholds_routed_rows_without_losing_ordinary_history() {
+    const REPLY: &str = "v8 cloud reply behind renewable read";
+    let mut fx = Fx::start();
+    let (stub, ca, address) = Stub::renewal_tls(fx.root.path());
+    fx.stub = stub;
+    for (key, value) in [
+        ("CADENCE_TEST_TLS_CA", ca.into_os_string()),
+        (
+            "CADENCE_TEST_TLS_CONNECT",
+            OsString::from(address.to_string()),
+        ),
+    ] {
+        fx._env.0.push((key, std::env::var_os(key)));
+        std::env::set_var(key, value);
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let capabilities = ["bridge.enroll", "cloud_agent.read", "cloud_agent.write"];
+    let refresh = format!("hcr_{}", "R".repeat(43));
+    let access = format!("hct_{}", "N".repeat(43));
+    write_login_owner(LoginSpec {
+        org: ORG,
+        org_id: ORG_ID,
+        endpoint: &fx.stub.url,
+        capabilities: &capabilities,
+        expires: at + 600,
+        subject: "stub-subject",
+        issuer: &fx.stub.url,
+        token_char: "a",
+    });
+    let path = login_path(ORG);
+    let session = json!({
+        "session_id":"hcs_12345678-1234-4234-8234-123456789abc",
+        "refresh_token":refresh, "generation":7, "device_label":"independent v8 read",
+        "idle_expires_at":at + 1000, "absolute_expires_at":at + 10_000,
+    });
+    let mut saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    saved["cli_session"] = session.clone();
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let pin = path.parent().unwrap().join("trusted-issuer");
+    std::fs::write(&pin, format!("{}\n", fx.stub.url)).unwrap();
+    std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (_, routed) = v8_routed_pair(&fx, &fx.stub.url, REPLY);
+    assert_eq!(fx.stub.calls("renew"), 0, "fresh fixture renewed");
+    // Make THIS saved login due only after the real operation/result exist.
+    saved["expires_at"] = json!(at + 45);
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    fx.stub.set(|script| {
+        script.renewal_status = 503;
+        // Same strict issuer shape as AOS-395 cli-session.ts accessResponse
+        // plus its /renew session rotation; status alone changes for the control.
+        script.renewal_answer = Some(json!({
+            "version":"hosted-cadence-auth.v1", "organization_id":ORG_ID,
+            "organization_slug":ORG, "audience":fx.stub.url,
+            "principal":{"kind":"user", "current_role":"owner", "subject_id":"stub-subject"},
+            "capabilities":capabilities,
+            "credential":{
+                "credential_id":"hcp_12345678-1234-4234-8234-123456789abc",
+                "access_token":access, "token_type":"Bearer", "issued_at":at,
+                "expires_at":at + 300, "renewal":"reexchange",
+            },
+            "cli_session":{
+                "session_id":session["session_id"], "generation":8,
+                "refresh_token":format!("hcr_{}", "S".repeat(43)),
+                "device_label":session["device_label"],
+                "idle_expires_at":at + 1000, "absolute_expires_at":at + 10_000,
+            },
+        }));
+    });
+    for method in ["thread_read", "agent_show"] {
+        let proof = proof_before(&fx.stub);
+        let wire = fx.stub.seen().len();
+        let renews = fx.stub.calls("renew");
+        let page = fx
+            .call(Asserted::Operator, method, json!({"alias":"peer"}))
+            .expect("transient issuer renewal must preserve the ordinary page");
+        assert_withheld(&page, "cloud_agent_unavailable", V8_REQUEST, REPLY);
+        assert!(page.to_string().contains(V8_ORDINARY), "{method}: {page}");
+        assert!(!page.to_string().contains(&routed), "{method}: {page}");
+        assert_eq!(fx.stub.calls("renew") - renews, 1, "{method}");
+        assert_eq!(
+            fx.stub.seen().len() - wire,
+            1,
+            "stale contract POST: {method}"
+        );
+        assert_proof_delta(&fx.stub, proof, &[], 0);
+        let script = fx.stub.script.lock().unwrap();
+        let renewal = script.seen.last().unwrap();
+        assert_eq!(renewal.action, "renew");
+        assert_eq!(renewal.method, "POST");
+        assert_eq!(renewal.authorization, format!("bearer {refresh}"));
+        assert_eq!(renewal.body["capabilities"], json!(capabilities));
+        assert_eq!(renewal.body["session_id"], session["session_id"]);
+        assert_eq!(renewal.body["expected_generation"], json!(7));
+        assert_eq!(script.calls("submit"), 1, "read spent another model turn");
+        println!("V8_RENEWAL_CHECKPOINT method={method} withheld=cloud_agent_unavailable ordinary=true renew=1 contract=0 submit_delta=0");
+    }
+    fx.stub.set(|script| script.renewal_status = 200);
+    for (index, method) in ["thread_read", "agent_show"].iter().enumerate() {
+        let proof = proof_before(&fx.stub);
+        let wire = fx.stub.seen().len();
+        let renews = fx.stub.calls("renew");
+        let page = fx
+            .call(Asserted::Operator, method, json!({"alias":"peer"}))
+            .expect("successful renewal must restore the same stored rows");
+        assert!(page.get("cloud_withheld").is_none(), "{method}: {page}");
+        for text in [V8_ORDINARY, REPLY, routed.as_str()] {
+            assert!(
+                page.to_string().contains(text),
+                "{method} lost {text}: {page}"
+            );
+        }
+        let expected_renewals = usize::from(index == 0);
+        assert_eq!(fx.stub.calls("renew") - renews, expected_renewals);
+        assert_eq!(fx.stub.seen().len() - wire, expected_renewals + 1);
+        assert_proof_delta(&fx.stub, proof, &[OPERATION], 1);
+        let script = fx.stub.script.lock().unwrap();
+        for contract in &script.seen[wire..] {
+            if contract.action != "renew" {
+                assert_eq!(contract.action, "readback");
+                assert_eq!(contract.authorization, format!("bearer {access}"));
+            }
+        }
+        assert_eq!(script.calls("submit"), 1);
+        println!("V8_RENEWAL_CHECKPOINT method={method} restored=true ordinary=true renew={expected_renewals} readback=1 new_access_only=true submit_delta=0");
+    }
+}
+
+#[test]
+fn cross_agent_pair_readers_withhold_cloud_rows_and_preserve_ordinary_pair_mail() {
+    const REPLY: &str = "v8 cloud pair private reply";
+    let fx = Fx::start();
+    let (pair, routed) = v8_routed_pair(&fx, "https://issuer.example.test", REPLY);
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    for (mode, capabilities, status, reason) in [
+        (
+            "local-scope",
+            vec!["cloud_agent.write"],
+            0,
+            "cloud_agent_scope_revoked",
+        ),
+        (
+            "upstream-503",
+            vec!["cloud_agent.read", "cloud_agent.write"],
+            503,
+            "cloud_agent_unavailable",
+        ),
+    ] {
+        write_login(ORG, ORG_ID, &fx.stub.url, &capabilities, expires);
+        fx.stub.set(|script| script.read_status = status);
+        for method in ["work_conversation_read", "work_conversation_list"] {
+            let proof = proof_before(&fx.stub);
+            let wire = fx.stub.seen().len();
+            let params = if method == "work_conversation_read" {
+                json!({"conversation":pair, "include_system":true})
+            } else {
+                json!({"include_system":true})
+            };
+            let page = fx
+                .call(Asserted::Operator, method, params)
+                .expect("cloud denial must preserve the pair view");
+            assert!(
+                !page.to_string().contains(V8_REQUEST),
+                "{mode}/{method}: {page}"
+            );
+            assert!(!page.to_string().contains(REPLY), "{mode}/{method}: {page}");
+            if method == "work_conversation_read" {
+                let messages = page["messages"].as_array().unwrap();
+                assert_eq!(messages.len(), 3, "the mixed pair lost rows: {page}");
+                let ordinary = messages
+                    .iter()
+                    .find(|row| row["id"] == json!("m-v8-pair-ordinary"))
+                    .unwrap();
+                assert_eq!(ordinary["body"], json!(V8_ORDINARY), "{page}");
+                assert!(ordinary["cloud_withheld"].is_null(), "{page}");
+                for id in [V8_PEER_OPERATION, routed.as_str()] {
+                    let row = messages
+                        .iter()
+                        .find(|row| row["id"] == json!(id))
+                        .expect("withheld row metadata missing");
+                    assert_eq!(row["cloud_withheld"], json!(reason), "{mode}: {row}");
+                    assert_eq!(row["body"], json!(""), "{row}");
+                    assert!(row["result"].is_null(), "{row}");
+                    assert!(row["error"].is_null(), "{row}");
+                    assert_eq!(row["routed"], json!([]), "routed copy leaked: {row}");
+                }
+            } else {
+                let row = page["conversations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["id"] == json!(pair))
+                    .unwrap();
+                assert_eq!(row["last"]["preview"], json!(""), "{row}");
+                assert_eq!(row["last"]["cloud_withheld"], json!(reason), "{row}");
+            }
+            // Two aliases on the pair read, one latest-row alias on list;
+            // each independently proves its own immutable snapshot once.
+            let proofs = if mode == "local-scope" {
+                0
+            } else if method == "work_conversation_read" {
+                2
+            } else {
+                1
+            };
+            let operations = vec![OPERATION; proofs];
+            assert_proof_delta(&fx.stub, proof, &operations, proofs);
+            assert_eq!(
+                fx.stub.seen().len() - wire,
+                proofs,
+                "extra transport: {mode}/{method}"
+            );
+            assert_eq!(fx.stub.calls("submit"), 1, "read spent a model turn");
+            println!("V8_PAIR_CHECKPOINT mode={mode} method={method} withheld={reason} ordinary=true readbacks={proofs} submit_delta=0");
+        }
+    }
+    write_login(
+        ORG,
+        ORG_ID,
+        &fx.stub.url,
+        &["cloud_agent.read", "cloud_agent.write"],
+        expires,
+    );
+    fx.stub.set(|script| script.read_status = 0);
+    let proof = proof_before(&fx.stub);
+    let restored = fx
+        .call(
+            Asserted::Operator,
+            "work_conversation_read",
+            json!({"conversation":pair, "include_system":true}),
+        )
+        .unwrap();
+    assert_proof_delta(&fx.stub, proof, &[OPERATION, OPERATION], 2);
+    let proof = proof_before(&fx.stub);
+    let listed = fx
+        .call(
+            Asserted::Operator,
+            "work_conversation_list",
+            json!({"include_system":true}),
+        )
+        .unwrap();
+    assert_proof_delta(&fx.stub, proof, &[OPERATION], 1);
+    let preview = listed["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == json!(pair))
+        .unwrap();
+    assert!(
+        !preview["last"]["preview"].as_str().unwrap().is_empty(),
+        "{preview}"
+    );
+    assert!(preview["last"]["cloud_withheld"].is_null(), "{preview}");
+    assert_eq!(fx.stub.calls("submit"), 1);
+    let rows = restored["messages"].as_array().unwrap();
+    let request = rows
+        .iter()
+        .find(|row| row["id"] == json!(V8_PEER_OPERATION))
+        .unwrap();
+    println!("V8_PAIR_CHECKPOINT mode=restored read_rpc_ok=true list_preview_restored=true request_visible={} request_withheld={} submit_delta=0", request["body"] == json!(V8_REQUEST), request["cloud_withheld"]);
+    assert_eq!(
+        request["body"],
+        json!(V8_REQUEST),
+        "restoring read authority lost the original peer request: {restored}"
+    );
+    assert!(request["cloud_withheld"].is_null(), "{request}");
+    assert!(
+        request["result"].to_string().contains(REPLY),
+        "peer completion missing: {request}"
+    );
+    assert!(
+        request["routed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["id"] == json!(routed) && row["result"].to_string().contains(REPLY) }),
+        "routed copy missing: {request}"
+    );
+    let report = rows.iter().find(|row| row["id"] == json!(routed)).unwrap();
+    assert!(report["body"].as_str().unwrap().contains(REPLY), "{report}");
+    assert!(
+        report["body"].as_str().unwrap().contains(V8_PEER_OPERATION),
+        "{report}"
+    );
+    assert!(
+        report["body"].as_str().unwrap().contains("completed"),
+        "{report}"
+    );
+    assert!(report["cloud_withheld"].is_null(), "{report}");
+    assert!(
+        rows.iter().any(|row| row["body"] == json!(V8_ORDINARY)),
+        "{restored}"
+    );
 }
 
 // ---------- acceptance ----------
