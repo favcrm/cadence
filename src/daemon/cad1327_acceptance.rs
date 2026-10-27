@@ -75,6 +75,8 @@ pub(super) struct Door {
     drop_text: AtomicBool,
     /// When set, a text call is answered 402 `insufficient_funds`.
     pub(super) no_credit: AtomicBool,
+    /// When set, the image submit is answered 402 `insufficient_funds`.
+    image_no_credit: AtomicBool,
     pub(super) text_calls: AtomicUsize,
     pub(super) reads: AtomicUsize,
     /// Every paid `POST /v1/runtime/tools/call` body as sent, answered or
@@ -193,6 +195,13 @@ fn serve(stream: std::net::TcpStream, door: &Door) {
                     "price":{"slug":"generate_image","chargeMinor":minor,"currency":"USD","version":"2026-09-29T00:00:00.000Z"}}}),
             )
         }
+        ("POST", "/v1/runtime/media/image") if door.image_no_credit.load(SeqCst) => raw(
+            402,
+            "application/json",
+            json!({"ok":false,"error":{"code":"insufficient_funds"}})
+                .to_string()
+                .as_bytes(),
+        ),
         (m, r) if r.starts_with("/v1/runtime/media/") => {
             let key = header("idempotency-key");
             match door.media.reply(m, r, key.as_deref(), &body) {
@@ -297,6 +306,7 @@ impl Fx {
             image_minor: Mutex::new(None),
             drop_text: AtomicBool::new(false),
             no_credit: AtomicBool::new(false),
+            image_no_credit: AtomicBool::new(false),
             text_calls: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
             calls: Mutex::new(Vec::new()),
@@ -936,6 +946,48 @@ fn a_price_above_the_estimate_runs_and_no_credit_is_the_only_stop() {
         "{done}"
     );
     assert_eq!(fx.door.spent(), (1, 1, 0), "an unfunded call was charged");
+}
+
+/// (6b) CAD-1852: a 402 on the IMAGE step of a draft is visible to the agent:
+/// `social.drafts.status` carries the credit text on that row, and no image
+/// job was charged.
+#[test]
+fn an_image_step_without_credit_says_so_in_drafts_status() {
+    let fx = Fx::new();
+    let token = fx.create_turn("m-6b");
+    fx.fetched("m-6b", &token, "op-f");
+    fx.door.image_no_credit.store(true, SeqCst);
+    let op = pending(
+        &fx.invoke(
+            "m-6b",
+            &token,
+            "social.draft.create",
+            "op-d",
+            json!({"post":"newest","with_image":true}),
+        )
+        .unwrap(),
+    );
+    let done = fx.decide(Asserted::Operator, &op, "allow_once").unwrap();
+    assert_eq!(done["operation"]["status"], "succeeded", "{done}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let row = loop {
+        let status = fx.shared.social_status(&fx.records(), &fx.context).unwrap();
+        let row = status["drafts"][0].clone();
+        if row["image"] == "failed" {
+            break row;
+        }
+        assert!(Instant::now() < deadline, "image never settled: {status}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        row["note"], "Not enough credit — top up to continue",
+        "{row}"
+    );
+    assert_eq!(
+        fx.door.media.job_count(),
+        0,
+        "an unfunded image was charged"
+    );
 }
 
 /// (7) The draft action cannot reach publish, approve, send, discard,

@@ -486,6 +486,11 @@ impl Shared {
             } else {
                 "ready"
             };
+            // Balance is the only cost stop: say so when the image step was
+            // refused for it (the draft itself is ready).
+            let note = image
+                .filter(|i| i["state"] == "refused" && i["outcome"] == "insufficient_funds")
+                .map(|_| super::app_assistant_rpc::OUT_OF_CREDIT);
             match state {
                 "ready" => ready += 1,
                 "waiting" => waiting += 1,
@@ -499,6 +504,7 @@ impl Shared {
                 "asset_id": draft["asset_id"],
                 "source_kind": draft.pointer("/source/kind"),
                 "caption": clip(draft["caption"].as_str().unwrap_or_default(), 80),
+                "note": note,
             }));
         }
         Ok(json!({"ready":ready,"waiting":waiting,"failed":failed,"drafts":rows}))
