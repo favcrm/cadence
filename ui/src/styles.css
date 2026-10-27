@@ -660,6 +660,34 @@ pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+/* CAD-1886: a quiet day rule between two days of a transcript. */
+.day-sep {
+  display: flex;
+  align-items: center;
+  gap: .625rem;
+  margin: .25rem 0;
+  color: var(--color-ink-500);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: .65625rem;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.day-sep::before,
+.day-sep::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--color-ink-800);
+}
+
+/* CAD-1886: the keyboard affordance under a full-density composer. */
+.composer-hint {
+  margin: .375rem .125rem 0;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+  text-align: right;
+}
+
 /* The answer: one surface, the Markdown measure, and only the chrome the
    turn owns. Tables lose their grid, a blockquote reads as the one staged
    callout, code and issue links as quiet chips. */
@@ -2190,5 +2218,20 @@ button.project-focus-preview:hover { color: var(--color-accent); }
     justify-content: center;
     min-width: 2.75rem;
     padding: 0 0.5rem;
+  }
+  /* CAD-1886: the remaining chat controls become thumbs. */
+  .tb-btn,
+  .newpill {
+    min-height: 2.75rem;
+  }
+  .tb-btn {
+    min-width: 2.75rem;
+  }
+  .newpill {
+    display: inline-flex;
+    align-items: center;
+  }
+  .composer-hint {
+    display: none;
   }
 }

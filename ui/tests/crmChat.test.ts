@@ -59,11 +59,14 @@ const stamp = { source: "operator", app: { install_id: "install-crm", context_id
 let thread: any = {
   entries: [
     ent(1, "operator", "message", "Build a VIP segment", stamp),
-    ent(2, "agent", "tool_call", "list_segments", { tool_use_id: "t1" }),
-    ent(3, "agent", "tool_result", "ok", { tool_use_id: "t1" }),
-    ent(4, "agent", "tool_call", "create_segment", { tool_use_id: "t2" }),
-    ent(5, "agent", "tool_result", "ok", { tool_use_id: "t2" }),
-    ent(6, "agent", "turn_result", "Created **VIP customers** in ctx-a", { source: "master" }),
+    { ...ent(2, "agent", "tool_call", "list_segments", { tool_use_id: "t1" }), message: "m2" },
+    { ...ent(3, "agent", "tool_result", "ok", { tool_use_id: "t1" }), message: "m2" },
+    { ...ent(4, "agent", "tool_call", "create_segment", { tool_use_id: "t2" }), message: "m2" },
+    { ...ent(5, "agent", "tool_result", "ok", { tool_use_id: "t2" }), message: "m2" },
+    // CAD-1886: a directive-bearing assistant item inside the same turn must
+    // render through the guarded card path, never as raw trace or answer text.
+    { ...ent(60, "agent", "assistant_text", confirm, null), message: "m2" },
+    { ...ent(6, "agent", "turn_result", "Created **VIP customers** in ctx-a", { source: "master" }), message: "m2" },
     ent(7, "operator", "message", confirm, stamp),
   ],
   more_before: false,
@@ -107,15 +110,35 @@ assert(!text().includes("**"), "no raw ** in the chat");
 // Tool steps fold to one line.
 // CAD-1431: app chat reuses Home's shared steps group (collapsed head,
 // expandable rows), not a plain one-line summary.
-const steps = host.querySelectorAll('[data-kind="tools"]');
-equal(steps.length, 1, "tool run folds into one shared steps group");
-assert((steps[0].textContent ?? "").includes("2 tool steps"), "the group counts the steps");
-equal(steps[0].getAttribute("data-open"), null, "steps stay collapsed until opened");
-// The step rows sit in the shared collapsed body (CSS grid 0fr); the head
-// carries only the count and the newest step, as on Home.
-assert(steps[0].querySelector(".steps-body") && steps[0].querySelector(".steps-head")?.getAttribute("aria-expanded") === "false", "steps body is the shared collapsed disclosure");
+// CAD-1884: the pane groups a turn like Home, so the tool run lives in the
+// turn's one trace instead of a second disclosure of its own.
+const traces = host.querySelectorAll('[data-kind="turn-trace"]');
+equal(traces.length, 1, "tool run folds into the turn's one disclosure");
+equal(host.querySelectorAll('[data-kind="tools"]').length, 0, "no second steps group inside the pane");
+assert((traces[0].textContent ?? "").includes("steps"), "the disclosure counts the steps");
+equal(traces[0].getAttribute("data-open"), null, "the trace stays collapsed until opened");
+assert(traces[0].querySelector(".steps-body") && traces[0].querySelector(".turntrace-head")?.getAttribute("aria-expanded") === "false", "the trace body is the shared collapsed disclosure");
+assert(traces[0].querySelector(".step-row") !== null, "the tool rows sit inside the trace");
+// CAD-1886: the grouped turn keeps per-item anchors inside it, so a reader
+// whose viewport sits on a trace row or the answer survives a prepend.
+const runRow = traces[0].closest("[data-chat-run]") as HTMLElement | null;
+assert(runRow !== null, "the trace lives inside a grouped turn row");
+const innerAnchors = Array.from(runRow!.querySelectorAll("[data-item-key]")) as HTMLElement[];
+assert(innerAnchors.length > 0, "a grouped turn carries per-item anchor keys");
+const innerKeys = innerAnchors.map((el) => el.dataset.itemKey);
+assert(new Set(innerKeys).size === innerKeys.length, "inner anchors are unique");
+// CAD-1886: one message split into several runs keeps one head, and the
+// segment without the answer never claims the turn returned nothing.
+const messageRuns = host.querySelectorAll("[data-chat-run]");
+equal(messageRuns.length, 2, "the split turn paints two runs");
+equal(host.querySelectorAll(".turn-head").length, 1, "the split turn paints exactly one head");
+assert(host.querySelector('[data-kind="no-answer"]') === null, "no segment of an answered turn claims no answer");
 // Directive card, never raw JSON, token, request id or ctx id.
 assert(host.querySelector('[data-chat-card="directive"]'), "CSV confirm renders as a card");
+assert(
+  host.querySelector('[data-chat-run] [data-chat-card="directive"]') !== null,
+  "a directive-bearing assistant item inside a turn renders as a card in that turn",
+);
 for (const bad of [SECRET, "req-9", "confirm_token", "cadence_csv_import", "ctx-a", "{"]) assert(!text().includes(bad), `chat never shows ${bad}`);
 assert(text().includes("Customer import"), "card reads as a human summary");
 // CAD-1865: the pane's header copy hands back what the row shows, not what the

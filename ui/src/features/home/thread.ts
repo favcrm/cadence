@@ -330,7 +330,7 @@ const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "arti
  *  still the one contract for the canvas feed, the working state and the
  *  window; a turn is only how a contiguous run of them paints. */
 export type ThreadRun =
-  | { turn: true; key: string; items: ThreadItem[] }
+  | { turn: true; key: string; items: ThreadItem[]; message: string | null }
   | { turn: false; key: string; item: ThreadItem };
 
 /**
@@ -347,7 +347,7 @@ export function threadRuns(items: ThreadItem[]): ThreadRun[] {
   const flush = () => {
     if (run.length === 0) return;
     if (run.some((item) => item.type !== "artifact")) {
-      runs.push({ turn: true, key: run[0].key, items: run });
+      runs.push({ turn: true, key: run[0].key, items: run, message: runMessage });
     } else {
       for (const item of run) runs.push({ turn: false, key: item.key, item });
     }

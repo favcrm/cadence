@@ -621,7 +621,7 @@ function TurnTrace({
             {items.map((item) => {
               if (item.type === "tools") {
                 return (
-                  <li key={item.key} className="turntrace-item">
+                  <li key={item.key} className="turntrace-item" data-item-key={item.key}>
                     <ToolRows entries={item.entries} />
                   </li>
                 );
@@ -629,7 +629,7 @@ function TurnTrace({
               if (item.type !== "thinking" && item.type !== "commentary") return null;
               const withheld = item.type === "thinking" && carriesSecret(item.entry.text);
               return (
-                <li key={item.key} className="turntrace-item">
+                <li key={item.key} className="turntrace-item" data-item-key={item.key}>
                   <div className="turntrace-kicker num">
                     {item.type === "thinking" ? t("Reasoning") : t("Worker note")}
                   </div>
@@ -754,6 +754,10 @@ export function ThreadTurn({
   allowLegacy = false,
   onOpenIssue,
   after,
+  head = true,
+  continued = false,
+  copy = true,
+  answered,
 }: {
   items: ThreadItem[];
   running?: boolean;
@@ -765,6 +769,17 @@ export function ThreadTurn({
   onOpenIssue?: (id: string) => void;
   /** Plan cards and the correction report, under the answer. */
   after?: ReactNode;
+  /** False for a continuation segment: one head per turn, on its first run. */
+  head?: boolean;
+  /** True for an earlier segment of a turn whose answer lands later: it must
+   *  not claim the turn returned no answer. */
+  continued?: boolean;
+  /** False in a pane that copies from its header: refused directives stay
+   *  inert, with no control in the row. */
+  copy?: boolean;
+  /** A terminal answer exists even when it renders outside this body (a
+   *  declared card or frame), so the turn is not answerless. */
+  answered?: boolean;
 }) {
   const t = useTranslate();
   const actor = useAssistantActor();
@@ -786,8 +801,8 @@ export function ThreadTurn({
   // a turn whose answer already landed keeps its finished look.
   const streaming = running && shown === null;
   const failure = shown ? turnFailure(shown.entry, t) : null;
-  const hasAnswer = shown !== null && (shown.entry.text.trim() !== "" || failure !== null);
-  const noAnswer = !streaming && !hasAnswer;
+  const hasAnswer = answered ?? (shown !== null && (shown.entry.text.trim() !== "" || failure !== null));
+  const noAnswer = !streaming && !hasAnswer && !continued;
   const steps = trace.reduce(
     (count, item) => count + (item.type === "tools" ? toolSteps(item.entries).length : 1),
     0,
@@ -800,13 +815,15 @@ export function ThreadTurn({
   const elapsed = streaming ? null : traceElapsed(introEntry?.created, shown?.entry.created);
   const headAt = shown?.entry.created ?? lastCreated(items);
   return (
-    <div className="turn min-w-0" data-kind="turn" data-turn-state={streaming ? "running" : "complete"}>
-      <div className="turn-head">
-        <AssistantFace size={16} />
-        <span className="turn-name">{displayName(actor.read, actor.scope, t)}</span>
-        <span className="turn-time num">{streaming ? t("now") : time(headAt)}</span>
-        {shown && shown.entry.text.trim() !== "" && <CopyControl text={shown.entry.text} />}
-      </div>
+    <div className="turn min-w-0" data-kind="turn" data-turn-state={streaming ? "running" : "complete"} data-turn-continued={continued || undefined}>
+      {head && (
+        <div className="turn-head">
+          <AssistantFace size={16} />
+          <span className="turn-name">{displayName(actor.read, actor.scope, t)}</span>
+          <span className="turn-time num">{streaming ? t("now") : time(headAt)}</span>
+          {copy && shown && shown.entry.text.trim() !== "" && <CopyControl text={shown.entry.text} />}
+        </div>
+      )}
       {trace.length > 0 && (
         <TurnTrace
           items={trace}
@@ -816,7 +833,11 @@ export function ThreadTurn({
           elapsed={elapsed}
         />
       )}
-      {shown && <AnswerSurface entry={shown.entry} density={density} onOpenIssue={onOpenIssue} earlier={legacy !== null} />}
+      {shown && (
+        <div data-item-key={shown.key}>
+          <AnswerSurface entry={shown.entry} density={density} onOpenIssue={onOpenIssue} earlier={legacy !== null} />
+        </div>
+      )}
       {noAnswer && (
         <div className="noanswer" data-kind="no-answer">
           {t("No answer returned")}
@@ -826,7 +847,11 @@ export function ThreadTurn({
       {artifacts.length > 0 && (
         <div className="turn-artifacts">
           {artifacts.map((item) =>
-            item.type === "artifact" ? <ArtifactCard key={item.key} entry={item.entry} /> : null,
+            item.type === "artifact" ? (
+              <div key={item.key} data-item-key={item.key}>
+                <ArtifactCard entry={item.entry} />
+              </div>
+            ) : null,
           )}
         </div>
       )}

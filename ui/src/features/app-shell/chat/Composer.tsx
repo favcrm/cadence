@@ -819,6 +819,11 @@ export default function Composer({
         )}
         {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? (slash ? "Run command" : "Send"))} />}
       </div>
+      {!block && (
+        <p className="composer-hint" data-composer-hint>
+          {t("Enter to send · Shift+Enter for a new line")}
+        </p>
+      )}
     </form>
   );
 }

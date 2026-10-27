@@ -170,6 +170,7 @@ async function main() {
   // inline typing bubble. `submitting` carries no message id, so the bubble
   // rides the operator's own row rather than a stored entry of this turn.
   await render(false);
+  assert(host.querySelector("[data-composer-hint]") !== null, "the full composer carries the keyboard hint");
   await React.act(async () => {
     resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
     resources.masterThread.write((state) => ({
