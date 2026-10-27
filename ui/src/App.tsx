@@ -1143,7 +1143,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             readOnly={readOnly}
             onAck={ackMonitor}
             onOpenContext={() => goRoute({ screen: "projects", slug: projectSlug, section: "context" })}
-            hosted={meta?.hosted === true}
+            noWiki={!wikiAvailable(meta)}
           />
         )}
         {(route.screen === "issue" || (route.screen === "projects" && route.slug)) && (

@@ -335,7 +335,7 @@ export default function OverviewView({
   readOnly,
   onAck,
   onOpenContext,
-  hosted = false,
+  noWiki = false,
 }: {
   state: ResourceState<Overview>;
   /** The cards — project summary counts come from counts.ts, like the sidebar. */
@@ -348,7 +348,7 @@ export default function OverviewView({
   readOnly: boolean;
   onAck: (monitor: string, seq: number) => void;
   onOpenContext: () => void;
-  hosted?: boolean;
+  noWiki?: boolean;
 }) {
   const t = useTranslate();
   const data = state.data;
@@ -383,7 +383,7 @@ export default function OverviewView({
             context={context}
             contextLoading={contextLoading}
             onOpenContext={onOpenContext}
-            hosted={hosted}
+            noWiki={noWiki}
           />
         )}
       </div>
@@ -436,7 +436,7 @@ export default function OverviewView({
           context={context}
           contextLoading={contextLoading}
           onOpenContext={onOpenContext}
-          hosted={hosted}
+          noWiki={noWiki}
         />
       )}
 
