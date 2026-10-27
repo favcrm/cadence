@@ -197,20 +197,53 @@ def check_fixture(root, dist):
         expect("check maps 201 form probe to available", parse(live)["form"] == "available")
         expect("check accepts an explicit form key", script(
             "check.py", "--run", run, "--url", url, "--dist", dist, "--form", "contact").returncode == 0)
+        done_flow(root, run, url, dist)
     finally:
         server.shutdown()
         server.server_close()
 
 
+def submit_step(root, run, step, data):
+    payload = os.path.join(root, f"{step}.json")
+    write_json(payload, {"step": step, "data": data})
+    return script("submit.py", "--run", run, "--data", payload)
+
+
+def done_flow(root, run, url, dist):
+    """Reach done through the remaining steps, then damage the recorded verify."""
+
+    with open(os.path.join(run, "artifacts", "build-manifest.json"), encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    for step, data in (
+        ("content", {"src": "site", "facts_from_owner": True}),
+        ("build", {"out": manifest["out"], "files": manifest["files"], "bytes": manifest["bytes"]}),
+        ("review", {"owner_approved": True}),
+        ("publish", {"owner_approved": True, "release": "rel-fixture", "slug": "demo-site"}),
+    ):
+        expect(f"{step} submits", submit_step(root, run, step, data).returncode == 0)
+    expect("verify refuses owner acceptance before a recorded check", submit_step(
+        root, run, "verify", {"owner_accepted": True}).returncode == 2)
+    recorded = script("check.py", "--run", run, "--url", url, "--dist", dist, "--record")
+    expect("check --record writes the evidence", recorded.returncode == 0)
+    expect("verify submits after the recorded check", submit_step(
+        root, run, "verify", {"owner_accepted": True}).returncode == 0)
+    finished = script("next.py", "--run", run)
+    expect("a full run reaches done", finished.returncode == 0 and parse(finished)["step"] == "done")
+    with open(os.path.join(run, "run.json"), encoding="utf-8") as handle:
+        state = json.load(handle)
+    state["verify"].pop("url")
+    write_json(os.path.join(run, "run.json"), state)
+    damaged = script("next.py", "--run", run)
+    expect("refuses a completed verify without its checked URL", damaged.returncode == 2)
+    expect("damaged verify refusal is one line", len(damaged.stderr.strip().splitlines()) == 1)
+
+
 def resume_validation(root):
     run = os.path.join(root, "bad-run")
     parse(script("next.py", "--run", run))
-    data = os.path.join(root, "bad-brief.json")
-    write_json(
-        data,
-        {"step": "brief", "data": {"owner_confirmed": True, "goal": "Ship the site", "name": "demo-site"}},
-    )
-    expect("brief submits before the resume check", script("submit.py", "--run", run, "--data", data).returncode == 0)
+    expect("brief submits before the resume check", submit_step(
+        root, run, "brief",
+        {"owner_confirmed": True, "goal": "Ship the site", "name": "demo-site"}).returncode == 0)
     path = os.path.join(run, "run.json")
     with open(path, encoding="utf-8") as handle:
         state = json.load(handle)

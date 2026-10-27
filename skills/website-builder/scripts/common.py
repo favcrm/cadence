@@ -202,7 +202,12 @@ def completed_record_problem(step, data):
     if step == "verify":
         if data.get("status") != 200 or data.get("bytes_match") is not True:
             return "needs the recorded passing check (status 200, bytes_match true)"
-        return yes("owner_accepted")
+        problem = yes("owner_accepted") or text("url") or text("checked_at")
+        if problem:
+            return problem
+        if "form" not in data:
+            return "needs the recorded form result"
+        return None
     return None
 
 
