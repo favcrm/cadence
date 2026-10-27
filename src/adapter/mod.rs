@@ -92,14 +92,15 @@ pub mod codex;
 pub mod fake;
 pub mod link;
 pub mod pi;
-// The protected managed-Pi launch seam is Linux-only (openat2 + fd-exec +
-// NSS account topology). On other targets the whole module is a stub whose
-// `protected_prereqs_satisfied` still fails closed — a non-Linux build never
+// The protected managed-Pi launch seam is Linux x86_64-only: it compiles the
+// installer_bundle constructor and helper_image_trust modules, which exist only
+// there. On other targets the whole module is a stub whose
+// `protected_prereqs_satisfied` still fails closed — such a build never
 // reaches a spawn through the split path.
-#[cfg(all(unix, target_os = "linux"))]
+#[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod pi_guest;
 
-#[cfg(not(all(unix, target_os = "linux")))]
+#[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
 pub(crate) mod pi_guest {
     use crate::error::{Error, Result};
     /// Non-Linux builds fail closed: the protected launch seam does not exist
@@ -1130,11 +1131,31 @@ mod split_launch_tests {
                 on_event: Box::new(|_, _| {}),
                 on_request: Box::new(|_| {}),
             };
+            // Bind a real settings store so open() reaches the protected
+            // prerequisite gate instead of refusing on an unbound adapter.
+            let dir = tempfile::tempdir().unwrap();
+            let tracker = dir.path().join("pm");
+            crate::issue::Pm::init(&tracker).unwrap();
+            let store = std::sync::Arc::new(
+                crate::store::Store::open(&dir.path().join("cadence.sqlite3")).unwrap(),
+            );
+            let mut settings = store.import_legacy_settings(&tracker).unwrap();
+            settings.doc.pi = Some(
+                serde_json::from_value(serde_json::json!({
+                    "models": { "allow": ["devin/swe-2-high"] }
+                }))
+                .unwrap(),
+            );
+            store
+                .save_settings(settings.revision, settings.doc, "cad-1159-fixture")
+                .unwrap();
+            let env = ProviderEnv::refusing_providers().with_settings_store(store);
+            env.set("CADENCE_PM_DIR", tracker.to_str().unwrap());
             let adapter = build(
                 &agent,
                 hooks,
                 std::path::Path::new("/nonexistent/fixture.log"),
-                &ProviderEnv::refusing_providers(),
+                &env,
                 Some(21001),
             )
             .unwrap_or_else(|e| panic!("managed/{provider} constructs under split: {e}"));
@@ -1143,7 +1164,22 @@ mod split_launch_tests {
                 Err(e) => e,
                 Ok(_) => panic!("{provider}: open succeeded with the prerequisites unavailable"),
             };
-            assert!(e.to_string().contains("UNKNOWN"), "{provider}: {e}");
+            // x86_64-linux reaches the fixed-supervisor gate; every other
+            // target stops at the unsupported-target stub. Both are
+            // fail-closed, and each asserts its own exact refusal rather than
+            // accepting any earlier error.
+            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+            assert!(
+                e.to_string()
+                    .contains("protected Pi must be provisioned by the fixed supervisor"),
+                "{provider}: {e}"
+            );
+            #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
+            assert!(
+                e.to_string()
+                    .contains("protected managed-Pi launch is Linux-only"),
+                "{provider}: {e}"
+            );
         }
     }
     #[test]

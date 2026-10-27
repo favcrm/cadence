@@ -55,6 +55,37 @@ env:
   CADENCE_CI_SHARDS: ${{ github.event_name == 'workflow_dispatch' && inputs.test_shards == '4' && '4' || '8' }}
 
 jobs:
+  native-fixture-release-exclusion:
+    # C1 is an explicitly dispatched, isolated artifact check, not a fixture run.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - run: scripts/ci-rust-toolchain --profile minimal
+      - name: Run independent C1 matrix on this isolated runner
+        env:
+          CAD1159_RUNNER_ADMISSION_ID: github-actions:${{ github.repository }}:${{ github.run_id }}:${{ github.run_attempt }}
+        run: |
+          set -eu
+          parent=$(mktemp -d "$RUNNER_TEMP/cad1159-c1.XXXXXX")
+          echo "CAD1159_C1_OUTPUT=$parent/result" >> "$GITHUB_ENV"
+          python3 scripts/acceptance/cad1159-native-fixture/check-release-exclusion.py \
+            "$GITHUB_WORKSPACE" "$parent/result"
+      - name: Retain report and all case logs, including failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cad1159-c1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.CAD1159_C1_OUTPUT }}/report.json
+            ${{ env.CAD1159_C1_OUTPUT }}/logs/
+          if-no-files-found: warn
+          retention-days: 14
+
   # CAD-926: rust-cache scope. Only `cache-warm` (push to main) SAVES the gate
   # profiles' caches, under the shared keys gate-test-ld1, gate-release and
   # gate-clippy (CAD-1493: -ldN is the linker/fingerprint epoch — bump it when
@@ -539,6 +570,11 @@ jobs:
         run: |
           if grep -aq 'cadence-test-seam-v1' target/ci/cadence; then
             echo "release binary contains the CAD-482 test seam" >&2
+            exit 1
+          fi
+          # S-VIEW-1 diagnostic seam (src/adapter/pi_guest/diag_seam.rs) marker.
+          if grep -aq 'cadence-n1-s-view-1-isolate-seam-refusal-v1' target/ci/cadence; then
+            echo "release binary contains the S-VIEW-1 diagnostic seam" >&2
             exit 1
           fi
       # CAD-482: the grep above proves the shipped binary carries no

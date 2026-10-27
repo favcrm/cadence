@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
@@ -864,13 +863,17 @@ impl IndexRefresh {
     }
 
     /// Spawn the refresh worker thread; the returned handle is joined at
-    /// shutdown after `close`.
-    pub fn spawn(self: &Arc<Self>) -> thread::JoinHandle<()> {
+    /// shutdown after `close`. Refusal is reported, never a panic.
+    pub(crate) fn spawn(self: &Arc<Self>) -> Option<crate::thread_budget::Budgeted<()>> {
         let me = Arc::clone(self);
-        thread::Builder::new()
-            .name("wiki-index-refresh".to_string())
-            .spawn(move || me.run())
-            .expect("spawn wiki-index-refresh")
+        match crate::thread_budget::spawn_named("wiki-index-refresh".to_string(), move || me.run())
+        {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                eprintln!("cadence: wiki index refresh not started: {e}");
+                None
+            }
+        }
     }
 }
 

@@ -15,14 +15,10 @@
 //! the facade + `'t`/`R: 'static` bounds keep a prepared write inside the
 //! armed window.
 //!
-//! `OpenMode::Protected` is a *request* from already-authenticated daemon
-//! startup provenance (`agent_uid`/`hosted.lease` `ServeOptions`) — it
-//! forces the strict refusals, it never grants restore/init eligibility.
-//! Without separately-proven external pre-start provenance the production
-//! protected constructor is unreachable: a real protected open is
-//! `Err(Unknown)`; only `#[cfg(test)]`/fixture construction reaches a
-//! guarded protected connection. No runtime or provisioning `InitPermit`
-//! factory exists.
+//! `OpenMode::Protected` remains a refusal-only selector. Positive protected
+//! opening requires an authenticated, externally consumed Store owner grant
+//! before file creation, recovery or WAL mutation. Fresh init and externally
+//! validated restore are distinct; no snapshot marker elects an incarnation.
 
 use crate::error::{Error, Result};
 use rusqlite::hooks::{AuthAction, Authorization};
@@ -32,6 +28,21 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use super::Store;
+
+#[path = "owner.rs"]
+pub(crate) mod owner;
+
+#[cfg(any(
+    test,
+    all(
+        debug_assertions,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )
+))]
+#[path = "owner_guard.rs"]
+pub(crate) mod owner_guard;
 
 /// Raw SQLite callers must distinguish a lease refusal from a closure
 /// refusal or a callback rejection. Only this module can construct the
@@ -74,7 +85,7 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// marker and triggers; v55 (CAD-1353) adds `messages.stall_secs`; v56
 /// (CAD-1726) adds the `artifacts` table. None
 /// changes a latch or witness table, so the bound extends to 56.
-const PROTECTED_SCHEMA_MAX: i64 = 56;
+pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 56;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -87,6 +98,7 @@ pub(super) struct GuardState {
     /// 0 = Callback (deny tx-boundary), 1 = TxControl (guard's own
     /// BEGIN/COMMIT/ROLLBACK/SAVEPOINT window).
     phase: AtomicU8,
+    pub(super) owner: std::sync::Mutex<Option<owner::CurrentDatabase>>,
 }
 impl GuardState {
     const DISARMED: u8 = 0;
@@ -120,18 +132,16 @@ pub(super) enum OwnerOp {
 /// let a caller reshape a permit mid-flight. `consumed` makes the
 /// barrier one-use: `take()` flips the flag once; a second maintenance
 /// call on the same permit refuses. A caller can never mint one — only
-/// `OwnerMaintenancePermit::issue` (authenticated external authority,
-/// unreachable in this build) and the `#[cfg(test)]` synthetic factory
-/// produce one.
+/// `OwnerMaintenancePermit::issue` (opaque authenticated private owner grant)
+/// and the `#[cfg(test)]` synthetic factory produce one.
 pub(super) struct OwnerMaintenancePermit {
     /// The operation this permit authorizes — `Close` vs `Witness`; a
     /// permit issued for one operation refuses the other.
     op: OwnerOp,
     /// The database this permit authorizes — bound to the *recorded local
     /// identity* (the canonicalized path at open), so a permit minted for
-    /// one store cannot authorize maintenance on another. This is a local
-    /// identity binding only — it is NOT authenticated restore/incarnation
-    /// provenance (no external authority exists to supply one).
+    /// one store cannot authorize maintenance on another. Real grants ALSO
+    /// compare the external database id/incarnation/epoch under the writer lock.
     database_id: String,
     /// The closure challenge the sealed latch recorded.
     challenge: Vec<u8>,
@@ -145,31 +155,33 @@ pub(super) struct OwnerMaintenancePermit {
     deadline_unix: i64,
     /// One-use barrier — flipped by `take()`; a spent permit refuses.
     consumed: std::sync::atomic::AtomicBool,
+    grant: Option<owner::StoreOwnerGrant>,
 }
 
 impl OwnerMaintenancePermit {
-    /// The production authority path. There is no authenticated external
-    /// authority wired in this build, so issuing a permit always fails —
-    /// a caller cannot conjure owner authority locally.
-    ///
-    /// This is deliberately not `dead_code`-gated: the production `Err`
-    /// is the *correct* runtime behavior, and keeping it reachable keeps
-    /// the signature honest for the future authority wiring (CAD-1011's
-    /// final upload/public-RPC authority is explicitly out of scope).
-    #[allow(dead_code)]
-    pub(super) fn issue(
-        _database_id: &str,
-        _op: OwnerOp,
-        _challenge: &[u8],
-        _attempt: &str,
-        _artifact: &str,
-        _epoch: u64,
-        _deadline_unix: i64,
-    ) -> Result<Self> {
-        Err(Error::rejected(
-            "no authenticated external owner-maintenance authority is \
-             reachable — a production OwnerMaintenancePermit cannot be issued",
-        ))
+    /// Only the authenticated constructor relay supplies this opaque grant.
+    /// Binding selectors alone, a hosted lease or a launch grant cannot.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(super) fn issue(grant: owner::StoreOwnerGrant) -> Result<Self> {
+        let b = grant.binding();
+        b.validate()?;
+        let op = match b.purpose {
+            owner::Purpose::Close => OwnerOp::Close,
+            owner::Purpose::Witness => OwnerOp::Witness,
+            _ => return Err(Error::rejected("not a Store maintenance grant")),
+        };
+        grant.recheck()?;
+        Ok(Self {
+            op,
+            database_id: b.path.clone(),
+            challenge: b.challenge.clone(),
+            attempt: b.attempt.clone(),
+            artifact: b.artifact.clone(),
+            epoch: b.database_epoch,
+            deadline_unix: b.deadline_unix,
+            consumed: std::sync::atomic::AtomicBool::new(false),
+            grant: Some(grant),
+        })
     }
 
     /// Test-only synthetic factory — `#[cfg(test)]` so a release build
@@ -194,7 +206,21 @@ impl OwnerMaintenancePermit {
             epoch,
             deadline_unix,
             consumed: std::sync::atomic::AtomicBool::new(false),
+            grant: None,
         }
+    }
+
+    fn recheck(&self, conn: &Connection) -> Result<()> {
+        if self.deadline_unix <= super::now() as i64 {
+            return Err(Error::rejected(
+                "owner-maintenance permit is past its deadline",
+            ));
+        }
+        if let Some(grant) = &self.grant {
+            grant.recheck()?;
+            owner::check_identity(conn, grant.binding(), false)?;
+        }
+        Ok(())
     }
 
     /// Consume the one-use barrier for `expected` operation — refuses a
@@ -219,6 +245,10 @@ impl OwnerMaintenancePermit {
                 "owner-maintenance permit is already consumed",
             ));
         }
+        if let Some(grant) = &self.grant {
+            // Burn before dispatch; missing external ACK is UNKNOWN, never retry.
+            grant.consume()?;
+        }
         Ok(())
     }
 
@@ -232,16 +262,17 @@ impl OwnerMaintenancePermit {
 /// restores `Disarmed`. The write window cannot outlive its tx.
 struct ArmGuard<'a> {
     state: &'a GuardState,
+    previous: u8,
 }
 impl<'a> ArmGuard<'a> {
     fn enter(state: &'a GuardState, level: u8) -> Self {
-        state.arm.store(level, Ordering::SeqCst);
-        Self { state }
+        let previous = state.arm.swap(level, Ordering::SeqCst);
+        Self { state, previous }
     }
 }
 impl Drop for ArmGuard<'_> {
     fn drop(&mut self) {
-        self.state.arm.store(GuardState::DISARMED, Ordering::SeqCst);
+        self.state.arm.store(self.previous, Ordering::SeqCst);
     }
 }
 
@@ -495,7 +526,12 @@ pub(super) fn install_authorizer(conn: &Connection, state: Arc<GuardState>) {
             AuthAction::Insert { table_name }
             | AuthAction::Update { table_name, .. }
             | AuthAction::Delete { table_name }
-                if table_name == "closure_state" || table_name == "owner_witness" =>
+                if table_name == "closure_state"
+                    || table_name == "owner_witness"
+                    || table_name == "store_incarnation"
+                    || table_name == "store_business_highwater"
+                    || table_name == "store_witness_capture"
+                    || table_name == "schema_version" =>
             {
                 if armed == GuardState::OWNER {
                     Authorization::Allow
@@ -665,9 +701,11 @@ pub enum SealError {
 /// outside the `Store` (rollout `connect`/`immediate`, backup
 /// copy-transform sources). Refuses when the file carries a closure
 /// latch — sealed *or* open-latch — or when it can't be read. A
-/// latch-absent legacy db and a non-existent path pass, so scratch
-/// copies and pre-init files are untouched.
+/// latch-absent legacy db and a non-existent path pass outside the fixed
+/// protected enclave. Inside it, even absent/partial/shadow paths refuse;
+/// only authentic owner startup can initialize the protected database.
 pub(crate) fn preflight_writer_guard(path: &std::path::Path) -> Result<()> {
+    owner::refuse_legacy_path(path)?;
     if !path.exists() {
         return Ok(());
     }
@@ -705,6 +743,12 @@ pub(crate) fn require_legacy_writer_tx(tx: &Transaction<'_>) -> Result<()> {
     if tx.is_autocommit() {
         return Err(SealError::Unknown("sibling writer has no held transaction".into()).into());
     }
+    let (name, filename): (String, String) =
+        tx.query_row("PRAGMA database_list", [], |r| Ok((r.get(1)?, r.get(2)?)))?;
+    if name != "main" {
+        return Err(SealError::Unknown("sibling writer has no actual main database".into()).into());
+    }
+    owner::refuse_legacy_path(Path::new(&filename))?;
     match preflight_read(tx)
         .map_err(|e| SealError::Unknown(format!("held writer-guard read: {e}")))?
     {
@@ -732,9 +776,35 @@ pub(super) enum PreflightDecision {
 }
 
 impl Store {
+    /// Closed native diagnostic on the SAME genuinely opened Store. Root must
+    /// establish healthy original consumed/current custody and a writer-free
+    /// window outside this local probe; its result is not remote CAS evidence.
+    #[cfg(all(
+        debug_assertions,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub(crate) fn reconsume_owned_opening(&self) -> Result<()> {
+        let owner = self
+            .seal_state
+            .owner
+            .lock()
+            .map_err(|_| Error::rejected("retained opening replay Store owner is poisoned"))?;
+        owner
+            .as_ref()
+            .ok_or_else(|| {
+                Error::rejected("retained opening replay has no authenticated Store owner")
+            })?
+            .reconsume_opening()
+    }
+
     /// Read-only preflight on the file — zero business writes before the
     /// decision. Runs *before* the writable `Connection::open`/WAL flip.
     pub(super) fn preflight(path: &Path, mode: OpenMode) -> Result<PreflightDecision> {
+        if mode == OpenMode::Legacy {
+            owner::refuse_legacy_path(path)?;
+        }
         if !path.exists() {
             return match mode {
                 OpenMode::Protected => Err(SealError::Unknown(
@@ -791,6 +861,43 @@ impl Store {
                 Preflight::LatchAbsent => Ok(PreflightDecision::LegacyOpen),
             },
         }
+    }
+
+    fn advance_business_highwater(&self, conn: &Connection) -> Result<()> {
+        if !self.protected_open {
+            return Ok(());
+        }
+        // A private owner-only row counts successful guarded business commits,
+        // not messages/events and never the distinct owner_witness sequence.
+        let _armed = ArmGuard::enter(&self.seal_state, GuardState::OWNER);
+        if conn.execute(
+            "UPDATE store_business_highwater SET sequence=sequence+1
+             WHERE id=1 AND sequence>=0 AND sequence<9007199254740991",
+            [],
+        )? != 1
+        {
+            return Err(Error::rejected(
+                "protected business highwater absent/malformed/exhausted",
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_owner_writer(&self, conn: &Connection) -> Result<()> {
+        let owner = self
+            .seal_state
+            .owner
+            .lock()
+            .map_err(|_| Error::rejected("Store owner binding is poisoned"))?;
+        if let Some(current) = owner.as_ref() {
+            current.recheck()?;
+            current.check_identity(conn)?;
+        } else if self.protected_open {
+            return Err(Error::rejected(
+                "protected Store has no authenticated incarnation",
+            ));
+        }
+        Ok(())
     }
 
     /// The durable closure check, evaluated inside the held
@@ -934,6 +1041,12 @@ impl Store {
                 "store write refused — the daemon's hosted lease is lost: {reason}"
             )));
         }
+        if arm == GuardState::BUSINESS {
+            if let Err(e) = self.check_owner_writer(&tx) {
+                Self::rollback_tx(state, &guard, tx)?;
+                return Err(e);
+            }
+        }
         // Producer/business writes refuse a sealed latch. `witness_commit`
         // is the owner barrier that legitimately writes *after* seal — it
         // passes `on_sealed` and verifies the latch itself inside `f`.
@@ -961,6 +1074,15 @@ impl Store {
                     return Err(Error::rejected(format!(
                         "store write refused — the daemon's hosted lease is lost: {reason}"
                     )));
+                }
+                if arm == GuardState::BUSINESS {
+                    if let Err(e) = self
+                        .advance_business_highwater(&tx)
+                        .and_then(|()| self.check_owner_writer(&tx))
+                    {
+                        Self::rollback_tx(state, &guard, tx)?;
+                        return Err(e);
+                    }
                 }
                 let _ctrl = ControlPhase::enter(state);
                 // Never infer nonpublication from autocommit after COMMIT error.
@@ -1017,6 +1139,13 @@ impl Store {
             }
             return Err(raw_lease_refusal(reason));
         }
+        if arm == GuardState::BUSINESS {
+            if let Err(e) = self.check_owner_writer(&tx) {
+                Self::rollback_tx(state, &guard, tx)
+                    .map_err(|rb| rusqlite::Error::ToSqlConversionFailure(Box::new(rb)))?;
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)));
+            }
+        }
         if !on_sealed {
             if let Err(e) = Self::check_closed_tx(&tx) {
                 if let Err(rb) = Self::rollback_tx(state, &guard, tx) {
@@ -1036,6 +1165,16 @@ impl Store {
                         return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(rb)));
                     }
                     return Err(raw_lease_refusal(reason));
+                }
+                if arm == GuardState::BUSINESS {
+                    if let Err(e) = self
+                        .advance_business_highwater(&tx)
+                        .and_then(|()| self.check_owner_writer(&tx))
+                    {
+                        Self::rollback_tx(state, &guard, tx)
+                            .map_err(|rb| rusqlite::Error::ToSqlConversionFailure(Box::new(rb)))?;
+                        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)));
+                    }
                 }
                 let _ctrl = ControlPhase::enter(state);
                 tx.commit()?;
@@ -1246,6 +1385,11 @@ impl Store {
     where
         R: 'static,
     {
+        if self.protected_open {
+            return Err(Error::rejected(
+                "fixture writes cannot mutate a protected Store",
+            ));
+        }
         // Owner arm so fixture DDL (CREATE/ALTER) is authorized; the
         // restricted WriteTxn facade still forbids a tx boundary. This
         // test-only owner scope may seed latch/witness rows; it is never
@@ -1288,7 +1432,14 @@ impl Store {
         let safe = matches!(
             preflight_read(&tx),
             Ok(Preflight::LatchAbsent) | Ok(Preflight::LatchOpen)
-        );
+        ) && state.owner.lock().is_ok_and(|owner| {
+            owner.as_ref().is_none_or(|current| {
+                current
+                    .recheck()
+                    .and_then(|()| current.check_identity(&tx))
+                    .is_ok()
+            })
+        });
         if !safe {
             // Transaction::drop ignores a denied rollback in Callback.
             // Refusal must explicitly relinquish the writer under the
@@ -1330,8 +1481,8 @@ impl Store {
     /// by an [`OwnerMaintenancePermit`]. The permit is consumed one-use
     /// and its `challenge`/`attempt`/`epoch` are bound into the latch row
     /// so a later `witness_commit` must present the *same* permit binding.
-    /// A caller can never mint the owner arm or a permit — synthetic in
-    /// this draft (production `Protected` open is unreachable).
+    /// A caller cannot mint the owner arm or a permit from selectors. Real
+    /// permits retain the private authenticated owner channel.
     #[allow(dead_code)]
     pub(super) fn propose_close(
         &self,
@@ -1354,7 +1505,7 @@ impl Store {
         // Closure authority is independent of the producer's hosted lease:
         // losing that lease must not prevent an externally authorized owner
         // from closing the producer. A Fence never grants this permit.
-        // Production permit issuance remains unavailable in this build.
+        // The external grant is already consumed; ACK loss never permits replay.
         self.sealed_tx(GuardState::OWNER, false, |wtx| {
             // Re-check the deadline + one-use inside the held tx — the
             // DML below must not outlive the permit's authority window.
@@ -1363,14 +1514,26 @@ impl Store {
                     "owner-maintenance permit is past its deadline",
                 ));
             }
+            permit.recheck(wtx.tx)?;
             wtx.execute_batch(SEAL_SCHEMA)?;
+            if permit.grant.is_some() {
+                let (closed, epoch, done): (i64, i64, i64) = wtx.query_row(
+                    "SELECT closed,epoch,witness_done FROM closure_state WHERE id=1", [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+                if closed != 0 || epoch != permit.epoch as i64 || done != 0 {
+                    return Err(Error::rejected("close permit does not match the current open epoch"));
+                }
+            }
             // The latch binds challenge + attempt + the exact artifact +
             // epoch — a later witness must present the same binding.
             wtx.execute(
                 "INSERT INTO closure_state(id,closed,reason,challenge,attempt,artifact,epoch,witness_done,closed_at)
                  VALUES(1,1,?,?,?,?,?,0,?)
-                 ON CONFLICT(id) DO UPDATE SET closed=1,reason=excluded.reason,closed_at=excluded.closed_at
-                   WHERE closure_state.witness_done=0",
+                 ON CONFLICT(id) DO UPDATE SET closed=1,reason=excluded.reason,
+                   challenge=excluded.challenge,attempt=excluded.attempt,artifact=excluded.artifact,
+                   epoch=excluded.epoch,closed_at=excluded.closed_at
+                   WHERE closure_state.closed=0 AND closure_state.witness_done=0",
                 rusqlite::params![
                     reason,
                     permit.challenge.as_slice(),
@@ -1380,6 +1543,7 @@ impl Store {
                     super::now()
                 ],
             )?;
+            permit.recheck(wtx.tx)?;
             Ok(())
         })
     }
@@ -1390,8 +1554,8 @@ impl Store {
     /// one-use and *every* binding — database identity, challenge, close
     /// attempt, artifact identity, epoch and deadline — must equal the
     /// durable latch sealed by `propose_close`; a mismatch refuses before
-    /// a single row writes. Synthetic/test in this draft (production
-    /// `Protected` open is unreachable).
+    /// a single row writes. Authentic permits bind the external incarnation;
+    /// only cfg(test) fixtures can use a synthetic permit.
     #[allow(dead_code)]
     pub(super) fn witness_commit(&self, permit: &OwnerMaintenancePermit) -> Result<u64> {
         // A Witness permit only — a Close permit cannot commit a witness.
@@ -1416,6 +1580,7 @@ impl Store {
                     "owner-maintenance permit is past its deadline",
                 ));
             }
+            permit.recheck(wtx.tx)?;
             let (closed, wdone, schallenge, sattempt, sartifact, sepoch): (
                 i64,
                 i64,
@@ -1527,7 +1692,19 @@ impl Store {
                 ],
             )?;
             let seq = wtx.query_row("SELECT last_insert_rowid()", [], |r| r.get::<_, i64>(0))?;
+            if permit.grant.is_some() && !(1..=owner::MAX_OWNER_INTEGER).contains(&seq) {
+                return Err(Error::rejected("owner witness sequence cannot cross the external exact-integer boundary"));
+            }
             wtx.execute("UPDATE closure_state SET witness_done=1 WHERE id=1", [])?;
+            if permit.grant.is_some() && wtx.execute(
+                "INSERT INTO store_witness_capture(witness_seq,business_highwater,captured_at)
+                 SELECT ?1,sequence,?2 FROM store_business_highwater WHERE id=1
+                   AND sequence>=0 AND sequence<=9007199254740991",
+                rusqlite::params![seq, super::now()],
+            )? != 1 {
+                return Err(Error::rejected("witness has no exact business highwater"));
+            }
+            permit.recheck(wtx.tx)?;
             Ok(seq as u64)
         })
     }
@@ -2473,27 +2650,37 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_protected_hook_guard_only_rejects_an_actual_hook() {
+    fn shutdown_protected_missing_owner_and_hook_registration_are_refused() {
         let dir = TempDir::new().unwrap();
         let (_, mut store) = open_legacy(&dir);
-        // This toggles only the dormant hook guard; it does not qualify
-        // or construct a production Protected store (which still refuses).
+        // A flag cannot install authenticated ownership. This deliberately
+        // invalid state must refuse even an empty drain, without a hook.
         store.protected_open = true;
-        assert!(store
+        let err = store
             .shutdown_entries(&std::collections::HashMap::new())
-            .is_ok());
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("protected Store has no authenticated incarnation"),
+            "missing owner must reach the actual writer refusal: {err}"
+        );
+        assert!(!err.is_fenced(), "missing owner is not lease loss: {err}");
+        assert!(store.conn().is_autocommit());
         assert!(store
             .set_shutdown_entries_hook(Some(Arc::new(|_| panic!("hook must not run"))))
             .is_err());
-        // Simulate corrupted registration to prove execution also refuses.
+        // Corrupt registration cannot bypass the missing-owner guard or run
+        // the callback. This is not an authenticated hook-execution fixture.
         store.shutdown_entries_hook = Some(Arc::new(|_| panic!("hook must not run")));
         let err = store
             .shutdown_entries(&std::collections::HashMap::new())
             .unwrap_err();
         assert!(
-            !err.is_fenced(),
-            "hook policy failure is not lease loss: {err}"
+            err.to_string()
+                .contains("protected Store has no authenticated incarnation"),
+            "a hook must not bypass missing-owner refusal: {err}"
         );
+        assert!(!err.is_fenced(), "missing owner is not lease loss: {err}");
         assert!(store.conn().is_autocommit());
     }
 

@@ -3,11 +3,40 @@
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 
-// Existing unresolved release slot, NOT the locally captured candidate election.
-#[cfg_attr(not(all(unix, target_os = "linux")), allow(dead_code))] // only pi_guest (linux) uses this
+/// Fixed image topology. Digests/entrypoints come only from the authenticated
+/// private image owner, never a candidate capture or a helper caller.
+// The daemon's lib path never opens the image; only the fixed helper binary
+// (`cadence-agent-exec`), which compiles the graph module separately, reads it.
+#[allow(dead_code)]
+pub(crate) const IMAGE_ROOT: &str = "/opt/cadence/pi";
+#[cfg_attr(
+    not(all(unix, target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)] // only the protected linux x86_64 helper/pi_guest path reads these
 pub(crate) const NODE_PATH: &str = "/opt/cadence/pi/node";
-#[cfg_attr(not(all(unix, target_os = "linux")), allow(dead_code))] // only pi_guest (linux) uses this
+/// Constructor-selected independently pinned artifact; no second helper/SUID election.
+#[cfg_attr(
+    not(all(unix, target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)] // only the protected helper/pi_guest path on linux x86_64 reads this
+pub(crate) const HELPER_PATH: &str = "/opt/protected/bin/cadence-agent-exec";
+#[cfg_attr(
+    not(all(unix, target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)] // only the protected linux x86_64 helper/pi_guest path reads this
 pub(crate) const NODE_DIGEST: Option<[u8; 32]> = None;
+#[cfg_attr(
+    not(all(unix, target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)] // consumed only by the protected linux x86_64 helper/constructor path
+#[path = "adapter/pi_guest/authority.rs"]
+pub(crate) mod authority;
+#[cfg_attr(
+    not(all(unix, target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)] // consumed only by the protected linux x86_64 helper/constructor path
+#[path = "adapter/pi_guest/purpose.rs"]
+pub(crate) mod purpose;
 
 #[derive(Debug)]
 #[allow(dead_code)] // Used by the cadence-agent-exec helper (#[path] include), not by the lib.
@@ -65,7 +94,29 @@ impl Profile {
     pub(crate) fn routing(&self) -> &Routing {
         &self.routing
     }
+    pub(crate) fn selection(&self) -> Result<authority::Selection, String> {
+        let selection = authority::Selection {
+            alias_sha256: self.alias_sha256.clone(),
+            generation: self.generation.clone(),
+            role: if self.routing.no_session {
+                authority::Role::Master
+            } else {
+                authority::Role::Worker
+            },
+            model: self
+                .routing
+                .model
+                .clone()
+                .ok_or("protected owner requires explicit model")?,
+        };
+        selection.validate().map_err(|e| e.to_string())?;
+        Ok(selection)
+    }
 }
+#[cfg_attr(
+    not(all(unix, target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)] // the token split is consumed only by the protected linux x86_64 launch path
 impl Routing {
     pub(crate) fn parse(args: &[OsString]) -> Result<Self, String> {
         if !(2..=5).contains(&args.len()) || args[0] != "--mode" || args[1] != "rpc" {

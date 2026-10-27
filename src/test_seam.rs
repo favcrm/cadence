@@ -54,6 +54,21 @@ compile_error!(
      be compiled into a release build (CAD-482)"
 );
 
+// CAD-1159 SEC-002: the fixture image-authority adapter exists only inside
+// the separately labelled debug + test-seam artifact. Every other
+// combination — each release build, or a debug build without the test seam —
+// refuses compilation here; the compiler cfg, never PROFILE, is
+// authoritative.
+#[cfg(all(
+    feature = "native-fixture-admission",
+    not(all(debug_assertions, feature = "test-seam"))
+))]
+compile_error!(
+    "feature `native-fixture-admission` admits an owner-elected fixture \
+     image-verification root; it requires a debug build with the test seam \
+     (native-fixture-admission-requires-debug-test-seam)"
+);
+
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -259,6 +274,20 @@ pub fn scope_headers(
 /// `daemon run`'s arming env, feature-gated at the call site.
 pub fn env_armed() -> bool {
     cfg!(feature = "test-seam") && std::env::var_os(ARM_ENV).is_some()
+}
+
+/// Observe the same fixed-image Pi trust gate used before helper/client effects.
+/// The bounded frame contains only version, selection, launch and signed data.
+/// No asserted caller, keys, clock, path, callback or custody proof is accepted;
+/// success returns no authority and performs no launch/current/consume effects.
+#[cfg(all(
+    debug_assertions,
+    feature = "test-seam",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub fn protected_pi_launch_trust_before_effects(frame: &[u8]) -> std::io::Result<()> {
+    crate::adapter::pi_guest::launch_trust_before_effects(frame)
 }
 
 // ---------------- implementation ----------------

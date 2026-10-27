@@ -34,11 +34,11 @@ pub(super) struct LeaseHeartbeat {
     /// in-flight store writer; before that the shared fence alone
     /// refuses every write the store will make.
     shared: Arc<OnceLock<Arc<Shared>>>,
-    handle: Option<thread::JoinHandle<()>>,
+    handle: Option<crate::thread_budget::Budgeted<()>>,
 }
 
 impl LeaseHeartbeat {
-    pub(super) fn start(state_dir: &Path, lease: &Arc<crate::lease::LeaseCtl>) -> Self {
+    pub(super) fn start(state_dir: &Path, lease: &Arc<crate::lease::LeaseCtl>) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let shared: Arc<OnceLock<Arc<Shared>>> = Arc::new(OnceLock::new());
         let handle = {
@@ -47,16 +47,16 @@ impl LeaseHeartbeat {
             // Named `lh-` + the state dir's last 12 name chars, so a test
             // can observe its own poster's lifetime against the lease
             // release (15 chars: the Linux `comm` limit).
-            thread::Builder::new()
-                .name(Self::thread_name(&state_dir))
-                .spawn(move || Self::run(&state_dir, &lease, &stop, &shared))
-                .expect("spawn lease heartbeat")
+            crate::thread_budget::spawn_named(Self::thread_name(&state_dir), move || {
+                Self::run(&state_dir, &lease, &stop, &shared)
+            })
+            .map_err(|e| crate::Error::internal(format!("lease heartbeat not started: {e}")))?
         };
-        Self {
+        Ok(Self {
             stop,
             shared,
             handle: Some(handle),
-        }
+        })
     }
 
     /// The poster's OS thread name for `state_dir`.
@@ -646,7 +646,7 @@ pub(super) fn lease_flush(
     let shared = Arc::clone(shared);
     let cancel = Arc::new(crate::issue::FlushCancel::default());
     let worker_cancel = Arc::clone(&cancel);
-    let worker = thread::spawn(move || {
+    let worker = crate::thread_budget::spawn(move || {
         let cancel = worker_cancel;
         // Test seam (CAD-694): a parked gate models a flush still in
         // flight when the budget lapses — the tail must then keep the
@@ -685,6 +685,13 @@ pub(super) fn lease_flush(
     // (checkpoint, the synchronous `git commit`) finished by then.
     // `false` means the worker may still be writing: callers must not
     // release the lease under it.
+    let worker = match worker {
+        Ok(worker) => worker,
+        Err(e) => {
+            eprintln!("cadence: shutdown flush not started: {e} — completion unproven");
+            return false;
+        }
+    };
     if rx.recv_timeout(budget).is_err() {
         eprintln!("cadence: shutdown flush exceeded {budget:?} — completion unproven");
         // The budget lapsed: the worker may still own a `git commit`.
@@ -1053,11 +1060,14 @@ pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
                     };
                     let shared = Arc::clone(shared);
                     let message_id = message.id.clone();
-                    std::thread::spawn(move || {
+                    match crate::thread_budget::spawn(move || {
                         if let Err(error) = shared.run_cloud_dispatch(&task_id, &message_id) {
                             eprintln!("cloud sandbox recovery {task_id} failed: {error}");
                         }
-                    });
+                    }) {
+                        Ok(thread) => thread.detach(),
+                        Err(e) => eprintln!("cadence: cloud dispatch recovery not started: {e}"),
+                    }
                 }
             }
             // No actor can prove these recovered panes; release any
@@ -1082,11 +1092,14 @@ pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
                     };
                     let shared = Arc::clone(shared);
                     let message_id = message.id.clone();
-                    std::thread::spawn(move || {
+                    match crate::thread_budget::spawn(move || {
                         if let Err(error) = shared.run_cloud_dispatch(&task_id, &message_id) {
                             eprintln!("cloud sandbox recovery {task_id} failed: {error}");
                         }
-                    });
+                    }) {
+                        Ok(thread) => thread.detach(),
+                        Err(e) => eprintln!("cadence: cloud dispatch recovery not started: {e}"),
+                    }
                 }
             }
             shared.adoptions_settle(&agent.alias);

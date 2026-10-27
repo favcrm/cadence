@@ -44,6 +44,16 @@ path = "src/bin/cadence-installer-client/main.rs"
 name = "cadence-installer-observer"
 path = "src/bin/cadence-installer-observer/main.rs"
 
+# CAD-1159: fixed provider-stream root constructor. Draft activation stays
+# closed; independently elected public image roots are never caller supplied.
+[[bin]]
+name = "cadence-root-constructor"
+path = "src/bin/cadence-root-constructor/main.rs"
+
+[[bin]]
+name = "cadence-enrolled-recipient"
+path = "src/bin/cadence-enrolled-recipient/main.rs"
+
 [features]
 # Embed the built `ui/` SPA into the binary. Requires `bun run build` inside
 # `ui/` first; without the feature `cadence ui run --dist <dir>` serves
@@ -54,6 +64,14 @@ ui = []
 # and review tests can inject proc roots. The compile_error! in
 # src/test_seam.rs keeps these seams out of every release build.
 test-seam = []
+# CAD-1159 SEC-002: admit an owner-elected PUBLIC fixture image-verification
+# root into a separately labelled debug/test-seam constructor artifact. Opt-in
+# only, never a default: the compile_error! in src/test_seam.rs refuses every
+# combination other than debug_assertions + test-seam + this feature, and
+# build.rs admits only the fixed private descriptor
+# .cadence/native-fixture-public-root-v1.txt — no env/argv/request key path.
+native-fixture-admission = []
+
 # CAD-1568: manual cross-repository CLI/runtime acceptance. The ignored
 # packaged-CLI scenario drives a `cargo build --features test-seam` binary
 # against real AOS test handlers; never part of ordinary `cargo test`.

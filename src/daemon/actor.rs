@@ -14,7 +14,6 @@ use crate::store::{self, Agent, Message, Take};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 impl Shared {
@@ -112,7 +111,8 @@ impl Shared {
         let shared = Arc::clone(self);
         let owned = alias.to_string();
         let spawned = Arc::clone(&ctl);
-        let handle = thread::spawn(move || shared.run_actor(&owned, spawned));
+        let handle = crate::thread_budget::spawn(move || shared.run_actor(&owned, spawned))
+            .map_err(|e| Error::internal(format!("actor thread not started: {e}")))?;
         *ctl.thread.lock().unwrap() = Some(handle);
         lc.agents.insert(alias.to_string(), ctl);
         Ok(true)
@@ -212,10 +212,24 @@ impl Shared {
         // Release the alias only after cleanup and the final state write:
         // until this removal, lifecycle callers still see the agent owned.
         let mut lc = self.lifecycle.lock().unwrap();
-        if lc.agents.get(alias).is_some_and(|c| Arc::ptr_eq(c, &ctl)) {
+        let removed = if lc.agents.get(alias).is_some_and(|c| Arc::ptr_eq(c, &ctl)) {
             lc.agents.remove(alias);
-        }
+            true
+        } else {
+            false
+        };
         drop(lc);
+        if removed {
+            // The actor cannot join itself. Hand its budget unit to the reaper,
+            // which joins after this thread exits and only then releases it.
+            // `try_lock` keeps teardown from blocking on a handle someone else
+            // is joining; a contended lock leaks the unit (fail closed).
+            if let Ok(mut thread) = ctl.thread.try_lock() {
+                if let Some(thread) = thread.take() {
+                    thread.detach();
+                }
+            }
+        }
         self.wake();
     }
 

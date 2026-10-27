@@ -140,12 +140,17 @@ fn namespace(dir: &File, name: &str) -> Result<(u64, u64)> {
     let m = f.metadata().map_err(|_| refused())?;
     Ok((m.dev(), m.ino()))
 }
-fn namespaces(dir: &File) -> Result<Namespaces> {
+pub(super) fn namespaces(dir: &File) -> Result<Namespaces> {
     Ok(Namespaces {
         user: namespace(dir, "ns/user")?,
         pid: namespace(dir, "ns/pid")?,
         mount: namespace(dir, "ns/mnt")?,
     })
+}
+pub(super) fn capture_namespaces(deadline: Deadline) -> Result<Namespaces> {
+    deadline.check()?;
+    let dir = File::open("/proc/self").map_err(|_| refused())?;
+    namespaces(&dir)
 }
 pub(super) fn self_namespaces(expected: &Namespaces, deadline: Deadline) -> Result<()> {
     deadline.check()?;

@@ -655,7 +655,7 @@ fn parse_request(v: &serde_json::Value) -> Result<LaunchRequest> {
     })
 }
 
-fn parse_launch(v: &serde_json::Value) -> Result<LaunchBinding> {
+pub(crate) fn parse_launch(v: &serde_json::Value) -> Result<LaunchBinding> {
     let m = obj_exact(v, &["epoch", "request"])?;
     Ok(LaunchBinding {
         request: parse_request(m.get("request").unwrap())?,
@@ -721,7 +721,7 @@ fn parse_pins(v: &serde_json::Value) -> Result<Pins> {
     })
 }
 
-fn parse_lineage(v: &serde_json::Value) -> Result<Lineage> {
+pub(crate) fn parse_lineage(v: &serde_json::Value) -> Result<Lineage> {
     let m = obj_exact(v, &["databaseEpoch", "reference"])?;
     let reference = sget(m, "reference")?;
     if !is_lineage_ref(reference) {
@@ -984,8 +984,14 @@ impl VerifiedEnvelope {
     }
 }
 pub(super) fn production_grant_keyring() -> Result<&'static [&'static [u8]]> {
-    let _ = SUPERVISOR_KEYRING;
-    Err(Error::unknown("grant keyring unavailable"))
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        crate::installer_bundle::constructor::grant_keys()
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    Err(Error::unknown(
+        "qualified constructor grant keyring unavailable",
+    ))
 }
 /// Reuses BOTH existing parsers. The receipt binding bytes are already verified
 /// canonical; parsing its challenge preserves optional imageLane presence.
