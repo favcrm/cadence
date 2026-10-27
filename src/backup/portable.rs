@@ -1919,29 +1919,46 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
     // the agent keeps its state, the attention marker and the note's
     // reference, without the quoted text.
     tx.execute("UPDATE agents SET error=NULL", [])?;
-    // Provider transcript that had no running message when it arrived is
-    // canonical history with NO binding: an unbound assistant text, tool call
-    // or tool result can quote a turn whose cloud operation is omitted, and
-    // nothing ties it back. A portable export carries the bound conversation,
-    // not unbound provider transcript.
-    tx.execute(
-        "DELETE FROM thread_entries WHERE message_id IS NULL \
-           AND kind IN ('assistant_text','tool_call','tool_result')",
-        [],
-    )?;
+    // Provider transcript and runtime notes that had no running message when
+    // they arrived are canonical history with NO binding: an unbound entry can
+    // quote a turn whose cloud operation is omitted, and nothing ties it back.
+    // A portable export carries the BOUND conversation, not unbound provider
+    // or runtime transcript.
+    tx.execute("DELETE FROM thread_entries WHERE message_id IS NULL", [])?;
     // A brokered permission notice copies the tool command/input summary into
     // its delivery body. The notice row, its sender and its state stay; the
     // copied prose does not.
+    // A brokered notice quotes the tool command/input summary that produced
+    // it, and that prose is copied into its receipt, its completion event, its
+    // thread entry and the entry's own error payload. The notice row, its
+    // sender, state and binding stay; every copy of the quoted text goes.
     tx.execute(
-        "UPDATE messages SET body='' WHERE source='worker_notice'",
+        "UPDATE messages SET body='', result=NULL, error=NULL WHERE source='worker_notice'",
         [],
     )?;
-    // The canonical enqueue copies that body into the notice's own thread
-    // entry, so blanking the message alone leaves the prose one table over.
-    // The entry keeps its row, kind and binding; the copied text goes.
+    tx.execute(
+        "UPDATE thread_entries SET text='', \
+           payload=json_remove(payload,'$.error') \
+          WHERE message_id IN (SELECT id FROM messages WHERE source='worker_notice') \
+            AND json_valid(payload)",
+        [],
+    )?;
     tx.execute(
         "UPDATE thread_entries SET text='' \
           WHERE message_id IN (SELECT id FROM messages WHERE source='worker_notice')",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE events SET payload=json_remove(payload,'$.result') \
+          WHERE kind='turn_finished' AND json_valid(payload) \
+            AND json_extract(payload,'$.message') IN \
+                (SELECT id FROM messages WHERE source='worker_notice')",
+        [],
+    )?;
+    // A provider session reset keeps the provider's error text in its event.
+    tx.execute(
+        "UPDATE events SET payload=json_remove(payload,'$.error') \
+          WHERE kind='provider_session_reset' AND json_valid(payload)",
         [],
     )?;
     tx.execute(
