@@ -125,6 +125,25 @@ pub(super) struct CloudProjection {
     viewer: Option<String>,
     /// The connection is provably the operator.
     operator: bool,
+    /// Why cloud content was withheld for this read, if it was. The read still
+    /// succeeds and the page carries this, so a reader is told the cloud
+    /// history is incomplete rather than shown an empty one as if complete.
+    pub(super) withheld: Option<String>,
+}
+
+impl Default for CloudProjection {
+    /// Nothing admitted: every row withholds. The fail-closed projection for
+    /// content that cannot be classified at all.
+    fn default() -> Self {
+        Self {
+            scopes: Vec::new(),
+            derived: std::collections::HashMap::new(),
+            ordinary: std::collections::BTreeSet::new(),
+            viewer: None,
+            operator: false,
+            withheld: None,
+        }
+    }
 }
 
 impl CloudProjection {
@@ -136,6 +155,7 @@ impl CloudProjection {
             ordinary: std::collections::BTreeSet::new(),
             viewer: None,
             operator: false,
+            withheld: None,
         }
     }
 
@@ -158,6 +178,7 @@ impl CloudProjection {
             ordinary: ordinary.into_iter().collect(),
             viewer,
             operator,
+            withheld: None,
         }
     }
 
@@ -601,17 +622,19 @@ impl Shared {
                 .agent_opt(alias)?
                 .is_some_and(|agent| agent.provider == crate::cloud_agent::PROVIDER);
             if cloud_target || self.store.alias_has_cloud_content(alias)? {
-                return Err(Error::gate_coded(
-                    "cloud_agent_authority_missing",
-                    format!(
-                        "{verb} refused: this alias holds cloud-agent content but no cloud \
-                         connection authority resolves; reconnect it explicitly"
-                    ),
-                ));
+                // Content with no authority to classify it: admit nothing and
+                // say why. The read still answers, so the page loads and the
+                // reader is told the cloud history is unavailable rather than
+                // shown it.
+                return Ok(CloudProjection {
+                    withheld: Some("cloud_agent_authority_missing".to_string()),
+                    ..CloudProjection::default()
+                });
             }
             return self.admit_derived_cloud_rows(alias, peer_pid);
         }
         let mut scopes = Vec::with_capacity(cloud_agents.len());
+        let mut withheld: Option<String> = None;
         for agent in cloud_agents {
             let (_, source) = self.cloud_agent_caller_source(&agent, peer_pid, verb)?;
             // FIRST the snapshot, before any authority proof: every operation
@@ -639,13 +662,26 @@ impl Shared {
             // credential/enrollment — not bare membership: a write-only
             // operator must not read stored replies through a generic
             // projection.
-            self.cloud_agent_authority(&agent, &source, SCOPE_READ)?;
+            if let Err(error) = self.cloud_agent_authority(&agent, &source, SCOPE_READ) {
+                // The verb still answers: authority covers this scope's cloud
+                // content, not the rest of the Thread.
+                withheld = Some(error.code().unwrap_or("cloud_agent_authority").to_string());
+                continue;
+            }
             // The local copy proves what the workspace STORED, not what the
             // platform still allows: a read scope revoked upstream leaves the
             // saved login valid and unexpired. The platform's own answer is
             // required before any stored cloud text is projected — and its
             // state decides whether the stored receipt may be shown at all.
-            let answer = self.cloud_read_authority(&agent, &source)?;
+            let answer = match self.cloud_read_authority(&agent, &source) {
+                Ok(answer) => answer,
+                Err(error) => {
+                    // Refused, unreachable or contradictory: no stored cloud
+                    // text for this scope, and nothing presented as complete.
+                    withheld = Some(error.code().unwrap_or("cloud_agent_uncertain").to_string());
+                    continue;
+                }
+            };
             // Decided from the snapshot AND the answer together: the snapshot
             // names the operations, the answer may only change the state of
             // one it names. It never ADMITS an operation the snapshot did not
@@ -676,7 +712,9 @@ impl Shared {
                 admitted,
             });
         }
-        Ok(CloudProjection::cloud(scopes))
+        let mut projection = CloudProjection::cloud(scopes);
+        projection.withheld = withheld;
+        Ok(projection)
     }
 
     /// The one policy for a routed cloud row: the operator, the delivery's
@@ -736,9 +774,36 @@ impl Shared {
             // rows; its ordinary mail still projects as before.
             Ok(caller_rule::Who::Unproven(_)) | Err(_) => (None, false),
         };
-        Ok(CloudProjection::derived_rows(
-            rows, ordinary, viewer, operator,
-        ))
+        let mut projection = CloudProjection::derived_rows(rows, ordinary, viewer, operator);
+        // Provenance binds WHO may read a routed copy. It does not decide
+        // whether the read is still allowed: an upstream read revocation
+        // leaves the delivery binding intact, so each cloud connection behind
+        // these rows must answer for the caller before any of them is served.
+        // One refused, unreachable or unproven connection withholds the routed
+        // rows; the alias' own mail still projects.
+        if !projection.derived.is_empty() {
+            for agent_id in self.store.cloud_derived_origin_agents(alias)? {
+                let Some(agent) = self.store.cloud_agent(&agent_id)? else {
+                    projection.derived.clear();
+                    projection.withheld = Some("cloud_agent_authority_missing".to_string());
+                    break;
+                };
+                let proven = match self.cloud_agent_caller_source(&agent, peer_pid, "cloud read") {
+                    Ok((_, source)) => {
+                        self.cloud_agent_authority(&agent, &source, SCOPE_READ)
+                            .is_ok()
+                            && self.cloud_read_authority(&agent, &source).is_ok()
+                    }
+                    Err(_) => false,
+                };
+                if !proven {
+                    projection.derived.clear();
+                    projection.withheld = Some("cloud_agent_scope_revoked".to_string());
+                    break;
+                }
+            }
+        }
+        Ok(projection)
     }
 
     /// The platform's own answer for "may this source read its cloud turn

@@ -1562,6 +1562,29 @@ impl Store {
     /// `messages.origin` is written by the daemon's outbox and never by a
     /// request, so following it is not a caller-controlled claim. Rows with no
     /// origin are ordinary.
+    /// The cloud connections whose operations are behind this alias' routed
+    /// rows. A projection needs them to prove current read authority before it
+    /// serves a routed copy: provenance binds WHO may read the row, not
+    /// whether the read is still allowed.
+    pub fn cloud_derived_origin_agents(&self, alias: &str) -> Result<Vec<String>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_vec(
+                "WITH RECURSIVE cloud(id, agent_alias) AS ( \
+                   SELECT id, alias FROM messages WHERE source='cloud_agent' \
+                   UNION \
+                   SELECT m.id, c.agent_alias FROM messages m JOIN cloud c ON m.origin=c.id \
+                 ) \
+                 SELECT DISTINCT ca.id \
+                   FROM messages d \
+                   JOIN cloud c ON c.id = d.origin \
+                   JOIN cloud_agents ca ON ca.alias = c.agent_alias \
+                  WHERE d.alias = ?1",
+                params![alias],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+    }
+
     pub fn cloud_derived_messages(&self, alias: &str) -> Result<Vec<CloudDerivedRow>> {
         self.read_tx(|conn| {
             Ok(conn.query_vec(
