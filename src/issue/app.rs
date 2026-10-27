@@ -436,10 +436,11 @@ fn skill_digest(name: &str, manifest_sha256: &str, files: &[SkillFile]) -> Strin
 
 /// Tokens in `text` that could name package material. A token is a run of
 /// ASCII alphanumerics plus `.`, `_`, `/` and `-`; everything else is a
-/// separator.
+/// separator. Every token is returned: dropping a long one would be a
+/// reference this guard silently ignores, and the files are bounded anyway.
 fn reference_tokens(text: &str) -> impl Iterator<Item = &str> + '_ {
     text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')))
-        .filter(|token| !token.is_empty() && token.len() <= 256)
+        .filter(|token| !token.is_empty())
 }
 
 /// The package-relative path a token names, or `None` when the token names
@@ -447,8 +448,16 @@ fn reference_tokens(text: &str) -> impl Iterator<Item = &str> + '_ {
 /// absolute path is somebody else's file.
 fn referenced_member<'a>(token: &'a str, tag: &'a str) -> Option<Reference<'a>> {
     let mut token = token;
+    // `./x` and `.//x` both name the relative path `x`; only a token that was
+    // never relative is an absolute path, which is somebody else's file.
+    let relative = token.starts_with('.');
     while let Some(rest) = token.strip_prefix("./") {
         token = rest;
+    }
+    if relative {
+        while let Some(rest) = token.strip_prefix('/') {
+            token = rest;
+        }
     }
     // A sentence-ending period is a separator, not part of a member name:
     // `run ./scripts/build.py.` names `scripts/build.py`.
@@ -5233,6 +5242,27 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         );
         let error = install_error(&bare);
         assert!(error.contains("notes.md"), "{error}");
+    }
+
+    #[test]
+    fn cad1867_static_undeclared_material_cannot_disappear_from_the_scan() {
+        let mut files: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::from([
+                (
+                    "skills/demo/skill.json".into(),
+                    r#"{"schema":1,"name":"demo","files":["SKILL.md"]}"#.into(),
+                ),
+                ("skills/demo/SKILL.md".into(), "Read SKILL.md.\n".into()),
+            ]);
+        assert!(crate::issue::app::skill_package(&files, "demo").is_ok());
+        let long_member = format!("scripts/{}.py", "a".repeat(246));
+        for reference in [long_member, ".//scripts/missing.py".to_owned()] {
+            files.insert("skills/demo/SKILL.md".into(), format!("Run {reference}.\n"));
+            let error = crate::issue::app::skill_package(&files, "demo")
+                .expect_err("static undeclared material must refuse")
+                .to_string();
+            assert!(error.contains("scripts/"), "{error}");
+        }
     }
 
     /// A workflow that names a package the bundle does not carry refuses at
