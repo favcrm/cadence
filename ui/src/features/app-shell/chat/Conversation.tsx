@@ -90,7 +90,7 @@ import type { AppChat } from "./contract";
 import ChatFrame from "./ChatFrame";
 import DirectiveCard, { ConfirmationCard } from "./DirectiveCard";
 import AssistantOperations from "./AssistantOperations";
-import { hideIds, matchDirective, type Directive } from "./directive";
+import { carriesSecret, hideIds, matchDirective, type Directive } from "./directive";
 import { planFrames, type FrameRow } from "./frames";
 import type { FileUploadProjection } from "./descriptorClient";
 import type { AttachDestination } from "./attach";
@@ -368,6 +368,41 @@ function restoreAnchor(el: HTMLElement, anchor: { key: string; top: number } | n
   const listTop = el.getBoundingClientRect().top;
   const now = target.getBoundingClientRect().top - listTop;
   if (now !== anchor.top) el.scrollTop += now - anchor.top;
+}
+
+/** The pane header's copy action: the newest answer's Markdown source, with
+ *  a one-shot confirmation in the same icon slot. */
+function CopyAnswerButton({ text, label, copiedLabel }: { text: string; label: string; copiedLabel: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      className="app-chat-iconbtn"
+      data-chat-header-copy
+      aria-label={copied ? copiedLabel : label}
+      title={copied ? copiedLabel : label}
+      onClick={() => {
+        void navigator.clipboard
+          ?.writeText(text)
+          .then(() => {
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1600);
+          })
+          .catch(() => undefined);
+      }}
+    >
+      {copied ? (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m5 12.5 4.5 4.5L19 7.5" />
+        </svg>
+      ) : (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="8" y="8" width="11" height="11" rx="2" />
+          <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
+        </svg>
+      )}
+    </button>
+  );
 }
 
 function AppRow({
@@ -691,6 +726,23 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
 
   const items = threadItems(thread.data);
   const { shown, hidden } = visibleWindow(items, limit);
+  // CAD-1865: Home copies an answer from its turn head. The pane renders flat
+  // rows instead, and a per-row button would collide with the CAD-1108
+  // acceptance check (a plain answer row must carry no actionable control), so
+  // the pane's one copy action lives in its header and targets the newest
+  // answer in this conversation.
+  const lastAnswer = useMemo(() => {
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i];
+      if (item.type !== "answer" || item.entry.text.trim() === "") continue;
+      // A directive answer paints as a card and a token-bearing body is
+      // withheld by the row renderer; neither has text to copy.
+      if (matchDirective(item.entry.text, descriptor) !== null) return null;
+      if (carriesSecret(item.entry.text)) return null;
+      return hideIds(item.entry.text);
+    }
+    return null;
+  }, [items, descriptor]);
   // A prepend (widened window or a fetched page) keeps the reader's row
   // at the same viewport offset, measured after the DOM updated.
   useLayoutEffect(() => {
@@ -1510,6 +1562,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           )}
         </div>
         <div className="app-chat-head-tools" role="toolbar" aria-label={t("Assistant tools")}>
+          {lastAnswer !== null && (
+            <CopyAnswerButton text={lastAnswer} label={t("Copy last answer")} copiedLabel={t("Copied")} />
+          )}
           {active.state !== "legacy" && (
             <button
               type="button"

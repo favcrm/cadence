@@ -110,6 +110,12 @@ for (let i = 0; i < 8; i++) await flush();
 
 const rows = Array.from(host.querySelectorAll("[data-chat-item]")) as HTMLElement[];
 equal(rows.length, 3, "three agent messages are listed");
+// CAD-1865: the pane's copy action lives in the header, never in a message row,
+// so a plain answer row still carries no actionable control of its own.
+const headerCopy = host.querySelector("[data-chat-header-copy]") as HTMLButtonElement | null;
+assert(headerCopy !== null, "the pane header offers the last answer's copy action");
+assert(headerCopy!.getAttribute("aria-label") === "Copy last answer", "the header action names what it copies");
+equal(headerCopy!.closest("[data-chat-item]"), null, "the copy action is outside every message row");
 const buttons = (row: HTMLElement) => Array.from(row.querySelectorAll("button, a, [role=button]"));
 
 // 1: the control renders its one declared button.
