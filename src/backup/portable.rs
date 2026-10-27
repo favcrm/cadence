@@ -1859,16 +1859,26 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
         ),
         [cloud],
     )?;
-    // Provider traffic and raw adapter bookkeeping can embed conversation text
-    // with no canonical id at all: the adapter's continuity pack quotes earlier
-    // thread content verbatim, and the Codex adapter forwards completed
-    // assistant messages with their full text. No id-keyed closure can find
-    // either, and a portable export is coordination data, not provider
-    // transcript material — the board, tasks and messages are what a restore
-    // resumes. Those kinds are therefore omitted whole; a future kind that
-    // carries provider content belongs in this list.
+    // Provider traffic and adapter bookkeeping are TRANSCRIPT material, not
+    // coordination data, and they can embed conversation text with no
+    // canonical id at all: a continuity pack quotes earlier thread content
+    // verbatim, the Codex adapter forwards completed assistant messages with
+    // their full text, and tool use/results and permission denials carry
+    // command, query and output summaries. No id-keyed closure can find any of
+    // that, and a restore resumes the board, tasks, messages and receipts — so
+    // every adapter bookkeeping kind is omitted whole, together with the
+    // generic provider event. This list mirrors the `cadence/<kind>` emitters
+    // under `src/adapter/`: a new adapter kind that can carry content belongs
+    // in it (and in the portable guard's producer shapes).
     tx.execute(
-        "DELETE FROM events WHERE kind IN ('fake_pack','provider_event')",
+        "DELETE FROM events WHERE kind IN ( \
+           'provider_event', 'fake_pack', 'claim_used', 'claude_init', \
+           'claude_result', 'cloud_session', 'codex_quota', 'interrupt_ack', \
+           'pane_root', 'pane_root_unrecorded', 'permission_denied', \
+           'pi_extension_error', 'pi_retry', 'pi_session_reset_failed', \
+           'pi_ui_request', 'ready_claimed', 'serialized_body_limited', \
+           'session_compacted', 'session_minted', 'session_resume_failed', \
+           'stale_result', 'tool_progress', 'tool_result', 'tool_use')",
         [],
     )?;
     tx.execute(
