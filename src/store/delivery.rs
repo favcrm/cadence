@@ -310,7 +310,7 @@ impl Store {
                 _ => current.sender_uid.as_deref() == Some(operation.source_uid.as_str()),
             };
             if current.alias != agent_alias
-                || current.source != "cloud_agent"
+                || current.source != super::cloud_agent::MESSAGE_SOURCE
                 || !source_ok
                 || current.recipient_uid.as_deref() != Some(operation.recipient_uid.as_str())
             {

@@ -441,8 +441,8 @@ impl Shared {
                     Some(m) => {
                         // The preview is cloud content when its message is; it
                         // is withheld on the same admission as the read.
-                        let cloud_bearing =
-                            m.source == crate::cloud_agent::PROVIDER || m.origin.is_some();
+                        let cloud_bearing = m.source == crate::store::cloud_agent::MESSAGE_SOURCE
+                            || m.origin.is_some();
                         let visible = if cloud_bearing {
                             let (cloud, readable, reason) = self.work_conversation_cloud_rows(
                                 peer_pid,
@@ -672,7 +672,7 @@ impl Shared {
         };
         let mut candidates: Vec<(String, String)> = Vec::new();
         for m in &messages {
-            if m.source == crate::cloud_agent::PROVIDER || m.origin.is_some() {
+            if m.source == crate::store::cloud_agent::MESSAGE_SOURCE || m.origin.is_some() {
                 candidates.push((m.alias.clone(), m.id.clone()));
             }
         }

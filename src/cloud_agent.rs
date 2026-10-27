@@ -694,7 +694,7 @@ pub fn send_authorized(
         let sender_uid =
             (source.kind != crate::store::cloud_agent::SOURCE_USER).then_some(source.uid.as_str());
         let same_identity = existing.alias == agent.alias
-            && existing.source == "cloud_agent"
+            && existing.source == crate::store::cloud_agent::MESSAGE_SOURCE
             && existing.sender_uid.as_deref() == sender_uid
             && existing.recipient_uid.as_deref() == Some(agent.recipient_uid.as_str());
         if !same_identity {

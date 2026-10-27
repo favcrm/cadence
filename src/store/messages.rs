@@ -626,7 +626,7 @@ impl Store {
             }
             if let Some(existing) = self.message_in(&tx, id)? {
                 let same = existing.alias == alias
-                    && existing.source == "cloud_agent"
+                    && existing.source == super::cloud_agent::MESSAGE_SOURCE
                     && existing.body == body
                     && existing.reply_to.as_deref() == reply_to
                     && existing.sender_uid.as_deref() == expected_sender_uid
@@ -647,7 +647,7 @@ impl Store {
                 body,
                 reply_to,
                 id,
-                "cloud_agent",
+                super::cloud_agent::MESSAGE_SOURCE,
                 None,
                 None,
                 None,

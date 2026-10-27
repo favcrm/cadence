@@ -110,6 +110,13 @@ CREATE INDEX IF NOT EXISTS cloud_agent_operations_status
 /// server-side contract scope is `cloud_agent.write`.
 pub const CONSENT_SCOPE: &str = "cloud_agent.write";
 
+/// The canonical message `source` of a cloud request or reply. NOT the
+/// provider id (`agenticos-cloud`, [`crate::cloud_agent::PROVIDER`]): the
+/// row's provenance is the cloud agent that owns it, while the connection's
+/// provider names the platform adapter. A reader that mixes the two skips
+/// exactly the rows it must admit.
+pub const MESSAGE_SOURCE: &str = "cloud_agent";
+
 pub const STATE_CONNECTED: &str = "connected";
 pub const STATE_DISCONNECTED: &str = "disconnected";
 
