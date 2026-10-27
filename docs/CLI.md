@@ -318,6 +318,12 @@ provider-session metadata and link to it. Provider transcripts are distinct
 from local work history. Refreshing the same owner's credential preserves
 context; another issuer/subject or agent registration cannot inherit it.
 
+Generic body reads, including direct message IDs and board previews, apply the
+same source/owner admission to canonical cloud history. Already-delivered local
+reports instead retain their immutable sender/recipient UID binding and proven
+operator access; they do not acquire an upstream read-scope requirement. An empty
+thread snapshot grants no authority over replies that arrive after admission.
+
 `cloud-agent ls|show` inspect connections. `cloud-agent read <connection-id>
 <operation-id>` reconciles an existing receipt without a new submission.
 `cloud-agent send` accepts an explicit `--operation-id`; reuse that ID and the
