@@ -560,6 +560,7 @@ Object.assign(zhTW, {
   "Always allow for this customer": "一律允許此客戶執行",
   "Always allow — any post in this installation": "一律允許：此安裝中的任何貼文",
   "Always allow image edits while I'm signed in": "在我登入期間一律允許圖片編輯",
+  "Always allow image edits — this installation": "一律允許圖片編輯：此安裝",
   "Estimated price": "預計價格",
   "about {price}": "約 {price}",
   "Original": "原圖",

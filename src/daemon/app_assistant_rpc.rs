@@ -1228,7 +1228,7 @@ impl Shared {
     /// CAD-1868: save the refine standing grant, sealed to the human who
     /// decided it. Only the operator-proofed decide path calls this. A public
     /// owner's grant stores that owner's board session; a local operator's
-    /// grant stores the explicit local marker, never on a hosted board.
+    /// grant stores the explicit local marker, only on a Standalone board.
     fn refine_grant_save(
         &self,
         records: &RecordStore,
@@ -1250,7 +1250,7 @@ impl Shared {
                     "Refining library images — while you stay signed in on this board",
                 )
             }
-            None if self.membership_native() => {
+            None if !self.membership_standalone() => {
                 return Err(Error::rejected(
                     "Always allow on a hosted board needs the signed-in board owner",
                 ));
@@ -1273,17 +1273,19 @@ impl Shared {
         Ok(())
     }
 
-    fn membership_native(&self) -> bool {
+    /// The local-operator marker is honoured only on a Standalone board, an
+    /// allowlist: hosted (`Native`) and `RequiredUnavailable` both refuse.
+    fn membership_standalone(&self) -> bool {
         matches!(
             self.membership_mode,
-            super::public_membership::MembershipMode::Native(_)
+            super::public_membership::MembershipMode::Standalone
         )
     }
 
     /// CAD-1868: the refine standing grant as an agent turn may use it now.
     /// The stored human is re-proven here, at run time: a public owner through
     /// the unchanged `fresh_run_human`, the local marker only while the board
-    /// is not hosted. A missing, malformed or lapsed human pauses the grant.
+    /// is Standalone. A missing, malformed or lapsed human pauses the grant.
     fn refine_grant(
         &self,
         records: &RecordStore,
@@ -1312,10 +1314,10 @@ impl Shared {
         let stored =
             records.app_assistant_permission_sealed_human(context, required_str(&grant, "id")?)?;
         if stored.as_deref() == Some(LOCAL_OPERATOR_GRANT) {
-            return Ok(if self.membership_native() {
-                RefineGrant::Paused
-            } else {
+            return Ok(if self.membership_standalone() {
                 RefineGrant::Local
+            } else {
+                RefineGrant::Paused
             });
         }
         Ok(
@@ -1370,6 +1372,11 @@ impl Shared {
                     "reason": reason,
                     "scope": {"install_id":install,"context_id":context,"action_id":"media.refine.prepare","resource_id":asset_id},
                     "allow_always": true,
+                    // The grant's real lifetime, so the button states it
+                    // (CAD-1868): a Standalone board's local operator grants
+                    // for this installation; a hosted owner's grant lapses
+                    // with that board session.
+                    "allow_always_scope": if self.membership_standalone() { "installation" } else { "session" },
                     "preview_kind": "media_refine",
                     "preview": {
                         "asset_id": asset_id,
@@ -1781,7 +1788,7 @@ impl Shared {
 }
 
 /// The stored human of a local operator's refine grant (CAD-1868). Honoured
-/// only while the board is not in hosted (Native) membership mode.
+/// only while the board is in Standalone membership mode.
 const LOCAL_OPERATOR_GRANT: &str = r#"{"kind":"local_operator"}"#;
 
 /// What an agent-turn refine may do under the standing grant.
@@ -1791,7 +1798,7 @@ enum RefineGrant {
     /// A grant exists but its human is missing, malformed or no longer
     /// current: park the card; never fall back to the operator.
     Paused,
-    /// The local operator's grant on a non-hosted board.
+    /// The local operator's grant on a Standalone board.
     Local,
     /// The public owner's grant, re-proven fresh just now.
     Owner(Value),

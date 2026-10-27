@@ -55,6 +55,10 @@ interface PermissionRequest {
   reason: string;
   scope: { install_id: string; context_id: string; action_id: string; resource_id: string };
   allow_always: boolean;
+  // The server-stated lifetime of an "Always allow" grant (CAD-1868):
+  // "installation" for a Standalone board's local operator, "session" for a
+  // hosted owner. Absent on cards parked before it existed.
+  allowAlwaysScope: "installation" | "session" | null;
   preview: TagPreview | null;
   recordPreview: RecordPreview | null;
   mediaPreview: MediaRefinePreview | null;
@@ -229,6 +233,7 @@ function parsePermissionRequest(value: unknown): PermissionRequest | null {
   const scope = record(v?.scope);
   if (!v || !scope || typeof v.allow_always !== "boolean") return null;
   if (v.preview_kind !== undefined && v.preview_kind !== null && v.preview_kind !== "record" && v.preview_kind !== "media_refine") return null;
+  if (v.allow_always_scope !== undefined && v.allow_always_scope !== "installation" && v.allow_always_scope !== "session") return null;
   const fields = [scope.install_id, scope.context_id, scope.action_id, scope.resource_id];
   if (!fields.every((field) => typeof field === "string" && field.length > 0 && field.length <= 128)) return null;
   const reason = text(v.reason, 300);
@@ -244,6 +249,7 @@ function parsePermissionRequest(value: unknown): PermissionRequest | null {
       resource_id: scope.resource_id as string,
     },
     allow_always: v.allow_always,
+    allowAlwaysScope: v.allow_always_scope === "installation" || v.allow_always_scope === "session" ? v.allow_always_scope : null,
     preview: v.preview_kind === "media_refine" ? null : parseTagPreview(v.preview),
     recordPreview: v.preview_kind === "media_refine" ? null : parseRecordPreview(v.preview),
     mediaPreview,
@@ -322,6 +328,14 @@ const STANDING_LABELS: Readonly<Record<string, string>> = {
   "social.draft.create": "Always allow — any post in this installation",
   "media.refine.prepare": "Always allow image edits while I'm signed in",
 };
+/** The button label for this card: the server's stated lifetime wins; a card
+ *  without one keeps the hosted wording. */
+function standingLabel(request: PermissionRequest, actionId: string): string {
+  if (actionId === "media.refine.prepare" && request.allowAlwaysScope === "installation") {
+    return "Always allow image edits — this installation";
+  }
+  return STANDING_LABELS[actionId];
+}
 
 function AssistantOperationCard({ operation, installId, contextId, busy, decide, appPath }: {
   operation: Operation;
@@ -414,7 +428,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
             )}
             <div className="app-assistant-controls">
               <Button size="sm" variant="primary" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_once")}>{t("Allow once")}</Button>
-              {request.allow_always && Object.hasOwn(STANDING_LABELS, operation.action_id) && <Button size="sm" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_always")}>{t(STANDING_LABELS[operation.action_id])}</Button>}
+              {request.allow_always && Object.hasOwn(STANDING_LABELS, operation.action_id) && <Button size="sm" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_always")}>{t(standingLabel(request, operation.action_id))}</Button>}
               <Button size="sm" variant="danger" disabled={busy || !previewReady} onClick={() => decide(operation, "deny")}>{t("Deny this request")}</Button>
             </div>
           </>}
