@@ -50,6 +50,13 @@ threads-required = 'num-test-threads'
 filter = 'test(/cad1590_templates_and_broadcasts/)'
 threads-required = 'num-test-threads'
 
+# CAD-347: this HTTP acceptance reuses a probe-then-bind board fixture.
+# Reserve the worker pool like the existing CAD-1489 fixtures so it cannot
+# take the safety floor's port between that test's probe and actual bind.
+[[profile.cadence.overrides]]
+filter = 'test(/^wiki_board_http_guard_acceptance::cad347_/)'
+threads-required = 'num-test-threads'
+
 [profile.cadence.junit]
 path = "junit.xml"
 report-skipped = "all"
