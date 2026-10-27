@@ -1881,6 +1881,15 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
            'stale_result', 'tool_progress', 'tool_result', 'tool_use')",
         [],
     )?;
+    // A render-failure diagnostic is a coordination event, but its payload
+    // carries the last lines of the pane BEFORE and AFTER the paste — the
+    // screen itself, which can show an earlier private reply. Keep the event
+    // and its retry evidence, drop the captured transcript.
+    tx.execute(
+        "UPDATE events SET payload=json_remove(payload,'$.before','$.after') \
+          WHERE kind='paste_not_rendered' AND json_valid(payload)",
+        [],
+    )?;
     tx.execute(
         &format!(
             "{cloud_messages} DELETE FROM messages WHERE id IN (SELECT id FROM cloud_message)"
