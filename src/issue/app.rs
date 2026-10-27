@@ -458,11 +458,15 @@ fn referenced_member(token: &str, tag: &str) -> Option<Reference> {
         return None;
     }
     let absolute = token.starts_with('/') && !token.starts_with('.');
+    let mut escaped = false;
     let mut segments: Vec<&str> = Vec::new();
     for segment in token.split('/') {
         match segment {
             "" | "." => continue,
-            ".." => return None,
+            // `..` cannot be resolved against the package, so a token that
+            // uses it and still names package material refuses below rather
+            // than being dropped as if it named nothing.
+            ".." => escaped = true,
             other => segments.push(other),
         }
     }
@@ -475,6 +479,7 @@ fn referenced_member(token: &str, tag: &str) -> Option<Reference> {
         return Some(Reference {
             owner: owner.to_string(),
             member: member.to_string(),
+            escaped,
         });
     }
     for directory in ["scripts", "references"] {
@@ -482,6 +487,7 @@ fn referenced_member(token: &str, tag: &str) -> Option<Reference> {
             return Some(Reference {
                 owner: tag.to_string(),
                 member: path,
+                escaped,
             });
         }
     }
@@ -495,14 +501,18 @@ fn referenced_member(token: &str, tag: &str) -> Option<Reference> {
     Some(Reference {
         owner: tag.to_string(),
         member: path,
+        escaped,
     })
 }
 
 /// One token that names package material: the package it names (`skills/` may
 /// name another package, which refuses) and the member path inside it.
+/// `escaped` records a `..` segment, which cannot be resolved inside the
+/// package and therefore refuses instead of being ignored.
 struct Reference {
     owner: String,
     member: String,
+    escaped: bool,
 }
 
 /// CAD-1867: the declared-inventory check. Every declared text file is
@@ -526,7 +536,13 @@ fn undeclared_references(
             let Some(reference) = referenced_member(token, tag) else {
                 continue;
             };
-            let refusal = if reference.owner != tag {
+            let refusal = if reference.escaped {
+                format!(
+                    "{SKILL_DIR}/{tag}/{path}: '{token}' reaches package material through '..' — \
+                     name the member path inside the package",
+                    path = file.path
+                )
+            } else if reference.owner != tag {
                 format!(
                     "{SKILL_DIR}/{tag}/{path}: '{token}' names skill package '{owner}' — a \
                      package references only its own declared members",
@@ -5291,13 +5307,17 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
             ".//scripts/missing.py",
             "././scripts/missing.py",
             ".//./skills/other/SKILL.md",
+            "../scripts/missing.py",
+            "../references/spec.md",
         ] {
             files.insert("skills/demo/SKILL.md".into(), format!("Run {reference}.\n"));
             let error = crate::issue::app::skill_package(&files, "demo")
                 .expect_err("a dotted spelling must still refuse")
                 .to_string();
             assert!(
-                error.contains("missing.py") || error.contains("other"),
+                error.contains("missing.py")
+                    || error.contains("other")
+                    || error.contains("through '..'"),
                 "{reference}: {error}"
             );
         }
