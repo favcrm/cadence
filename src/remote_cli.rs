@@ -939,12 +939,12 @@ fn renew_credential_locked(
         &session.refresh_token,
         request,
         request_deadline,
-    )
-    .map_err(|error| cloud_renewal_error(purpose, error))?;
+    )?;
     if answer.status != 200 {
-        return Err(cloud_renewal_error(
-            purpose,
-            renewal_refusal(answer.status, &answer.body, answer.correlation.as_ref()),
+        return Err(renewal_refusal(
+            answer.status,
+            &answer.body,
+            answer.correlation.as_ref(),
         ));
     }
     let body = answer.body;
@@ -1157,21 +1157,29 @@ fn purpose_refusal(purpose: CredentialPurpose) -> Error {
     }
 }
 
-/// A cloud send whose saved consent could not be renewed has sent nothing.
-/// That is a cloud-authority outcome, not a generic local failure: a reader
-/// withholds the cloud rows and keeps the rest of its page instead of failing
-/// the whole read, and a writer reports a definite refusal. The issuer's own
-/// text still says why, so a terminal refusal remains actionable. The CLI
-/// purpose is untouched — its callers are CLI verbs, not cloud readers.
-fn cloud_renewal_error(purpose: CredentialPurpose, error: Error) -> Error {
-    if purpose == CredentialPurpose::Cli {
-        return error;
-    }
-    let message = match &error {
+/// The issuer's own text for a renewal that did not complete, so a terminal
+/// refusal stays actionable.
+fn renewal_message(error: &Error) -> String {
+    match error {
         Error::Rejected(text) | Error::Internal(text) => text.clone(),
         _ => "the saved cloud login could not be renewed, so nothing was sent".to_string(),
-    };
-    Error::gate_coded("cloud_agent_unavailable", message)
+    }
+}
+
+/// A READ whose saved cloud consent could not be renewed has proved no
+/// current read authority: the cloud rows are withheld and the rest of the
+/// page stays. Nothing was sent, so this is never an uncertain send outcome.
+fn cloud_renewal_withheld(error: Error) -> Error {
+    Error::gate_coded("cloud_agent_unavailable", renewal_message(&error))
+}
+
+/// A SEND (or an enrollment) whose saved cloud consent could not be renewed
+/// never reached the contract. It is a DEFINITE refusal — `cloud_agent_unavailable`
+/// would classify the operation as a possibly-accepted send and strand it as
+/// unknown, blocking the conversation until a readback of a turn that never
+/// existed settles it.
+fn cloud_renewal_refused(error: Error) -> Error {
+    Error::gate_coded("cloud_agent_authority_missing", renewal_message(&error))
 }
 
 /// Known, unique capabilities that include the CLI pair. Wiki scopes are
@@ -2388,7 +2396,7 @@ pub fn cloud_agent_enroll_post(
     // cloud-purpose: a cloud-only grant refreshes under its own consent, and
     // a refusal here is definite (nothing was sent), never `unknown`.
     let cred = load_credential(&dir, target)?;
-    let cred = cloud_send_credential(&dir, target, cred)?;
+    let cred = cloud_send_credential(&dir, target, cred).map_err(cloud_renewal_refused)?;
     let pin = identity_of(&cred, target)?;
     let issuer = pin.issuer.trim_end_matches('/').to_string();
     post(
@@ -2472,7 +2480,13 @@ pub fn cloud_agent_post(
     // login, and renewal can only return the identical capability set, so the
     // token sent is admitted for the same action. A cloud-only grant never
     // reaches the CLI purpose.
-    let cred = cloud_send_credential(&dir, target, cred)?;
+    let cred = cloud_send_credential(&dir, target, cred).map_err(|error| {
+        if scope == crate::cloud_agent::SCOPE_READ {
+            cloud_renewal_withheld(error)
+        } else {
+            cloud_renewal_refused(error)
+        }
+    })?;
     // The saved audience is an origin without a trailing slash; normalize so
     // one slash joins it to the contract path (never `//__platform/...`).
     let origin = target.endpoint.trim_end_matches('/');

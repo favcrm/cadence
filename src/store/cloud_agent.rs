@@ -323,6 +323,12 @@ pub struct CloudDerivedRow {
     /// The backing operation's connection, never inferred from the delivered
     /// alias. Missing authority does not remove the cloud classification.
     pub cloud_agent_id: Option<String>,
+    /// The backing operation's immutable logical owner (issuer + subject).
+    /// A viewer whose own verified owner differs is a replaced human and must
+    /// not read this row, however legitimate its own grant on the connection
+    /// is — the UID binding alone is not an owner proof.
+    pub owner_issuer: Option<String>,
+    pub owner_subject: Option<String>,
 }
 
 /// One durable request ⇄ remote operation correlation.
@@ -1620,7 +1626,9 @@ impl Store {
                     WHERE NOT c.is_cloud \
                  ), cloud AS ( \
                    SELECT c.message_id, \
-                          CASE WHEN COUNT(*)=1 THEN MIN(ca.id) END AS agent_id \
+                          CASE WHEN COUNT(*)=1 THEN MIN(ca.id) END AS agent_id, \
+                          CASE WHEN COUNT(*)=1 THEN MIN(o.owner_issuer) END AS owner_issuer, \
+                          CASE WHEN COUNT(*)=1 THEN MIN(o.owner_subject) END AS owner_subject \
                      FROM origins c JOIN messages m ON m.id=c.id \
                      LEFT JOIN cloud_agent_operations o \
                        ON o.operation_id=c.id AND o.message_id=c.id \
@@ -1629,7 +1637,8 @@ impl Store {
                     WHERE c.is_cloud GROUP BY c.message_id \
                  ) \
                  SELECT i.id, m.sender_uid, m.recipient_uid, \
-                        c.message_id IS NOT NULL, c.agent_id \
+                        c.message_id IS NOT NULL, c.agent_id, \
+                        c.owner_issuer, c.owner_subject \
                    FROM ids i LEFT JOIN messages m ON m.id=i.id \
                    LEFT JOIN cloud c ON c.message_id=i.id",
                 params![alias, message_id],
@@ -1640,6 +1649,8 @@ impl Store {
                             sender_uid: row.get(1)?,
                             recipient_uid: row.get(2)?,
                             cloud_agent_id: row.get(4)?,
+                            owner_issuer: row.get(5)?,
+                            owner_subject: row.get(6)?,
                         })
                     } else {
                         ProjectionRow::Ordinary(row.get(0)?)

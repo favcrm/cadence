@@ -78,7 +78,7 @@ export interface ConversationRow {
   id: string;
   kind: ConversationKind;
   participants: Participant[];
-  last?: { preview: string; at: number } | null;
+  last?: { preview: string; at: number; cloud_withheld?: string | null } | null;
   counts?: ConversationCounts;
   last_activity: number;
   /** Group rows: the topic type, its source and its post count. */
@@ -124,6 +124,10 @@ export interface ThreadMessage {
   routed?: RoutedCopy[];
   /** The daemon's stored refusal/failure text, when one was recorded. */
   error?: string | null;
+  /** Set when this row's cloud content was withheld: the body and result are
+   *  empty on purpose, and the row says why instead of looking like an empty
+   *  completed message. */
+  cloud_withheld?: string | null;
   body: string;
   state: DeliveryState;
   issue: string | null;

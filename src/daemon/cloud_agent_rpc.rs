@@ -209,6 +209,11 @@ pub(super) struct CloudProjection {
     ordinary: std::collections::BTreeSet<String>,
     /// The caller's verified agent UID, when the connection derives one.
     viewer: Option<String>,
+    /// The caller's verified logical owner (issuer + subject), learned from
+    /// the same per-origin proof. A derived row whose backing operation was
+    /// created for a different owner is a replaced human's content: the UID
+    /// binding alone never admits it.
+    viewer_owner: Option<crate::store::cloud_agent::Owner>,
     /// The connection is provably the operator.
     operator: bool,
     /// Why cloud content was withheld for this read, if it was. The read still
@@ -229,6 +234,7 @@ impl Default for CloudProjection {
             admitted_origins: std::collections::BTreeSet::new(),
             ordinary: std::collections::BTreeSet::new(),
             viewer: None,
+            viewer_owner: None,
             operator: false,
             withheld: None,
         }
@@ -246,6 +252,7 @@ impl CloudProjection {
             admitted_origins: std::collections::BTreeSet::new(),
             ordinary: std::collections::BTreeSet::new(),
             viewer: None,
+            viewer_owner: None,
             operator: false,
             withheld: None,
         }
@@ -272,6 +279,7 @@ impl CloudProjection {
             admitted_origins: std::collections::BTreeSet::new(),
             ordinary: ordinary.into_iter().collect(),
             viewer,
+            viewer_owner: None,
             operator,
             withheld: None,
         }
@@ -321,7 +329,22 @@ impl CloudProjection {
             };
         }
         if let Some(row) = self.derived.get(message_id) {
-            return if self.bound(row)
+            // The backing operation's immutable owner must be the viewer's
+            // own verified owner. A different human who legitimately
+            // connects on the same tenant/alias proves authority for its own
+            // source, never for the retained content of the one it replaced.
+            let same_owner = match (
+                self.viewer_owner.as_ref(),
+                row.owner_issuer.as_deref(),
+                row.owner_subject.as_deref(),
+            ) {
+                (Some(viewer), Some(issuer), Some(subject)) => {
+                    viewer.issuer == issuer && viewer.subject == subject
+                }
+                _ => false,
+            };
+            return if same_owner
+                && self.bound(row)
                 && row
                     .cloud_agent_id
                     .as_ref()
@@ -946,16 +969,37 @@ impl Shared {
                 self.cloud_agent_authority(&agent, &source, SCOPE_READ)?;
                 let operations = self.store.cloud_agent_operations(&agent.id, None)?;
                 self.cloud_read_authority(&agent, &source, &operations)
+                    .map(|answer| (answer, source.owner.clone()))
             })();
             match proof {
-                Ok(Some((_, PlatformState::Unsettled))) => {
+                Ok((Some((_, PlatformState::Unsettled)), owner)) => {
+                    projection.viewer_owner.get_or_insert(owner);
                     projection.withheld = Some("cloud_agent_not_settled".to_string());
                 }
-                Ok(_) => {
+                Ok((_, owner)) => {
+                    projection.viewer_owner.get_or_insert(owner);
                     projection.admitted_origins.insert(agent_id);
                 }
                 Err(error) => projection.withheld = Some(projection_denial(error)?),
             }
+        }
+        // A row whose backing operation belongs to another verified owner is
+        // never admitted, and the read says why rather than looking complete.
+        if projection.viewer_owner.is_some()
+            && projection.derived.values().any(|row| {
+                let same_owner = matches!(
+                    (
+                        projection.viewer_owner.as_ref(),
+                        row.owner_issuer.as_deref(),
+                        row.owner_subject.as_deref()
+                    ),
+                    (Some(viewer), Some(issuer), Some(subject))
+                        if viewer.issuer == issuer && viewer.subject == subject
+                );
+                !same_owner
+            })
+        {
+            projection.withheld = Some("cloud_agent_owner_changed".to_string());
         }
         Ok(projection)
     }

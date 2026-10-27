@@ -658,7 +658,13 @@ function issueProjectMap(issues: { id: string; project: string }[]): IssueProjec
 /** A row's second line from real data only: the last preview; else a group's
  *  post and member counts; else a direct thread's label. */
 function rowDescriptor(row: ConversationRow, t: (english: string) => string = (english) => english): string {
-  if (row.last) return row.last.preview;
+  if (row.last) {
+    // A withheld cloud preview is empty on purpose; say so rather than
+    // rendering a blank second line.
+    return row.last.cloud_withheld
+      ? t("Cloud content unavailable")
+      : row.last.preview;
+  }
   if (row.kind === "group") {
     const members = liveMembers(row).length;
     const parts = [`${members} ${t(members === 1 ? "member" : "members")}`];
@@ -1076,7 +1082,13 @@ function MessageRow({
         me={message.sender.kind === "operator"}
         state={message.state}
       >
-        {message.body}
+        {message.cloud_withheld ? (
+          <span className="threads-note" role="status">
+            {t("Cloud content unavailable")}
+          </span>
+        ) : (
+          message.body
+        )}
       </Turn>
       {(message.issue || message.task_id || message.origin || routed.length > 0 || recipient) && (
         <div className="threads-refs">
