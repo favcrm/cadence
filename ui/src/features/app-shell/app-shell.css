@@ -802,6 +802,15 @@
   .app-chat-textarea {
     font-size: 16px;
   }
+  /* CAD-1886: starter rows and the pane's jump pill reach a thumb. */
+  .app-chat-sugg-row,
+  .app-chat-jump {
+    min-height: 2.75rem;
+  }
+  .app-chat-jump {
+    display: inline-flex;
+    align-items: center;
+  }
 }
 
 /* Generic outlet tabs + detail drawer. */

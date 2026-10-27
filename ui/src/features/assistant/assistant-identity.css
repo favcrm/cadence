@@ -318,7 +318,13 @@
   /* Only where the sheet replaces it: MemberChat's header keeps its About. */
   .assistant-heading:has(.assistant-menu) .assistant-heading-actions > .assistant-about-trigger:not(.assistant-menu-trigger) { display: none; }
   .assistant-menu { display: inline-flex; }
-  .assistant-menu-trigger { width: 2.75rem; height: 2.75rem; }
+  .assistant-menu-trigger,
+  /* MemberChat and the installed-app header keep this trigger with no sheet. */
+  .assistant-heading:not(:has(.assistant-menu)) .assistant-about-trigger,
+  .app-chat-head .assistant-about-trigger {
+    width: 2.75rem;
+    height: 2.75rem;
+  }
   .assistant-menu-panel .lnk { min-width: 2.75rem; }
   /* The trigger sits after the name, not at the header's right edge: pin the
      sheet to the viewport so a short name cannot push it off-screen. */

@@ -331,13 +331,15 @@ await pick("Spring launch");
   assert(bar() === null, "the owned running turn paints no dock row after a master frame");
   assert(typingBubble() !== null, "the owned running turn shows its inline typing bubble");
   assert(stopButton() !== null, "the owned running turn offers Stop in the composer");
-  // CAD-1859: the app pane paints the same inline typing bubble as Home, at
-  // the tail of its own list, and takes it away when the turn stops working.
-  const typingRows = Array.from(host.querySelectorAll(".app-chat-list [data-chat-typing]")) as HTMLElement[];
-  assert(typingRows.length === 1, `a working turn appends exactly one typing row (got ${typingRows.length})`);
-  assert(typingRows[0].querySelector('[data-kind="typing"]') !== null, "the appended row is the assistant typing bubble");
+  // CAD-1859 + CAD-1884: the app pane paints the same inline typing bubble as
+  // Home. The run that owns the turn paints it, so there is exactly one and
+  // no second standalone row behind it.
+  const typingRows = Array.from(host.querySelectorAll('.app-chat-list [data-kind="typing"]')) as HTMLElement[];
+  assert(typingRows.length === 1, `a working turn paints exactly one typing bubble (got ${typingRows.length})`);
+  const owner = typingRows[0].closest("[data-chat-run], [data-chat-typing]");
+  assert(owner !== null, "the typing bubble is the turn's own row or the pane's tail row");
   const paneRows = Array.from(host.querySelectorAll(".app-chat-list > li")) as HTMLElement[];
-  assert(paneRows.length > 0 && paneRows[paneRows.length - 1] === typingRows[0], "the typing row is the last row in the pane");
+  assert(paneRows.length > 0 && paneRows[paneRows.length - 1] === owner, "the typing turn is the last row in the pane");
   // CAD-1880: `writing` is the same running turn with its assistant text
   // last. The dock row is gone, so the bubble must survive that transition
   // or the pane would show nothing at all while it writes.
@@ -346,9 +348,17 @@ await pick("Spring launch");
   await settle();
   assert(bar() === null, "a writing turn paints no dock row");
   assert(
-    host.querySelector('.app-chat-list [data-chat-typing] [data-kind="typing"]') !== null,
+    host.querySelector('.app-chat-list [data-chat-run] [data-kind="typing"]') !== null,
     "a writing turn keeps the inline typing bubble in the pane",
   );
+  // CAD-1886: two days of transcript paint two day rules, and the rule
+  // belongs to the list, not to a turn.
+  threads["c-camp"].push({ ...ent(9, "operator", "message", "yesterday's note", "m-yest"), created: "2026-10-02T00:00:00Z" });
+  await React.act(async () => { await conversationThread("c-camp").refresh(); });
+  await settle();
+  const dayRules = Array.from(host.querySelectorAll("[data-day-sep]"));
+  assert(dayRules.length === 2, `two days paint two day rules (got ${dayRules.length})`);
+  assert(dayRules.every((rule) => !rule.closest("[data-chat-run]")), "a day rule is its own list row");
   // The store state the daemon's own operator entry produces: the optimistic
   // row retires, so nothing is left sending or working for this pane.
   turn = null;

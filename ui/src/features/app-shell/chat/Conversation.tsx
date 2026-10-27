@@ -34,6 +34,7 @@ import {
   type ScrollKind,
 } from "../../home/scrollFollow";
 import { ThreadTurn, ThreadItemView, type Density } from "../../home/ThreadView";
+import { DayDivider, dayKey, itemCreated } from "../../home/DayDivider";
 import CorrectionReport from "../../wiki/CorrectionReport";
 import {
   addPending,
@@ -262,13 +263,25 @@ function HomeList({
   };
   return (
     <ol className="space-y-6 min-w-0" role="log" aria-live="polite" aria-relevant="additions" aria-label={t("messages")} data-rendered={items.length}>
-      {runs.map((run) => {
-        if (!run.turn) return row(run.item);
+      {(() => {
+        let prevDay: string | null = null;
+        return runs.map((run) => {
+        const first = run.turn ? run.items[0] : run.item;
+        const created = itemCreated(first);
+        const day = created === null ? null : dayKey(created);
+        const divider = day !== null && day !== prevDay && created !== null
+          ? <DayDivider key={`day-${day}`} ms={created} />
+          : null;
+        if (day !== null) prevDay = day;
+        const wrap = (node: ReactNode, key: string) => (
+          <Fragment key={key}>{divider}{node}</Fragment>
+        );
+        if (!run.turn) return wrap(row(run.item), run.key);
         const acts = run.items.map((item) => activity?.(item) ?? null);
         // A hire proposal is its own card; keep the existing flat row
         // instead of folding it into a trace.
         if (run.items.some((item) => item.type === "hire")) {
-          return <Fragment key={run.key}>{run.items.map(row)}</Fragment>;
+          return wrap(<>{run.items.map(row)}</>, run.key);
         }
         const hasFallback = acts.some((act) => act?.kind === "row" && act.fallback === true);
         // The turn's own live rows fold into the head and the typing dots;
@@ -279,8 +292,8 @@ function HomeList({
           (running !== null && run.items.some((item) => itemMessage(item) === running));
         const live = Number(run.key.slice(1)) > liveAfter;
         const answer = run.items.find((item) => item.type === "answer");
-        return (
-          <li key={run.key} className={`min-w-0 space-y-4${live ? " msg-in" : ""}`}>
+        return wrap(
+          <li className={`min-w-0 space-y-4${live ? " msg-in" : ""}`}>
             <ThreadTurn
               items={run.items}
               running={busy}
@@ -303,9 +316,11 @@ function HomeList({
                   <Fragment key={`fallback-${idx}`}>{act.node}</Fragment>
                 ) : null,
               )}
-          </li>
+          </li>,
+          run.key,
         );
-      })}
+        });
+      })()}
     </ol>
   );
 }
@@ -331,6 +346,9 @@ const itemText = (item: ThreadItem): string | null =>
       : null;
 
 /** The same item with every internal id rewritten (host constant, D4). */
+/** Alias for the grouped path: AppPane has its own `hidden` count. */
+const hideItem = (item: ThreadItem): ThreadItem => hidden(item);
+
 function hidden(item: ThreadItem): ThreadItem {
   switch (item.type) {
     case "operator":
@@ -1519,6 +1537,80 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     return { key: item.key, directive: text === null ? null : matchDirective(text, descriptor) };
   });
   const plan = planFrames(directives, failedFrames);
+  // CAD-1884: group the pane's rows into runs like Home, so a turn paints one
+  // head, one trace and one answer. A turn can be split by a system row into
+  // several runs that share its message id: the first paints the head, the
+  // last owns the typing dots, and only the segment carrying the answer says
+  // anything about completion.
+  const runs = useMemo(() => threadRuns(shown), [shown]);
+  // A transcript with no answer kind anywhere predates the mapper: its last
+  // worker note is what the operator read as the reply (same rule as Home).
+  const legacyTranscript = useMemo(() => items.every((item) => item.type !== "answer"), [items]);
+  const directiveByKey = useMemo(
+    () => new Map(shown.map((item, i) => [item.key, directives[i]?.directive ?? null])),
+    [shown, directives],
+  );
+  const runViews = useMemo(() => {
+    const special = (item: ThreadItem) =>
+      directiveByKey.get(item.key) != null || plan.has(item.key) || item.type === "hire";
+    const perMessage = new Map<string, number>();
+    // Completion is the message's, not a segment's: an answer in any run of
+    // a split turn completes the whole turn.
+    const answeredByMessage = new Map<string, boolean>();
+    for (const run of runs) {
+      if (run.turn && run.message !== null) {
+        perMessage.set(run.message, (perMessage.get(run.message) ?? 0) + 1);
+        if (run.items.some((item) => item.type === "answer")) {
+          answeredByMessage.set(run.message, true);
+        }
+      }
+    }
+    const seen = new Map<string, number>();
+    return runs.map((run) => {
+      if (!run.turn) return { kind: "item" as const, run };
+      const message = run.message;
+      const ordinal = message === null ? 1 : (seen.get(message) ?? 0) + 1;
+      if (message !== null) seen.set(message, ordinal);
+      const total = message === null ? 1 : (perMessage.get(message) ?? 1);
+      const cards = run.items.filter(special);
+      const cardAnswer = cards.some((item) => item.type === "answer");
+      const answerItem = run.items.find((item) => item.type === "answer" && !special(item)) ?? null;
+      const owns =
+        message !== null && runningMessage !== null && run.items.some((item) => itemMessage(item) === runningMessage);
+      return {
+        kind: "turn" as const,
+        run,
+        cards,
+        answerItem,
+        // Only a card/frame answer is external to the body; anything else
+        // leaves ThreadTurn's own text/failure check in charge. A segment
+        // with no answer of its own is complete when the message answered
+        // elsewhere, so it never claims the turn returned nothing.
+        answered:
+          cardAnswer || (answerItem === null && message !== null && answeredByMessage.get(message) === true)
+            ? true
+            : undefined,
+        owns,
+        key: message === null ? run.key : ordinal === 1 ? message : `${message}#${ordinal}`,
+        head: ordinal === 1,
+        continued: ordinal < total,
+        // The dots belong to the turn's last segment, and only while it has
+        // no answer anywhere in its own segment.
+        // Dots only while the turn's last segment has no answer of either
+        // kind: a landed card answer completes the turn too.
+        running:
+          owns &&
+          ordinal === total &&
+          answerItem === null &&
+          !cardAnswer &&
+          !(message !== null && answeredByMessage.get(message) === true),
+      };
+    });
+  }, [runs, directiveByKey, plan, runningMessage]);
+  // Only a run that will actually paint dots owns the indicator; a turn whose
+  // answer already landed keeps the pane's standalone row while master state
+  // still reports it working (the pre-CAD-1886 behaviour).
+  const typingOwned = runViews.some((view) => view.kind === "turn" && view.running);
   const onFrameFail = useCallback((tag: string) => setFailedFrames((s) => new Set(s).add(tag)), []);
   const readOnly = !viewer.operator || viewer.readOnly;
   // The CSV importer exists only when the descriptor declares it and the
@@ -1778,16 +1870,20 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         </div>
       )}
       <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} role="log" aria-live="polite" aria-relevant="additions" aria-label={t("Conversation messages")}>
-        {shown.map((item, i) => (
-          <li
-            key={item.key}
-            className="text-secondary text-ink-300 break-words"
-            data-chat-item
-            data-item-key={item.key}
-          >
+        {(() => {
+          let prevDay: string | null = null;
+          return runViews.map((view) => {
+          const first = view.kind === "turn" ? view.run.items[0] : view.run.item;
+          const created = itemCreated(first);
+          const day = created === null ? null : dayKey(created);
+          const divider = day !== null && day !== prevDay && created !== null
+            ? <DayDivider key={`day-${day}`} ms={created} />
+            : null;
+          if (day !== null) prevDay = day;
+          const row = (item: ThreadItem, index: number) => (
             <AppRow
               item={item}
-              directive={directives[i].directive}
+              directive={directives[index]?.directive ?? null}
               frame={plan.get(item.key)}
               mode={mode}
               density={density}
@@ -1796,11 +1892,70 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
               onFail={onFrameFail}
               onRetry={retry}
               onDiscard={discard}
-              question={visibleQuestion(shown, i)}
+              question={visibleQuestion(shown, index)}
             />
-          </li>
-        ))}
-        {(turnState.kind === "sending" || turnState.kind === "working" || turnState.kind === "writing") && (
+          );
+          if (view.kind === "item") {
+            const item = view.run.item;
+            const index = shown.indexOf(item);
+            return (
+              <Fragment key={item.key}>
+                {divider}
+                <li
+                  className="text-secondary text-ink-300 break-words"
+                  data-chat-item
+                  data-item-key={item.key}
+                >
+                  {row(item, index)}
+                </li>
+              </Fragment>
+            );
+          }
+          const key = view.key;
+          // Cards render through their guarded AppRow, never through the
+          // turn body: that path is what withholds tokens and frame bodies.
+          const safe = view.run.items.filter((item) => !view.cards.includes(item)).map(hideItem);
+          const hiddenAnswer = view.answerItem ? hideItem(view.answerItem) : null;
+          const answerText = hiddenAnswer?.type === "answer" ? hiddenAnswer.entry.text : null;
+          return (
+            <Fragment key={key}>
+            {divider}
+            <li
+              className="text-secondary text-ink-300 break-words"
+              data-chat-item
+              data-chat-run
+            >
+              <ThreadTurn
+                items={safe}
+                density={density}
+                head={view.head}
+                continued={view.continued}
+                allowLegacy={legacyTranscript}
+                copy={false}
+                answered={view.answered}
+                running={view.running}
+                after={
+                  <>
+                    {view.cards.map((item) => (
+                      <div key={item.key} data-chat-card-row data-item-key={item.key}>
+                        {row(item, shown.indexOf(item))}
+                      </div>
+                    ))}
+                    {answerText !== null && view.answerItem ? (
+                      <CorrectionReport
+                        question={hideIds(visibleQuestion(shown, shown.indexOf(view.answerItem)))}
+                        answer={answerText}
+                      />
+                    ) : null}
+                  </>
+                }
+              />
+            </li>
+            </Fragment>
+          );
+          });
+        })()}
+        {(turnState.kind === "sending" || ((turnState.kind === "working" || turnState.kind === "writing") && !typingOwned)) && (
           <li className="text-secondary text-ink-300 break-words" data-chat-typing>
             <ThreadTurn items={[]} running density={density} />
           </li>
