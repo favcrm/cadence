@@ -29,13 +29,13 @@ const CRM_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ap
 
 /// The three registered Social Content actions, exactly as the registry
 /// owns them (the descriptor may not change handler, effect or scope).
-const FETCH: &str = r#"{ "id": "social.posts.fetch", "description": "Read recent posts.", "input_schema": { "type": "object", "properties": { "handle": { "type": "string", "minLength": 1, "maxLength": 64 } }, "required": [], "additionalProperties": false }, "effect": "read", "confirmation": "permission_required", "availability": "requires_context" }"#;
-const DRAFT: &str = r#"{ "id": "social.draft.create", "description": "Draft a caption.", "input_schema": { "type": "object", "properties": { "post": { "type": "string", "minLength": 1, "maxLength": 128 }, "instructions": { "type": "string", "maxLength": 500 }, "with_image": { "type": "boolean" } }, "required": ["post"], "additionalProperties": false }, "effect": "draft", "confirmation": "permission_required", "availability": "requires_context" }"#;
-const STATUS: &str = r#"{ "id": "social.drafts.status", "description": "Draft status.", "input_schema": { "type": "object", "properties": {}, "required": [], "additionalProperties": false }, "effect": "read", "confirmation": "none", "availability": "requires_context" }"#;
+pub(super) const FETCH: &str = r#"{ "id": "social.posts.fetch", "description": "Read recent posts.", "input_schema": { "type": "object", "properties": { "handle": { "type": "string", "minLength": 1, "maxLength": 64 } }, "required": [], "additionalProperties": false }, "effect": "read", "confirmation": "permission_required", "availability": "requires_context" }"#;
+pub(super) const DRAFT: &str = r#"{ "id": "social.draft.create", "description": "Draft a caption.", "input_schema": { "type": "object", "properties": { "post": { "type": "string", "minLength": 1, "maxLength": 128 }, "instructions": { "type": "string", "maxLength": 500 }, "with_image": { "type": "boolean" } }, "required": ["post"], "additionalProperties": false }, "effect": "draft", "confirmation": "permission_required", "availability": "requires_context" }"#;
+pub(super) const STATUS: &str = r#"{ "id": "social.drafts.status", "description": "Draft status.", "input_schema": { "type": "object", "properties": {}, "required": [], "additionalProperties": false }, "effect": "read", "confirmation": "none", "availability": "requires_context" }"#;
 const COMPOSE: &str = r#"{ "id": "social.draft.compose", "description": "Compose a manual draft.", "input_schema": { "type": "object", "properties": { "caption": { "type": "string", "minLength": 1, "maxLength": 8800 }, "brief": { "type": "string", "maxLength": 500 }, "asset_id": { "type": "string", "minLength": 1, "maxLength": 128 } }, "required": ["caption"], "additionalProperties": false }, "effect": "draft", "confirmation": "none", "availability": "requires_context" }"#;
 const ATTACH: &str = r#"{ "id": "social.drafts.attach_image", "description": "Attach an uploaded image.", "input_schema": { "type": "object", "properties": { "draft_id": { "type": "string", "minLength": 1, "maxLength": 128 }, "expected_revision": { "type": "integer", "minimum": 1 }, "asset_id": { "type": "string", "minLength": 1, "maxLength": 128 } }, "required": ["draft_id", "expected_revision", "asset_id"], "additionalProperties": false }, "effect": "draft", "confirmation": "none", "availability": "requires_context" }"#;
 
-fn descriptor(app: Option<&str>, actions: &[&str]) -> String {
+pub(super) fn descriptor(app: Option<&str>, actions: &[&str]) -> String {
     let app = app.map_or(String::new(), |a| format!(r#""app": "{a}","#));
     format!(
         r#"{{ "contract": "app-assistant/v1", {app} "actions": [{}] }}"#,
@@ -64,23 +64,26 @@ fn step_id(install: &str, context: &str, operation: &str, step: &str) -> String 
     format!("sa-{step}-{}", &digest["sha256:".len()..][..36])
 }
 
-struct Door {
+pub(super) struct Door {
     media: aos_media_door::MediaDoor,
-    read_price: Mutex<String>,
-    text_price: Mutex<String>,
+    pub(super) read_price: Mutex<String>,
+    pub(super) text_price: Mutex<String>,
     /// Overrides the media door's image price (`chargeMinor`) when set.
     image_minor: Mutex<Option<u64>>,
     /// When set, a text call is counted and the connection is dropped
     /// without an answer (an uncertain provider outcome).
     drop_text: AtomicBool,
     /// When set, a text call is answered 402 `insufficient_funds`.
-    no_credit: AtomicBool,
-    text_calls: AtomicUsize,
-    reads: AtomicUsize,
+    pub(super) no_credit: AtomicBool,
+    pub(super) text_calls: AtomicUsize,
+    pub(super) reads: AtomicUsize,
+    /// Every paid `POST /v1/runtime/tools/call` body as sent, answered or
+    /// not (CAD-1852 acceptance reads `max_charge_minor` from it).
+    pub(super) calls: Mutex<Vec<Value>>,
 }
 
 impl Door {
-    fn spent(&self) -> (usize, usize, usize) {
+    pub(super) fn spent(&self) -> (usize, usize, usize) {
         (
             self.reads.load(SeqCst),
             self.text_calls.load(SeqCst),
@@ -136,6 +139,9 @@ fn serve(stream: std::net::TcpStream, door: &Door) {
     reader.read_exact(&mut body).unwrap();
     let sent: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let route = path.split_once('?').map_or(path.as_str(), |(r, _)| r);
+    if method == "POST" && route == "/v1/runtime/tools/call" {
+        door.calls.lock().unwrap().push(sent.clone());
+    }
     let raw = |status: u16, content_type: &str, bytes: &[u8]| {
         let mut out = format!(
             "HTTP/1.1 {status} OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -215,16 +221,16 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
 /// One fixture at a time inside this module.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-struct Fx {
+pub(super) struct Fx {
     _serial: std::sync::MutexGuard<'static, ()>,
     dir: tempfile::TempDir,
     shared: Arc<Shared>,
-    door: Arc<Door>,
-    install: String,
-    context: String,
+    pub(super) door: Arc<Door>,
+    pub(super) install: String,
+    pub(super) context: String,
 }
 
-fn refused(result: Result<Value>, needle: &str, what: &str) -> String {
+pub(super) fn refused(result: Result<Value>, needle: &str, what: &str) -> String {
     match result {
         Ok(value) => panic!("{what} was accepted: {value}"),
         Err(error) => {
@@ -239,25 +245,25 @@ fn refused(result: Result<Value>, needle: &str, what: &str) -> String {
 }
 
 impl Fx {
-    fn call(&self, who: Asserted, method: &str, params: Value) -> Result<Value> {
+    pub(super) fn call(&self, who: Asserted, method: &str, params: Value) -> Result<Value> {
         scoped(who, || {
             self.shared.dispatch(method, &params, std::process::id())
         })
     }
-    fn operator(&self, method: &str, params: Value) -> Value {
+    pub(super) fn operator(&self, method: &str, params: Value) -> Value {
         self.call(Asserted::Operator, method, params)
             .unwrap_or_else(|e| panic!("operator {method}: {e}"))
     }
-    fn db(&self) -> rusqlite::Connection {
+    pub(super) fn db(&self) -> rusqlite::Connection {
         rusqlite::Connection::open(crate::rollout::db_file(self.dir.path())).unwrap()
     }
     fn records_of(&self, install: &str) -> RecordStore {
         RecordStore::open(self.dir.path(), install).unwrap()
     }
-    fn records(&self) -> RecordStore {
+    pub(super) fn records(&self) -> RecordStore {
         self.records_of(&self.install)
     }
-    fn drafts(&self, context: &str) -> usize {
+    pub(super) fn drafts(&self, context: &str) -> usize {
         self.records().app_social_draft_list(context).unwrap()["drafts"]
             .as_array()
             .unwrap()
@@ -266,7 +272,7 @@ impl Fx {
 
     /// A fixture with the Social Content package installed with
     /// `descriptor`, or with nothing installed.
-    fn with_social(descriptor: Option<&str>) -> Self {
+    pub(super) fn with_social(descriptor: Option<&str>) -> Self {
         for name in [
             "CADENCE_PUBLISH_SEND_URL",
             "CADENCE_PUBLISH_SEND_CREDENTIAL_FILE",
@@ -293,6 +299,7 @@ impl Fx {
             no_credit: AtomicBool::new(false),
             text_calls: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
+            calls: Mutex::new(Vec::new()),
         });
         let serving = door.clone();
         std::thread::spawn(move || {
@@ -401,7 +408,7 @@ impl Fx {
         fx
     }
 
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::with_social(Some(&social_descriptor()))
     }
 
@@ -517,7 +524,7 @@ impl Fx {
         token
     }
 
-    fn create_turn(&self, message: &str) -> String {
+    pub(super) fn create_turn(&self, message: &str) -> String {
         self.create_turn_in(&self.install, &self.context, message)
     }
 
@@ -540,7 +547,7 @@ impl Fx {
         )
     }
 
-    fn invoke(
+    pub(super) fn invoke(
         &self,
         message: &str,
         token: &str,
@@ -575,7 +582,7 @@ impl Fx {
         )
     }
 
-    fn decide(&self, who: Asserted, op: &Value, decision: &str) -> Result<Value> {
+    pub(super) fn decide(&self, who: Asserted, op: &Value, decision: &str) -> Result<Value> {
         self.decide_in(who, &self.install, &self.context, op, decision)
     }
 
@@ -587,14 +594,14 @@ impl Fx {
         )
     }
 
-    fn show(&self, op: &str) -> Value {
+    pub(super) fn show(&self, op: &str) -> Value {
         self.show_in(&self.install, &self.context, op)
             .unwrap_or_else(|e| panic!("show {op}: {e}"))["operation"]
             .clone()
     }
 
     /// Fetch through the operator's Allow so posts exist to draft from.
-    fn fetched(&self, message: &str, token: &str, op: &str) {
+    pub(super) fn fetched(&self, message: &str, token: &str, op: &str) {
         let pending = pending(
             &self
                 .invoke(message, token, "social.posts.fetch", op, json!({}))
@@ -615,7 +622,7 @@ impl Fx {
     }
 }
 
-fn pending(reply: &Value) -> Value {
+pub(super) fn pending(reply: &Value) -> Value {
     let op = reply["operation"].clone();
     assert_eq!(op["status"], "pending_permission", "{reply}");
     assert_eq!(op["permission_request"]["allow_always"], true, "{reply}");
