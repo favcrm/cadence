@@ -534,6 +534,66 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
                     }
                 }
             }
+            // CAD-1867: skills/<tag>/<member> — the package manifest, flat
+            // root text leaves, and one scripts/ or references/ subdirectory.
+            // `Root::read` opens O_NOFOLLOW and refuses hard links, so a
+            // package member is always the file the digest covered.
+            Some(libc::S_IFDIR) if name.as_str() == "skills" => {
+                for tag in root.list(&path, &mut budget)? {
+                    if tag.starts_with('.') || !model::valid_tag(&tag) {
+                        return Err(Error::rejected(
+                            "a skill package is a tag-named skills/<tag>/ directory",
+                        ));
+                    }
+                    let tagdir = path.join(&tag);
+                    if root.kind(&tagdir)? != Some(libc::S_IFDIR) {
+                        return Err(Error::rejected("skills/<tag> must be a directory"));
+                    }
+                    for leaf in root.list(&tagdir, &mut budget)? {
+                        if leaf.starts_with('.') {
+                            return Err(Error::rejected(
+                                "skills/<tag>/ dotfiles are not app content",
+                            ));
+                        }
+                        match root.kind(&tagdir.join(&leaf))? {
+                            Some(libc::S_IFDIR) => {
+                                if !app::skill_subdir_ok(&leaf) {
+                                    return Err(Error::rejected(
+                                        "a skill package nests only scripts/ or references/",
+                                    ));
+                                }
+                                let memberdir = tagdir.join(&leaf);
+                                for member in root.list(&memberdir, &mut budget)? {
+                                    if member.starts_with('.')
+                                        || !app::skill_member_ok(&format!("{leaf}/{member}"))
+                                    {
+                                        return Err(Error::rejected(
+                                            "a scripts/ member is <stem>.<py|sh|js|mjs> and a references/ member is <stem>.<md|txt>",
+                                        ));
+                                    }
+                                    add(
+                                        format!("skills/{tag}/{leaf}/{member}"),
+                                        memberdir.join(member),
+                                    )?;
+                                }
+                            }
+                            Some(libc::S_IFREG) => {
+                                if !app::skill_member_ok(&leaf) {
+                                    return Err(Error::rejected(
+                                        "a skill package leaf is <stem>.(md|txt|json|yaml|yml|csv|css|svg)",
+                                    ));
+                                }
+                                add(format!("skills/{tag}/{leaf}"), tagdir.join(leaf))?;
+                            }
+                            _ => {
+                                return Err(Error::rejected(
+                                    "unsupported or unsafe app bundle entry",
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
             Some(libc::S_IFDIR)
                 if matches!(
                     name.as_str(),

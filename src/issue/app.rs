@@ -38,7 +38,7 @@
 //! source is cloned into a temp dir and pinned to its HEAD SHA before
 //! any byte is looked at.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -79,7 +79,9 @@ const GATED_KEYS: &[&str] = &["records", "actions", "ui", "settings", "actors"];
 /// exactly one file — `views/app-views-v1.json`, the app-views/v1
 /// descriptor — and only when `app.md` declares `needs.views.contract`.
 /// CAD-1129: `assets/` is the catalog's icon and screenshots — flat
-/// `*.svg` files only.
+/// `*.svg` files only. CAD-1867: `skills/` holds one `<tag>/` package per
+/// installed skill — its `skill.json` manifest, flat root text leaves, and
+/// one `scripts/` or `references/` subdirectory.
 const TOP_DIRS: &[&str] = &[
     "workflows",
     "rubrics",
@@ -88,6 +90,7 @@ const TOP_DIRS: &[&str] = &[
     "views",
     "assets",
     "storage",
+    "skills",
 ];
 
 /// Largest single file in a bundle — workflows render to plans, so the
@@ -99,13 +102,21 @@ const MAX_FILE_BYTES: u64 = plan::MAX_PLAN_BYTES as u64;
 pub(crate) const MAX_SCREEN_ASSET_BYTES: u64 = 384 * 1024;
 
 /// The per-file cap for bundle member `rel`: [`MAX_SCREEN_ASSET_BYTES`] for a
-/// screen JS/CSS leaf, else [`MAX_FILE_BYTES`].
+/// screen JS/CSS leaf, the skill caps inside a `skills/<tag>/` package, else
+/// [`MAX_FILE_BYTES`].
 pub(crate) fn file_cap(rel: &str) -> u64 {
     let screen_leaf = rel
         .strip_prefix("screens/")
         .is_some_and(|r| r.split('/').count() == 2 && (r.ends_with(".js") || r.ends_with(".css")));
     if screen_leaf {
         MAX_SCREEN_ASSET_BYTES
+    } else if rel
+        .strip_prefix("skills/")
+        .is_some_and(|r| r.split('/').count() == 2 && r.ends_with(&format!("/{SKILL_MANIFEST}")))
+    {
+        SKILL_MANIFEST_BYTES
+    } else if rel.starts_with("skills/") {
+        SKILL_FILE_BYTES
     } else {
         MAX_FILE_BYTES
     }
@@ -162,6 +173,10 @@ pub(crate) enum DirRule {
     /// A `screens/<tag>/` package: the declaration or a tag-shaped stem plus
     /// `js|css|svg|json`.
     ScreensPackage,
+    /// A `skills/<tag>/` package: its `skill.json` manifest, flat root text
+    /// leaves, and one `scripts/` or `references/` subdirectory. See
+    /// [`skill_member_ok`].
+    SkillsPackage,
 }
 
 /// The directory half of the grammar, in one table. [`bundle_path_ok`]
@@ -180,12 +195,15 @@ pub(crate) const DIR_RULES: &[(&str, DirRule)] = &[
         },
     ),
     ("screens", DirRule::ScreensPackage),
+    // CAD-1867: an installed workflow's skill material — one
+    // `<tag>/` package per skill, frozen into a run at creation.
+    ("skills", DirRule::SkillsPackage),
     ("storage", DirRule::TaggedLeaf { suffix: ".json" }),
 ];
 
 /// Version of the published grammar document. Bump only for a shape change.
 #[cfg(test)]
-pub(crate) const GRAMMAR_VERSION: u32 = 2;
+pub(crate) const GRAMMAR_VERSION: u32 = 3;
 
 /// The lexical pieces the published document must state normatively. They are
 /// constants so the predicate and the document cannot disagree.
@@ -208,6 +226,466 @@ fn dir_rule(directory: &str) -> Option<DirRule> {
         .iter()
         .find(|(name, _)| *name == directory)
         .map(|(_, rule)| *rule)
+}
+
+/// CAD-1867: the skill package directory and its manifest. A package is
+/// `skills/<tag>/`; `skill.json` declares which members it carries.
+pub const SKILL_DIR: &str = "skills";
+pub const SKILL_MANIFEST: &str = "skill.json";
+/// The one member a package must always declare: the instructions an agent
+/// reads first.
+pub const SKILL_ENTRY: &str = "SKILL.md";
+/// A package declares at most this many members (its manifest excluded).
+pub const SKILL_FILES_MAX: usize = 16;
+/// Largest declared member, and largest `skill.json`.
+pub const SKILL_FILE_BYTES: u64 = 16 * 1024;
+pub const SKILL_MANIFEST_BYTES: u64 = 4 * 1024;
+/// Largest package: `skill.json` plus every declared member.
+pub const SKILL_PACKAGE_BYTES: u64 = 32 * 1024;
+
+/// Extensions a package's flat root leaves may carry.
+const SKILL_ROOT_EXTS: &[&str] = &["md", "txt", "json", "yaml", "yml", "csv", "css", "svg"];
+/// Extensions the one nested level admits, per subdirectory. `scripts/` holds
+/// code an agent may run; `references/` holds prose and notes.
+const SKILL_SCRIPTS_EXTS: &[&str] = &["py", "sh", "js", "mjs"];
+const SKILL_REFERENCES_EXTS: &[&str] = &["md", "txt"];
+/// Every extension the reference scan treats as naming package material.
+const SKILL_ALL_EXTS: &[&str] = &[
+    "md", "txt", "json", "yaml", "yml", "csv", "css", "svg", "py", "sh", "js", "mjs",
+];
+
+/// `scripts/` and `references/` are the only nested directories, each exactly
+/// one level deep.
+fn skill_nested_ext(directory: &str) -> Option<&'static [&'static str]> {
+    match directory {
+        "scripts" => Some(SKILL_SCRIPTS_EXTS),
+        "references" => Some(SKILL_REFERENCES_EXTS),
+        _ => None,
+    }
+}
+
+/// Whether `directory` is one of the package's two nested directories. The
+/// bundle walkers ask this before descending, so `skills/<tag>/<dir>/` can only
+/// ever be `scripts/` or `references/`.
+pub(crate) fn skill_subdir_ok(directory: &str) -> bool {
+    skill_nested_ext(directory).is_some()
+}
+
+fn skill_leaf_ok(name: &str, exts: &[&str]) -> bool {
+    plain_leaf_ok(name)
+        && exts.iter().any(|ext| {
+            name.strip_suffix(&format!(".{ext}"))
+                .is_some_and(|stem| !stem.is_empty())
+        })
+}
+
+/// The grammar of one package-relative member: a flat root leaf with an
+/// allowed text extension, or `<scripts|references>/<leaf>` with that
+/// directory's extensions. Nothing deeper, no dotfiles, no separators.
+pub fn skill_member_ok(member: &str) -> bool {
+    if member.is_empty() || !member.is_ascii() || member.contains('\\') || member.contains('\0') {
+        return false;
+    }
+    let segs: Vec<&str> = member.split('/').collect();
+    match segs.as_slice() {
+        [leaf] => skill_leaf_ok(leaf, SKILL_ROOT_EXTS),
+        [directory, leaf] => {
+            skill_nested_ext(directory).is_some_and(|exts| skill_leaf_ok(leaf, exts))
+        }
+        _ => false,
+    }
+}
+
+/// The `skill.json` a package must carry. Closed decode: an unknown field
+/// refuses, so a package cannot smuggle a contract this host does not read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillManifest {
+    pub schema: u32,
+    pub name: String,
+    /// Every member of the package except `skill.json` itself, in declared
+    /// order. The set must equal the set actually present — both directions
+    /// refuse, naming the path.
+    pub files: Vec<String>,
+}
+
+/// One declared member, frozen: the exact bytes the host read, and their
+/// digest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillFile {
+    pub path: String,
+    pub sha256: String,
+    pub text: String,
+}
+
+/// A skill package frozen at run creation: `{name, manifest,
+/// manifest_sha256, digest, files}`. This value travels in the run snapshot
+/// and in the dispatch kickoff and nowhere else — the host materializes no
+/// copy on disk, so a later bundle update cannot change what a run was given.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillPackage {
+    pub name: String,
+    pub manifest: SkillManifest,
+    pub manifest_sha256: String,
+    pub digest: String,
+    pub files: Vec<SkillFile>,
+}
+
+/// The one skill manifest validator: install validation and run creation both
+/// reach a package through [`skill_package`], which is the only caller of
+/// this, so the two can never disagree about what a complete package is.
+///
+/// `tag` is the package's directory name. The manifest's own `name` must be
+/// that tag — a package cannot declare itself to be another one.
+pub fn parse_skill_manifest(text: &str, tag: &str) -> Result<SkillManifest> {
+    if !crate::issue::model::valid_tag(tag) {
+        return Err(Error::rejected(format!(
+            "skill package '{tag}' — a package name is [a-z0-9-], ≤32 bytes"
+        )));
+    }
+    if text.len() as u64 > SKILL_MANIFEST_BYTES {
+        return Err(Error::rejected(format!(
+            "{SKILL_DIR}/{tag}/{SKILL_MANIFEST} is {} bytes — a skill manifest is at \
+             most {SKILL_MANIFEST_BYTES}",
+            text.len()
+        )));
+    }
+    let manifest: SkillManifest = serde_json::from_str(text).map_err(|e| {
+        Error::rejected(format!(
+            "{SKILL_DIR}/{tag}/{SKILL_MANIFEST}: {e} — the manifest is \
+             {{\"schema\":1,\"name\":\"{tag}\",\"files\":[\"{SKILL_ENTRY}\"]}}"
+        ))
+    })?;
+    if manifest.schema != 1 {
+        return Err(Error::rejected(format!(
+            "{SKILL_DIR}/{tag}/{SKILL_MANIFEST}: schema {} — this host reads schema 1",
+            manifest.schema
+        )));
+    }
+    if manifest.name != tag {
+        return Err(Error::rejected(format!(
+            "{SKILL_DIR}/{tag}/{SKILL_MANIFEST} declares name '{}' — it must be its \
+             own directory name '{tag}'",
+            manifest.name
+        )));
+    }
+    if manifest.files.is_empty() {
+        return Err(Error::rejected(format!(
+            "{SKILL_DIR}/{tag}/{SKILL_MANIFEST} declares no files — it must declare \
+             {SKILL_ENTRY} and every member the package carries"
+        )));
+    }
+    if manifest.files.len() > SKILL_FILES_MAX {
+        return Err(Error::rejected(format!(
+            "{SKILL_DIR}/{tag} declares {} files — a package declares at most \
+             {SKILL_FILES_MAX}",
+            manifest.files.len()
+        )));
+    }
+    for (i, member) in manifest.files.iter().enumerate() {
+        if member == SKILL_MANIFEST {
+            return Err(Error::rejected(format!(
+                "{SKILL_DIR}/{tag}/{SKILL_MANIFEST} lists '{SKILL_MANIFEST}' — the \
+                 manifest is never one of its own declared files"
+            )));
+        }
+        if !skill_member_ok(member) {
+            return Err(Error::rejected(format!(
+                "{SKILL_DIR}/{tag}/{SKILL_MANIFEST} declares '{member}' — a package \
+                 member is a flat root <stem>.<{}>, or scripts/<stem>.<{}>, or \
+                 references/<stem>.<{}>",
+                SKILL_ROOT_EXTS.join("|"),
+                SKILL_SCRIPTS_EXTS.join("|"),
+                SKILL_REFERENCES_EXTS.join("|"),
+            )));
+        }
+        if manifest.files[..i].contains(member) {
+            return Err(Error::rejected(format!(
+                "{SKILL_DIR}/{tag}/{SKILL_MANIFEST} declares '{member}' twice"
+            )));
+        }
+    }
+    if !manifest.files.iter().any(|member| member == SKILL_ENTRY) {
+        return Err(Error::rejected(format!(
+            "{SKILL_DIR}/{tag}/{SKILL_MANIFEST} must declare {SKILL_ENTRY} — the \
+             instructions an agent reads first"
+        )));
+    }
+    Ok(manifest)
+}
+
+/// The digest over a frozen package: the name, the manifest bytes and every
+/// declared member's path and digest, length-prefixed in declared order.
+fn skill_digest(name: &str, manifest_sha256: &str, files: &[SkillFile]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cadence-app-skill-v1\n");
+    for part in [name, manifest_sha256] {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    for file in files {
+        for part in [file.path.as_str(), file.sha256.as_str()] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
+/// Tokens in `text` that could name package material. A token is a run of
+/// ASCII alphanumerics plus `.`, `_`, `/` and `-`; everything else is a
+/// separator. Every token is returned: dropping a long one would be a
+/// reference this guard silently ignores, and the files are bounded anyway.
+fn reference_tokens(text: &str) -> impl Iterator<Item = &str> + '_ {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')))
+        .filter(|token| !token.is_empty())
+}
+
+/// The package-relative path a token names, or `None` when the token names
+/// nothing this contract tracks.
+///
+/// Every `.`-led spelling is the same relative path: `./x`, `.//x` and
+/// `.//./x` all name `x`, and `.`/empty segments carry no meaning. Only a token
+/// that starts with a slash and was never `.`-led is an absolute path, which is
+/// somebody else's file. `..` would escape the package and refuses.
+fn referenced_member(token: &str, tag: &str) -> Option<Reference> {
+    // A sentence-ending period is a separator, not part of a member name:
+    // `run ./scripts/build.py.` names `scripts/build.py`.
+    let token = token.trim_end_matches('.');
+    if token.is_empty() {
+        return None;
+    }
+    let absolute = token.starts_with('/') && !token.starts_with('.');
+    let mut escaped = false;
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in token.split('/') {
+        match segment {
+            "" | "." => continue,
+            // `..` cannot be resolved against the package, so a token that
+            // uses it and still names package material refuses below rather
+            // than being dropped as if it named nothing.
+            ".." => escaped = true,
+            other => segments.push(other),
+        }
+    }
+    if segments.is_empty() || absolute {
+        return None;
+    }
+    let path = segments.join("/");
+    if let Some(rest) = path.strip_prefix(&format!("{SKILL_DIR}/")) {
+        let (owner, member) = rest.split_once('/')?;
+        return Some(Reference {
+            owner: owner.to_string(),
+            member: member.to_string(),
+            escaped,
+        });
+    }
+    for directory in ["scripts", "references"] {
+        if path.starts_with(&format!("{directory}/")) {
+            return Some(Reference {
+                owner: tag.to_string(),
+                member: path,
+                escaped,
+            });
+        }
+    }
+    if path.contains('/') {
+        return None;
+    }
+    let ext = path.rsplit_once('.').map(|(_, ext)| ext)?;
+    if !SKILL_ALL_EXTS.contains(&ext) {
+        return None;
+    }
+    Some(Reference {
+        owner: tag.to_string(),
+        member: path,
+        escaped,
+    })
+}
+
+/// One token that names package material: the package it names (`skills/` may
+/// name another package, which refuses) and the member path inside it.
+/// `escaped` records a `..` segment, which cannot be resolved inside the
+/// package and therefore refuses instead of being ignored.
+struct Reference {
+    owner: String,
+    member: String,
+    escaped: bool,
+}
+
+/// CAD-1867: the declared-inventory check. Every declared text file is
+/// scanned for tokens that name package material, and a token naming a member
+/// the manifest does not declare refuses.
+///
+/// This is a declared-inventory contract, NOT import analysis: it reads names,
+/// never evaluates them, so a path assembled at run time (`os.path.join`,
+/// `importlib`, a variable) is invisible to it. It fails closed on the names it
+/// can see — including a bare `name.ext` with an allowed extension, which is
+/// read as a package member — because a silently ignored reference is a member
+/// an agent would look for and not find.
+fn undeclared_references(
+    files: &[SkillFile],
+    declared: &BTreeSet<String>,
+    tag: &str,
+) -> Vec<String> {
+    let mut refusals: Vec<String> = Vec::new();
+    for file in files {
+        for token in reference_tokens(&file.text) {
+            let Some(reference) = referenced_member(token, tag) else {
+                continue;
+            };
+            let refusal = if reference.escaped {
+                format!(
+                    "{SKILL_DIR}/{tag}/{path}: '{token}' reaches package material through '..' — \
+                     name the member path inside the package",
+                    path = file.path
+                )
+            } else if reference.owner != tag {
+                format!(
+                    "{SKILL_DIR}/{tag}/{path}: '{token}' names skill package '{owner}' — a \
+                     package references only its own declared members",
+                    path = file.path,
+                    owner = reference.owner
+                )
+            } else if declared.contains(&reference.member) {
+                continue;
+            } else {
+                format!(
+                    "{SKILL_DIR}/{tag}/{path}: '{token}' is not declared in \
+                     {SKILL_DIR}/{tag}/{SKILL_MANIFEST} — declare '{member}' in its files",
+                    path = file.path,
+                    member = reference.member
+                )
+            };
+            if !refusals.contains(&refusal) {
+                refusals.push(refusal);
+            }
+        }
+    }
+    refusals
+}
+
+/// Resolve ONE skill package out of a bundle's file map — `rel-path → text`.
+///
+/// This is the only package validator: install validation runs it over every
+/// package a bundle carries and over every tag a workflow names, and run
+/// creation runs it over the tag it freezes, so the two cannot disagree. The
+/// map is the bundle's own bytes (the installed file map at run creation);
+/// nothing here touches the filesystem.
+pub fn skill_package(files: &BTreeMap<String, String>, tag: &str) -> Result<SkillPackage> {
+    if !crate::issue::model::valid_tag(tag) {
+        return Err(Error::rejected(format!(
+            "skill '{tag}' — a skill name is [a-z0-9-], ≤32 bytes"
+        )));
+    }
+    let prefix = format!("{SKILL_DIR}/{tag}/");
+    let manifest_path = format!("{prefix}{SKILL_MANIFEST}");
+    let manifest_text = files.get(&manifest_path).ok_or_else(|| {
+        Error::rejected(format!(
+            "no skill package '{tag}' in this bundle — it needs {manifest_path}"
+        ))
+    })?;
+    let manifest = parse_skill_manifest(manifest_text, tag)?;
+    // What the bundle actually carries under this package.
+    let mut present: BTreeSet<String> = BTreeSet::new();
+    for rel in files.keys().filter_map(|rel| rel.strip_prefix(&prefix)) {
+        if !skill_member_ok(rel) {
+            return Err(Error::rejected(format!(
+                "{prefix}{rel} — a package member is a flat root <stem>.<{}>, or \
+                 scripts/<stem>.<{}>, or references/<stem>.<{}>; nothing deeper, no \
+                 dotfiles",
+                SKILL_ROOT_EXTS.join("|"),
+                SKILL_SCRIPTS_EXTS.join("|"),
+                SKILL_REFERENCES_EXTS.join("|"),
+            )));
+        }
+        present.insert(rel.to_string());
+    }
+    if !present.contains(SKILL_MANIFEST) {
+        // `present` is built from the prefix, so the manifest is there; this
+        // only guards a future rewrite of the scan above.
+        return Err(Error::rejected(format!("{manifest_path} is absent")));
+    }
+    let declared: BTreeSet<String> = manifest.files.iter().cloned().collect();
+    for member in &declared {
+        if !present.contains(member) {
+            return Err(Error::rejected(format!(
+                "{SKILL_DIR}/{tag}/{SKILL_MANIFEST} declares '{member}' but the bundle \
+                 does not carry {prefix}{member} — a package declares exactly what it \
+                 ships"
+            )));
+        }
+    }
+    for member in &present {
+        if member != SKILL_MANIFEST && !declared.contains(member) {
+            return Err(Error::rejected(format!(
+                "{prefix}{member} is not declared in {SKILL_DIR}/{tag}/{SKILL_MANIFEST} \
+                 — declare it in the manifest's files, or remove it"
+            )));
+        }
+    }
+    let mut total = manifest_text.len() as u64;
+    let mut frozen: Vec<SkillFile> = Vec::with_capacity(manifest.files.len());
+    for member in &manifest.files {
+        let text = files.get(&format!("{prefix}{member}")).ok_or_else(|| {
+            Error::internal(format!(
+                "{prefix}{member} vanished after the presence check"
+            ))
+        })?;
+        if text.len() as u64 > SKILL_FILE_BYTES {
+            return Err(Error::rejected(format!(
+                "{prefix}{member} is {} bytes — a skill member is at most {SKILL_FILE_BYTES}",
+                text.len()
+            )));
+        }
+        total += text.len() as u64;
+        frozen.push(SkillFile {
+            path: member.clone(),
+            sha256: format!("sha256:{}", sha256_hex(text.as_bytes())),
+            text: text.clone(),
+        });
+    }
+    if total > SKILL_PACKAGE_BYTES {
+        return Err(Error::rejected(format!(
+            "{SKILL_DIR}/{tag} is {total} bytes — a skill package is at most \
+             {SKILL_PACKAGE_BYTES} including its manifest"
+        )));
+    }
+    let refusals = undeclared_references(&frozen, &declared, tag);
+    if !refusals.is_empty() {
+        return Err(Error::rejected(refusals.join("; ")));
+    }
+    let manifest_sha256 = format!("sha256:{}", sha256_hex(manifest_text.as_bytes()));
+    Ok(SkillPackage {
+        name: tag.to_string(),
+        digest: skill_digest(tag, &manifest_sha256, &frozen),
+        manifest,
+        manifest_sha256,
+        files: frozen,
+    })
+}
+
+/// Every skill package a bundle carries, by tag.
+pub fn skill_packages(files: &BTreeMap<String, String>) -> Result<Vec<SkillPackage>> {
+    let mut tags: Vec<&str> = Vec::new();
+    for rel in files.keys() {
+        let Some(rest) = rel.strip_prefix(&format!("{SKILL_DIR}/")) else {
+            continue;
+        };
+        let Some((tag, _)) = rest.split_once('/') else {
+            return Err(Error::rejected(format!(
+                "{SKILL_DIR}/{rest} — a skill package is a {SKILL_DIR}/<tag>/ directory"
+            )));
+        };
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+    tags.into_iter()
+        .map(|tag| skill_package(files, tag))
+        .collect()
 }
 
 /// The one bundle path grammar. The board's files-mode transport (install and
@@ -245,20 +723,26 @@ pub(crate) fn bundle_path_ok(path: &str) -> bool {
                 plain_leaf_ok(leaf) && leaf.ends_with(ASSET_SUFFIX) && leaf.len() <= max_leaf_bytes
             }
             // A screens package is a directory, never a flat leaf.
-            Some(DirRule::ScreensPackage) | None => false,
+            Some(DirRule::ScreensPackage) | Some(DirRule::SkillsPackage) | None => false,
         },
         // CAD-1006: one tag-named package dir per screen.
         ["screens", tag, leaf] => {
             crate::issue::model::valid_tag(tag) && crate::issue::app_screen_pkg::leaf_ok(leaf)
+        }
+        // CAD-1867: one tag-named package dir per skill — a flat root leaf or
+        // one `scripts/`/`references/` member.
+        ["skills", tag, member] => crate::issue::model::valid_tag(tag) && skill_member_ok(member),
+        ["skills", tag, directory, leaf] => {
+            crate::issue::model::valid_tag(tag) && skill_member_ok(&format!("{directory}/{leaf}"))
         }
         _ => false,
     }
 }
 
 /// The published grammar document, generated from [`ROOT_MEMBERS`],
-/// [`DIR_RULES`] and the caps. `contracts/bundle-grammar/v2/grammar.json` must
-/// equal this byte for byte; the test below refuses drift. The v1 document
-/// stays as the historical artifact a v1 reader already carries.
+/// [`DIR_RULES`] and the caps. `contracts/bundle-grammar/v3/grammar.json` must
+/// equal this byte for byte; the test below refuses drift. The v1 and v2
+/// documents stay as the historical artifacts a v1/v2 reader already carries.
 #[cfg(test)]
 pub(crate) fn bundle_grammar_json() -> String {
     let directories: Vec<serde_json::Value> = DIR_RULES
@@ -284,6 +768,13 @@ pub(crate) fn bundle_grammar_json() -> String {
                 "rule": "screens_package",
                 "declaration": crate::issue::app_screen_pkg::SCREEN_MANIFEST,
                 "leaf": "tag_stem.(js|css|svg|json)",
+            }),
+            DirRule::SkillsPackage => serde_json::json!({
+                "dir": directory,
+                "rule": "skills_package",
+                "declaration": SKILL_MANIFEST,
+                "entry": SKILL_ENTRY,
+                "member": "<stem>.(md|txt|json|yaml|yml|csv|css|svg) | <scripts|references>/<stem>",
             }),
         })
         .collect();
@@ -324,6 +815,21 @@ pub(crate) fn bundle_grammar_json() -> String {
                 "assetStem": "validTag",
                 "extensions": SCREEN_ASSET_EXTS,
             },
+            // CAD-1867: a skill package. `files` in its manifest is the
+            // declared inventory and must equal the present set exactly,
+            // in both directions; `skill.json` is never listed in itself.
+            "skillsPackage": {
+                "path": "skills/<tag>/<member>",
+                "tag": "validTag",
+                "manifest": SKILL_MANIFEST,
+                "entry": SKILL_ENTRY,
+                "rootExtensions": SKILL_ROOT_EXTS,
+                "nested": { "scripts": SKILL_SCRIPTS_EXTS, "references": SKILL_REFERENCES_EXTS },
+                "maxDepth": 2,
+                "dotfiles": "refused",
+                "symlinks": "refused",
+                "declaredEqualsPresent": true,
+            },
             "exact": { "leaf": "the name carried by the directory entry" },
         },
         "directories": directories,
@@ -332,6 +838,10 @@ pub(crate) fn bundle_grammar_json() -> String {
             "screenAssetBytes": MAX_SCREEN_ASSET_BYTES,
             "bundleBytes": MAX_APP_BYTES,
             "files": MAX_FILES,
+            "skillManifestBytes": SKILL_MANIFEST_BYTES,
+            "skillFileBytes": SKILL_FILE_BYTES,
+            "skillPackageBytes": SKILL_PACKAGE_BYTES,
+            "skillFiles": SKILL_FILES_MAX,
         },
     });
     serde_json::to_string_pretty(&document).expect("grammar document serializes") + "\n"
@@ -356,6 +866,11 @@ mod bundle_grammar_tests {
             "screens/crm/screens.json",
             "screens/crm/client.js",
             "screens/crm/styles.css",
+            "skills/meeting-writer/skill.json",
+            "skills/meeting-writer/SKILL.md",
+            "skills/meeting-writer/notes.txt",
+            "skills/meeting-writer/scripts/build.py",
+            "skills/meeting-writer/references/style.md",
         ] {
             assert!(bundle_path_ok(path), "{path}");
         }
@@ -374,6 +889,14 @@ mod bundle_grammar_tests {
             "workflows/UPPER.md",
             "views/other.json",
             "screens/crm/deep/file.js",
+            "skills/meeting-writer",
+            "skills/meeting-writer/scripts",
+            "skills/meeting-writer/scripts/deep/build.py",
+            "skills/meeting-writer/scripts/build.rb",
+            "skills/meeting-writer/references/build.py",
+            "skills/meeting-writer/scripts/build.md",
+            "skills/meeting-writer/.hidden.md",
+            "skills/UPPER/SKILL.md",
             "../secret",
             "app.md/inner",
             "./app-actions.json",
@@ -385,16 +908,17 @@ mod bundle_grammar_tests {
         assert!(!bundle_path_ok(&format!("assets/{}.svg", "a".repeat(125))));
     }
 
-    /// The live artifact. Parity is checked against v2 only: the v1 document
-    /// is historical and stays untouched, so a v1 reader keeps the shape it
-    /// was published with.
+    /// The live artifact. Parity is checked against the current version only:
+    /// the v1 and v2 documents are historical and stay untouched, so a v1/v2
+    /// reader keeps the shape it was published with.
     fn grammar_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("contracts/bundle-grammar/v2/grammar.json")
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "contracts/bundle-grammar/v{GRAMMAR_VERSION}/grammar.json"
+        ))
     }
 
     /// The published document is generated, never hand-written: this test is
-    /// the only thing keeping `contracts/bundle-grammar/v2/grammar.json` equal
+    /// the only thing keeping `contracts/bundle-grammar/v3/grammar.json` equal
     /// to the predicate consumers are expected to apply.
     #[test]
     fn published_artifact_matches_the_predicate() {
@@ -1264,7 +1788,7 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
         }
         return Err(Error::rejected(format!(
             "app source entry '{name}' — v0 knows app.md, app-chat.json, workflows/, \
-             rubrics/, templates/, screens/, views/; everything else refuses"
+             rubrics/, templates/, screens/, skills/, views/; everything else refuses"
         )));
     }
     if !manifest {
@@ -1315,6 +1839,17 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
                     return Err(entry_err(
                         &format!("{top}/{name}"),
                         "a screen package is a <tag>/ directory",
+                    ));
+                }
+                continue;
+            }
+            if *top == "skills" {
+                // CAD-1867: a skills member is a <tag>/ directory handled
+                // by the nested pass below — never a flat file.
+                if !ft.is_dir() {
+                    return Err(entry_err(
+                        &format!("{top}/{name}"),
+                        "a skill package is a <tag>/ directory",
                     ));
                 }
                 continue;
@@ -1426,6 +1961,123 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             }
             // screens/ holds subdirs only — the flat-member loop above
             // collected none for it; drop the loop's own (empty) result.
+        }
+        // CAD-1867: skills/<tag>/<member>, where `<member>` is a flat root
+        // text leaf or one `scripts/`/`references/` member. Exactly the
+        // grammar `skill_member_ok` states — a directory is only ever
+        // `scripts/` or `references/`, never a file, and nothing nests
+        // deeper.
+        if top == "skills" {
+            for tag_entry in std::fs::read_dir(dir)?.flatten() {
+                let tag = tag_entry.file_name();
+                let Some(tag) = tag.to_str() else {
+                    return Err(Error::rejected("skills/ carries a non-UTF-8 name"));
+                };
+                if tag.starts_with('.') {
+                    return Err(entry_err(
+                        &format!("skills/{tag}"),
+                        "dotfiles are not app content",
+                    ));
+                }
+                let ft = tag_entry
+                    .file_type()
+                    .map_err(|e| Error::rejected(format!("cannot stat 'skills/{tag}': {e}")))?;
+                if ft.is_symlink() {
+                    return Err(entry_err(
+                        &format!("skills/{tag}"),
+                        "a symlink — an app folder holds real files only",
+                    ));
+                }
+                if !ft.is_dir() {
+                    return Err(entry_err(
+                        &format!("skills/{tag}"),
+                        "a skill package is a <tag>/ directory",
+                    ));
+                }
+                check_name(tag, "skill name")?;
+                let tagdir = tag_entry.path();
+                for leaf in std::fs::read_dir(&tagdir)?.flatten() {
+                    let leaf_name = leaf.file_name();
+                    let Some(leaf_name) = leaf_name.to_str() else {
+                        return Err(Error::rejected(
+                            "skills/<tag>/ carries a non-UTF-8 leaf name",
+                        ));
+                    };
+                    let rel = format!("skills/{tag}/{leaf_name}");
+                    if leaf_name.starts_with('.') {
+                        return Err(entry_err(&rel, "dotfiles are not app content"));
+                    }
+                    let lft = leaf
+                        .file_type()
+                        .map_err(|e| Error::rejected(format!("cannot stat '{rel}': {e}")))?;
+                    if lft.is_symlink() {
+                        return Err(entry_err(
+                            &rel,
+                            "a symlink — an app folder holds real files only",
+                        ));
+                    }
+                    if lft.is_dir() {
+                        if !skill_subdir_ok(leaf_name) {
+                            return Err(entry_err(
+                                &rel,
+                                "a skill package nests only scripts/ or references/",
+                            ));
+                        }
+                        for member in std::fs::read_dir(leaf.path())?.flatten() {
+                            let member_name = member.file_name();
+                            let Some(member_name) = member_name.to_str() else {
+                                return Err(Error::rejected(format!(
+                                    "{rel}/ carries a non-UTF-8 name"
+                                )));
+                            };
+                            let member_rel = format!("{rel}/{member_name}");
+                            if member_name.starts_with('.') {
+                                return Err(entry_err(&member_rel, "dotfiles are not app content"));
+                            }
+                            let mft = member.file_type().map_err(|e| {
+                                Error::rejected(format!("cannot stat '{member_rel}': {e}"))
+                            })?;
+                            if mft.is_symlink() {
+                                return Err(entry_err(
+                                    &member_rel,
+                                    "a symlink — an app folder holds real files only",
+                                ));
+                            }
+                            if !mft.is_file() {
+                                return Err(entry_err(
+                                    &member_rel,
+                                    "skill members are flat files — no deeper folders",
+                                ));
+                            }
+                            let package_member = format!("{leaf_name}/{member_name}");
+                            if !skill_member_ok(&package_member) {
+                                return Err(entry_err(
+                                    &member_rel,
+                                    &format!(
+                                        "a {leaf_name}/ member is <stem>.<{}>",
+                                        skill_nested_ext(leaf_name).unwrap_or(&[]).join("|")
+                                    ),
+                                ));
+                            }
+                            files.push((member_rel, member.path()));
+                        }
+                        continue;
+                    }
+                    if !lft.is_file() {
+                        return Err(entry_err(&rel, "not a regular file"));
+                    }
+                    if !skill_member_ok(leaf_name) {
+                        return Err(entry_err(
+                            &rel,
+                            &format!(
+                                "a package root leaf is <stem>.<{}>",
+                                SKILL_ROOT_EXTS.join("|")
+                            ),
+                        ));
+                    }
+                    files.push((rel, leaf.path()));
+                }
+            }
         }
     }
     if files.len() > MAX_FILES {
@@ -1690,6 +2342,10 @@ fn validate_contents(
     {
         errors.push(error.to_string());
     }
+    // This bundle's own bytes as one `rel-path → text` map. The skill and
+    // screen member groups are both validated over it, and run creation
+    // resolves a skill package from the same shape of map.
+    let bundle_map: BTreeMap<String, String> = files.iter().cloned().collect();
     // CAD-1129 §3: every asset `listing` references must be in this
     // bundle's own inventory — `assets/` flat *.svg, nothing outside.
     if let Some(listing) = &manifest.listing {
@@ -1780,7 +2436,10 @@ fn validate_contents(
             continue;
         }
         workflow_count += 1;
-        let (errs, ns, _) = workflow::check_text(text, agents, agent_sources);
+        // CAD-1867: an installed bundle's workflow MAY declare `skill:` —
+        // the tag is resolved against this bundle's own packages below, and
+        // run creation re-proves it through the same `skill_package`.
+        let (errs, ns, _) = workflow::check_installed_text(text, agents, agent_sources);
         errors.extend(errs.into_iter().map(|e| format!("{rel}: {e}")));
         notes.extend(ns.into_iter().map(|n| format!("{rel}: {n}")));
         if let Ok(template) = workflow::parse_template(text) {
@@ -1806,6 +2465,25 @@ fn validate_contents(
             }
             Err(e) => errors.push(format!("{rel}: {e}")),
         }
+        match workflow::skill_tags(text) {
+            Ok(tags) => {
+                for tag in tags.into_iter().flatten() {
+                    if let Err(e) = skill_package(&bundle_map, &tag) {
+                        errors.push(format!("{rel}: `skill: {tag}` — {e}"));
+                    }
+                }
+            }
+            Err(e) => errors.push(format!("{rel}: {e}")),
+        }
+    }
+    // CAD-1867: every `skills/<tag>/` package the bundle carries must be
+    // complete on its own terms — its manifest, the declared set equal to the
+    // present set, the caps, and every reference its declared text files make
+    // to package material. One validator, `skill_package`, so install and run
+    // creation can never disagree.
+    match skill_packages(&bundle_map) {
+        Ok(_) => {}
+        Err(e) => errors.push(e.to_string()),
     }
     // CAD-1270 item 3: every `screens/<tag>/` member group is a screen
     // package — integrity-check each through the same
@@ -1819,8 +2497,8 @@ fn validate_contents(
     // install-check and the offline `app check` all inherit — no second
     // parser.
     {
-        let screen_map: BTreeMap<String, String> = files.iter().cloned().collect();
-        if let Err(e) = crate::issue::app_screen_pkg::tags_in(&screen_map) {
+        let screen_map = &bundle_map;
+        if let Err(e) = crate::issue::app_screen_pkg::tags_in(screen_map) {
             errors.push(format!("screens: {e}"));
         }
         let mut candidates: Vec<&str> = Vec::new();
@@ -1834,7 +2512,7 @@ fn validate_contents(
             }
         }
         for tag in candidates {
-            match crate::issue::app_screen_pkg::extract(&screen_map, tag) {
+            match crate::issue::app_screen_pkg::extract(screen_map, tag) {
                 // Same binding the mount RPC enforces: the package's
                 // declared `app` must be this bundle's manifest app —
                 // a package cannot claim a different app.
@@ -3550,7 +4228,9 @@ pub fn show(pm: &Pm, project_key: &str, name: &str, state_dir: &Path) -> Result<
             continue;
         };
         let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let (errors, notes, doc) = workflow::check_text(&text, &agents, &agent_sources);
+        // The installed bundle's own verdict: a `skill:` tag is admissible
+        // here, and `validate` proved it resolves.
+        let (errors, notes, doc) = workflow::check_installed_text(&text, &agents, &agent_sources);
         let tpl = workflow::parse_template(&text).ok();
         workflows.push(json!({
             "name": format!("{name}/{wf}"),
@@ -3605,6 +4285,11 @@ pub fn plan_text(
     let _ = app_dir(pm_dir, project, app)?;
     let record = read_record(pm_dir, project, app)?;
     let text = read_workflow(pm_dir, project, app, wf)?;
+    // CAD-1867: a `skill:` directive is resolved only by an app RUN, which
+    // freezes the package into its snapshot. A plan proposal renders the
+    // workflow into tracker tickets — it freezes nothing — so the directive
+    // refuses here instead of being dropped into prose.
+    workflow::refuse_skill_directive(&text)?;
     // The digest covers THIS buffer for the rendered workflow — the
     // bytes the operator approved are the bytes rendered, even if a
     // co-host writer flips the file after this one read (N2).
@@ -3717,7 +4402,8 @@ pub fn board_rows(pm_dir: &Path, project: &str, state_dir: &Path) -> Vec<Value> 
                         continue;
                     }
                     let text = std::fs::read_to_string(path).unwrap_or_default();
-                    let (_, _, doc) = workflow::check_text(&text, &agents, &agent_sources);
+                    let (_, _, doc) =
+                        workflow::check_installed_text(&text, &agents, &agent_sources);
                     let tpl = workflow::parse_template(&text).ok();
                     let mut row = json!({
                         "project": project,
@@ -4286,5 +4972,400 @@ installed_at: '2026-09-27T00:00:00Z'\ninstalled_by: operator\n",
         let pkg = crate::issue::app_screen_pkg::extract(&map, "feed").unwrap();
         assert_eq!(pkg.contract, "app-screens/v2");
         assert_eq!(pkg.tools["instagram.read"], "source");
+    }
+
+    /// CAD-1867: a bundle carrying one complete skill package, as the text map
+    /// install and run creation both validate. `declared` is the manifest's
+    /// `files`; `carried` is what the bundle actually holds.
+    fn skill_bundle(
+        declared: &[&str],
+        carried: &[(&str, &str)],
+        workflow: &str,
+    ) -> BTreeMap<String, String> {
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "name": "meeting-writer",
+            "files": declared,
+        });
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        files.insert(
+            MANIFEST.to_string(),
+            "---\napp: skill-app\ntitle: Skill app\nversion: '1'\nneeds:\n  \
+             connections: []\n---\n\nGuide.\n"
+                .to_string(),
+        );
+        files.insert("workflows/do.md".to_string(), workflow.to_string());
+        files.insert(
+            format!("{SKILL_DIR}/meeting-writer/{SKILL_MANIFEST}"),
+            manifest.to_string(),
+        );
+        for (member, text) in carried {
+            files.insert(
+                format!("{SKILL_DIR}/meeting-writer/{member}"),
+                text.to_string(),
+            );
+        }
+        files
+    }
+
+    /// The storage guard workflow with a `skill:` line appended as the step's
+    /// last metadata line — the only position the plan parser can read.
+    fn skill_workflow(skill_line: &str) -> String {
+        SKILL_BASE_WORKFLOW.replace(
+            "agent: dev-1\nsize: S\n",
+            &format!("agent: dev-1\nsize: S\n{skill_line}"),
+        )
+    }
+
+    /// A minimal valid workflow the install gate accepts.
+    const SKILL_BASE_WORKFLOW: &str = "---\ntitle: \"Post: {{topic}}\"\ngoal: \"Publish {{topic}}\"\n\
+inputs:\n  topic: { ask: \"About what?\" }\n---\n\n\
+Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance\n- [ ] brief written\n";
+
+    fn skill_texts(files: &BTreeMap<String, String>) -> Vec<(String, String)> {
+        files.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    fn install_error(files: &BTreeMap<String, String>) -> String {
+        match validate_texts(skill_texts(files), &HashSet::new(), &[]) {
+            Ok(_) => panic!("install accepts the bundle"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    const SKILL_MD: &str = "Read references/style.md, then run ./scripts/build.py.\n";
+    const STYLE_MD: &str = "Short sentences.\n";
+    const BUILD_PY: &str = "print('ok')\n";
+
+    /// The complete package installs and freezes every declared member
+    /// byte-exactly, with the manifest's own digest.
+    #[test]
+    fn cad1867_a_complete_skill_package_installs_and_freezes_its_bytes() {
+        let files = skill_bundle(
+            &[SKILL_ENTRY, "references/style.md", "scripts/build.py"],
+            &[
+                (SKILL_ENTRY, SKILL_MD),
+                ("references/style.md", STYLE_MD),
+                ("scripts/build.py", BUILD_PY),
+            ],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        let validated = validate_texts(skill_texts(&files), &HashSet::new(), &[]).unwrap();
+        assert_eq!(validated.manifest.app, "skill-app");
+
+        let package = skill_package(&files, "meeting-writer").unwrap();
+        assert_eq!(package.name, "meeting-writer");
+        assert_eq!(
+            package
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![SKILL_ENTRY, "references/style.md", "scripts/build.py"]
+        );
+        for file in &package.files {
+            let exact = &files[&format!("{SKILL_DIR}/meeting-writer/{}", file.path)];
+            assert_eq!(&file.text, exact, "{} froze different bytes", file.path);
+            assert_eq!(
+                file.sha256,
+                format!("sha256:{}", sha256_hex(exact.as_bytes()))
+            );
+        }
+        let manifest_path = format!("{SKILL_DIR}/meeting-writer/{SKILL_MANIFEST}");
+        assert_eq!(
+            package.manifest_sha256,
+            format!("sha256:{}", sha256_hex(files[&manifest_path].as_bytes()))
+        );
+        assert!(package.digest.starts_with("sha256:"));
+        // Deterministic: the same bytes freeze to the same package.
+        assert_eq!(package, skill_package(&files, "meeting-writer").unwrap());
+    }
+
+    /// A manifest that omits a member its own declared text references is
+    /// refused at install, and the SAME validator refuses it again at run
+    /// creation — one function, so the two cannot disagree.
+    #[test]
+    fn cad1867_an_undeclared_reference_refuses_at_install_and_at_run_creation() {
+        // SKILL.md names `references/style.md`; the manifest omits it and the
+        // bundle does not carry it either, so only the reference scan catches
+        // it.
+        let files = skill_bundle(
+            &[SKILL_ENTRY, "scripts/build.py"],
+            &[(SKILL_ENTRY, SKILL_MD), ("scripts/build.py", BUILD_PY)],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        let install = install_error(&files);
+        assert!(install.contains("references/style.md"), "{install}");
+        let run = skill_package(&files, "meeting-writer")
+            .expect_err("run creation refuses")
+            .to_string();
+        assert!(run.contains("references/style.md"), "{run}");
+    }
+
+    /// The declared set must equal the present set in both directions, each
+    /// mismatch naming the path.
+    #[test]
+    fn cad1867_declared_and_present_sets_must_match() {
+        // Present but undeclared.
+        let extra = skill_bundle(
+            &[SKILL_ENTRY, "scripts/build.py"],
+            &[
+                (SKILL_ENTRY, SKILL_MD),
+                ("scripts/build.py", BUILD_PY),
+                ("references/style.md", STYLE_MD),
+            ],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        let error = install_error(&extra);
+        assert!(error.contains("references/style.md"), "{error}");
+        assert!(error.contains("not declared"), "{error}");
+
+        // Declared but absent.
+        let missing = skill_bundle(
+            &[SKILL_ENTRY, "notes.txt"],
+            &[(SKILL_ENTRY, "See notes.txt.\n")],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        let error = install_error(&missing);
+        assert!(error.contains("notes.txt"), "{error}");
+    }
+
+    /// `SKILL.md` is required, `skill.json` is never one of its own members,
+    /// and an unknown field is refused by the closed decode.
+    #[test]
+    fn cad1867_the_manifest_is_closed_and_requires_its_entry() {
+        let entry =
+            |value: serde_json::Value| parse_skill_manifest(&value.to_string(), "meeting-writer");
+        assert!(entry(serde_json::json!({
+            "schema": 1,
+            "name": "meeting-writer",
+            "files": ["scripts/a.py"],
+        }))
+        .unwrap_err()
+        .to_string()
+        .contains(SKILL_ENTRY));
+        assert!(entry(serde_json::json!({
+            "schema": 1,
+            "name": "meeting-writer",
+            "files": [SKILL_ENTRY, SKILL_MANIFEST],
+        }))
+        .is_err());
+        assert!(entry(serde_json::json!({
+            "schema": 1,
+            "name": "other",
+            "files": [SKILL_ENTRY],
+        }))
+        .is_err());
+        assert!(entry(serde_json::json!({
+            "schema": 2,
+            "name": "meeting-writer",
+            "files": [SKILL_ENTRY],
+        }))
+        .is_err());
+        assert!(entry(serde_json::json!({
+            "schema": 1,
+            "name": "meeting-writer",
+            "files": [SKILL_ENTRY],
+            "extra": 1,
+        }))
+        .is_err());
+        // A nested directory is not a member.
+        assert!(entry(serde_json::json!({
+            "schema": 1,
+            "name": "meeting-writer",
+            "files": [SKILL_ENTRY, "scripts"],
+        }))
+        .is_err());
+        assert!(entry(serde_json::json!({
+            "schema": 1,
+            "name": "meeting-writer",
+            "files": [SKILL_ENTRY, "scripts/a.rb"],
+        }))
+        .is_err());
+    }
+
+    /// The published caps: 16 declared members, 16 KiB per member, 4 KiB for
+    /// the manifest, 32 KiB per package.
+    #[test]
+    fn cad1867_the_skill_caps_are_enforced() {
+        // 17 declared members.
+        let mut declared: Vec<String> = vec![SKILL_ENTRY.to_string()];
+        for n in 0..SKILL_FILES_MAX {
+            declared.push(format!("references/r{n}.md"));
+        }
+        let names: Vec<&str> = declared.iter().map(String::as_str).collect();
+        let mut carried: Vec<(&str, &str)> = vec![(SKILL_ENTRY, "Plain instructions.\n")];
+        carried.extend(
+            declared
+                .iter()
+                .skip(1)
+                .map(|member| (member.as_str(), "x\n")),
+        );
+        let files = skill_bundle(&names, &carried, &skill_workflow("skill: meeting-writer\n"));
+        assert!(
+            install_error(&files).contains("at most"),
+            "over the member count"
+        );
+
+        // One member over the per-file cap.
+        let big = "a".repeat(SKILL_FILE_BYTES as usize + 1);
+        let files = skill_bundle(
+            &[SKILL_ENTRY, "notes.txt"],
+            &[
+                (SKILL_ENTRY, "See notes.txt.\n"),
+                ("notes.txt", big.as_str()),
+            ],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        assert!(skill_package(&files, "meeting-writer")
+            .unwrap_err()
+            .to_string()
+            .contains("at most"));
+
+        // Four 8 KiB members plus the manifest are over the package cap.
+        let chunk = "b".repeat(8 * 1024);
+        let files = skill_bundle(
+            &[
+                SKILL_ENTRY,
+                "notes.txt",
+                "references/a.md",
+                "references/b.md",
+                "references/c.md",
+            ],
+            &[
+                (SKILL_ENTRY, "See notes.txt.\n"),
+                ("notes.txt", chunk.as_str()),
+                ("references/a.md", chunk.as_str()),
+                ("references/b.md", chunk.as_str()),
+                ("references/c.md", chunk.as_str()),
+            ],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        assert!(skill_package(&files, "meeting-writer")
+            .unwrap_err()
+            .to_string()
+            .contains("at most"));
+    }
+
+    /// A package may reference only its own declared members: another
+    /// package's path refuses, and so does a bare undeclared name.
+    #[test]
+    fn cad1867_a_reference_to_another_package_refuses() {
+        let files = skill_bundle(
+            &[SKILL_ENTRY],
+            &[(SKILL_ENTRY, "See skills/other-skill/SKILL.md.\n")],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        let error = install_error(&files);
+        assert!(error.contains("other-skill"), "{error}");
+
+        let bare = skill_bundle(
+            &[SKILL_ENTRY],
+            &[(SKILL_ENTRY, "See notes.md for the rules.\n")],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        let error = install_error(&bare);
+        assert!(error.contains("notes.md"), "{error}");
+    }
+
+    #[test]
+    fn cad1867_static_undeclared_material_cannot_disappear_from_the_scan() {
+        let mut files: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::from([
+                (
+                    "skills/demo/skill.json".into(),
+                    r#"{"schema":1,"name":"demo","files":["SKILL.md"]}"#.into(),
+                ),
+                ("skills/demo/SKILL.md".into(), "Read SKILL.md.\n".into()),
+            ]);
+        assert!(crate::issue::app::skill_package(&files, "demo").is_ok());
+        let long_member = format!("scripts/{}.py", "a".repeat(246));
+        for reference in [long_member, ".//scripts/missing.py".to_owned()] {
+            files.insert("skills/demo/SKILL.md".into(), format!("Run {reference}.\n"));
+            let error = crate::issue::app::skill_package(&files, "demo")
+                .expect_err("static undeclared material must refuse")
+                .to_string();
+            assert!(error.contains("scripts/"), "{error}");
+        }
+    }
+
+    /// Every `.`-led spelling of the same relative path is the same reference,
+    /// so a dotted form cannot hide material the plain form refuses.
+    #[test]
+    fn cad1867_dotted_spellings_are_not_a_way_around_the_scan() {
+        let mut files: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::from([
+                (
+                    "skills/demo/skill.json".into(),
+                    r#"{"schema":1,"name":"demo","files":["SKILL.md"]}"#.into(),
+                ),
+                ("skills/demo/SKILL.md".into(), "Read SKILL.md.\n".into()),
+            ]);
+        assert!(crate::issue::app::skill_package(&files, "demo").is_ok());
+        for reference in [
+            ".//./scripts/missing.py",
+            ".//scripts/missing.py",
+            "././scripts/missing.py",
+            ".//./skills/other/SKILL.md",
+            "../scripts/missing.py",
+            "../references/spec.md",
+        ] {
+            files.insert("skills/demo/SKILL.md".into(), format!("Run {reference}.\n"));
+            let error = crate::issue::app::skill_package(&files, "demo")
+                .expect_err("a dotted spelling must still refuse")
+                .to_string();
+            assert!(
+                error.contains("missing.py")
+                    || error.contains("other")
+                    || error.contains("through '..'"),
+                "{reference}: {error}"
+            );
+        }
+    }
+
+    /// A workflow that names a package the bundle does not carry refuses at
+    /// install, and `skill:` must be the step's LAST metadata line.
+    #[test]
+    fn cad1867_a_declared_tag_must_resolve_and_be_the_last_metadata_line() {
+        let files = skill_bundle(
+            &[SKILL_ENTRY],
+            &[(SKILL_ENTRY, "Plain instructions.\n")],
+            &skill_workflow("skill: other-skill\n"),
+        );
+        let error = install_error(&files);
+        assert!(error.contains("other-skill"), "{error}");
+
+        let misordered = skill_workflow("skill: meeting-writer\nsize: S\n");
+        let error = crate::issue::workflow::skill_tags(&misordered)
+            .expect_err("skill must be last")
+            .to_string();
+        assert!(error.contains("last metadata line"), "{error}");
+    }
+
+    /// A frozen package is a value: updating the installed bundle afterwards
+    /// leaves the frozen material — and its digest — exactly as it was.
+    #[test]
+    fn cad1867_a_frozen_package_does_not_change_when_the_bundle_updates() {
+        let mut files = skill_bundle(
+            &[SKILL_ENTRY, "scripts/build.py"],
+            &[
+                (SKILL_ENTRY, "Run ./scripts/build.py.\n"),
+                ("scripts/build.py", BUILD_PY),
+            ],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        let frozen = skill_package(&files, "meeting-writer").unwrap();
+        let frozen_json = serde_json::to_value(&frozen).unwrap();
+        files.insert(
+            format!("{SKILL_DIR}/meeting-writer/scripts/build.py"),
+            "print('replaced')\n".to_string(),
+        );
+        let updated = skill_package(&files, "meeting-writer").unwrap();
+        assert_ne!(frozen.digest, updated.digest);
+        assert_eq!(serde_json::to_value(&frozen).unwrap(), frozen_json);
+        assert_eq!(
+            frozen.files[1].text, BUILD_PY,
+            "the frozen value kept its own bytes"
+        );
     }
 }

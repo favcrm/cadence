@@ -517,7 +517,15 @@ impl Shared {
                 )
                 .map_err(Error::rejected)?;
             }
-            let workflow = LocalWorkflow::parse(text, &inputs).map_err(|error| {
+            // CAD-1867: a step's `skill: <tag>` is resolved from THIS
+            // installed bundle's own file map — the same validator install
+            // ran — and frozen into the step, so the snapshot digest covers
+            // it. Nothing is written to disk and the live bundle is never
+            // consulted again.
+            let workflow = LocalWorkflow::parse_installed(text, &inputs, &|tag: &str| {
+                crate::issue::app::skill_package(files, tag)
+            })
+            .map_err(|error| {
                 if context.is_some() {
                     Error::rejected("contextual workflow inputs refused")
                 } else {

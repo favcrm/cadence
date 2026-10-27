@@ -107,8 +107,10 @@ const TIMEOUT_KILL_CODE: i32 = 137;
 /// The v0 bundle shape — the same allowlist `app.rs` pins privately:
 /// `app.md` plus flat `workflows/`, `rubrics/`, `templates/` dirs,
 /// CAD-1006's `screens/` (one `<tag>/` subdir per package of flat
-/// `<stem>.<js|css|svg|json>` leaves + `screens.json`) and CAD-1129's
-/// `assets/` (flat `*.svg`). Kept identical by inspection parity.
+/// `<stem>.<js|css|svg|json>` leaves + `screens.json`), CAD-1129's
+/// `assets/` (flat `*.svg`) and CAD-1867's `skills/` (one `<tag>/`
+/// package of `skill.json` + declared members). Kept identical by
+/// inspection parity.
 const TOP_DIRS: &[&str] = &[
     "workflows",
     "rubrics",
@@ -116,6 +118,7 @@ const TOP_DIRS: &[&str] = &[
     "screens",
     "assets",
     "storage",
+    "skills",
 ];
 
 /// Most files a bundle may carry — pinned at `app.rs`'s private
@@ -807,6 +810,113 @@ fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
                     _ => {
                         return Err(Error::rejected(format!(
                             "bundle entry '{rel}': a screen package is a <tag>/ directory"
+                        )))
+                    }
+                }
+                continue;
+            }
+            // CAD-1867: skills/<tag>/<member> — the package manifest, flat
+            // root text leaves, and one scripts/ or references/ subdirectory.
+            if top_text == "skills" {
+                match kind_at(&sub, &leaf)? {
+                    libc::S_IFDIR => {
+                        if !model::valid_tag(leaf_text) {
+                            return Err(Error::rejected(format!(
+                                "bundle entry '{rel}': the skill package name \
+                                 '{leaf_text}' is not tag-shaped"
+                            )));
+                        }
+                        let tagdir = open_dir_at(&sub, &leaf).map_err(|e| {
+                            Error::rejected(format!(
+                                "bundle directory '{rel}' cannot be opened: {e}"
+                            ))
+                        })?;
+                        for member in list_dir(&tagdir)? {
+                            let member_text = std::str::from_utf8(&member).map_err(|_| {
+                                Error::rejected(format!("{rel}/ carries a non-UTF-8 name"))
+                            })?;
+                            let mrel = format!("{rel}/{member_text}");
+                            if member_text.starts_with('.') {
+                                return Err(Error::rejected(format!(
+                                    "bundle entry '{mrel}': dotfiles are not app content"
+                                )));
+                            }
+                            match kind_at(&tagdir, &member)? {
+                                libc::S_IFDIR => {
+                                    if !app::skill_subdir_ok(member_text) {
+                                        return Err(Error::rejected(format!(
+                                            "bundle entry '{mrel}': a skill package nests \
+                                             only scripts/ or references/"
+                                        )));
+                                    }
+                                    let memberdir = open_dir_at(&tagdir, &member).map_err(|e| {
+                                        Error::rejected(format!(
+                                            "bundle directory '{mrel}' cannot be opened: {e}"
+                                        ))
+                                    })?;
+                                    for leaf in list_dir(&memberdir)? {
+                                        let leaf_text =
+                                            std::str::from_utf8(&leaf).map_err(|_| {
+                                                Error::rejected(format!(
+                                                    "{mrel}/ carries a non-UTF-8 name"
+                                                ))
+                                            })?;
+                                        let lrel = format!("{mrel}/{leaf_text}");
+                                        if leaf_text.starts_with('.') {
+                                            return Err(Error::rejected(format!(
+                                                "bundle entry '{lrel}': dotfiles are not app \
+                                                 content"
+                                            )));
+                                        }
+                                        if kind_at(&memberdir, &leaf)? != libc::S_IFREG {
+                                            return Err(Error::rejected(format!(
+                                                "bundle entry '{lrel}' is not a regular file"
+                                            )));
+                                        }
+                                        if !app::skill_member_ok(&format!(
+                                            "{member_text}/{leaf_text}"
+                                        )) {
+                                            return Err(Error::rejected(format!(
+                                                "bundle entry '{lrel}': a scripts/ member is \
+                                                 <stem>.<py|sh|js|mjs> and a references/ \
+                                                 member is <stem>.<md|txt>"
+                                            )));
+                                        }
+                                        add(&memberdir, &leaf, lrel)?;
+                                    }
+                                }
+                                libc::S_IFREG => {
+                                    if !app::skill_member_ok(member_text) {
+                                        return Err(Error::rejected(format!(
+                                            "bundle entry '{mrel}': a skill package leaf is \
+                                             <stem>.(md|txt|json|yaml|yml|csv|css|svg)"
+                                        )));
+                                    }
+                                    add(&tagdir, &member, mrel)?;
+                                }
+                                libc::S_IFLNK => {
+                                    return Err(Error::rejected(format!(
+                                        "bundle entry '{mrel}' is a symlink — a bundle holds \
+                                         real files only"
+                                    )))
+                                }
+                                _ => {
+                                    return Err(Error::rejected(format!(
+                                        "bundle entry '{mrel}' is not a regular file"
+                                    )))
+                                }
+                            }
+                        }
+                    }
+                    libc::S_IFLNK => {
+                        return Err(Error::rejected(format!(
+                            "bundle entry '{rel}' is a symlink — a bundle holds real \
+                             files only"
+                        )))
+                    }
+                    _ => {
+                        return Err(Error::rejected(format!(
+                            "bundle entry '{rel}': a skill package is a <tag>/ directory"
                         )))
                     }
                 }

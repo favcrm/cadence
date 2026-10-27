@@ -94,11 +94,13 @@ daemon, no store and no PM read or write — usable in an app repo's CI before
 anything talks to a host. The `builtin:<catalog-id>` source form is retired
 (CAD-1422) and refused at the source stage (`app_check_source`). It runs the same bundle snapshot and content
 validation `install-check` runs (entry grammar, per-file caps — 384 KiB for a
-screen JS/CSS asset and 256 KiB elsewhere — the 2 MiB aggregate, the manifest
+screen JS/CSS asset, 16 KiB for a skill member, 4 KiB for a `skill.json`, and
+256 KiB elsewhere — the 2 MiB aggregate, the manifest
 including `summary`, descriptor forbidden keys, workflow checks, the full
 `app-screens/v1|v2` declaration integrity for every `screens/<tag>/` package
 (`screens.json` body, declared↔supplied asset set, sha256+size matches — the
-same `app_screen_pkg::extract` the mount RPC re-runs), `requires`
+same `app_screen_pkg::extract` the mount RPC re-runs), every `skills/<tag>/`
+package through the one manifest validator, `requires`
 against this build's contract registry, and the secret guard) and reports the
 same `sha256:` bundle digest. A git/URL source is refused: fetching is a
 transport the daemon vets, not bytes in hand.
@@ -110,8 +112,32 @@ no leading hyphen); links, nested storage directories and alternate extensions
 are refused. Storage members require exactly
 `needs.requires.contracts: {app-storage: [1]}`, and that requirement needs its
 root declaration. The generated document is
-`contracts/bundle-grammar/v2/grammar.json`; version 1 remains a historical
-artifact, not a second current admission path.
+`contracts/bundle-grammar/v3/grammar.json`; versions 1 and 2 remain historical
+artifacts, not a second current admission path.
+
+The version-3 grammar adds one directory, `skills/<tag>/`: an installed skill
+package. It holds a required `skill.json` manifest, flat root text leaves
+(`md`, `txt`, `json`, `yaml`, `yml`, `csv`, `css`, `svg`), and at most one
+`scripts/` (`py`, `sh`, `js`, `mjs`) or `references/` (`md`, `txt`)
+subdirectory. Nothing nests deeper, dotfiles and links refuse, and the caps are
+16 declared members, 16 KiB per member, 4 KiB for the manifest and 32 KiB per
+package including the manifest. The manifest is a closed decode
+(`{"schema":1,"name":"<tag>","files":[...]}`) and must declare `SKILL.md`; its
+declared set must equal the set actually present in both directions, each
+mismatch naming the path. Every declared text file is scanned for tokens that
+name package material (`scripts/…`, `references/…`, `skills/<tag>/…`, `./`
+forms, and a bare `name.ext` with an allowed extension); a token naming an
+undeclared member refuses. That scan is a declared-inventory contract, not
+import analysis, so a path assembled at run time is invisible to it. The same
+validator (`crate::issue::app::skill_package`) runs at install and again at run
+creation, so the two cannot disagree about what a complete package is.
+
+This is package grammar support, **not** host-side script execution. The host
+freezes a package's bytes into a run's snapshot and hands them to the assigned
+worker; it never executes `scripts/` itself, never sandboxes them and never
+attests what they did. A frozen digest proves which bytes a run received, not
+that a worker ran them. See `docs/guides/app-runs.md` for the run contract and
+`docs/guides/app-development.md` for authoring one.
 
 This is package grammar support, **not a native storage runtime**. The native
 host does not advertise `app-storage`, execute these migrations or claim schema
@@ -249,8 +275,8 @@ cadence app catalog show <install-id>
 ```
 
 The source must be an A1 bundle: `app.md`, checked workflow Markdown under
-`workflows/`, and supported optional `rubrics/`, `templates/` and `views/`
-files. `views/` may carry exactly one file — `views/app-views-v1.json`, a
+`workflows/`, and supported optional `rubrics/`, `templates/`, `skills/` and
+`views/` files. `views/` may carry exactly one file — `views/app-views-v1.json`, a
 data-only [app-views/v1](../../contracts/app-views/v1/README.md) descriptor —
 and only when `app.md` declares it with `needs.views.contract: app-views/v1`.
 The declaration and the file pair up: either alone refuses install, and the

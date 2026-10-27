@@ -14,7 +14,7 @@ the versioned app toolchain.
 | Frame, board drawer, scrim, close | Host | `ScreenOutlet` + `screenActions` |
 | Receiver, presentation and drawer helpers | App-kit | `createScreenReceiver`, `presentation()`, `openDrawer()`/`closeDrawer()` |
 | Surface content and app verbs | App | your projection, payload validation and actions |
-| Package and workflow | App | `app/app.md`, `screens/<tag>`, `workflows/` |
+| Package and workflow | App | `app/app.md`, `screens/<tag>`, `skills/<tag>`, `workflows/` |
 | Build toolchain | App repo, pinned | `cadence-app-toolchain-<tag>.tar.gz` |
 | Install and consent | Operator | local CLI catalog or hosted board |
 
@@ -222,7 +222,61 @@ screen app. Decide explicitly:
 
 Do not ship two bridge protocols for one app.
 
-## 8. Do not
+## 8. Skill packages
+
+A workflow step can name packaged instructions and helper files instead of
+repeating them in the ticket body. Declare it as the step's last metadata line
+and put the package in the bundle:
+
+```text
+app/
+  workflows/meeting.md       # a step carries `skill: meeting-writer`
+  skills/meeting-writer/
+    skill.json               # {"schema":1,"name":"meeting-writer","files":[…]}
+    SKILL.md
+    references/style.md
+    scripts/build.py
+```
+
+Rules that `cadence app check` enforces offline:
+
+- `skill.json` is a closed decode: `schema: 1`, `name` equal to the directory
+  name, `files` listing every member the package ships and nothing else.
+  `SKILL.md` must be declared; `skill.json` must not list itself.
+- Declared set equals present set in both directions; each mismatch names the
+  path.
+- Members are flat root leaves (`md`, `txt`, `json`, `yaml`, `yml`, `csv`,
+  `css`, `svg`), `scripts/<stem>.py|sh|js|mjs`, or `references/<stem>.md|txt`.
+  No deeper nesting, no dotfiles, no links.
+- Caps: 16 declared members, 16 KiB per member, 4 KiB manifest, 32 KiB per
+  package including the manifest.
+- A token in any declared text file that names package material —
+  `scripts/…`, `references/…`, `skills/<tag>/…`, `./` forms, or a bare
+  `name.ext` with an allowed extension — must name a declared member. This is a
+  declared-inventory contract, not import analysis: the check reads names, so a
+  path assembled at run time is invisible to it, and a bare word that looks
+  like a filename is treated as package material. Keep prose free of
+  path-shaped words, or declare the file.
+- `skill: <tag>` is static and must be the step's last metadata line; it is part
+  of the workflow's gate digest, so changing it re-gates the app approval.
+
+What the host does with a package: at run creation it resolves the tag from the
+installed bundle's file map and freezes the manifest and every declared member,
+with their digests, into `snapshot.workflow.steps[].skill`; dispatch sends that
+frozen object in the kickoff. Nothing is materialized on disk and a later
+bundle update cannot change an existing run's material. `skill:` is refused on
+every path that freezes nothing — `cadence workflow check`, `cadence plan
+propose --workflow <stored-name>`, and `cadence plan propose --workflow
+<app>/<workflow>`.
+
+The limit to state honestly: **script execution is agent-side and unattested.**
+The host freezes bytes and hands them to the assigned worker. It does not run
+`scripts/` itself, does not sandbox them beyond that worker's existing
+confinement, and cannot prove what a worker did with them. A frozen digest
+proves which bytes a run received — never that a script ran, or ran as written.
+Do not present a package digest as evidence of execution.
+
+## 9. Do not
 
 - write a private `postMessage` receiver or a second `screen-surfaces` bridge;
 - copy, patch or vendor the host frame; use `cadence app frame-kit`;
@@ -231,7 +285,8 @@ Do not ship two bridge protocols for one app.
 - use the retired `builtin:` source;
 - assume arbitrary source-based app management works remotely; the published-release catalog commands are the remote path, and source/Git updates use the board;
 - edit the packaged app-kit or regenerate its lockfile;
-- claim the host board is the app's surface; the app owns its surface.
+- claim the host board is the app's surface; the app owns its surface;
+- present a frozen skill-package digest as proof that a script ran.
 
 ## References
 
