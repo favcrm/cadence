@@ -58,7 +58,7 @@ fn consented_digest(shared: &Shared, install: &str, row: &Value) -> Result<Strin
     Ok(digest.to_string())
 }
 
-fn install_descriptor(shared: &Shared, install: &str) -> Result<(String, Value)> {
+pub(super) fn install_descriptor(shared: &Shared, install: &str) -> Result<(String, Value)> {
     let pm = shared.pm_at(&shared.pm_dir()?)?;
     workspace::with_runtime_read(&pm, install, |row, files| {
         let digest = consented_digest(shared, install, row)?;
@@ -123,6 +123,16 @@ pub(super) fn assistant_error_is_definite_refusal(error: &Error) -> bool {
         Error::Structured(details) => matches!(details.kind, "rejected" | "conflict" | "gate"),
         _ => false,
     }
+}
+
+/// The only cost stop (CAD-1852): AgenticOS answers 402 `insufficient_funds`
+/// and nothing is charged. The text carries either the provider code (text
+/// and source calls) or "insufficient credit" (image submit).
+pub(super) const OUT_OF_CREDIT: &str = "Not enough credit — top up to continue";
+
+pub(super) fn assistant_error_is_out_of_credit(error: &Error) -> bool {
+    let text = error.to_string();
+    text.contains("insufficient_funds") || text.contains("insufficient credit")
 }
 
 fn normalize_interrupted_operation(
@@ -1072,11 +1082,6 @@ impl Shared {
                 "no operator decision handler is registered for this action",
             ));
         }
-        if is_paid_social(action) && decision != "allow_once" {
-            return Err(Error::rejected(
-                "paid social actions are allowed one time only",
-            ));
-        }
         let (descriptor_digest, descriptor) = install_descriptor(self, install)?;
         if !descriptor["actions"]
             .as_array()
@@ -1117,6 +1122,26 @@ impl Shared {
             );
         }
         if is_paid_social(action) {
+            // CAD-1852: "Always allow" is the operator's standing grant for
+            // this action in this installation. Only this operator-proofed
+            // decide path writes it; an agent turn only reads it.
+            if decision == "allow_always" {
+                records.app_assistant_permission_save(AssistantPermissionWrite {
+                    permission_id: &uuid::Uuid::new_v4().to_string(),
+                    context,
+                    action_id: action,
+                    resource_id: super::app_assistant_social::STANDING_RESOURCE,
+                    effect: "allow",
+                    semantics_digest: &crate::store::app_runs::material_digest(
+                        &json!({"contract":crate::issue::app_assistant::CONTRACT,"action":action,"schema":meta.input_schema,"handler_version":meta.handler_version,"descriptor_digest":descriptor_digest}),
+                    ),
+                    scope_label: if action == "social.posts.fetch" {
+                        "Reading Instagram posts — this installation"
+                    } else {
+                        "Drafting posts — this installation"
+                    },
+                })?;
+            }
             return self.social_run(records, install, context, &op, &input);
         }
         let customer = required_str(&input, "customer_id")?;
@@ -1198,9 +1223,9 @@ impl Shared {
         let (slot, quote) = self.refine_quote(install, context, asset_id, revision, sha256)?;
         let micros = quote["total_price_micros"]
             .as_u64()
-            .ok_or_else(|| Error::rejected("reference-edit quote is missing its exact price"))?;
+            .ok_or_else(|| Error::rejected("reference-edit quote is missing its price"))?;
         let model = crate::platform::agenticos_external::reviewed_image_model();
-        let reason = "Review one library image reference edit. The card freezes the source pin, instructions, model, exact price, and maximum spend. Charged once. The source stays unchanged.";
+        let reason = "Review one library image reference edit. The card freezes the source pin, instructions and model. The price shown is an estimate. Charged once. The source stays unchanged.";
         records
             .app_assistant_operation_set(crate::store::app_records::AssistantOperationUpdate {
                 operation_id,
@@ -1228,7 +1253,6 @@ impl Shared {
                         "quote": quote,
                         "estimate_micros": micros,
                         "currency": "USD",
-                        "ceiling_micros": micros,
                         "allow_once": true,
                     },
                 }),
@@ -1396,18 +1420,11 @@ impl Shared {
             ));
         }
         let (slot, live) = self.refine_quote(install, context, asset_id, revision, sha256)?;
-        let confirmed = preview["ceiling_micros"]
-            .as_u64()
-            .ok_or_else(|| Error::rejected("the confirmed reference-edit ceiling is missing"))?;
-        let live_micros = live["total_price_micros"].as_u64().unwrap_or(u64::MAX);
-        if slot != preview["slot"].as_str().unwrap_or("") || live_micros > confirmed {
+        // The live quote is the run's `max_charge_minor`; the estimate on the
+        // card is not compared with it (CAD-1852).
+        if slot != preview["slot"].as_str().unwrap_or("") {
             return Err(Error::rejected(
-                "price_changed: the live reference-edit price is above the confirmed price",
-            ));
-        }
-        if live != preview["quote"] || preview["estimate_micros"] != live["total_price_micros"] {
-            return Err(Error::rejected(
-                "price_changed: the confirmed reference-edit quote is no longer current",
+                "the image tool changed since the card was shown",
             ));
         }
         let mut params = json!({
@@ -1590,6 +1607,8 @@ impl Shared {
                     if unknown { "unknown" } else { "failed" },
                     if unknown {
                         "Reference edit outcome is uncertain; retry reuses the same run".to_owned()
+                    } else if assistant_error_is_out_of_credit(&error) {
+                        OUT_OF_CREDIT.to_owned()
                     } else {
                         "Reference edit was refused".to_owned()
                     },

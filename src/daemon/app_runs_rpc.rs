@@ -1001,6 +1001,8 @@ impl Shared {
     /// proof of authority loss, and the final locked receipt check remains
     /// authoritative. Price drift is accepted, so a fresh quote is not
     /// compared with the frozen one.
+    /// Kept as the CAD-1142 re-quote witness: it only observes that every
+    /// slot still quotes; the result is never compared with the frozen price.
     pub(super) fn probe_app_run_prices(&self, run: &Value) -> Result<()> {
         if let Ok(requests) = self.prepare_app_run_quotes(run) {
             for request in requests.into_values() {

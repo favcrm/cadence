@@ -1992,7 +1992,7 @@ pub(super) fn app_reason_class(detail: &str) -> &'static str {
     if lower.contains("binding") || lower.contains("receipt") {
         "run binding receipt is no longer current"
     } else if lower.contains("price") || lower.contains("quote") {
-        "capability price changed since run approval"
+        "capability price could not be confirmed"
     } else if lower.contains("context") {
         "run context was updated or archived"
     } else if lower.contains("connection") {

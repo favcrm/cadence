@@ -148,8 +148,6 @@ pub(super) struct ToolCall<'a> {
     pub request_id: &'a str,
     pub input: &'a Value,
     pub generation_scope: Option<&'a Value>,
-    /// The price the operator confirmed; a higher live quote is refused.
-    pub ceiling_micros: Option<u64>,
 }
 
 /// Bounded action-context map: ≤256 live mounts' contexts process-wide.
@@ -649,7 +647,6 @@ impl Shared {
                 request_id,
                 input: &input,
                 generation_scope: params.get("generation_scope"),
-                ceiling_micros: None,
             },
         )
     }
@@ -657,9 +654,8 @@ impl Shared {
     /// The guarded execution core shared by the screen entry above and the
     /// operator-approved assistant action (CAD-1327): digest pin, approval,
     /// declared-slot effect, request-id replay, live binding, re-quote,
-    /// exactly-once claim and receipt. `ceiling_micros`, when set, is the
-    /// price the operator confirmed: a live quote above it is refused before
-    /// any claim or provider I/O.
+    /// exactly-once claim and receipt. The live quote is the provider's
+    /// `max_charge_minor` ceiling (CAD-1141); no confirmed price is compared.
     pub(super) fn app_tool_execute(
         self: &Arc<Self>,
         ctx: &ToolContext,
@@ -671,7 +667,6 @@ impl Shared {
             request_id,
             input,
             generation_scope,
-            ceiling_micros,
         } = call;
         let input = input.clone();
         let pm_dir = self.pm_dir()?;
@@ -904,13 +899,6 @@ impl Shared {
                     })
             {
                 return Err(Error::rejected("tool mount changed during price discovery"));
-            }
-            if ceiling_micros.is_some_and(|ceiling| quote.total_price_micros > ceiling) {
-                return Err(Error::rejected(format!(
-                    "price_changed: the live price {} micros is above the confirmed {} micros",
-                    quote.total_price_micros,
-                    ceiling_micros.unwrap_or(0)
-                )));
             }
             let config = &proof.config;
             let provider = required_str(config, "provider")?;

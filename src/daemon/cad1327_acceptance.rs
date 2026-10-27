@@ -29,13 +29,13 @@ const CRM_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ap
 
 /// The three registered Social Content actions, exactly as the registry
 /// owns them (the descriptor may not change handler, effect or scope).
-const FETCH: &str = r#"{ "id": "social.posts.fetch", "description": "Read recent posts.", "input_schema": { "type": "object", "properties": { "handle": { "type": "string", "minLength": 1, "maxLength": 64 } }, "required": [], "additionalProperties": false }, "effect": "read", "confirmation": "permission_required", "availability": "requires_context" }"#;
-const DRAFT: &str = r#"{ "id": "social.draft.create", "description": "Draft a caption.", "input_schema": { "type": "object", "properties": { "post": { "type": "string", "minLength": 1, "maxLength": 128 }, "instructions": { "type": "string", "maxLength": 500 }, "with_image": { "type": "boolean" } }, "required": ["post"], "additionalProperties": false }, "effect": "draft", "confirmation": "permission_required", "availability": "requires_context" }"#;
-const STATUS: &str = r#"{ "id": "social.drafts.status", "description": "Draft status.", "input_schema": { "type": "object", "properties": {}, "required": [], "additionalProperties": false }, "effect": "read", "confirmation": "none", "availability": "requires_context" }"#;
+pub(super) const FETCH: &str = r#"{ "id": "social.posts.fetch", "description": "Read recent posts.", "input_schema": { "type": "object", "properties": { "handle": { "type": "string", "minLength": 1, "maxLength": 64 } }, "required": [], "additionalProperties": false }, "effect": "read", "confirmation": "permission_required", "availability": "requires_context" }"#;
+pub(super) const DRAFT: &str = r#"{ "id": "social.draft.create", "description": "Draft a caption.", "input_schema": { "type": "object", "properties": { "post": { "type": "string", "minLength": 1, "maxLength": 128 }, "instructions": { "type": "string", "maxLength": 500 }, "with_image": { "type": "boolean" } }, "required": ["post"], "additionalProperties": false }, "effect": "draft", "confirmation": "permission_required", "availability": "requires_context" }"#;
+pub(super) const STATUS: &str = r#"{ "id": "social.drafts.status", "description": "Draft status.", "input_schema": { "type": "object", "properties": {}, "required": [], "additionalProperties": false }, "effect": "read", "confirmation": "none", "availability": "requires_context" }"#;
 const COMPOSE: &str = r#"{ "id": "social.draft.compose", "description": "Compose a manual draft.", "input_schema": { "type": "object", "properties": { "caption": { "type": "string", "minLength": 1, "maxLength": 8800 }, "brief": { "type": "string", "maxLength": 500 }, "asset_id": { "type": "string", "minLength": 1, "maxLength": 128 } }, "required": ["caption"], "additionalProperties": false }, "effect": "draft", "confirmation": "none", "availability": "requires_context" }"#;
 const ATTACH: &str = r#"{ "id": "social.drafts.attach_image", "description": "Attach an uploaded image.", "input_schema": { "type": "object", "properties": { "draft_id": { "type": "string", "minLength": 1, "maxLength": 128 }, "expected_revision": { "type": "integer", "minimum": 1 }, "asset_id": { "type": "string", "minLength": 1, "maxLength": 128 } }, "required": ["draft_id", "expected_revision", "asset_id"], "additionalProperties": false }, "effect": "draft", "confirmation": "none", "availability": "requires_context" }"#;
 
-fn descriptor(app: Option<&str>, actions: &[&str]) -> String {
+pub(super) fn descriptor(app: Option<&str>, actions: &[&str]) -> String {
     let app = app.map_or(String::new(), |a| format!(r#""app": "{a}","#));
     format!(
         r#"{{ "contract": "app-assistant/v1", {app} "actions": [{}] }}"#,
@@ -64,21 +64,28 @@ fn step_id(install: &str, context: &str, operation: &str, step: &str) -> String 
     format!("sa-{step}-{}", &digest["sha256:".len()..][..36])
 }
 
-struct Door {
+pub(super) struct Door {
     media: aos_media_door::MediaDoor,
-    read_price: Mutex<String>,
-    text_price: Mutex<String>,
+    pub(super) read_price: Mutex<String>,
+    pub(super) text_price: Mutex<String>,
     /// Overrides the media door's image price (`chargeMinor`) when set.
     image_minor: Mutex<Option<u64>>,
     /// When set, a text call is counted and the connection is dropped
     /// without an answer (an uncertain provider outcome).
     drop_text: AtomicBool,
-    text_calls: AtomicUsize,
-    reads: AtomicUsize,
+    /// When set, a text call is answered 402 `insufficient_funds`.
+    pub(super) no_credit: AtomicBool,
+    /// When set, the image submit is answered 402 `insufficient_funds`.
+    image_no_credit: AtomicBool,
+    pub(super) text_calls: AtomicUsize,
+    pub(super) reads: AtomicUsize,
+    /// Every paid `POST /v1/runtime/tools/call` body as sent, answered or
+    /// not (CAD-1852 acceptance reads `max_charge_minor` from it).
+    pub(super) calls: Mutex<Vec<Value>>,
 }
 
 impl Door {
-    fn spent(&self) -> (usize, usize, usize) {
+    pub(super) fn spent(&self) -> (usize, usize, usize) {
         (
             self.reads.load(SeqCst),
             self.text_calls.load(SeqCst),
@@ -134,6 +141,9 @@ fn serve(stream: std::net::TcpStream, door: &Door) {
     reader.read_exact(&mut body).unwrap();
     let sent: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let route = path.split_once('?').map_or(path.as_str(), |(r, _)| r);
+    if method == "POST" && route == "/v1/runtime/tools/call" {
+        door.calls.lock().unwrap().push(sent.clone());
+    }
     let raw = |status: u16, content_type: &str, bytes: &[u8]| {
         let mut out = format!(
             "HTTP/1.1 {status} OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -168,6 +178,12 @@ fn serve(stream: std::net::TcpStream, door: &Door) {
             if door.drop_text.load(SeqCst) {
                 return;
             }
+            if door.no_credit.load(SeqCst) {
+                door.text_calls.fetch_sub(1, SeqCst);
+                let body = json!({"ok":false,"error":{"code":"insufficient_funds"}}).to_string();
+                let _ = writer.write_all(&raw(402, "application/json", body.as_bytes()));
+                return;
+            }
             json_reply(
                 json!({"ok":true,"data":{"slug":"generate_text","repeated":false,"price":text_price,"result":{"text":"秋日菜單登場，歡迎品嚐。","finishReason":"stop","usage":{"inputTokens":9,"outputTokens":5,"totalTokens":14,"cachedInputTokens":null,"reasoningOutputTokens":null}}}}),
             )
@@ -179,6 +195,13 @@ fn serve(stream: std::net::TcpStream, door: &Door) {
                     "price":{"slug":"generate_image","chargeMinor":minor,"currency":"USD","version":"2026-09-29T00:00:00.000Z"}}}),
             )
         }
+        ("POST", "/v1/runtime/media/image") if door.image_no_credit.load(SeqCst) => raw(
+            402,
+            "application/json",
+            json!({"ok":false,"error":{"code":"insufficient_funds"}})
+                .to_string()
+                .as_bytes(),
+        ),
         (m, r) if r.starts_with("/v1/runtime/media/") => {
             let key = header("idempotency-key");
             match door.media.reply(m, r, key.as_deref(), &body) {
@@ -207,16 +230,16 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
 /// One fixture at a time inside this module.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-struct Fx {
+pub(super) struct Fx {
     _serial: std::sync::MutexGuard<'static, ()>,
     dir: tempfile::TempDir,
     shared: Arc<Shared>,
-    door: Arc<Door>,
-    install: String,
-    context: String,
+    pub(super) door: Arc<Door>,
+    pub(super) install: String,
+    pub(super) context: String,
 }
 
-fn refused(result: Result<Value>, needle: &str, what: &str) -> String {
+pub(super) fn refused(result: Result<Value>, needle: &str, what: &str) -> String {
     match result {
         Ok(value) => panic!("{what} was accepted: {value}"),
         Err(error) => {
@@ -231,25 +254,25 @@ fn refused(result: Result<Value>, needle: &str, what: &str) -> String {
 }
 
 impl Fx {
-    fn call(&self, who: Asserted, method: &str, params: Value) -> Result<Value> {
+    pub(super) fn call(&self, who: Asserted, method: &str, params: Value) -> Result<Value> {
         scoped(who, || {
             self.shared.dispatch(method, &params, std::process::id())
         })
     }
-    fn operator(&self, method: &str, params: Value) -> Value {
+    pub(super) fn operator(&self, method: &str, params: Value) -> Value {
         self.call(Asserted::Operator, method, params)
             .unwrap_or_else(|e| panic!("operator {method}: {e}"))
     }
-    fn db(&self) -> rusqlite::Connection {
+    pub(super) fn db(&self) -> rusqlite::Connection {
         rusqlite::Connection::open(crate::rollout::db_file(self.dir.path())).unwrap()
     }
     fn records_of(&self, install: &str) -> RecordStore {
         RecordStore::open(self.dir.path(), install).unwrap()
     }
-    fn records(&self) -> RecordStore {
+    pub(super) fn records(&self) -> RecordStore {
         self.records_of(&self.install)
     }
-    fn drafts(&self, context: &str) -> usize {
+    pub(super) fn drafts(&self, context: &str) -> usize {
         self.records().app_social_draft_list(context).unwrap()["drafts"]
             .as_array()
             .unwrap()
@@ -258,7 +281,7 @@ impl Fx {
 
     /// A fixture with the Social Content package installed with
     /// `descriptor`, or with nothing installed.
-    fn with_social(descriptor: Option<&str>) -> Self {
+    pub(super) fn with_social(descriptor: Option<&str>) -> Self {
         for name in [
             "CADENCE_PUBLISH_SEND_URL",
             "CADENCE_PUBLISH_SEND_CREDENTIAL_FILE",
@@ -282,8 +305,11 @@ impl Fx {
             text_price: Mutex::new("0.002000".into()),
             image_minor: Mutex::new(None),
             drop_text: AtomicBool::new(false),
+            no_credit: AtomicBool::new(false),
+            image_no_credit: AtomicBool::new(false),
             text_calls: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
+            calls: Mutex::new(Vec::new()),
         });
         let serving = door.clone();
         std::thread::spawn(move || {
@@ -392,7 +418,7 @@ impl Fx {
         fx
     }
 
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::with_social(Some(&social_descriptor()))
     }
 
@@ -508,7 +534,7 @@ impl Fx {
         token
     }
 
-    fn create_turn(&self, message: &str) -> String {
+    pub(super) fn create_turn(&self, message: &str) -> String {
         self.create_turn_in(&self.install, &self.context, message)
     }
 
@@ -531,7 +557,7 @@ impl Fx {
         )
     }
 
-    fn invoke(
+    pub(super) fn invoke(
         &self,
         message: &str,
         token: &str,
@@ -566,7 +592,7 @@ impl Fx {
         )
     }
 
-    fn decide(&self, who: Asserted, op: &Value, decision: &str) -> Result<Value> {
+    pub(super) fn decide(&self, who: Asserted, op: &Value, decision: &str) -> Result<Value> {
         self.decide_in(who, &self.install, &self.context, op, decision)
     }
 
@@ -578,14 +604,14 @@ impl Fx {
         )
     }
 
-    fn show(&self, op: &str) -> Value {
+    pub(super) fn show(&self, op: &str) -> Value {
         self.show_in(&self.install, &self.context, op)
             .unwrap_or_else(|e| panic!("show {op}: {e}"))["operation"]
             .clone()
     }
 
     /// Fetch through the operator's Allow so posts exist to draft from.
-    fn fetched(&self, message: &str, token: &str, op: &str) {
+    pub(super) fn fetched(&self, message: &str, token: &str, op: &str) {
         let pending = pending(
             &self
                 .invoke(message, token, "social.posts.fetch", op, json!({}))
@@ -606,10 +632,10 @@ impl Fx {
     }
 }
 
-fn pending(reply: &Value) -> Value {
+pub(super) fn pending(reply: &Value) -> Value {
     let op = reply["operation"].clone();
     assert_eq!(op["status"], "pending_permission", "{reply}");
-    assert_eq!(op["permission_request"]["allow_always"], false, "{reply}");
+    assert_eq!(op["permission_request"]["allow_always"], true, "{reply}");
     op
 }
 
@@ -725,20 +751,17 @@ fn invoke_alone_never_drafts_or_calls_a_paid_door() {
     assert_eq!(fx.door.spent(), (1, 1, 1));
 }
 
-/// (3) A paid social action is allowed one time only: Always allow and a
-/// standing block are refused, and the refusal consumes nothing.
+/// (3) CAD-1852: Always allow on a paid social action is the operator's
+/// standing grant for that action in this installation. A later agent call
+/// runs without a card, revoke parks cards again, and a standing block stays
+/// unsupported for the paid actions.
 #[test]
-fn allow_always_and_standing_grants_are_refused_for_social_actions() {
+fn allow_always_is_a_revocable_standing_grant_for_social_actions() {
     let fx = Fx::new();
     let token = fx.create_turn("m-3");
     let op = pending(
         &fx.invoke("m-3", &token, "social.posts.fetch", "op-3", json!({}))
             .unwrap(),
-    );
-    refused(
-        fx.decide(Asserted::Operator, &op, "allow_always"),
-        "one time only",
-        "allow_always on social.posts.fetch",
     );
     for action in ["social.posts.fetch", "social.draft.create"] {
         assert!(
@@ -751,28 +774,58 @@ fn allow_always_and_standing_grants_are_refused_for_social_actions() {
             "standing block accepted for {action}"
         );
     }
+    assert_eq!(fx.door.spent(), (0, 0, 0));
+    let done = fx.decide(Asserted::Operator, &op, "allow_always").unwrap();
+    assert_eq!(done["operation"]["status"], "succeeded", "{done}");
+    assert_eq!(fx.door.spent(), (1, 0, 0));
     let permissions = fx.operator(
         "app_assistant_permissions",
         json!({"install_id":fx.install,"context_id":fx.context}),
     );
-    assert_eq!(
-        permissions["permissions"].as_array().map(Vec::len),
-        Some(0),
-        "{permissions}"
+    let grants = permissions["permissions"].as_array().unwrap();
+    assert_eq!(grants.len(), 1, "{permissions}");
+    assert_eq!(grants[0]["action_id"], "social.posts.fetch");
+    assert_eq!(grants[0]["effect"], "allow");
+    // The standing grant covers only the granted action.
+    let other = pending(
+        &fx.invoke(
+            "m-3",
+            &token,
+            "social.draft.create",
+            "op-3d",
+            json!({"post":"newest"}),
+        )
+        .unwrap(),
     );
-    assert_eq!(fx.door.spent(), (0, 0, 0));
-    let shown = fx.show("op-3");
-    assert_eq!(shown["status"], "pending_permission", "{shown}");
-    // Positive control: Allow once on the same operation still works.
-    fx.decide(Asserted::Operator, &op, "allow_once").unwrap();
-    assert_eq!(fx.door.spent(), (1, 0, 0));
-    // A later identical request parks again; nothing was remembered.
-    let next = pending(
-        &fx.invoke("m-3", &token, "social.posts.fetch", "op-3b", json!({}))
+    assert_eq!(other["status"], "pending_permission");
+    // A later identical request runs with no card, once.
+    let ran = fx
+        .invoke("m-3", &token, "social.posts.fetch", "op-3b", json!({}))
+        .unwrap();
+    assert_eq!(ran["operation"]["status"], "succeeded", "{ran}");
+    assert_eq!(fx.door.spent(), (2, 0, 0));
+    let replay = fx
+        .invoke("m-3", &token, "social.posts.fetch", "op-3b", json!({}))
+        .unwrap();
+    assert_eq!(replay["operation"]["status"], "succeeded", "{replay}");
+    assert_eq!(fx.door.spent(), (2, 0, 0), "a replay charged again");
+    // An agent cannot create or revoke a grant.
+    assert!(fx
+        .decide(Asserted::Agent("master".into()), &other, "allow_always")
+        .is_err());
+    // Revoke stops the agent: the next call parks a card again.
+    let revision = grants[0]["revision"].clone();
+    fx.operator(
+        "app_assistant_permission_revoke",
+        json!({"install_id":fx.install,"context_id":fx.context,
+            "permission_id":grants[0]["id"],"expected_revision":revision}),
+    );
+    let parked = pending(
+        &fx.invoke("m-3", &token, "social.posts.fetch", "op-3c", json!({}))
             .unwrap(),
     );
-    assert_eq!(next["status"], "pending_permission");
-    assert_eq!(fx.door.spent(), (1, 0, 0));
+    assert_eq!(parked["status"], "pending_permission");
+    assert_eq!(fx.door.spent(), (2, 0, 0));
 }
 
 /// (4) Exactly once: a second Allow (stale or current revision) and a
@@ -842,27 +895,23 @@ fn a_second_allow_and_a_replayed_operation_never_charge_twice() {
     assert_eq!(fx.drafts(&fx.context), 1, "a replay created another draft");
 }
 
-/// (6) A live price above what the operator confirmed fails the operation
-/// before anything is claimed: no provider call, no draft, no image job.
-/// Each slot is held to its own confirmed price.
+/// (6) CAD-1852: the card price is an estimate only. A live price above it
+/// does not stop the action (the live quote is the provider's
+/// `max_charge_minor`), and a 402 `insufficient_funds` is the only cost
+/// stop: it says so and charges nothing.
 #[test]
-fn a_price_above_the_confirmed_estimate_fails_with_nothing_charged() {
+fn a_price_above_the_estimate_runs_and_no_credit_is_the_only_stop() {
     let fx = Fx::new();
     let token = fx.create_turn("m-6");
-    // The paid read.
     let op = pending(
         &fx.invoke("m-6", &token, "social.posts.fetch", "op-f1", json!({}))
             .unwrap(),
     );
-    *fx.door.read_price.lock().unwrap() = "0.500000".into();
+    *fx.door.read_price.lock().unwrap() = "0.003000".into();
     let done = fx.decide(Asserted::Operator, &op, "allow_once").unwrap();
-    assert_eq!(done["operation"]["status"], "failed", "{done}");
-    assert_eq!(fx.door.spent(), (0, 0, 0), "an over-price read was charged");
-    *fx.door.read_price.lock().unwrap() = "0.002000".into();
-    fx.fetched("m-6", &token, "op-f2");
+    assert_eq!(done["operation"]["status"], "succeeded", "{done}");
     assert_eq!(fx.door.spent(), (1, 0, 0));
 
-    // The caption step.
     let op = pending(
         &fx.invoke(
             "m-6",
@@ -873,71 +922,72 @@ fn a_price_above_the_confirmed_estimate_fails_with_nothing_charged() {
         )
         .unwrap(),
     );
-    *fx.door.text_price.lock().unwrap() = "0.900000".into();
+    *fx.door.text_price.lock().unwrap() = "0.003000".into();
     let done = fx.decide(Asserted::Operator, &op, "allow_once").unwrap();
-    assert_eq!(done["operation"]["status"], "failed", "{done}");
-    assert!(
-        done["operation"]["summary"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("price"),
-        "{done}"
-    );
-    assert_eq!(
-        fx.door.spent(),
-        (1, 0, 0),
-        "an over-price caption was charged"
-    );
-    assert_eq!(fx.drafts(&fx.context), 0, "an over-price action drafted");
+    assert_eq!(done["operation"]["status"], "succeeded", "{done}");
+    assert_eq!(fx.door.spent(), (1, 1, 0));
 
-    // The image step: the image price rises above its confirmed share while
-    // the text price drops by more, so the total still looks confirmed.
-    *fx.door.text_price.lock().unwrap() = "0.002000".into();
+    // Balance is the only cost stop.
     let op = pending(
         &fx.invoke(
             "m-6",
             &token,
             "social.draft.create",
             "op-d2",
-            json!({"post":"newest","with_image":true}),
+            json!({"post":"newest"}),
         )
         .unwrap(),
     );
-    let preview = op["permission_request"]["preview"].clone();
-    let image = preview["image_micros"].as_u64().expect("image estimate");
-    assert!(image > 0, "{preview}");
-    *fx.door.text_price.lock().unwrap() = "0.000001".into();
-    // `chargeMinor` is in the door's minor unit; raise it a little.
-    *fx.door.image_minor.lock().unwrap() = Some(31_501);
+    fx.door.no_credit.store(true, SeqCst);
     let done = fx.decide(Asserted::Operator, &op, "allow_once").unwrap();
     assert_eq!(done["operation"]["status"], "failed", "{done}");
     assert_eq!(
-        fx.door.spent(),
-        (1, 0, 0),
-        "an over-price image was charged or its caption ran: {done}"
+        done["operation"]["summary"], "Not enough credit — top up to continue",
+        "{done}"
     );
-    assert_eq!(
-        fx.drafts(&fx.context),
-        0,
-        "an over-price image action drafted"
-    );
+    assert_eq!(fx.door.spent(), (1, 1, 0), "an unfunded call was charged");
+}
 
-    // Positive control: at the confirmed prices the same request runs.
-    *fx.door.text_price.lock().unwrap() = "0.002000".into();
-    *fx.door.image_minor.lock().unwrap() = None;
+/// (6b) CAD-1852: a 402 on the IMAGE step of a draft is visible to the agent:
+/// `social.drafts.status` carries the credit text on that row, and no image
+/// job was charged.
+#[test]
+fn an_image_step_without_credit_says_so_in_drafts_status() {
+    let fx = Fx::new();
+    let token = fx.create_turn("m-6b");
+    fx.fetched("m-6b", &token, "op-f");
+    fx.door.image_no_credit.store(true, SeqCst);
     let op = pending(
         &fx.invoke(
-            "m-6",
+            "m-6b",
             &token,
             "social.draft.create",
-            "op-d3",
-            json!({"post":"newest"}),
+            "op-d",
+            json!({"post":"newest","with_image":true}),
         )
         .unwrap(),
     );
     let done = fx.decide(Asserted::Operator, &op, "allow_once").unwrap();
     assert_eq!(done["operation"]["status"], "succeeded", "{done}");
-    assert_eq!(fx.door.spent(), (1, 1, 0));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let row = loop {
+        let status = fx.shared.social_status(&fx.records(), &fx.context).unwrap();
+        let row = status["drafts"][0].clone();
+        if row["image"] == "failed" {
+            break row;
+        }
+        assert!(Instant::now() < deadline, "image never settled: {status}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        row["note"], "Not enough credit — top up to continue",
+        "{row}"
+    );
+    assert_eq!(
+        fx.door.media.job_count(),
+        0,
+        "an unfunded image was charged"
+    );
 }
 
 /// (7) The draft action cannot reach publish, approve, send, discard,
