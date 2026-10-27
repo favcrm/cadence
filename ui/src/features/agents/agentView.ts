@@ -199,3 +199,13 @@ export function agentMatchesSearch(
     .toLowerCase();
   return terms.every((term) => text.includes(term));
 }
+
+/** CAD-1853: the AgenticOS cloud connection is conversational-only, so its
+ *  page shows the cloud projection instead of the local work panels. Another
+ *  provider can also report `endpoint_kind: "cloud"` (Devin does), and its
+ *  tabs, stats and settings must stay exactly as they were. */
+export function conversationalOnlyCloud(
+  a?: Pick<Agent, "provider" | "endpoint_kind"> | null,
+): boolean {
+  return a?.provider === "agenticos-cloud" && a?.endpoint_kind === "cloud";
+}

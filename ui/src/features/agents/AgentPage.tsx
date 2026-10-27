@@ -19,6 +19,7 @@ import { AGENT_TABS, type AgentTab } from "./agentTabModel";
 import {
   agentHoldsWorkButDead,
   agentLocation,
+  conversationalOnlyCloud,
   lifecycleBadge,
   lifecycleOf,
 } from "./agentView";
@@ -123,7 +124,7 @@ export default function AgentPage({
         on: detail.on ?? observed?.on ?? [],
       }
     : observed;
-  const isCloud = profile?.endpoint_kind === "cloud";
+  const isCloud = conversationalOnlyCloud(profile);
   const fenced = detail?.fenced ?? observed?.fenced;
   const recovery = detail?.recovery ?? observed?.recovery;
   const resume = detail?.resume ?? observed?.resume;
