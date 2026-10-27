@@ -444,57 +444,65 @@ fn reference_tokens(text: &str) -> impl Iterator<Item = &str> + '_ {
 }
 
 /// The package-relative path a token names, or `None` when the token names
-/// nothing this contract tracks. `./`-prefixed forms are the same path; an
-/// absolute path is somebody else's file.
-fn referenced_member<'a>(token: &'a str, tag: &'a str) -> Option<Reference<'a>> {
-    let mut token = token;
-    // `./x` and `.//x` both name the relative path `x`; only a token that was
-    // never relative is an absolute path, which is somebody else's file.
-    let relative = token.starts_with('.');
-    while let Some(rest) = token.strip_prefix("./") {
-        token = rest;
-    }
-    if relative {
-        while let Some(rest) = token.strip_prefix('/') {
-            token = rest;
-        }
-    }
+/// nothing this contract tracks.
+///
+/// Every `.`-led spelling is the same relative path: `./x`, `.//x` and
+/// `.//./x` all name `x`, and `.`/empty segments carry no meaning. Only a token
+/// that starts with a slash and was never `.`-led is an absolute path, which is
+/// somebody else's file. `..` would escape the package and refuses.
+fn referenced_member(token: &str, tag: &str) -> Option<Reference> {
     // A sentence-ending period is a separator, not part of a member name:
     // `run ./scripts/build.py.` names `scripts/build.py`.
     let token = token.trim_end_matches('.');
-    if token.is_empty() || token.starts_with('/') || token.ends_with('/') {
+    if token.is_empty() {
         return None;
     }
-    if let Some(rest) = token.strip_prefix(&format!("{SKILL_DIR}/")) {
+    let absolute = token.starts_with('/') && !token.starts_with('.');
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in token.split('/') {
+        match segment {
+            "" | "." => continue,
+            ".." => return None,
+            other => segments.push(other),
+        }
+    }
+    if segments.is_empty() || absolute {
+        return None;
+    }
+    let path = segments.join("/");
+    if let Some(rest) = path.strip_prefix(&format!("{SKILL_DIR}/")) {
         let (owner, member) = rest.split_once('/')?;
-        return Some(Reference { owner, member });
+        return Some(Reference {
+            owner: owner.to_string(),
+            member: member.to_string(),
+        });
     }
     for directory in ["scripts", "references"] {
-        if token.starts_with(&format!("{directory}/")) {
+        if path.starts_with(&format!("{directory}/")) {
             return Some(Reference {
-                owner: tag,
-                member: token,
+                owner: tag.to_string(),
+                member: path,
             });
         }
     }
-    if token.contains('/') {
+    if path.contains('/') {
         return None;
     }
-    let ext = token.rsplit_once('.').map(|(_, ext)| ext)?;
+    let ext = path.rsplit_once('.').map(|(_, ext)| ext)?;
     if !SKILL_ALL_EXTS.contains(&ext) {
         return None;
     }
     Some(Reference {
-        owner: tag,
-        member: token,
+        owner: tag.to_string(),
+        member: path,
     })
 }
 
 /// One token that names package material: the package it names (`skills/` may
 /// name another package, which refuses) and the member path inside it.
-struct Reference<'a> {
-    owner: &'a str,
-    member: &'a str,
+struct Reference {
+    owner: String,
+    member: String,
 }
 
 /// CAD-1867: the declared-inventory check. Every declared text file is
@@ -525,7 +533,7 @@ fn undeclared_references(
                     path = file.path,
                     owner = reference.owner
                 )
-            } else if declared.contains(reference.member) {
+            } else if declared.contains(&reference.member) {
                 continue;
             } else {
                 format!(
@@ -5262,6 +5270,36 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
                 .expect_err("static undeclared material must refuse")
                 .to_string();
             assert!(error.contains("scripts/"), "{error}");
+        }
+    }
+
+    /// Every `.`-led spelling of the same relative path is the same reference,
+    /// so a dotted form cannot hide material the plain form refuses.
+    #[test]
+    fn cad1867_dotted_spellings_are_not_a_way_around_the_scan() {
+        let mut files: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::from([
+                (
+                    "skills/demo/skill.json".into(),
+                    r#"{"schema":1,"name":"demo","files":["SKILL.md"]}"#.into(),
+                ),
+                ("skills/demo/SKILL.md".into(), "Read SKILL.md.\n".into()),
+            ]);
+        assert!(crate::issue::app::skill_package(&files, "demo").is_ok());
+        for reference in [
+            ".//./scripts/missing.py",
+            ".//scripts/missing.py",
+            "././scripts/missing.py",
+            ".//./skills/other/SKILL.md",
+        ] {
+            files.insert("skills/demo/SKILL.md".into(), format!("Run {reference}.\n"));
+            let error = crate::issue::app::skill_package(&files, "demo")
+                .expect_err("a dotted spelling must still refuse")
+                .to_string();
+            assert!(
+                error.contains("missing.py") || error.contains("other"),
+                "{reference}: {error}"
+            );
         }
     }
 
