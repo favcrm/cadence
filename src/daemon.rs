@@ -354,7 +354,6 @@ use std::sync::Barrier;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::thread;
-use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 use uuid::Uuid;

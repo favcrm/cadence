@@ -30,8 +30,10 @@ pub(crate) const RESERVED_OUTSIDE_BUDGET: usize = 1;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// Detached threads whose unit is released only when their join succeeds.
-fn detached() -> &'static Mutex<Vec<(JoinHandle<()>, Permit)>> {
-    static DETACHED: OnceLock<Mutex<Vec<(JoinHandle<()>, Permit)>>> = OnceLock::new();
+type Detached = Mutex<Vec<(JoinHandle<()>, Permit)>>;
+
+fn detached() -> &'static Detached {
+    static DETACHED: OnceLock<Detached> = OnceLock::new();
     DETACHED.get_or_init(|| Mutex::new(Vec::new()))
 }
 
