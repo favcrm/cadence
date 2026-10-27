@@ -5852,30 +5852,25 @@ fn a_routed_cloud_result_is_not_projected_to_an_unrelated_agent() {
     }
 }
 
-/// The projection's default is denial, and the branch it has to hold is an
-/// ORDINARY alias before it has ever carried a cloud row: the projection used
-/// to hand such an alias back whole, so the alias' first routed delivery could
-/// be read under an admission taken before it existed. An id the snapshot
-/// enumerated neither as ordinary mail nor as a bound derived row is withheld,
-/// and the page still advances past it.
+/// An ordinary alias keeps its own thread entries, including the ones whose
+/// `message_id` never named a message row — an artifact card and a hire
+/// proposal are exactly that shape. The projection admits entry ids too, so
+/// default-deny must not eat them; the page still advances past every row it
+/// scanned.
 #[test]
-fn an_unadmitted_id_on_an_ordinary_alias_is_withheld_and_the_page_advances() {
-    const MISSING: &str = "m-cad1853-vanished-row";
-    const MISSING_TEXT: &str = "orphaned entry text that must never project";
+fn an_ordinary_alias_keeps_its_entry_only_rows_and_the_page_advances() {
+    const ENTRY_ONLY: &str = "m-cad1853-entry-only-card";
+    const ENTRY_TEXT: &str = "an entry with no message row of its own";
     const ORDINARY: &str = "ordinary peer mail";
     const ORDINARY_ID: &str = "m-peer-ordinary";
 
     let fx = Fx::start();
-    for alias in ["peer", "outsider"] {
-        fx.call(
-            Asserted::Operator,
-            "agent_register",
-            json!({"alias": alias, "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
-        )
-        .unwrap();
-    }
-    // An ordinary alias with no cloud provenance at all: this is the shape
-    // the empty-derived fast path used to wave through.
+    fx.call(
+        Asserted::Operator,
+        "agent_register",
+        json!({"alias": "peer", "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+    )
+    .unwrap();
     fx.call(
         Asserted::Operator,
         "thread_send",
@@ -5883,59 +5878,49 @@ fn an_unadmitted_id_on_an_ordinary_alias_is_withheld_and_the_page_advances() {
     )
     .unwrap();
     let store = fx.store();
-    let orphan = store
+    let appended = store
         .thread_append(
             "peer",
             cadence_agent::store::NewEntry {
                 role: "agent",
-                kind: "message",
-                text: MISSING_TEXT,
+                kind: cadence_agent::store::KIND_ARTIFACT,
+                text: ENTRY_TEXT,
                 payload: None,
-                message_id: Some(MISSING),
+                message_id: Some(ENTRY_ONLY),
             },
         )
         .unwrap()
-        .expect("the orphaned entry is appended to the thread");
+        .expect("the entry is appended to the thread");
     assert!(
-        store.message(MISSING).unwrap().is_none(),
+        store.message(ENTRY_ONLY).unwrap().is_none(),
         "the fixture must not create the message row the entry names"
     );
-    assert!(
-        store.cloud_derived_messages("peer").unwrap().is_empty(),
-        "the fixture must hold no cloud-derived row"
-    );
 
-    for who in [Asserted::Operator, Asserted::Agent("outsider".into())] {
-        let read = fx
-            .call(
-                who.clone(),
-                "thread_read",
-                json!({"alias": "peer", "after": 0, "limit": 200}),
-            )
-            .unwrap();
-        let rendered = read.to_string();
-        assert!(
-            !rendered.contains(MISSING_TEXT),
-            "{who:?} was served an id the admission never enumerated: {rendered}"
-        );
-        assert!(
-            !rendered.contains(MISSING),
-            "{who:?} was served the unadmitted id itself: {rendered}"
-        );
-        assert!(
-            rendered.contains(ORDINARY),
-            "{who:?} lost the alias' ordinary mail: {rendered}"
-        );
-        let cursor = read["cursor"]
-            .as_i64()
-            .or_else(|| read["scanned"].as_i64())
-            .or_else(|| read["page"]["cursor"].as_i64())
-            .unwrap_or_else(|| panic!("the page must report where it stopped: {read}"));
-        assert!(
-            cursor >= orphan,
-            "the page did not advance past the withheld row ({cursor} < {orphan})"
-        );
-    }
+    let read = fx
+        .call(
+            Asserted::Operator,
+            "thread_read",
+            json!({"alias": "peer", "after": 0, "limit": 200}),
+        )
+        .unwrap();
+    let rendered = read.to_string();
+    assert!(
+        rendered.contains(ENTRY_TEXT),
+        "an entry-borne id was withheld from the alias' own read: {rendered}"
+    );
+    assert!(
+        rendered.contains(ORDINARY),
+        "the alias' ordinary mail stopped projecting: {rendered}"
+    );
+    let cursor = read["cursor"]
+        .as_i64()
+        .or_else(|| read["scanned"].as_i64())
+        .or_else(|| read["page"]["cursor"].as_i64())
+        .unwrap_or_else(|| panic!("the page must report where it stopped: {read}"));
+    assert!(
+        cursor >= appended,
+        "the page did not advance past the scanned row ({cursor} < {appended})"
+    );
 }
 
 /// An admission is fixed when a read begins, and that ordering is explicit

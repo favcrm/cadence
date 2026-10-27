@@ -1596,6 +1596,11 @@ impl Store {
     /// result that resolves after the snapshot is absent from both, and
     /// assuming it ordinary would hand another source's reply to whoever
     /// asks. Only rows enumerated here render.
+    /// Every id this alias' own rows can carry, so a projection can admit
+    /// them explicitly instead of by absence. Messages are the obvious half;
+    /// thread entries are the other, because an entry's `message_id` need not
+    /// name a message row (artifact cards and hire proposals never do), and a
+    /// projection that enumerated only messages would withhold them.
     pub fn ordinary_message_ids(&self, alias: &str) -> Result<Vec<String>> {
         self.read_tx(|conn| {
             Ok(conn.query_vec(
@@ -1607,7 +1612,12 @@ impl Store {
                    SELECT m.id FROM messages m JOIN cloud c ON m.origin=c.id \
                  ) \
                  SELECT id FROM messages \
-                  WHERE alias=?1 AND id NOT IN (SELECT id FROM cloud)",
+                  WHERE alias=?1 AND id NOT IN (SELECT id FROM cloud) \
+                 UNION \
+                 SELECT e.message_id FROM thread_entries e \
+                   JOIN threads t ON t.id = e.thread_id \
+                  WHERE t.alias = ?1 AND e.message_id IS NOT NULL \
+                    AND e.message_id NOT IN (SELECT id FROM cloud)",
                 params![alias, crate::cloud_agent::PROVIDER],
                 |row| row.get::<_, String>(0),
             )?)
