@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "scripts" / "run-result-tests"
 RESULT_ARGS = ROOT / "scripts" / "result-test-args"
 INSTALLER = ROOT / "scripts" / "install-cadence-nextest"
-PINNED_VERSION = "0.9.145"
+PINNED_VERSION = "0.9.150"
 
 
 def fail(message: str) -> "NoReturn":

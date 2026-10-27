@@ -77,10 +77,10 @@ jobs:
         if: steps.scope.outputs.mode != 'docs'
         env:
           TMPDIR: ${{ runner.temp }}
-          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
+          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.150
         run: |
           scripts/install-cadence-nextest
-          echo "CADENCE_NEXTTEST_BIN=$RUNNER_TEMP/cadence-nextest-0.9.145/cargo-nextest" >> "$GITHUB_ENV"
+          echo "CADENCE_NEXTTEST_BIN=$RUNNER_TEMP/cadence-nextest-0.9.150/cargo-nextest" >> "$GITHUB_ENV"
       - name: Verify inventory parity
         if: steps.scope.outputs.mode != 'docs'
         run: python3 scripts/ci-rust-tests.py --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/plan.json" --phase inventory

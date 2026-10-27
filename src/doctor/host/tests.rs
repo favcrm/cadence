@@ -1686,13 +1686,13 @@ fn temp_dirs_never_list_the_pinned_runner() {
     let root = TempDir::new().unwrap();
     let scan = fake_scan(&root);
     let tmp = scan.temp_dir.clone();
-    let runner = tmp.join("cadence-nextest-0.9.145");
+    let runner = tmp.join("cadence-nextest-0.9.150");
     real_bytes(&runner.join("cargo-nextest"), 64);
     std::fs::create_dir_all(tmp.join("cadence-nextest-0.9.146")).unwrap();
     std::fs::create_dir_all(tmp.join("cadence-nextest-contract.AbC")).unwrap();
     real_bytes(&tmp.join("cadence-nextest-contract.AbC/cargo-nextest"), 8);
     for name in [
-        "cadence-nextest-0.9.145",
+        "cadence-nextest-0.9.150",
         "cadence-nextest-0.9.146",
         "cadence-nextest-contract.AbC",
     ] {
@@ -1701,7 +1701,7 @@ fn temp_dirs_never_list_the_pinned_runner() {
     let c = check_temp_dirs(&scan);
     assert_eq!(c.value["count"].as_u64().unwrap(), 2, "{}", c.value);
     assert!(
-        !c.remedy.contains("cadence-nextest-0.9.145"),
+        !c.remedy.contains("cadence-nextest-0.9.150"),
         "{}",
         c.remedy
     );

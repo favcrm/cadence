@@ -50,7 +50,9 @@ after admission and isolation are configured:
 rtk proxy cargo test --locked --features test-seam --test daemon <FILTER> -- --test-threads 2
 ```
 
-Set `CARGO_BUILD_JOBS=4`. Keep host-wide sccache enabled; only use the documented
+Set `CARGO_BUILD_JOBS=4`. Keep host-wide sccache enabled (`SCCACHE_DIR`
+forced to `~/.cache/sccache` in `~/.cargo/config.toml` so a lane tmp
+`XDG_CACHE_HOME` cannot steal port 4226); only use the documented
 one-off `RUSTC_WRAPPER=` diagnostic after a strange build failure. Shared model
 changes also require compilation of all affected targets: a narrow behavior
 selection cannot find an incompatible initializer in another test crate.

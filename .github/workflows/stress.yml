@@ -132,11 +132,11 @@ jobs:
         working-directory: ui
       - name: Install pinned cargo-nextest
         env:
-          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
+          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.150
           TMPDIR: ${{ runner.temp }}
         run: |
           scripts/install-cadence-nextest
-          echo "CADENCE_NEXTTEST_BIN=${RUNNER_TEMP}/cadence-nextest-0.9.145/cargo-nextest" >> "$GITHUB_ENV"
+          echo "CADENCE_NEXTTEST_BIN=${RUNNER_TEMP}/cadence-nextest-0.9.150/cargo-nextest" >> "$GITHUB_ENV"
       # Build once. Listing compiles the test binaries and proves the filter
       # selects at least one test, so a typo fails here rather than as `count`
       # identical failures.
