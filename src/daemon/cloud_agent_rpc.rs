@@ -242,11 +242,11 @@ impl CloudProjection {
         store: &crate::store::Store,
         ids: impl IntoIterator<Item = &'a str>,
     ) -> Result<bool> {
-        // No cloud content resolves on this alias: the alias' own mail
-        // projects whole and there is nothing to re-prove.
-        if self.scopes.is_empty() && self.derived.is_empty() && self.ordinary.is_empty() {
-            return Ok(false);
-        }
+        // No shortcut, not even for an alias that is empty right now: an
+        // empty snapshot is a fact about this instant, and the row that
+        // arrives next would otherwise be rendered by a projection that never
+        // enumerated it. Admission is unconditional; the cost is one lookup
+        // per row on an alias with no cloud content at all.
         for id in ids {
             if self.scopes.is_empty() {
                 if !self.ordinary.contains(id) && !self.derived.contains_key(id) {
@@ -280,9 +280,6 @@ impl CloudProjection {
         store: &crate::store::Store,
         entries: Vec<crate::store::ThreadEntry>,
     ) -> Result<Vec<crate::store::ThreadEntry>> {
-        if self.scopes.is_empty() && self.derived.is_empty() && self.ordinary.is_empty() {
-            return Ok(entries);
-        }
         let mut kept = Vec::with_capacity(entries.len());
         for entry in entries {
             let row = match entry.message_id.as_deref() {
@@ -310,9 +307,6 @@ impl CloudProjection {
         store: &crate::store::Store,
         messages: Vec<crate::store::Message>,
     ) -> Result<Vec<crate::store::Message>> {
-        if self.scopes.is_empty() && self.derived.is_empty() && self.ordinary.is_empty() {
-            return Ok(messages);
-        }
         let mut kept = Vec::with_capacity(messages.len());
         for mut message in messages {
             match self.row(store, &message.id)? {
@@ -335,9 +329,6 @@ impl CloudProjection {
         store: &crate::store::Store,
         events: Vec<crate::store::Event>,
     ) -> Result<Vec<crate::store::Event>> {
-        if self.scopes.is_empty() && self.derived.is_empty() && self.ordinary.is_empty() {
-            return Ok(events);
-        }
         let mut kept = Vec::with_capacity(events.len());
         for event in events {
             let row = match event.payload.get("message").and_then(Value::as_str) {
