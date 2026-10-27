@@ -172,6 +172,13 @@ impl Shared {
                 // beside bound work; only a truly absent grant takes the
                 // ordinary path. `text`/`app` proposals never reach here.
                 if crate::issue::app::split_ref(name).is_none() && !name.contains('/') {
+                    // CAD-1867: a stored project workflow has no installed
+                    // bundle to resolve `skill:` against, and the grant path
+                    // renders this same text — refuse the directive before
+                    // either path can drop it.
+                    crate::issue::workflow::refuse_skill_directive(
+                        &crate::issue::workflow::read_for(&self.pm_dir()?, project, name)?,
+                    )?;
                     if let Some(out) =
                         self.admit_unattended_workflow(project, name, &provided, &actor)?
                     {
@@ -258,6 +265,10 @@ impl Shared {
             )));
         }
         let text = crate::issue::workflow::read_for(&pm_dir, project, name)?;
+        // CAD-1867: a project workflow is not an installed app's workflow, so
+        // a `skill:` directive has no bundle to resolve against — refuse it
+        // rather than propose a plan that silently drops it.
+        crate::issue::workflow::refuse_skill_directive(&text)?;
         let digest = crate::issue::workflow::gate_digest(&text)?;
         let approvals = self.store.workflow_approvals()?;
         let ok = approvals

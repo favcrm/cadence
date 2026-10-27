@@ -85,7 +85,9 @@ const WORKFLOW_ONLY_KEYS: &[&str] = &[
 /// Ticket metadata lines a workflow recognises: the plan's own plus
 /// the approval-affecting fields later stages add (a `reviewer:` line
 /// is checked, and `tries:`/`uses:` gate the file, even though the v0
-/// plan parser leaves them in the issue body).
+/// plan parser leaves them in the issue body). CAD-1867: `skill:`
+/// names the installed bundle's skill package for that step — a static
+/// tag, resolved only by an installed app run.
 const TICKET_META_KEYS: &[&str] = &[
     "size",
     "agent",
@@ -94,11 +96,12 @@ const TICKET_META_KEYS: &[&str] = &[
     "tries",
     "uses",
     "action",
+    "skill",
 ];
 
 /// Metadata fields that must be static so `workflow check` can verify
 /// them — a placeholder here is refused.
-const STATIC_META_KEYS: &[&str] = &["size", "depends_on", "action"];
+const STATIC_META_KEYS: &[&str] = &["size", "depends_on", "action", "skill"];
 
 /// One `inputs:` entry: what the proposer is asked, whether the run may
 /// leave it blank, the shape its value must match at render (CAD-571),
@@ -684,6 +687,68 @@ pub(crate) fn ticket_meta(body: &str) -> Result<TicketMetas> {
         out.push(meta);
     }
     Ok(out)
+}
+
+/// CAD-1867: the per-ticket `skill:` tags of workflow text, in ticket order —
+/// `None` for a ticket that declares no skill package.
+///
+/// The tag is static (a `{{input}}` refuses in [`ticket_meta`]), and the line
+/// must be the LAST metadata line of its ticket: the plan parser stops reading
+/// metadata at the first key it does not know, so anything written after
+/// `skill:` would land in the step body and never reach the run.
+pub fn skill_tags(text: &str) -> Result<Vec<Option<String>>> {
+    let (_, body) = parse::split_front(text)?;
+    let metas = ticket_meta(body)?;
+    let mut out = Vec::with_capacity(metas.len());
+    for (i, meta) in metas.iter().enumerate() {
+        let mut tag: Option<String> = None;
+        for (position, (key, value)) in meta.iter().enumerate() {
+            if key != "skill" {
+                continue;
+            }
+            if position + 1 != meta.len() {
+                return Err(Error::rejected(format!(
+                    "Ticket {}: a `skill:` line must be the last metadata line — the plan \
+                     parser stops reading metadata at the first key it does not know, so \
+                     anything after `skill:` would land in the step body",
+                    i + 1
+                )));
+            }
+            if value.is_empty() {
+                return Err(Error::rejected(format!(
+                    "Ticket {}: `skill:` needs a package name — `skill: <tag>`",
+                    i + 1
+                )));
+            }
+            if !model::valid_tag(value) {
+                return Err(Error::rejected(format!(
+                    "Ticket {}: `skill: {value}` — a skill package name is [a-z0-9-], \
+                     ≤32 bytes",
+                    i + 1
+                )));
+            }
+            tag = Some(value.clone());
+        }
+        out.push(tag);
+    }
+    Ok(out)
+}
+
+/// Refuse a `skill:` directive in text that is not an installed bundle's own
+/// workflow. `workflow check`, a stored project workflow's `plan propose` and
+/// an installed app's `<app>/<workflow>` proposal all read workflow text
+/// without freezing any package, so a `skill:` there would be silently
+/// dropped — this refuses it instead.
+pub fn refuse_skill_directive(text: &str) -> Result<()> {
+    let tags = skill_tags(text)?;
+    if let Some(tag) = tags.into_iter().flatten().next() {
+        return Err(Error::rejected(format!(
+            "`skill: {tag}` names installed-app skill material — only an installed app run \
+             freezes a skill package into its snapshot; this workflow is not an installed \
+             app's workflow, so the directive cannot be honored"
+        )));
+    }
+    Ok(())
 }
 
 /// Substitute `{{name}}` with `values[name]` over plain text; the
@@ -1422,10 +1487,43 @@ pub fn approved(
 /// A `check` verdict on workflow text: errors refuse; notes say what
 /// was skipped and why. `meta` is the raw per-ticket metadata
 /// ([`ticket_meta`]), `doc` the canonically rendered plan.
+///
+/// This is the NON-installed verdict: a `skill:` directive refuses here,
+/// because nothing on this path freezes a package. [`check_installed_text`]
+/// is the installed bundle's own verdict, where the tag is admissible and the
+/// caller proves it resolves.
 pub(crate) fn check_text(
     text: &str,
     agents: &HashSet<String>,
     agent_sources: &[String],
+) -> (Vec<String>, Vec<String>, Option<plan::PlanDoc>) {
+    check_text_for(text, agents, agent_sources, SkillDirective::Refuse)
+}
+
+/// The installed bundle's verdict: a `skill:` directive is admissible (it is
+/// this bundle's own material), and the caller — `app::validate_contents` —
+/// proves each tag resolves to a complete package and run creation re-proves
+/// it. Every other check is identical to [`check_text`].
+pub(crate) fn check_installed_text(
+    text: &str,
+    agents: &HashSet<String>,
+    agent_sources: &[String],
+) -> (Vec<String>, Vec<String>, Option<plan::PlanDoc>) {
+    check_text_for(text, agents, agent_sources, SkillDirective::Installed)
+}
+
+/// Whether a `skill:` directive is admissible in the text being checked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkillDirective {
+    Refuse,
+    Installed,
+}
+
+fn check_text_for(
+    text: &str,
+    agents: &HashSet<String>,
+    agent_sources: &[String],
+    skill: SkillDirective,
 ) -> (Vec<String>, Vec<String>, Option<plan::PlanDoc>) {
     let mut errors = Vec::new();
     let mut notes = Vec::new();
@@ -1480,6 +1578,18 @@ pub(crate) fn check_text(
                 .find(|(key, _)| key.as_str() == k)
                 .map(|(_, v)| v.as_str())
         };
+        // CAD-1867: `skill:` is admissible only in an installed bundle's own
+        // workflow, where the tag resolves against that bundle. Every other
+        // reader of this text refuses it rather than dropping it.
+        if skill == SkillDirective::Refuse {
+            if let Some(tag) = get("skill") {
+                errors.push(format!(
+                    "{label}: `skill: {tag}` names installed-app skill material — only an \
+                     installed app run freezes a skill package into its snapshot; this \
+                     workflow is not an installed app's workflow"
+                ));
+            }
+        }
         // The plan parser reads metadata only until the first key it
         // does not know — `size:`/`agent:`/`depends_on:` written AFTER
         // a `reviewer:`/`tries:`/`uses:` line is body text to it, so
@@ -1504,7 +1614,7 @@ pub(crate) fn check_text(
                         "{label}: `{key}` sits after an unknown metadata line — the plan \
                          parser already stopped reading metadata, so it lands in the \
                          ticket body. Put `size:`/`agent:`/`depends_on:` before \
-                         `reviewer:`/`tries:`/`uses:`"
+                         `reviewer:`/`tries:`/`uses:`/`skill:`"
                     ));
                 }
             }
@@ -1524,7 +1634,7 @@ pub(crate) fn check_text(
                 errors.push(format!(
                     "{label}: `depends_on` sits after an unknown metadata line — the plan \
                      parser already stopped reading metadata, so the dependency lands in \
-                     the ticket body. Put `depends_on:` before `reviewer:`/`tries:`/`uses:`"
+                     the ticket body. Put `depends_on:` before `reviewer:`/`tries:`/`uses:`/`skill:`"
                 ));
             }
         }

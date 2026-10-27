@@ -177,6 +177,13 @@ pub struct LocalStep {
     pub assignee: String,
     pub dependencies: Vec<String>,
     pub instruction: String,
+    /// CAD-1867: the skill package this step was frozen with — resolved from
+    /// the INSTALLED bundle's file map at run creation and stored inside the
+    /// snapshot, so the digest covers it. `None` for a step that declares no
+    /// `skill:`. Nothing is materialized on disk: these bytes travel in the
+    /// kickoff envelope and nowhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<crate::issue::app::SkillPackage>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -199,13 +206,48 @@ pub struct LocalWorkflow {
 fn execution_agent() -> String {
     "agent".into()
 }
+
+/// The non-installed resolver: a `skill:` tag names material only an installed
+/// bundle can freeze, so it refuses rather than resolving to nothing.
+fn refuse_skill_package(tag: &str) -> Result<crate::issue::app::SkillPackage> {
+    Err(Error::rejected(format!(
+        "`skill: {tag}` names installed-app skill material — only an installed app run \
+         freezes a skill package into its snapshot"
+    )))
+}
 impl LocalWorkflow {
+    /// The NON-installed parse: no bundle is being frozen here, so a `skill:`
+    /// directive refuses instead of being silently dropped.
     pub fn parse(text: &str, inputs: &BTreeMap<String, String>) -> Result<Self> {
+        Self::parse_with(text, inputs, &refuse_skill_package)
+    }
+
+    /// CAD-1867: the installed parse. `resolve` maps a step's `skill: <tag>` to
+    /// the package frozen out of the INSTALLED bundle's file map
+    /// (`crate::issue::app::skill_package`), which is the same validator
+    /// install ran — a package that is missing, incomplete or over bounds
+    /// refuses here, before any run row exists.
+    pub fn parse_installed(
+        text: &str,
+        inputs: &BTreeMap<String, String>,
+        resolve: &dyn Fn(&str) -> Result<crate::issue::app::SkillPackage>,
+    ) -> Result<Self> {
+        Self::parse_with(text, inputs, resolve)
+    }
+
+    fn parse_with(
+        text: &str,
+        inputs: &BTreeMap<String, String>,
+        resolve: &dyn Fn(&str) -> Result<crate::issue::app::SkillPackage>,
+    ) -> Result<Self> {
         let template = workflow::parse_template(text)?;
         let publication_slot = template.publication_slot;
         let capability_slots = template.capability_slots;
         let required_asset_slot = template.required_asset_slot;
         let execution = template.execution.as_str().to_string();
+        // CAD-1867: the per-step `skill:` tags of the TEMPLATE — the tags are
+        // static (a placeholder refuses), so the render cannot change them.
+        let skill_tags = workflow::skill_tags(text)?;
         let rendered = workflow::render(text, inputs)?;
         let parsed = plan::parse_plan(&rendered)?;
         let (_, body) =
@@ -213,6 +255,11 @@ impl LocalWorkflow {
         let metadata = workflow::ticket_meta(body)?;
         if parsed.tickets.len() > 16 {
             return Err(Error::rejected("local runs support at most 16 steps"));
+        }
+        if skill_tags.len() != parsed.tickets.len() {
+            return Err(Error::rejected(
+                "the rendered workflow has a different step count than its template",
+            ));
         }
         let mut steps = Vec::new();
         for (n, ticket) in parsed.tickets.iter().enumerate() {
@@ -226,7 +273,13 @@ impl LocalWorkflow {
                 .take_while(|line| !line.trim().is_empty())
             {
                 if let Some((key, _)) = line.split_once(':') {
-                    if !matches!(key.trim(), "action" | "uses" | "tries" | "reviewer") {
+                    // CAD-1867: `skill:` is a metadata line the plan parser
+                    // leaves in the body, so it appears here; the installed
+                    // parse resolves it, and the non-installed one refuses it.
+                    if !matches!(
+                        key.trim(),
+                        "action" | "uses" | "tries" | "reviewer" | "skill"
+                    ) {
                         return Err(Error::rejected("unsupported local step directive"));
                     }
                 }
@@ -306,12 +359,33 @@ impl LocalWorkflow {
                     "local step instruction exceeds its byte limit",
                 ));
             }
+            // CAD-1867: a declared tag is resolved NOW, from the installed
+            // bundle, and frozen into the step. A missing or incomplete
+            // package refuses here — before the run row exists.
+            let skill = match skill_tags[n].clone() {
+                Some(tag) => {
+                    // A host capability step runs in-process with no worker
+                    // and no kickoff, so frozen material would be dropped
+                    // silently. Refuse rather than pretend.
+                    if kind == "capability" {
+                        return Err(Error::rejected(format!(
+                            "step `skill: {tag}` — a host capability step runs no worker, \
+                             so it cannot use skill material"
+                        )));
+                    }
+                    Some(resolve(&tag).map_err(|error| {
+                        Error::rejected(format!("step `skill: {tag}` — {error}"))
+                    })?)
+                }
+                None => None,
+            };
             steps.push(LocalStep {
                 id: format!("s{}", n + 1),
                 kind: kind.into(),
                 assignee,
                 dependencies,
                 instruction,
+                skill,
             });
         }
         if execution == "host" && steps.iter().any(|step| step.kind != "capability") {
@@ -340,6 +414,35 @@ impl LocalWorkflow {
         })
     }
 }
+
+/// The exact kickoff body one step is dispatched with.
+///
+/// Creation measures this same body — for every step, with the run id it is
+/// about to write — plus [`KICKOFF_DEPENDENCY_BYTES`] per declared dependency,
+/// and refuses before any run row exists when it could not be transported.
+/// Dispatch sends the body this builds from the SNAPSHOT alone: `skill` is the
+/// material frozen at creation, never a re-read of the live bundle.
+fn kickoff_body(
+    run_id: &str,
+    step: &LocalStep,
+    dependencies: &[Value],
+    snapshot: &Value,
+) -> Result<String> {
+    let envelope = json!({"schema":1,"run_id":run_id,"step_id":step.id,"revision":1,"kind":step.kind,"instruction":step.instruction,"dependencies":dependencies,
+        "skill":step.skill,
+        "source":snapshot["source"],
+        "capability_slots":snapshot["workflow"]["capability_slots"],
+        "required_asset_slot":snapshot["workflow"]["required_asset_slot"],
+        "result_contract":"Return exactly one complete JSON envelope as your final text, with no prose, heading, or Markdown fence. It must have schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with the active message and turn token. An approve is refused unless this turn successfully fetched that dependency; revise does not require the fetch. Managed Codex: call MCP self, then MCP app_run_artifact with the dependency artifact_id and that response's exact id as message and turn_id as token. Other providers: cadence app run artifact ID --message MSG --token TOKEN. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
+    serde_json::to_string(&envelope).map_err(|e| Error::internal(e.to_string()))
+}
+
+/// Worst-case bytes one `dependencies` entry adds to the kickoff body: the
+/// artifact id (`artifact-<run>-<step>`), the producer step id, the revision,
+/// the `sha256:` digest, a media type and a byte count. Creation reserves this
+/// per declared dependency because the artifact does not exist yet; dispatch
+/// then measures the real body again.
+const KICKOFF_DEPENDENCY_BYTES: usize = 320;
 
 pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS app_install_capabilities(
@@ -873,6 +976,28 @@ impl Store {
                         return Self::app_run_show_in(&tx, &id);
                     }
                     let id = format!("run-{}", uuid::Uuid::new_v4().simple());
+                    // CAD-1867: the kickoff envelope a step will be dispatched
+                    // with is measured NOW — frozen skill material included —
+                    // before any row exists. A run whose material cannot reach
+                    // its worker is refused here, not half-created and then
+                    // un-dispatchable. A capability step enqueues no message,
+                    // so it has no envelope to fit.
+                    for step in &workflow.steps {
+                        if step.kind == "capability" {
+                            continue;
+                        }
+                        let bytes = kickoff_body(&id, step, &[], &snapshot)?.len()
+                            + step.dependencies.len() * KICKOFF_DEPENDENCY_BYTES;
+                        if bytes > super::ENQUEUE_BYTES {
+                            return Err(Error::rejected(format!(
+                                "encoded app kickoff for step {} exceeds the transport byte \
+                                 limit ({bytes} > {}) — reduce the skill package or the step \
+                                 instruction",
+                                step.id,
+                                super::ENQUEUE_BYTES
+                            )));
+                        }
+                    }
                     // CAD-1171: a host run stores an empty owner (its
                     // snapshot carries `owner_pm: null`).
                     let owner_row = owner_pm.unwrap_or_default();
@@ -1676,12 +1801,7 @@ impl Store {
                             ));
                         }
                         let message = format!("app-{id}-{step_id}-r1");
-                        let envelope = json!({"schema":1,"run_id":id,"step_id":step_id,"revision":1,"kind":step.kind,"instruction":step.instruction,"dependencies":dependencies,
-                            "source":run["snapshot"]["source"],
-                            "capability_slots":run["snapshot"]["workflow"]["capability_slots"],
-                            "required_asset_slot":run["snapshot"]["workflow"]["required_asset_slot"],
-                            "result_contract":"Return exactly one complete JSON envelope as your final text, with no prose, heading, or Markdown fence. It must have schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with the active message and turn token. An approve is refused unless this turn successfully fetched that dependency; revise does not require the fetch. Managed Codex: call MCP self, then MCP app_run_artifact with the dependency artifact_id and that response's exact id as message and turn_id as token. Other providers: cadence app run artifact ID --message MSG --token TOKEN. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
-                        let body = envelope.to_string();
+                        let body = kickoff_body(id, &step, &dependencies, &run["snapshot"])?;
                         if body.len() > super::ENQUEUE_BYTES {
                             return Err(Error::rejected(
                                 "encoded app kickoff exceeds transport byte limit",
