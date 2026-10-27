@@ -196,12 +196,31 @@ pub(super) fn member_view(page: &mut Value) {
             t.get("install_id")
                 .is_none_or(|i| i.is_null() || i.as_str() == Some(crate::store::RECRUIT_INSTALL))
         });
+    // CAD-1853: a cloud turn belongs to the connection that admitted it. A
+    // member session is relayed under the BOARD's own identity, so the
+    // daemon's cloud admission cannot see the difference between the operator
+    // and a member; this layer can, and drops the cloud request together with
+    // every entry that shares its operation id (the reply lands under the
+    // same id). A proven operator never reaches this function.
+    let cloud_ids: std::collections::BTreeSet<String> = page["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["payload"]["source"].as_str() == Some("cloud_agent")
+                || e["payload"].get("cloud_agent").is_some()
+        })
+        .filter_map(|e| e["message"].as_str().map(str::to_string))
+        .collect();
     if let Some(entries) = page["entries"].as_array_mut() {
         entries.retain(|e| {
             !home
                 && !e["kind"]
                     .as_str()
                     .is_some_and(crate::store::operator_only_kind)
+                && !e["message"]
+                    .as_str()
+                    .is_some_and(|id| cloud_ids.contains(id))
         });
     }
     if home {
@@ -228,5 +247,56 @@ pub(super) fn redact_master_state(state: &mut Value) {
             .filter_map(|k| turn.get(*k).map(|v| ((*k).to_string(), v.clone())))
             .collect();
         state["turn"] = Value::Object(kept);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::member_view;
+    use serde_json::json;
+
+    /// A member never sees a cloud turn: the request carries
+    /// `payload.source = "cloud_agent"` and the reply shares its operation
+    /// id. Ordinary mail on the same thread survives.
+    #[test]
+    fn a_member_view_drops_a_cloud_turn_and_keeps_ordinary_mail() {
+        let mut page = json!({
+            "alias": "worker",
+            "thread": {"id": "t", "install_id": null},
+            "entries": [
+                {"seq": 1, "kind": "message", "role": "operator", "message": "op-1",
+                 "text": "cloud request", "payload": {"source": "cloud_agent"}},
+                {"seq": 2, "kind": "turn_result", "role": "agent", "message": "op-1",
+                 "text": "cloud reply", "payload": {"status": "completed"}},
+                {"seq": 3, "kind": "message", "role": "agent", "message": "m-2",
+                 "text": "ordinary mail", "payload": {"source": "agent"}},
+                {"seq": 4, "kind": "message", "role": "operator", "message": "m-3",
+                 "text": "another cloud request", "payload": {"cloud_agent": "cld-1"}}
+            ]
+        });
+        member_view(&mut page);
+        let text = page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["text"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(text, vec!["ordinary mail".to_string()], "{page}");
+    }
+
+    /// The operator path never calls this function, so the same page keeps
+    /// its cloud turn — the filter is a member rule, not a data rule.
+    #[test]
+    fn the_member_rule_does_not_touch_a_page_without_cloud_content() {
+        let mut page = json!({
+            "alias": "worker",
+            "thread": {"id": "t", "install_id": null},
+            "entries": [
+                {"seq": 1, "kind": "message", "role": "operator", "message": "m-1",
+                 "text": "ordinary", "payload": {"source": "agent"}}
+            ]
+        });
+        member_view(&mut page);
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1, "{page}");
     }
 }
