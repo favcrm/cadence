@@ -9412,6 +9412,31 @@ fn a_portable_round_trip_with_an_enrolled_peer_drops_the_routed_result() {
                 ),
             ),
         ] {
+            if what == "event payload" && count(&sql) != 0 {
+                // Failure-only evidence from the immutable export/restore,
+                // before the unchanged no-cloud-content assertion below.
+                // Events use `seq` as their primary identifier, not `id`.
+                let mut statement = conn.prepare(
+                    "SELECT seq,kind,alias,payload FROM events WHERE payload LIKE ?1 ORDER BY seq",
+                ).unwrap();
+                let events = statement
+                    .query_map([format!("%{ROUTED}%")], |row| {
+                        Ok(json!({
+                            "id":row.get::<_, i64>(0)?,
+                            "kind":row.get::<_, String>(1)?,
+                            "alias":row.get::<_, String>(2)?,
+                            "payload":row.get::<_, String>(3)?,
+                        }))
+                    })
+                    .unwrap();
+                for event in events {
+                    eprintln!(
+                        "CAD1853_PORTABLE_EVENT_LEAK package={} event={}",
+                        copy.display(),
+                        event.unwrap()
+                    );
+                }
+            }
             assert_eq!(
                 count(&sql),
                 0,

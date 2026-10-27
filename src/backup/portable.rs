@@ -1855,10 +1855,20 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
         &format!(
             "{cloud_messages} DELETE FROM events WHERE \
                json_extract(payload,'$.message') IN (SELECT id FROM cloud_message) \
-               OR json_extract(payload,'$.delivery') IN (SELECT id FROM cloud_message)"
+               OR json_extract(payload,'$.delivery') IN (SELECT id FROM cloud_message) \
+               OR EXISTS ( \
+                 SELECT 1 FROM json_tree(events.payload) t \
+                  WHERE t.atom IN (SELECT id FROM cloud_message) \
+               )"
         ),
         [cloud],
     )?;
+    // Raw adapter bookkeeping can embed conversation text with no structured
+    // id at all: the adapter's continuity pack quotes earlier thread content
+    // verbatim. No id-keyed closure can find that, so a portable export —
+    // coordination data, not provider transcript material — omits the raw
+    // packs themselves. A future raw-pack kind belongs in this list.
+    tx.execute("DELETE FROM events WHERE kind='fake_pack'", [])?;
     tx.execute(
         &format!(
             "{cloud_messages} DELETE FROM messages WHERE id IN (SELECT id FROM cloud_message)"
