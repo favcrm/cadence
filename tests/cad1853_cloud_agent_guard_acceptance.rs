@@ -70,6 +70,8 @@ struct Script {
     agent_organization: Option<String>,
     capabilities: Option<Value>,
     provenance: Option<Value>,
+    /// Only the replacement-owner case opts into its own server-issued session.
+    remote_session: Option<String>,
     submit_status: u16,
     submit_state: String,
     submit_text: Option<String>,
@@ -110,6 +112,7 @@ impl Script {
             agent_organization: None,
             capabilities: None,
             provenance: None,
+            remote_session: None,
             submit_status: 0,
             submit_state: "queued".into(),
             submit_text: None,
@@ -131,6 +134,14 @@ impl Script {
     }
     fn calls(&self, action: &str) -> usize {
         self.seen.iter().filter(|s| s.action == action).count()
+    }
+
+    fn conversation(&self, conversation: &str) -> Value {
+        let mut answer = conversation_object(conversation);
+        if let Some(session) = &self.remote_session {
+            answer["remote_session_id"] = json!(session);
+        }
+        answer
     }
 }
 
@@ -566,7 +577,7 @@ fn serve_io(mut stream: impl Read + Write, script: Arc<Mutex<Script>>, close: im
                 json!({
                     "ok": true,
                     "agent": agent_object(&script),
-                    "conversation": conversation_object(&conversation),
+                    "conversation": script.conversation(&conversation),
                     "capabilities": script
                         .capabilities
                         .clone()
@@ -591,7 +602,7 @@ fn serve_io(mut stream: impl Read + Write, script: Arc<Mutex<Script>>, close: im
                     json!({
                         "ok": true,
                         "agent": agent_object(&script),
-                        "conversation": conversation_object(&conversation),
+                        "conversation": script.conversation(&conversation),
                         "operation": {
                             "operation_id": operation,
                             "conversation_id": conversation,
@@ -1743,6 +1754,187 @@ fn cross_agent_pair_readers_withhold_cloud_rows_and_preserve_ordinary_pair_mail(
         rows.iter().any(|row| row["body"] == json!(V8_ORDINARY)),
         "{restored}"
     );
+}
+
+#[test]
+fn a_replacement_owner_cannot_read_retained_cloud_pair_content() {
+    const REPLY_A: &str = "v11 retained owner A cloud reply";
+    const REPLY_B: &str = "v11 owner B own cloud reply";
+    const OPERATION_B: &str = "owner-b-operation-0001";
+    const SESSION_B: &str = "ns_v11_owner_b_000000000000000000";
+    let fx = Fx::start();
+    println!("V11_OWNER_STAGE stage=seed-owner-a");
+    let saved_a = std::fs::read(login_path(ORG)).unwrap();
+    let (pair, routed) = v8_routed_pair(&fx, "https://issuer.example.test", REPLY_A);
+    let original = fx.call(Asserted::Operator, "cloud_agent_list", json!({})).unwrap();
+    let id_a = original["agents"].as_array().unwrap().iter()
+        .find(|agent| agent["alias"] == json!(ALIAS)).unwrap()["id"].clone();
+    let owner_b = json!({
+        "issuer":"https://replacement-issuer.example.test", "subject":"replacement-owner-b",
+    });
+    let invoker_b = format!("inv_{}", "b".repeat(32));
+    let token_a = format!("bearer hct_{}", "a".repeat(43));
+    let token_b = format!("bearer hct_{}", "b".repeat(43));
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    // B receives its own fixture login, then explicit consent through the real
+    // connect RPC. No A source/grant/session is copied into B's identity.
+    println!("V11_OWNER_STAGE stage=connect-owner-b");
+    write_login_owner(LoginSpec {
+        org: ORG,
+        org_id: ORG_ID,
+        endpoint: &fx.stub.url,
+        capabilities: &["cloud_agent.read", "cloud_agent.write"],
+        expires,
+        subject: "replacement-owner-b",
+        issuer: "https://replacement-issuer.example.test",
+        token_char: "b",
+    });
+    fx.stub.set(|script| {
+        script.provenance = Some(json!({"kind":"user", "invoker_id":invoker_b, "peer":null}));
+        script.remote_session = Some(SESSION_B.into());
+        script.submit_text = Some(REPLY_B.into());
+        script.read_text = REPLY_B.into();
+    });
+    let wire = fx.stub.seen().len();
+    let connected_b = fx.connect();
+    assert_eq!(fx.stub.seen().len() - wire, 1, "B connect transport");
+    assert_eq!(&fx.stub.auths()[wire..], std::slice::from_ref(&token_b));
+    assert_eq!(fx.stub.seen()[wire]["action"], json!("agent"));
+    assert_eq!(connected_b["agent"]["id"], id_a);
+    assert_eq!(connected_b["agent"]["endpoint"], json!(fx.stub.url));
+    assert_eq!(connected_b["agent"]["alias"], json!(ALIAS));
+    assert_eq!(connected_b["agent"]["organization_id"], json!(ORG_ID));
+    let grant_b = connected_b["agent"]["sources"]
+        .as_array().unwrap().iter()
+        .find(|source| source["kind"] == json!("user") && source["owner"] == owner_b)
+        .expect("B must acquire its own explicit user grant");
+    assert_eq!(grant_b["state"], json!("active"));
+    assert_eq!(grant_b["invoker_id"], json!(invoker_b));
+    let sessions = connected_b["agent"]["sessions"].as_array().unwrap();
+    let session_b = sessions.iter()
+        .find(|row| row["source"]["kind"] == json!("user") && row["source"]["owner"] == owner_b)
+        .expect("B must establish its own session");
+    let session_a = sessions.iter()
+        .find(|row| row["source"]["kind"] == json!("user")
+            && row["source"]["owner"] == json!({"issuer":"https://issuer.example.test", "subject":"stub-subject"}))
+        .expect("A's original session must remain retained");
+    assert_eq!(session_b["remote_session_id"], json!(SESSION_B));
+    assert_eq!(session_b["invoker_id"], json!(invoker_b));
+    assert_ne!(session_b["remote_session_id"], session_a["remote_session_id"]);
+    assert_eq!(fx.stub.calls("submit"), 1, "connect spent a model turn");
+    println!("V11_OWNER_CHECKPOINT stage=connect-owner-b own_grant=true own_session=true own_token=true submit_delta=0");
+
+    // A real B-owned HTTP turn provides a positive read receipt. The denied
+    // pair reads below must prove THIS receipt under B, never borrow A's.
+    println!("V11_OWNER_STAGE stage=owner-b-own-read");
+    let id = cloud_agent_id(&connected_b);
+    let home = thread_of(&connected_b);
+    let wire = fx.stub.seen().len();
+    fx.call(Asserted::Operator, "cloud_agent_send", json!({
+        "cloud_agent_id":id, "thread_id":home, "operation_id":OPERATION_B,
+        "text":"B's own legitimate request", "wake":true,
+    })).unwrap();
+    assert_eq!(fx.stub.seen().len() - wire, 1);
+    assert_eq!(&fx.stub.auths()[wire..], std::slice::from_ref(&token_b));
+    let proof = proof_before(&fx.stub);
+    let wire = fx.stub.seen().len();
+    let own_b = fx.call(Asserted::Operator, "cloud_agent_read", json!({
+        "cloud_agent_id":id, "operation_id":OPERATION_B,
+    })).expect("B's own current read authority must work");
+    assert_proof_delta(&fx.stub, proof, &[OPERATION_B], 1);
+    assert_eq!(fx.stub.seen().len() - wire, 1);
+    assert_eq!(&fx.stub.auths()[wire..], std::slice::from_ref(&token_b));
+    assert_eq!(own_b["operation"]["source"]["owner"], owner_b);
+    assert_eq!(own_b["operation"]["remote_session_id"], json!(SESSION_B));
+    assert_eq!(own_b["operation"]["status"], json!("completed"));
+    assert_eq!(own_b["operation"]["reply"]["text"], json!(REPLY_B));
+    assert_eq!(fx.stub.calls("submit"), 2);
+    println!("V11_OWNER_CHECKPOINT stage=owner-b-own-read own_reply=true own_owner=true own_session=true readbacks=1 own_token=true");
+
+    for original in [false, true] {
+        let stage = if original { "original-a" } else { "replacement-b" };
+        if original {
+            // Restore A's original credential, not a new consent or reseeded
+            // result: the exact retained rows must still be readable by A.
+            std::fs::write(login_path(ORG), &saved_a).unwrap();
+            fx.stub.set(|script| {
+                script.provenance = None;
+                script.remote_session = None;
+                script.read_text = "genuine stub reply".into();
+            });
+        }
+        for method in ["work_conversation_read", "work_conversation_list"] {
+            println!("V11_OWNER_STAGE stage={stage} method={method}");
+            let proof = proof_before(&fx.stub);
+            let wire = fx.stub.seen().len();
+            let params = if method == "work_conversation_read" {
+                json!({"conversation":pair, "include_system":true})
+            } else {
+                json!({"include_system":true})
+            };
+            let page = fx.call(Asserted::Operator, method, params)
+                .expect("owner filtering must preserve the pair page");
+            let proofs = if method == "work_conversation_read" { 2 } else { 1 };
+            let operation = if original { OPERATION } else { OPERATION_B };
+            assert_proof_delta(&fx.stub, proof, &vec![operation; proofs], proofs);
+            assert_eq!(fx.stub.seen().len() - wire, proofs, "extra transport: {stage}/{method}");
+            let token = if original { &token_a } else { &token_b };
+            assert!(fx.stub.auths()[wire..].iter().all(|auth| auth == token));
+            assert_eq!(fx.stub.calls("submit"), 2, "a pair read spent a model turn");
+            if !original {
+                assert!(!page.to_string().contains(V8_REQUEST), "A request leaked: {page}");
+                assert!(!page.to_string().contains(REPLY_A), "A reply leaked: {page}");
+            }
+            if method == "work_conversation_read" {
+                let messages = page["messages"].as_array().unwrap();
+                assert_eq!(messages.len(), 3, "the retained pair lost metadata: {page}");
+                let ordinary = messages.iter()
+                    .find(|row| row["id"] == json!("m-v8-pair-ordinary")).unwrap();
+                assert_eq!(ordinary["body"], json!(V8_ORDINARY));
+                assert!(ordinary["cloud_withheld"].is_null());
+                let request = messages.iter()
+                    .find(|row| row["id"] == json!(V8_PEER_OPERATION)).unwrap();
+                let report = messages.iter()
+                    .find(|row| row["id"] == json!(routed)).unwrap();
+                if original {
+                    assert_eq!(request["body"], json!(V8_REQUEST));
+                    assert!(request["cloud_withheld"].is_null());
+                    assert!(request["result"].to_string().contains(REPLY_A));
+                    assert!(request["routed"].as_array().unwrap().iter().any(|row| {
+                        row["id"] == json!(routed) && row["result"].to_string().contains(REPLY_A)
+                    }));
+                    assert!(report["cloud_withheld"].is_null());
+                    assert!(report["body"].as_str().unwrap().contains(REPLY_A));
+                    assert!(report["body"].as_str().unwrap().contains(V8_PEER_OPERATION));
+                    assert!(report["body"].as_str().unwrap().contains("completed"));
+                    assert!(report["result"].to_string().contains(REPLY_A));
+                } else {
+                    for row in [request, report] {
+                        assert_eq!(row["cloud_withheld"], json!("cloud_agent_owner_changed"));
+                        assert_eq!(row["body"], json!(""));
+                        assert!(row["result"].is_null());
+                        assert!(row["error"].is_null());
+                        assert_eq!(row["routed"], json!([]));
+                    }
+                }
+            } else {
+                let row = page["conversations"].as_array().unwrap().iter()
+                    .find(|row| row["id"] == json!(pair)).unwrap();
+                if original {
+                    assert!(!row["last"]["preview"].as_str().unwrap().is_empty());
+                    assert!(row["last"]["cloud_withheld"].is_null());
+                } else {
+                    assert_eq!(row["last"]["preview"], json!(""));
+                    assert_eq!(row["last"]["cloud_withheld"], json!("cloud_agent_owner_changed"));
+                }
+            }
+            println!("V11_OWNER_CHECKPOINT stage={stage} method={method} passed=true readbacks={proofs} own_token=true ordinary=true submit_delta=0");
+        }
+    }
 }
 
 // ---------- acceptance ----------
