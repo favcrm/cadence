@@ -1839,6 +1839,7 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
         &format!(
             "{cloud_messages} DELETE FROM thread_entries WHERE \
                message_id IN (SELECT id FROM cloud_message) \
+               OR json_extract(payload,'$.message') IN (SELECT id FROM cloud_message) \
                OR thread_id IN (SELECT id FROM threads WHERE alias IN ({cloud_alias}))"
         ),
         [cloud],
@@ -1910,6 +1911,36 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
     // same screen prose can sit one level down in `monitor_alerts.payload`.
     // The alert keeps its identity, task, kind, state and fingerprint; the
     // copied transcript does not.
+    // Provider error prose has no lineage at all: a failed turn publishes the
+    // provider's own message into `agents.error` and into an `attention`
+    // event, and a history-refusal note is a thread entry that references its
+    // delivery only in the payload. None of those can be traced back to the
+    // cloud row they quoted, so the portable copy does not carry the prose:
+    // the agent keeps its state, the attention marker and the note's
+    // reference, without the quoted text.
+    tx.execute("UPDATE agents SET error=NULL", [])?;
+    // Provider transcript that had no running message when it arrived is
+    // canonical history with NO binding: an unbound assistant text, tool call
+    // or tool result can quote a turn whose cloud operation is omitted, and
+    // nothing ties it back. A portable export carries the bound conversation,
+    // not unbound provider transcript.
+    tx.execute(
+        "DELETE FROM thread_entries WHERE message_id IS NULL \
+           AND kind IN ('assistant_text','tool_call','tool_result')",
+        [],
+    )?;
+    // A brokered permission notice copies the tool command/input summary into
+    // its delivery body. The notice row, its sender and its state stay; the
+    // copied prose does not.
+    tx.execute(
+        "UPDATE messages SET body='' WHERE source='worker_notice'",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE events SET payload=json_remove(payload,'$.reason') \
+          WHERE kind='attention' AND json_valid(payload)",
+        [],
+    )?;
     tx.execute(
         "UPDATE monitor_alerts SET payload=json_remove(payload, \
            '$.payload.before','$.payload.after','$.payload.line', \
