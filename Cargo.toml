@@ -223,10 +223,23 @@ incremental = false
 # file:line while cutting that to ~3.2 GB and ~3.0 GB.
 debug = "line-tables-only"
 
+# CAD-1684: dependency debuginfo is not needed for this crate's own panic
+# and backtrace lines. Disable it for every non-workspace package; the
+# workspace crates (cadence-agent and cadence-core) keep the line tables
+# above, so panic locations and backtraces through our code still carry
+# file:line. `"*"` never matches a workspace member, and this setting is
+# part of the dependency fingerprint — hence the gate-test/gate-clippy/
+# cross-dual epoch bump in ci.yml.
+[profile.dev.package."*"]
+debug = false
+
 # CAD-1367: cached dependencies run faster in image-heavy acceptance tests.
 # Keep the workspace crate at O0 and retain test debug assertions.
+# CAD-1684: `test` inherits `dev`'s line tables for the workspace crate;
+# dependencies get no debuginfo here either, matching the dev profile.
 [profile.test.package."*"]
 opt-level = 1
+debug = false
 
 # CAD-1103: PR/merge-queue gate profile. Used ONLY by the ci.yml `build` and
 # `ui` jobs, which prove "compiles, links, no test seam, migration rehearsal",
