@@ -1232,7 +1232,7 @@ export function ConnectionDetail({
                     setRevoking(false);
                     setRotating((v) => !v);
                   }}
-                >{t("Legacy credential update…")}</Button>
+                >{t("Update credentials…")}</Button>
               )}
               <Button
                 variant="danger"
