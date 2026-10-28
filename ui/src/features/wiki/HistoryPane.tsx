@@ -18,9 +18,12 @@ import { Failure, Loading, Note, WikiToolbar } from "./shared";
 export default function HistoryPane({
   path,
   navHref,
+  hosted = false,
 }: {
   path: string;
   navHref: (route: Route) => string;
+  /** A hosted Worker board keeps no historical page text yet (AOS-452), so by default only the current revision opens. */
+  hosted?: boolean;
 }) {
   const t = useTranslate();
   const [entries, setEntries] = useState<WikiVersion[] | null>(null);
@@ -42,7 +45,7 @@ export default function HistoryPane({
         if (cancelled) return;
         const list = resp.entries ?? resp.history ?? [];
         setCanCompare(resp.canCompare !== false);
-        setCanOpen(resp.canOpen !== false);
+        setCanOpen(resp.canOpen ?? !hosted);
         setEntries(list);
         const current = resp.rev ?? list[0]?.rev ?? null;
         setCurrentRev(current);
@@ -54,7 +57,7 @@ export default function HistoryPane({
     return () => {
       cancelled = true;
     };
-  }, [path]);
+  }, [path, hosted]);
 
   useEffect(() => {
     if (!selected || !currentRev || selected === currentRev) {
