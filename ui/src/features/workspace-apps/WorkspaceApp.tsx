@@ -474,7 +474,12 @@ export default function WorkspaceApp({
     };
   }, [refresh]);
   useEffect(() => {
-    if (viewer.operator !== true) return;
+    // A read-only session may open the app. It must not arm a release.
+    if (viewer.operator !== true || viewer.readOnly) {
+      setArmed(false);
+      automaticRef.current = false;
+      return;
+    }
     const controller = new AbortController();
     setAutomatic(false);
     automaticRef.current = false;
@@ -493,7 +498,7 @@ export default function WorkspaceApp({
       })
       .catch(() => { if (!controller.signal.aborted) setAutomaticReady(false); });
     return () => controller.abort();
-  }, [installId, viewer.operator]);
+  }, [installId, viewer.operator, viewer.readOnly]);
   useEffect(() => {
     const visitKey = destinationVisitKey;
     if (!visitKey || !destination || !viewer.operator || busy || mutationLock.current || loading || accessDenied) return;
@@ -656,7 +661,7 @@ export default function WorkspaceApp({
     setUpgradeSource(current => current.trim() ? current : recordedUpgradeSource);
   }, [recordedUpgradeSource]);
   useEffect(() => {
-    if (viewer.operator !== true || !armed) {
+    if (!canWrite || !armed) {
       if (!armed) autoCheckKey.current = "";
       return;
     }
@@ -702,7 +707,7 @@ export default function WorkspaceApp({
         if (identity.current === installId) setBusy(false);
       }
     })();
-  }, [armed, installId, data, recordedUpgradeSource, viewer.operator, refresh, clearPrivate]);
+  }, [armed, installId, data, recordedUpgradeSource, canWrite, refresh, clearPrivate]);
   // CAD-1025: the mounted screen's publish intents, read with the existing
   // operator-only list and tagged with its scope; the projection pushes it
   // only while that tag still matches the route install and context. The
