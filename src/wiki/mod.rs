@@ -475,6 +475,25 @@ fn entry_kind(abs: &Path, norm: &str) -> Result<Kind> {
     }
 }
 
+/// The logical entry kind at `norm`, after refusing a parent that is a
+/// page: creating a missing parent directory beside `p.blob` (or over a
+/// text page `p`) would hide it. Call it only while holding `pm.lock()`.
+fn logical_kind(vault: &Path, norm: &str) -> Result<Kind> {
+    let segs: Vec<&str> = norm.split('/').collect();
+    for i in 1..segs.len() {
+        let parent = segs[..i].join("/");
+        match entry_kind(&resolve(vault, &parent)?, &parent)? {
+            Kind::Dir | Kind::None => {}
+            Kind::Text | Kind::Blob => {
+                return Err(Error::rejected(format!(
+                    "wiki '{norm}' refused: '{parent}' is a page, not a directory"
+                )))
+            }
+        }
+    }
+    entry_kind(&resolve(vault, norm)?, norm)
+}
+
 pub(crate) fn rev_bytes(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
@@ -1617,7 +1636,7 @@ pub fn write(
     let _lock = pm.lock()?;
     let gitignore = ensure_layout(pm)?;
 
-    match entry_kind(&abs, &norm)? {
+    match logical_kind(&vault, &norm)? {
         Kind::Dir => {
             return Err(Error::rejected(format!(
                 "wiki write '{norm}' refused: a directory exists there"
@@ -1696,7 +1715,7 @@ pub fn mkdir(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
     let abs = resolve(&vault, &norm)?;
     let _lock = pm.lock()?;
     let gitignore = ensure_layout(pm)?;
-    match entry_kind(&abs, &norm)? {
+    match logical_kind(&vault, &norm)? {
         Kind::Dir => return Ok(json!({"path": norm, "created": false})),
         Kind::Text | Kind::Blob => {
             return Err(Error::rejected(format!(
@@ -1877,7 +1896,7 @@ fn mv_real(
     // Check the logical destination, not `dst`: a blob page moves to
     // `<to>.blob`, and a text page or dir at `<to>` must refuse too.
     let vault = vault_dir(pm)?;
-    if entry_kind(&resolve(&vault, to)?, to)? != Kind::None {
+    if logical_kind(&vault, to)? != Kind::None {
         return Err(Error::rejected(format!(
             "wiki mv '{from_label}' → '{to}' refused: destination exists"
         )));
@@ -2151,7 +2170,7 @@ pub fn put_blob(
     let pointer = vault.join(format!("{norm}.blob"));
     let _lock = pm.lock()?;
     let gitignore = ensure_layout(pm)?;
-    match entry_kind(&resolve(&vault, &norm)?, &norm)? {
+    match logical_kind(&vault, &norm)? {
         Kind::Text => {
             return Err(Error::rejected(format!(
                 "wiki put_blob '{norm}' refused: a text page exists there — rm it first"
@@ -3877,6 +3896,22 @@ mod tests {
     }
 
     // ---- CAD-912: logical entry kinds under the writer lock ----
+
+    #[test]
+    fn cad912_nested_mkdir_and_write_beside_blob_page_are_refused() {
+        let (_root, pm) = range_pm();
+        let ptr = cad912_blob_page(&pm, "global/x");
+        let vault = vault_dir(&pm).unwrap();
+        let m = mkdir(&pm, &Caller::Operator, "global/x/y");
+        assert!(m.is_err(), "mkdir under a blob page must be refused: {m:?}");
+        let w = write(&pm, &Caller::Operator, "global/x/y", "hi", Some(ABSENT));
+        assert!(w.is_err(), "write under a blob page must be refused: {w:?}");
+        assert!(ptr.exists(), "blob pointer intact");
+        assert!(
+            vault.join("global/x").symlink_metadata().is_err(),
+            "no directory beside the blob page"
+        );
+    }
 
     #[test]
     fn cad912_mv_blob_page_onto_text_page_is_refused() {
