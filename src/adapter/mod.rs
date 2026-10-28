@@ -1171,7 +1171,7 @@ mod split_launch_tests {
             #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
             assert!(
                 e.to_string()
-                    .contains("protected Pi must be provisioned by the fixed supervisor"),
+                    .contains("protected managed-Pi prerequisites unavailable"),
                 "{provider}: {e}"
             );
             #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]

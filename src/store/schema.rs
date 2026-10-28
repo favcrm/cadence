@@ -828,7 +828,7 @@ impl Store {
                 if !columns.iter().any(|c| c == "credential_revision") {
                     tx.execute_batch("ALTER TABLE platform_credentials ADD COLUMN credential_revision INTEGER NOT NULL DEFAULT 1;")?;
                 }
-                tx.execute_batch("UPDATE platform_credentials SET connection_id='conn-' || lower(hex(randomblob(16))) WHERE connection_id=''; CREATE UNIQUE INDEX IF NOT EXISTS platform_connection_id ON platform_credentials(connection_id); CREATE TABLE IF NOT EXISTS connection_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),workspace_id TEXT NOT NULL); INSERT OR IGNORE INTO connection_metadata VALUES(1,lower(hex(randomblob(16))));")?;
+                tx.execute_batch("UPDATE platform_credentials SET connection_id='conn-' || lower(hex(randomblob(16))) WHERE connection_id=''; CREATE UNIQUE INDEX IF NOT EXISTS platform_connection_id ON platform_credentials(connection_id); CREATE TABLE IF NOT EXISTS connection_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),workspace_id TEXT NOT NULL); INSERT OR IGNORE INTO connection_metadata(singleton, workspace_id) VALUES(1,lower(hex(randomblob(16))));")?;
                 tx.execute("UPDATE schema_version SET version=21", [])?;
                 tx.commit()?;
             }

@@ -34,6 +34,7 @@ use zeroize::Zeroizing;
 
 use cadence_core::connection_dispatch::{pi_model_decision, Digest, ModelId, Revision, RoleV1};
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use crate::daemon::credential_entry_rpc::{
     BoundedSecretInputV1, SecretKind, VerifiedHumanAttemptV1,
 };
@@ -1544,6 +1545,7 @@ impl NativeModelBroker {
 
     // -- trusted human source link -----------------------------------------
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub(crate) fn apply_human_attempt(
         &self,
         attempt: &VerifiedHumanAttemptV1,

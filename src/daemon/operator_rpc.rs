@@ -368,6 +368,7 @@ impl Shared {
     /// the current owner/core floor. The entry-purpose one-use link binds
     /// the exact root-pinned origin AND that canonical request id. No
     /// credential row/key is touched. The nonce never rides a URL.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub(super) fn rpc_credential_entry_continue_mint(
         &self,
         params: &Value,
@@ -736,6 +737,7 @@ impl Shared {
     /// ISSUED ON the exact root-pinned entry origin. A board/normal
     /// loopback session never satisfies it; the entry cookie is a distinct
     /// scope, not board authority.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub(super) fn rpc_credential_entry_session_check(&self, params: &Value) -> Result<Value> {
         let token = required_str(params, "token")?;
         let key = optional_str(params, "key").unwrap_or_default();

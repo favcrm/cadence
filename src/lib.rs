@@ -50,6 +50,7 @@ pub mod home;
 mod ident;
 pub mod inbox;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod installer_bundle;
 pub mod issue;
 #[cfg(test)]

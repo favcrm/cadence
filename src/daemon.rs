@@ -228,11 +228,14 @@ mod cad1868_acceptance;
 mod cloud_agent_rpc;
 mod connection_test;
 mod connections_rpc;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod credential_entry_rpc;
 /// CAD-1128: the `connection_custody_*` operator verbs.
 pub(crate) mod custody_rpc;
 pub(crate) mod native_model_turn;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod protected_connections;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod protected_management_rpc;
 // the frozen acceptance check and its genuine fixture.
 // Both compile only under `test-seam`; production carries neither.
@@ -309,6 +312,7 @@ mod social_publish_driver;
 mod social_publish_rpc;
 mod social_publish_start;
 #[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod supervisor_grant;
 #[cfg(all(test, feature = "test-seam"))]
 pub(crate) mod team_assistants_refusal;
@@ -887,6 +891,7 @@ pub struct Shared {
     /// is operator test configuration, not a caller-controlled
     /// bypass: certificate verification still runs on every send.
     smtp_test_ca: Option<Vec<u8>>,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     protected: std::sync::OnceLock<Arc<protected_connections::ProtectedConnections>>,
     protected_runtime: std::sync::OnceLock<Arc<protected_runtime::ProtectedRuntimeCoordinator>>,
     native_model: std::sync::OnceLock<Arc<native_model_turn::NativeModelBroker>>,
@@ -1348,6 +1353,7 @@ impl Shared {
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
             smtp_test_ca: opts.smtp_test_ca_pem.clone(),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             protected: std::sync::OnceLock::new(),
             protected_runtime: std::sync::OnceLock::new(),
             native_model: std::sync::OnceLock::new(),
@@ -4311,6 +4317,7 @@ impl Shared {
             "connection_custody_unlock" => self.rpc_connection_custody(method, params, peer_pid),
             "connection_custody_lock" => self.rpc_connection_custody(method, params, peer_pid),
             "connection_custody_status" => self.rpc_connection_custody(method, params, peer_pid),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             "credential_request_create" => credential_entry_rpc::rpc_credential_entry(
                 self,
                 method,
@@ -4318,6 +4325,7 @@ impl Shared {
                 peer_pid,
                 |attempt, input| self.apply_human_credential_attempt(attempt, input),
             ),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             "credential_request_show" => credential_entry_rpc::rpc_credential_entry(
                 self,
                 method,
@@ -4325,6 +4333,7 @@ impl Shared {
                 peer_pid,
                 |attempt, input| self.apply_human_credential_attempt(attempt, input),
             ),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             "credential_request_list" => credential_entry_rpc::rpc_credential_entry(
                 self,
                 method,
@@ -4332,6 +4341,7 @@ impl Shared {
                 peer_pid,
                 |attempt, input| self.apply_human_credential_attempt(attempt, input),
             ),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             "credential_request_status" => credential_entry_rpc::rpc_credential_entry(
                 self,
                 method,
@@ -4339,6 +4349,7 @@ impl Shared {
                 peer_pid,
                 |attempt, input| self.apply_human_credential_attempt(attempt, input),
             ),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             "credential_request_cancel" => credential_entry_rpc::rpc_credential_entry(
                 self,
                 method,
@@ -4346,6 +4357,7 @@ impl Shared {
                 peer_pid,
                 |attempt, input| self.apply_human_credential_attempt(attempt, input),
             ),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             "credential_entry_session" => credential_entry_rpc::rpc_credential_entry(
                 self,
                 method,
@@ -4353,6 +4365,7 @@ impl Shared {
                 peer_pid,
                 |attempt, input| self.apply_human_credential_attempt(attempt, input),
             ),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             "credential_request_submit" => credential_entry_rpc::rpc_credential_entry(
                 self,
                 method,
@@ -4360,12 +4373,15 @@ impl Shared {
                 peer_pid,
                 |attempt, input| self.apply_human_credential_attempt(attempt, input),
             ),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             "protected_management_session" => {
                 protected_management_rpc::rpc_protected_management(self, method, params, peer_pid)
             }
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             "protected_management_status" => {
                 protected_management_rpc::rpc_protected_management(self, method, params, peer_pid)
             }
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             "protected_management_action" => {
                 protected_management_rpc::rpc_protected_management(self, method, params, peer_pid)
             }
