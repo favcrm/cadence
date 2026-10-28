@@ -296,6 +296,7 @@ jobs:
         run: |
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           python3 scripts/check-migration-ddl --base "$BASE_SHA"
+      - run: python3 tests/cad1285_migration_ddl_acceptance.py
       - name: Check contributor documentation paths
         run: python3 scripts/check-doc-links.py
       - name: Test contributor documentation checker

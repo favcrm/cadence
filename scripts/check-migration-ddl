@@ -7,7 +7,8 @@ the base must keep its body, and the `execute_batch(<module>::SCHEMA*)`
 constants it applies must keep their text. New DDL goes in a new version.
 Full-line `//` comments and trailing whitespace are ignored; any other change
 fails. Allowlist: `// migration-lint: allow <N> -- <reason>` inside, or
-directly above, block N (reason required).
+directly above, block N (reason required). Only an annotation the change adds
+counts; one already on the base excepted an earlier change.
 
 Prints one reason per line. Exit 0 clean, 1 refused, 2 cannot check.
 """
@@ -65,17 +66,28 @@ def norm(body):
     return [l.rstrip() for l in body if not l.lstrip().startswith("//")]
 
 
-def allowed(n, body, header, lines):
-    """None if no annotation, else the reason ('' when missing)."""
+def annotations(n, body, header, lines):
+    """Allow-annotation lines for block N: inside it or directly above it."""
     cands = list(body)
     j = header - 1
     while j >= 0 and lines[j].lstrip().startswith("//"):
         cands.append(lines[j])
         j -= 1
+    out = []
     for l in cands:
         m = ALLOW.search(l)
         if m and int(m.group(1)) == n and l.lstrip().startswith("//"):
-            return m.group(2)
+            out.append((l.strip(), m.group(2)))
+    return out
+
+
+def allowed(n, old, new):
+    """None if this change adds no annotation, else its reason ('' when missing).
+    An annotation already on the base excepted an earlier change, not this one."""
+    shipped = {line for line, _ in annotations(n, *old)}
+    for line, reason in annotations(n, *new):
+        if line not in shipped:
+            return reason
     return None
 
 
@@ -134,8 +146,8 @@ def main():
             if n not in new:
                 fails.append(f"version < {n}: shipped block removed")
                 continue
-            nbody, hdr, nlines = new[n]
-            reason = allowed(n, nbody, hdr, nlines)
+            nbody = new[n][0]
+            reason = allowed(n, old[n], new[n])
             problems = []
             if norm(obody) != norm(nbody):
                 problems.append(f"version < {n}: shipped migration block edited; add a new version instead")
