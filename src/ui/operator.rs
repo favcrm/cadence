@@ -362,6 +362,26 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-social-drafts/effect-stage",
         RouteClass::OperatorOnly,
     ),
+    route(
+        "POST",
+        "/api/app-social-drafts/confirm",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/schedule",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/reschedule",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/cancel",
+        RouteClass::OperatorOnly,
+    ),
     route("POST", "/api/issues", RouteClass::AgentAllowed),
     // CAD-140: filing a report or idea is creating a tracker issue —
     // the same class as `POST /api/issues`, through `report::file`.
