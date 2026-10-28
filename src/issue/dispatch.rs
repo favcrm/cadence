@@ -515,6 +515,7 @@ fn lane_head(worktree: &Path) -> Option<String> {
 struct ContextFacts {
     lessons: Vec<String>,
     lessons_withheld: Vec<(String, String)>,
+    lessons_omitted: Vec<(String, String)>,
     lessons_error: Option<String>,
 }
 
@@ -527,24 +528,46 @@ impl ContextFacts {
             }
         }
         let mut lessons_withheld = Vec::new();
+        let mut lessons_omitted = Vec::new();
         let mut lessons_error = None;
         for gap in &manifest.withheld {
             if gap.path != LESSON_PATH {
                 continue;
             }
-            // Each lesson gap is already one bounded aggregate fact, so it is
-            // reported as written; re-wrapping it would only duplicate text.
+            // The aggregate gap reason keeps the complete count; bounded
+            // detail names the exact lessons with their own reasons. A pin
+            // written before detail existed still reports its aggregate fact.
+            let detail = |notes: &[crate::context_pack::LessonNote]| {
+                notes
+                    .iter()
+                    .map(|note| (note.id.clone(), note.reason.clone()))
+                    .collect::<Vec<_>>()
+            };
             match gap.state.as_str() {
                 "withheld" => {
+                    // The aggregate fact keeps the complete count and the
+                    // truncation disclosure; bounded detail names the
+                    // individual lessons after it. A pre-detail pin has an
+                    // empty list, so the extend is a no-op there.
                     lessons_withheld.push((gap.id.clone(), gap.reason.clone()));
+                    lessons_withheld.extend(detail(&gap.lessons));
                 }
-                "unreadable" | "unavailable" => lessons_error = Some(gap.reason.clone()),
+                "overflow" if gap.id == LESSON_OMITTED_ID => {
+                    lessons_omitted.push((gap.id.clone(), gap.reason.clone()));
+                    lessons_omitted.extend(detail(&gap.lessons));
+                }
+                "unreadable" | "unavailable" => {
+                    // A pin written before the redaction boundary can still
+                    // carry a raw load-error line; redact before reporting.
+                    lessons_error = Some(redacted_fact(&gap.reason));
+                }
                 _ => {}
             }
         }
         ContextFacts {
             lessons,
             lessons_withheld,
+            lessons_omitted,
             lessons_error,
         }
     }
@@ -840,6 +863,18 @@ fn content_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Redacted, bounded file-controlled lesson text: a withholding reason, a
+/// memory load-error line (an unreadable file name can be token-shaped) or a
+/// match failure. Redaction runs before the cap, and a redaction failure shows
+/// the marker — never the raw value.
+fn redacted_fact(text: &str) -> String {
+    let clean = match crate::secret::redact_text(text) {
+        Ok(text) => text,
+        Err(_) => crate::context_pack::LESSON_REDACTION_UNAVAILABLE.to_string(),
+    };
+    lesson_fact(&clean)
+}
+
 /// Select the project-memory lessons current policy applies to this issue
 /// and the actual assignee's provider, exactly once. The rendered Markdown
 /// becomes one optional content-addressed source whose included IDs are the
@@ -868,6 +903,7 @@ fn lesson_selection(
         state: state.to_string(),
         reason,
         required: false,
+        lessons: Vec::new(),
     };
     let mut withheld = Vec::new();
     let source = match memory::match_for_issue(pm, &issue, Some(provider), role) {
@@ -875,41 +911,91 @@ fn lesson_selection(
             withheld.push(gap(
                 LESSON_SOURCE_ID,
                 "unavailable",
-                lesson_fact(&format!("memory match failed: {error}")),
+                redacted_fact(&format!("memory match failed: {error}")),
             ));
             None
         }
         Ok((matched, errors)) => {
             if !matched.withheld.is_empty() {
-                // Count only: untrusted withholding text must not inflate the
-                // mandatory payload. Renderer-capped reasons ride the optional
-                // lesson source instead.
-                withheld.push(gap(
-                    LESSON_WITHHELD_ID,
-                    "withheld",
-                    format!(
+                // The aggregate fact names the complete count; bounded detail
+                // names each lesson with its recorded reason. Neither enters
+                // the mandatory payload — the optional lesson source carries
+                // the renderer-capped text, and both facts ride the pin and
+                // supply receipts.
+                let detail = crate::context_pack::lesson_notes(
+                    matched
+                        .withheld
+                        .iter()
+                        .map(|(memory, reason)| (memory.front.id.clone(), reason.clone())),
+                );
+                let shown = detail.len();
+                withheld.push(crate::context_pack::Gap {
+                    id: LESSON_WITHHELD_ID.to_string(),
+                    path: LESSON_PATH.to_string(),
+                    state: "withheld".to_string(),
+                    reason: format!(
                         "{} in-scope lesson(s) withheld by validity or role policy; \
-                         `cadence memory match --issue {} --json` lists reasons",
+                         `cadence memory match --issue {} --json` lists reasons{}",
                         matched.withheld.len(),
                         front.id,
+                        if shown < matched.withheld.len() {
+                            format!("; first {shown} named here")
+                        } else {
+                            String::new()
+                        },
                     ),
-                ));
+                    required: false,
+                    lessons: detail,
+                });
             }
             if let Some(line) = memory::load_errors_line(&errors) {
-                withheld.push(gap(LESSON_LOAD_ID, "unreadable", lesson_fact(&line)));
+                // The first failing file name is file-controlled and can be
+                // token-shaped; redact before bounding the gap reason.
+                withheld.push(gap(LESSON_LOAD_ID, "unreadable", redacted_fact(&line)));
             }
             let (text, slugs) = memory::render_lessons(&matched);
+            // Omitted reporting does not depend on the renderer's header: a
+            // matched lesson the renderer did not emit is named (bounded) even
+            // when no lesson text shipped at all.
+            let omitted = matched.lessons.len().saturating_sub(slugs.len());
+            if omitted > 0 {
+                // The emitted slugs are the renderer's truth; everything
+                // else was dropped by its entry or byte cap.
+                let emitted: std::collections::HashSet<&str> =
+                    slugs.iter().map(String::as_str).collect();
+                let detail = crate::context_pack::lesson_notes(
+                    matched
+                        .lessons
+                        .iter()
+                        .filter(|memory| !emitted.contains(memory.front.id.as_str()))
+                        .map(|memory| {
+                            (
+                                memory.front.id.clone(),
+                                "matched lesson omitted by the bounded lesson injection cap"
+                                    .to_string(),
+                            )
+                        }),
+                );
+                let shown = detail.len();
+                withheld.push(crate::context_pack::Gap {
+                    id: LESSON_OMITTED_ID.to_string(),
+                    path: LESSON_PATH.to_string(),
+                    state: "overflow".to_string(),
+                    reason: format!(
+                        "{omitted} matched lesson(s) omitted by the lesson injection cap{}",
+                        if shown < omitted {
+                            format!("; first {shown} named here")
+                        } else {
+                            String::new()
+                        },
+                    ),
+                    required: false,
+                    lessons: detail,
+                });
+            }
             if text.is_empty() {
                 None
             } else {
-                let omitted = matched.lessons.len().saturating_sub(slugs.len());
-                if omitted > 0 {
-                    withheld.push(gap(
-                        LESSON_OMITTED_ID,
-                        "overflow",
-                        format!("{omitted} matched lesson(s) omitted by the lesson injection cap"),
-                    ));
-                }
                 let digest = content_digest(text.as_bytes());
                 Some(crate::context_pack::Source {
                     id: LESSON_SOURCE_ID.to_string(),
@@ -2300,6 +2386,7 @@ struct Lessons {
     lessons_file: Option<PathBuf>,
     lessons_error: Option<String>,
     lessons_withheld: Vec<(String, String)>,
+    lessons_omitted: Vec<(String, String)>,
     body: Option<String>,
 }
 
@@ -2389,8 +2476,14 @@ fn lessons(
     Lessons {
         lessons,
         lessons_file,
-        lessons_error,
+        // Every legacy error here can carry a file-controlled memory name
+        // (load-error line, match failure, lessons path); redact once at the
+        // construction boundary, before any output sink bounds it.
+        lessons_error: lessons_error.as_deref().map(redacted_fact),
         lessons_withheld,
+        // The legacy sidecar path has no pinned selection to compare against,
+        // so it reports no omitted detail.
+        lessons_omitted: vec![],
         body,
     }
 }
@@ -2411,6 +2504,7 @@ struct RecordCtx<'a> {
     lessons_file: Option<PathBuf>,
     lessons_error: Option<String>,
     lessons_withheld: Vec<(String, String)>,
+    lessons_omitted: Vec<(String, String)>,
     acceptance_warning: Option<String>,
     cwd_override: Option<String>,
     agent: &'a Value,
@@ -2437,6 +2531,7 @@ fn record(ctx: RecordCtx<'_>) -> Result<Value> {
         lessons_file,
         lessons_error,
         lessons_withheld,
+        lessons_omitted,
         acceptance_warning,
         cwd_override,
         agent,
@@ -2484,9 +2579,16 @@ fn record(ctx: RecordCtx<'_>) -> Result<Value> {
     if !lessons_withheld.is_empty() {
         let items: Vec<String> = lessons_withheld
             .iter()
-            .map(|(slug, reason)| format!("{slug} ({reason})"))
+            .map(|(slug, reason)| format!("{slug} ({})", redacted_fact(reason)))
             .collect();
         comment_text.push_str(&format!("\nLessons withheld: {}", items.join("; ")));
+    }
+    if !lessons_omitted.is_empty() {
+        let items: Vec<String> = lessons_omitted
+            .iter()
+            .map(|(slug, reason)| format!("{slug} ({})", redacted_fact(reason)))
+            .collect();
+        comment_text.push_str(&format!("\nLessons omitted: {}", items.join("; ")));
     }
     // A `--job` dispatch's override is already recorded by `issue
     // start`, which re-checks the assignee; the plain path records it
@@ -2552,11 +2654,18 @@ fn record(ctx: RecordCtx<'_>) -> Result<Value> {
         .unwrap_or(Value::Null);
     out["lessons_withheld"] = json!(lessons_withheld
         .iter()
-        .map(|(slug, reason)| json!({"slug": slug, "reason": reason}))
+        .map(|(slug, reason)| json!({"slug": slug, "reason": redacted_fact(reason)}))
+        .collect::<Vec<_>>());
+    out["lessons_omitted"] = json!(lessons_omitted
+        .iter()
+        .map(|(slug, reason)| json!({"slug": slug, "reason": redacted_fact(reason)}))
         .collect::<Vec<_>>());
     out["lessons_error"] = lessons_error
         .as_ref()
-        .map(|e| json!(e))
+        // The common construction already redacts; this covers a pin written
+        // before that boundary and any legacy variant. Redaction failure
+        // yields the marker, never the raw value.
+        .map(|e| json!(redacted_fact(e)))
         .unwrap_or(Value::Null);
     out["comment"] = comment["comment"].clone();
     // CAD-467: `folded` when the queued bootstrap was cancelled into
@@ -2899,6 +3008,7 @@ pub fn run(
         lessons_file,
         lessons_error,
         lessons_withheld,
+        lessons_omitted,
         body,
     } = match context_lessons {
         Some(facts) => Lessons {
@@ -2906,6 +3016,7 @@ pub fn run(
             lessons_file: None,
             lessons_error: facts.lessons_error,
             lessons_withheld: facts.lessons_withheld,
+            lessons_omitted: facts.lessons_omitted,
             body,
         },
         None => lessons(
@@ -3140,6 +3251,7 @@ pub fn run(
         lessons_file,
         lessons_error,
         lessons_withheld,
+        lessons_omitted,
         acceptance_warning,
         cwd_override,
         agent,

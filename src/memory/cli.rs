@@ -235,9 +235,14 @@ pub enum MemoryAction {
         json: bool,
     },
     /// Ranked accepted memories applying to a context: `--issue <ID>`
-    /// (component/tags/recorded-commit paths) and/or explicit axes.
+    /// (component, tags, recorded-commit paths and the planned paths it
+    /// declares) and/or explicit axes. `--json` reports the declared
+    /// paths as `context.planned_paths`, apart from the recorded and
+    /// explicit `context.paths`; without `--issue` it is empty.
     Match {
-        /// Issue id — supplies component, tags and commit paths.
+        /// Issue id — supplies component, tags, recorded-commit paths and
+        /// the issue's validated declared planned paths, the same inputs
+        /// dispatch selects with.
         #[arg(long)]
         issue: Option<String>,
         /// Project key for explicit-axis matching; defaults to the cwd's
@@ -253,7 +258,9 @@ pub enum MemoryAction {
         /// Component axis; repeatable.
         #[arg(long)]
         component: Vec<String>,
-        /// Repo-relative path axis; repeatable.
+        /// Repo-relative path axis; repeatable. Recorded commit paths and
+        /// the issue's declared planned paths are separate inputs —
+        /// reported as `context.paths` and `context.planned_paths`.
         #[arg(long)]
         path: Vec<String>,
         /// Tag axis; repeatable.
@@ -699,7 +706,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             json: as_json,
         } => {
             let pm = open_pm()?;
-            let (mems, ctx, load_errors, project_key) = if let Some(id) = issue {
+            let (mems, ctx, load_errors, project_key, planned_paths) = if let Some(id) = issue {
                 let (proj, dir) = write::issue_dir(&pm, id)?;
                 let (front, body) = write::load_front(&dir)?;
                 let issue_obj = board::Issue {
@@ -710,19 +717,25 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                     comments: vec![],
                     artifacts: vec![],
                 };
-                let mut ctx =
-                    memory::issue_ctx(&pm, &issue_obj, provider.as_deref(), role.as_deref())?;
-                ctx.components.extend(component.clone());
-                ctx.paths.extend(path.clone());
-                ctx.tags.extend(tag.clone());
-                let (pool, errors) = memory::load_project_report(&pm.dir, &issue_obj.project);
-                let fresh = memory::Freshness::for_project(Some(&proj));
-                (
-                    memory::match_memories(&pool, &ctx, &fresh),
-                    ctx,
-                    errors,
-                    issue_obj.project,
-                )
+                // The issue path is delivery's own selection — planned
+                // paths included — with the CLI's extra axes layered on,
+                // so this diagnostic can never disagree with what a
+                // dispatch delivers. The declared paths are reported
+                // separately from the recorded/explicit ones, from the
+                // same validated list selection used.
+                let (mems, ctx, load_errors) = memory::issue_matching::match_for_issue_ctx(
+                    &pm,
+                    &issue_obj,
+                    provider.as_deref(),
+                    role.as_deref(),
+                    |ctx| {
+                        ctx.components.extend(component.clone());
+                        ctx.paths.extend(path.clone());
+                        ctx.tags.extend(tag.clone());
+                    },
+                )?;
+                let planned = memory::issue_matching::issue_planned_paths(&issue_obj);
+                (mems, ctx, load_errors, issue_obj.project, planned)
             } else {
                 let cwd = std::env::current_dir()?;
                 let proj = crate::issue::project::resolve(&pm.dir, project.as_deref(), &cwd)?;
@@ -740,6 +753,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                     ctx,
                     errors,
                     proj.key,
+                    Vec::new(),
                 )
             };
             if let Some(line) = memory::load_errors_line(&load_errors) {
@@ -765,6 +779,11 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                         "project": project_key,
                         "components": ctx.components,
                         "paths": ctx.paths,
+                        // The issue's validated planned declarations — a
+                        // separate selection input, never mixed into the
+                        // recorded/explicit `paths` above. Empty without
+                        // `--issue`.
+                        "planned_paths": planned_paths,
                         "providers": ctx.providers,
                         "tags": ctx.tags,
                         "roles": ctx.roles,
