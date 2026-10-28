@@ -294,6 +294,9 @@ mod pm_activity_rpc;
 mod portable_replace_rpc;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod protected_runtime;
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[path = "daemon/protected_runtime_stub.rs"]
+pub(crate) mod protected_runtime;
 mod public_membership;
 mod recovery_rpc;
 mod requests_rpc;

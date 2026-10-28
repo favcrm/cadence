@@ -357,8 +357,11 @@ export function createNativeConnectionTools({
       prepareArguments,
       executionMode: 'sequential',
       execute: async (_toolCallId, args, signal) => {
+        // The quote tool's registered wire method is not its tool name plus
+        // `_v1`: the ops router accepts connection_model_quote_v1.
+        const method = name === 'connection_quote' ? 'connection_model_quote_v1' : `${name}_v1`;
         const reply = await callData(
-          socketPath, `${name}_v1`, prepareArguments(args), EXECUTION_WAIT_MS, signal,
+          socketPath, method, prepareArguments(args), EXECUTION_WAIT_MS, signal,
         );
         return {
           content: [{ type: 'text', text: JSON.stringify(reply) }],

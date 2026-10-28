@@ -588,6 +588,54 @@ impl NativeModelBroker {
         }))
     }
 
+    /// A bound request may only be re-read as a duplicate when the guest
+    /// supplies exactly the selectors and input that were frozen. The frozen
+    /// configuration is loaded by the row's own id, not by the parsed one, so
+    /// a later configuration revision cannot turn a changed duplicate into a
+    /// status read.
+    fn verify_bound_duplicate(
+        &self,
+        parsed: &dto::InvokeArgsV1,
+        row: &durable::RequestRow,
+        evidence: &NativeModelRuntimeEvidence,
+    ) -> Result<()> {
+        let Some(existing) = row.input_digest.as_deref() else {
+            return Ok(());
+        };
+        let shared = self.shared()?;
+        let configuration = shared
+            .store
+            .native_model_configuration(&row.configuration_id)?
+            .ok_or_else(|| refused("invalid_request", "the frozen configuration is unknown"))?;
+        if parsed.configuration_id != row.configuration_id
+            || parsed.expected_configuration_revision
+                != u64::try_from(row.configuration_revision).unwrap_or(u64::MAX)
+            || parsed.snapshot_id != row.snapshot_id
+            || parsed.loaded_receipt_id != row.loaded_receipt_id
+        {
+            return Err(refused(
+                "idempotency_conflict",
+                "the model request was already bound to different selectors",
+            ));
+        }
+        let route = self.route(PROVIDER)?.clone();
+        let active = authorize_tools(&parsed.messages, evidence, &route)?;
+        let binding = dto::operation_binding(parsed, &active)?;
+        let digest = operation_input_digest(
+            &binding,
+            &configuration,
+            parsed.max_output_tokens,
+            parsed.tool_choice.as_str(),
+        )?;
+        if existing != digest {
+            return Err(refused(
+                "idempotency_conflict",
+                "the model request was already bound to different input",
+            ));
+        }
+        Ok(())
+    }
+
     fn invoke(&self, caller: &RuntimeCaller, args: &Value) -> Result<Value> {
         let parsed = dto::parse_invoke_args(args)?;
         let evidence = self.measured(caller)?;
@@ -608,9 +656,11 @@ impl NativeModelBroker {
                 "the model request does not belong to this principal",
             ));
         }
-        // A duplicate or settled request is a status read, never a second
-        // provider call.
+        // A duplicate or settled request is a status read only when its
+        // immutable selectors and input digest still match; a changed
+        // duplicate is an idempotency conflict, never a second provider call.
         if row.state != durable::STATE_PREPARED || row.input_digest.is_some() {
+            self.verify_bound_duplicate(&parsed, &row, &evidence)?;
             return receipt(&row);
         }
         let configuration = shared
@@ -1167,7 +1217,10 @@ impl NativeModelBroker {
                             tx,
                             &row,
                             durable::STATE_RESULT_REFUSED,
-                            Some(assistant.to_json().to_string().as_str()),
+                            // A screened/unauthorised assistant is never
+                            // persisted: the credential echo must not reach
+                            // core SQLite or WAL.
+                            None,
                             Some(usage.to_json().to_string().as_str()),
                             Some(
                                 ClosedModelTurnErrorV1::result_refused()
