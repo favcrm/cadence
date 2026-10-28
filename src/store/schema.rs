@@ -1560,6 +1560,10 @@ impl Store {
                 // that already passed v20.
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(super::app_runs::OPERATOR_DECISION_SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=59", [])?;
+                tx.commit()?;
+            }
+            if version < 60 {
                 // CAD-1085: the native protected Connection authority and the
                 // metadata-only human credential-entry tables. One forward
                 // step: the dispatch/journal schema and `credential_requests`
@@ -1568,7 +1572,7 @@ impl Store {
                 // store converges.
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 super::connection_dispatch::migrate_v60(&tx)?;
-                tx.execute("UPDATE schema_version SET version=59", [])?;
+                tx.execute("UPDATE schema_version SET version=60", [])?;
                 tx.commit()?;
             }
             if let Some(crossing) = permit.crossing {
