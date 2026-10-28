@@ -438,6 +438,10 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
             findings.push(format!("citation reference was refused: {finding}"));
             continue;
         }
+        // Admission may allow warning-only or operator-allowlisted matches;
+        // those values still must not be displayed in a receipt.
+        let display_source = crate::secret::redact_text(&reference.source)?;
+        let display_revision = crate::secret::redact_text(&reference.revision)?;
         let (resolution, content) = resolve(pm, &mem.project, caller, reference)?;
         match resolution {
             Resolution::Resolved { bytes, sha256 } => {
@@ -449,8 +453,8 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
                         EvidenceKind::NativeRecord => "native",
                         EvidenceKind::External => "external",
                     },
-                    reference.source,
-                    reference.revision,
+                    display_source,
+                    display_revision,
                     bytes,
                     sha256
                 ));
@@ -461,19 +465,19 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
                             blocked = true;
                             findings.push(format!(
                                 "cited content in {} at {} was refused: {finding}",
-                                reference.source, reference.revision
+                                display_source, display_revision
                             ));
                         }
                         if matches!(text, std::borrow::Cow::Owned(_)) {
                             skipped.push(format!(
                                 "content scan incomplete for {}: source is not UTF-8",
-                                reference.source
+                                display_source
                             ));
                         }
                     }
                     None => skipped.push(format!(
                         "content scan skipped for {}: original bytes are unavailable",
-                        reference.source
+                        display_source
                     )),
                 }
                 // Applicability is a separate check at the target the condition
@@ -489,21 +493,21 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
                             ) if at_target == sha256 => {
                                 checked.push(format!(
                                     "{} is unchanged at target {target}",
-                                    reference.source
+                                    display_source
                                 ));
                             }
                             (Resolution::Resolved { .. }, _) => {
                                 revise = true;
                                 findings.push(format!(
                                     "{} differs between cited revision {} and target {target}",
-                                    reference.source, reference.revision
+                                    display_source, display_revision
                                 ));
                             }
                             (Resolution::Missing(_), _) => {
                                 revise = true;
                                 findings.push(format!(
                                     "{} is absent at target {target}",
-                                    reference.source
+                                    display_source
                                 ));
                             }
                             (Resolution::Unsupported(reason), _) => {
@@ -518,7 +522,7 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
                         if target == reference.revision {
                             checked.push(format!(
                                 "{} is unchanged at Wiki target {target}",
-                                reference.source
+                                display_source
                             ));
                         } else {
                             match crate::wiki::read_revision_for_evidence(
@@ -533,19 +537,19 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
                                         Some(digest) if digest == sha256 => {
                                             checked.push(format!(
                                                 "{} is unchanged at Wiki target {target}",
-                                                reference.source
+                                                display_source
                                             ));
                                         }
                                         Some(_) => {
                                             revise = true;
                                             findings.push(format!(
                                             "{} differs between cited revision {} and Wiki target {target}",
-                                            reference.source, reference.revision
+                                            display_source, display_revision
                                         ));
                                         }
                                         None => skipped.push(format!(
                                             "Wiki target check skipped for {}: no content digest",
-                                            reference.source
+                                            display_source
                                         )),
                                     }
                                 }
@@ -553,12 +557,12 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
                                     revise = true;
                                     findings.push(format!(
                                         "{} is absent at Wiki target {target}",
-                                        reference.source
+                                        display_source
                                     ));
                                 }
                                 Err(error) => skipped.push(format!(
                                     "Wiki target check skipped for {}: {error}",
-                                    reference.source
+                                    display_source
                                 )),
                             }
                         }
@@ -568,7 +572,7 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
                     {
                         skipped.push(format!(
                             "target applicability skipped for {}: no Wiki target revision recorded",
-                            reference.source
+                            display_source
                         ));
                     }
                 }
@@ -583,12 +587,12 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
                         EvidenceKind::NativeRecord => "native",
                         EvidenceKind::External => "external",
                     },
-                    reference.source,
-                    reference.revision
+                    display_source,
+                    display_revision
                 ));
             }
             Resolution::Unsupported(reason) => {
-                skipped.push(format!("{}: {reason}", reference.source));
+                skipped.push(format!("{}: {reason}", display_source));
             }
         }
     }
@@ -629,15 +633,25 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
     } else {
         Outcome::Pass
     };
+    // Reasons and identifiers can include other user-controlled text too.
+    // Redact at the output boundary independently of the operator allowlist.
+    for text in checked.iter_mut().chain(&mut skipped).chain(&mut findings) {
+        *text = crate::secret::redact_text(text)?;
+    }
+    let display = |value: Option<&str>| -> Result<Option<String>> {
+        value.map(crate::secret::redact_text).transpose()
+    };
 
     Ok(Receipt {
         candidate_digest: semantic_digest(mem),
-        check_id: condition
-            .map(|c| c.check_id.clone())
-            .unwrap_or_else(|| "evidence-analysis".to_string()),
-        source_revision: condition.and_then(|c| c.source_revision.clone()),
-        target_revision: condition.and_then(|c| c.target_revision.clone()),
-        wiki_target_revision: condition.and_then(|c| c.wiki_target_revision.clone()),
+        check_id: crate::secret::redact_text(
+            condition
+                .map(|c| c.check_id.as_str())
+                .unwrap_or("evidence-analysis"),
+        )?,
+        source_revision: display(condition.and_then(|c| c.source_revision.as_deref()))?,
+        target_revision: display(condition.and_then(|c| c.target_revision.as_deref()))?,
+        wiki_target_revision: display(condition.and_then(|c| c.wiki_target_revision.as_deref()))?,
         outcome,
         checked,
         skipped,

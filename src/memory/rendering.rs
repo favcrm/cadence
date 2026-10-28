@@ -195,7 +195,8 @@ pub fn detail_json_with_evidence(
             Ok(receipt) => receipt.to_json(),
             Err(error) => json!({
                 "result": "unknown",
-                "error": error.to_string(),
+                "error": crate::secret::redact_text(&error.to_string())
+                    .unwrap_or_else(|_| "evidence analysis unavailable".to_string()),
                 "semantic_detection": "not claimed",
             }),
         };

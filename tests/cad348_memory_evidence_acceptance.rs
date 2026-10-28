@@ -2097,3 +2097,263 @@ fn an_unregistered_project_is_unsupported_not_a_missing_citation() {
     );
     assert_not_pass("unregistered project", &receipt);
 }
+
+/// A generic-API-key-shaped value assembled at runtime: a literal one in this
+/// file would trip the repository's own secret scan, which must stay clean.
+fn fixture_generic_key() -> String {
+    format!("{}{}", "Q7mZ2rT9xV4kL8nB6cD1sF", "3gH5jK0pW2")
+}
+
+/// A credential the rule pack only *warns* about is still a credential. A
+/// reference carrying a generic `api_key` value must never reach a serialized
+/// receipt field — whole or in part — while the citation keeps the outcome its
+/// own resolution dictates (a source this analysis cannot fetch is unknown,
+/// never a pass), and a credential-free citation in the same receipt is still
+/// named in full, so a fix may not blanket-mask the receipt.
+#[test]
+fn a_warning_only_credential_in_a_reference_is_never_echoed() {
+    let rig = Rig::new();
+    let value = fixture_generic_key();
+    let reference = EvidenceRef {
+        kind: EvidenceKind::External,
+        source: format!("https://example.invalid/page?api_key={value}"),
+        revision: "2026-10-28".into(),
+    };
+
+    // The fixture's shape is the point: one warn-only finding, so the pack
+    // itself does not refuse this reference and the analysis has to keep the
+    // value out of the receipt on its own.
+    let findings = cadence_agent::secret::scan(&reference.source, None).unwrap();
+    assert_eq!(
+        findings.len(),
+        1,
+        "the fixture must carry exactly one credential-shaped span: {findings:?}"
+    );
+    assert_eq!(findings[0].rule, "generic-api-key");
+    assert_eq!(
+        findings[0].severity,
+        cadence_agent::secret::Severity::Warn,
+        "the fixture must be a warning-only credential, not a refusal: {:?}",
+        findings[0]
+    );
+    assert!(
+        scan_content(&reference.source).unwrap().is_none(),
+        "a warning-only finding must not refuse the citation reference"
+    );
+
+    let plain = git_ref("evidence.txt", &rig.commit);
+    let mem = memory(
+        "warn-only-reference",
+        "A claim whose external citation carries a generic API key",
+        vec![reference, plain],
+        Some(condition(None, None)),
+    );
+    let receipt = analyse(&rig.pm, &mem).unwrap();
+
+    // Evidence semantics are unchanged: an external source is not fetched, so
+    // the record is unknown. A credential in the reference may not turn that
+    // into a pass, and it may not silently drop the citation either.
+    assert_eq!(
+        receipt.outcome,
+        Outcome::Unknown,
+        "checked {:?}, skipped {:?}, findings {:?}",
+        receipt.checked,
+        receipt.skipped,
+        receipt.findings
+    );
+    assert_eq!(receipt.to_json()["result"], "unknown");
+    assert!(
+        receipt
+            .skipped
+            .iter()
+            .any(|entry| entry.contains("external sources are not fetched")),
+        "the receipt did not report the unreadable citation: {:?}",
+        receipt.skipped
+    );
+    assert_not_pass("warning-only reference credential", &receipt);
+
+    // Neither the complete credential nor its tail may appear in the
+    // serialized receipt.
+    let serialised = receipt.to_json().to_string();
+    assert!(
+        !serialised.contains(&value),
+        "the receipt echoed the warning-only citation credential: {serialised}"
+    );
+    let tail = &value[value.len() - 12..];
+    assert!(
+        !serialised.contains(tail),
+        "the receipt echoed part of the warning-only credential: {serialised}"
+    );
+
+    // No blanket masking: the credential-free citation is still named, with
+    // its byte count and digest, exactly as before.
+    let checked = format!(
+        "git:evidence.txt@{} ({} bytes, sha256 {})",
+        rig.commit,
+        b"original\n".len(),
+        sha256_hex(b"original\n")
+    );
+    assert!(
+        receipt.checked.iter().any(|entry| entry == &checked),
+        "the credential-free citation was not named in full: {:?}",
+        receipt.checked
+    );
+    assert!(
+        serialised.contains(&checked),
+        "the serialized receipt dropped the credential-free citation: {serialised}"
+    );
+}
+
+/// The operator allowlist makes a blocking rule *permitted*; it does not make
+/// the value safe to publish. An allowlisted credential in a citation
+/// reference must never reach a serialized receipt field, while the citation
+/// keeps the outcome its resolution dictates and a credential-free citation in
+/// the same receipt is still named in full.
+///
+/// The allowlist is read from `CADENCE_STATE_DIR`, a process-wide input, so the
+/// real analysis runs in a process of its own with an isolated state dir: no
+/// other check in this binary can observe the allowlist.
+#[test]
+fn an_allowlisted_credential_in_a_reference_is_never_echoed() {
+    let state = tempfile::Builder::new()
+        .prefix("cad348allowlist-")
+        .tempdir()
+        .unwrap();
+    std::fs::write(
+        state.path().join("secret-allowlist.toml"),
+        "[[allow]]\nrule = \"cadence-figma-token\"\nreason = \"CAD-348 fixture\"\n",
+    )
+    .expect("isolated operator allowlist");
+
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "cad348_memory_evidence_acceptance::allowlisted_credential_receipt_proof",
+        ])
+        .args(["--ignored", "--test-threads", "1", "--nocapture"])
+        .env("CADENCE_STATE_DIR", state.path())
+        .env("CAD348_ALLOWLIST_PROOF", "1")
+        .env_remove("CADENCE_PM_DIR");
+    let out = cadence_agent::reaper::output(&mut child)
+        .expect("`git` and the test binary are required by this fixture");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "the allowlisted-credential proof failed: {text}"
+    );
+    assert!(
+        text.contains("CAD-348 allowlist proof ok"),
+        "the allowlisted-credential proof did not run: {text}"
+    );
+}
+
+/// Child entry point of
+/// `an_allowlisted_credential_in_a_reference_is_never_echoed`: runs only in
+/// the process that check starts, where `CADENCE_STATE_DIR` carries the
+/// operator allowlist and nothing else in this binary sees it.
+#[test]
+#[ignore = "child entry point of an_allowlisted_credential_in_a_reference_is_never_echoed"]
+fn allowlisted_credential_receipt_proof() {
+    if std::env::var_os("CAD348_ALLOWLIST_PROOF").is_none() {
+        return;
+    }
+    let rig = Rig::new();
+    let token = fixture_token();
+    let source = format!("{token}.txt");
+
+    // The fixture's shape is the point: the pack blocks this value, and only
+    // the operator allowlist lets the reference through, so the analysis has
+    // to keep the value out of the receipt on its own.
+    let findings = cadence_agent::secret::scan(&source, None).unwrap();
+    let token_finding = findings
+        .iter()
+        .find(|finding| finding.rule == "cadence-figma-token")
+        .expect("the fixture must carry a figma-token credential");
+    assert_eq!(
+        token_finding.severity,
+        cadence_agent::secret::Severity::Block,
+        "the fixture credential must be a blocking finding: {token_finding:?}"
+    );
+    assert!(
+        scan_content(&source).unwrap().is_none(),
+        "the operator allowlist did not permit the fixture credential, so the \
+         allowlisted path was not exercised: {findings:?}"
+    );
+
+    let plain = git_ref("evidence.txt", &rig.commit);
+    let mem = memory(
+        "allowlisted-reference",
+        "A claim whose citation carries an operator-allowlisted credential",
+        vec![git_ref(&source, &rig.commit), plain],
+        Some(condition(Some(&rig.commit), Some(&rig.commit))),
+    );
+    let receipt = analyse(&rig.pm, &mem).unwrap();
+
+    // Evidence semantics are unchanged: the credential-bearing citation names
+    // a path this commit does not carry, so the record is blocked — never a
+    // pass, and the citation is not dropped.
+    assert_eq!(
+        receipt.outcome,
+        Outcome::Blocked,
+        "checked {:?}, skipped {:?}, findings {:?}",
+        receipt.checked,
+        receipt.skipped,
+        receipt.findings
+    );
+    assert_eq!(receipt.to_json()["result"], "blocked");
+    assert!(
+        receipt
+            .findings
+            .iter()
+            .any(|finding| finding.contains("is missing")),
+        "the receipt did not name the missing citation: {:?}",
+        receipt.findings
+    );
+    assert_not_pass("allowlisted reference credential", &receipt);
+
+    // Neither the complete credential nor its tail may appear in the
+    // serialized receipt.
+    let serialised = receipt.to_json().to_string();
+    assert!(
+        !serialised.contains(&token),
+        "the receipt echoed the allowlisted citation credential: {serialised}"
+    );
+    assert!(
+        receipt
+            .findings
+            .iter()
+            .all(|finding| !finding.contains(&token)),
+        "a finding echoed the allowlisted citation credential: {:?}",
+        receipt.findings
+    );
+    let tail = &token[token.len() - 12..];
+    assert!(
+        !serialised.contains(tail),
+        "the receipt echoed part of the allowlisted credential: {serialised}"
+    );
+
+    // No blanket masking: the credential-free citation is still named, with
+    // its byte count and digest, exactly as before.
+    let checked = format!(
+        "git:evidence.txt@{} ({} bytes, sha256 {})",
+        rig.commit,
+        b"original\n".len(),
+        sha256_hex(b"original\n")
+    );
+    assert!(
+        receipt.checked.iter().any(|entry| entry == &checked),
+        "the credential-free citation was not named in full: {:?}",
+        receipt.checked
+    );
+    assert!(
+        serialised.contains(&checked),
+        "the serialized receipt dropped the credential-free citation: {serialised}"
+    );
+
+    println!("CAD-348 allowlist proof ok");
+}

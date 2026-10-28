@@ -1809,8 +1809,10 @@ Memory evidence receipts include two deliberately bounded fixtures. A body line
 overfit fixture flags a fact line shaped `<environment> cron = <comma-separated
 minutes> was broken` as an incident-specific answer; citations and the Why/How
 sections are not searched for this pattern. It does not detect other overfit or
-establish semantic truth. A `pass` means only the receipt's listed mechanical
-checks passed; it is not a review, verification authorization, or finalization.
+establish semantic truth. Citation-derived receipt text and errors redact
+credential-shaped values, including warn-only and operator-allowlisted matches.
+A `pass` means only the receipt's listed mechanical checks passed; it is not a
+review, verification authorization, or finalization.
 
 ### API — writes
 
