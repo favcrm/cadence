@@ -25,7 +25,6 @@
 mod capabilities;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod policy;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[path = "../../protected_pi_profile.rs"]
 #[allow(dead_code)] // Same grammar compiled into both artifacts, not a caller policy port.
 mod protected_pi_profile;
