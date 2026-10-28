@@ -58,6 +58,7 @@ globalThis.fetch = async (input, init) => {
     throw new Error(`Unexpected write ${path}`);
   }
   if (path === "/api/app-installations/install-a") return json(installation);
+  if (path === "/api/app-installations/install-a/automatic-updates") return json({ install_id: "install-a", automatic: false });
   if (path === "/api/app-installations/install-a/contexts") return json({ contexts: [] });
   if (path === "/api/app-installations/install-a/bindings") return json({ bindings: [] });
   if (path === "/api/connections") return json({ connections: [] });

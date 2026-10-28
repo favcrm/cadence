@@ -111,6 +111,37 @@ mod tests {
         fn member(&self, handle: &str) {
             self.session(handle, "member");
         }
+        /// The bearer a live public session would send. `role` is the
+        /// stored board role: `operator` or `member`.
+        fn session_token(&self, handle: &str, role: &str) -> String {
+            let now = self.shared.operator_now();
+            let user = BoardUser {
+                sub: format!("sub-{handle}"),
+                email: format!("{handle}@example.test"),
+                name: handle.to_string(),
+                role: role.to_string(),
+                handle: handle.to_string(),
+            };
+            let config = crate::board_identity::read_config(self.dir.path()).unwrap();
+            let realm = crate::operator_auth::PublicRealm {
+                issuer: config.issuer,
+                company: config.company,
+                host: config.host,
+            };
+            self.shared
+                .operator_auth()
+                .open_public_bound(
+                    user,
+                    &format!("jti-token-{handle}"),
+                    now + 60,
+                    "ua",
+                    realm,
+                    now,
+                )
+                .unwrap()
+                .expect("fresh jti")
+                .token
+        }
         /// Every file under the tracker (outside .git), with its bytes.
         fn tree(&self) -> BTreeMap<String, Vec<u8>> {
             fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
@@ -236,6 +267,11 @@ mod tests {
                 json!({"catalog_id": "crm", "expected_digest": digest}),
             ),
             ("app_workspace_update_check", json!({"install_id": "x"})),
+            ("app_automatic_updates_get", json!({"install_id": "x"})),
+            (
+                "app_automatic_updates_set",
+                json!({"install_id": "x", "automatic": true}),
+            ),
             ("app_workspace_remove_preview", json!({"install_id": "x"})),
             (
                 "app_workspace_remove",
@@ -1354,5 +1390,52 @@ mod tests {
             "a tombstone invents no access rows: {shown}"
         );
         assert!(shown.get("data").is_none(), "{shown}");
+    }
+
+    /// Setting the preference needs a person at the board. An operator
+    /// shell with no session proof must not turn it on.
+    #[test]
+    fn automatic_updates_set_needs_a_person_at_the_board() {
+        let fx = Fx::new();
+        let err = err_text(
+            fx.call(
+                Asserted::Operator,
+                "app_automatic_updates_set",
+                json!({"install_id": "x", "automatic": true}),
+            ),
+            "operator shell without a board person",
+        );
+        assert!(
+            err.contains("person at the board"),
+            "shell was not refused as a missing person: {err}"
+        );
+        assert_eq!(
+            fx.shared.store.app_automatic_updates_get("x").unwrap()["automatic"],
+            false
+        );
+
+        let installed = fx.install_fixture("crm");
+        let id = installed["install_id"].as_str().unwrap();
+        let member = fx.session_token("ada", "member");
+        let err = err_text(
+            fx.call(
+                Asserted::Operator,
+                "app_automatic_updates_set",
+                json!({"install_id": id, "automatic": true, "public_session": member}),
+            ),
+            "member session sets the preference",
+        );
+        assert!(
+            err.contains("does not match"),
+            "member session was not refused: {err}"
+        );
+        let operator = fx.session_token("ora", "operator");
+        let set = fx.op(
+            "app_automatic_updates_set",
+            json!({"install_id": id, "automatic": true, "public_session": operator}),
+        );
+        assert_eq!(set["automatic"], true);
+        let got = fx.op("app_automatic_updates_get", json!({"install_id": id}));
+        assert_eq!(got["automatic"], true);
     }
 }

@@ -45,6 +45,8 @@ pub(super) enum RouteId {
     AgentDetail,
     AgentRoles,
     ExplorerUpdateCheck,
+    AutomaticUpdatesGet,
+    AutomaticUpdatesSet,
     ExplorerRemovePreview,
     ExplorerRemove,
     ExplorerRestore,
@@ -326,6 +328,18 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
     row!(
         ExplorerUpdateCheck,
         "/api/app-installations/{id}/update-check",
+        OperatorOnly,
+        EXPLORER_ID
+    ),
+    get!(
+        AutomaticUpdatesGet,
+        "/api/app-installations/{id}/automatic-updates",
+        OperatorOnly,
+        EXPLORER_ID
+    ),
+    row!(
+        AutomaticUpdatesSet,
+        "/api/app-installations/{id}/automatic-updates",
         OperatorOnly,
         EXPLORER_ID
     ),

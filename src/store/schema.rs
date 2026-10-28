@@ -1471,6 +1471,18 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=57", [])?;
                 tx.commit()?;
             }
+            if version < 58 {
+                // The operator's automatic-update preference. New table only;
+                // absence means off. No existing row is read or rewritten.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS app_update_preferences(
+ install_id TEXT PRIMARY KEY,
+ automatic INTEGER NOT NULL CHECK(automatic IN (0,1)));",
+                )?;
+                tx.execute("UPDATE schema_version SET version=58", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

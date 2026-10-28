@@ -770,6 +770,54 @@ impl Shared {
         Ok(outcome.map(|changed| changed.is_some()))
     }
 
+    /// The consent and the switch an automatic apply observed. The client
+    /// re-reads both before the Git fetch, which runs without the PM lock, so
+    /// this reads them again under the caller's lock immediately before the
+    /// upgrade commits. Revoke takes that same lock, so a revocation that
+    /// landed during the fetch is visible here and the bundle is not replaced.
+    pub(super) fn automatic_update_still_observed(
+        &self,
+        install_id: &str,
+        observed_digest: &str,
+    ) -> Result<()> {
+        let preference = self.store.app_automatic_updates_get(install_id)?;
+        if preference["automatic"] != true {
+            return Err(Error::rejected(
+                "automatic updates are off; the checked update was not applied",
+            ));
+        }
+        let current = self.store.app_install_consent_current(install_id)?;
+        if current["state"] != "approved" || current["digest"].as_str() != Some(observed_digest) {
+            return Err(Error::rejected(
+                "install consent changed before the automatic update",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record approval of the new digest only while the observed consent still
+    /// holds. A retry of a request that already approved this digest is a
+    /// no-op. A revoke or a switch turned off after the fetch refuses, and
+    /// does not write a fresh approval over that decision.
+    pub(super) fn record_automatic_upgrade_consent(
+        &self,
+        pm: &crate::issue::Pm,
+        install: &str,
+        new_digest: &str,
+        observed_digest: &str,
+    ) -> Result<Value> {
+        let (value, _) =
+            self.record_install_consent_guarded(pm, install, new_digest, "upgrade", &|| {
+                let current = self.store.app_install_consent_current(install)?;
+                if current["state"] == "approved" && current["digest"].as_str() == Some(new_digest)
+                {
+                    return Ok(());
+                }
+                self.automatic_update_still_observed(install, observed_digest)
+            })?;
+        Ok(value)
+    }
+
     pub(super) fn rpc_app_local(
         self: &Arc<Self>,
         method: &str,

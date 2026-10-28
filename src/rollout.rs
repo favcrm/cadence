@@ -118,7 +118,10 @@ pub use migration::{
 /// v57 (CAD-1853) adds the cloud-agent connection, its per-thread remote
 /// session bindings, the explicit local assistant consent and the durable
 /// operation correlation rows.
-pub const SCHEMA_VERSION: i64 = 57;
+/// v58 records the operator's per-install automatic-update choice. The row
+/// is a preference, not a grant: a routine checked release may apply, and a
+/// release that changes declared access still waits for Apply.
+pub const SCHEMA_VERSION: i64 = 58;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

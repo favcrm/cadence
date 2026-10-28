@@ -598,7 +598,12 @@ export type UpgradeBody = {
  * catalog generation it was read under; a checked apply adds the new
  * bundle digest and a retained request id. */
 export type UpgradeCheckBody = UpgradeBody;
-export type UpgradeApplyBody = UpgradeBody & { expected_new_digest: string; request_id: string };
+export type UpgradeApplyBody = UpgradeBody & {
+  expected_new_digest: string;
+  request_id: string;
+  automatic?: true;
+  observed_approval?: "approved";
+};
 
 export const appExplorer = {
   catalog: (signal?: AbortSignal) => request<{ catalog: CatalogCard[] }>("/api/app-catalog", signal),
@@ -632,6 +637,10 @@ export const appExplorer = {
   requestInstall: (catalogId: string) => request<InstallRequest>("/api/app-catalog/request", undefined, { catalog_id: catalogId }),
   dismissRequest: (id: string) => request<unknown>("/api/app-requests/dismiss", undefined, { id }),
   updateCheck: (installId: string) => request<{ has_update: boolean; digest: string; access_change?: { state: string; added?: string[]; removed?: string[] } }>(`/api/app-installations/${part(installId)}/update-check`, undefined, {}),
+  automaticUpdates: (installId: string, signal?: AbortSignal) =>
+    request<{ install_id: string; automatic: boolean }>(`/api/app-installations/${part(installId)}/automatic-updates`, signal),
+  setAutomaticUpdates: (installId: string, automatic: boolean) =>
+    request<{ install_id: string; automatic: boolean }>(`/api/app-installations/${part(installId)}/automatic-updates`, undefined, { automatic }),
   removePreview: (installId: string) => request<RemovePreview>(`/api/app-installations/${part(installId)}/remove-preview`, undefined, {}),
   remove: (installId: string, body: { expected_generation: string; expected_digest: string; request_id: string }) => request<unknown>(`/api/app-installations/${part(installId)}/remove`, undefined, body),
   restore: (installId: string) => request<{ restored: boolean; digest: string }>(`/api/app-installations/${part(installId)}/restore`, undefined, {}),

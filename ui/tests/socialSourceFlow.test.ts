@@ -69,6 +69,7 @@ globalThis.fetch = async (input, init) => {
   reads.push(path);
   if (denySource && path === "/api/app-runs/source-run/capability-results") return json({ error: "Operator session expired" }, 403);
   if (path === "/api/app-installations/install-a") return json(installation);
+  if (path === "/api/app-installations/install-a/automatic-updates") return json({ install_id: "install-a", automatic: false });
   if (path === "/api/app-installations/install-a/contexts") return json({ contexts: [] });
   if (path === "/api/app-installations/install-a/bindings") return json({ bindings: [binding("publication", "local-id", "local"), binding("source", "provider-id", "agenticos_external")] });
   if (path === "/api/connections") return json({ connections: [{ id: "local-id", provider: "local", account: "local", status: { manifest_status: "matched", custody_available: true } }, { id: "provider-id", provider: "agenticos_external", account: "company-a", status: { manifest_status: "matched", custody_available: true }, descriptor: { action_mappings: [{ capability: "social.read", action: "list_posts", effect: "read" }] } }] });

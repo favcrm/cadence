@@ -33,6 +33,25 @@ fn proposal_inputs(inputs: Option<&Value>) -> Result<BTreeMap<String, String>> {
     }
 }
 
+/// `true` only for an automatic apply that claims it still saw an approval.
+/// Absent on a manual upgrade, which is itself the consent. Any other shape
+/// is refused before the package is fetched.
+fn automatic_upgrade_requested(method: &str, params: &Value) -> Result<bool> {
+    if method != "app_workspace_upgrade" {
+        return Ok(false);
+    }
+    match (
+        params.get("automatic"),
+        params.get("observed_approval").and_then(Value::as_str),
+    ) {
+        (None, None) => Ok(false),
+        (Some(Value::Bool(true)), Some("approved")) => Ok(true),
+        _ => Err(Error::rejected(
+            "an automatic update must set automatic true and observed_approval \"approved\"",
+        )),
+    }
+}
+
 impl Shared {
     /// CAD-360: the plan gate for every daemon dispatch of a task —
     /// `task_dispatch` and both monitor paths. A task whose job is bound
@@ -579,6 +598,8 @@ impl Shared {
                 "catalogue",
                 "catalogue_resolution",
                 "hosted_operation_id",
+                "automatic",
+                "observed_approval",
             ],
             "app_workspace_upgrade_check" => &[
                 "install_id",
@@ -599,6 +620,9 @@ impl Shared {
         if object.keys().any(|key| !allowed.contains(&key.as_str())) {
             return Err(Error::rejected("unknown workspace catalog parameter"));
         }
+        // An automatic apply is not itself consent. The claim is checked
+        // before the package fetch so a malformed one never opens the network.
+        let automatic_apply = automatic_upgrade_requested(method, params)?;
         let hosted_operation_id = params
             .get("hosted_operation_id")
             .map(|_| required_str(params, "hosted_operation_id"))
@@ -727,6 +751,12 @@ impl Shared {
                                 incompatible_bindings.push(binding["id"].clone());
                             }
                         }
+                        // Still under the PM lock, after the fetch and before
+                        // any journal byte. A revoke during the fetch holds
+                        // this same lock and has already committed.
+                        if automatic_apply {
+                            self.automatic_update_still_observed(id, expected_digest)?;
+                        }
                         Ok((
                             json!({"incompatible_contexts":incompatible_contexts,
                             "rebind_required":incompatible_bindings,
@@ -821,7 +851,16 @@ impl Shared {
                 result["install_id"].as_str().map(str::to_owned),
                 result["digest"].as_str().map(str::to_owned),
             ) {
-                result["consent"] = self.record_install_consent(&pm, &id, &digest, via);
+                result["consent"] = if automatic_apply {
+                    self.record_automatic_upgrade_consent(
+                        &pm,
+                        &id,
+                        &digest,
+                        required_str(params, "expected_digest")?,
+                    )?
+                } else {
+                    self.record_install_consent(&pm, &id, &digest, via)
+                };
             }
         }
         let project_approval = |row: &mut Value| -> Result<()> {

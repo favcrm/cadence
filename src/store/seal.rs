@@ -84,9 +84,10 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// v53 (CAD-804) adds `agents.gc_keep`; v54 (CAD-1239) adds the archive
 /// marker and triggers; v55 (CAD-1353) adds `messages.stall_secs`; v56
 /// (CAD-1726) adds the `artifacts` table; v57 (CAD-1853) adds the
-/// cloud-agent connection, source, session and operation tables. None
-/// changes a latch or witness table, so the bound extends to 57.
-pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 57;
+/// cloud-agent connection, source, session and operation tables. v58 adds
+/// `app_update_preferences`, the operator's per-install automatic-update
+/// choice. None changes a latch or witness table, so the bound extends to 58.
+pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 58;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -1702,6 +1703,27 @@ impl Store {
                     |row| row.get(0),
                 )?;
                 if cloud_columns != 2 {
+                    return Err(Error::rejected("owner witness database schema is unsupported"));
+                }
+            }
+            if *db_schema >= 58 {
+                // v58 is the automatic-update preference only. A database
+                // stamped 58 without that table and its two columns is not
+                // the schema this witness accepts.
+                let preference_tables: i64 = wtx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_update_preferences'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if preference_tables != 1 {
+                    return Err(Error::rejected("owner witness database schema is unsupported"));
+                }
+                let preference_columns: i64 = wtx.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('app_update_preferences') WHERE name IN ('install_id','automatic')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if preference_columns != 2 {
                     return Err(Error::rejected("owner witness database schema is unsupported"));
                 }
             }

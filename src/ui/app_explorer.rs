@@ -77,6 +77,16 @@ fn board_caller(
     operator::board_caller(request, state_dir, opts, false, None)
 }
 
+/// `GET /api/app-installations/{id}/automatic-updates`. Absence is off.
+pub(super) fn automatic_updates_get(state_dir: &Path, install: &str) -> HttpResp {
+    relay(
+        state_dir,
+        "app_automatic_updates_get",
+        json!({"install_id": install}),
+        None,
+    )
+}
+
 /// GET reads: `/api/app-catalog`, `/api/app-catalog/<id>`,
 /// `/api/app-home`, `/api/app-favorites`, `/api/app-requests`.
 pub(super) fn read(
@@ -139,6 +149,7 @@ pub(super) enum WriteAction {
     FavoriteOpened,
     RequestDismiss,
     UpdateCheck,
+    AutomaticUpdatesSet,
     RemovePreview,
     Remove,
     Restore,
@@ -154,6 +165,7 @@ pub(super) fn write(
     caller: Option<&operator::Caller>,
     proof_relay: operator::PublicRelay,
     state_dir: &Path,
+    opts: &ServeOpts,
 ) -> HttpResp {
     // No admitted caller, or an agent, never reaches a relay: the member
     // verbs below would otherwise run as the operator.
@@ -189,6 +201,34 @@ pub(super) fn write(
             json!({"install_id": install}),
             None,
         ),
+        WriteAction::AutomaticUpdatesSet => match public_proof(proof_relay) {
+            Ok(proof) => {
+                // A public host already named the person. A local or
+                // tailnet board puts the operator cookie it checked into
+                // the same base object. The cookie is not a body field.
+                let mut base = json!({ "install_id": install });
+                let local = if proof.is_none() {
+                    operator::local_operator_proof(request, opts)
+                } else {
+                    None
+                };
+                if let Some(local) = local {
+                    base["session_token"] = json!(local.token);
+                    base["session_key"] = json!(local.key);
+                    base["session_origin"] = json!(local.origin);
+                }
+                relay_body(
+                    request,
+                    state_dir,
+                    "app_automatic_updates_set",
+                    base,
+                    &["automatic"],
+                    None,
+                    proof.as_deref(),
+                )
+            }
+            Err(resp) => resp,
+        },
         WriteAction::RemovePreview => relay(
             state_dir,
             "app_workspace_remove_preview",
@@ -286,7 +326,7 @@ fn public_proof(relay: operator::PublicRelay) -> Result<Option<String>, HttpResp
     }
 }
 
-/// Read a bounded JSON body, forward its allow-listed fields onto `base`
+/// Read a bounded JSON body, forward its allow-listed fields onto `params`
 /// (a path-derived id, or empty), plus the caller's `member_as` when the
 /// route admits a member and the attributed verb's `public_session` proof.
 /// Unknown body fields are dropped.
@@ -294,7 +334,7 @@ fn relay_body(
     request: &mut Request,
     state_dir: &Path,
     method: &str,
-    base: Value,
+    mut params: Value,
     fields: &[&str],
     member: Option<&str>,
     proof: Option<&str>,
@@ -307,7 +347,6 @@ fn relay_body(
         Ok(v) => v,
         Err(_) => return err_response(400, "body must be a JSON object"),
     };
-    let mut params = base;
     if let Some(obj) = value.as_object() {
         for f in fields {
             if let Some(v) = obj.get(*f) {

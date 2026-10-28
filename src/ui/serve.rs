@@ -1206,6 +1206,9 @@ fn read_dispatch(
         endpoints::RouteId::WorkspaceShow => {
             apps::workspace(request, state_dir, "app_workspace_show", bound.get("id"))
         }
+        endpoints::RouteId::AutomaticUpdatesGet => {
+            app_explorer::automatic_updates_get(state_dir, bound.get("id").unwrap_or_default())
+        }
         endpoints::RouteId::AgentDetail => {
             let alias = bound.get("alias").unwrap_or_default();
             // The viewer verdict the OperatorOnly reads use: only the

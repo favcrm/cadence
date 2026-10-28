@@ -54,6 +54,7 @@ let loseCreateReply = false;
 function read(path: string): Response {
   if (denyReads) return json({ error: "Operator session expired" }, 403);
   if (path === "/api/app-installations/install-a") return json(simulatedInstallation ?? installation);
+  if (path === "/api/app-installations/install-a/automatic-updates") return json({ install_id: "install-a", automatic: false });
   if (path === "/api/app-installations/install-a/contexts") return json({ contexts: [{ id: "context-b", install_id: "install-a", revision: 1, state: "active", digest: "brand-digest", config: { schema: 1, label: "Brand B", input_defaults: {} } }] });
   if (path === "/api/app-installations/install-a/bindings") return json({ bindings: [{ id: "binding-a", install_id: "install-a", context_id: null, slot: "publication", revision: 1, state: "configured", digest: "binding-digest", config: { bundle_digest: "bundle-digest", connection_id: "local-id", account: "default" } }] });
   if (path === "/api/connections") return json({ connections: [

@@ -871,6 +871,31 @@ pub(super) fn public_relay(request: &Request, opts: &ServeOpts) -> PublicRelay {
     }
 }
 
+/// The local or tailnet operator session on this request, read from the
+/// cookie the board already checked. Never taken from a JSON body. Public
+/// hosts use [`public_relay`] instead.
+pub(super) struct LocalOperatorProof {
+    pub token: String,
+    pub key: String,
+    pub origin: String,
+}
+
+pub(super) fn local_operator_proof(
+    request: &Request,
+    opts: &ServeOpts,
+) -> Option<LocalOperatorProof> {
+    let origin = request_origin_kind(request, opts)?;
+    if origin == Origin::Public {
+        return None;
+    }
+    let token = session_cookie(request, opts, origin)?;
+    Some(LocalOperatorProof {
+        token,
+        key: session_key(request),
+        origin: origin.as_str().to_string(),
+    })
+}
+
 /// A board write's caller, once [`board_caller`] has decided.
 pub(super) enum Caller {
     /// Holds a live operator session: `actor` is `operator (ui)` or a
@@ -2704,6 +2729,7 @@ mod tests {
             "/api/app-favorites/default",
             "/api/app-requests/dismiss",
             "/api/app-installations/inst-1/update-check",
+            "/api/app-installations/inst-1/automatic-updates",
             "/api/app-installations/inst-1/remove-preview",
             "/api/app-installations/inst-1/remove",
             "/api/app-installations/inst-1/restore",

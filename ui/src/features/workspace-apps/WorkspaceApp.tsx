@@ -29,6 +29,7 @@ import { connectOutcome, connectToast, publishAllowed, withoutConnectParams } fr
 import Toast, { type ToastMsg } from "../../ui/Toast";
 import { declaredSlots } from "./bindingChoices";
 import {
+  appExplorer,
   workspaceApps,
   readWorkspaceAppSnapshot,
   readWorkspaceAppSnapshotFresh,
@@ -57,6 +58,7 @@ import { screenFailurePane, type ScreenPaneState } from "./screen/screenFailure"
 import { socialPublish } from "./socialPublish";
 import { supportsSocialContentWorkspace } from "./socialContentSupport";
 import { isUnchangedUpgradeError } from "../explorer/appErrors";
+import { automaticUpgradeClaim, installConsentAllowsAutomatic, mayApplyAutomatically, recordedPackageSource, releaseChangesReach } from "../explorer/automaticUpdates";
 
 type Section =
   | "Board"
@@ -348,6 +350,13 @@ export default function WorkspaceApp({
   const [editingContextId, setEditingContextId] = useState("");
   const [upgradeSource, setUpgradeSource] = useState("");
   const [upgradeProposal, setUpgradeProposal] = useState<{ source: string; receipt: UpgradeProposal } | null>(null);
+  const [automatic, setAutomatic] = useState(false);
+  const [automaticReady, setAutomaticReady] = useState(false);
+  const [savingAutomatic, setSavingAutomatic] = useState(false);
+  const [armed, setArmed] = useState(false);
+  const automaticRef = useRef(false);
+  const preferenceWrite = useRef(0);
+  const autoCheckKey = useRef("");
   const [outbox, setOutbox] = useState<WorkspaceOutbox | null>(null);
   const [outboxError, setOutboxError] = useState<string | null>(null);
   const [selectedEffectId, setSelectedEffectId] = useState("");
@@ -464,6 +473,32 @@ export default function WorkspaceApp({
       activeRead.current?.abort();
     };
   }, [refresh]);
+  useEffect(() => {
+    // A read-only session may open the app. It must not arm a release.
+    if (viewer.operator !== true || viewer.readOnly) {
+      setArmed(false);
+      automaticRef.current = false;
+      return;
+    }
+    const controller = new AbortController();
+    setAutomatic(false);
+    automaticRef.current = false;
+    setArmed(false);
+    setAutomaticReady(false);
+    preferenceWrite.current += 1;
+    setSavingAutomatic(false);
+    autoCheckKey.current = "";
+    void appExplorer.automaticUpdates(installId, controller.signal)
+      .then((row) => {
+        if (controller.signal.aborted) return;
+        setAutomatic(row.automatic);
+        automaticRef.current = row.automatic;
+        setArmed(row.automatic);
+        setAutomaticReady(true);
+      })
+      .catch(() => { if (!controller.signal.aborted) setAutomaticReady(false); });
+    return () => controller.abort();
+  }, [installId, viewer.operator, viewer.readOnly]);
   useEffect(() => {
     const visitKey = destinationVisitKey;
     if (!visitKey || !destination || !viewer.operator || busy || mutationLock.current || loading || accessDenied) return;
@@ -604,6 +639,78 @@ export default function WorkspaceApp({
       if (refreshAfterMutation && identity.current === expectedInstall) await refresh();
     }
   };
+  const applyReceipt = async (source: string, receipt: UpgradeProposal) => {
+    const requestKey = JSON.stringify([installId, "upgrade", receipt.expected_digest, receipt.expected_generation, receipt.digest]);
+    await workspaceApps.upgrade(installId, {
+      source,
+      expected_digest: receipt.expected_digest,
+      expected_generation: receipt.expected_generation,
+      expected_new_digest: receipt.digest,
+      request_id: retainedRequest(requestKey),
+      catalogue_resolution: "manual",
+      // The caller's re-read is stale by the time the server finishes
+      // fetching. This claim is rechecked under the commit lock.
+      ...automaticUpgradeClaim(),
+    });
+    completeRequest(requestKey);
+    setUpgradeProposal(null);
+    setActionStatus(t("Update applied."));
+  };
+  const recordedUpgradeSource = data?.installation.install_id === installId
+    ? recordedPackageSource(data.installation.source)
+    : "";
+  useEffect(() => {
+    if (!recordedUpgradeSource) return;
+    setUpgradeSource(current => current.trim() ? current : recordedUpgradeSource);
+  }, [recordedUpgradeSource]);
+  useEffect(() => {
+    if (!canWrite || !armed) {
+      if (!armed) autoCheckKey.current = "";
+      return;
+    }
+    const source = recordedUpgradeSource.trim();
+    if (!source || !data || data.installation.install_id !== installId) return;
+    if (!installConsentAllowsAutomatic(data.installation)) return;
+    const key = [installId, source, data.installation.digest, data.installation.catalog_generation].join("\0");
+    if (autoCheckKey.current === key || mutationLock.current) return;
+    autoCheckKey.current = key;
+    const digest = data.installation.digest;
+    const generation = data.installation.catalog_generation;
+    mutationLock.current = true;
+    setBusy(true);
+    void (async () => {
+      try {
+        const receipt = await workspaceApps.upgradeCheck(installId, {
+          source,
+          expected_digest: digest,
+          expected_generation: generation,
+          catalogue_resolution: "manual",
+        });
+        if (identity.current !== installId || autoCheckKey.current !== key) return;
+        setUpgradeProposal({ source, receipt });
+        if (!mayApplyAutomatically({ checkedSource: source, recordedSource: recordedUpgradeSource, receipt })) return;
+        const [fresh, preference] = await Promise.all([
+          workspaceApps.detail(installId),
+          appExplorer.automaticUpdates(installId),
+        ]);
+        if (
+          identity.current !== installId ||
+          autoCheckKey.current !== key ||
+          !preference.automatic ||
+          !installConsentAllowsAutomatic(fresh)
+        ) return;
+        await applyReceipt(source, receipt);
+        if (identity.current === installId) await refresh();
+      } catch (error) {
+        if (identity.current !== installId || autoCheckKey.current !== key || isUnchangedUpgradeError(error)) return;
+        if (refused(error)) clearPrivate();
+        setActionError(message(error));
+      } finally {
+        mutationLock.current = false;
+        if (identity.current === installId) setBusy(false);
+      }
+    })();
+  }, [armed, installId, data, recordedUpgradeSource, canWrite, refresh, clearPrivate]);
   // CAD-1025: the mounted screen's publish intents, read with the existing
   // operator-only list and tagged with its scope; the projection pushes it
   // only while that tag still matches the route install and context. The
@@ -1343,6 +1450,53 @@ export default function WorkspaceApp({
               <div className="wa-stack">
                 <section className="wa-panel wa-stack">
                   <h2>{t("App package")}</h2>
+                  {canWrite && (
+                    <div className="swrow">
+                      <div>
+                        <p>{t("Automatic updates")}</p>
+                        {automatic && <p className="wa-muted">{t("Updates that change what this app can reach still ask you.")}</p>}
+                      </div>
+                      <button
+                        className="switch"
+                        type="button"
+                        role="switch"
+                        aria-checked={automatic}
+                        aria-label={t("Automatic updates for {title}").replace("{title}", () => data.installation.title || data.installation.name)}
+                        disabled={!automaticReady || busy || savingAutomatic}
+                        onClick={() => {
+                          if (!automaticReady || busy || savingAutomatic) return;
+                          const next = !automaticRef.current;
+                          const requested = installId;
+                          const confirmed = automaticRef.current;
+                          const write = ++preferenceWrite.current;
+                          setSavingAutomatic(true);
+                          setAutomatic(next);
+                          if (!next) {
+                            automaticRef.current = false;
+                            setArmed(false);
+                          }
+                          void appExplorer.setAutomaticUpdates(requested, next)
+                            .then(row => {
+                              if (preferenceWrite.current !== write || identity.current !== requested) return;
+                              setAutomatic(row.automatic);
+                              automaticRef.current = row.automatic;
+                              setArmed(row.automatic);
+                            })
+                            .catch((error: unknown) => {
+                              if (preferenceWrite.current !== write || identity.current !== requested) return;
+                              setAutomatic(confirmed);
+                              automaticRef.current = confirmed;
+                              setArmed(confirmed);
+                              if (refused(error)) clearPrivate();
+                              setActionError(message(error));
+                            })
+                            .finally(() => {
+                              if (preferenceWrite.current === write) setSavingAutomatic(false);
+                            });
+                        }}
+                      />
+                    </div>
+                  )}
                   <p className="wa-muted">{t("Installed version {version}. Check a new package from a path on this Cadence host or a Git URL. The check shows the exact digest and changed files before you apply it. Completed drafts and retained source posts keep their original version.").replace("{version}", () => data.installation.version)}</p>
                   <label className="wa-field">
                     <span>{t("Package path or Git URL")}</span>
@@ -1369,6 +1523,7 @@ export default function WorkspaceApp({
                       {kind}: {upgradeProposal.receipt.structural_diff[kind].join(", ") || "none"}
                     </p>)}
                     {!!upgradeProposal.receipt.secret_warnings?.length && <p className="wa-alert">{t("Package validation reported secret warnings; review the source before applying.")}</p>}
+                    {automatic && releaseChangesReach(upgradeProposal.receipt.access_diff) && <p className="wa-muted">{t("This release changes what {title} can reach.").replace("{title}", () => data.installation.title || data.installation.name)}</p>}
                     <p className="wa-muted">{t("Applying preserves this installation, contexts, version-pinned bindings and completed work. Applying it approves the new version. New-version runs need new bindings.")}</p>
                     <Button variant="primary" disabled={!canWrite || busy || !!upgradeProposal.receipt.secret_warnings?.length} loading={busy}
                       onClick={() => void mutate(async () => {
