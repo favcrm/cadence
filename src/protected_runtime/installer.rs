@@ -772,3 +772,7 @@ fn read_response(stream: &UnixStream, deadline: Deadline) -> Result<Vec<u8>> {
     }
     Ok(response)
 }
+
+#[cfg(test)]
+#[path = "installer_capsule_acceptance_20261027.rs"]
+mod installer_capsule_acceptance_20261027;
