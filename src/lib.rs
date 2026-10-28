@@ -7,6 +7,14 @@
 // (only `daemon run` does, and `reaper`'s own proof in a process of its
 // own), so the spawn registry need not see test spawns.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
+// CAD-1085: the protected runtime and its whole daemon surface exist only on
+// x86_64 Linux. Other targets compile the shared types so cross-platform code
+// keeps building, and the protected paths are dormant by design, so their
+// helpers read as dead code there. Keep the lint fully on where it matters.
+#![cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code, unused_imports)
+)]
 
 pub mod adapter;
 pub mod agent_roles;
