@@ -4255,8 +4255,10 @@ impl Shared {
                 self.rpc_operator_session_open_device(params, peer_pid)
             }
             "operator_session_check" => self.rpc_operator_session_check(params),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             "credential_entry_session_check" => self.rpc_credential_entry_session_check(params),
             "credential_entry_config" => self.rpc_credential_entry_config(params, peer_pid),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             "credential_entry_continue_mint" => {
                 self.rpc_credential_entry_continue_mint(params, peer_pid)
             }
