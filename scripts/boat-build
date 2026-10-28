@@ -50,6 +50,7 @@ if subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).st
 env = dict(os.environ)
 env['CARGO_BUILD_JOBS'] = '1'
 env['CARGO_TERM_COLOR'] = 'never'
+env['CADENCE_SUITE_LOCK'] = '/tmp/cadence-suite.lock'
 print('Boat gate execution; required CI, review and approval remain authoritative', flush=True)
 print('head=' + job['head'] + ' base=' + job['base'], flush=True)
 print('command=' + repr(job['command']), flush=True)
@@ -262,12 +263,15 @@ def main():
                         'refs/heads/candidate'], check=True)
         subprocess.run(['git', '-C', str(snapshot), 'bundle', 'create', str(bundle),
                         'HEAD', 'refs/heads/base'], check=True)
-        patch = git(root, 'diff', '--binary', '--no-ext-diff', head, binary=True)
+        # Worktree edits belong to the current HEAD only. A push of another
+        # commit is checked exactly as that commit, without local edits.
+        apply_patch = head == current_head
+        patch = git(root, 'diff', '--binary', '--no-ext-diff', head, binary=True) if apply_patch else b''
         if git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip() != current_head:
             raise Failure('HEAD changed while preparing the sandbox')
         (directory / 'boat-changes.patch').write_bytes(patch)
         patch_sha = hashlib.sha256(patch).hexdigest()
-        print(f'tracked_patch_sha256={patch_sha}', flush=True)
+        print(f'tracked_patch_sha256={patch_sha} applied={apply_patch}', flush=True)
         (directory / 'boat-job.json').write_text(json.dumps({'head': head, 'base': base, 'command': command}))
         (directory / 'boat-remote.py').write_text(REMOTE)
         sandbox = None
