@@ -60,9 +60,10 @@ struct Session {
 struct Fixture {
     root: PathBuf,
     state: PathBuf,
+    pm: PathBuf,
     port: u16,
     sessions: Vec<Session>,
-    _board: OwnedChild,
+    board: Option<OwnedChild>,
     _daemon: OwnedChild,
 }
 
@@ -97,7 +98,9 @@ fn fixture_command(root: &Path, state: &Path, pm: &Path) -> Command {
 }
 
 impl Fixture {
-    fn start(parent: &Path, name: &str, host: &str, connect: &[&str], port: u16) -> Self {
+    /// The isolated store, its native operator sessions and its daemon;
+    /// the board starts separately ([`Fixture::board`]).
+    fn new(parent: &Path, name: &str) -> Self {
         let root = parent.join(name);
         for dir in [
             "", "state", "pm", "home", "xdg", "config", "data", "tmp", "bin", "dist",
@@ -132,7 +135,12 @@ impl Fixture {
             })
             .collect();
         let mut daemon = OwnedChild(
-            reaper::spawn(fixture_command(&root, &state, &pm).args(["daemon", "run"])).unwrap(),
+            reaper::spawn(
+                fixture_command(&root, &state, &pm)
+                    .args(["daemon", "run"])
+                    .stderr(log_file(&root.join("daemon.err"))),
+            )
+            .unwrap(),
         );
         let deadline = Instant::now() + Duration::from_secs(30);
         while client::rpc_private_timeout(
@@ -144,15 +152,40 @@ impl Fixture {
         .is_err()
         {
             assert!(
-                daemon.0.try_wait().unwrap().is_none(),
-                "{name}: daemon exited"
+                daemon.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                "{name}: daemon exited or not ready; stderr:\n{}",
+                read_log(&root.join("daemon.err"))
             );
-            assert!(Instant::now() < deadline, "{name}: daemon not ready");
             std::thread::sleep(Duration::from_millis(30));
         }
+        Fixture {
+            root,
+            state,
+            pm,
+            port: 0,
+            sessions,
+            board: None,
+            _daemon: daemon,
+        }
+    }
+
+    /// Start this fixture's board on `host:port`. Ready only when THIS
+    /// child wrote the readiness marker with this start's nonce and its
+    /// own pid (written after its bind succeeded), it answers
+    /// `/api/health` over `probe`, and it is still alive afterwards.
+    /// `Err` (with the board's stderr) only when the child exits with its
+    /// own AddrInUse frame — the port was taken — so the caller retries
+    /// on another port; any other exit panics with the stderr.
+    fn board(&mut self, host: &str, probe: &[&str], port: u16) -> Result<(), String> {
+        self.stop_board();
+        let ready = self.state.join("ui.ready");
+        let _ = std::fs::remove_file(&ready);
+        let err = self.root.join(format!("board-{port}.err"));
+        let nonce = format!("cad760-{}-{port}-{}", std::process::id(), now_nanos());
         let mut board = OwnedChild(
             reaper::spawn(
-                fixture_command(&root, &state, &pm)
+                fixture_command(&self.root, &self.state, &self.pm)
+                    .env("CADENCE_UI_READY_NONCE", &nonce)
                     .args([
                         "ui",
                         "run",
@@ -162,30 +195,73 @@ impl Fixture {
                         &port.to_string(),
                         "--dist",
                     ])
-                    .arg(root.join("dist")),
+                    .arg(self.root.join("dist"))
+                    .stderr(log_file(&err)),
             )
             .unwrap(),
         );
+        let pid = board.0.id();
         let deadline = Instant::now() + Duration::from_secs(30);
-        while !connect
-            .iter()
-            .any(|ip| TcpStream::connect((*ip, port)).is_ok())
-        {
+        loop {
+            if let Some(status) = board.0.try_wait().unwrap() {
+                let why = format!(
+                    "board on {host}:{port} exited ({status}); stderr:\n{}",
+                    read_log(&err)
+                );
+                // Only the board's own typed AddrInUse frame (this pid,
+                // this nonce) is a lost port race worth retrying; any
+                // other exit is a broken fixture and fails loudly.
+                let frame: Value =
+                    std::fs::read(self.state.join(format!("ui.startup-failed-{pid}")))
+                        .ok()
+                        .and_then(|b| serde_json::from_slice(&b).ok())
+                        .unwrap_or(Value::Null);
+                assert!(
+                    frame["kind"] == "addr_in_use"
+                        && frame["pid"] == json!(pid)
+                        && frame["nonce"] == json!(nonce),
+                    "{why}"
+                );
+                return Err(why);
+            }
+            let marker: Value = std::fs::read(&ready)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or(Value::Null);
+            if marker["pid"] == json!(pid) && marker["nonce"] == json!(nonce) {
+                break;
+            }
             assert!(
-                board.0.try_wait().unwrap().is_none(),
-                "{name}: board exited"
+                Instant::now() < deadline,
+                "board on {host}:{port} not ready; stderr:\n{}",
+                read_log(&err)
             );
-            assert!(Instant::now() < deadline, "{name}: board did not bind");
             std::thread::sleep(Duration::from_millis(30));
         }
-        Fixture {
-            root,
-            state,
-            port,
-            sessions,
-            _board: board,
-            _daemon: daemon,
+        self.port = port;
+        let health = probe.iter().find_map(|ip| {
+            let mut s = TcpStream::connect((*ip, port)).ok()?;
+            Some(operator_send(
+                &mut s,
+                &self.request("GET", "/api/health", None, &[]),
+            ))
+        });
+        let alive = board.0.try_wait().unwrap().is_none();
+        match health {
+            Some(r) if r.status == 200 && alive => {
+                self.board = Some(board);
+                Ok(())
+            }
+            other => panic!(
+                "board on {host}:{port} wrote its marker but does not serve: {other:?}, \
+                 alive {alive}; stderr:\n{}",
+                read_log(&err)
+            ),
         }
+    }
+
+    fn stop_board(&mut self) {
+        self.board = None;
     }
 
     /// Byte-for-byte what a board tab sends for an operator-only write,
@@ -433,13 +509,53 @@ fn assert_refused(reply: &Reply, check: &str, needle: &str, case: &str) {
     );
 }
 
-fn free_port(ips: &[Ipv4Addr]) -> u16 {
-    (3110..=3199)
-        .find(|p| {
-            ips.iter()
-                .all(|ip| std::net::TcpListener::bind((*ip, *p)).is_ok())
-        })
-        .expect("a port free on every fixture address in 3110..=3199")
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+}
+
+fn log_file(path: &Path) -> std::fs::File {
+    std::fs::File::create(path).unwrap()
+}
+
+fn read_log(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| format!("<{}: {e}>", path.display()))
+}
+
+/// Candidate ports in 3110..=3199, starting at a per-process offset so
+/// parallel tests do not all race for the same first port. A candidate
+/// is only a hint: the board's own bind is the proof, and a lost race
+/// is retried on the next candidate.
+fn candidate_ports() -> impl Iterator<Item = u16> {
+    let start = (std::process::id() as u128 + now_nanos() / 1_000) % 90;
+    (0..90u16).map(move |i| 3110 + ((start as u16 + i) % 90))
+}
+
+/// Start `boards` (fixture, host, probe address) all on ONE port,
+/// retrying the whole set on the next candidate when any bind loses.
+fn start_on_one_port(boards: &mut [(&mut Fixture, &str, &str)]) {
+    let mut lost = Vec::new();
+    for port in candidate_ports().take(20) {
+        let mut started = 0;
+        for (fixture, host, probe) in boards.iter_mut() {
+            match fixture.board(host, &[probe], port) {
+                Ok(()) => started += 1,
+                Err(why) => {
+                    lost.push(why);
+                    break;
+                }
+            }
+        }
+        if started == boards.len() {
+            return;
+        }
+        for (fixture, _, _) in boards.iter_mut() {
+            fixture.stop_board();
+        }
+    }
+    panic!("no port in 3110..=3199 could be bound by every board: {lost:#?}");
 }
 
 fn scratch() -> tempfile::TempDir {
@@ -489,9 +605,16 @@ fn collide(
 #[test]
 fn cad760_colliding_source_ports_are_judged_on_their_own_socket() {
     let dir = scratch();
-    let port = free_port(&[Ipv4Addr::LOCALHOST, Ipv4Addr::new(127, 0, 0, 2)]);
-    let a = Fixture::start(dir.path(), "a", "127.0.0.1", &["127.0.0.1"], port);
-    let b = Fixture::start(dir.path(), "b", "127.0.0.2", &["127.0.0.2"], port);
+    let mut a = Fixture::new(dir.path(), "a");
+    let mut b = Fixture::new(dir.path(), "b");
+    start_on_one_port(&mut [
+        (&mut a, "127.0.0.1", "127.0.0.1"),
+        (&mut b, "127.0.0.2", "127.0.0.2"),
+    ]);
+    assert_eq!(
+        a.port, b.port,
+        "the collision needs one port on both addresses"
+    );
 
     // (c) control: the genuine operator, plain loopback, passes on both
     // boards — operator-only read and write.
@@ -590,8 +713,23 @@ fn cad760_colliding_source_ports_are_judged_on_their_own_socket() {
 #[test]
 fn cad760_board_without_a_concrete_bind_refuses_operator_proof() {
     let dir = scratch();
-    let port = free_port(&[Ipv4Addr::LOCALHOST]);
-    let c = Fixture::start(dir.path(), "c", "localhost", &["127.0.0.1", "::1"], port);
+    let mut c = Fixture::new(dir.path(), "c");
+    let mut lost = Vec::new();
+    let started =
+        candidate_ports()
+            .take(20)
+            .any(|p| match c.board("localhost", &["127.0.0.1", "::1"], p) {
+                Ok(()) => true,
+                Err(why) => {
+                    lost.push(why);
+                    false
+                }
+            });
+    assert!(
+        started,
+        "no port could be bound by the localhost board: {lost:#?}"
+    );
+    let port = c.port;
     let mut checked = 0;
     for ip in ["127.0.0.1", "::1"] {
         let Ok(mut s) = TcpStream::connect((ip, port)) else {
