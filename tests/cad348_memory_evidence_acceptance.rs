@@ -2357,3 +2357,184 @@ fn allowlisted_credential_receipt_proof() {
 
     println!("CAD-348 allowlist proof ok");
 }
+
+/// One required variable the parent check hands its child process.
+fn child_var(name: &str) -> String {
+    let Ok(value) = std::env::var(name) else {
+        panic!("{name} must be set by the parent check");
+    };
+    value
+}
+
+/// The record both halves of the failed-analysis check analyse: one
+/// warning-only credential in an external citation, and one Git citation whose
+/// read is what fails in the child process.
+fn failure_receipt_fixture(commit: &str) -> Memory {
+    let value = fixture_generic_key();
+    memory(
+        "detail-failure",
+        "A claim whose citations cannot be analysed in this process",
+        vec![
+            EvidenceRef {
+                kind: EvidenceKind::External,
+                source: format!("https://example.invalid/page?api_key={value}"),
+                revision: "2026-10-28".into(),
+            },
+            git_ref("evidence.txt", commit),
+        ],
+        Some(condition_with_wiki_target(
+            Some(commit),
+            Some(commit),
+            Some(commit),
+        )),
+    )
+}
+
+/// A receipt that could not be produced is still a receipt. When the analysis
+/// itself fails, the detail JSON must carry the complete bounded unknown
+/// receipt — the record's digest, the condition's check id and all three
+/// pinned revisions, an empty `checked`, an explicit non-empty `skipped`, the
+/// bounded `limits`, and a sanitized reason — never a pass and never a secret.
+///
+/// The failure is genuine, not a mock: the same record is analysed in a child
+/// process whose `PATH` holds no `git`, so `analyse_as` fails at the citation's
+/// Git read. This process, where `git` works, analyses it too, as the positive
+/// control the failure receipt must match.
+#[test]
+fn a_failed_analysis_still_emits_the_complete_unknown_receipt() {
+    use cadence_agent::memory::{detail_json_with_evidence, semantic_digest, Freshness};
+
+    let rig = Rig::new();
+    let mem = failure_receipt_fixture(&rig.commit);
+    let fresh = Freshness::for_key(&rig.pm.dir, "demo");
+    let detail = detail_json_with_evidence(&mem, &fresh, Some(&rig.pm), None);
+    let control = detail["evidence_analysis"].clone();
+    let control_dump = control.to_string();
+    let empty = serde_json::json!([]);
+    let value = fixture_generic_key();
+    let control_leak = detail.to_string().contains(&value);
+
+    // Positive control: with `git` available the Git citation really resolves,
+    // so the record is unknown only because the external citation cannot be
+    // fetched — and the control receipt echoes no credential.
+    assert_eq!(control["result"], "unknown", "control: {control_dump}");
+    assert_ne!(control["checked"], empty, "control: {control_dump}");
+    assert!(!control_leak, "the control receipt echoed the credential");
+
+    // The failing process: an isolated environment whose `PATH` has no `git`.
+    let empty_path = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "cad348_memory_evidence_acceptance::detail_failure_receipt_proof",
+        ])
+        .args(["--ignored", "--test-threads", "1", "--nocapture"])
+        .env("PATH", empty_path.path())
+        .env("CADENCE_STATE_DIR", state.path())
+        .env("CAD348_DETAIL_PROOF", "1")
+        .env("CAD348_DETAIL_PM_DIR", &rig.pm.dir)
+        .env("CAD348_DETAIL_COMMIT", &rig.commit)
+        .env_remove("CADENCE_PM_DIR");
+    let out = cadence_agent::reaper::output(&mut child)
+        .expect("the test binary is required by this fixture");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "the failed-analysis receipt proof failed: {text}"
+    );
+    // libtest writes `test <name> ... ` without a newline, so with
+    // `--nocapture` the child's marker follows that prefix on the same line.
+    let marker = "CAD348_DETAIL_JSON ";
+    let Some((_, reported)) = text.split_once(marker) else {
+        panic!("the proof did not report its receipt");
+    };
+    let reported = reported.lines().next().unwrap_or_default();
+    let parsed = serde_json::from_str::<serde_json::Value>(reported);
+    let failure = parsed.expect("the proof receipt is not JSON");
+    let failure_dump = failure.to_string();
+    let digest = serde_json::json!(semantic_digest(&mem));
+    let reason = failure["error"].as_str().unwrap_or_default();
+    let failure_leak = failure_dump.contains(&value);
+
+    // The failure receipt must carry the same identity, condition bindings and
+    // bounds as the receipt this process produced from the same record.
+    for key in [
+        "candidate_digest",
+        "check_id",
+        "source_revision",
+        "target_revision",
+        "wiki_target_revision",
+        "limits",
+    ] {
+        assert_eq!(failure[key], control[key], "`{key}`: {failure_dump}");
+    }
+    assert_eq!(failure["candidate_digest"], digest, "{failure_dump}");
+    assert_eq!(failure["result"], "unknown", "result: {failure_dump}");
+    assert_eq!(failure["checked"], empty, "checked: {failure_dump}");
+    assert_ne!(failure["skipped"], empty, "skipped: {failure_dump}");
+    assert!(!reason.is_empty(), "reason: {failure_dump}");
+    assert!(!failure_leak, "the failure receipt echoed the credential");
+}
+
+/// Child entry point of `a_failed_analysis_still_emits_the_complete_unknown_receipt`:
+/// runs only in the process that check starts, where `git` cannot be spawned
+/// and the tracker was built by the parent.
+#[test]
+#[ignore = "child entry point of a_failed_analysis_still_emits_the_complete_unknown_receipt"]
+fn detail_failure_receipt_proof() {
+    use cadence_agent::memory::{detail_json_with_evidence, semantic_digest, Freshness};
+
+    if std::env::var_os("CAD348_DETAIL_PROOF").is_none() {
+        return;
+    }
+    let mut probe = Command::new("git");
+    probe.arg("--version");
+    assert!(
+        cadence_agent::reaper::output(&mut probe).is_err(),
+        "this proof must run where `git` cannot be spawned"
+    );
+
+    let pm_dir = child_var("CAD348_DETAIL_PM_DIR");
+    let commit = child_var("CAD348_DETAIL_COMMIT");
+    let pm = Pm::at(Path::new(&pm_dir)).expect("prebuilt tracker");
+    let mem = failure_receipt_fixture(&commit);
+    let fresh = Freshness::for_key(&pm.dir, "demo");
+    let detail = detail_json_with_evidence(&mem, &fresh, Some(&pm), None);
+    let failure = detail["evidence_analysis"].clone();
+    let dump = failure.to_string();
+    let empty = serde_json::json!([]);
+    let digest = serde_json::json!(semantic_digest(&mem));
+    let pinned = serde_json::json!(commit);
+    let value = fixture_generic_key();
+    let reason = failure["error"].as_str().unwrap_or_default();
+    let max_cited = failure["limits"]["max_cited_bytes"].clone();
+    let bound = serde_json::json!(cadence_agent::memory::evidence::MAX_CITED_BYTES);
+    let detection = failure["limits"]["semantic_detection"].clone();
+    let serialised = detail.to_string();
+    let leak = serialised.contains(&value);
+    let tail = &value[value.len() - 12..];
+    let partial_leak = serialised.contains(tail);
+
+    assert_eq!(failure["result"], "unknown", "result: {dump}");
+    assert_eq!(failure["candidate_digest"], digest, "digest: {dump}");
+    assert_eq!(failure["check_id"], "evidence-analysis", "id: {dump}");
+    for key in ["source_revision", "target_revision", "wiki_target_revision"] {
+        assert_eq!(failure[key], pinned, "pinned `{key}`: {dump}");
+    }
+    assert_eq!(failure["checked"], empty, "checked: {dump}");
+    assert_ne!(failure["skipped"], empty, "skipped: {dump}");
+    assert!(failure["findings"].is_array(), "findings: {dump}");
+    assert!(!reason.is_empty(), "reason: {dump}");
+    assert_eq!(max_cited, bound, "read bound: {dump}");
+    assert_eq!(detection, "not claimed", "detection: {dump}");
+    assert!(!leak, "the failure receipt echoed the credential");
+    assert!(!partial_leak, "the failure receipt echoed part of it");
+
+    println!("CAD348_DETAIL_JSON {failure}");
+}

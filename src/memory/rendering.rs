@@ -193,12 +193,43 @@ pub fn detail_json_with_evidence(
         let caller = caller.unwrap_or(&crate::wiki::Caller::Public);
         v["evidence_analysis"] = match super::evidence::analyse_as(pm, m, caller) {
             Ok(receipt) => receipt.to_json(),
-            Err(error) => json!({
-                "result": "unknown",
-                "error": crate::secret::redact_text(&error.to_string())
-                    .unwrap_or_else(|_| "evidence analysis unavailable".to_string()),
-                "semantic_detection": "not claimed",
-            }),
+            Err(error) => {
+                let safe = |text: &str| {
+                    crate::secret::redact_text(text)
+                        .unwrap_or_else(|_| "redaction unavailable".to_string())
+                };
+                let condition = m
+                    .front
+                    .policy
+                    .as_ref()
+                    .and_then(|policy| policy.verification_condition.as_ref());
+                let mut receipt = super::evidence::Receipt {
+                    candidate_digest: semantic_digest(m),
+                    check_id: safe(
+                        condition
+                            .map(|condition| condition.check_id.as_str())
+                            .unwrap_or("evidence-analysis"),
+                    ),
+                    source_revision: condition
+                        .and_then(|condition| condition.source_revision.as_deref())
+                        .map(safe),
+                    target_revision: condition
+                        .and_then(|condition| condition.target_revision.as_deref())
+                        .map(safe),
+                    wiki_target_revision: condition
+                        .and_then(|condition| condition.wiki_target_revision.as_deref())
+                        .map(safe),
+                    outcome: super::evidence::Outcome::Unknown,
+                    checked: Vec::new(),
+                    skipped: vec![
+                        "citation resolution, target applicability, duplicate, contradiction and overfit checks incomplete; see error".to_string(),
+                    ],
+                    findings: Vec::new(),
+                }
+                .to_json();
+                receipt["error"] = json!(safe(&error.to_string()));
+                receipt
+            }
         };
     }
     v

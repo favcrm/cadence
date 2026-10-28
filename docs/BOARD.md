@@ -1811,6 +1811,8 @@ minutes> was broken` as an incident-specific answer; citations and the Why/How
 sections are not searched for this pattern. It does not detect other overfit or
 establish semantic truth. Citation-derived receipt text and errors redact
 credential-shaped values, including warn-only and operator-allowlisted matches.
+If analysis fails, the `unknown` receipt retains the candidate and condition
+identifiers and reports the checks as incomplete with a sanitized error.
 A `pass` means only the receipt's listed mechanical checks passed; it is not a
 review, verification authorization, or finalization.
 
