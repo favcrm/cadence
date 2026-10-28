@@ -147,13 +147,14 @@ export default function WorkItemDetail(props: WorkItemDetailProps) {
       tabs={tabs}
       foot={
         <>
+          <div className="crm-drawer-actions">
+            {href ? (
+              <Button variant="primary" href={href}>{t("Open full issue")}</Button>
+            ) : (
+              <Button disabled title={t("Project unknown")}>{t("Open full issue")}</Button>
+            )}
+          </div>
           <span className="crm-drawer-note">{t(workItemOriginLabel(origin))}</span>
-          <span className="crm-drawer-spacer" />
-          {href ? (
-            <Button variant="primary" href={href}>{t("Open full issue")}</Button>
-          ) : (
-            <Button disabled title={t("Project unknown")}>{t("Open full issue")}</Button>
-          )}
         </>
       }
       onClose={onClose}

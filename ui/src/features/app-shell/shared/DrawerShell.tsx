@@ -9,9 +9,10 @@ import { useDrawerClose } from "./useDrawerClose";
  *  - header: avatar/icon, title, subtitle, status pills/tags, an optional
  *    warning strip (text only, never a button) and the tab strip;
  *  - body: the active tab panel, or `edit.body` swapped in place;
- *  - footer: pinned. Every action lives here — the ⋯ menu on the left
- *    (opens upward, destructive item last and red), secondary buttons,
- *    one primary on the right. While editing it becomes Cancel / Save.
+ *  - footer: pinned. Every action lives here, grouped on the left — the ⋯
+ *    menu (opens upward, destructive item last and red), secondary buttons,
+ *    one primary last; the note sits on the right. While editing it becomes
+ *    Cancel / Save in the same group.
  * The scrim dims the outlet only: the left chat pane stays usable.
  * `scrim="board"` (CAD-1216, the Home review drawer) is opt-in: the scrim
  * covers the whole board, a `kicker` sits above the title and `foot`
@@ -254,23 +255,26 @@ export default function DrawerShell(props: DrawerShellProps) {
           <footer className="crm-drawer-foot" data-state={note != null && !editing ? "read-only" : undefined}>
             {editing ? (
               <>
-                <span className="crm-drawer-spacer" />
-                <Button size="sm" variant="ghost" onClick={edit.onCancel} disabled={edit.pending}>
-                  {t("Cancel")}
-                </Button>
-                <button type="submit" form={edit.formId} className="btn btn-sm btn-primary" disabled={edit.pending} aria-busy={edit.pending || undefined}>
-                  {edit.pending ? t("Saving…") : (edit.saveLabel ?? t("Save"))}
-                </button>
+                <div className="crm-drawer-actions">
+                  <Button size="sm" variant="ghost" onClick={edit.onCancel} disabled={edit.pending}>
+                    {t("Cancel")}
+                  </Button>
+                  <button type="submit" form={edit.formId} className="btn btn-sm btn-primary" disabled={edit.pending} aria-busy={edit.pending || undefined}>
+                    {edit.pending ? t("Saving…") : (edit.saveLabel ?? t("Save"))}
+                  </button>
+                </div>
+                {note != null && <span className="crm-drawer-note">{note}</span>}
               </>
             ) : foot != null ? (
               foot
             ) : (
               <>
-                {menu != null && menu.length > 0 && <OverflowMenu items={menu} open={menuOpen} setOpen={setMenuOpen} />}
+                <div className="crm-drawer-actions">
+                  {menu != null && menu.length > 0 && <OverflowMenu items={menu} open={menuOpen} setOpen={setMenuOpen} />}
+                  {secondary}
+                  {primary}
+                </div>
                 {note != null && <span className="crm-drawer-note">{note}</span>}
-                <span className="crm-drawer-spacer" />
-                {secondary}
-                {primary}
               </>
             )}
           </footer>
