@@ -3181,7 +3181,12 @@ fn stage_and_validate(source: &Path, stage: &Path, manifest: &PortableManifest) 
         &stage.join(INACTIVE_MARKER),
         serde_json::to_string_pretty(&restore_marker(manifest))?.as_bytes(),
     )?;
-    verify_staged_members(stage, manifest)
+    verify_staged_members(stage, manifest)?;
+    // The package purges the source UUID, so the receiver mints its own
+    // coordination identity. This runs after the member hash check: it is the
+    // receiver's materialization, not package content.
+    ensure_coordination_metadata(&stage.join(PKG_DB), manifest.schema_version)?;
+    Ok(())
 }
 
 /// The inactive marker for a fresh restore. Replacement writes its own
@@ -3211,6 +3216,35 @@ fn stage_members_and_validate(
     verify_tracker_content(&stage.join(TRACKER_DIR), manifest)?;
     if let Some(rel) = manifest.pm_root.as_deref() {
         crate::issue::Pm::at(&stage.join(TRACKER_DIR).join(rel))?;
+    }
+    Ok(())
+}
+
+/// Materialize the coordination singleton row the package deliberately
+/// purges. The ledger head is reset to the genesis of database epoch 1 when
+/// the staged schema already carries the v58 head columns; an older schema is
+/// completed by the daemon's own migration on first open.
+fn ensure_coordination_metadata(db: &Path, schema_version: i64) -> Result<()> {
+    let conn = Connection::open(db)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO connection_metadata(singleton, workspace_id) \
+         VALUES(1, lower(hex(randomblob(16))))",
+        [],
+    )?;
+    if schema_version >= 58 {
+        let genesis = cadence_core::connection_dispatch::ledger::genesis_ledger_head_v1(
+            cadence_core::connection_dispatch::Revision::new(1)
+                .map_err(|_| Error::internal("fixture epoch"))?,
+        );
+        conn.execute(
+            "UPDATE connection_metadata SET database_epoch=?1, ledger_sequence=?2, \
+             ledger_digest=?3 WHERE singleton=1",
+            rusqlite::params![
+                genesis.database_epoch.get(),
+                genesis.sequence.get(),
+                genesis.digest.as_str()
+            ],
+        )?;
     }
     Ok(())
 }
