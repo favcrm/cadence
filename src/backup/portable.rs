@@ -290,6 +290,17 @@ const CATALOG: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "app_run_dispositions",
+        &[
+            "run_id",
+            "request_id",
+            "artifact_id",
+            "artifact_digest",
+            "decision",
+            "created",
+        ],
+    ),
+    (
         "app_run_failures",
         &["run_id", "step_id", "kind", "reason", "created"],
     ),
@@ -319,6 +330,20 @@ const CATALOG: &[(&str, &[&str])] = &[
             "state",
             "message_id",
             "result_digest",
+        ],
+    ),
+    (
+        "app_run_tickets",
+        &[
+            "run_id",
+            "request_id",
+            "artifact_id",
+            "artifact_digest",
+            "suggestion_index",
+            "suggestion_count",
+            "suggestion_text",
+            "issue_id",
+            "created",
         ],
     ),
     (
