@@ -479,11 +479,7 @@ impl Store {
 
     /// Record the choice. The row does not apply a release; the board does
     /// that only after a check whose declared access is unchanged.
-    pub fn app_automatic_updates_set(
-        &self,
-        install_id: &str,
-        automatic: bool,
-    ) -> Result<Value> {
+    pub fn app_automatic_updates_set(&self, install_id: &str, automatic: bool) -> Result<Value> {
         install_id_ok(install_id)?;
         self.write_tx(|conn| {
             let tx = &mut *conn;
@@ -523,17 +519,26 @@ mod automatic_updates {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(&dir.path().join("t.sqlite3")).unwrap();
         let id = "inst-1";
-        assert_eq!(store.app_automatic_updates_get(id).unwrap()["automatic"], false);
+        assert_eq!(
+            store.app_automatic_updates_get(id).unwrap()["automatic"],
+            false
+        );
         assert_eq!(
             store.app_automatic_updates_set(id, true).unwrap()["automatic"],
             true
         );
-        assert_eq!(store.app_automatic_updates_get(id).unwrap()["automatic"], true);
+        assert_eq!(
+            store.app_automatic_updates_get(id).unwrap()["automatic"],
+            true
+        );
         assert_eq!(
             store.app_automatic_updates_set(id, false).unwrap()["automatic"],
             false
         );
-        assert_eq!(store.app_automatic_updates_get(id).unwrap()["automatic"], false);
+        assert_eq!(
+            store.app_automatic_updates_get(id).unwrap()["automatic"],
+            false
+        );
         assert!(store.app_automatic_updates_get("bad id").is_err());
     }
 }
