@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
 
-const FIXTURE_CONTRACT: &str = "app-screen-projection-fixtures/4";
+const FIXTURE_CONTRACT: &str = "app-screen-projection-fixtures/5";
 const FRAME_KIT_ENTRY: &str = "client.js";
 const PRODUCER: &str = include_str!("app_preview_export/producer.mjs");
 const INPUT_CAP: usize = 1024 * 1024;
