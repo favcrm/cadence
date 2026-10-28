@@ -540,6 +540,20 @@ mod result_refused_parse_tests {
     }
 
     #[test]
+    fn result_refused_with_a_cost_field_is_ambiguous() {
+        // The real producer's usage object includes `cost`; the refusal payload
+        // must project the five counters, and the parser stays strict.
+        parse_reply(
+            result_refused_reply(serde_json::json!({
+                "input": 3, "output": 2, "cacheRead": 1, "cacheWrite": 0, "totalTokens": 6,
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}
+            }))
+            .as_bytes(),
+        )
+        .expect_err("a usage object with cost must be refused");
+    }
+
+    #[test]
     fn result_refused_with_inconsistent_usage_is_ambiguous() {
         parse_reply(
             result_refused_reply(serde_json::json!({

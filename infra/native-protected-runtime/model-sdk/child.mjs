@@ -364,9 +364,21 @@ const main = async () => {
   // never yields an assistant: truthful usage and the one inference settle as
   // a closed result_refused with no content.
   if (seal.refusesCredentialEcho(assistant)) {
+    // The refusal payload carries exactly the validated counters; the broker's
+    // strict parser rejects any extra field (including `cost`).
+    const usage = assistant.usage;
     process.stdout.write(
       JSON.stringify(
-        reply('result_refused', { error: 'result_refused', usage: assistant.usage }, seal),
+        reply('result_refused', {
+          error: 'result_refused',
+          usage: {
+            input: usage.input,
+            output: usage.output,
+            cacheRead: usage.cacheRead,
+            cacheWrite: usage.cacheWrite,
+            totalTokens: usage.totalTokens,
+          },
+        }, seal),
       ) + '\n',
     );
     return;

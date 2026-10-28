@@ -227,7 +227,7 @@ impl StdioAdapter {
 
     /// Typed protected transport. No command/env/cwd from agent params enters
     /// this path; only the owned context can yield a bound helper exec plan.
-    #[cfg(all(unix, target_os = "linux"))]
+    #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
     pub(crate) fn launch_protected(
         self: &Arc<Self>,
         context: super::pi_guest::GuestCtx,

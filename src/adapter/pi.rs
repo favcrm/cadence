@@ -1125,14 +1125,14 @@ impl ProviderAdapter for PiAdapter {
         // fallback. The older split seam (`agent_uid`) keeps its own refusal
         // only for deployments without the reviewed profile.
         let protected_profile = crate::protected_runtime::protected_profile_active();
-        #[cfg(not(all(unix, target_os = "linux")))]
+        #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
         if self.agent_uid.is_some() || protected_profile {
             super::pi_guest::protected_prereqs_satisfied()?;
             return Err(Error::rejected(
                 "protected managed-Pi launch requires Linux x86_64",
             ));
         }
-        #[cfg(all(unix, target_os = "linux"))]
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
         let protected = if protected_profile {
             None
         } else if let Some(uid) = self.agent_uid {
@@ -1174,7 +1174,7 @@ impl ProviderAdapter for PiAdapter {
         // CAD-1085: open the owned console before the transport exists so the
         // adapter's generation tag is the measured runtime's, and so a failed
         // bootstrap refuses before any prompt state is touched.
-        #[cfg(all(unix, target_os = "linux"))]
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
         let mut protected_console = if protected_profile {
             let provider = crate::daemon::protected_runtime::console_provider()?;
             Some(provider.open_console(
@@ -1212,7 +1212,7 @@ impl ProviderAdapter for PiAdapter {
             let role = if master { "master" } else { "worker" };
             self.log_confinement(role, policy)?;
         }
-        #[cfg(all(unix, target_os = "linux"))]
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
         let generation = if let Some(console) = protected_console.as_ref() {
             console.generation_tag.clone()
         } else {
@@ -1221,7 +1221,7 @@ impl ProviderAdapter for PiAdapter {
                 .map(|ctx| ctx.segments().generation_hex())
                 .unwrap_or_else(|| Uuid::new_v4().simple().to_string()[..12].to_string())
         };
-        #[cfg(not(all(unix, target_os = "linux")))]
+        #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
         let generation = Uuid::new_v4().simple().to_string()[..12].to_string();
         *self.shared.generation.lock().unwrap() = generation.clone();
         self.shared.dead.store(false, Ordering::SeqCst);
@@ -1375,7 +1375,7 @@ impl ProviderAdapter for PiAdapter {
         *self.transport.write().unwrap() = Arc::clone(&transport);
         let workdir = launch_workdir(agent).to_string_lossy().into_owned();
         let initialized = (|| {
-            #[cfg(all(unix, target_os = "linux"))]
+            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
             let pid = if let Some(console) = protected_console.take() {
                 *self.protected_caller.lock().unwrap() = Some(Arc::new(console.caller));
                 *self.protected_agent_uid.lock().unwrap() = Some(agent.uid.clone());
