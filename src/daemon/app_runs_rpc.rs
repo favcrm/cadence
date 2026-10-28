@@ -872,6 +872,23 @@ impl Shared {
             "app_run_show" => &["run_id"],
             "app_run_list" => &["install_id", "context_id"],
             "app_run_artifact" => &["artifact_id", "message", "token"],
+            "app_run_disposition" => &[
+                "run_id",
+                "request_id",
+                "artifact_id",
+                "digest",
+                "decision",
+                "public_session",
+            ],
+            "app_run_ticket_reserve" => &[
+                "run_id",
+                "request_id",
+                "artifact_id",
+                "digest",
+                "index",
+                "public_session",
+            ],
+            "app_run_ticket_bind" => &["run_id", "request_id", "issue_id", "public_session"],
             _ => return Err(Error::rejected("unknown app lifecycle method")),
         };
         let fields = params
@@ -925,7 +942,10 @@ impl Shared {
                 | "app_run_cancel"
                 | "app_run_dispatch"
                 | "app_run_start"
-                | "app_run_create",
+                | "app_run_create"
+                | "app_run_disposition"
+                | "app_run_ticket_reserve"
+                | "app_run_ticket_bind",
                 Some(_),
             ) => {
                 // An agent (registered pane or managed endpoint) never carries
@@ -1061,6 +1081,38 @@ impl Shared {
                 self.store
                     .app_artifact_for_operator(required_str(params, "artifact_id")?)
             }
+            "app_run_disposition" => self.store.app_run_disposition(
+                required_str(params, "run_id")?,
+                required_str(params, "request_id")?,
+                required_str(params, "artifact_id")?,
+                required_str(params, "digest")?,
+                required_str(params, "decision")?,
+                human,
+            ),
+            "app_run_ticket_reserve" => {
+                let index = params.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                    Error::rejected("suggestion index must be a positive integer")
+                })?;
+                if index == 0 || index > 64 {
+                    return Err(Error::rejected(
+                        "suggestion index is outside the proposal list",
+                    ));
+                }
+                self.store.app_run_ticket_reserve(
+                    required_str(params, "run_id")?,
+                    required_str(params, "request_id")?,
+                    required_str(params, "artifact_id")?,
+                    required_str(params, "digest")?,
+                    index as u32,
+                    human,
+                )
+            }
+            "app_run_ticket_bind" => self.store.app_run_ticket_bind(
+                required_str(params, "run_id")?,
+                required_str(params, "request_id")?,
+                required_str(params, "issue_id")?,
+                human,
+            ),
             _ => Err(Error::rejected("unknown app lifecycle method")),
         }
     }

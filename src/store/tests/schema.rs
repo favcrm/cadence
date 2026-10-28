@@ -1888,3 +1888,71 @@
         }
         assert!(has("chat_files"));
     }
+
+    /// CAD-1887: v59 adds the operator disposition and the one selected
+    /// ticket. A store that already reached v58 never re-runs the app-run
+    /// schema block, so the migration itself has to create both tables.
+    #[test]
+    fn cad1887_migration_v58_to_v59_adds_operator_decision_tables() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE app_run_tickets;
+                 DROP TABLE app_run_dispositions;
+                 UPDATE schema_version SET version=58;",
+            )
+            .unwrap();
+        let has = |name: &str| -> bool {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [name],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        let index = |name: &str| -> bool {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+                    [name],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(!has("app_run_dispositions"));
+        assert!(!has("app_run_tickets"));
+        assert!(!index("app_run_tickets_issue"));
+        assert!(has("app_runs"));
+        assert!(has("app_update_preferences"));
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert!(has("app_run_dispositions"));
+            assert!(has("app_run_tickets"));
+            assert!(index("app_run_tickets_issue"));
+            assert_eq!(
+                Connection::open(&db)
+                    .unwrap()
+                    .query_row("SELECT version FROM schema_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                crate::rollout::SCHEMA_VERSION
+            );
+            assert_eq!(s.agent("a1").unwrap().alias, "a1");
+        }
+        let _ = Store::open_for_schema_tests(&db).unwrap();
+        assert!(has("app_run_dispositions") && has("app_run_tickets"));
+        assert!(has("app_update_preferences"));
+    }

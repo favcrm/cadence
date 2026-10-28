@@ -21,6 +21,7 @@ mod plan;
 mod projects;
 mod rev;
 mod stage;
+mod ticket;
 
 use done::check_done_evidence;
 #[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
@@ -53,6 +54,7 @@ pub(crate) use rev::{
     commit, commit_scoped, commit_who, commit_who_scoped, create_exclusive, file_preimage,
     post_commit_warning, restore_preimage, write_new,
 };
+pub use ticket::materialize_app_run_ticket;
 
 #[cfg(test)]
 use new::lock_for_new_issue_rounds;
@@ -1243,5 +1245,50 @@ mod tests {
         assert!(clean(&pm), "a refused attach left something behind");
         assert!(!pm.dir.join("cadence/CAD-1/artifacts/note-1.txt").exists());
         std::fs::remove_file(hook).unwrap();
+    }
+
+    #[test]
+    fn selected_app_ticket_is_created_once_and_omits_the_other_proposal() {
+        let (dir, pm) = tracker();
+        let reserved = json!({
+            "request_id": "ticket-req-1",
+            "run_id": "run-0123456789abcdef0123456789abcdef",
+            "artifact_id": "artifact-run-0123456789abcdef0123456789abcdef-s1",
+            "artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "index": 1,
+            "count": 2,
+            "suggestion": "Publish the Tuesday menu on the board.",
+        });
+        let first = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        assert_eq!(first["created"], true);
+        let id = first["id"].as_str().unwrap();
+        let body =
+            std::fs::read_to_string(pm.dir.join("cadence").join(id).join("issue.md")).unwrap();
+        assert!(
+            body.contains("cadence-app-ticket-request: ticket-req-1"),
+            "{body}"
+        );
+        assert!(body.contains("- decision: accept"), "{body}");
+        assert!(
+            body.contains("- artifact: artifact-run-0123456789abcdef0123456789abcdef-s1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("Publish the Tuesday menu on the board."),
+            "{body}"
+        );
+        assert!(
+            !body.contains("Ask the vendor for a written quote."),
+            "{body}"
+        );
+        let second = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        assert_eq!(second["id"], id);
+        assert_eq!(second["created"], false);
+        let other = pm.dir.join("cadence/CAD-1/issue.md");
+        let mut text = std::fs::read_to_string(&other).unwrap();
+        text.push_str("\ncadence-app-ticket-request: ticket-req-1\n");
+        std::fs::write(&other, text).unwrap();
+        let err = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap_err();
+        assert!(err.to_string().contains("more than one"), "{err}");
     }
 }

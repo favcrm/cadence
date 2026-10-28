@@ -81,7 +81,7 @@ const GATED_KEYS: &[&str] = &["records", "actions", "ui", "settings", "actors"];
 /// CAD-1129: `assets/` is the catalog's icon and screenshots — flat
 /// `*.svg` files only. CAD-1867: `skills/` holds one `<tag>/` package per
 /// installed skill — its `skill.json` manifest, flat root text leaves, and
-/// one `scripts/` or `references/` subdirectory.
+/// `scripts/` and `references/` subdirectories.
 const TOP_DIRS: &[&str] = &[
     "workflows",
     "rubrics",
@@ -174,7 +174,7 @@ pub(crate) enum DirRule {
     /// `js|css|svg|json`.
     ScreensPackage,
     /// A `skills/<tag>/` package: its `skill.json` manifest, flat root text
-    /// leaves, and one `scripts/` or `references/` subdirectory. See
+    /// leaves, and `scripts/` and `references/` subdirectories. See
     /// [`skill_member_ok`].
     SkillsPackage,
 }
@@ -603,11 +603,9 @@ pub fn skill_package(files: &BTreeMap<String, String>, tag: &str) -> Result<Skil
         }
         present.insert(rel.to_string());
     }
-    if !present.contains(SKILL_MANIFEST) {
-        // `present` is built from the prefix, so the manifest is there; this
-        // only guards a future rewrite of the scan above.
-        return Err(Error::rejected(format!("{manifest_path} is absent")));
-    }
+    // The manifest was loaded from this same map before the scan. It is a
+    // root text leaf, so the scan above keeps it in `present`; the declared
+    // set deliberately excludes it.
     let declared: BTreeSet<String> = manifest.files.iter().cloned().collect();
     for member in &declared {
         if !present.contains(member) {
@@ -730,7 +728,7 @@ pub(crate) fn bundle_path_ok(path: &str) -> bool {
             crate::issue::model::valid_tag(tag) && crate::issue::app_screen_pkg::leaf_ok(leaf)
         }
         // CAD-1867: one tag-named package dir per skill — a flat root leaf or
-        // one `scripts/`/`references/` member.
+        // a file in `scripts/` or `references/`.
         ["skills", tag, member] => crate::issue::model::valid_tag(tag) && skill_member_ok(member),
         ["skills", tag, directory, leaf] => {
             crate::issue::model::valid_tag(tag) && skill_member_ok(&format!("{directory}/{leaf}"))
@@ -1963,7 +1961,7 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             // collected none for it; drop the loop's own (empty) result.
         }
         // CAD-1867: skills/<tag>/<member>, where `<member>` is a flat root
-        // text leaf or one `scripts/`/`references/` member. Exactly the
+        // text leaf or a file in `scripts/` or `references/`. Exactly the
         // grammar `skill_member_ok` states — a directory is only ever
         // `scripts/` or `references/`, never a file, and nothing nests
         // deeper.

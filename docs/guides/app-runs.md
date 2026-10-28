@@ -335,6 +335,55 @@ Use `cadence app run cancel <run-id>` to prevent further execution, or
 to withdraw its local capability approval. Neither operation converts
 old results into new execution authority.
 
+## Operator decision and one selected ticket
+
+Installation approval, run approval, quality review, and outward release stay
+separate. `cadence app effect accept` still records a decision and releases
+the artifact. A post-review choice that must not publish is not an effect
+flag: `execute: false` stays off the CLI, because a stored non-execution is
+reconciled as an interrupted accept.
+
+Record the choice on the succeeded run instead:
+
+```sh
+cadence app run disposition <run-id> \
+  --request-id <request-id> \
+  --artifact-id <artifact-id> \
+  --digest <sha256-digest> \
+  --decision accept
+```
+
+`--decision` is `accept` or `decline`. The run must be succeeded and approved,
+the digest must be the stored artifact bytes, and an independent reviewer
+must have approved that digest. The producer approving their own artifact is
+refused. The command does not stage a release, does not write an effect row,
+and does not change upgrade readiness. One decision per run: the same request
+returns the stored row, and a different request or decision conflicts.
+`cadence app run show` includes the row after a daemon restart.
+
+An accepted artifact whose text has a `## Proposed next steps` section can
+become one host issue. The index is 1-based. At least two proposals are
+required, and only the chosen one is written:
+
+```sh
+cadence app run ticket <run-id> \
+  --request-id <ticket-request-id> \
+  --artifact-id <artifact-id> \
+  --digest <sha256-digest> \
+  --index 1 \
+  --project <project-key>
+```
+
+The daemon parses the section and reserves that suggestion. The CLI then
+creates one tracker issue through the existing issue writer. The body
+records the accept decision, run, artifact and digest, plus a
+`cadence-app-ticket-request:` marker, and the command binds the issue
+id. Repeating the command returns that issue. A different index or
+request conflicts, so the unselected proposals are not written. Decline
+cannot reserve a ticket.
+A crash after the issue commit and before the bind retries onto the marker
+instead of creating a second issue; two markers for one request refuse.
+
 ## Approval and recovery boundaries
 
 Installation capability approval, run execution approval, any priced provider

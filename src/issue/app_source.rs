@@ -816,7 +816,7 @@ fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
                 continue;
             }
             // CAD-1867: skills/<tag>/<member> — the package manifest, flat
-            // root text leaves, and one scripts/ or references/ subdirectory.
+            // root text leaves, and scripts/ and references/ subdirectories.
             if top_text == "skills" {
                 match kind_at(&sub, &leaf)? {
                     libc::S_IFDIR => {

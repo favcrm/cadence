@@ -535,7 +535,7 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
                 }
             }
             // CAD-1867: skills/<tag>/<member> — the package manifest, flat
-            // root text leaves, and one scripts/ or references/ subdirectory.
+            // root text leaves, and scripts/ and references/ subdirectories.
             // `Root::read` opens O_NOFOLLOW and refuses hard links, so a
             // package member is always the file the digest covered.
             Some(libc::S_IFDIR) if name.as_str() == "skills" => {

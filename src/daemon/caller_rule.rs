@@ -721,6 +721,18 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_run_show", Rule::Handler("operator_connection (CAD-631)")),
     ("app_run_list", Rule::Handler("operator_connection (CAD-631)")),
     ("app_run_artifact", Rule::Handler("assigned turn or operator (CAD-631)")),
+    (
+        "app_run_disposition",
+        Rule::Handler("operator_connection (CAD-1887): reviewed artifact decision, no release"),
+    ),
+    (
+        "app_run_ticket_reserve",
+        Rule::Handler("operator_connection (CAD-1887): one selected proposal"),
+    ),
+    (
+        "app_run_ticket_bind",
+        Rule::Handler("operator_connection (CAD-1887): bind the reserved issue"),
+    ),
     ("app_binding_quote", Rule::Handler("operator_connection and exact current binding (CAD-632)")),
     // CAD-1177: standalone (no run/agent/team) screen tool invocation —
     // operator connection + the live mount's server-bound action context,

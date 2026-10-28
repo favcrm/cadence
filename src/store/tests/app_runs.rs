@@ -1445,3 +1445,295 @@ fn cad1142_reason_class_is_bounded_and_never_echoes() {
         assert!(!class.contains("leaked") && !class.contains("abc"));
     }
 }
+
+const TWO_PROPOSALS: &str = "\
+## Recorded decisions
+
+The group agreed to keep the current lunch hours.
+
+## Proposed next steps
+
+- Publish the Tuesday menu on the board.
+- Ask the vendor for a written quote.
+
+## Notes
+
+This line is not a proposal.
+";
+
+const ONE_PROPOSAL: &str = "\
+## Proposed next steps
+
+- Publish the Tuesday menu on the board.
+";
+
+fn reviewed_text_run(markdown: &str) -> (TempDir, Store, String, String, String) {
+    let (dir, s, run) = runtime_fixture();
+    let id = run["id"].as_str().unwrap().to_string();
+    s.app_run_decide(
+        &id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
+    let dispatched = s.app_run_dispatch(&id, "sha256:bundle").unwrap();
+    let produce_step = dispatched["steps"][0]["step_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let writer = start_local_step(&s, &dispatched, 0, "writer");
+    let envelope = json!({
+        "schema": 1,
+        "kind": "produce_text",
+        "run_id": id,
+        "step_id": produce_step,
+        "revision": 1,
+        "outcome": "succeeded",
+        "artifacts": [{"media_type": "text/markdown", "text": markdown}],
+    });
+    s.finish(
+        &writer,
+        "completed",
+        &json!({"turn_id": writer.turn_id, "text": envelope.to_string()}),
+        None,
+    )
+    .unwrap();
+    let next = s.app_run_dispatch(&id, "sha256:bundle").unwrap();
+    let review_step = next["steps"][1]["step_id"].as_str().unwrap().to_string();
+    let reviewer = start_local_step(&s, &next, 1, "reviewer");
+    let artifact = next["artifacts"][0]["id"].as_str().unwrap().to_string();
+    let fetched = s
+        .app_artifact_with_digest(
+            &artifact,
+            Some((&reviewer.id, reviewer.turn_id.as_deref().unwrap())),
+            "sha256:bundle",
+        )
+        .unwrap();
+    let digest = fetched["digest"].as_str().unwrap().to_string();
+    let response = json!({
+        "schema": 1,
+        "kind": "review_text",
+        "run_id": id,
+        "step_id": review_step,
+        "revision": 1,
+        "producer_step_id": produce_step,
+        "producer_revision": 1,
+        "artifact_sha256": digest,
+        "decision": "approve",
+        "rationale": "The proposals are in the source.",
+    });
+    s.finish(
+        &reviewer,
+        "completed",
+        &json!({"turn_id": reviewer.turn_id, "text": response.to_string()}),
+        None,
+    )
+    .unwrap();
+    assert_eq!(s.app_run_show(&id).unwrap()["state"], "succeeded");
+    (dir, s, id, artifact, digest)
+}
+
+fn flipped_digest(digest: &str) -> String {
+    let mut chars: Vec<char> = digest.chars().collect();
+    chars[7] = if chars[7] == '0' { '1' } else { '0' };
+    chars.into_iter().collect()
+}
+
+#[test]
+fn cad1887_fresh_schema_includes_the_operator_decision_tables() {
+    let schema = crate::store::app_runs::SCHEMA;
+    let delta = crate::store::app_runs::OPERATOR_DECISION_SCHEMA;
+    assert!(
+        schema.contains(delta),
+        "a fresh store must create the same disposition tables the v59 migration adds"
+    );
+}
+
+#[test]
+fn cad1887_proposed_steps_parser_keeps_only_the_section() {
+    let steps = crate::store::app_runs::parse_proposed_steps(TWO_PROPOSALS).unwrap();
+    assert_eq!(
+        steps,
+        vec![
+            "Publish the Tuesday menu on the board.".to_string(),
+            "Ask the vendor for a written quote.".to_string(),
+        ]
+    );
+    assert_eq!(
+        crate::store::app_runs::parse_proposed_steps(ONE_PROPOSAL)
+            .unwrap()
+            .len(),
+        1
+    );
+    let prose = "## Proposed next steps\n\n- One\nAlso this\n- Two\n";
+    assert!(crate::store::app_runs::parse_proposed_steps(prose)
+        .unwrap_err()
+        .to_string()
+        .contains("not a single proposal"));
+    assert!(
+        crate::store::app_runs::parse_proposed_steps("No heading\n- One\n- Two\n")
+            .unwrap_err()
+            .to_string()
+            .contains("no Proposed next steps")
+    );
+    let twice = format!("{TWO_PROPOSALS}\n## Proposed next steps\n\n- Again\n- Twice\n");
+    assert!(crate::store::app_runs::parse_proposed_steps(&twice)
+        .unwrap_err()
+        .to_string()
+        .contains("more than one"));
+}
+
+#[test]
+fn cad1887_disposition_accepts_one_proposal_and_tickets_only_with_two() {
+    let (_dir, s, id, artifact, digest) = reviewed_text_run(ONE_PROPOSAL);
+    assert!(s.app_run_show(&id).unwrap()["disposition"].is_null());
+    let accepted = s
+        .app_run_disposition(&id, "decision-1", &artifact, &digest, "accept", None)
+        .unwrap();
+    assert_eq!(accepted["decision"], "accept");
+    assert_eq!(accepted["replayed"], false);
+    let err = s
+        .app_run_ticket_reserve(&id, "ticket-1", &artifact, &digest, 1, None)
+        .unwrap_err();
+    assert!(err.to_string().contains("at least two"), "{err}");
+    let upgrade_before = s
+        .app_install_upgrade_ready("install-1")
+        .err()
+        .map(|e| e.to_string());
+    let upgrade_after = s
+        .app_install_upgrade_ready("install-1")
+        .err()
+        .map(|e| e.to_string());
+    assert_eq!(upgrade_before, upgrade_after);
+}
+
+#[test]
+fn cad1887_decline_is_durable_and_blocks_a_ticket() {
+    let (_dir, s, id, artifact, digest) = reviewed_text_run(TWO_PROPOSALS);
+    let declined = s
+        .app_run_disposition(&id, "decision-1", &artifact, &digest, "decline", None)
+        .unwrap();
+    assert_eq!(declined["decision"], "decline");
+    let replay = s
+        .app_run_disposition(&id, "decision-1", &artifact, &digest, "decline", None)
+        .unwrap();
+    assert_eq!(replay["replayed"], true);
+    let err = s
+        .app_run_disposition(&id, "decision-2", &artifact, &digest, "accept", None)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("already has an operator decision"),
+        "{err}"
+    );
+    let err = s
+        .app_run_ticket_reserve(&id, "ticket-1", &artifact, &digest, 1, None)
+        .unwrap_err();
+    assert!(err.to_string().contains("accepted disposition"), "{err}");
+    assert_eq!(s.app_run_show(&id).unwrap()["state"], "succeeded");
+    assert!(s.app_run_show(&id).unwrap()["ticket"].is_null());
+}
+
+#[test]
+fn cad1887_one_selected_ticket_survives_restart_and_refuses_the_rest() {
+    let (dir, s, id, artifact, digest) = reviewed_text_run(TWO_PROPOSALS);
+    s.write_tx(|conn| {
+        let tx = &mut *conn;
+        tx.execute(
+            "UPDATE app_run_reviews SET reviewer='writer' WHERE run_id=?",
+            [&id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let err = s
+        .app_run_disposition(&id, "decision-1", &artifact, &digest, "accept", None)
+        .unwrap_err();
+    assert!(err.to_string().contains("producer"), "{err}");
+    s.write_tx(|conn| {
+        let tx = &mut *conn;
+        tx.execute(
+            "UPDATE app_run_reviews SET reviewer='reviewer' WHERE run_id=?",
+            [&id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let err = s
+        .app_run_disposition(
+            &id,
+            "decision-1",
+            &artifact,
+            &flipped_digest(&digest),
+            "accept",
+            None,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("digest"), "{err}");
+    let accepted = s
+        .app_run_disposition(&id, "decision-1", &artifact, &digest, "accept", None)
+        .unwrap();
+    assert_eq!(accepted["replayed"], false);
+    assert_eq!(
+        s.app_run_disposition(&id, "decision-1", &artifact, &digest, "accept", None)
+            .unwrap()["replayed"],
+        true
+    );
+    let reserved = s
+        .app_run_ticket_reserve(&id, "ticket-1", &artifact, &digest, 1, None)
+        .unwrap();
+    assert_eq!(
+        reserved["suggestion"],
+        "Publish the Tuesday menu on the board."
+    );
+    assert_eq!(reserved["count"], 2);
+    assert!(reserved["issue_id"].is_null());
+    assert_eq!(reserved["replayed"], false);
+    let replay = s
+        .app_run_ticket_reserve(&id, "ticket-1", &artifact, &digest, 1, None)
+        .unwrap();
+    assert_eq!(replay["replayed"], true);
+    let err = s
+        .app_run_ticket_reserve(&id, "ticket-2", &artifact, &digest, 2, None)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("already has a selected ticket"),
+        "{err}"
+    );
+    let err = s
+        .app_run_ticket_bind(&id, "ticket-1", "not-an-issue", None)
+        .unwrap_err();
+    assert!(err.to_string().contains("Invalid issue id"), "{err}");
+    let bound = s
+        .app_run_ticket_bind(&id, "ticket-1", "CAD-1887", None)
+        .unwrap();
+    assert_eq!(bound["issue_id"], "CAD-1887");
+    assert_eq!(bound["replayed"], false);
+    assert_eq!(
+        s.app_run_ticket_bind(&id, "ticket-1", "CAD-1887", None)
+            .unwrap()["replayed"],
+        true
+    );
+    let err = s
+        .app_run_ticket_bind(&id, "ticket-1", "CAD-1", None)
+        .unwrap_err();
+    assert!(err.to_string().contains("different issue"), "{err}");
+    let shown = s.app_run_show(&id).unwrap();
+    assert_eq!(shown["disposition"]["decision"], "accept");
+    assert_eq!(shown["ticket"]["issue_id"], "CAD-1887");
+    assert_eq!(
+        shown["ticket"]["suggestion"],
+        "Publish the Tuesday menu on the board."
+    );
+    assert_ne!(
+        shown["ticket"]["suggestion"],
+        "Ask the vendor for a written quote."
+    );
+    assert_eq!(shown["state"], "succeeded");
+    drop(s);
+    let reopened = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+    let shown = reopened.app_run_show(&id).unwrap();
+    assert_eq!(shown["disposition"]["decision"], "accept");
+    assert_eq!(shown["ticket"]["issue_id"], "CAD-1887");
+    assert_eq!(shown["ticket"]["index"], 1);
+}

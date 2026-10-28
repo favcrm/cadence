@@ -121,7 +121,9 @@ pub use migration::{
 /// v58 records the operator's per-install automatic-update choice. The row
 /// is a preference, not a grant: a routine checked release may apply, and a
 /// release that changes declared access still waits for Apply.
-pub const SCHEMA_VERSION: i64 = 58;
+/// v59 (CAD-1887) adds one operator disposition per succeeded run and at
+/// most one selected ticket. Neither publishes the artifact.
+pub const SCHEMA_VERSION: i64 = 59;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
