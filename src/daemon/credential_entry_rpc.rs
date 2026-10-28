@@ -119,6 +119,10 @@ fn context_digest(context: &EntryContextV1) -> Result<String> {
 /// an agent participant (the chat surface). It cannot carry a secret; the
 /// browser fills that in on the trusted entry page.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 pub(crate) struct AgentCredentialIntent {
     pub provider: String,
     pub verb: CredentialVerb,
@@ -1021,6 +1025,10 @@ fn error_code(error: &Error) -> &'static str {
 /// authenticated agent participant. The participant UID and conversation
 /// come from the authenticated server context, never from model arguments;
 /// model text can at most ask the parent to call this.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 pub(crate) fn create_agent_credential_request(
     shared: &Shared,
     participant_uid: &str,

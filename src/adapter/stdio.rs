@@ -313,6 +313,10 @@ impl StdioAdapter {
     /// process runs inside the measured OCI runtime, and this transport only
     /// carries its stdin/stdout. The reader thread demultiplexes stdout; a
     /// console EOF marks the endpoint disconnected exactly like a child exit.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) fn adopt_console(
         self: &Arc<Self>,
         console: crate::protected_runtime::console::OwnerConsole,
