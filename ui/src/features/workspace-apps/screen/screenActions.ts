@@ -299,8 +299,8 @@ async function listDestinations(args: Record<string, unknown>, ctx: ActionContex
   return { ok: true, data: { unavailable: reply.unavailable, destinations: reply.destinations.map(value => ({ destination_id: value.destination_id, label: accountLabel(value.label || value.destination_id) })) } };
 }
 
-/** `publish.destination.use`: a host-drawn tap points the install's publication binding at one of the
- *  company's accounts. The label comes from the company's list, never from the frame. */
+/** `publish.destination.use`: the install's own publication binding points at one of the
+ *  company's accounts. The account comes from the company's list, never from the frame. */
 async function planUseDestination(ctx: ActionContext, args: Record<string, unknown>): Promise<SlotPlan | ActionRefusal> {
   if (!exact(args, ["destination_id"]) || typeof args.destination_id !== "string") return { code: "bad_args", text: "That request is not valid." };
   const slot = sendSlot(ctx.installation);
@@ -384,6 +384,12 @@ function openLink(args: Record<string, unknown>, ui: { showLink(url: string): vo
   return { ok: true, data: {} };
 }
 
+/** Execute a planner as a direct call: the same validation and daemon write,
+ *  with no host-drawn tap. */
+async function runPlan(plan: SlotPlan | ActionRefusal): Promise<ActionResult> {
+  return "code" in plan ? { ok: false, refusal: plan } : plan.run();
+}
+
 /** The direct (non-spending) verbs. The set is closed in `screenProtocol`. */
 export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string, unknown>,
   ui: Parameters<ScreenActions["call"]>[2] & { navigate?: (path: string) => void; assign?: (url: string) => void }): Promise<ActionResult> {
@@ -403,6 +409,8 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "social.drafts.publish.stage": () => socialDraftCall(verb,args,ui),
     "social.sources.show": () => socialDraftCall(verb,args,ui),
     "social.sources.save": () => socialDraftCall(verb,args,ui),
+    "publish.destination.use": async () => runPlan(await planUseDestination(ctx, args)),
+    "publish.settings.save": async () => runPlan(await planSavePublishSettings(ctx, args)),
     "media.read": () => mediaRead(args, ui),
     "media.chat.attach": () => mediaChatAttach(args, ui),
     "media.publish": () => mediaPublish(args, ui),
@@ -634,12 +642,10 @@ export function makePlanner(get: () => ActionContext): Planner {
     if (!(SLOT_VERBS as readonly string[]).includes(verb)) return Promise.resolve({ code: "forbidden", text: "This operation requires the records service." });
     const table: Record<(typeof SLOT_VERBS)[number], () => Promise<SlotPlan | ActionRefusal>> = {
       "run.start": () => planRunStart(get(), args),
-      "publish.destination.use": () => planUseDestination(get(), args),
       "publish.draft.confirm": () => planConfirmPublish(get(), args, ui?.actionToken),
       "publish.draft.schedule": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
       "publish.draft.reschedule": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
       "publish.draft.cancel": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
-      "publish.settings.save": () => planSavePublishSettings(get(), args),
       "media.original.download": () => planOriginalDownload(get, args, ui),
       "social.image.pick": () => planImagePick(args, ui),
     };
