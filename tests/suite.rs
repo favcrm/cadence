@@ -102,6 +102,7 @@ mod cad1752_recruit_refusal_acceptance;
 mod cad1767_followup_acceptance;
 mod cad1772_recruit_page_acceptance;
 mod cad1853_cloud_agent_guard_acceptance;
+mod cad1901_memory_project_access_acceptance;
 mod cad508_restart_window;
 mod cad760_board_four_tuple_acceptance;
 mod cad832_sharing_refusal;
