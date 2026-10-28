@@ -1028,7 +1028,14 @@ impl Shared {
         let membership = public_membership::MembershipMode::capture(&hosted, &|name| {
             opts.provider_env.var(name)
         });
-        Self::new_leased(state_dir, opts, hot, lease, seam, membership)
+        let (shared, prepared) = Self::new_leased(state_dir, opts, hot, lease, seam, membership)?;
+        // Ordinary construction stays back-reference free so fixtures can set
+        // private fields before the Arc escapes; a protected profile installs
+        // its coordinator here because no serve path is involved.
+        if prepared.is_some() {
+            protected_runtime::initialize(&shared, prepared)?;
+        }
+        Ok(shared)
     }
 
     /// `new_hot` over an already-resolved lease and seam — `serve`
@@ -1041,7 +1048,7 @@ impl Shared {
         lease: Option<Arc<crate::lease::LeaseCtl>>,
         seam: Option<crate::test_seam::Seam>,
         membership: public_membership::MembershipMode,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<(Arc<Self>, Option<protected_runtime::PreparedProtection>)> {
         // Backstop for the armed-fixture seal applied at the entry
         // points (`new_hot` above, `serve_with`): idempotent — an
         // already-sealed env validates and writes nothing — so it
@@ -1358,7 +1365,6 @@ impl Shared {
                 wiki_pm_lease,
             ),
         });
-        protected_runtime::initialize(&shared, prepared)?;
         #[cfg(test)]
         if let Some(observer) = &opts.custody_acceptance_shared {
             *observer.lock().unwrap() = Some(shared.clone());
@@ -1405,7 +1411,7 @@ impl Shared {
         }
         // Hosted completion retries run after the socket is bound. Doing
         // them here would hold startup on each remote timeout.
-        Ok(shared)
+        Ok((shared, prepared))
     }
 
     fn wake(&self) {
@@ -5992,7 +5998,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     let hot = hot_restart_begin(state_dir);
     let membership =
         public_membership::MembershipMode::capture(&hosted, &|name| opts.provider_env.var(name));
-    let shared = Shared::new_leased(state_dir, &opts, hot, lease, seam, membership)?;
+    let (shared, prepared) = Shared::new_leased(state_dir, &opts, hot, lease, seam, membership)?;
+    // Two-phase init: the backend/coordinator holds a Weak back-reference, so
+    // it is installed only after the Arc exists and before the listener binds.
+    protected_runtime::initialize(&shared, prepared)?;
     if let Some(heartbeat) = &lease_heartbeat {
         heartbeat.attach(&shared);
     }
