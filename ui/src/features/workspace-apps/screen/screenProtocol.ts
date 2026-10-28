@@ -102,10 +102,13 @@ export function parseScreenDrawerCall(verb: ScreenDrawerVerb, args: ActionArgs):
 
 /** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the
  *  port. `call` verbs never spend or publish: the install's own config and
- *  drafts run directly. Every spend, publish or custody verb is a `slot` verb
+ *  drafts, and the user's own follow-ups to an approved post (reschedule,
+ *  cancel), run directly. Every approval is a host-drawn slot: confirm for
+ *  publish-now and schedule for a scheduled post (the scheduler sends it with
+ *  no later confirm). Every spend, publish or custody verb is a `slot` verb
  *  and waits for a tap on a host-drawn button. */
-export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "publish.destination.use", "publish.settings.save", "media.read", "media.publish", "media.chat.attach"] as const;
-export const SLOT_VERBS = ["run.start", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "media.original.download", "social.image.pick"] as const;
+export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "publish.destination.use", "publish.settings.save", "publish.draft.reschedule", "publish.draft.cancel", "media.read", "media.publish", "media.chat.attach"] as const;
+export const SLOT_VERBS = ["run.start", "publish.draft.confirm", "publish.draft.schedule", "media.original.download", "social.image.pick"] as const;
 /** CAD-1365 — the protected original download slot. Qualified per mount
  *  (screen-media.v1 + media.read + live token); never a generic action verb. */
 export const ORIGINAL_DOWNLOAD_VERB = "media.original.download" as const;

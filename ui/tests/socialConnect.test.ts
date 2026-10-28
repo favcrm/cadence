@@ -1,4 +1,4 @@
-import { runCall, type ActionContext } from "../src/features/workspace-apps/screen/screenActions";
+import { makePlanner, runCall, type ActionContext } from "../src/features/workspace-apps/screen/screenActions";
 import { accountLabel, connectOutcome, connectReturnTo, connectToast, publishAllowed, publicationBinding, sendSlot, withoutConnectParams } from "../src/features/workspace-apps/socialConnect";
 import type { AppBinding, Installation } from "../src/features/workspace-apps/workspaceApps";
 
@@ -112,6 +112,44 @@ async function main() {
   assert(fresh.ok, "creates the binding");
   const sent = calls[calls.length - 1].body as Record<string, unknown>;
   assert(typeof sent.request_id === "string" && !("expected_revision" in sent), "create carries a request id and no revision");
+
+  // CAD-1905: the user's own follow-ups to an approved post (reschedule, cancel) are direct
+  // calls. Every approval stays a host-drawn slot: confirm for publish-now, and schedule for a
+  // scheduled post, which the scheduler sends with no later confirm.
+  const token = "ab".repeat(32);
+  const effect = "sfx_install_1";
+  const due = Math.floor(Date.now() / 1000) + 3600;
+  replies = { "/api/app-social-drafts/reschedule": { body: { ok: 2 } }, "/api/app-social-drafts/cancel": { body: { ok: 3 } } };
+  let reloads = 0;
+  const direct = (verb: string, args: Record<string, unknown>, actionToken: string | null = token) =>
+    runCall(ctx(() => { reloads += 1; }), verb as Parameters<typeof runCall>[1], args, { ...ui, actionToken: actionToken ?? undefined });
+  calls.length = 0;
+  for (const [verb, args, path] of [
+    ["publish.draft.reschedule", { alias: "social.draft", effect_id: effect, due_epoch: due + 60 }, "reschedule"],
+    ["publish.draft.cancel", { alias: "social.draft", effect_id: effect }, "cancel"],
+  ] as const) {
+    const done = await direct(verb, { ...args });
+    assert(done.ok, `${verb} runs directly`);
+    const sentCall = calls[calls.length - 1];
+    assert(sentCall.path.endsWith(`/api/app-social-drafts/${path}`), `${verb} reaches its daemon route`);
+    const body = sentCall.body as Record<string, unknown>;
+    equal(body.tool_alias, "social.draft", "alias is host-mapped");
+    equal(body.action_token, token, "the host-held mount token is sent");
+    equal(body.effect_id, effect, "only the named effect travels");
+    assert(!("digest" in body) && !("revision" in body), "no frame-supplied digest or revision");
+  }
+  equal(reloads, 2, "each action reloads the board");
+  const before = calls.length;
+  assert(!(await direct("publish.draft.reschedule", { alias: "social.draft", effect_id: effect, due_epoch: due }, null)).ok, "no mount token: refused before any request");
+  assert(!(await direct("publish.draft.reschedule", { alias: "social.draft", effect_id: effect, due_epoch: due, digest: "sha256:forged" })).ok, "an extra field is refused");
+  assert(!(await direct("publish.draft.reschedule", { alias: "social.draft", effect_id: effect, due_epoch: 1 })).ok, "a past time is refused");
+  assert(!(await direct("publish.draft.cancel", { alias: "social.draft", effect_id: "../x" })).ok, "a malformed effect id is refused");
+  // The approvals are never frame calls: a frame cannot schedule or confirm a post by itself.
+  assert(!(await direct("publish.draft.schedule", { alias: "social.draft", effect_id: effect, due_epoch: due })).ok, "schedule is not a direct call");
+  assert(!(await direct("publish.draft.confirm", { alias: "social.draft", effect_id: effect })).ok, "confirm is not a direct call");
+  equal(calls.length, before, "refusals make no daemon request");
+  const asSlot = await makePlanner(() => ctx())("publish.draft.schedule", { alias: "social.draft", effect_id: effect, due_epoch: due }, { actionToken: token });
+  assert(!("code" in asSlot), "schedule is planned as a host-drawn slot");
 }
 
 main().then(() => console.log("socialConnect ok"));

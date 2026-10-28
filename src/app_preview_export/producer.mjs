@@ -89,7 +89,10 @@ new ConditionalGet((input, init) => fetch(input, init), () => `${sessionKey() ??
 //#region src/features/workspace-apps/screen/screenProtocol.ts
 /** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the
 *  port. `call` verbs never spend or publish: the install's own config and
-*  drafts run directly. Every spend, publish or custody verb is a `slot` verb
+*  drafts, and the user's own follow-ups to an approved post (reschedule,
+*  cancel), run directly. Every approval is a host-drawn slot: confirm for
+*  publish-now and schedule for a scheduled post (the scheduler sends it with
+*  no later confirm). Every spend, publish or custody verb is a `slot` verb
 *  and waits for a tap on a host-drawn button. */
 var CALL_VERBS = [
 	"read.run",
@@ -108,6 +111,8 @@ var CALL_VERBS = [
 	"social.destinations.list",
 	"publish.destination.use",
 	"publish.settings.save",
+	"publish.draft.reschedule",
+	"publish.draft.cancel",
 	"media.read",
 	"media.publish",
 	"media.chat.attach"
@@ -116,8 +121,6 @@ var SLOT_VERBS = [
 	"run.start",
 	"publish.draft.confirm",
 	"publish.draft.schedule",
-	"publish.draft.reschedule",
-	"publish.draft.cancel",
 	"media.original.download",
 	"social.image.pick"
 ];
@@ -780,7 +783,7 @@ function screenProjection(installation, tag, contextId, contexts, runs, effects,
 //#region scripts/app-fixtures/producer.ts
 var MAX_INPUT = 1048576;
 var MAX_OUTPUT = 8388608;
-var CONTRACT = "app-screen-projection-fixtures/5";
+var CONTRACT = "app-screen-projection-fixtures/6";
 var NOW = 1799999e3;
 var SCENARIOS = [
 	"empty",

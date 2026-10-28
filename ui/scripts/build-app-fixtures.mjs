@@ -11,7 +11,7 @@ const ui = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repo = resolve(ui, "..");
 const artifact = resolve(repo, "src/app_preview_export/producer.mjs");
 const baselinePath = resolve(repo, "src/app_preview_export/baseline.json");
-const contract = "app-screen-projection-fixtures/5";
+const contract = "app-screen-projection-fixtures/6";
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
 const fail = message => { console.error(`app fixture drift: ${message}`); process.exitCode = 1; };
 
