@@ -253,12 +253,15 @@ impl<'de> Deserialize<'de> for FilesMap {
 /// raw `Value`s for the field-count/schema gate in
 /// [`workspace_upgrade_transport`]. The wire shape is closed: only
 /// `files`, `source`, `expected_digest`, `expected_generation`,
-/// `expected_new_digest`, `request_id`.
+/// `expected_new_digest`, `request_id`, and — on an apply, not a check —
+/// the optional automatic-consent pair `automatic` + `observed_approval`.
 struct UpgradeWire {
     files: Option<Vec<(String, String)>>,
     source: Option<Value>,
     catalogue: Option<CatalogueWire>,
     catalogue_resolution: Option<String>,
+    automatic: Option<Value>,
+    observed_approval: Option<Value>,
     fields: serde_json::Map<String, Value>,
 }
 
@@ -276,6 +279,8 @@ impl<'de> Deserialize<'de> for UpgradeWire {
             "request_id",
             "catalogue",
             "catalogue_resolution",
+            "automatic",
+            "observed_approval",
         ];
         struct WireVisitor;
         impl<'de> Visitor<'de> for WireVisitor {
@@ -291,6 +296,8 @@ impl<'de> Deserialize<'de> for UpgradeWire {
                 let mut source: Option<Value> = None;
                 let mut catalogue: Option<CatalogueWire> = None;
                 let mut catalogue_resolution: Option<String> = None;
+                let mut automatic: Option<Value> = None;
+                let mut observed_approval: Option<Value> = None;
                 let mut fields = serde_json::Map::new();
                 let mut seen: HashSet<String> = HashSet::new();
                 while let Some(key) = map.next_key::<String>()? {
@@ -313,6 +320,12 @@ impl<'de> Deserialize<'de> for UpgradeWire {
                         "catalogue_resolution" => {
                             catalogue_resolution = Some(map.next_value::<String>()?);
                         }
+                        "automatic" => {
+                            automatic = Some(map.next_value::<Value>()?);
+                        }
+                        "observed_approval" => {
+                            observed_approval = Some(map.next_value::<Value>()?);
+                        }
                         _ => {
                             fields.insert(key, map.next_value::<Value>()?);
                         }
@@ -328,6 +341,8 @@ impl<'de> Deserialize<'de> for UpgradeWire {
                     source,
                     catalogue,
                     catalogue_resolution,
+                    automatic,
+                    observed_approval,
                     fields,
                 })
             }
@@ -525,6 +540,8 @@ fn workspace_upgrade_transport(
         source,
         catalogue,
         catalogue_resolution,
+        automatic,
+        observed_approval,
         fields,
     } = wire;
     let catalogue = match catalogue_params(catalogue, catalogue_resolution) {
@@ -567,6 +584,10 @@ fn workspace_upgrade_transport(
             "upgrade body has missing or unsupported fields",
         ));
     }
+    let claim = match automatic_upgrade_claim(method, automatic, observed_approval) {
+        Ok(claim) => claim,
+        Err(message) => return Err(err_response(400, message)),
+    };
     if let Some(files) = files {
         // `{files}` mode — server-derived `source` via secure staging.
         // `files` is already the strict duplicate-free Vec<(path,text)>.
@@ -594,6 +615,7 @@ fn workspace_upgrade_transport(
         params["source"] = json!(source);
         params["install_id"] = json!(id);
         merge_catalogue(&mut params, catalogue);
+        merge_automatic(&mut params, &claim);
         Ok((params, Some(staging)))
     } else {
         // Legacy `source` mode — the validated path/URL passes through
@@ -609,7 +631,45 @@ fn workspace_upgrade_transport(
         params["source"] = source;
         params["install_id"] = json!(id);
         merge_catalogue(&mut params, catalogue);
+        merge_automatic(&mut params, &claim);
         Ok((params, None))
+    }
+}
+
+/// The automatic-consent pair is optional, and only on an apply. A check
+/// never carries it. A partial or contradictory pair is refused rather
+/// than treated as a manual upgrade, which would record fresh consent.
+fn automatic_upgrade_claim(
+    method: &str,
+    automatic: Option<Value>,
+    observed_approval: Option<Value>,
+) -> std::result::Result<Option<Value>, &'static str> {
+    match (method, automatic, observed_approval) {
+        ("app_workspace_upgrade", None, None) => Ok(None),
+        ("app_workspace_upgrade", Some(Value::Bool(true)), Some(Value::String(state)))
+            if state == "approved" =>
+        {
+            Ok(Some(
+                json!({"automatic": true, "observed_approval": "approved"}),
+            ))
+        }
+        ("app_workspace_upgrade", _, _) => {
+            Err("an automatic update must set automatic true and observed_approval \"approved\"")
+        }
+        (_, None, None) => Ok(None),
+        _ => Err("upgrade check does not accept automatic consent fields"),
+    }
+}
+
+fn merge_automatic(params: &mut Value, claim: &Option<Value>) {
+    let Some(extra) = claim else {
+        return;
+    };
+    let (Some(dest), Some(src)) = (params.as_object_mut(), extra.as_object()) else {
+        return;
+    };
+    for (key, value) in src {
+        dest.insert(key.clone(), value.clone());
     }
 }
 
@@ -1305,6 +1365,50 @@ pub(super) fn workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// An automatic apply forwards the consent pair. A manual apply omits
+    /// it. A partial pair, or the pair on a check, is a 400 and is not
+    /// forwarded as a manual upgrade.
+    #[test]
+    fn automatic_upgrade_claim_is_forwarded_and_closed() {
+        let admit = |body: &str| {
+            let wire: UpgradeWire = serde_json::from_str(body).unwrap();
+            match workspace_upgrade_transport("app_workspace_upgrade", "inst", wire) {
+                Ok(admitted) => admitted,
+                Err(_) => panic!("upgrade transport refused a closed body"),
+            }
+        };
+        let manual = r#"{"source":"/tmp/app","expected_digest":"sha256:aa","expected_generation":"gen","expected_new_digest":"sha256:bb","request_id":"req-1"}"#;
+        let (params, staging) = admit(manual);
+        assert!(staging.is_none());
+        assert!(params.get("automatic").is_none());
+        assert!(params.get("observed_approval").is_none());
+
+        let claimed = r#"{"source":"/tmp/app","expected_digest":"sha256:aa","expected_generation":"gen","expected_new_digest":"sha256:bb","request_id":"req-1","automatic":true,"observed_approval":"approved"}"#;
+        let (params, _) = admit(claimed);
+        assert_eq!(params["automatic"], json!(true));
+        assert_eq!(params["observed_approval"], json!("approved"));
+        assert_eq!(params["expected_digest"], json!("sha256:aa"));
+
+        for bad in [
+            r#"{"source":"/tmp/app","expected_digest":"sha256:aa","expected_generation":"gen","expected_new_digest":"sha256:bb","request_id":"req-1","automatic":true}"#,
+            r#"{"source":"/tmp/app","expected_digest":"sha256:aa","expected_generation":"gen","expected_new_digest":"sha256:bb","request_id":"req-1","automatic":false,"observed_approval":"approved"}"#,
+            r#"{"source":"/tmp/app","expected_digest":"sha256:aa","expected_generation":"gen","expected_new_digest":"sha256:bb","request_id":"req-1","observed_approval":"approved"}"#,
+            r#"{"source":"/tmp/app","expected_digest":"sha256:aa","expected_generation":"gen","expected_new_digest":"sha256:bb","request_id":"req-1","automatic":true,"observed_approval":"revoked"}"#,
+            r#"{"source":"/tmp/app","expected_digest":"sha256:aa","expected_generation":"gen","automatic":true,"observed_approval":"approved"}"#,
+        ] {
+            let wire: UpgradeWire = serde_json::from_str(bad).unwrap();
+            assert!(
+                workspace_upgrade_transport("app_workspace_upgrade", "inst", wire).is_err(),
+                "{bad}"
+            );
+        }
+
+        let check = r#"{"source":"/tmp/app","expected_digest":"sha256:aa","expected_generation":"gen","automatic":true,"observed_approval":"approved"}"#;
+        let wire: UpgradeWire = serde_json::from_str(check).unwrap();
+        assert!(workspace_upgrade_transport("app_workspace_upgrade_check", "inst", wire).is_err());
+    }
 
     /// The read route's shape: exactly the list, `<project>/<name>`, or
     /// one app's `runs` / `outputs` — no partial segment, no deeper

@@ -1,4 +1,4 @@
-import { installConsentAllowsAutomatic, mayApplyAutomatically, recordedPackageSource, releaseChangesReach, routineRelease } from "../src/features/explorer/automaticUpdates";
+import { automaticUpgradeClaim, installConsentAllowsAutomatic, mayApplyAutomatically, recordedPackageSource, releaseChangesReach, routineRelease } from "../src/features/explorer/automaticUpdates";
 import type { AccessDiff } from "../src/features/workspace-apps/workspaceApps";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
@@ -81,3 +81,4 @@ equal(installConsentAllowsAutomatic({ approved: false, approval: { state: "revok
 equal(installConsentAllowsAutomatic({ approved: null, approval: { state: "pending" } }), false, "an unapproved install does not apply on its own");
 equal(installConsentAllowsAutomatic({ approved: true, removed: 1, approval: { state: "approved" } }), false, "a removed install does not apply on its own");
 equal(installConsentAllowsAutomatic({ approved: true, state: "disabled", approval: { state: "approved" } }), false, "a disabled install does not apply on its own");
+equal(JSON.stringify(automaticUpgradeClaim()), JSON.stringify({ automatic: true, observed_approval: "approved" }), "an automatic apply carries the approval it observed");

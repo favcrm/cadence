@@ -2819,6 +2819,21 @@ impl Store {
             .optional()?
             .unwrap_or(json!({"state":"unapproved"})))
     }
+
+    /// The install's one consent row, whichever digest it currently names.
+    /// An automatic update compares this with the digest it observed before
+    /// the package fetch. No row means nobody has decided the install.
+    pub fn app_install_consent_current(&self, id: &str) -> Result<Value> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT digest,state FROM app_install_capabilities WHERE install_id=?",
+                [id],
+                |r| Ok(json!({"digest": r.get::<_, String>(0)?, "state": r.get::<_, String>(1)?})),
+            )
+            .optional()?
+            .unwrap_or(json!({"state": "unapproved"})))
+    }
 }
 
 pub(super) enum AppCompletionProof {

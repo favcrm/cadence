@@ -15,7 +15,7 @@ import { useInstallations } from "../workspace-apps/useInstallations";
 import { installationAppHref } from "../apps/appViewModel";
 import { AppGlyph, useModal } from "./shared";
 import { appErrorCopy, appLoadErrorCopy, isUnchangedUpgradeError } from "./appErrors";
-import { installConsentAllowsAutomatic, mayApplyAutomatically, recordedPackageSource, releaseChangesReach } from "./automaticUpdates";
+import { automaticUpgradeClaim, installConsentAllowsAutomatic, mayApplyAutomatically, recordedPackageSource, releaseChangesReach } from "./automaticUpdates";
 import { Loading, Notice } from "../app-shell/shared/States";
 import { useTranslate } from "../../lib/locale";
 import "./explorer.css";
@@ -215,7 +215,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
     expectedDigest: string;
     expectedGeneration: string;
     receipt: UpgradeProposal;
-  }) => {
+  }, mode: "automatic" | "manual") => {
     const { source, receipt, expectedDigest, expectedGeneration } = proposal;
     const requestedInstallId = proposal.installId;
     const request = ++applyRequest.current;
@@ -228,6 +228,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       expected_new_digest: receipt.digest,
       request_id: `upgrade-${crypto.randomUUID()}`,
       catalogue_resolution: "manual",
+      ...(mode === "automatic" ? automaticUpgradeClaim() : {}),
     })
       .then(async () => {
         await appExplorer.updateCheck(requestedInstallId).catch(() => undefined);
@@ -269,7 +270,10 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
           appExplorer.automaticUpdates(requestedInstallId),
         ]);
         if (!isCurrentRequest() || !preference.automatic || !installConsentAllowsAutomatic(fresh)) return;
-        applyKnown(proposal);
+        // The re-read above finishes before the server fetches the package.
+        // Carry the approval it saw; the server refuses the commit if that
+        // consent or the switch changed during the fetch.
+        applyKnown(proposal, "automatic");
       })
       .catch((e: unknown) => {
         if (!isCurrentRequest()) return;
@@ -371,7 +375,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
             {!!upgradeProposal.receipt.notes?.length && <ul className="hint mt-2">{upgradeProposal.receipt.notes.map((note, index) => <li key={index}>{note}</li>)}</ul>}
             {!!upgradeProposal.receipt.secret_warnings?.length && <p className="alert warn mt-2">{t("Package validation reported secret warnings; review the source before applying.")}</p>}
             {automatic && releaseChangesReach(upgradeProposal.receipt.access_diff) && <p className="hint mt-2">{t("This release changes what {title} can reach.").replace("{title}", () => inst.title)}</p>}
-            <div className="mt-3"><Button className="btn-primary btn-sm" disabled={!proposalMatchesCurrent || applying || !!upgradeProposal.receipt.secret_warnings?.length} onClick={() => applyKnown(upgradeProposal)}>{applying ? t("Applying…") : t("Apply checked update")}</Button></div>
+            <div className="mt-3"><Button className="btn-primary btn-sm" disabled={!proposalMatchesCurrent || applying || !!upgradeProposal.receipt.secret_warnings?.length} onClick={() => applyKnown(upgradeProposal, "manual")}>{applying ? t("Applying…") : t("Apply checked update")}</Button></div>
           </div>}
         </div>
 

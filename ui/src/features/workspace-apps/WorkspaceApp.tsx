@@ -58,7 +58,7 @@ import { screenFailurePane, type ScreenPaneState } from "./screen/screenFailure"
 import { socialPublish } from "./socialPublish";
 import { supportsSocialContentWorkspace } from "./socialContentSupport";
 import { isUnchangedUpgradeError } from "../explorer/appErrors";
-import { installConsentAllowsAutomatic, mayApplyAutomatically, recordedPackageSource, releaseChangesReach } from "../explorer/automaticUpdates";
+import { automaticUpgradeClaim, installConsentAllowsAutomatic, mayApplyAutomatically, recordedPackageSource, releaseChangesReach } from "../explorer/automaticUpdates";
 
 type Section =
   | "Board"
@@ -648,6 +648,9 @@ export default function WorkspaceApp({
       expected_new_digest: receipt.digest,
       request_id: retainedRequest(requestKey),
       catalogue_resolution: "manual",
+      // The caller's re-read is stale by the time the server finishes
+      // fetching. This claim is rechecked under the commit lock.
+      ...automaticUpgradeClaim(),
     });
     completeRequest(requestKey);
     setUpgradeProposal(null);

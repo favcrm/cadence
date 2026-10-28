@@ -598,7 +598,12 @@ export type UpgradeBody = {
  * catalog generation it was read under; a checked apply adds the new
  * bundle digest and a retained request id. */
 export type UpgradeCheckBody = UpgradeBody;
-export type UpgradeApplyBody = UpgradeBody & { expected_new_digest: string; request_id: string };
+export type UpgradeApplyBody = UpgradeBody & {
+  expected_new_digest: string;
+  request_id: string;
+  automatic?: true;
+  observed_approval?: "approved";
+};
 
 export const appExplorer = {
   catalog: (signal?: AbortSignal) => request<{ catalog: CatalogCard[] }>("/api/app-catalog", signal),

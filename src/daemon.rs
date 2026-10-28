@@ -233,6 +233,8 @@ pub(crate) mod custody_rpc;
 
 // CAD-1128 r2: the frozen acceptance check and its genuine fixture.
 // Both compile only under `test-seam`; production carries neither.
+#[cfg(all(test, feature = "test-seam"))]
+mod automatic_upgrade_consent;
 #[cfg(all(test, unix, feature = "test-seam"))]
 mod cached_return_tests;
 #[cfg(all(test, unix, feature = "test-seam"))]

@@ -23,6 +23,14 @@ export function recordedPackageSource(
   return source.url.trim();
 }
 
+/** What an automatic apply tells the server it saw. The server re-reads
+ *  this at commit, after the package fetch, and refuses the upgrade when
+ *  the install is no longer approved or the switch is off. A manual Apply
+ *  omits the pair; that click is itself the consent. */
+export function automaticUpgradeClaim(): { automatic: true; observed_approval: "approved" } {
+  return { automatic: true, observed_approval: "approved" };
+}
+
 /** Automatic apply is not consent. A removed, disabled, or
  *  not-yet-approved install stays off until someone approves it. */
 export function installConsentAllowsAutomatic(install: {
