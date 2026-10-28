@@ -537,7 +537,13 @@ function BlobPane({ page, blob, navHref, viewerSub }: {
             <track kind="captions" />
           </video>
         ) : blob === "pdf" && src ? (
-          <iframe className="wk-pdf" src={src} sandbox="" title={name} />
+          // Chrome's PDF viewer will not run in a fully sandboxed frame, and the sandbox stays:
+          // the blob opens in its own tab, where the browser's isolated viewer renders it.
+          <div className="wk-download">
+            <span className="chip bg-ink-800 text-ink-400">{kindLabel(name, page.mime)}</span>
+            <div className="wk-etitle">{name}</div>
+            <a className="btn btn-primary" href={src} target="_blank" rel="noopener noreferrer">{t("Open PDF")}</a>
+          </div>
         ) : (
           <div className="wk-download">
             <span className="chip bg-ink-800 text-ink-400">{kindLabel(name, page.mime)}</span>

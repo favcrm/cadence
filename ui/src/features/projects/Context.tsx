@@ -35,7 +35,9 @@ export default function Context({
   if (noWiki) {
     return (
       <main className="context-workspace" aria-label={`${project} context`}>
-        <div className="p-5 text-secondary text-ink-400">{t("The wiki isn’t available on this board.")}</div>
+        <div className="p-5 text-secondary text-ink-400">
+          {t("The wiki isn’t available on this board.")} <Link className="lnk" href={navHref({ screen: "home" })}>{t("Back to Home")}</Link>
+        </div>
       </main>
     );
   }

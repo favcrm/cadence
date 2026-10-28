@@ -169,13 +169,14 @@ async function blobTransportChecks() {
 
     await renderWiki("notes.pdf");
     equal(revoked.includes(videoUrl), true, "changing files revokes the old preview");
-    const frame = host.querySelector("iframe")!;
-    equal(frame.getAttribute("src")?.startsWith("blob:"), true, "PDF uses a local blob");
-    equal(frame.getAttribute("sandbox"), "", "PDF retains an opaque scriptless sandbox");
-    const pdfUrl = frame.getAttribute("src")!;
+    equal(host.querySelector("iframe"), null, "a PDF is never framed (Chrome's viewer cannot run in a sandboxed frame)");
+    const open = host.querySelector<HTMLAnchorElement>("a[target=_blank]")!;
+    equal(open.getAttribute("href")?.startsWith("blob:"), true, "PDF opens from a local blob");
+    equal(open.getAttribute("rel"), "noopener noreferrer", "the PDF tab cannot reach the board window");
+    const pdfUrl = open.getAttribute("href")!;
     await React.act(async () => pausePrivateReads());
     equal(revoked.includes(pdfUrl), true, "pausing reads revokes the PDF immediately");
-    equal(host.querySelector("iframe"), null, "paused private content disappears without another fetch");
+    equal(host.querySelector("a[target=_blank]"), null, "paused private content disappears without another fetch");
     allowPrivateReads();
 
     await renderWiki("unsafe.mp4");

@@ -1583,6 +1583,7 @@ Object.assign(zhTW, {
 
 Object.assign(zhTW, {
   "a team member": "團隊成員",
+  "Open PDF": "開啟 PDF",
   "extracting text — searchable once it finishes": "正在擷取文字 — 完成後即可搜尋",
   "indexed — searchable": "已建立索引 — 可搜尋",
   "saved, but no text was found in it": "已儲存，但在其中找不到文字",
