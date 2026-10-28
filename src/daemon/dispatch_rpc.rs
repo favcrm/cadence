@@ -286,6 +286,7 @@ impl Shared {
             None,
             authorized_until,
             selection,
+            None,
         )?;
         self.notify_agent(&alias);
         self.wake();

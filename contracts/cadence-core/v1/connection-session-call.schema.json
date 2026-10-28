@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SessionCallV1",
+  "type": "object",
+  "properties": {
+    "input_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "invocation_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "method": {
+      "$ref": "#/$defs/SessionMethodV1"
+    },
+    "session_object_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "task_key": {
+      "$ref": "#/$defs/Ident"
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "invocation_id",
+    "session_object_id",
+    "method",
+    "input_digest",
+    "task_key"
+  ],
+  "$defs": {
+    "Digest": {
+      "description": "`sha256:` plus 64 lowercase hex digits.",
+      "type": "string"
+    },
+    "Ident": {
+      "description": "Bounded printable ASCII identifier (`0x21..=0x7e`, 1..=128 bytes).",
+      "type": "string"
+    },
+    "SessionMethodV1": {
+      "type": "string",
+      "enum": [
+        "snapshot_v1",
+        "model_quote_v1",
+        "stage_send_v1",
+        "invoke_v1",
+        "result_v1"
+      ]
+    },
+    "UuidV1": {
+      "description": "Canonical lowercase UUID selector (`8-4-4-4-12`).",
+      "type": "string"
+    }
+  }
+}

@@ -405,27 +405,7 @@ impl Store {
     /// Bind a request post to the queued request message it created (CAD-821).
     /// Set once; a second, different binding is a conflict.
     pub fn topic_post_bind_request(&self, post: &str, message: &str) -> Result<()> {
-        self.write_tx(|conn| {
-            // Outer None: no such post. Inner None: the post is unbound.
-            let current: Option<Option<String>> = conn.query_opt(
-                "SELECT request_message FROM topic_posts WHERE id=?",
-                [post],
-                |r| r.get::<_, Option<String>>(0),
-            )?;
-            match current {
-                None => Err(Error::rejected("Request post not found")),
-                Some(Some(bound)) if bound != message => Err(Error::rejected(
-                    "Request post already bound to a different message",
-                )),
-                Some(_) => {
-                    conn.execute(
-                        "UPDATE topic_posts SET request_message=? WHERE id=?",
-                        params![message, post],
-                    )?;
-                    Ok(())
-                }
-            }
-        })
+        self.write_tx(|conn| bind_request_in(conn, post, message))
     }
 
     /// The request message a post is bound to, if any.
@@ -696,6 +676,29 @@ impl Store {
                 |r| r.get(0),
             )?)
         })
+    }
+}
+
+/// Reuse the set-once binding guard inside an existing queue transaction.
+pub(super) fn bind_request_in(conn: &impl StoreConn, post: &str, message: &str) -> Result<()> {
+    // Outer None: no such post. Inner None: the post is unbound.
+    let current: Option<Option<String>> = conn.query_opt(
+        "SELECT request_message FROM topic_posts WHERE id=?",
+        [post],
+        |r| r.get::<_, Option<String>>(0),
+    )?;
+    match current {
+        None => Err(Error::rejected("Request post not found")),
+        Some(Some(bound)) if bound != message => Err(Error::rejected(
+            "Request post already bound to a different message",
+        )),
+        Some(_) => {
+            conn.execute(
+                "UPDATE topic_posts SET request_message=? WHERE id=?",
+                params![message, post],
+            )?;
+            Ok(())
+        }
     }
 }
 

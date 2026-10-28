@@ -11,9 +11,21 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = ["wasm-abi"]
 wasm-abi = []
+# CAD-1085: the custody envelope primitive. Off by default, so the ordinary
+# `core.wasm` artifact carries no key/nonce/plaintext entry point; only the
+# separate private custody build enables these exports.
+custody-crypto = ["dep:chacha20poly1305"]
 
 [dependencies]
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_yaml = "0.9"
+# SHA-256 for the one canonical material/ledger digest (already locked by the
+# root crate; the algorithm is extracted from src/store/app_runs.rs).
+sha2 = "0.10"
+# The secret-bearing projection buffers are zeroized on drop in every build.
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+# CAD-1128's RustCrypto AEAD, alloc-only: the same primitive native custody
+# already uses. Optional; only `custody-crypto` pulls it in.
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"], optional = true }

@@ -2615,10 +2615,13 @@ mod fleet_check_tests {
             .unwrap_or("")
             .contains("no model configured"));
         assert_eq!(refused[2]["alias"], "dev-d");
+        // The padded id is refused as an invalid model id before the
+        // exact-membership allowlist is consulted; either refusal is
+        // fail-closed, and this one is the earlier, stronger check.
         assert!(refused[2]["reason"]
             .as_str()
             .unwrap_or("")
-            .contains("allowlist"));
+            .contains("not a valid model id"));
     }
 
     /// An absent policy allows nothing; the check must report that instead of

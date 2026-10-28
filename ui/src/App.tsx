@@ -33,6 +33,8 @@ import Memory from "./features/settings/Memory";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
 import Connections from "./features/settings/Connections";
+import CredentialEntry from "./features/connections/CredentialEntry";
+import CredentialAuthorize from "./features/connections/CredentialAuthorize";
 import EmailSending from "./features/settings/EmailSending";
 import SettingsLayout from "./features/settings/SettingsLayout";
 import Templates from "./features/templates/Templates";
@@ -93,6 +95,7 @@ import { useMaybeResource, useResource } from "./lib/useResource";
 import {
   goTo,
   locationHref,
+  matchRoute,
   openProject,
   projectScope,
   readLocation,
@@ -143,6 +146,8 @@ const SCREEN_LABEL: Record<Screen, string> = {
   outbox: "outbox",
   setup: "setup",
   settings: "settings",
+  credentialEntry: "secure form",
+  credentialAuthorize: "authorize entry",
   login: "sign in",
   issue: "issue",
   notFound: "not found",
@@ -176,6 +181,18 @@ function mergePersonalCard(previous: MyWorkList, card: IssueCard): MyWorkList {
 }
 
 export default function App() {
+  // CAD-1085: the trusted entry page is deliberately OUTSIDE AuthBoundary.
+  // It holds no credential, renders its selector-only "continue on the
+  // board" handoff even when signed out, and the auth POST document mounts
+  // it with the memory-only entry key.
+  const entry = matchRoute(window.location.pathname);
+  if (entry.screen === "credentialEntry") {
+    return (
+      <NavigationProvider adapter={hostNavigation}>
+        <CredentialEntry requestId={entry.requestId} />
+      </NavigationProvider>
+    );
+  }
   // Private room alerts share the admitted workspace's concealment and reset lifecycle.
   return <NavigationProvider adapter={hostNavigation}><AuthBoundary>{(meta, recheck) => <NotificationToastProvider><Workspace meta={meta} recheck={recheck} /></NotificationToastProvider>}</AuthBoundary></NavigationProvider>;
 }
@@ -1381,6 +1398,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             operator={meta.operator === true}
             onOpenWorkItem={(id) => openWorkItem(id, "threads")}
           />
+        )}
+        {route.screen === "credentialEntry" && (
+          <CredentialEntry key={route.requestId} requestId={route.requestId} />
+        )}
+        {route.screen === "credentialAuthorize" && (
+          <CredentialAuthorize key={route.requestId} requestId={route.requestId} />
         )}
         {screen === "outbox" && <Outbox operator={meta?.operator === true} onOpenIssue={openIssue} />}
         {screen === "setup" && (

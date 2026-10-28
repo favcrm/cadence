@@ -129,12 +129,11 @@ fn protected_profile_caller_elections_and_missing_authority_never_spawn() {
         );
         let request = policy::parse(&valid_args).expect("same valid supported routing DATA");
         let refused = dispatch_protected_request(request)
-            .err()
-            .expect("supported dispatcher admitted missing kernel caller custody");
+            .expect_err("supported dispatcher admitted missing kernel caller custody");
         assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(
             refused.to_string(),
-            "protected Pi owner authorization refused/UNKNOWN"
+            "protected split launch is not available; the native runtime owner is the only protected path"
         );
         assert_eq!(
             protected_effect_count(),

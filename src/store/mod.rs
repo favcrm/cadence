@@ -11,13 +11,24 @@
 //!   attention | stopping -> stopped | offline
 
 use crate::error::{Error, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod settings_authority;
 pub use settings_authority::{ProfileBody, SettingsDoc, SettingsSnapshot};
+/// CAD-1085: the native protected Connection authority (config, reviewed
+/// operation policy, manifest, one-use approval, quotes, immutable dispatch
+/// rows, settlement and the metadata-only protected ledger).
+pub(crate) mod connection_dispatch;
+/// CAD-1085: metadata-only human credential requests and their one-use entry
+/// attempts.
+pub(crate) mod credential_requests;
+/// CAD-1085: the broker-private native-model source/task/configuration/
+/// request rows. Registered here so they share the one forward migration and
+/// the protected authority journal.
+pub(crate) mod native_model_turn;
 mod platform;
 pub(crate) use platform::{scope_list, scope_name};
 pub use platform::{
@@ -26,6 +37,8 @@ pub use platform::{
     SCOPE_REVOKED_EVENT,
 };
 mod effects;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use effects::effect_bind_in;
 pub use effects::{
     presser_json, DraftRow, EffectKey, EffectRow, EFFECT_CANCELLED_EVENT, EFFECT_DECIDED_EVENT,
     EFFECT_EXECUTED_EVENT, EFFECT_FAILED_EVENT, EFFECT_NEEDS_YOU_EVENT, EFFECT_REQUESTED_EVENT,
@@ -139,9 +152,6 @@ pub(crate) mod seal;
 pub(crate) mod wiki_transfers;
 pub(crate) use schema::open_read_only;
 pub use schema::{AdoptEntry, ConsumedMarker, RecoveryOutcome, Take};
-pub(crate) use seal::owner::StoreOwnerGrant;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) use seal::owner::{Binding, Purpose};
 pub use seal::OpenMode;
 // `WriteTxn` is `pub` so the `ShutdownEntriesHook` test seam (a `pub`
 // `ServeOptions` field) can name it — it is an opaque facade to external
@@ -222,6 +232,22 @@ pub struct Store {
     /// in `seal.rs` read it; it is a local identity only, never
     /// authenticated restore/incarnation provenance.
     pub(super) db_identity: String,
+    /// CAD-1085: the external restore-watermark transport, installed by the
+    /// daemon before any boot-time authorizing write. Every protected
+    /// authorizing/accounting success is checkpointed here AFTER its writer
+    /// transaction commits and releases this store's lock. Missing writer =>
+    /// `runtime_unqualified`; a lost acknowledgement => `outcome_unknown`
+    /// plus a local fence, never a silent success.
+    pub(crate) protected_checkpoint:
+        std::sync::OnceLock<Arc<dyn crate::store::connection_dispatch::ProtectedCheckpointWriter>>,
+    /// CAD-1085 (NWAR-6): the monotone PROCESS admission fence. It is set the
+    /// instant a protected authorizing outcome becomes unknown — BEFORE the
+    /// guarded durable `fenced` write, which may itself fail — and is never
+    /// cleared in this process. Admission, boot authority, cached-result
+    /// re-authorization and the authorizing commit transaction all consult it;
+    /// metadata/status bookkeeping deliberately stays available for
+    /// reconciliation.
+    admission_fence: std::sync::atomic::AtomicBool,
 }
 
 /// The `shutdown_entries` test seam (CAD-694): called with each
@@ -382,10 +408,63 @@ impl Store {
     where
         R: 'static,
     {
-        // The fence is re-checked inside the held conn mutex by
-        // `with_sealed_tx_fenced` — a writer fenced while waiting on the
-        // lock is refused before arming or opening the tx.
-        self.with_sealed_tx_fenced(|| self.write_fence.get().and_then(|f| f.check()), f)
+        self.write_tx_checkpointed(true, f)
+    }
+
+    /// Admission/management callers own the exact post-commit checkpoint and
+    /// cannot expose success or execute until that acknowledgement arrives.
+    fn write_tx_pending_checkpoint<R: 'static>(
+        &self,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
+    ) -> Result<R> {
+        self.write_tx_checkpointed(false, f)
+    }
+
+    fn write_tx_checkpointed<R: 'static>(
+        &self,
+        acknowledge: bool,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
+    ) -> Result<R> {
+        let acknowledge = acknowledge && self.protected_checkpoint.get().is_some();
+        let written = self.with_sealed_tx_fenced(
+            || self.write_fence.get().and_then(|f| f.check()),
+            |tx| {
+                let journal = tx
+                    .query_row_raw(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='connection_ledger'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                if journal.is_none() {
+                    return Ok((f(tx)?, None));
+                }
+                self.require_protected_side_authority_in(&*tx)?;
+                connection_dispatch::require_clean_journal_in(tx)?;
+                let before = acknowledge
+                    .then(|| connection_dispatch::ledger_head_in(tx))
+                    .transpose()?;
+                let value = f(tx)?;
+                let head = connection_dispatch::seal_authority_changes_in(tx)?;
+                let changed = before.is_some_and(|before| before != head);
+                Ok((value, changed.then_some(head)))
+            },
+        );
+        let (value, committed_head) = match written {
+            Err(error)
+                if self.protected_checkpoint.get().is_some()
+                    && (matches!(error, Error::OutcomeUnknown(_))
+                        || error.code() == Some("outcome_unknown")) =>
+            {
+                return Err(self.unacknowledged_authority(error));
+            }
+            other => other?,
+        };
+        // The database mutex and transaction are gone before owner I/O.
+        if let Some(head) = committed_head {
+            self.checkpoint_authority_write(head)?;
+        }
+        Ok(value)
     }
 
     /// Raw-error variant of [`Self::write_tx`] — the callback returns
@@ -398,7 +477,66 @@ impl Store {
     where
         T: 'static,
     {
-        self.with_sealed_tx_fenced_raw(|| self.write_fence.get().and_then(|f| f.check()), f)
+        let acknowledge = self.protected_checkpoint.get().is_some();
+        let domain_error = |error: Error| rusqlite::Error::ToSqlConversionFailure(Box::new(error));
+        let (value, committed_head) = self.with_sealed_tx_fenced_raw(
+            || self.write_fence.get().and_then(|f| f.check()),
+            |tx| {
+                let journal = tx
+                    .query_row_raw(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='connection_ledger'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                if journal.is_none() {
+                    return Ok((f(tx)?, None));
+                }
+                self.require_protected_side_authority_in(&*tx)
+                    .map_err(domain_error)?;
+                connection_dispatch::require_clean_journal_in(tx).map_err(domain_error)?;
+                let before = acknowledge
+                    .then(|| connection_dispatch::ledger_head_in(tx))
+                    .transpose()
+                    .map_err(domain_error)?;
+                let value = f(tx)?;
+                let head = connection_dispatch::seal_authority_changes_in(tx)
+                    .map_err(domain_error)?;
+                let changed = before.is_some_and(|before| before != head);
+                Ok((value, changed.then_some(head)))
+            },
+        )?;
+        if let Some(head) = committed_head {
+            self.checkpoint_authority_write(head)
+                .map_err(domain_error)?;
+        }
+        Ok(value)
+    }
+
+    /// The durable selection of protected authority journaling, independent of
+    /// dispatch enablement. Only the authenticated protected boot path writes
+    /// it; an ordinary store answers `false`.
+    pub(crate) fn protection_required(&self) -> Result<bool> {
+        self.read_tx(|conn| connection_dispatch::protection_required_in(&*conn))
+    }
+
+    /// A Store instance without the authenticated checkpoint transport — a
+    /// side writer, or an unrelated process writer — must not authorizing-write
+    /// a durably protected deployment: its changes could never advance the
+    /// external restore floor, so an older core could resurrect them. Ordinary
+    /// stores never select protection, so their defaults are unchanged.
+    fn require_protected_side_authority_in(&self, conn: &impl StoreConn) -> Result<()> {
+        if self.protected_checkpoint.get().is_some() {
+            // The authenticated lane is installed: it owns the checkpoint.
+            return Ok(());
+        }
+        if connection_dispatch::protection_required_in(conn)? {
+            return Err(Error::invalid(
+                "runtime_unqualified",
+                "this is a protected deployment: authorizing writes require the authenticated checkpoint lane",
+            ));
+        }
+        Ok(())
     }
 
     /// Install the hosted-lease fence — the daemon calls this right
@@ -454,3 +592,10 @@ impl Store {
         self.owner_checkpoint()
     }
 }
+
+#[cfg(test)]
+#[path = "cad1085_native_provider_metadata_acceptance_20261027.rs"]
+mod cad1085_native_provider_metadata_acceptance_20261027;
+
+#[cfg(test)]
+mod room_request_queue_acceptance;

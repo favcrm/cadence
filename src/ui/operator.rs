@@ -192,6 +192,13 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/connections", RouteClass::OperatorOnly),
+    // CAD-1085: board-origin human Continue mints one purpose/RID-bound
+    // entry nonce; the secret routes remain entry-origin only.
+    route(
+        "POST",
+        "/api/credential-entry/prepare",
+        RouteClass::OperatorOnly,
+    ),
     route(
         "POST",
         "/api/connections/*/rotate",
@@ -938,9 +945,14 @@ pub(crate) fn board_host(port: u16) -> String {
     format!("cadence-{port}.localhost:{port}")
 }
 
-/// Where a request came from, for session binding.
+/// Where a request came from, for session binding. `Entry` is the
+/// deployment-pinned credential-entry origin: a distinct browser origin and
+/// a distinct, daemon-issued entry session scope — never the loopback
+/// operator session and never inferred from a `Host` value alone.
+#[derive(Clone, Debug)]
 enum ReqOrigin {
     Known(Origin),
+    Entry(super::credential_entry::EntryOrigin),
     /// No session can be used or opened on this request: the Host is not
     /// this board's own name, or names the tailnet without the proof.
     NoSession(String),
@@ -960,6 +972,18 @@ fn request_origin(request: &Request, opts: &ServeOpts) -> ReqOrigin {
                 .unwrap_or_default()
                 .trim()
                 .to_ascii_lowercase();
+            // CAD-1085: the root-pinned credential-entry origin is a
+            // distinct browser origin with its own daemon-issued entry
+            // session scope. It is NOT folded into `Origin::Loopback`:
+            // the entry cookie is separate, the daemon verifies that
+            // `entry_origin` was persisted at sign-in, and a board-origin
+            // session cannot satisfy it. The `Host` only routes the
+            // request to that scope; it is not the authentication.
+            if let Some(entry) = super::credential_entry::EntryOrigin::from_opts(opts) {
+                if entry.matches_host(&host) {
+                    return ReqOrigin::Entry(entry);
+                }
+            }
             // CAD-526: this instance's configured public name — the
             // `aud` assertions are minted for — is its own origin, as
             // distinct from the local login surface as tailnet is.
@@ -1003,6 +1027,84 @@ fn cookie_name(opts: &ServeOpts, origin: Origin) -> String {
     }
 }
 
+/// The ordinary board's browser Origin (public, tailnet or loopback). Used
+/// for the entry page's selector-only "continue on the board" link; the
+/// auth-only POST accepts any configured board Origin, not a caller-chosen
+/// one.
+pub(super) fn board_origin(opts: &ServeOpts) -> String {
+    if let Some(public) = &opts.public {
+        format!("{}://{}", public_scheme(&public.host), public.host)
+    } else if let Some((dns, port)) = &opts.tailnet {
+        super::tailnet_url(dns, *port)
+    } else {
+        format!("http://{}", board_host(opts.port))
+    }
+}
+
+/// Is `origin` a configured ordinary board Origin (never the entry origin)?
+/// The auth-only POST's single cross-origin exception admits exactly this
+/// set; the nonce/human Continue is still the authority.
+pub(super) fn is_board_origin(opts: &ServeOpts, origin: &str) -> bool {
+    let origin = origin.trim().to_ascii_lowercase();
+    if let Some(entry) = super::credential_entry::EntryOrigin::from_opts(opts) {
+        if origin == entry.origin().to_ascii_lowercase() {
+            return false;
+        }
+    }
+    super::write_path::origin_allowed(&origin, opts.port, &opts.allow_hosts, &opts.allow_origins)
+}
+
+/// The browser peer of the auth-only POST must not be tied to an agent or
+/// be unattributable. A proxy/foreign socket or an unowned local browser is
+/// fine; the nonce and the daemon's positive UI-peer proof are the
+/// authority. No session is consulted here.
+pub(super) fn authenticate_peer(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<(), HttpResp> {
+    let origin = ReqOrigin::NoSession("credential-entry authentication peer".to_string());
+    match attribute(request, state_dir, opts, &origin, None) {
+        Attribution::Agent(alias) => Err(guard_fail(
+            "session_from_agent",
+            &format!("credential entry sign-in refused: this connection is agent '{alias}'"),
+        )),
+        Attribution::AgentUid => Err(guard_fail(
+            "session_from_agent",
+            "credential entry sign-in refused: this connection is the agent UID",
+        )),
+        Attribution::Unknown(why) | Attribution::Unavailable(why) => Err(guard_fail(
+            "caller_identity",
+            &format!("credential entry sign-in refused: the caller is unattributable — {why}"),
+        )),
+        Attribution::NoAgent | Attribution::Foreign(_) | Attribution::Proxy(_) => Ok(()),
+    }
+}
+
+/// The credential-entry session cookie: a distinct name on a distinct
+/// origin, issued only by the entry-origin device poll for a session the
+/// daemon persisted with `entry_origin`. It is never the loopback cookie,
+/// so a board-origin session cannot be replayed into the form.
+pub(super) fn entry_cookie_name(opts: &ServeOpts) -> String {
+    format!("__Host-cadence_entry_{}", opts.port)
+}
+
+fn entry_session_cookie(request: &Request, opts: &ServeOpts) -> Option<String> {
+    cookie_value(request, &[entry_cookie_name(opts)])
+}
+
+fn cookie_value(request: &Request, names: &[String]) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .filter(|h| h.field.equiv("Cookie"))
+        .flat_map(|h| h.value.as_str().split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(k, _)| names.iter().any(|n| n == *k))
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// CAD-1006: the request's session origin for the screen credential
 /// relay — the `Origin` `request_origin` resolves to, or `None` when the
 /// request names no session-bearing host. Read-only; the daemon re-verifies
@@ -1010,7 +1112,10 @@ fn cookie_name(opts: &ServeOpts, origin: Origin) -> String {
 pub(super) fn request_origin_kind(request: &Request, opts: &ServeOpts) -> Option<Origin> {
     match request_origin(request, opts) {
         ReqOrigin::Known(o) => Some(o),
-        ReqOrigin::NoSession(_) => None,
+        // The entry origin is a distinct session scope, not one of the
+        // board's `Origin` kinds; relays that need a board session must
+        // not treat it as loopback.
+        ReqOrigin::Entry(_) | ReqOrigin::NoSession(_) => None,
     }
 }
 
@@ -1052,15 +1157,7 @@ fn session_cookie(request: &Request, opts: &ServeOpts, origin: Origin) -> Option
         ],
         _ => vec![cookie_name(opts, origin)],
     };
-    request
-        .headers()
-        .iter()
-        .filter(|h| h.field.equiv("Cookie"))
-        .flat_map(|h| h.value.as_str().split(';'))
-        .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(k, _)| names.iter().any(|n| n == *k))
-        .map(|(_, v)| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    cookie_value(request, &names)
 }
 
 /// This request's own origin, as a browser on it would send `Origin`.
@@ -1178,6 +1275,51 @@ fn check_session(
     }
 }
 
+/// Ask the daemon whether `token` is a live session **scoped to the
+/// trusted entry origin**. A board/normal-loopback session is not one:
+/// the daemon stored `entry_origin` at sign-in and compares it here.
+fn check_entry_session(
+    state_dir: &std::path::Path,
+    token: &str,
+    key: &str,
+    entry_origin: &str,
+    budget: Option<&client::MetaBudget>,
+) -> Result<Option<Value>, HttpResp> {
+    let params = json!({"token": token, "key": key, "entry_origin": entry_origin});
+    let answered = match budget {
+        Some(b) => b.read(state_dir, "credential_entry_session_check", params),
+        None => client::rpc(state_dir, "credential_entry_session_check", params),
+    };
+    match answered {
+        Ok(v) if v["valid"] == true && v["session"].is_object() => Ok(Some(v["session"].clone())),
+        Ok(v) if v["valid"] == false => Ok(None),
+        Ok(_) => Err(coded_response(
+            503,
+            "session_unavailable",
+            "the daemon did not answer whether this entry session is valid",
+            None,
+        )),
+        Err(e) if e.to_string().contains("Unknown method") => Err(coded_response(
+            501,
+            "unsupported_daemon",
+            "this daemon does not support trusted credential entry — upgrade it",
+            None,
+        )),
+        Err(e) => Err(coded_response(
+            503,
+            "daemon_unavailable",
+            &format!("credential-entry sessions are checked by the daemon: {e}"),
+            None,
+        )),
+    }
+}
+
+/// The fixed `entry_session_required` refusal a credential form gets
+/// without a live entry-origin session.
+pub(super) const ENTRY_SESSION_REQUIRED: &str =
+    "The credential form needs the signed-in operator's session on this trusted entry \
+     origin — sign in on that origin (device sign-in), then reopen the entry link";
+
 /// The live public session this request's `__Host-` cookie names — the
 /// read gate for the board's public surface (CAD-526): on that host a
 /// request either carries a valid session or gets bounced to the
@@ -1203,8 +1345,16 @@ pub(super) fn public_session(
 /// the daemon's live cookie + tab key (public sessions use only their
 /// cookie), with no inferred privilege from the peer's process.
 /// Credentials stay in this request/stream and are never serialized.
+/// The session scope a read proved. `Entry` is the daemon-issued,
+/// entry-origin-scoped session; `Origin` is one of the board's own.
+#[derive(Clone, Debug)]
+enum SessionScope {
+    Origin(Origin),
+    Entry(super::credential_entry::EntryOrigin),
+}
+
 pub(super) struct ReadAdmission {
-    proof: Option<(String, String, Origin)>,
+    proof: Option<(String, String, SessionScope)>,
     checked_at: std::time::Instant,
 }
 
@@ -1272,7 +1422,15 @@ impl ReadAdmission {
         }
         let checked_at = std::time::Instant::now();
         let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
-        match check_session(state_dir, token, key, *origin, Some(&budget)) {
+        let live = match origin {
+            SessionScope::Origin(origin) => {
+                check_session(state_dir, token, key, *origin, Some(&budget))
+            }
+            SessionScope::Entry(entry) => {
+                check_entry_session(state_dir, token, key, entry.origin(), Some(&budget))
+            }
+        };
+        match live {
             Ok(Some(_)) => {
                 self.checked_at = checked_at;
                 true
@@ -1300,34 +1458,56 @@ pub(super) fn admit_read(
 ) -> Result<ReadAdmission, HttpResp> {
     let checked_at = std::time::Instant::now();
     let admission = |proof| ReadAdmission { proof, checked_at };
-    let origin = match request_origin(request, opts) {
-        ReqOrigin::Known(origin) => Some(origin),
+    let scope = match request_origin(request, opts) {
+        ReqOrigin::Known(origin) => Some(SessionScope::Origin(origin)),
+        ReqOrigin::Entry(entry) => Some(SessionScope::Entry(entry)),
         ReqOrigin::NoSession(_) => None,
     };
     // Only the loopback origin can use the local bootstrap allowance; a
-    // tailnet proxy or any other Host still needs a session.
-    if anonymous_reads_on(opts, origin) {
-        return Ok(admission(None));
-    }
-    if let Some(origin) = origin {
-        if let Some(token) = session_cookie(request, opts, origin) {
-            let key = session_key(request);
-            let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
-            if check_session(state_dir, &token, &key, origin, Some(&budget))?.is_some() {
-                return Ok(admission(Some((token, key, origin))));
-            }
+    // tailnet proxy, the entry origin or any other Host still needs a
+    // session.
+    if let Some(SessionScope::Origin(origin)) = &scope {
+        if anonymous_reads_on(opts, Some(*origin)) {
+            return Ok(admission(None));
         }
     }
-    let (code, message) = if origin == Some(Origin::Public) {
-        (
+    match &scope {
+        Some(SessionScope::Origin(origin)) => {
+            if let Some(token) = session_cookie(request, opts, *origin) {
+                let key = session_key(request);
+                let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+                if check_session(state_dir, &token, &key, *origin, Some(&budget))?.is_some() {
+                    return Ok(admission(Some((token, key, SessionScope::Origin(*origin)))));
+                }
+            }
+        }
+        Some(SessionScope::Entry(entry)) => {
+            if let Some(token) = entry_session_cookie(request, opts) {
+                let key = session_key(request);
+                let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+                if check_entry_session(state_dir, &token, &key, entry.origin(), Some(&budget))?
+                    .is_some()
+                {
+                    return Ok(admission(Some((
+                        token,
+                        key,
+                        SessionScope::Entry(entry.clone()),
+                    ))));
+                }
+            }
+        }
+        None => {}
+    }
+    let (code, message) = match &scope {
+        Some(SessionScope::Origin(Origin::Public)) => (
             "board_session_required",
             "a board session is required — sign in through your company's workspace",
-        )
-    } else {
-        (
+        ),
+        Some(SessionScope::Entry(_)) => ("entry_session_required", ENTRY_SESSION_REQUIRED),
+        _ => (
             "operator_session_required",
             "a local board session is required — sign in with cadence ui login",
-        )
+        ),
     };
     Err(coded_response(401, code, message, None))
 }
@@ -1602,7 +1782,7 @@ fn attribute(
         Err(why) => {
             let why = match origin {
                 ReqOrigin::NoSession(p) => format!("{why}. {p}"),
-                ReqOrigin::Known(_) => why,
+                ReqOrigin::Known(_) | ReqOrigin::Entry(_) => why,
             };
             return match foreign_socket(request, opts) {
                 Some(uid) => Attribution::Foreign(format!("{why} (its socket is uid {uid}'s)")),
@@ -1637,7 +1817,7 @@ fn attribute(
         Err(why) => {
             let why = match origin {
                 ReqOrigin::NoSession(p) => format!("{why}. {p}"),
-                ReqOrigin::Known(_) => why,
+                ReqOrigin::Known(_) | ReqOrigin::Entry(_) => why,
             };
             // Only a live client socket of another uid excuses it.
             match foreign_socket(request, opts) {
@@ -1717,10 +1897,29 @@ pub(super) fn board_caller(
             }
             None => (None, None),
         },
+        ReqOrigin::Entry(entry) => match entry_session_cookie(request, opts) {
+            Some(token) => {
+                if write {
+                    require_entry_origin(request, entry)?;
+                }
+                match check_entry_session(
+                    state_dir,
+                    &token,
+                    &session_key(request),
+                    entry.origin(),
+                    budget,
+                )? {
+                    Some(_) => (Some(Held::Operator), Some(token)),
+                    None => (None, None),
+                }
+            }
+            None => (None, None),
+        },
         ReqOrigin::NoSession(_) => (None, None),
     };
     let required = match &origin {
         ReqOrigin::Known(Origin::Public) => ("board_session_required", BOARD_SESSION_REQUIRED),
+        ReqOrigin::Entry(_) => ("entry_session_required", ENTRY_SESSION_REQUIRED),
         _ => ("operator_session_required", SESSION_REQUIRED),
     };
     let attribution = attribute(request, state_dir, opts, &origin, budget);
@@ -1818,6 +2017,24 @@ pub(super) fn meta(
             });
             (hint, token.is_some(), session)
         }
+        ReqOrigin::Entry(entry) => {
+            let token = entry_session_cookie(request, opts);
+            let session = token.as_deref().and_then(|token| {
+                check_entry_session(
+                    state_dir,
+                    token,
+                    &session_key(request),
+                    entry.origin(),
+                    Some(budget),
+                )
+                .ok()
+            });
+            (
+                "sign in on this trusted credential origin",
+                token.is_some(),
+                session,
+            )
+        }
         ReqOrigin::NoSession(_) => ("cadence ui login", false, None),
     };
     // CAD-777/CAD-841: device sign-in is advertised on the operator
@@ -1826,7 +2043,7 @@ pub(super) fn meta(
     // an unanswerable check it stays silent rather than mislead.
     let device_login = matches!(
         request_origin(request, opts),
-        ReqOrigin::Known(Origin::Loopback | Origin::Tailnet)
+        ReqOrigin::Known(Origin::Loopback | Origin::Tailnet) | ReqOrigin::Entry(_)
     ) && device_config(state_dir, Some(budget)).is_some();
     // `None` with a cookie (a check that could not answer) reports
     // `signed_in: null`; `Some(None)` (proven not valid) and a request
@@ -1884,6 +2101,50 @@ fn cookie_attrs(origin: Origin, max_age: i64) -> String {
     }
 }
 
+fn cookie_attrs_entry(max_age: i64) -> String {
+    format!("Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age={max_age}")
+}
+
+/// A write on the entry origin must name exactly that origin. The board's
+/// Host routing is not the authentication; this is the same-origin guard
+/// for the daemon-issued entry session.
+fn require_entry_origin(
+    request: &Request,
+    entry: &super::credential_entry::EntryOrigin,
+) -> Result<(), HttpResp> {
+    match header_value(request, "Origin") {
+        Some(got) if entry.matches_origin(&got) => Ok(()),
+        Some(got) => Err(guard_fail(
+            "origin",
+            &format!(
+                "the trusted credential origin only accepts its own Origin ({}); \
+                 this request says '{got}'",
+                entry.origin()
+            ),
+        )),
+        None => Err(guard_fail(
+            "origin",
+            "a request carrying a credential-entry session must send Origin",
+        )),
+    }
+}
+
+/// The entry-origin session proof for a secret-bearing relay. Only an
+/// entry-scoped cookie on the pinned origin produces one; it names the
+/// pinned origin so the daemon can verify the server-issued scope.
+pub(super) fn credential_entry_session_proof(request: &Request, opts: &ServeOpts) -> Option<Value> {
+    let ReqOrigin::Entry(entry) = request_origin(request, opts) else {
+        return None;
+    };
+    let token = entry_session_cookie(request, opts)?;
+    Some(json!({
+        "token": token,
+        "key": session_key(request),
+        "origin": Origin::Loopback.as_str(),
+        "entry_origin": entry.origin(),
+    }))
+}
+
 /// `POST /api/session {"nonce"}` — exchange a login link for a session:
 /// the cookie (`Set-Cookie`) plus `{"session_key"}` for the page, both
 /// required on later private reads and writes. The write guards apply, and the Host must be this board's own
@@ -1903,6 +2164,17 @@ pub(super) fn open(
     }
     let origin = match request_origin(request, opts) {
         ReqOrigin::Known(o) => o,
+        ReqOrigin::Entry(_) => {
+            // HELD until the reviewed local board-continue transport lands:
+            // no nonce is accepted in an entry URL/fragment. The entry
+            // origin uses the existing device sign-in (if configured) for
+            // now; board link exchange stays on the ordinary board origin.
+            return guard_fail(
+                "session_origin",
+                "local link sign-in is not enabled on the trusted credential origin — \
+                 do not put a sign-in nonce in this URL; use the configured device sign-in",
+            );
+        }
         ReqOrigin::NoSession(why) => {
             return guard_fail("session_origin", &format!("sign-in refused: {why}"))
         }
@@ -2013,8 +2285,31 @@ pub(super) fn logout(request: &Request, state_dir: &std::path::Path, opts: &Serv
     if let Err(resp) = write_guard(request, "application/json", opts) {
         return resp;
     }
-    let ReqOrigin::Known(origin) = request_origin(request, opts) else {
-        return guard_fail("session_origin", "logout: no session lives on this Host");
+    let origin = match request_origin(request, opts) {
+        ReqOrigin::Known(origin) => origin,
+        ReqOrigin::Entry(entry) => {
+            if let Some(token) = entry_session_cookie(request, opts) {
+                if let Err(resp) = require_entry_origin(request, &entry) {
+                    return resp;
+                }
+                if let Err(e) = client::rpc(
+                    state_dir,
+                    "operator_session_logout",
+                    json!({"token": token}),
+                ) {
+                    return coded_response(503, "daemon_unavailable", &e.to_string(), None);
+                }
+            }
+            let mut resp = Response::from_data(Vec::new()).with_status_code(StatusCode(204));
+            set_cookie(
+                &mut resp,
+                &format!("{}=; {}", entry_cookie_name(opts), cookie_attrs_entry(0)),
+            );
+            return no_store(resp);
+        }
+        ReqOrigin::NoSession(_) => {
+            return guard_fail("session_origin", "logout: no session lives on this Host")
+        }
     };
     if let Some(token) = session_cookie(request, opts, origin) {
         if let Err(resp) = require_own_origin(request, origin) {
@@ -2070,25 +2365,36 @@ fn device_off() -> HttpResp {
     super::err_response(404, "no such write route")
 }
 
-fn device_origin(request: &Request, opts: &ServeOpts) -> std::result::Result<Origin, HttpResp> {
-    let origin = match request_origin(request, opts) {
-        ReqOrigin::Known(o) => o,
-        ReqOrigin::NoSession(why) => {
-            return Err(guard_fail(
-                "session_origin",
-                &format!("sign-in refused: {why}"),
-            ));
+/// The device sign-in surface for this request: a board origin (loopback/
+/// tailnet) with its normal session scope, or the pinned credential-entry
+/// origin with the distinct entry scope the daemon will persist.
+fn device_origin(
+    request: &Request,
+    opts: &ServeOpts,
+) -> std::result::Result<(Origin, Option<super::credential_entry::EntryOrigin>), HttpResp> {
+    match request_origin(request, opts) {
+        ReqOrigin::Known(origin) => {
+            if origin == Origin::Public {
+                return Err(guard_fail(
+                    "session_origin",
+                    "sign-in on this board is the platform's — device login applies \
+                     to the loopback/tailnet surface only",
+                ));
+            }
+            require_own_origin(request, origin)?;
+            Ok((origin, None))
         }
-    };
-    if origin == Origin::Public {
-        return Err(guard_fail(
+        ReqOrigin::Entry(entry) => {
+            require_entry_origin(request, &entry)?;
+            // The daemon records the entry scope; the response is consumed
+            // by the entry document's memory-only key reader, never storage.
+            Ok((Origin::Loopback, Some(entry)))
+        }
+        ReqOrigin::NoSession(why) => Err(guard_fail(
             "session_origin",
-            "sign-in on this board is the platform's — device login applies \
-             to the loopback/tailnet surface only",
-        ));
+            &format!("sign-in refused: {why}"),
+        )),
     }
-    require_own_origin(request, origin)?;
-    Ok(origin)
 }
 
 /// Refuse agent peers on the device routes. Unlike the link exchange
@@ -2141,7 +2447,7 @@ pub(super) fn device_code(
     if let Err(resp) = write_guard(request, "application/json", opts) {
         return resp;
     }
-    let origin = match device_origin(request, opts) {
+    let (origin, _entry) = match device_origin(request, opts) {
         Ok(o) => o,
         Err(resp) => return resp,
     };
@@ -2232,7 +2538,7 @@ pub(super) fn device_poll(
     if let Err(resp) = write_guard(request, "application/json", opts) {
         return resp;
     }
-    let origin = match device_origin(request, opts) {
+    let (origin, entry) = match device_origin(request, opts) {
         Ok(o) => o,
         Err(resp) => return resp,
     };
@@ -2285,18 +2591,21 @@ pub(super) fn device_poll(
             // browser reads as a sign-in refusal (403), never a
             // retryable outage. A failed live verification is the
             // issuer's answer, not a refusal — 502.
-            let opened = client::rpc_answer(
-                state_dir,
-                "operator_session_open_device",
-                json!({
-                    // The daemon verifies this bearer live against its
-                    // pinned trust root and derives subject/workspace
-                    // itself — no identity field crosses this call.
-                    "token": token,
-                    "origin": origin.as_str(),
-                    "user_agent": user_agent,
-                }),
-            );
+            let mut open_params = json!({
+                // The daemon verifies this bearer live against its
+                // pinned trust root and derives subject/workspace
+                // itself — no identity field crosses this call.
+                "token": token,
+                "origin": origin.as_str(),
+                "user_agent": user_agent,
+            });
+            if let Some(entry) = &entry {
+                // Server-issued entry scope: the daemon requires this to
+                // equal the live root profile origin and persists it on
+                // the session row. A board-origin sign-in never has one.
+                open_params["entry_origin"] = json!(entry.origin());
+            }
+            let opened = client::rpc_answer(state_dir, "operator_session_open_device", open_params);
             let opened = match opened {
                 Err(e) => {
                     return coded_response(503, "daemon_unavailable", &e.to_string(), None);
@@ -2318,14 +2627,17 @@ pub(super) fn device_poll(
             let body = serde_json::to_vec(&json!({ "session_key": key })).unwrap_or_default();
             let mut resp = Response::from_data(body).with_status_code(StatusCode(200));
             resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
-            set_cookie(
-                &mut resp,
-                &format!(
-                    "{}={token}; {}",
-                    cookie_name(opts, origin),
-                    cookie_attrs(origin, (expires - now).max(0))
+            let (name, attrs) = match &entry {
+                Some(_) => (
+                    entry_cookie_name(opts),
+                    cookie_attrs_entry((expires - now).max(0)),
                 ),
-            );
+                None => (
+                    cookie_name(opts, origin),
+                    cookie_attrs(origin, (expires - now).max(0)),
+                ),
+            };
+            set_cookie(&mut resp, &format!("{name}={token}; {attrs}"));
             no_store(resp)
         }
         Err(_) => {

@@ -73,7 +73,26 @@ var ConditionalGet = class {
 * signing out. Clearing the key is what ends this browser's session.
 */
 var SESSION_KEY_STORE = "cadence.sessionKey";
+var entryMemoryKey = null;
+function entryMode() {
+	try {
+		return globalThis.__CADENCE_ENTRY_MODE__ === true;
+	} catch {
+		return false;
+	}
+}
+function consumeEntryBootstrap() {
+	if (!entryMode()) return;
+	const scope = globalThis;
+	const bootstrap = scope.__CADENCE_ENTRY_BOOTSTRAP__;
+	if (bootstrap && typeof bootstrap.key === "string" && /^[0-9a-f]{64}$/.test(bootstrap.key)) entryMemoryKey = bootstrap.key;
+	try {
+		delete scope.__CADENCE_ENTRY_BOOTSTRAP__;
+	} catch {}
+}
+consumeEntryBootstrap();
 function sessionKey() {
+	if (entryMode()) return entryMemoryKey;
 	for (const kind of ["local", "session"]) try {
 		const key = (kind === "local" ? globalThis.localStorage : globalThis.sessionStorage).getItem(SESSION_KEY_STORE);
 		if (key) return key;

@@ -30,12 +30,15 @@ import {
   smtpUnreadable,
   smtpErrorMessage,
   verificationSupport,
-  verificationResult,
   type ServiceGroup,
   type VerificationOutcome,
 } from "./connectionsView";
 import { PRESETS, portFor, type Preset, type TlsMode } from "./hostedSmtpView";
+import { errorCopy, openTrustedEntry } from "../connections/credentialRequestView";
+import { useProtectedEntry } from "../connections/useProtectedEntry";
+import { RecentCredentialRequestList } from "../connections/CredentialRequestCard";
 import SmtpAccountForm from "./SmtpAccountForm";
+import ProtectedManagement from "./ProtectedManagement";
 import { connectionLabel } from "../../lib/connections";
 import "./connections.css";
 import { useTranslate } from "../../lib/locale";
@@ -216,6 +219,82 @@ export default function Connections({
  * grouped by provider. Accounts are compact links to their own detail
  * pages — nothing expands in place.
  */
+/** The daemon's own custody facts, stated as reported — never inferred from
+ *  a stored flag and never presented as protection when isolation is absent. */
+function CustodyStatusPanel({ canWrite }: { canWrite: boolean }) {
+  const t = useTranslate();
+  const [custody, setCustody] = useState<{
+    configured: boolean;
+    unlocked: boolean;
+    fenced: boolean;
+    isolation: string;
+    protected: boolean;
+  } | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let live = true;
+    api
+      .connectionCustodyStatus()
+      .then((reply) => {
+        if (live) setCustody(reply.custody);
+      })
+      .catch(() => {
+        if (live) setFailed(true);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+  const isolated = custody !== null && custody.isolation !== "none";
+  return (
+    <section className="card px-4 py-3.5 min-w-0" aria-labelledby="custody-title" data-custody-panel>
+      <h2 id="custody-title" className="text-cardtitle font-medium text-ink-100">{t("Credential custody")}</h2>
+      {custody === null ? (
+        <p className="text-label text-ink-500 mt-2" role={failed ? "alert" : "status"}>
+          {failed
+            ? t("The daemon did not report custody state — treat protected entry as unavailable.")
+            : t("Reading custody state…")}
+        </p>
+      ) : (
+        <dl className="mt-2 space-y-1 text-label min-w-0">
+          <div className="flex flex-wrap gap-x-2">
+            <dt className="text-ink-500">{t("Encrypted store")}</dt>
+            <dd className="text-ink-200">{custody.configured ? t("configured") : t("not configured")}</dd>
+          </div>
+          <div className="flex flex-wrap gap-x-2">
+            <dt className="text-ink-500">{t("Key session")}</dt>
+            <dd className="text-ink-200">
+              {custody.fenced ? t("fenced") : custody.unlocked ? t("unlocked") : t("locked")}
+            </dd>
+          </div>
+          <div className="flex flex-wrap gap-x-2">
+            <dt className="text-ink-500">{t("Runtime isolation")}</dt>
+            <dd className={isolated ? "text-ink-200" : "text-warn"}>
+              {isolated ? custody.isolation : t("none — encrypted storage only, not isolated from same-account agents")}
+            </dd>
+          </div>
+          <div className="flex flex-wrap gap-x-2">
+            <dt className="text-ink-500">{t("Protected entry")}</dt>
+            <dd className={custody.protected && isolated ? "text-ink-200" : "text-warn"}>
+              {custody.protected && isolated
+                ? t("the daemon reports a protected profile")
+                : t("unavailable — protected enrollment/verification will refuse")}
+            </dd>
+          </div>
+          <div className="flex flex-wrap gap-x-2">
+            <dt className="text-ink-500">{t("Loaded runtime")}</dt>
+            <dd className="text-ink-400">{t("not reported by this daemon")}</dd>
+          </div>
+        </dl>
+      )}
+      <p className="text-micro text-ink-500 mt-2 break-words">
+        {t("These are the daemon's reported facts. Encryption alone does not isolate a same-account agent, and a stored flag is not a verified runtime.")}
+        {canWrite ? "" : " " + t("Read-only access — nothing here can be changed.")}
+      </p>
+    </section>
+  );
+}
+
 function ConnectionsIndex({
   viewer,
   canWrite,
@@ -289,6 +368,10 @@ function ConnectionsIndex({
         <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
       ) : (
         <>
+          <div className="space-y-3 mb-3">
+            <CustodyStatusPanel canWrite={canWrite} />
+            <RecentCredentialRequestList />
+          </div>
           <ResourceGate
             state={listState ?? emptyGate}
             loading="loading connections…"
@@ -329,6 +412,9 @@ function ConnectionsIndex({
               )}
             </div>
           )}
+          <div className="mt-3">
+            <ProtectedManagement canWrite={canWrite} />
+          </div>
         </>
       )}
     </section>
@@ -448,6 +534,9 @@ function ConnectionsAdd({
   page: ConnectionPage & { kind: "add" | "addProvider" };
 }) {
   const t = useTranslate();
+  const protectedEntry = useProtectedEntry();
+  const protectedOnly =
+    protectedEntry.status === "ready" && protectedEntry.entry.configured;
   const providersRes = viewer.operator ? resources.connectionProviders : null;
   const listRes = viewer.operator ? resources.connections : null;
   const providersState = useMaybeResource(providersRes);
@@ -517,7 +606,11 @@ function ConnectionsAdd({
                 failed="could not load connections"
                 onRetry={refresh}
               />
-              {listState?.data && (
+              {listState?.data && protectedOnly ? (
+                <PageState title={t("Protected entry")}>
+                  {t("This protected profile collects credentials only on its separately served trusted entry page. Use `cadence connection enroll smtp` to create the request, complete it there, then return here.")}
+                </PageState>
+              ) : listState?.data ? (
                 <SmtpAccountForm
                   rows={rows}
                   onSaved={(id) => {
@@ -525,7 +618,7 @@ function ConnectionsAdd({
                     navigate(connectionDetailHref(id));
                   }}
                 />
-              )}
+              ) : null}
             </>
           ) : (
             <>
@@ -806,6 +899,11 @@ export function ConnectionDetail({
   onRevoked: () => void;
 }) {
   const t = useTranslate();
+  // CAD-1085: a protected profile collects secrets only on the pinned
+  // trusted origin. The legacy direct-input controls are absent there.
+  const protectedEntry = useProtectedEntry();
+  const entryRequired =
+    protectedEntry.status === "ready" && protectedEntry.entry.configured;
   const [rotating, setRotating] = useState(false);
   const [revoking, setRevoking] = useState(false);
   const [checking, setChecking] = useState(false);
@@ -919,53 +1017,75 @@ export function ConnectionDetail({
       });
   };
 
-  // The approved broker no-send login test (CAD-1065/CAD-1085): it sends
-  // only the connection's id and the captured revision+registration
-  // digest, and renders only the typed receipt's fixed safe text. A
-  // stale/malformed/late response never becomes a positive result.
-  const test = () => {
+  // CAD-1085 r3: verification is the human's explicit act on the trusted
+  // entry page, bound to a stable request ID and a one-use nonce. This
+  // button only creates that metadata request; the page performs exactly
+  // one AUTH and never sends mail.
+  const verifyViaEntry = () => {
     if (testing) return;
-    const gen = ++checkGen.current;
-    const ctx = context;
-    const want = {
-      id: row.id,
-      revision: row.revision ?? null,
-      registration_digest: row.registration_digest ?? null,
-    };
     setTesting(true);
     setVerifyNote(null);
     api
-      .connectionTest(row.id, {
-        expected_revision: want.revision,
-        expected_registration_digest: want.registration_digest,
+      .credentialRequestCreate({
+        provider: row.provider,
+        verb: "verify",
+        connection_id: row.id,
+        ...(row.revision !== null ? { expected_credential_revision: row.revision } : {}),
       })
-      .then((out) => {
-        if (gen !== checkGen.current || latestCtx.current !== ctx) return;
-        const res = verificationResult(out, want);
-        if (res === null) {
+      .then(({ request }) => {
+        if (!openTrustedEntry(request)) {
           setVerifyNote({
             ok: false,
             stale: false,
             checkedAt: null,
-            text: "The check did not return a readable result — treat this as a configuration problem, not a connection that works.",
+            text: errorCopy("unsupported_deployment"),
           });
-        } else {
-          setVerifyNote(res);
-          if (res.stale) onChanged(); // a stale result re-reads the live identity
         }
       })
-      .catch(() => {
-        if (gen !== checkGen.current || latestCtx.current !== ctx) return;
+      .catch((error: unknown) => {
+        const code = error instanceof ApiError ? error.code : null;
         setVerifyNote({
           ok: false,
           stale: false,
           checkedAt: null,
-          text: "The verification could not be run — try again, or check the connection's configuration first.",
+          text: errorCopy(code),
         });
       })
-      .finally(() => {
-        if (gen === checkGen.current) setTesting(false);
-      });
+      .finally(() => setTesting(false));
+  };
+
+  // Rotation's secret also belongs on the trusted page, never in this form.
+  const rotateViaEntry = () => {
+    if (testing) return;
+    setTesting(true);
+    setVerifyNote(null);
+    api
+      .credentialRequestCreate({
+        provider: row.provider,
+        verb: "rotate",
+        connection_id: row.id,
+        ...(row.revision !== null ? { expected_credential_revision: row.revision } : {}),
+      })
+      .then(({ request }) => {
+        if (!openTrustedEntry(request)) {
+          setVerifyNote({
+            ok: false,
+            stale: false,
+            checkedAt: null,
+            text: errorCopy("unsupported_deployment"),
+          });
+        }
+      })
+      .catch((error: unknown) => {
+        const code = error instanceof ApiError ? error.code : null;
+        setVerifyNote({
+          ok: false,
+          stale: false,
+          checkedAt: null,
+          text: errorCopy(code),
+        });
+      })
+      .finally(() => setTesting(false));
   };
 
   return (
@@ -1059,7 +1179,7 @@ export function ConnectionDetail({
               {providerMetaPending ? t("unknown — the service's metadata is still loading") : verify.supported ? t("available") : `unsupported — ${verify.reason}`}
             </dd>
           </div>
-          <p className="text-micro text-ink-500 pt-1 break-words">{t("Listing and local configuration reads never contact this account's network; a remote login test (when offered) is a separate explicit check. Either way the result is evidence only — it grants no execution permission and proves no message delivery or sender entitlement.")}</p>
+          <p className="text-micro text-ink-500 pt-1 break-words">{t("Listing and local configuration reads never contact this account's network. Verification, when offered, is a separate explicit human action on the trusted entry page with a one-use nonce; its result is evidence only — it grants no execution permission and proves no message delivery or sender entitlement.")}</p>
         </dl>
       </details>
 
@@ -1086,23 +1206,34 @@ export function ConnectionDetail({
             <Button
               variant="secondary"
               size="sm"
-              onClick={test}
+              onClick={verifyViaEntry}
               loading={testing}
               disabled={testing || checking}
+              title={t("Opens the trusted entry page; one explicit sign-in check, no email")}
             >
-              {testing ? t("Testing…") : t("Test SMTP login")}
+              {testing ? t("Opening…") : t("Verify sign-in…")}
             </Button>
           )}
           {managed && (
             <>
               <Button
-                variant="secondary"
+                variant="primary"
                 size="sm"
-                onClick={() => {
-                  setRevoking(false);
-                  setRotating((v) => !v);
-                }}
-              >{t("Update credentials…")}</Button>
+                onClick={rotateViaEntry}
+                loading={testing}
+                disabled={testing || checking}
+              >{t("Replace via secure entry…")}</Button>
+              {!entryRequired && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  title={t("Legacy direct-input path — explicitly unprotected same-account transport")}
+                  onClick={() => {
+                    setRevoking(false);
+                    setRotating((v) => !v);
+                  }}
+                >{t("Update credentials…")}</Button>
+              )}
               <Button
                 variant="danger"
                 size="sm"
@@ -1118,7 +1249,7 @@ export function ConnectionDetail({
       {!canWrite && managed && (
         <p className="text-micro text-ink-500 mt-2">{t("Updating credentials and disconnecting are the operator's on an editable board.")}</p>
       )}
-      {managed && rotating && (
+      {managed && rotating && !entryRequired && (
         <RotateForm row={row} onDone={onChanged} onClose={() => setRotating(false)} />
       )}
       {managed && revoking && (
@@ -1564,6 +1695,11 @@ export function AddConnection({
   onAdded: (id: string) => void;
 }) {
   const t = useTranslate();
+  // CAD-1085: on a protected profile the trusted entry page is the only
+  // credential collector; the legacy typed token/SMTP form is withheld.
+  const protectedEntry = useProtectedEntry();
+  const protectedOnly =
+    protectedEntry.status === "ready" && protectedEntry.entry.configured;
   const providerId = useId();
   const accountId = useId();
   const tokenId = useId();
@@ -1827,6 +1963,49 @@ export function AddConnection({
       });
   };
 
+  // CAD-1085: the protected path. It creates a metadata-only request and
+  // opens the trusted entry page; the operator types the credential,
+  // account handle and (for SMTP) transport there, never in this form.
+  const protectedEnroll = () => {
+    if (busy || provider === "" || unavailable || methodPending) return;
+    const wanted = smtpShape
+      ? smtpRequiredScopes(chosen)
+      : hint.filter((s) => scopePicks.has(s));
+    if (wanted.length === 0) {
+      setError(
+        smtpShape
+          ? "This provider does not offer SMTP sending — it has no reviewed send permission to enroll."
+          : "Tick at least one reviewed permission before requesting protected enrollment.",
+      );
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const gen = requestGen.current;
+    api
+      .credentialRequestCreate({
+        provider,
+        verb: "enroll",
+        shape: smtpShape ? "smtp" : "token",
+        scopes: wanted,
+      })
+      .then(({ request }) => {
+        if (!live(gen)) return;
+        setToken("");
+        if (!openTrustedEntry(request)) {
+          setError(errorCopy("unsupported_deployment"));
+        }
+      })
+      .catch((e: ApiError) => {
+        if (!live(gen)) return;
+        setError(errorCopy(e.code));
+      })
+      .finally(() => {
+        if (!live(gen)) return;
+        setBusy(false);
+      });
+  };
+
   // provider === "" is the choose-service placeholder; a selected
   // provider that is not currently enrollable (removed from the
   // registry, or its descriptor/shapes gone) is `unavailable`. Either
@@ -1911,7 +2090,27 @@ export function AddConnection({
             <p className="text-micro text-ink-500 break-words">
               {t("Choose how to connect {serviceLabel} — a scoped API token, or an SMTP sender.").replace("{serviceLabel}", () => serviceLabel(provider))}</p>
           )}
-          {!methodPending && (
+          {!methodPending && protectedOnly && (
+            <div className="card px-3 py-2.5 space-y-2" data-protected-enroll>
+              <p className="text-label font-medium text-ink-200">{t("Protected enrollment")}</p>
+              <p className="text-micro text-ink-500 break-words">
+                {t("This protected profile collects the account handle, SMTP transport and credential on the separately served trusted entry page, then sends them once to protected custody. Nothing is typed on this board.")}
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  variant="primary"
+                  size="sm"
+                  onClick={protectedEnroll}
+                  loading={busy}
+                  disabled={busy}
+                >
+                  {t("Continue on secure entry…")}
+                </Button>
+              </div>
+            </div>
+          )}
+          {!methodPending && !protectedOnly && (
           <>
           {smtpShape && (
           <fieldset className="space-y-2">

@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StageSendArgsV1",
+  "type": "object",
+  "properties": {
+    "capability_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "connection_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "expected_source_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "loaded_receipt_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "snapshot_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "source_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "connection_id",
+    "snapshot_id",
+    "loaded_receipt_id",
+    "capability_id",
+    "source_id",
+    "expected_source_digest"
+  ],
+  "$defs": {
+    "Digest": {
+      "description": "`sha256:` plus 64 lowercase hex digits.",
+      "type": "string"
+    },
+    "Ident": {
+      "description": "Bounded printable ASCII identifier (`0x21..=0x7e`, 1..=128 bytes).",
+      "type": "string"
+    },
+    "UuidV1": {
+      "description": "Canonical lowercase UUID selector (`8-4-4-4-12`).",
+      "type": "string"
+    }
+  }
+}

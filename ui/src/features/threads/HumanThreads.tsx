@@ -5,6 +5,7 @@ import Button from "../../ui/Button";
 import Composer from "../app-shell/chat/Composer";
 import { newMessageId } from "../home/thread";
 import { ThreadComposerFrame, Turn } from "./ThreadChatParts";
+import CredentialRequestList from "../connections/CredentialRequestCard";
 import {
   addHumanMember,
   createHumanGroup,
@@ -326,6 +327,7 @@ export function HumanRoomTimeline({
         <p className="threads-note">Loading…</p>
       ) : null}
       <div className="threads-messages" aria-live="polite" ref={messagesRef}>
+        <CredentialRequestList conversationId={id} />
         {page && hasOlder && page.posts.length > 0 && (
           <Button variant="ghost" size="sm" disabled={olderBusy} onClick={loadEarlier}>
             Earlier

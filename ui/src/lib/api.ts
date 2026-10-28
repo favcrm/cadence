@@ -12,6 +12,7 @@ import {
   type PrivateOperation,
 } from "./privateSession";
 import type {
+  AgentAccess,
   AgentDetail,
   AgentRegisterBody,
   AgentRolesPayload,
@@ -25,7 +26,9 @@ import type {
   ConnectionProvidersPayload,
   ConnectionsPayload,
   ConnectionVerificationPayload,
+  CredentialRequest,
   Health,
+  ProtectedEntry,
   IssueCard,
   IssueDetail,
   IssueHistoryEntry,
@@ -438,6 +441,88 @@ export interface MyWorkMembership {
   assignment: AssignmentContext | null;
 }
 
+
+type CredentialRequestWire = Record<string, unknown>;
+
+/**
+ * CAD-1085 projection adapter. The native board returns the full
+ * `CredentialRequest`; the hosted custody board returns the normative
+ * `{provider_kind, allowed_verb, ...}` projection. The card and form read
+ * one local shape, so normalize at the client boundary. Unknown fields are
+ * ignored; native-only fields absent from the hosted projection get inert
+ * defaults, never fabricated authority.
+ */
+export function normalizeCredentialRequest(raw: unknown): CredentialRequest {
+  const row = (raw ?? {}) as CredentialRequestWire;
+  const nativeVerb = row.verb;
+  if (
+    typeof row.request_id === "string" &&
+    typeof row.provider === "string" &&
+    (nativeVerb === "enroll" || nativeVerb === "rotate" || nativeVerb === "verify")
+  ) {
+    return row as unknown as CredentialRequest;
+  }
+  const provider = typeof row.provider_kind === "string" ? row.provider_kind : "";
+  const verb =
+    row.allowed_verb === "rotate" ||
+    row.allowed_verb === "verify" ||
+    row.allowed_verb === "enroll"
+      ? row.allowed_verb
+      : "enroll";
+  const state =
+    row.state === "pending" ||
+    row.state === "submitting" ||
+    row.state === "done" ||
+    row.state === "cancelled" ||
+    row.state === "expired" ||
+    row.state === "unknown"
+      ? row.state
+      : "unknown";
+  const shape =
+    provider === "smtp"
+      ? "smtp"
+      : provider === ""
+        ? null
+        : provider === "openrouter"
+          ? "token"
+          : null;
+  return {
+    request_id: typeof row.request_id === "string" ? row.request_id : "",
+    request_revision: 0,
+    provider,
+    verb,
+    connection_id: null,
+    target_id: "",
+    display_alias: typeof row.display_alias === "string" ? row.display_alias : provider,
+    shape,
+    scopes: [],
+    expected_credential_revision: null,
+    expected_authorization_revision: null,
+    custody_domain: "",
+    custody_epoch: 0,
+    context_digest: "",
+    requester_kind: "operator_ui",
+    requester_participant: null,
+    conversation_id: null,
+    target_agent_uid: null,
+    state,
+    status: typeof row.status === "string" ? row.status : "",
+    result_code: null,
+    verification_request_id: null,
+    entry_url: typeof row.entry_url === "string" ? row.entry_url : null,
+    created_at_ms: 0,
+    updated_at_ms: 0,
+    expires_at_ms: typeof row.expires_at_ms === "number" ? row.expires_at_ms : 0,
+    entry_path: "",
+    readiness: undefined,
+  };
+}
+
+function normalizeRequestReply<T extends { request: unknown }>(
+  value: T,
+): Omit<T, "request"> & { request: CredentialRequest } {
+  return { ...value, request: normalizeCredentialRequest(value.request) };
+}
 
 export const api = {
   health: () => get<Health>("/api/health"),
@@ -984,6 +1069,28 @@ export const api = {
       `/api/connection-providers/${encodeURIComponent(provider)}/connect`,
       {},
     ),
+  /**
+   * `GET /api/connection-custody/status` — the custody facts as the daemon
+   * reports them: configured/unlocked/fenced, the isolation kind and whether
+   * the deployment is protected. Never credential material, never a probe.
+   */
+  connectionCustodyStatus: () =>
+    get<{
+      custody: {
+        configured: boolean;
+        unlocked: boolean;
+        fenced: boolean;
+        isolation: string;
+        protected: boolean;
+      };
+    }>("/api/connection-custody/status"),
+  /**
+   * `GET /api/agents/<alias>/access` — one agent's durable grant rows and
+   * connection metadata, plus the daemon's reported custody facts. No
+   * credential, ciphertext reference or provider response is included.
+   */
+  agentAccess: (alias: string) =>
+    get<AgentAccess>(`/api/agents/${encodeURIComponent(alias)}/access`),
   /** `GET /api/connections` — every exact provider account (operator-only). */
   connections: () => get<ConnectionsPayload>("/api/connections"),
   /** `GET /api/connections/<id>` — one connection's metadata (operator-only). */
@@ -1064,6 +1171,165 @@ export const api = {
       `/api/connections/${encodeURIComponent(id)}/test`,
       expected,
     ),
+  /**
+   * `GET /api/credential-requests` — metadata-only human credential
+   * requests (CAD-1085), newest first. With `conversation`, exactly that
+   * conversation's; without, the recent operator list. Operator-only.
+   */
+  credentialRequests: (params?: { conversation?: string; limit?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.conversation) query.set("conversation", params.conversation);
+    if (params?.limit !== undefined) query.set("limit", String(params.limit));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return get<{ requests: unknown[] }>(`/api/credential-requests${suffix}`).then(
+      (reply) => ({
+        ...reply,
+        requests: (reply.requests ?? []).map(normalizeCredentialRequest),
+      }),
+    );
+  },
+  /** `GET /api/credential-requests/<id>` — one request, metadata only. */
+  credentialRequest: (id: string) =>
+    get<{ request: unknown }>(
+      `/api/credential-requests/${encodeURIComponent(id)}`,
+    ).then(normalizeRequestReply),
+  /**
+   * `POST /api/credential-requests` — create a metadata-only request.
+   * The secret is NOT a field here: the operator types it on the trusted
+   * entry page, which the returned `entry_url` opens (absolute, pinned
+   * origin plus the request selector only).
+   */
+  credentialRequestCreate: (
+    body:
+      | {
+          provider: string;
+          verb: "enroll" | "rotate" | "verify";
+          connection_id?: string;
+          account?: string;
+          shape?: "token" | "smtp" | "native-model-api-key" | "native-model-devin-credentials";
+          scopes?: string[];
+          host?: string;
+          port?: number;
+          tls_mode?: string;
+          username?: string;
+          sender?: string;
+          sender_name?: string;
+          expected_credential_revision?: number;
+          expected_authorization_revision?: number;
+          /** Opaque broker-owned source selector for a native-model rotate. */
+          target_id?: string;
+        }
+      | {
+          /** Hosted normative create body; passed through unchanged. */
+          v: 1;
+          provider_kind: "smtp" | "openrouter";
+          allowed_verb: "enroll" | "rotate" | "verify";
+          connection_id?: string;
+          expected_credential_revision?: number;
+          expected_authorization_revision?: number;
+        },
+  ) =>
+    post<{ request: unknown }>("/api/credential-requests", body).then(
+      normalizeRequestReply,
+    ),
+  /**
+   * `POST /api/credential-requests/<id>/session` — bind this live
+   * operator session to a fresh, one-use form nonce. The nonce is the
+   * only value the submit endpoint needs besides the credential itself.
+   */
+  credentialRequestSession: (id: string) =>
+    post<{
+      request: unknown;
+      nonce: string;
+      nonce_expires_in_ms: number;
+    }>(`/api/credential-requests/${encodeURIComponent(id)}/session`, {}).then((reply) => {
+      const request = normalizeCredentialRequest(reply.request);
+      if (!request.expires_at_ms) {
+        request.expires_at_ms = Date.now() + reply.nonce_expires_in_ms;
+      }
+      return { ...reply, request };
+    }),
+  /**
+   * `POST /api/credential-requests/<id>/submit` — one attempt. The
+   * server claims the nonce before anything is forwarded; a lost or
+   * ambiguous outcome is `outcome_unknown`, never a retry.
+   */
+  credentialRequestSubmit: (
+    id: string,
+    body: {
+      nonce: string;
+      secret?: string;
+      transport?: {
+        host: string;
+        port: number;
+        tls_mode: string;
+        username: string;
+        sender: string;
+        sender_name?: string;
+      };
+    },
+  ) =>
+    post<{ request: unknown; status: string }>(
+      `/api/credential-requests/${encodeURIComponent(id)}/submit`,
+      body,
+    ).then(normalizeRequestReply),
+  /** `POST /api/credential-requests/<id>/cancel` — close an unclaimed request. */
+  credentialRequestCancel: (id: string) =>
+    post<{ request: unknown }>(
+      `/api/credential-requests/${encodeURIComponent(id)}/cancel`,
+      {},
+    ).then(normalizeRequestReply),
+  /**
+   * `POST /api/credential-entry/prepare` — the trusted Board Continue.
+   * Requires the ordinary signed-in Board operator (same-origin + CSRF);
+   * returns ONE purpose/RID-bound one-use nonce for the auth-only form
+   * POST. No credential and no URL nonce.
+   */
+  credentialEntryPrepare: (requestId: string) =>
+    post<{ nonce: string; expires_in: number }>(
+      "/api/credential-entry/prepare",
+      { request_id: requestId },
+    ),
+  /** `GET /api/protected-entry` — the deployment's trusted credential
+   *  origin. `origin: null` means trusted entry is unsupported here. */
+  protectedEntry: (signal?: AbortSignal) =>
+    get<ProtectedEntry>("/api/protected-entry", signal),
+  /**
+   * `POST /api/protected-management/session` — one one-use management nonce
+   * bound to the live operator session and the exact action parameters.
+   */
+  protectedManagementSession: (body: {
+    action: string;
+    params?: Record<string, unknown>;
+  }) =>
+    post<{
+      attempt_id: string;
+      nonce: string;
+      nonce_expires_in_ms: number;
+      owner_epoch: number;
+      workspace_id: string;
+      action: string;
+    }>("/api/protected-management/session", body),
+  /**
+   * `POST /api/protected-management/action` — claim the nonce and run the
+   * typed action once. A lost/ambiguous outcome is `outcome_unknown` and is
+   * reconciled through the status route, never retried.
+   */
+  protectedManagementAction: (body: {
+    attempt_id: string;
+    nonce: string;
+    action: string;
+    params?: Record<string, unknown>;
+  }) => post<Record<string, unknown>>("/api/protected-management/action", body),
+  /** `GET /api/protected-management/status?attempt_id=…` — metadata only. */
+  protectedManagementStatus: (attemptId: string) =>
+    get<{
+      attempt_id: string;
+      action: string;
+      state: "issued" | "claimed" | "applied" | "refused" | "unknown";
+      code: string | null;
+      expires_at_ms: number;
+    }>(`/api/protected-management/status?attempt_id=${encodeURIComponent(attemptId)}`),
   /**
    * `GET /api/projects/<key>/workflows/<name>/preview?inputs=<json>` —
    * what `plan propose --workflow` renders for these inputs. The query

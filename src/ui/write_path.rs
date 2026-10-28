@@ -22,8 +22,8 @@ use super::ServeOpts;
 use super::{
     app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_media, app_records,
     app_release, app_runs, app_screens, app_social_drafts, approvals, apps, business_templates,
-    connections, crm_send, crm_smtp, endpoints, home, lane, operator, read_model, social_publish,
-    stages, threads, updates, whatsapp, wiki, workflows,
+    connections, credential_entry, crm_send, crm_smtp, endpoints, home, lane, operator, read_model,
+    social_publish, stages, threads, updates, whatsapp, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -1573,6 +1573,23 @@ pub(crate) fn write_route(
             return;
         }
         let response = connections::handle(&mut request, state_dir, route, true);
+        send(request, response);
+        return;
+    }
+    // CAD-1085: the trusted credential-entry writes. `admit` ran above as
+    // OperatorOnly; these relays then re-prove the operator in the daemon
+    // and bind the form nonce to the live browser session.
+    if let Some(route) = credential_entry::route(path) {
+        if *method != Method::Post
+            || matches!(
+                route,
+                credential_entry::Route::Show(_) | credential_entry::Route::ManagementStatus
+            )
+        {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = credential_entry::handle_write(&mut request, state_dir, opts, route);
         send(request, response);
         return;
     }

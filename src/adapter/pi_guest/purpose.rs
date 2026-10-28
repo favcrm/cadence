@@ -1,6 +1,9 @@
 //! Finite shared Pi-purpose verification for root and its selected helper.
 //! Callers obtain keys only from independently qualified purpose trust. This
 //! result is NOT a root launch permit, owned caller or durable current proof.
+//! CAD-1085: the split helper launch is superseded by the native runtime owner;
+//! these helpers stay compiled for the owner-side audit but have no caller.
+#![allow(dead_code)]
 use super::authority::{refused, OperationScope};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};

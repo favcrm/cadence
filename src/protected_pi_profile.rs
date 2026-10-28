@@ -1,5 +1,7 @@
 //! Shared protected helper wire grammar. Routing tokens are not launch authority.
 //! No caller executable, script, extension path, fd, uid, hash or environment.
+//! CAD-1085: the split helper launch is superseded by the native runtime owner;
+//! these helpers stay compiled for the owner-side audit but have no caller.
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 
@@ -19,6 +21,7 @@ pub(crate) const NODE_PATH: &str = "/opt/cadence/pi/node";
     not(all(unix, target_os = "linux", target_arch = "x86_64")),
     allow(dead_code)
 )] // only the protected helper/pi_guest path on linux x86_64 reads this
+#[allow(dead_code)] // CAD-1085: the split helper path has no caller after the supersession.
 pub(crate) const HELPER_PATH: &str = "/opt/protected/bin/cadence-agent-exec";
 #[cfg_attr(
     not(all(unix, target_os = "linux", target_arch = "x86_64")),

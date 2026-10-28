@@ -44,15 +44,10 @@ path = "src/bin/cadence-installer-client/main.rs"
 name = "cadence-installer-observer"
 path = "src/bin/cadence-installer-observer/main.rs"
 
-# CAD-1159: fixed provider-stream root constructor. Draft activation stays
-# closed; independently elected public image roots are never caller supplied.
+# CAD-1085: separately provisioned root runtime owner; never an agent executor.
 [[bin]]
-name = "cadence-root-constructor"
-path = "src/bin/cadence-root-constructor/main.rs"
-
-[[bin]]
-name = "cadence-enrolled-recipient"
-path = "src/bin/cadence-enrolled-recipient/main.rs"
+name = "cadence-runtime-owner"
+path = "src/bin/cadence-runtime-owner/main.rs"
 
 [features]
 # Embed the built `ui/` SPA into the binary. Requires `bun run build` inside
@@ -143,7 +138,7 @@ path = "tests/cad1739_hosted_app_public_acceptance.rs"
 required-features = ["test-seam"]
 
 [dependencies]
-cadence-core = { path = "crates/cadence-core" }
+cadence-core = { path = "crates/cadence-core", features = ["custody-crypto"] }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 # Frozen app/agent identity receipts must survive production JSON reads.

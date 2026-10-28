@@ -929,6 +929,22 @@ impl Store {
         })
     }
 
+    /// The private human room whose Ask produced this queued request message,
+    /// resolved through the trusted post→request binding
+    /// (`topic_post_bind_request`). Read-only; `None` when no room post
+    /// carries that request message.
+    pub fn human_room_for_request(&self, message_id: &str) -> Result<Option<String>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_opt(
+                "SELECT r.id FROM human_rooms r
+                   JOIN topic_posts p ON p.topic_id=r.topic_id
+                  WHERE p.request_message=?",
+                [message_id],
+                |r| r.get::<_, String>(0),
+            )?)
+        })
+    }
+
     /// A page of a room's history for an active agent member: rows after the
     /// agent's cutoff, newest-first from `before`, returned ascending, with
     /// whether older rows remain. Read-only.

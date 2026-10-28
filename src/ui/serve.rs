@@ -26,11 +26,12 @@ use super::write_path::{
     request_identity, send, with_agents, write_route, HttpResp, BUSY_RETRY_AFTER_SECS,
 };
 use super::{
-    app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
-    app_release, app_runs, app_screens, approvals, apps, assist_route, business_templates,
-    cli_route, connections, crm_send, delivery_sync, endpoints, home, lane, locale, member_assist,
-    my_work, operator, platform_account, read_model, social_publish, stages, threads, topics,
-    updates, wiki, wiki_envelope, work_conversations, workflows,
+    agent_access, app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer,
+    app_records, app_release, app_runs, app_screens, approvals, apps, assist_route,
+    business_templates, cli_route, connections, credential_entry, crm_send, delivery_sync,
+    endpoints, home, lane, locale, member_assist, my_work, operator, platform_account, read_model,
+    social_publish, stages, threads, topics, updates, wiki, wiki_envelope, work_conversations,
+    workflows,
 };
 use super::{
     push_device_login_config, ready_file, startup_failed_file, tailnet_url, ServeOpts,
@@ -1104,10 +1105,12 @@ macro_rules! read_route_enums {
 read_route_enums!(
     app_assistant::Route<'_>,
     app_contexts::Route<'_>,
+    agent_access::Route<'_>,
     app_audiences::Route<'_>,
     app_records::Route<'_>,
     app_content::Route<'_>,
     connections::Route<'_>,
+    credential_entry::Route<'_>,
     crm_send::Route,
     app_release::Route<'_>,
     app_runs::Route<'_>,
@@ -1343,7 +1346,8 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         .find(|h| h.field.equiv("Host"))
         .map(|h| h.value.as_str().to_string())
         .unwrap_or_default();
-    if !host_allowed(&host, opts.port, &opts.allow_hosts) {
+    let at_entry_origin = credential_entry::accepts_host(opts, &host);
+    if !host_allowed(&host, opts.port, &opts.allow_hosts) && !at_entry_origin {
         let _ = request.respond(err_response(421, "misdirected request — Host not allowed"));
         return;
     }
@@ -1386,6 +1390,29 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     };
 
     let send = |req: Request, resp: HttpResp| send(req, resp, head_only);
+
+    // CAD-1085: the ONE auth-only cross-origin exception. It is exact
+    // path+method on the pinned origin, accepts only a configured Board
+    // Origin and a strict form body, and never applies to the secret
+    // session/submit routes (which require the entry Origin). It runs
+    // before the generic write guard so the board-origin form can reach it.
+    if is_write && path == credential_entry::AUTH_PATH {
+        let response = credential_entry::authenticate(&mut request, state_dir, opts);
+        send(request, response);
+        return;
+    }
+
+    // CAD-1085: the trusted credential origin gate runs before every
+    // handler and every body read. The entry page and its secret-bearing
+    // session/submit/cancel routes exist only on the root-pinned origin;
+    // the ordinary board 404s the page and refuses those writes with a
+    // closed refusal, so a credential body is never collected there. On a
+    // protected profile the legacy directly-typed connection bodies are
+    // refused here too, before `read_body`.
+    if let Some(response) = credential_entry::gate(&request, opts, &path, is_write) {
+        send(request, response);
+        return;
+    }
 
     // CAD-786: the recipient's unsubscribe confirmation page — the
     // token in the path is the credential, so the page is answered
@@ -1594,7 +1621,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     // routes and streams. Local bootstrap/static files are public. The
     // screen document instead owns a one-use, live-session-bound capability.
     let private_api = path.starts_with("/api/")
-        && !matches!(path.as_str(), "/api/meta" | "/api/health" | "/api/version")
+        && !matches!(
+            path.as_str(),
+            "/api/meta" | "/api/health" | "/api/version" | "/api/protected-entry"
+        )
         && app_screens::frame_route(&path).is_none();
     let public_read = public_host && !matches!(path.as_str(), "/api/health" | "/api/version");
     let read_admission = if private_api || public_read {
@@ -1618,7 +1648,9 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     // alias (`a/b` carries `/`) and answered 400 before any handler. The
     // table's single-segment row cannot bind it, so the answer is kept here.
     if let Some(tail) = path.strip_prefix("/api/agents/") {
-        if tail.contains('/') {
+        // CAD-1085: `/api/agents/<alias>/access` is one real bounded
+        // subresource; every other multi-segment tail stays the old 400.
+        if tail.contains('/') && agent_access::route(&path).is_none() {
             send(request, err_response(400, "bad agent alias"));
             return;
         }
@@ -1759,6 +1791,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 ),
             );
         }
+        // CAD-1085: the SPA's origin gate — where the trusted credential
+        // form lives (root-pinned) and where this board is. Metadata only:
+        // no request, credential or capability.
+        "/api/protected-entry" => send(request, json_response(credential_entry::config_json(opts))),
         // CAD-561: the Update card's view and the draining banner.
         "/api/update" => send(request, updates::get(state_dir)),
         "/api/update/banner" => send(request, updates::banner_get(state_dir)),
@@ -2409,6 +2445,28 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 &mut request,
                 state_dir,
                 opts,
+                credential_entry::route(&path),
+                operator::admit_operator_read,
+                |req, route| credential_entry::handle_read(req, state_dir, opts, route),
+            ) {
+                send(request, response);
+                return;
+            }
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                agent_access::route(&path),
+                operator::admit_operator_read,
+                |_req, route| agent_access::handle(state_dir, route),
+            ) {
+                send(request, response);
+                return;
+            }
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
                 crm_send::route(&path),
                 operator::admit_operator_read,
                 |_, route| crm_send::handle_read(state_dir, route, &query),
@@ -2760,6 +2818,30 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 send(request, err_response(404, "no such route"));
                 return;
             }
+            // CAD-1085: every private entry document is the real SPA
+            // shell with a server-owned memory-only marker (and, after the
+            // auth POST, its one-use bootstrap). It must be uncompressed
+            // so the marker can be injected.
+            if at_entry_origin {
+                if let Some(request_id) = credential_entry::entry_page_id(&path) {
+                    send(
+                        request,
+                        credential_entry::handoff_document(opts, request_id),
+                    );
+                    return;
+                }
+                if path == "/login" || path == "/login/" {
+                    let response = match credential_entry::entry_document(opts, None) {
+                        Some(bytes) => credential_entry::document_response(bytes, 200),
+                        None => err_response(
+                            503,
+                            "no SPA build — pass --dist or rebuild with --features ui",
+                        ),
+                    };
+                    send(request, response);
+                    return;
+                }
+            }
             // Static: a file of the build, the SPA shell for a client
             // route, or 404 for a file that is not there.
             match static_answer_for(
@@ -2831,6 +2913,43 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     // The tailnet proof's operator latch starts with this process: read
     // tailscaled's operator user now, never trust a caller-made latch.
     opts.agent_uid = board_boot_agent_uid(state_dir, opts.agent_uid)?;
+    // CAD-1085: the root profile pins the credential-entry origin. It is
+    // resolved from the daemon once (no agent or loaded guest needed), so
+    // every later Host/Origin decision is the deployment's, not a request
+    // field. A fixture may inject it; nothing else sets it. An absent or
+    // non-separate origin disables trusted entry EXPLICITLY — it never
+    // falls back to this board's own origin.
+    if opts.credential_entry_origin.is_none() {
+        let (installed, origin) = super::credential_entry_config(state_dir);
+        // `installed` alone (even with the owner down, or with an origin
+        // this deployment cannot use) blocks the legacy secret paths.
+        opts.protected_profile = opts.protected_profile || installed;
+        opts.credential_entry_origin = origin;
+    }
+    let entry = credential_entry::EntryOrigin::from_opts(&opts);
+    let entry_hosts = entry
+        .as_ref()
+        .map(credential_entry::EntryOrigin::host_forms)
+        .unwrap_or_default();
+    if entry_hosts.is_empty() && opts.credential_entry_origin.is_some() {
+        eprintln!(
+            "warning: the protected profile's credential origin is not a separate https origin \
+             — trusted credential entry is unsupported"
+        );
+        opts.credential_entry_origin = None;
+    }
+    // The entry host is NOT added to the ordinary board allowlist: it is
+    // accepted only by the credential-entry gate, which serves just its own
+    // page/API there. Its https Origin is a valid same-origin write Origin.
+    if let Some(origin) = entry.as_ref().map(credential_entry::EntryOrigin::origin) {
+        if !opts
+            .allow_origins
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(origin))
+        {
+            opts.allow_origins.push(origin.to_string());
+        }
+    }
     opts.tailnet_latch = if opts.tailnet.is_some() {
         crate::tailnet_proof::OperatorLatch::at_startup(opts.tailscaled_socket.as_deref())
     } else {

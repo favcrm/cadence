@@ -409,7 +409,8 @@ pub enum LinkRefusal {
     AlreadyUsed,
     /// Older than [`LINK_TTL_SECS`].
     Expired,
-    /// Minted for the other origin (loopback vs tailnet).
+    /// Minted for another origin or audience (board vs the pinned entry
+    /// origin, or loopback vs tailnet).
     WrongOrigin,
 }
 
@@ -437,8 +438,9 @@ impl LinkRefusal {
             }
             Self::Expired => "this login link expired — run `cadence ui login` again",
             Self::WrongOrigin => {
-                "this login link was minted for another address (loopback vs tailnet) — \
-                 run `cadence ui login` (or `--tailnet`) for the address you opened"
+                "this login link was minted for another address or audience \
+                 (board vs trusted credential origin, or loopback vs tailnet) — \
+                 run the matching `cadence ui login` for the page you opened"
             }
         }
     }
@@ -545,6 +547,12 @@ struct Row {
     #[serde(default)]
     key_hash: String,
     origin: Origin,
+    /// CAD-1085: the exact root-pinned credential-entry origin this session
+    /// was issued for. `None` is an ordinary board session and can never
+    /// satisfy the typed entry check; an entry-scoped row can never satisfy
+    /// the ordinary board check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entry_origin: Option<String>,
     created: i64,
     last_used: i64,
     expires_at: i64,
@@ -676,6 +684,27 @@ struct SessionsFile {
     jtis: HashMap<String, i64>,
 }
 
+/// The typed audience of one login link. A board link can never be
+/// exchanged on the trusted credential-entry origin, and an entry link can
+/// never become a board session.
+///
+/// An entry audience binds BOTH the exact root-pinned origin AND the exact
+/// canonical request UUID whose genuine human Continue authorized it. The
+/// session created from it carries only the entry-origin scope; the request
+/// selector is consumed once and returned as the destination, never stored
+/// as broad session authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LinkScope {
+    Board,
+    /// The dedicated entry-login RPCs bind the exact root-pinned origin AND
+    /// the canonical request UUID whose genuine human Continue authorized
+    /// it. The resulting session carries only the entry-origin scope.
+    Entry {
+        origin: String,
+        request_id: String,
+    },
+}
+
 /// The daemon's operator-auth state: live link nonces (memory only — a
 /// restart voids every unexchanged link), the spent ones (so a replay
 /// says "already used", not "unknown"), and the persisted sessions.
@@ -687,8 +716,8 @@ struct SessionsFile {
 pub struct Auth {
     path: PathBuf,
     sessions: Vec<Row>,
-    /// nonce hash → (origin, expires_at)
-    links: HashMap<String, (Origin, i64, Option<String>)>,
+    /// nonce hash → (origin, expires_at, upload account, typed audience)
+    links: HashMap<String, (Origin, i64, Option<String>, LinkScope)>,
     /// spent nonce hash → when it would have expired (pruned after)
     spent: HashMap<String, i64>,
     /// seen jti hash → its acceptance deadline (`exp + skew`) — the
@@ -772,7 +801,7 @@ impl Auth {
         // An expired link is kept one more TTL so its refusal can say
         // "expired" rather than "unknown".
         self.links
-            .retain(|_, (_, exp, _)| now <= *exp + LINK_TTL_SECS);
+            .retain(|_, (_, exp, _, _)| now <= *exp + LINK_TTL_SECS);
         self.spent.retain(|_, exp| now <= *exp + LINK_TTL_SECS);
         // A jti stays through its assertion's acceptance deadline — the
         // same horizon `verify` uses — so a replay inside the grace still
@@ -783,11 +812,21 @@ impl Auth {
         before != self.sessions.len()
     }
 
-    /// Mint a single-use link nonce for `origin`. The caller has already
-    /// proved the operator; this only records `sha256(nonce)`. `public`
-    /// is refused outright — those sessions are born only of a verified
-    /// platform assertion, never a login link (CAD-526).
+    /// Mint a single-use link nonce for `origin` on the ordinary board
+    /// audience. The caller has already proved the operator; this only
+    /// records `sha256(nonce)`. `public` is refused outright — those
+    /// sessions are born only of a verified platform assertion, never a
+    /// login link (CAD-526).
     pub fn mint(&mut self, origin: Origin, now: i64) -> Result<String> {
+        self.mint_scoped(origin, LinkScope::Board, now)
+    }
+
+    pub(crate) fn mint_scoped(
+        &mut self,
+        origin: Origin,
+        scope: LinkScope,
+        now: i64,
+    ) -> Result<String> {
         if origin == Origin::Public {
             return Err(Error::invalid(
                 "invalid_request",
@@ -797,15 +836,16 @@ impl Auth {
         self.prune(now);
         let nonce = random_credential()?;
         self.links
-            .insert(digest(&nonce), (origin, now + LINK_TTL_SECS, None));
+            .insert(digest(&nonce), (origin, now + LINK_TTL_SECS, None, scope));
         Ok(nonce)
     }
 
     /// Mint a login link bound to a durable account registered by the
     /// caller after independent native operator authentication.
-    pub fn mint_for_account(
+    pub(crate) fn mint_for_account(
         &mut self,
         origin: Origin,
+        scope: LinkScope,
         now: i64,
         account_id: String,
     ) -> Result<String> {
@@ -819,14 +859,15 @@ impl Auth {
         let nonce = random_credential()?;
         self.links.insert(
             digest(&nonce),
-            (origin, now + LINK_TTL_SECS, Some(account_id)),
+            (origin, now + LINK_TTL_SECS, Some(account_id), scope),
         );
         Ok(nonce)
     }
 
-    /// Exchange `nonce` for a session on `origin`. The nonce is spent by
-    /// the first attempt that names it, whatever the outcome — a refused
-    /// exchange (wrong origin, too late) cannot be retried.
+    /// Exchange `nonce` for an ordinary board session on `origin`. The
+    /// nonce is spent by the first attempt that names it, whatever the
+    /// outcome — a refused exchange (wrong origin/audience, too late)
+    /// cannot be retried.
     pub fn open(
         &mut self,
         nonce: &str,
@@ -834,6 +875,25 @@ impl Auth {
         user_agent: &str,
         now: i64,
     ) -> std::result::Result<Result<Opened>, LinkRefusal> {
+        self.open_scoped(nonce, origin, LinkScope::Board, user_agent, now)
+            .map(|created| created.map(|(opened, _)| opened))
+    }
+
+    /// Exchange `nonce` only for a session minted with the exact `scope`.
+    /// The live profile origin was already re-checked by the caller; this
+    /// enforces that a board link never becomes entry authority and an
+    /// entry link never becomes board authority. An entry audience also
+    /// carries the canonical request UUID that authorized it: a different
+    /// submitted request spends the nonce and creates no session, and the
+    /// returned stored scope is the ONLY destination the caller may use.
+    pub(crate) fn open_scoped(
+        &mut self,
+        nonce: &str,
+        origin: Origin,
+        scope: LinkScope,
+        user_agent: &str,
+        now: i64,
+    ) -> std::result::Result<Result<(Opened, LinkScope)>, LinkRefusal> {
         self.prune(now);
         if !well_formed(nonce) {
             return Err(LinkRefusal::Malformed);
@@ -842,17 +902,39 @@ impl Auth {
         if self.spent.contains_key(&hash) {
             return Err(LinkRefusal::AlreadyUsed);
         }
-        let Some((minted_for, expires, account_id)) = self.links.remove(&hash) else {
+        let Some((minted_for, expires, account_id, stored_scope)) = self.links.remove(&hash) else {
             return Err(LinkRefusal::Unknown);
         };
         self.spent.insert(hash, expires);
         if now > expires {
             return Err(LinkRefusal::Expired);
         }
-        if minted_for != origin {
+        if minted_for != origin || stored_scope != scope {
             return Err(LinkRefusal::WrongOrigin);
         }
-        Ok(self.create(origin, user_agent, now, account_id))
+        let entry_origin = match &stored_scope {
+            LinkScope::Board => None,
+            LinkScope::Entry { origin, .. } => Some(origin.clone()),
+        };
+        let opened = self.create(origin, user_agent, now, account_id, entry_origin);
+        Ok(opened.map(|opened| (opened, stored_scope)))
+    }
+
+    /// Spend one link nonce without creating a session. Used when the
+    /// submitted entry origin/profile no longer matches the stored audience:
+    /// the nonce is single-use even on refusal.
+    pub(crate) fn spend_link(&mut self, nonce: &str, now: i64) {
+        self.prune(now);
+        if !well_formed(nonce) {
+            return;
+        }
+        let hash = digest(nonce);
+        if self.spent.contains_key(&hash) {
+            return;
+        }
+        if let Some((_, expires, _, _)) = self.links.remove(&hash) {
+            self.spent.insert(hash, expires);
+        }
     }
 
     fn create(
@@ -861,6 +943,7 @@ impl Auth {
         user_agent: &str,
         now: i64,
         account_id: Option<String>,
+        entry_origin: Option<String>,
     ) -> Result<Opened> {
         let token = random_credential()?;
         let key = random_credential()?;
@@ -868,6 +951,7 @@ impl Auth {
             hash: digest(&token),
             key_hash: digest(&key),
             origin,
+            entry_origin,
             created: now,
             last_used: now,
             expires_at: now + ABSOLUTE_SECS,
@@ -907,9 +991,14 @@ impl Auth {
         user_agent: &str,
         now: i64,
     ) -> Result<Opened> {
-        self.open_device_account(user, origin, user_agent, now, None)
+        self.open_device_account(user, origin, user_agent, now, None, None)
     }
 
+    /// `entry_origin` is the exact root-pinned credential-entry origin for a
+    /// sign-in performed on that separate browser origin. It is persisted on
+    /// the row and required by [`Self::check_entry`]; a board sign-in passes
+    /// `None`. Entry scope is loopback-only and never upgrades a caller
+    /// string: the daemon RPC validates it against the live profile first.
     pub fn open_device_account(
         &mut self,
         user: BoardUser,
@@ -917,6 +1006,7 @@ impl Auth {
         user_agent: &str,
         now: i64,
         account_id: Option<String>,
+        entry_origin: Option<String>,
     ) -> Result<Opened> {
         self.prune(now);
         if origin == Origin::Public {
@@ -925,6 +1015,18 @@ impl Auth {
                 "public sessions open through a verified assertion, not a device grant",
             ));
         }
+        if let Some(entry) = entry_origin.as_deref() {
+            if origin != Origin::Loopback
+                || !entry.starts_with("https://")
+                || entry.len() > 200
+                || entry.bytes().any(|b| b.is_ascii_whitespace())
+            {
+                return Err(Error::invalid(
+                    "invalid_request",
+                    "entry sessions open only for the exact pinned entry origin",
+                ));
+            }
+        }
         if !user.is_operator() {
             return Err(Error::invalid(
                 "invalid_request",
@@ -932,7 +1034,13 @@ impl Auth {
             ));
         }
         self.sessions.retain(|r| {
-            !(r.origin != Origin::Public && r.user.as_ref().is_some_and(|u| u.sub == user.sub))
+            let same_subject =
+                r.origin != Origin::Public && r.user.as_ref().is_some_and(|u| u.sub == user.sub);
+            // Board and the pinned entry origin are separate browser scopes:
+            // a fresh sign-in ends the earlier session in the SAME scope, not
+            // the operator's session in the other one.
+            let same_scope = r.entry_origin.as_deref() == entry_origin.as_deref();
+            !(same_subject && same_scope)
         });
         let token = random_credential()?;
         let key = random_credential()?;
@@ -940,6 +1048,7 @@ impl Auth {
             hash: digest(&token),
             key_hash: digest(&key),
             origin,
+            entry_origin,
             created: now,
             last_used: now,
             expires_at: now + crate::device_login::REMOTE_ABSOLUTE_SECS,
@@ -1072,6 +1181,7 @@ impl Auth {
             // keyed `check`.
             key_hash: String::new(),
             origin: Origin::Public,
+            entry_origin: None,
             created: now,
             last_used: now,
             expires_at: now + PUBLIC_SESSION_SECS,
@@ -1172,6 +1282,32 @@ impl Auth {
         origin: Origin,
         now: i64,
     ) -> Result<Option<SessionView>> {
+        self.check_scoped(token, key, origin, None, now)
+    }
+
+    /// Verify one live session bound to the exact root-pinned entry origin.
+    /// An ordinary board session never matches, and an entry session can
+    /// never satisfy [`Self::check`]: the entry cookie is a distinct scope,
+    /// not board authority.
+    pub fn check_entry(
+        &mut self,
+        token: &str,
+        key: &str,
+        entry_origin: &str,
+        now: i64,
+    ) -> Result<Option<SessionView>> {
+        let requested = Origin::Loopback;
+        self.check_scoped(token, key, requested, Some(entry_origin), now)
+    }
+
+    fn check_scoped(
+        &mut self,
+        token: &str,
+        key: &str,
+        origin: Origin,
+        entry_origin: Option<&str>,
+        now: i64,
+    ) -> Result<Option<SessionView>> {
         let mut dirty = self.prune(now);
         if !well_formed(token) || !well_formed(key) {
             if dirty {
@@ -1188,7 +1324,17 @@ impl Auth {
                 // Both compared in full, whatever the first says.
                 let token_ok = same_credential(&r.hash, &hash);
                 let key_ok = same_credential(&r.key_hash, &key_hash);
-                token_ok & key_ok && r.origin == origin
+                let scope_ok = match entry_origin {
+                    // Ordinary board session: rows carrying an entry scope
+                    // are never board authority.
+                    None => r.entry_origin.is_none(),
+                    // Typed entry scope: loopback origin plus the exact
+                    // entry origin persisted at sign-in.
+                    Some(want) => {
+                        r.origin == Origin::Loopback && r.entry_origin.as_deref() == Some(want)
+                    }
+                };
+                token_ok & key_ok & (r.origin == origin) & scope_ok
             })
             .map(|row| {
                 if now - row.last_used >= TOUCH_EVERY_SECS {
@@ -1325,7 +1471,7 @@ impl Auth {
         }
         let gone = self.sessions.len();
         self.sessions.clear();
-        for (hash, (_, exp, _)) in self.links.drain() {
+        for (hash, (_, exp, _, _)) in self.links.drain() {
             self.spent.insert(hash, exp);
         }
         self.persist()?;
@@ -1566,6 +1712,7 @@ mod tests {
             hash: format!("{}{}", prefix, suffix),
             key_hash: "k".repeat(64),
             origin: Origin::Loopback,
+            entry_origin: None,
             created: now,
             last_used: now,
             expires_at: now + 10_000,

@@ -40,15 +40,45 @@ jobs:
           cargo build -p cadence-core --target wasm32-unknown-unknown --release --features wasm-abi --locked
           mkdir -p dist
           cp target/wasm32-unknown-unknown/release/cadence_core.wasm dist/core.wasm
+          # CAD-1085: generate the Connection contract schemas from the same
+          # Rust types (one contract source, no hand-written TS policy).
+          cargo run -p cadence-core --locked --example dump_connection_schemas -- dist
           cp contracts/cadence-core/v1/*.schema.json dist/
           for f in contracts/board-api/v1/*.schema.json; do cp "$f" "dist/board-api-$(basename "$f")"; done
           (cd dist && sha256sum core.wasm > core.wasm.sha256)
           echo "contract version: v1" | tee dist/CONTRACT_VERSION
           cat dist/core.wasm.sha256
+      # CAD-1085: the custody envelope primitive is a SEPARATE artifact built
+      # from the same source with the optional feature. The ordinary core.wasm
+      # must not contain any core_custody_* export.
+      - name: Build custody-core.wasm
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/src --remap-path-prefix=/home/runner/.cargo=/cargo
+        run: |
+          set -eu
+          cargo build -p cadence-core --target wasm32-unknown-unknown --release --features wasm-abi,custody-crypto --locked
+          mkdir -p dist-private
+          cp target/wasm32-unknown-unknown/release/cadence_core.wasm dist-private/custody-core.wasm
+          (cd dist-private && sha256sum custody-core.wasm > custody-core.wasm.sha256)
+          cat dist-private/custody-core.wasm.sha256
+      - name: The ordinary artifact has no custody crypto export
+        run: |
+          set -eu
+          if grep -aq 'core_custody_' dist/core.wasm; then
+            echo "ordinary core.wasm must not expose custody crypto (CAD-1085)" >&2
+            exit 1
+          fi
+          grep -aq 'core_connection_plan_v1' dist/core.wasm
+          grep -aq 'core_custody_' dist-private/custody-core.wasm
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cadence-core-wasm
           path: dist/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cadence-core-wasm-custody
+          path: dist-private/
           if-no-files-found: error
 
   release:
@@ -62,6 +92,10 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: cadence-core-wasm
+          path: dist/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cadence-core-wasm-custody
           path: dist/
       - name: Attach to the release
         env:
@@ -78,5 +112,6 @@ jobs:
           else
             gh release create "$TAG" --draft --latest=false --title "$TAG" --notes "cadence-core wasm, contract v1"
           fi
-          gh release upload "$TAG" --clobber dist/core.wasm dist/core.wasm.sha256 dist/*.schema.json
+          gh release upload "$TAG" --clobber dist/core.wasm dist/core.wasm.sha256 \
+            dist/custody-core.wasm dist/custody-core.wasm.sha256 dist/*.schema.json
           gh release edit "$TAG" --draft=false --latest=false

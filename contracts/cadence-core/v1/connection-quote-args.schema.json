@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QuoteArgsV1",
+  "type": "object",
+  "properties": {
+    "capability_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "connection_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "data_scope_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "expected_authorization_revision": {
+      "$ref": "#/$defs/Revision"
+    },
+    "expected_credential_revision": {
+      "$ref": "#/$defs/Revision"
+    },
+    "loaded_receipt_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "max_cost_micros": {
+      "$ref": "#/$defs/UsdMicros"
+    },
+    "max_output_tokens": {
+      "$ref": "#/$defs/MaxOutputTokens"
+    },
+    "model": {
+      "$ref": "#/$defs/ModelId"
+    },
+    "snapshot_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "connection_id",
+    "expected_credential_revision",
+    "expected_authorization_revision",
+    "snapshot_id",
+    "loaded_receipt_id",
+    "capability_id",
+    "model",
+    "max_output_tokens",
+    "max_cost_micros",
+    "data_scope_id"
+  ],
+  "$defs": {
+    "Ident": {
+      "description": "Bounded printable ASCII identifier (`0x21..=0x7e`, 1..=128 bytes).",
+      "type": "string"
+    },
+    "MaxOutputTokens": {
+      "description": "`16..=4096` output-token cap; omitted, zero, negative and float refuse.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "ModelId": {
+      "description": "An explicitly named model id; whitespace and control bytes refuse.",
+      "type": "string"
+    },
+    "Revision": {
+      "description": "Positive canonical decimal revision (0 refuses).",
+      "type": "string"
+    },
+    "UsdMicros": {
+      "description": "Nonnegative exact USD micro-dollars as a canonical decimal string.",
+      "type": "string"
+    },
+    "UuidV1": {
+      "description": "Canonical lowercase UUID selector (`8-4-4-4-12`).",
+      "type": "string"
+    }
+  }
+}

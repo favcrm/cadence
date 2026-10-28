@@ -207,6 +207,60 @@ impl Store {
         Ok((store, RecoveryOutcome::default()))
     }
 
+    /// The protected-profile open: same gate, preflight, seal and schema
+    /// guards as `open_adopting`, but NO recovery sweep. The daemon installs
+    /// the external checkpoint transport and validates the external floor
+    /// before it runs [`Self::run_guarded_recover`] explicitly.
+    pub(crate) fn open_unrecovered_mode(
+        path: &Path,
+        mode: super::seal::OpenMode,
+    ) -> Result<(Self, RecoveryOutcome)> {
+        let (store, _) = Self::open_inner(path, None, true, false, mode)?;
+        Ok((store, RecoveryOutcome::default()))
+    }
+
+    /// Run the existing recovery sweep under the installed protected journal,
+    /// then require the external checkpoint acknowledgement for its actual
+    /// head BEFORE reporting success. A missing/lost acknowledgement fences
+    /// further protected admission and answers `outcome_unknown`; the sweep is
+    /// never rerun.
+    pub(crate) fn run_guarded_recover(
+        &self,
+        marker: Option<&ConsumedMarker>,
+        owner_epoch: cadence_core::connection_dispatch::primitives::Revision,
+    ) -> Result<RecoveryOutcome> {
+        let outcome = self.recover(marker)?;
+        let authority = self.protected_authority()?;
+        let binding = cadence_core::connection_dispatch::primitives::Digest::try_from(
+            cadence_core::connection_dispatch::material_digest_for_domain(
+                "cadence-protected-recover-v1",
+                &json!({
+                    "workspace_id": authority.workspace_id,
+                    "owner_epoch": owner_epoch.get(),
+                    "ledger_sequence": authority.ledger_head.sequence.get(),
+                    "ledger_digest": authority.ledger_head.digest.as_str(),
+                }),
+            ),
+        )
+        .map_err(|_| Error::internal("the recovery binding is malformed"))?;
+        if let Err(error) =
+            self.protected_checkpoint_head(&authority.workspace_id, owner_epoch, binding)
+        {
+            let _ = self.write_tx(|tx| {
+                tx.execute_raw(
+                    "UPDATE connection_dispatch_config SET fenced=1 WHERE singleton=1",
+                    [],
+                )?;
+                Ok(())
+            });
+            return Err(Error::OutcomeUnknown(format!(
+                "recovery was applied but its external checkpoint is unacknowledged: {}",
+                error.code().unwrap_or("storage_unavailable")
+            )));
+        }
+        Ok(outcome)
+    }
+
     /// Open a live database for a side write that must not run restart
     /// recovery. `app remove` uses this to revoke derived grants while
     /// the daemon still holds the store — recovery would fence the
@@ -216,7 +270,11 @@ impl Store {
     }
 
     /// `open_side` with a mode — under `Protected` a second writer
-    /// connection to `cadence.sqlite3` refuses outright (CAD-1011).
+    /// connection to `cadence.sqlite3` refuses outright (CAD-1011). A
+    /// durably protected deployment (the authenticated boot path selected
+    /// protected authority journaling) likewise has NO unauthenticated side
+    /// writer: this instance cannot carry the external checkpoint transport,
+    /// so an authorizing side write could never move the restore floor.
     pub fn open_side_mode(path: &Path, mode: super::seal::OpenMode) -> Result<Self> {
         if mode == super::seal::OpenMode::Protected {
             return Err(Error::rejected(
@@ -224,7 +282,14 @@ impl Store {
                  cadence.sqlite3 is not permitted",
             ));
         }
-        Self::open_inner(path, None, true, false, mode).map(|(store, _)| store)
+        let store = Self::open_inner(path, None, true, false, mode)?.0;
+        if store.protection_required()? {
+            return Err(Error::rejected(
+                "open_side refused: this database is a protected deployment and \
+                 has no unauthenticated side writer",
+            ));
+        }
+        Ok(store)
     }
 
     /// Migrate an older database without the rollout lease gate.
@@ -750,6 +815,10 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=20", [])?;
                 tx.commit()?;
             }
+            // migration-lint: allow 21 -- CAD-1085: name the insert's two
+            // columns so a store that already carries the v59 dispatch
+            // additions re-migrates; the inserted values and meaning are
+            // unchanged.
             if version < 21 {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 let mut statement = tx.prepare("PRAGMA table_info(platform_credentials)")?;
@@ -763,7 +832,7 @@ impl Store {
                 if !columns.iter().any(|c| c == "credential_revision") {
                     tx.execute_batch("ALTER TABLE platform_credentials ADD COLUMN credential_revision INTEGER NOT NULL DEFAULT 1;")?;
                 }
-                tx.execute_batch("UPDATE platform_credentials SET connection_id='conn-' || lower(hex(randomblob(16))) WHERE connection_id=''; CREATE UNIQUE INDEX IF NOT EXISTS platform_connection_id ON platform_credentials(connection_id); CREATE TABLE IF NOT EXISTS connection_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),workspace_id TEXT NOT NULL); INSERT OR IGNORE INTO connection_metadata VALUES(1,lower(hex(randomblob(16))));")?;
+                tx.execute_batch("UPDATE platform_credentials SET connection_id='conn-' || lower(hex(randomblob(16))) WHERE connection_id=''; CREATE UNIQUE INDEX IF NOT EXISTS platform_connection_id ON platform_credentials(connection_id); CREATE TABLE IF NOT EXISTS connection_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),workspace_id TEXT NOT NULL); INSERT OR IGNORE INTO connection_metadata(singleton, workspace_id) VALUES(1,lower(hex(randomblob(16))));")?;
                 tx.execute("UPDATE schema_version SET version=21", [])?;
                 tx.commit()?;
             }
@@ -1494,6 +1563,18 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=59", [])?;
                 tx.commit()?;
             }
+            if version < 60 {
+                // CAD-1085: the native protected Connection authority and the
+                // metadata-only human credential-entry tables. One forward
+                // step: the dispatch/journal schema and `credential_requests`
+                // commit together, so no store can have one without the
+                // other. Column-checked and idempotent so a half-applied
+                // store converges.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                super::connection_dispatch::migrate_v60(&tx)?;
+                tx.execute("UPDATE schema_version SET version=60", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(
@@ -1532,6 +1613,8 @@ impl Store {
                 .unwrap_or_else(|_| path.to_path_buf())
                 .to_string_lossy()
                 .into_owned(),
+            protected_checkpoint: std::sync::OnceLock::new(),
+            admission_fence: std::sync::atomic::AtomicBool::new(false),
         };
         let outcome = if recover {
             Some(store.recover(marker.as_ref())?)

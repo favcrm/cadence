@@ -7,6 +7,7 @@ export const AGENT_TABS = [
   { id: "knowledge", label: "Knowledge" },
   { id: "skills", label: "Skills" },
   { id: "tools", label: "MCP & tools" },
+  { id: "access", label: "Access" },
   { id: "settings", label: "Settings" },
 ] as const;
 

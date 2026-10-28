@@ -1,0 +1,1235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AdmissionSnapshotV1",
+  "type": "object",
+  "properties": {
+    "approval": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SendApprovalV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "clock_floor_ms": {
+      "$ref": "#/$defs/EpochMs"
+    },
+    "connection": {
+      "$ref": "#/$defs/ConnectionFactsV1"
+    },
+    "database_epoch": {
+      "$ref": "#/$defs/Revision"
+    },
+    "dispatch_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "existing": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExistingDispatchV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "exposure": {
+      "$ref": "#/$defs/ExposureFactsV1"
+    },
+    "grants": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/UidGrantV1"
+      }
+    },
+    "ledger_head": {
+      "$ref": "#/$defs/LedgerHeadV1"
+    },
+    "limits": {
+      "$ref": "#/$defs/OwnerLimitsV1"
+    },
+    "manifest": {
+      "$ref": "#/$defs/ManifestV1"
+    },
+    "now_ms": {
+      "$ref": "#/$defs/EpochMs"
+    },
+    "observed_registry_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "policy": {
+      "$ref": "#/$defs/OperationPolicyV1"
+    },
+    "policy_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "principal": {
+      "$ref": "#/$defs/PrincipalBindingV1"
+    },
+    "request_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "requester": {
+      "$ref": "#/$defs/RequesterV1"
+    },
+    "resolved": {
+      "$ref": "#/$defs/ResolvedMaterialV1"
+    },
+    "role_policy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RoleModelPolicyV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeFactsV1"
+    },
+    "snapshot_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "test_send_record": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HumanActionRecordV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "verify_record": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HumanActionRecordV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "snapshot_id",
+    "dispatch_id",
+    "request_id",
+    "now_ms",
+    "clock_floor_ms",
+    "database_epoch",
+    "ledger_head",
+    "requester",
+    "principal",
+    "runtime",
+    "connection",
+    "policy",
+    "grants",
+    "limits",
+    "exposure",
+    "manifest",
+    "observed_registry_digest",
+    "policy_digest",
+    "resolved"
+  ],
+  "$defs": {
+    "AgentUid": {
+      "description": "Stable hosted agent UID: `agt-` plus the 32 lowercase hex UUID digits.",
+      "type": "string"
+    },
+    "ArtifactKindV1": {
+      "type": "string",
+      "enum": [
+        "skill",
+        "mcp",
+        "tool"
+      ]
+    },
+    "ArtifactV1": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "implementation_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "input_schema_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "kind": {
+          "$ref": "#/$defs/ArtifactKindV1"
+        },
+        "output_schema_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "resource_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "version": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "kind",
+        "version",
+        "content_digest",
+        "implementation_digest",
+        "resource_digest",
+        "input_schema_digest",
+        "output_schema_digest"
+      ]
+    },
+    "CallableV1": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/Ident"
+        },
+        "version": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "CapabilityV1": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "callable": {
+          "$ref": "#/$defs/CallableV1"
+        },
+        "capability_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "connection_scope": {
+          "$ref": "#/$defs/Ident"
+        },
+        "effect": {
+          "$ref": "#/$defs/EffectClassV1"
+        },
+        "operation": {
+          "$ref": "#/$defs/OperationKindV1"
+        },
+        "policy_scope": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "capability_id",
+        "callable",
+        "artifact_id",
+        "operation",
+        "effect",
+        "connection_scope",
+        "policy_scope"
+      ]
+    },
+    "ConnectionFactsV1": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "$ref": "#/$defs/Ident"
+        },
+        "authorization_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "connection_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "credential_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "custody_domain": {
+          "$ref": "#/$defs/Ident"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "exchange": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ident"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fence": {
+          "$ref": "#/$defs/FenceStateV1"
+        },
+        "incarnation": {
+          "$ref": "#/$defs/Ident"
+        },
+        "key_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "policy_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "provider_kind": {
+          "$ref": "#/$defs/ProviderKindV1"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "connection_id",
+        "provider_kind",
+        "workspace_id",
+        "custody_domain",
+        "account",
+        "incarnation",
+        "credential_revision",
+        "authorization_revision",
+        "policy_revision",
+        "key_id",
+        "enabled",
+        "fence"
+      ]
+    },
+    "Counter": {
+      "description": "Nonnegative canonical decimal counter (`0|[1-9][0-9]*`, <= i64::MAX).",
+      "type": "string"
+    },
+    "DataScopeSourceV1": {
+      "type": "string",
+      "enum": [
+        "caller_text",
+        "immutable_source"
+      ]
+    },
+    "DataScopeV1": {
+      "type": "object",
+      "properties": {
+        "allow_caller_text": {
+          "type": "boolean"
+        },
+        "content_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retention_policy": {
+          "$ref": "#/$defs/Ident"
+        },
+        "scope_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "source": {
+          "$ref": "#/$defs/DataScopeSourceV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "scope_id",
+        "source",
+        "retention_policy",
+        "allow_caller_text"
+      ]
+    },
+    "DestinationKindV1": {
+      "type": "string",
+      "enum": [
+        "smtp",
+        "https"
+      ]
+    },
+    "Digest": {
+      "description": "`sha256:` plus 64 lowercase hex digits.",
+      "type": "string"
+    },
+    "DispatchStateV1": {
+      "type": "string",
+      "enum": [
+        "committed",
+        "done",
+        "refused",
+        "unknown",
+        "overrun"
+      ]
+    },
+    "EffectClassV1": {
+      "type": "string",
+      "enum": [
+        "read",
+        "draft"
+      ]
+    },
+    "EpochMs": {
+      "description": "Trusted epoch milliseconds: a checked safe JSON integer, never a float.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "ExistingDispatchV1": {
+      "type": "object",
+      "properties": {
+        "commitment_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "dispatch_id": {
+          "$ref": "#/$defs/UuidV1"
+        },
+        "idempotency_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "payload_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "request_id": {
+          "$ref": "#/$defs/UuidV1"
+        },
+        "reserved_micros": {
+          "$ref": "#/$defs/UsdMicros"
+        },
+        "state": {
+          "$ref": "#/$defs/DispatchStateV1"
+        },
+        "v": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "dispatch_id",
+        "request_id",
+        "state",
+        "idempotency_digest",
+        "commitment_digest",
+        "payload_digest",
+        "reserved_micros"
+      ]
+    },
+    "ExposureFactsV1": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "$ref": "#/$defs/ExposureScopeV1"
+        },
+        "principal": {
+          "$ref": "#/$defs/ExposureScopeV1"
+        },
+        "workspace": {
+          "$ref": "#/$defs/ExposureScopeV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "principal",
+        "account",
+        "workspace"
+      ]
+    },
+    "ExposureScopeV1": {
+      "type": "object",
+      "properties": {
+        "daily_settled_micros": {
+          "$ref": "#/$defs/UsdMicros"
+        },
+        "lifetime_settled_micros": {
+          "$ref": "#/$defs/UsdMicros"
+        },
+        "recent_request_ms": {
+          "description": "Request timestamps inside the caller's durable view of the window.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EpochMs"
+          }
+        },
+        "unresolved": {
+          "$ref": "#/$defs/Counter"
+        },
+        "unresolved_reserved_micros": {
+          "description": "ALL unresolved reservations regardless of age.",
+          "$ref": "#/$defs/UsdMicros"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "recent_request_ms",
+        "unresolved",
+        "daily_settled_micros",
+        "unresolved_reserved_micros",
+        "lifetime_settled_micros"
+      ]
+    },
+    "FenceStateV1": {
+      "type": "string",
+      "enum": [
+        "clear",
+        "revoking",
+        "revoked",
+        "unknown"
+      ]
+    },
+    "GrantStateV1": {
+      "type": "string",
+      "enum": [
+        "active",
+        "revoked"
+      ]
+    },
+    "HostedBindingKindV1": {
+      "type": "string",
+      "enum": [
+        "hosted"
+      ]
+    },
+    "HostedRuntimeBindingV1": {
+      "type": "object",
+      "properties": {
+        "activation_id": {
+          "$ref": "#/$defs/UuidV1"
+        },
+        "custody_epoch": {
+          "$ref": "#/$defs/Revision"
+        },
+        "kind": {
+          "$ref": "#/$defs/HostedBindingKindV1"
+        },
+        "placement_epoch": {
+          "$ref": "#/$defs/Revision"
+        },
+        "restore_epoch": {
+          "$ref": "#/$defs/Revision"
+        },
+        "session_object_id": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "session_object_id",
+        "placement_epoch",
+        "activation_id",
+        "custody_epoch",
+        "restore_epoch"
+      ]
+    },
+    "HumanActionRecordV1": {
+      "description": "The server record that binds a human test send or verification to exact\nrevisions, content and destination. The human decision reference is a\npositive durable row id; there is no `approved` boolean.",
+      "type": "object",
+      "properties": {
+        "authorization_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "body_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "connection_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "credential_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "destination_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "human_decision_ref": {
+          "$ref": "#/$defs/Ident"
+        },
+        "kind": {
+          "$ref": "#/$defs/OperationKindV1"
+        },
+        "policy_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "record_id": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "record_id",
+        "kind",
+        "connection_id",
+        "credential_revision",
+        "authorization_revision",
+        "policy_revision",
+        "body_digest",
+        "destination_digest",
+        "human_decision_ref"
+      ]
+    },
+    "Ident": {
+      "description": "Bounded printable ASCII identifier (`0x21..=0x7e`, 1..=128 bytes).",
+      "type": "string"
+    },
+    "LedgerHeadV1": {
+      "type": "object",
+      "properties": {
+        "database_epoch": {
+          "$ref": "#/$defs/Revision"
+        },
+        "digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "sequence": {
+          "$ref": "#/$defs/Counter"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "database_epoch",
+        "digest"
+      ]
+    },
+    "LimitSetV1": {
+      "type": "object",
+      "properties": {
+        "daily_micros": {
+          "$ref": "#/$defs/UsdMicros"
+        },
+        "lifetime_micros": {
+          "$ref": "#/$defs/UsdMicros"
+        },
+        "per_call_micros": {
+          "$ref": "#/$defs/UsdMicros"
+        },
+        "requests_per_60s": {
+          "$ref": "#/$defs/Counter"
+        },
+        "unresolved": {
+          "$ref": "#/$defs/Counter"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requests_per_60s",
+        "unresolved",
+        "daily_micros",
+        "lifetime_micros",
+        "per_call_micros"
+      ]
+    },
+    "ManifestV1": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArtifactV1"
+          }
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CapabilityV1"
+          }
+        },
+        "manifest_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "material_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "policy_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "v": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "manifest_id",
+        "revision",
+        "artifacts",
+        "capabilities",
+        "policy_digest",
+        "material_digest"
+      ]
+    },
+    "ModelId": {
+      "description": "An explicitly named model id; whitespace and control bytes refuse.",
+      "type": "string"
+    },
+    "NativeBindingKindV1": {
+      "type": "string",
+      "enum": [
+        "native"
+      ]
+    },
+    "NativeRuntimeBindingV1": {
+      "type": "object",
+      "properties": {
+        "agent_generation": {
+          "$ref": "#/$defs/Revision"
+        },
+        "continuity_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "kind": {
+          "$ref": "#/$defs/NativeBindingKindV1"
+        },
+        "launch_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "owner_generation": {
+          "$ref": "#/$defs/Revision"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "launch_digest",
+        "continuity_digest",
+        "agent_generation",
+        "owner_generation"
+      ]
+    },
+    "NativeSessionV1": {
+      "type": "object",
+      "properties": {
+        "generation": {
+          "$ref": "#/$defs/Revision"
+        },
+        "session_id": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "generation"
+      ]
+    },
+    "OperationKindV1": {
+      "description": "The typed operations a protected Connection dispatch may name.",
+      "type": "string",
+      "enum": [
+        "text.generate@1",
+        "smtp.send@1",
+        "smtp.test_send@1",
+        "smtp.verify@1"
+      ]
+    },
+    "OperationPolicyV1": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "allowed_destinations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ident"
+          }
+        },
+        "allowed_human_operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OperationKindV1"
+          }
+        },
+        "allowed_models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ModelId"
+          }
+        },
+        "allowed_operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OperationKindV1"
+          }
+        },
+        "approved_document_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "data_scopes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DataScopeV1"
+          }
+        },
+        "policy_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "provider_profile": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "policy_revision",
+        "active",
+        "allowed_operations",
+        "allowed_human_operations",
+        "allowed_destinations",
+        "allowed_models",
+        "provider_profile",
+        "data_scopes",
+        "approved_document_digest"
+      ]
+    },
+    "OwnerLimitsV1": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "$ref": "#/$defs/LimitSetV1"
+        },
+        "principal": {
+          "$ref": "#/$defs/LimitSetV1"
+        },
+        "workspace": {
+          "$ref": "#/$defs/LimitSetV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "principal",
+        "account",
+        "workspace"
+      ]
+    },
+    "PrincipalBindingV1": {
+      "description": "The persisted principal binding. Untrusted selectors never reach this\nshape; it is built by the trusted adapter from durable rows.",
+      "type": "object",
+      "properties": {
+        "agent_uid": {
+          "$ref": "#/$defs/AgentUid"
+        },
+        "alias": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ident"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "binding": {
+          "$ref": "#/$defs/RuntimeBindingV1"
+        },
+        "conversation_generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Revision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "custody_domain": {
+          "$ref": "#/$defs/Ident"
+        },
+        "enrollment_generation": {
+          "$ref": "#/$defs/Revision"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKindV1"
+        },
+        "native_session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativeSessionV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "principal_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "session_authority_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ident"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Revision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "custody_domain",
+        "workspace_id",
+        "kind",
+        "principal_id",
+        "agent_uid",
+        "enrollment_generation",
+        "binding"
+      ]
+    },
+    "PrincipalKindV1": {
+      "type": "string",
+      "enum": [
+        "agent",
+        "human"
+      ]
+    },
+    "ProviderKindV1": {
+      "type": "string",
+      "enum": [
+        "smtp",
+        "openrouter"
+      ]
+    },
+    "RequesterV1": {
+      "type": "object",
+      "properties": {
+        "agent_uid": {
+          "$ref": "#/$defs/AgentUid"
+        },
+        "runtime_generation": {
+          "$ref": "#/$defs/Revision"
+        },
+        "session_binding_id": {
+          "$ref": "#/$defs/UuidV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent_uid",
+        "session_binding_id",
+        "runtime_generation"
+      ]
+    },
+    "ResolvedDestinationV1": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "$ref": "#/$defs/Ident"
+        },
+        "kind": {
+          "$ref": "#/$defs/DestinationKindV1"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "port": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "host"
+      ]
+    },
+    "ResolvedMaterialV1": {
+      "type": "object",
+      "properties": {
+        "destination": {
+          "$ref": "#/$defs/ResolvedDestinationV1"
+        },
+        "provider_body_digest": {
+          "$ref": "#/$defs/Digest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "destination",
+        "provider_body_digest"
+      ]
+    },
+    "Revision": {
+      "description": "Positive canonical decimal revision (0 refuses).",
+      "type": "string"
+    },
+    "RoleModelPolicyV1": {
+      "type": "object",
+      "properties": {
+        "agentic_providers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ident"
+          }
+        },
+        "allow": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ModelId"
+          }
+        },
+        "master_allow": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/ModelId"
+          }
+        },
+        "worker_allow": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/ModelId"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "allow",
+        "agentic_providers"
+      ]
+    },
+    "RoleV1": {
+      "type": "string",
+      "enum": [
+        "master",
+        "worker"
+      ]
+    },
+    "RuntimeBindingV1": {
+      "description": "Native launch/continuity or hosted object/placement/activation/restore.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NativeRuntimeBindingV1"
+        },
+        {
+          "$ref": "#/$defs/HostedRuntimeBindingV1"
+        }
+      ]
+    },
+    "RuntimeFactsV1": {
+      "type": "object",
+      "properties": {
+        "custody_epoch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Revision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "enrollment_id": {
+          "$ref": "#/$defs/UuidV1"
+        },
+        "fence": {
+          "$ref": "#/$defs/FenceStateV1"
+        },
+        "loaded_receipt_id": {
+          "$ref": "#/$defs/UuidV1"
+        },
+        "observed_registry_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "owner_epoch": {
+          "$ref": "#/$defs/Revision"
+        },
+        "profile": {
+          "$ref": "#/$defs/RuntimeProfileV1"
+        },
+        "receipt_expires_ms": {
+          "$ref": "#/$defs/EpochMs"
+        },
+        "receipt_issued_ms": {
+          "$ref": "#/$defs/EpochMs"
+        },
+        "runtime_generation": {
+          "$ref": "#/$defs/Revision"
+        },
+        "snapshot_expires_ms": {
+          "$ref": "#/$defs/EpochMs"
+        },
+        "snapshot_issued_ms": {
+          "$ref": "#/$defs/EpochMs"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "runtime_generation",
+        "enrollment_id",
+        "loaded_receipt_id",
+        "observed_registry_digest",
+        "owner_epoch",
+        "fence",
+        "snapshot_issued_ms",
+        "snapshot_expires_ms",
+        "receipt_issued_ms",
+        "receipt_expires_ms"
+      ]
+    },
+    "RuntimeProfileV1": {
+      "type": "string",
+      "enum": [
+        "native-oci-agent/1",
+        "tenant-custody-worker/1"
+      ]
+    },
+    "SendApprovalV1": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/Ident"
+        },
+        "approval_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "authorization_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "body_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "connection_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "consumed_dispatch_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UuidV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "credential_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "destination_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "human_decision_ref": {
+          "description": "Positive reference to the durable human decision record.",
+          "$ref": "#/$defs/Ident"
+        },
+        "policy_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "policy_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "principal_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "source_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "source_id": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "approval_id",
+        "connection_id",
+        "source_id",
+        "source_digest",
+        "action",
+        "principal_digest",
+        "credential_revision",
+        "authorization_revision",
+        "policy_revision",
+        "body_digest",
+        "destination_digest",
+        "policy_digest",
+        "human_decision_ref"
+      ]
+    },
+    "UidGrantV1": {
+      "type": "object",
+      "properties": {
+        "agent_uid": {
+          "$ref": "#/$defs/AgentUid"
+        },
+        "allowed_subject_ids": {
+          "description": "Hosted grants bind explicit subject ids; a native grant leaves it empty.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ident"
+          }
+        },
+        "role": {
+          "$ref": "#/$defs/RoleV1"
+        },
+        "state": {
+          "$ref": "#/$defs/GrantStateV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent_uid",
+        "role",
+        "state",
+        "allowed_subject_ids"
+      ]
+    },
+    "UsdMicros": {
+      "description": "Nonnegative exact USD micro-dollars as a canonical decimal string.",
+      "type": "string"
+    },
+    "UuidV1": {
+      "description": "Canonical lowercase UUID selector (`8-4-4-4-12`).",
+      "type": "string"
+    }
+  }
+}

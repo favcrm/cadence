@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectionInvokeV1",
+  "type": "object",
+  "properties": {
+    "capability_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "connection_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "expected_authorization_revision": {
+      "$ref": "#/$defs/Revision"
+    },
+    "expected_credential_revision": {
+      "$ref": "#/$defs/Revision"
+    },
+    "idempotency_key": {
+      "$ref": "#/$defs/Ident"
+    },
+    "loaded_receipt_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "operation": {
+      "$ref": "#/$defs/AgentOperationV1"
+    },
+    "snapshot_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "connection_id",
+    "expected_credential_revision",
+    "expected_authorization_revision",
+    "idempotency_key",
+    "snapshot_id",
+    "loaded_receipt_id",
+    "capability_id",
+    "operation"
+  ],
+  "$defs": {
+    "AgentOperationV1": {
+      "description": "The agent-invokable union: three tags, `smtp.verify@1` impossible.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TextGenerateV1"
+        },
+        {
+          "$ref": "#/$defs/SmtpSendV1"
+        },
+        {
+          "$ref": "#/$defs/NativeSmtpTestV1"
+        }
+      ]
+    },
+    "Ident": {
+      "description": "Bounded printable ASCII identifier (`0x21..=0x7e`, 1..=128 bytes).",
+      "type": "string"
+    },
+    "MaxOutputTokens": {
+      "description": "`16..=4096` output-token cap; omitted, zero, negative and float refuse.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "MessageRole": {
+      "type": "string",
+      "enum": [
+        "system",
+        "user",
+        "assistant"
+      ]
+    },
+    "MessageV1": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/MessageRole"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "content"
+      ]
+    },
+    "ModelId": {
+      "description": "An explicitly named model id; whitespace and control bytes refuse.",
+      "type": "string"
+    },
+    "NativeSmtpTestV1": {
+      "description": "`smtp.test_send@1`: human-only test whose server record binds the content.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/SmtpTestSendKindV1"
+        },
+        "test_request_id": {
+          "$ref": "#/$defs/UuidV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "test_request_id"
+      ]
+    },
+    "Revision": {
+      "description": "Positive canonical decimal revision (0 refuses).",
+      "type": "string"
+    },
+    "SmtpSendKindV1": {
+      "type": "string",
+      "enum": [
+        "smtp.send@1"
+      ]
+    },
+    "SmtpSendV1": {
+      "description": "`smtp.send@1`: the exact server-resolved human-approved send only.",
+      "type": "object",
+      "properties": {
+        "approved_send_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "kind": {
+          "$ref": "#/$defs/SmtpSendKindV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "approved_send_id"
+      ]
+    },
+    "SmtpTestSendKindV1": {
+      "type": "string",
+      "enum": [
+        "smtp.test_send@1"
+      ]
+    },
+    "TextGenerateKindV1": {
+      "type": "string",
+      "enum": [
+        "text.generate@1"
+      ]
+    },
+    "TextGenerateV1": {
+      "description": "`text.generate@1`: explicit model, bounded messages, explicit caller cap.",
+      "type": "object",
+      "properties": {
+        "data_scope_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "kind": {
+          "$ref": "#/$defs/TextGenerateKindV1"
+        },
+        "max_cost_micros": {
+          "$ref": "#/$defs/UsdMicros"
+        },
+        "max_output_tokens": {
+          "$ref": "#/$defs/MaxOutputTokens"
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MessageV1"
+          }
+        },
+        "model": {
+          "$ref": "#/$defs/ModelId"
+        },
+        "quote_id": {
+          "$ref": "#/$defs/UuidV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "quote_id",
+        "model",
+        "messages",
+        "max_output_tokens",
+        "max_cost_micros",
+        "data_scope_id"
+      ]
+    },
+    "UsdMicros": {
+      "description": "Nonnegative exact USD micro-dollars as a canonical decimal string.",
+      "type": "string"
+    },
+    "UuidV1": {
+      "description": "Canonical lowercase UUID selector (`8-4-4-4-12`).",
+      "type": "string"
+    }
+  }
+}

@@ -48,6 +48,7 @@ import { useConversationDestination } from "../app-shell/chat/conversationNaviga
 import MemberChat from "./MemberChat";
 import { memberScope } from "./memberThread";
 import { CloudContentNotice, StreamBanner, ThreadTurn, time } from "./ThreadView";
+import CredentialRequestList from "../connections/CredentialRequestCard";
 import {
   initialFollow,
   motionBehavior,
@@ -1420,6 +1421,7 @@ function MasterHome({
               </div>
             )}
 
+            <CredentialRequestList conversationId={homeConversation} className="mx-1" />
             <ThreadList
               items={items}
               limit={limit}

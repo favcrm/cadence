@@ -133,35 +133,6 @@ const CATALOG: &[(&str, &[&str])] = &[
             "uid",
         ],
     ),
-    ("app_media_asset_origins", &["asset_id", "receipt_id"]),
-    (
-        "app_media_assets",
-        &[
-            "id",
-            "install_id",
-            "title",
-            "kind",
-            "lifecycle",
-            "revision",
-            "creator",
-            "created",
-            "updated",
-        ],
-    ),
-    (
-        "app_media_publish_requests",
-        &[
-            "request_id",
-            "asset_id",
-            "expected_revision",
-            "result",
-            "created",
-        ],
-    ),
-    (
-        "app_media_lineage",
-        &["asset_id", "source_asset_id", "source_sha256"],
-    ),
     (
         "app_bindings",
         &[
@@ -260,6 +231,7 @@ const CATALOG: &[(&str, &[&str])] = &[
             "granted_at",
             "by",
             "install_id",
+            "agent_uid",
         ],
     ),
     (
@@ -269,6 +241,35 @@ const CATALOG: &[(&str, &[&str])] = &[
     (
         "app_install_requests",
         &["id", "catalog_id", "requested_by", "at", "state"],
+    ),
+    ("app_media_asset_origins", &["asset_id", "receipt_id"]),
+    (
+        "app_media_assets",
+        &[
+            "id",
+            "install_id",
+            "title",
+            "kind",
+            "lifecycle",
+            "revision",
+            "creator",
+            "created",
+            "updated",
+        ],
+    ),
+    (
+        "app_media_lineage",
+        &["asset_id", "source_asset_id", "source_sha256"],
+    ),
+    (
+        "app_media_publish_requests",
+        &[
+            "request_id",
+            "asset_id",
+            "expected_revision",
+            "result",
+            "created",
+        ],
     ),
     (
         "app_run_artifact_fetches",
@@ -521,24 +522,6 @@ const CATALOG: &[(&str, &[&str])] = &[
         &["id", "principal_hash", "authority", "created"],
     ),
     (
-        "cloud_dispatch_outbox",
-        &[
-            "cursor",
-            "message_id",
-            "source",
-            "task_id",
-            "task_revision",
-            "audience_agent",
-            "expected_head",
-            "payload_digest",
-            "organization_id",
-            "remote_turn_id",
-            "created",
-            "claimed",
-            "cloud_eligible",
-        ],
-    ),
-    (
         "cloud_agent_operations",
         &[
             "operation_id",
@@ -624,7 +607,244 @@ const CATALOG: &[(&str, &[&str])] = &[
             "updated",
         ],
     ),
-    ("connection_metadata", &["singleton", "workspace_id"]),
+    (
+        "cloud_dispatch_outbox",
+        &[
+            "cursor",
+            "message_id",
+            "source",
+            "task_id",
+            "task_revision",
+            "audience_agent",
+            "expected_head",
+            "payload_digest",
+            "organization_id",
+            "remote_turn_id",
+            "created",
+            "claimed",
+            "cloud_eligible",
+        ],
+    ),
+    (
+        "connection_authority_changes",
+        &["id", "table_name", "key_json"],
+    ),
+    (
+        "connection_authority_rows",
+        &["table_name", "key_json", "digest"],
+    ),
+    (
+        "connection_dispatch_config",
+        &[
+            "singleton",
+            "enabled",
+            "ever_enabled",
+            "fenced",
+            "protection_required",
+            "limits_json",
+            "policy_digest",
+        ],
+    ),
+    (
+        "connection_dispatches",
+        &[
+            "dispatch_id",
+            "request_id",
+            "workspace_id",
+            "custody_domain",
+            "principal_key",
+            "agent_uid",
+            "connection_id",
+            "credential_revision",
+            "authorization_revision",
+            "idempotency_key",
+            "idempotency_digest",
+            "payload_digest",
+            "body_digest",
+            "destination_digest",
+            "commitment_digest",
+            "commit_json",
+            "committed_ms",
+            "reserved_micros",
+            "state",
+            "actual_micros",
+            "usage_json",
+            "result_json",
+            "error_code",
+            "receipt_json",
+            "settled_ms",
+        ],
+    ),
+    (
+        "connection_ledger",
+        &["sequence", "database_epoch", "digest", "record_json"],
+    ),
+    (
+        "connection_loaded_receipts",
+        &[
+            "loaded_receipt_id",
+            "snapshot_id",
+            "workspace_id",
+            "manifest_digest",
+            "observed_registry_digest",
+            "runtime_generation",
+            "enrollment_id",
+            "receipt_json",
+            "issued_ms",
+            "expires_ms",
+        ],
+    ),
+    (
+        "connection_manifests",
+        &[
+            "manifest_id",
+            "revision",
+            "policy_digest",
+            "material_digest",
+            "manifest_json",
+            "state",
+        ],
+    ),
+    (
+        "connection_metadata",
+        &[
+            "singleton",
+            "workspace_id",
+            "authorization_revision",
+            "admission_clock_ms",
+            "database_epoch",
+            "ledger_sequence",
+            "ledger_digest",
+        ],
+    ),
+    (
+        "connection_model_quotes",
+        &[
+            "quote_id",
+            "connection_id",
+            "credential_revision",
+            "authorization_revision",
+            "principal_key",
+            "process_activation",
+            "quote_digest",
+            "quote_json",
+            "observed_ms",
+            "expires_ms",
+        ],
+    ),
+    (
+        "connection_operation_policies",
+        &[
+            "connection_id",
+            "credential_revision",
+            "policy_revision",
+            "policy_digest",
+            "policy_json",
+            "state",
+        ],
+    ),
+    (
+        "connection_send_approvals",
+        &[
+            "approval_id",
+            "principal_key",
+            "connection_id",
+            "credential_revision",
+            "authorization_revision",
+            "source_id",
+            "source_digest",
+            "recipient",
+            "body",
+            "approval_json",
+            "consumed_dispatch_id",
+        ],
+    ),
+    (
+        "connection_snapshots",
+        &[
+            "snapshot_id",
+            "workspace_id",
+            "custody_domain",
+            "agent_uid",
+            "session_binding_id",
+            "runtime_generation",
+            "authorization_revision",
+            "manifest_id",
+            "manifest_revision",
+            "manifest_digest",
+            "policy_digest",
+            "observed_registry_digest",
+            "enrollment_id",
+            "snapshot_json",
+            "issued_ms",
+            "expires_ms",
+        ],
+    ),
+    (
+        "credential_request_attempts",
+        &[
+            "attempt_id",
+            "request_id",
+            "nonce_digest",
+            "session_binding",
+            "verb",
+            "state",
+            "result_code",
+            "claimed_at_ms",
+            "finished_at_ms",
+        ],
+    ),
+    (
+        "credential_request_nonces",
+        &[
+            "nonce_digest",
+            "request_id",
+            "attempt_id",
+            "session_binding",
+            "request_revision",
+            "provider",
+            "verb",
+            "connection_id",
+            "target_id",
+            "expected_credential_revision",
+            "expected_authorization_revision",
+            "custody_epoch",
+            "context_digest",
+            "issued_at_ms",
+            "expires_at_ms",
+            "claimed_at_ms",
+        ],
+    ),
+    (
+        "credential_requests",
+        &[
+            "request_id",
+            "request_revision",
+            "provider",
+            "verb",
+            "connection_id",
+            "target_id",
+            "enrollment_shape",
+            "scopes",
+            "expected_credential_revision",
+            "expected_authorization_revision",
+            "custody_domain",
+            "custody_epoch",
+            "context_digest",
+            "requester_kind",
+            "requester_participant",
+            "conversation_id",
+            "target_agent_uid",
+            "state",
+            "status",
+            "result_code",
+            "result_connection_id",
+            "verification_request_id",
+            "created_at_ms",
+            "updated_at_ms",
+            "expires_at_ms",
+        ],
+    ),
     (
         "crm_sends",
         &[
@@ -660,6 +880,62 @@ const CATALOG: &[(&str, &[&str])] = &[
     (
         "events",
         &["seq", "alias", "kind", "payload", "at", "job_id", "task_id"],
+    ),
+    (
+        "human_notification_intents",
+        &[
+            "id",
+            "room",
+            "post",
+            "seq",
+            "recipient",
+            "reason",
+            "attempts",
+            "created",
+        ],
+    ),
+    (
+        "human_notification_prefs",
+        &[
+            "human", "dm", "mention", "sound", "preview", "quiet", "zone", "updated",
+        ],
+    ),
+    ("human_notification_reads", &["room", "human", "seq"]),
+    (
+        "human_principals",
+        &["id", "org", "issuer", "subject", "name", "seen"],
+    ),
+    (
+        "human_push_deliveries",
+        &[
+            "intent",
+            "device",
+            "state",
+            "attempts",
+            "next_at",
+            "lease",
+            "lease_until",
+        ],
+    ),
+    (
+        "human_push_devices",
+        &[
+            "id", "org", "issuer", "subject", "human", "endpoint", "p256dh", "auth", "session",
+            "enrolled", "expires", "revoked",
+        ],
+    ),
+    ("human_push_presence", &["device", "tab", "room", "expires"]),
+    ("human_read_markers", &["room", "human", "seq"]),
+    (
+        "human_room_members",
+        &["room", "kind", "member", "cutoff", "added", "removed"],
+    ),
+    ("human_room_mutes", &["room", "human", "muted"]),
+    (
+        "human_rooms",
+        &[
+            "id", "topic_id", "org", "kind", "pair", "title", "creator", "created",
+        ],
     ),
     (
         "job_subscribers",
@@ -700,6 +976,7 @@ const CATALOG: &[(&str, &[&str])] = &[
             "created",
             "started",
             "completed",
+            "stall_secs",
             "task_id",
             "priority",
             "issue",
@@ -709,7 +986,6 @@ const CATALOG: &[(&str, &[&str])] = &[
             "sender",
             "recipient",
             "origin",
-            "stall_secs",
         ],
     ),
     ("model_defaults", &["id", "revision", "document"]),
@@ -751,6 +1027,104 @@ const CATALOG: &[(&str, &[&str])] = &[
             "created",
             "updated",
             "auto_dispatch_enabled",
+        ],
+    ),
+    (
+        "native_model_configurations",
+        &[
+            "configuration_id",
+            "revision",
+            "workspace_id",
+            "agent_uid",
+            "session_binding",
+            "runtime_id",
+            "runtime_generation",
+            "owner_epoch",
+            "role",
+            "model",
+            "model_uid",
+            "effort",
+            "provider",
+            "source_id",
+            "source_revision",
+            "account",
+            "origin",
+            "destination",
+            "billing_route",
+            "sdk_graph_digest",
+            "approved_tools_json",
+            "manifest_digest",
+            "snapshot_id",
+            "snapshot_expires_ms",
+            "loaded_receipt_id",
+            "max_output_tokens",
+            "created_ms",
+        ],
+    ),
+    (
+        "native_model_requests",
+        &[
+            "request_id",
+            "workspace_id",
+            "agent_uid",
+            "durable_task_id",
+            "request_index",
+            "configuration_id",
+            "configuration_revision",
+            "snapshot_id",
+            "loaded_receipt_id",
+            "source_id",
+            "account",
+            "state",
+            "input_digest",
+            "assistant_json",
+            "usage_json",
+            "error_json",
+            "billing_json",
+            "auth_requests",
+            "inference_requests",
+            "created_ms",
+            "committed_ms",
+            "settled_ms",
+        ],
+    ),
+    (
+        "native_model_source_history",
+        &["seq", "source_id", "revision", "action", "actor", "at_ms"],
+    ),
+    (
+        "native_model_sources",
+        &[
+            "source_id",
+            "workspace_id",
+            "provider",
+            "account",
+            "revision",
+            "origin",
+            "origin_kind",
+            "catalog_revision",
+            "model_uid_map",
+            "vault_reference",
+            "key_id",
+            "state",
+            "created_ms",
+            "updated_ms",
+        ],
+    ),
+    (
+        "native_model_tasks",
+        &[
+            "durable_task_id",
+            "workspace_id",
+            "agent_uid",
+            "session_binding",
+            "client_message_id",
+            "server_message_id",
+            "turn_token",
+            "state",
+            "created_ms",
+            "fenced_ms",
+            "fence_reason",
         ],
     ),
     (
@@ -811,11 +1185,37 @@ const CATALOG: &[(&str, &[&str])] = &[
             "staged_at",
             "updated_at",
             "authorization_kind",
+            "connection_operation_binding",
         ],
     ),
     (
         "platform_grants",
-        &["agent", "platform", "account", "scopes", "granted_at", "by"],
+        &[
+            "agent",
+            "platform",
+            "account",
+            "scopes",
+            "granted_at",
+            "by",
+            "agent_uid",
+        ],
+    ),
+    (
+        "protected_management_attempts",
+        &[
+            "nonce_digest",
+            "attempt_id",
+            "action",
+            "params_digest",
+            "session_binding",
+            "custody_epoch",
+            "issued_at_ms",
+            "expires_at_ms",
+            "claimed_at_ms",
+            "state",
+            "result_code",
+            "finished_at_ms",
+        ],
     ),
     (
         "rollout_grants",
@@ -908,62 +1308,6 @@ const CATALOG: &[(&str, &[&str])] = &[
             "board_port",
             "registered_by",
             "registered_at",
-        ],
-    ),
-    (
-        "human_principals",
-        &["id", "org", "issuer", "subject", "name", "seen"],
-    ),
-    ("human_read_markers", &["room", "human", "seq"]),
-    (
-        "human_notification_prefs",
-        &[
-            "human", "dm", "mention", "sound", "preview", "quiet", "zone", "updated",
-        ],
-    ),
-    ("human_notification_reads", &["room", "human", "seq"]),
-    ("human_room_mutes", &["room", "human", "muted"]),
-    (
-        "human_push_devices",
-        &[
-            "id", "org", "issuer", "subject", "human", "endpoint", "p256dh", "auth", "session",
-            "enrolled", "expires", "revoked",
-        ],
-    ),
-    (
-        "human_push_deliveries",
-        &[
-            "intent",
-            "device",
-            "state",
-            "attempts",
-            "next_at",
-            "lease",
-            "lease_until",
-        ],
-    ),
-    ("human_push_presence", &["device", "tab", "room", "expires"]),
-    (
-        "human_notification_intents",
-        &[
-            "id",
-            "room",
-            "post",
-            "seq",
-            "recipient",
-            "reason",
-            "attempts",
-            "created",
-        ],
-    ),
-    (
-        "human_room_members",
-        &["room", "kind", "member", "cutoff", "added", "removed"],
-    ),
-    (
-        "human_rooms",
-        &[
-            "id", "topic_id", "org", "kind", "pair", "title", "creator", "created",
         ],
     ),
     (
@@ -2837,7 +3181,12 @@ fn stage_and_validate(source: &Path, stage: &Path, manifest: &PortableManifest) 
         &stage.join(INACTIVE_MARKER),
         serde_json::to_string_pretty(&restore_marker(manifest))?.as_bytes(),
     )?;
-    verify_staged_members(stage, manifest)
+    verify_staged_members(stage, manifest)?;
+    // The package purges the source UUID, so the receiver mints its own
+    // coordination identity. This runs after the member hash check: it is the
+    // receiver's materialization, not package content.
+    ensure_coordination_metadata(&stage.join(PKG_DB), manifest.schema_version)?;
+    Ok(())
 }
 
 /// The inactive marker for a fresh restore. Replacement writes its own
@@ -2867,6 +3216,35 @@ fn stage_members_and_validate(
     verify_tracker_content(&stage.join(TRACKER_DIR), manifest)?;
     if let Some(rel) = manifest.pm_root.as_deref() {
         crate::issue::Pm::at(&stage.join(TRACKER_DIR).join(rel))?;
+    }
+    Ok(())
+}
+
+/// Materialize the coordination singleton row the package deliberately
+/// purges. The ledger head is reset to the genesis of database epoch 1 when
+/// the staged schema already carries the v58 head columns; an older schema is
+/// completed by the daemon's own migration on first open.
+fn ensure_coordination_metadata(db: &Path, schema_version: i64) -> Result<()> {
+    let conn = Connection::open(db)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO connection_metadata(singleton, workspace_id) \
+         VALUES(1, lower(hex(randomblob(16))))",
+        [],
+    )?;
+    if schema_version >= 58 {
+        let genesis = cadence_core::connection_dispatch::ledger::genesis_ledger_head_v1(
+            cadence_core::connection_dispatch::Revision::new(1)
+                .map_err(|_| Error::internal("fixture epoch"))?,
+        );
+        conn.execute(
+            "UPDATE connection_metadata SET database_epoch=?1, ledger_sequence=?2, \
+             ledger_digest=?3 WHERE singleton=1",
+            rusqlite::params![
+                genesis.database_epoch.get(),
+                genesis.sequence.get(),
+                genesis.digest.as_str()
+            ],
+        )?;
     }
     Ok(())
 }

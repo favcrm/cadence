@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ManifestV1",
+  "type": "object",
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ArtifactV1"
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CapabilityV1"
+      }
+    },
+    "manifest_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "material_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "policy_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "revision": {
+      "$ref": "#/$defs/Revision"
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "manifest_id",
+    "revision",
+    "artifacts",
+    "capabilities",
+    "policy_digest",
+    "material_digest"
+  ],
+  "$defs": {
+    "ArtifactKindV1": {
+      "type": "string",
+      "enum": [
+        "skill",
+        "mcp",
+        "tool"
+      ]
+    },
+    "ArtifactV1": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "implementation_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "input_schema_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "kind": {
+          "$ref": "#/$defs/ArtifactKindV1"
+        },
+        "output_schema_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "resource_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "version": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "kind",
+        "version",
+        "content_digest",
+        "implementation_digest",
+        "resource_digest",
+        "input_schema_digest",
+        "output_schema_digest"
+      ]
+    },
+    "CallableV1": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/Ident"
+        },
+        "version": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "CapabilityV1": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "callable": {
+          "$ref": "#/$defs/CallableV1"
+        },
+        "capability_id": {
+          "$ref": "#/$defs/Ident"
+        },
+        "connection_scope": {
+          "$ref": "#/$defs/Ident"
+        },
+        "effect": {
+          "$ref": "#/$defs/EffectClassV1"
+        },
+        "operation": {
+          "$ref": "#/$defs/OperationKindV1"
+        },
+        "policy_scope": {
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "capability_id",
+        "callable",
+        "artifact_id",
+        "operation",
+        "effect",
+        "connection_scope",
+        "policy_scope"
+      ]
+    },
+    "Digest": {
+      "description": "`sha256:` plus 64 lowercase hex digits.",
+      "type": "string"
+    },
+    "EffectClassV1": {
+      "type": "string",
+      "enum": [
+        "read",
+        "draft"
+      ]
+    },
+    "Ident": {
+      "description": "Bounded printable ASCII identifier (`0x21..=0x7e`, 1..=128 bytes).",
+      "type": "string"
+    },
+    "OperationKindV1": {
+      "description": "The typed operations a protected Connection dispatch may name.",
+      "type": "string",
+      "enum": [
+        "text.generate@1",
+        "smtp.send@1",
+        "smtp.test_send@1",
+        "smtp.verify@1"
+      ]
+    },
+    "Revision": {
+      "description": "Positive canonical decimal revision (0 refuses).",
+      "type": "string"
+    }
+  }
+}

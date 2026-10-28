@@ -228,10 +228,16 @@ mod cad1868_acceptance;
 mod cloud_agent_rpc;
 mod connection_test;
 mod connections_rpc;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod credential_entry_rpc;
 /// CAD-1128: the `connection_custody_*` operator verbs.
 pub(crate) mod custody_rpc;
-
-// CAD-1128 r2: the frozen acceptance check and its genuine fixture.
+pub(crate) mod native_model_turn;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) mod protected_connections;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod protected_management_rpc;
+// the frozen acceptance check and its genuine fixture.
 // Both compile only under `test-seam`; production carries neither.
 #[cfg(all(test, feature = "test-seam"))]
 mod automatic_upgrade_consent;
@@ -259,15 +265,10 @@ mod explorer_acceptance;
 mod hire_rpc;
 mod idea_rpc;
 mod identity;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod installer_client;
 pub(crate) mod installer_enrollment_wire;
 mod lane_relaunch;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-mod native_task;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-mod protected_runtime;
-mod turn_project;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;
 mod bootstrap_files;
@@ -294,6 +295,11 @@ mod plans_rpc;
 mod platform_rpc;
 mod pm_activity_rpc;
 mod portable_replace_rpc;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) mod protected_runtime;
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[path = "daemon/protected_runtime_stub.rs"]
+pub(crate) mod protected_runtime;
 mod public_membership;
 mod recovery_rpc;
 mod requests_rpc;
@@ -305,6 +311,8 @@ mod social_connect_rpc;
 mod social_publish_driver;
 mod social_publish_rpc;
 mod social_publish_start;
+#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod supervisor_grant;
 #[cfg(all(test, feature = "test-seam"))]
 pub(crate) mod team_assistants_refusal;
@@ -312,6 +320,7 @@ mod test_queue_rpc;
 mod threads_rpc;
 mod timers;
 mod topics_rpc;
+mod turn_project;
 mod unattended;
 mod unattended_landing;
 mod watch;
@@ -882,6 +891,14 @@ pub struct Shared {
     /// is operator test configuration, not a caller-controlled
     /// bypass: certificate verification still runs on every send.
     smtp_test_ca: Option<Vec<u8>>,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    protected: std::sync::OnceLock<Arc<protected_connections::ProtectedConnections>>,
+    protected_runtime: std::sync::OnceLock<Arc<protected_runtime::ProtectedRuntimeCoordinator>>,
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    native_model: std::sync::OnceLock<Arc<native_model_turn::NativeModelBroker>>,
     /// CAD-538: the hosted lease this daemon holds when `hosted.lease`
     /// is configured. The heartbeat renews it; its fence is shared with
     /// `store` (every `write_conn`) and with each [`Self::pm`] handle.
@@ -1020,7 +1037,14 @@ impl Shared {
         let membership = public_membership::MembershipMode::capture(&hosted, &|name| {
             opts.provider_env.var(name)
         });
-        Self::new_leased(state_dir, opts, hot, lease, seam, membership)
+        let (shared, prepared) = Self::new_leased(state_dir, opts, hot, lease, seam, membership)?;
+        // Ordinary construction stays back-reference free so fixtures can set
+        // private fields before the Arc escapes; a protected profile installs
+        // its coordinator here because no serve path is involved.
+        if prepared.is_some() {
+            protected_runtime::initialize(&shared, prepared)?;
+        }
+        Ok(shared)
     }
 
     /// `new_hot` over an already-resolved lease and seam — `serve`
@@ -1033,7 +1057,7 @@ impl Shared {
         lease: Option<Arc<crate::lease::LeaseCtl>>,
         seam: Option<crate::test_seam::Seam>,
         membership: public_membership::MembershipMode,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<(Arc<Self>, Option<protected_runtime::PreparedProtection>)> {
         // Backstop for the armed-fixture seal applied at the entry
         // points (`new_hot` above, `serve_with`): idempotent — an
         // already-sealed env validates and writes nothing — so it
@@ -1043,9 +1067,15 @@ impl Shared {
         if seam.is_some() {
             opts.provider_env.isolate_for_test()?;
         }
-        let HotStart { instance, marker } = hot;
+        let HotStart {
+            instance,
+            mut marker,
+        } = hot;
         let daemon_id = instance.clone();
         let db_path = state_dir.join("cadence.sqlite3");
+        // Validate deployment provenance before opening a writable store.
+        let prepared =
+            protected_runtime::prepare_profile(opts.protected_runtime_profile.as_deref())?;
         // Authorise the holder before the store opens the file
         // read-write and migrates. A direct `daemon run` whose identity
         // does not hold the lease refuses here and leaves the database
@@ -1054,26 +1084,32 @@ impl Shared {
         // store opens. A malformed or unknown receipt refuses here, so a
         // portable activation in manual mode can never be bypassed.
         let execution_mode = crate::backup::portable_fence::load(state_dir)?;
-        let (mut store, recovered) = if state_dir == Path::new("/srv/cadence/protected/store") {
-            // This path only requests protected startup; it is NOT permission.
-            // Authentic fixed-owner issuance selects mode/binding BEFORE SQL,
-            // and unavailable/invalid ownership never falls back to Legacy.
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            let grant = crate::installer_bundle::constructor::StoreOwnerGrant::startup()?;
-            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-            let grant = crate::store::StoreOwnerGrant::startup()?;
-            crate::rollout::authorize_migration(Path::new(&grant.binding().path))?;
-            Store::open_owned(grant)?
+        // The OCI custody profile uses the permitted coordination store, not
+        // the separate sealed-store constructor. Its recovery waits for the
+        // authenticated external ledger floor and checkpoint transport.
+        let (mut store, mut recovered) = if prepared.is_some() {
+            Store::open_unrecovered_mode(&db_path, crate::store::OpenMode::Legacy)?
+        } else if execution_mode.fenced() {
+            Store::open_unrecovered(&db_path)?
         } else {
-            crate::rollout::authorize_migration(&db_path)?;
-            // CAD-1163: a manual execution-disabled mode opens without the
-            // restart sweep, so pending effects stay inert from the first start.
-            if execution_mode.fenced() {
-                Store::open_unrecovered(&db_path)?
-            } else {
-                Store::open_adopting(&db_path, marker)?
-            }
+            Store::open_adopting(&db_path, marker.take())?
         };
+        if let Some(lease) = &lease {
+            store.install_write_fence(lease.fence());
+        }
+        if let Some(prepared) = prepared.as_ref() {
+            let boot = protected_runtime::install_store_gate(&store, prepared)?;
+            if !execution_mode.fenced() {
+                if let protected_runtime::PreparedBoot::Ready { owner_epoch, .. } = boot {
+                    let owner_epoch =
+                        cadence_core::connection_dispatch::primitives::Revision::new(owner_epoch)
+                            .map_err(|_| {
+                            Error::invalid("runtime_unqualified", "owner epoch is invalid")
+                        })?;
+                    recovered = store.run_guarded_recover(marker.as_ref(), owner_epoch)?;
+                }
+            }
+        }
         store.set_shutdown_entries_hook(opts.shutdown_entries_hook.clone())?;
         if let Some(ms) = opts.shutdown_backoff_ms_for_test {
             store.shutdown_backoff_ms = ms;
@@ -1084,11 +1120,6 @@ impl Shared {
         // taken (the predecessor was already dead) and for endpoints
         // the cursors never covered.
         write_recovery_record(state_dir, &daemon_id, &recovered);
-        // CAD-538: the store's write path now shares the lease fence —
-        // one trip refuses every later write.
-        if let Some(lease) = &lease {
-            store.install_write_fence(lease.fence());
-        }
         if let Some(delay) = opts.startup_delay_for_test {
             std::thread::sleep(delay);
         }
@@ -1326,6 +1357,10 @@ impl Shared {
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
             smtp_test_ca: opts.smtp_test_ca_pem.clone(),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            protected: std::sync::OnceLock::new(),
+            protected_runtime: std::sync::OnceLock::new(),
+            native_model: std::sync::OnceLock::new(),
             lease,
             hosted_business_documents,
             seam,
@@ -1340,25 +1375,6 @@ impl Shared {
                 wiki_pm_lease,
             ),
         });
-        #[cfg(all(
-            debug_assertions,
-            feature = "test-seam",
-            target_os = "linux",
-            target_arch = "x86_64"
-        ))]
-        if state_dir == Path::new("/srv/cadence/protected/store") {
-            // Only the genuine protected opening can reach this window; path
-            // equality requests it, never admits a caller. The fixed Client
-            // controller additionally requires its original inherited Root FD3.
-            // No hosted lease heartbeat or seam worker may overlap comparison.
-            if shared.lease.is_some() || shared.seam.is_some() {
-                return Err(Error::unknown("retained Store replay window UNKNOWN"));
-            }
-            return crate::installer_bundle::constructor::runtime_child::retained_opening_replay(
-                &shared.store,
-            )
-            .and_then(|never| match never {});
-        }
         #[cfg(test)]
         if let Some(observer) = &opts.custody_acceptance_shared {
             *observer.lock().unwrap() = Some(shared.clone());
@@ -1405,7 +1421,7 @@ impl Shared {
         }
         // Hosted completion retries run after the socket is bound. Doing
         // them here would hold startup on each remote timeout.
-        Ok(shared)
+        Ok((shared, prepared))
     }
 
     fn wake(&self) {
@@ -2951,6 +2967,7 @@ impl Shared {
         // with its attribution field stamped to the caller.
         let stamped = self.caller_gate(method, params, peer_pid)?;
         let params = stamped.as_ref().unwrap_or(params);
+        self.refuse_legacy_protected_authority(method, params, peer_pid)?;
         match method {
             // `pid` is the singleton-lock holder: `daemon start` tells
             // the child it spawned from a daemon that already ran.
@@ -4242,6 +4259,16 @@ impl Shared {
                 self.rpc_operator_session_open_device(params, peer_pid)
             }
             "operator_session_check" => self.rpc_operator_session_check(params),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            "credential_entry_session_check" => self.rpc_credential_entry_session_check(params),
+            "credential_entry_config" => self.rpc_credential_entry_config(params, peer_pid),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            "credential_entry_continue_mint" => {
+                self.rpc_credential_entry_continue_mint(params, peer_pid)
+            }
+            "credential_entry_continue_open" => {
+                self.rpc_credential_entry_continue_open(params, peer_pid)
+            }
             "board_session_open" => self.rpc_board_session_open(params, peer_pid),
             "board_session_check" => self.rpc_board_session_check(params),
             "human_actor_check" => self.rpc_human_actor_check(params, peer_pid),
@@ -4296,6 +4323,74 @@ impl Shared {
             "connection_custody_unlock" => self.rpc_connection_custody(method, params, peer_pid),
             "connection_custody_lock" => self.rpc_connection_custody(method, params, peer_pid),
             "connection_custody_status" => self.rpc_connection_custody(method, params, peer_pid),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            "credential_request_create" => credential_entry_rpc::rpc_credential_entry(
+                self,
+                method,
+                params,
+                peer_pid,
+                |attempt, input| self.apply_human_credential_attempt(attempt, input),
+            ),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            "credential_request_show" => credential_entry_rpc::rpc_credential_entry(
+                self,
+                method,
+                params,
+                peer_pid,
+                |attempt, input| self.apply_human_credential_attempt(attempt, input),
+            ),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            "credential_request_list" => credential_entry_rpc::rpc_credential_entry(
+                self,
+                method,
+                params,
+                peer_pid,
+                |attempt, input| self.apply_human_credential_attempt(attempt, input),
+            ),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            "credential_request_status" => credential_entry_rpc::rpc_credential_entry(
+                self,
+                method,
+                params,
+                peer_pid,
+                |attempt, input| self.apply_human_credential_attempt(attempt, input),
+            ),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            "credential_request_cancel" => credential_entry_rpc::rpc_credential_entry(
+                self,
+                method,
+                params,
+                peer_pid,
+                |attempt, input| self.apply_human_credential_attempt(attempt, input),
+            ),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            "credential_entry_session" => credential_entry_rpc::rpc_credential_entry(
+                self,
+                method,
+                params,
+                peer_pid,
+                |attempt, input| self.apply_human_credential_attempt(attempt, input),
+            ),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            "credential_request_submit" => credential_entry_rpc::rpc_credential_entry(
+                self,
+                method,
+                params,
+                peer_pid,
+                |attempt, input| self.apply_human_credential_attempt(attempt, input),
+            ),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            "protected_management_session" => {
+                protected_management_rpc::rpc_protected_management(self, method, params, peer_pid)
+            }
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            "protected_management_status" => {
+                protected_management_rpc::rpc_protected_management(self, method, params, peer_pid)
+            }
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            "protected_management_action" => {
+                protected_management_rpc::rpc_protected_management(self, method, params, peer_pid)
+            }
             "crm_smtp_bind" => self.rpc_crm_smtp(method, params, peer_pid),
             "crm_smtp_rebind" => self.rpc_crm_smtp(method, params, peer_pid),
             "crm_smtp_revoke" => self.rpc_crm_smtp(method, params, peer_pid),
@@ -4482,6 +4577,9 @@ but the host could not read their list; do not claim to have read them.]";
         }
         self.closing.store(true, Ordering::SeqCst);
         self.wake();
+        if let Ok(coordinator) = self.protected_runtime() {
+            coordinator.stop_all("daemon shutdown");
+        }
     }
 
     /// CAD-561: is a `cadence update` draining the fleet right now?
@@ -5734,6 +5832,9 @@ pub struct ServeOptions {
     /// state dir and every ordinary artifact root. `None` keeps the
     /// legacy backend selection. Never sourced from RPC or PM.
     pub encrypted_custody: Option<crate::platform::encrypted_sqlite::EncryptedCustodyConfig>,
+    /// Root-owned protected runtime deployment profile. This is deployment
+    /// metadata, never a model, RPC, PM or environment-selected authority.
+    pub protected_runtime_profile: Option<PathBuf>,
     /// CAD-786: the public origin unsubscribe links mint
     /// (`{origin}/unsubscribe/<token>`). `https://` anywhere or
     /// loopback `http://` for rigs; `None` refuses
@@ -5768,6 +5869,7 @@ pub fn serve(state_dir: &Path) -> Result<()> {
     // build without the feature, so production never consults it.
     let mut opts = ServeOptions {
         test_seam: crate::test_seam::env_armed(),
+        protected_runtime_profile: protected_runtime::default_profile_path()?,
         ..ServeOptions::default()
     };
     // CAD-546: the built-in `local` platform rides the production
@@ -5918,9 +6020,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     let hot = hot_restart_begin(state_dir);
     let membership =
         public_membership::MembershipMode::capture(&hosted, &|name| opts.provider_env.var(name));
-    let shared = Shared::new_leased(state_dir, &opts, hot, lease, seam, membership)?;
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    let protected = protected_runtime::Maintenance::start(&shared);
+    let (shared, prepared) = Shared::new_leased(state_dir, &opts, hot, lease, seam, membership)?;
+    // Two-phase init: the backend/coordinator holds a Weak back-reference, so
+    // it is installed only after the Arc exists and before the listener binds.
+    protected_runtime::initialize(&shared, prepared)?;
     if let Some(heartbeat) = &lease_heartbeat {
         heartbeat.attach(&shared);
     }
@@ -5940,10 +6043,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             Some((path, gid)) => {
                 // The actual fixed runtime entry never uses the fixture's
                 // relaxed parent-group/mode check for its shared socket.
-                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-                let fixture =
-                    crate::installer_bundle::constructor::runtime_child::control().is_none();
-                #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+                // CAD-1085: the fixed runtime entry is never the fixture path.
                 let fixture = true;
                 (path.clone(), *gid, fixture)
             }
@@ -5969,11 +6069,6 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    if protected.is_some() {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
-    }
     // Outcome/config events wake the reporter and explicit workspace bridge.
     // Only pending obligations schedule retries; standalone opens no socket.
     {
@@ -6142,18 +6237,6 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // A loop error is a stop, never a skip: `serve_error` is returned
     // only after the shutdown below has run — the refusals and the
     // marker it writes are the next start's adoption evidence.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    let protected_serving = if protected.is_some() {
-        Some(protected_runtime::publish_serving(
-            &listener,
-            &shared_socket
-                .as_ref()
-                .ok_or_else(|| Error::rejected("protected shared listener unavailable"))?
-                .listener,
-        )?)
-    } else {
-        None
-    };
     let mut serve_error: Option<Error> = None;
     let mut accept_backoff = Duration::ZERO;
     // Persistent pressure (EMFILE) retries every ACCEPT_BACKOFF_MAX:
@@ -6244,11 +6327,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         }
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    drop(protected_serving); // invalidate serving BEFORE drain/flush; not FINAL
-                             // A loop that ended on error never observed `closing`: set it now
-                             // so the watches and actors drain through the normal stop below.
-                             // `begin_closing` is idempotent — a clean exit keeps the facts
-                             // snapshot taken when its stop was requested.
+    // A loop that ended on error never observed `closing`: set it now
+    // so the watches and actors drain through the normal stop below.
+    // `begin_closing` is idempotent — a clean exit keeps the facts
+    // snapshot taken when its stop was requested.
     shared.begin_closing();
     // Former facts snapshot lived in `shutdown`. A test holds this
     // barrier until it has observed idle actors detach, which is the
@@ -6306,12 +6388,6 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         &socket_path,
         shared_socket,
     );
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    if serve_error.is_none() && _flushed {
-        if let Some(protected) = protected {
-            protected.quiesced()?;
-        }
-    }
     match serve_error {
         Some(error) => Err(error),
         None => Ok(()),

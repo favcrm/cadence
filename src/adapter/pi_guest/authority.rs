@@ -1,6 +1,9 @@
 //! Fixed private protected-Pi protocol. No public/network authority endpoint.
 //! The service owns provisioning, process custody and the one-use current CAS;
 //! these messages contain selectors, never caller attestations or credentials.
+//! CAD-1085: the split helper launch is superseded by the native runtime owner;
+//! these helpers stay compiled for the owner-side audit but have no caller.
+#![allow(dead_code)]
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 #[cfg(target_os = "linux")]
