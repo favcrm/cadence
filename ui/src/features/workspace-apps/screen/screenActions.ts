@@ -411,7 +411,6 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "social.sources.save": () => socialDraftCall(verb,args,ui),
     "publish.destination.use": async () => runPlan(await planUseDestination(ctx, args)),
     "publish.settings.save": async () => runPlan(await planSavePublishSettings(ctx, args)),
-    "publish.draft.schedule": async () => runPlan(await planDraftEffectChange(ctx, verb, args, ui.actionToken)),
     "publish.draft.reschedule": async () => runPlan(await planDraftEffectChange(ctx, verb, args, ui.actionToken)),
     "publish.draft.cancel": async () => runPlan(await planDraftEffectChange(ctx, verb, args, ui.actionToken)),
     "media.read": () => mediaRead(args, ui),
@@ -425,7 +424,7 @@ const MAX_DRAFT_SCHEDULE_SECONDS = 366 * 24 * 60 * 60;
 
 /** Schedule controls name a board draft effect and execute on the human's own action: the app's
  *  time picker already chose the time, so no second confirmation card is shown. */
-async function planDraftEffectChange(ctx: ActionContext, verb: CallVerb, args: Record<string, unknown>, actionToken?: string): Promise<SlotPlan | ActionRefusal> {
+async function planDraftEffectChange(ctx: ActionContext, verb: CallVerb | "publish.draft.schedule", args: Record<string, unknown>, actionToken?: string): Promise<SlotPlan | ActionRefusal> {
   if (typeof actionToken !== "string" || !/^[a-f0-9]{64}$/.test(actionToken)) return { code: "denied", text: "That draft action is unavailable." };
   const hasDue = verb !== "publish.draft.cancel";
   const expectedKeys = hasDue ? ["alias", "due_epoch", "effect_id"] : ["alias", "effect_id"];
@@ -646,6 +645,7 @@ export function makePlanner(get: () => ActionContext): Planner {
     const table: Record<(typeof SLOT_VERBS)[number], () => Promise<SlotPlan | ActionRefusal>> = {
       "run.start": () => planRunStart(get(), args),
       "publish.draft.confirm": () => planConfirmPublish(get(), args, ui?.actionToken),
+      "publish.draft.schedule": () => planDraftEffectChange(get(), "publish.draft.schedule", args, ui?.actionToken),
       "media.original.download": () => planOriginalDownload(get, args, ui),
       "social.image.pick": () => planImagePick(args, ui),
     };
