@@ -153,6 +153,13 @@ pub mod ops {
     }
 }
 
+/// The owner CLI entry point. On this host no owner can run, so the binary
+/// exists, prints the refusal and exits non-zero.
+pub fn run_owner_cli() -> i32 {
+    eprintln!("the protected runtime owner is unavailable on this host");
+    1
+}
+
 /// No reviewed protected profile can be active on this host.
 pub fn protected_profile_active() -> bool {
     false
