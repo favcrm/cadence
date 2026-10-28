@@ -811,6 +811,9 @@ impl NativeModelBroker {
                     .store
                     .native_model_request(&row.request_id)?
                     .unwrap_or(row.clone());
+                // A concurrent duplicate is still a status read only for the
+                // frozen selectors and input.
+                self.verify_bound_duplicate(&parsed, &current, &evidence)?;
                 return receipt(&current);
             }
         }
@@ -1029,6 +1032,9 @@ impl NativeModelBroker {
                 .store
                 .native_model_request(&parsed.request_id)?
                 .ok_or_else(|| refused("invalid_request", "the request is unknown"))?;
+            // A concurrent commit won: the loser is a status read only for the
+            // exact frozen input, never for a changed duplicate.
+            self.verify_bound_duplicate(parsed, &current, evidence)?;
             return receipt(&current);
         };
 
