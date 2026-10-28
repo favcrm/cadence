@@ -78,6 +78,7 @@ pub(crate) mod types;
 pub(crate) use client::{OwnerEvidence, RootOwnerClient};
 pub(crate) use ops::RuntimeCaller;
 pub(crate) use profile::LocalProfile;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use qualified::{CurrentEligibility, RuntimeStatus};
 pub(crate) use store::{CheckpointAck, CheckpointV1};
 
