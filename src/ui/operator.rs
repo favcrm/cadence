@@ -1436,17 +1436,24 @@ fn pinned_agent_uid(configured: Option<u32>, active: Option<u32>) -> Result<Opti
     }
 }
 
-fn concrete_board_server(opts: &ServeOpts) -> Result<std::net::SocketAddr, String> {
+/// The board's concrete bound address — the destination half of every
+/// connection's four-tuple (CAD-760). It is the configured bind the
+/// listener took (`Server::http(host:port)`), never the HTTP Host or any
+/// other request field. A host name or a wildcard (`0.0.0.0`, `::`,
+/// `::ffff:0.0.0.0`) has no single destination: refused, so every
+/// caller fails closed.
+pub(super) fn concrete_board_server(opts: &ServeOpts) -> Result<std::net::SocketAddr, String> {
     let ip = opts
         .host
         .parse::<std::net::IpAddr>()
         .map_err(|_| "board bind address is not a concrete IP".to_string())?;
-    if ip.is_unspecified() {
+    let server = crate::peer::canonical(std::net::SocketAddr::new(ip, opts.port));
+    if server.ip().is_unspecified() {
         return Err(
             "board bind address is wildcard; client destination cannot be proved".to_string(),
         );
     }
-    Ok(std::net::SocketAddr::new(ip, opts.port))
+    Ok(server)
 }
 
 pub(super) fn active_agent_uid(state_dir: &std::path::Path) -> Result<Option<u32>, String> {
@@ -1559,6 +1566,7 @@ fn attribute(
         }
     };
     let found = Ok::<crate::peer::AgentRoots, String>(roots).and_then(|roots| {
+        let server = concrete_board_server(opts)?;
         let peer = request
             .remote_addr()
             .ok_or_else(|| "the request has no peer address".to_string())?;
@@ -1568,15 +1576,15 @@ fn attribute(
             // gone (an early-closed replay by an agent that then exited)
             // is unattributable, never "tied to no agent" (review round 2).
             let peer = crate::peer::canonical(*peer);
-            if peer.ip().is_loopback() && crate::peer::client_socket(opts.port, peer)?.is_none() {
+            if peer.ip().is_loopback() && crate::peer::client_socket_exact(server, peer)?.is_none()
+            {
                 return Err(format!(
-                    "no local socket is the client end of {peer} → port {}",
-                    opts.port
+                    "no local socket is the client end of {peer} → {server}"
                 ));
             }
             return Ok(None);
         }
-        crate::peer::tcp_peer_agent(opts.port, *peer, &roots)
+        crate::peer::tcp_peer_agent(server, *peer, &roots)
     });
     match found {
         Ok(Some(alias)) => Attribution::Agent(alias),
@@ -1597,12 +1605,19 @@ fn attribute(
 
 /// The uid owning the peer's still-open client socket when it is not
 /// this process's — a privilege-separated proxy (tailscaled, sshd).
+/// Matched on the full four-tuple (CAD-760); no concrete bound address,
+/// no excuse.
 fn foreign_socket(request: &Request, opts: &ServeOpts) -> Option<u32> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
+    let server = concrete_board_server(opts).ok()?;
     request
         .remote_addr()
-        .and_then(|peer| crate::peer::client_socket(opts.port, *peer).ok().flatten())
+        .and_then(|peer| {
+            crate::peer::client_socket_exact(server, *peer)
+                .ok()
+                .flatten()
+        })
         .map(|(_, uid)| uid)
         .filter(|uid| *uid != euid)
 }
