@@ -362,6 +362,45 @@ impl Shared {
         })
     }
 
+    /// Cloud rows in a cross-agent work conversation obey the same admission
+    /// as every other reader, from ONE snapshot per alias: a revoked read
+    /// scope, a replaced credential or an unverifiable upstream answer
+    /// withholds the cloud row instead of serving it from local storage, and
+    /// the reason travels with the row. Ordinary mail is not this policy's
+    /// business and never pays for a cloud proof.
+    fn work_conversation_cloud_rows(
+        &self,
+        peer_pid: u32,
+        rows: &[(String, String)],
+    ) -> Result<(
+        std::collections::BTreeSet<String>,
+        std::collections::BTreeSet<String>,
+        Option<String>,
+    )> {
+        let mut by_alias: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (alias, id) in rows {
+            by_alias.entry(alias.clone()).or_default().push(id.clone());
+        }
+        let mut cloud = std::collections::BTreeSet::new();
+        let mut readable = std::collections::BTreeSet::new();
+        let mut withheld = None;
+        for (alias, ids) in by_alias {
+            let admission = self.admit_cloud_rows(&alias, peer_pid)?;
+            for id in ids {
+                if admission.cloud.contains(&id) {
+                    if admission.readable.contains(&id) {
+                        readable.insert(id.clone());
+                    }
+                    cloud.insert(id);
+                }
+            }
+            if withheld.is_none() {
+                withheld = admission.withheld;
+            }
+        }
+        Ok((cloud, readable, withheld))
+    }
+
     /// CAD-819 `work_conversation_list {project?, agent?, include_system?}`
     /// — the operator's cross-agent view: pair rows, the operator's own
     /// agent row, group rows and the unknown/system bucket, each filtered
@@ -393,12 +432,38 @@ impl Shared {
             let (counts, oldest) =
                 self.store
                     .work_conversation_counts(&pair.a_uid, &pair.b_uid, &scope_ref)?;
+            let mut withheld = None;
             let preview =
                 match self
                     .store
                     .work_conversation_latest(&pair.a_uid, &pair.b_uid, &scope_ref)?
                 {
-                    Some(m) => store::conversations::preview(&m.body)?,
+                    Some(m) => {
+                        // The preview is cloud content when its message is; it
+                        // is withheld on the same admission as the read.
+                        let cloud_bearing = m.source == crate::store::cloud_agent::MESSAGE_SOURCE
+                            || m.origin.is_some();
+                        let visible = if cloud_bearing {
+                            let (cloud, readable, reason) = self.work_conversation_cloud_rows(
+                                peer_pid,
+                                &[(m.alias.clone(), m.id.clone())],
+                            )?;
+                            let visible = !cloud.contains(&m.id) || readable.contains(&m.id);
+                            if !visible {
+                                withheld = Some(
+                                    reason.unwrap_or_else(|| "cloud_agent_uncertain".to_string()),
+                                );
+                            }
+                            visible
+                        } else {
+                            true
+                        };
+                        if visible {
+                            store::conversations::preview(&m.body)?
+                        } else {
+                            String::new()
+                        }
+                    }
                     None => String::new(),
                 };
             // Every stored state is counted; the six named states always
@@ -425,7 +490,7 @@ impl Shared {
                 "id": pair.id,
                 "kind": "pair",
                 "participants": participants,
-                "last": {"preview": preview, "at": pair.last_at},
+                "last": {"preview": preview, "at": pair.last_at, "cloud_withheld": withheld},
                 "counts": state_counts,
                 "oldest_unhandled_at": oldest,
                 "last_activity": pair.last_at,
@@ -593,10 +658,50 @@ impl Shared {
             (None, _) => false,
         };
         let mut out = Vec::with_capacity(messages.len());
+        // Cloud rows in this surface obey the same admission as every other
+        // reader: the pair view is not a way around a revoked read scope, a
+        // replaced credential or an unverifiable upstream answer. Only rows
+        // that can carry cloud provenance are resolved, so ordinary mail
+        // never pays for a cloud proof.
+        let page_ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+        let routed = match &pair {
+            Some(p) => self
+                .store
+                .work_conversation_routed_of(&p.a_uid, &p.b_uid, &page_ids)?,
+            None => Vec::new(),
+        };
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for m in &messages {
+            if m.source == crate::store::cloud_agent::MESSAGE_SOURCE || m.origin.is_some() {
+                candidates.push((m.alias.clone(), m.id.clone()));
+            }
+        }
+        for copy in &routed {
+            if let (Some(alias), Some(id)) = (copy["alias"].as_str(), copy["id"].as_str()) {
+                candidates.push((alias.to_string(), id.to_string()));
+            }
+        }
+        let (cloud, readable, reason) = if candidates.is_empty() {
+            Default::default()
+        } else {
+            self.work_conversation_cloud_rows(peer_pid, &candidates)?
+        };
+        let withheld_code = |id: &str| -> Option<String> {
+            (!readable.contains(id)).then(|| {
+                reason
+                    .clone()
+                    .unwrap_or_else(|| "cloud_agent_uncertain".to_string())
+            })
+        };
         for m in messages
             .iter()
             .filter(|m| include_system || !store::conversations::is_system(m))
         {
+            let withheld = cloud
+                .contains(&m.id)
+                .then(|| withheld_code(&m.id))
+                .flatten();
+            let visible = withheld.is_none();
             out.push(json!({
                 "id": m.id,
                 "seq": m.seq,
@@ -604,34 +709,47 @@ impl Shared {
                 "system": store::conversations::is_system(m),
                 "sender": self.message_participant(m.sender_uid.as_deref(), m.sender.as_deref())?,
                 "recipient": self.message_participant(m.recipient_uid.as_deref(), m.recipient.as_deref())?,
-                "body": store::conversations::body(&m.body),
+                "body": if visible { store::conversations::body(&m.body) } else { String::new() },
                 "source": m.source,
                 "state": m.state,
-                "result": m.result,
-                "error": m.error,
+                "result": if visible { m.result.clone() } else { None },
+                "error": if visible { m.error.clone() } else { None },
                 "origin": m.origin,
                 "task_id": m.task_id,
                 "issue": m.issue,
                 "created": m.created,
                 "started": m.started,
                 "completed": m.completed,
+                "cloud_withheld": withheld,
             }));
         }
-        // Routed copies nest under the message they answer (`origin`).
-        if let Some(p) = &pair {
-            let routed = self.store.work_conversation_routed_of(
-                &p.a_uid,
-                &p.b_uid,
-                &messages.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
-            )?;
+        // Routed copies nest under the message they answer (`origin`). A copy
+        // the caller's cloud admission does not cover is dropped, and the row
+        // it would have hung under says why.
+        if pair.is_some() {
             for row in out.iter_mut() {
                 let mid = row["id"].as_str().unwrap_or_default().to_string();
+                let mut dropped = false;
                 let copies: Vec<Value> = routed
                     .iter()
                     .filter(|c| c["origin"].as_str() == Some(mid.as_str()))
+                    .filter(|c| {
+                        let visible = c["id"]
+                            .as_str()
+                            .is_some_and(|id| !cloud.contains(id) || readable.contains(id));
+                        if !visible {
+                            dropped = true;
+                        }
+                        visible
+                    })
                     .cloned()
                     .collect();
                 row["routed"] = Value::Array(copies);
+                if dropped && row["cloud_withheld"].is_null() {
+                    row["cloud_withheld"] = json!(reason
+                        .clone()
+                        .unwrap_or_else(|| "cloud_agent_uncertain".to_string()));
+                }
             }
         }
         let conversation = match &pair {

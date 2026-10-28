@@ -75,6 +75,24 @@ export interface ThreadState {
    *  window. Absent on a daemon that predates it; entries never advance
    *  it, and a page never lowers it. */
   replySeq?: number;
+  /** CAD-1853: the highest `seq` the daemon has SCANNED for this thread.
+   *  A projection filters another source's cloud entries out of a page, so
+   *  the scanned cursor can be ahead of every held entry; resuming the
+   *  catch-up from it is what keeps a fully filtered page from being read
+   *  again forever. Absent on a daemon that predates the page cursor. */
+  cursor?: number;
+  /** CAD-1853: the lowest `seq` the daemon has SCANNED BACKWARDS for this
+   *  thread (`scanned_before` of the oldest page read). The oldest HELD entry
+   *  is not a continuation point once a projection can hide a whole page —
+   *  it may not move at all — so "earlier" continues below this boundary
+   *  instead. Absent on a daemon that predates it. */
+  older?: number;
+  /** A server code means cloud history is incomplete, even with no entries. */
+  cloudWithheld?: string | null;
+  /** Orders availability observations independently of entry sequence. */
+  cloudRevision?: number;
+  /** Restoration needs a fresh tail, not catch-up past the evicted rows. */
+  cloudRefreshNeeded?: boolean;
   entries: ThreadEntry[];
   pending: PendingMessage[];
 }
@@ -105,10 +123,45 @@ export function asEntry(value: unknown): ThreadEntry | null {
   };
 }
 
+/** Only server provenance marks a cloud row, including routed local copies. */
+export function isCloudEntry(entry: ThreadEntry): boolean {
+  return entry.payload != null &&
+    (Object.prototype.hasOwnProperty.call(entry.payload, "cloud_agent") ||
+      entry.payload.source === "cloud_agent");
+}
+
+/** Absent page metadata is clean; a present malformed/unknown code is not. */
+export function pageCloudWithheld(page: { cloud_withheld?: unknown }): string | null {
+  if (!Object.prototype.hasOwnProperty.call(page, "cloud_withheld")) return null;
+  return typeof page.cloud_withheld === "string" && page.cloud_withheld.trim() !== ""
+    ? page.cloud_withheld
+    : "unknown";
+}
+
+function withCloudWithheld(state: ThreadState, code: string | null): ThreadState {
+  const entries = code === null ? state.entries : state.entries.filter((e) => !isCloudEntry(e));
+  return {
+    ...state,
+    cloudWithheld: code,
+    cloudRevision: (state.cloudRevision ?? 0) + 1,
+    cloudRefreshNeeded: code === null
+      ? state.cloudRefreshNeeded || state.cloudWithheld != null
+      : false,
+    entries,
+  };
+}
+
 /** The highest stored `seq` — the resume cursor; null with none. */
 export function lastSeq(state: ThreadState | null): number | null {
   const entries = state?.entries ?? [];
   return entries.length ? entries[entries.length - 1].seq : null;
+}
+
+/** The forward resume cursor: every stored row at or below it has been
+ *  scanned, including rows a projection filtered out. */
+export function resumeSeq(state: ThreadState | null): number | null {
+  const seq = Math.max(state?.cursor ?? 0, lastSeq(state) ?? 0);
+  return seq > 0 ? seq : null;
 }
 
 /** A visible agent reply — the same rule as the daemon's complete
@@ -139,7 +192,8 @@ export function mergeEntries(state: ThreadState | null, incoming: ThreadEntry[])
   const previousReply = base.replySeq ?? 0;
   let replySeq = previousReply;
   for (const e of incoming) {
-    if (!bySeq.has(e.seq)) changed = true;
+    if (base.cloudWithheld != null && isCloudEntry(e)) continue;
+    if (bySeq.get(e.seq) !== e) changed = true;
     bySeq.set(e.seq, e);
     if (isReplyEntry(e) && e.seq > replySeq) replySeq = e.seq;
   }
@@ -162,9 +216,23 @@ export function mergeEntries(state: ThreadState | null, incoming: ThreadEntry[])
   };
 }
 
-/** `streamInto`'s reducer: an `entry` frame merges; anything else is ignored. */
+/** Fold entries and independent cloud-availability frames from the stream. */
 export function reduceFrame(state: ThreadState | null, event: SseEvent): ThreadState {
   const base = state ?? EMPTY_THREAD;
+  if (event.type === "cloud_withheld") {
+    let status: unknown;
+    try {
+      status = JSON.parse(event.data);
+    } catch {
+      return withCloudWithheld(base, "unknown");
+    }
+    const wire = status !== null && typeof status === "object"
+      ? status as { cloud_withheld?: unknown }
+      : { cloud_withheld: undefined };
+    return withCloudWithheld(base, wire.cloud_withheld === null
+      ? null
+      : pageCloudWithheld({ cloud_withheld: wire.cloud_withheld }));
+  }
   if (event.type !== "entry") return base;
   let parsed: unknown;
   try {
@@ -179,10 +247,10 @@ export function reduceFrame(state: ThreadState | null, event: SseEvent): ThreadS
 /** A page from `GET /api/threads/<alias>` folded into the state. */
 export function mergePage(
   state: ThreadState | null,
-  page: { thread?: unknown; entries?: unknown[]; reply_seq?: unknown },
+  page: { thread?: unknown; entries?: unknown[]; reply_seq?: unknown; cloud_withheld?: unknown },
 ): ThreadState {
   const entries = (page.entries ?? []).map(asEntry).filter((e): e is ThreadEntry => e !== null);
-  const merged = mergeEntries(state, entries);
+  const merged = mergeEntries(withCloudWithheld(state ?? EMPTY_THREAD, pageCloudWithheld(page)), entries);
   // The page reports the COMPLETE thread's reply watermark, so keep the
   // maximum: a bounded, forward or older page (and a live frame that
   // carries only an entry) can never erase a reply it does not hold.
@@ -575,6 +643,17 @@ export interface ThreadPageLike {
    *  (0 when none), independent of the page cursor. Absent on a daemon
    *  that predates it. */
   reply_seq?: number;
+  /** CAD-1853: the last `seq` this page scanned, past every row the
+   *  projection filtered out. Absent on a daemon that predates it. */
+  cursor?: number;
+  /** CAD-1853: backward reads only — the LOWEST `seq` this page scanned, the
+   *  `before` continuation past every row the projection filtered out. */
+  scanned_before?: number;
+  /** CAD-1853: forward reads only — the scan filled the page, so raw rows may
+   *  remain beyond it. `false` is exhaustion; absent on a daemon that
+   *  predates it. */
+  more_after?: boolean;
+  cloud_withheld?: string;
 }
 
 /** How the store reads pages: forward after a seq, the newest page, or
@@ -610,25 +689,70 @@ export async function loadThread(
   limit = PAGE,
 ): Promise<ThreadState> {
   const held = current ?? EMPTY_THREAD;
+  let state = held;
   try {
-    let after = lastSeq(held);
-    if (after !== null) {
-      let state = held;
+    const resume = held.cloudRefreshNeeded ? null : resumeSeq(held);
+    if (resume !== null) {
+      let after: number = resume;
       for (let i = 0; i < CATCH_UP_PAGES; i++) {
         const page = await read.after(after, limit);
+        const visible = (page.entries ?? []).length;
         state = mergePage(state, page);
-        if ((page.entries ?? []).length < limit) return state;
-        after = lastSeq(state) ?? after;
+        if (state.cloudRefreshNeeded) break;
+        // CAD-1853: resume past every row the daemon scanned, not just the
+        // ones it kept. A page of another source's cloud entries is filtered
+        // out of the projection, shows nothing, and still carries the cursor
+        // beyond them; ignoring it would read the same hidden page forever.
+        const next: number =
+          typeof page.cursor === "number" &&
+          Number.isSafeInteger(page.cursor) &&
+          page.cursor > after
+            ? page.cursor
+            : (lastSeq(state) ?? after);
+        if (next > after) state = { ...state, cursor: next };
+        // Exhaustion is a property of the RAW scan, not of the kept rows: a
+        // projection can hide every row of a FULL page, so a small visible
+        // count no longer proves the thread's end. Prefer the daemon's own
+        // raw-page answer; a daemon that predates it keeps the visible-count
+        // rule.
+        const exhausted =
+          typeof page.more_after === "boolean"
+            ? !page.more_after
+            : visible > 0 && visible < limit;
+        if (exhausted) return state;
+        if (next <= after) return state;
+        after = next;
       }
       // Too far behind to replay: reopen on the newest page.
     }
     const page = await read.tail(limit);
     const fresh = mergePage(
-      { ...EMPTY_THREAD, pending: held.pending, replySeq: held.replySeq },
+      state.cloudRefreshNeeded || state.cloudWithheld != null
+        ? state
+        : { ...EMPTY_THREAD, pending: held.pending, replySeq: state.replySeq },
       page,
     );
+    const scanned = Math.max(
+      typeof page.cursor === "number" && Number.isSafeInteger(page.cursor)
+        ? page.cursor
+        : 0,
+      resumeSeq(fresh) ?? 0,
+    );
+    // The tail is a BACKWARD read too. Its lowest scanned seq is where
+    // "earlier" continues, even when the projection kept none of the page —
+    // without it a fully filtered tail leaves older history unreachable,
+    // because there is no held entry to page below.
+    const older =
+      typeof page.scanned_before === "number" &&
+      Number.isSafeInteger(page.scanned_before) &&
+      page.scanned_before > 0
+        ? page.scanned_before
+        : null;
     return {
       ...fresh,
+      cloudRefreshNeeded: false,
+      ...(scanned > 0 ? { cursor: scanned } : {}),
+      ...(older !== null ? { older } : {}),
       moreBefore: typeof page.more_before === "boolean" ? page.more_before : null,
     };
   } catch (e) {
@@ -643,9 +767,20 @@ export function fetchEarlier(
   state: ThreadState,
   limit = PAGE,
 ): Promise<ThreadPageLike> | null {
+  // Continue below the last BACKWARD SCAN, not below the oldest held entry:
+  // a projection can hide a whole page, so the oldest held seq does not move
+  // and paging from it would re-read the same hidden page forever. The
+  // daemon's `scanned_before` is that boundary; without it (an older daemon)
+  // the first held entry is all we have.
   const first = state.entries[0]?.seq;
-  if (first === undefined || first <= 1) return null;
-  return read.before(first, limit);
+  const before =
+    first === undefined
+      ? state.older
+      : state.older === undefined
+        ? first
+        : Math.min(first, state.older);
+  if (before === undefined || before <= 1) return null;
+  return read.before(before, limit);
 }
 
 /**
@@ -655,7 +790,26 @@ export function fetchEarlier(
  */
 export function applyEarlier(state: ThreadState | null, page: ThreadPageLike): ThreadState {
   const merged = mergePage(state, page);
-  return { ...merged, moreBefore: page.more_before === true };
+  // The backward boundary only moves DOWN as pages fold in; keeping the
+  // smallest boundary read so far is what makes repeated "earlier" presses
+  // cross hidden pages instead of asking for the same one again.
+  const scanned =
+    typeof page.scanned_before === "number" &&
+    Number.isSafeInteger(page.scanned_before) &&
+    page.scanned_before > 0
+      ? page.scanned_before
+      : undefined;
+  const older =
+    scanned === undefined
+      ? state?.older
+      : state?.older === undefined
+        ? scanned
+        : Math.min(state.older, scanned);
+  return {
+    ...merged,
+    moreBefore: page.more_before === true,
+    ...(older !== undefined ? { older } : {}),
+  };
 }
 
 /** Items rendered at most, until the operator asks for earlier ones. */

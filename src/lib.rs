@@ -24,6 +24,7 @@ pub mod business_export;
 pub mod business_templates;
 pub mod cli_actor;
 pub mod client;
+pub mod cloud_agent;
 pub mod confine;
 pub mod context_pack;
 pub mod continuity;

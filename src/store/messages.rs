@@ -561,6 +561,113 @@ impl Store {
         )
     }
 
+    /// CAD-1853: enqueue one canonical cloud request with the immutable
+    /// source and recipient verified INSIDE this transaction.
+    ///
+    /// `Sender::Agent(alias)` is deliberately not trusted to re-resolve the
+    /// alias: the caller's verified source UID and registration stamp must
+    /// still match the live row, the alias must still be the pinned cloud
+    /// recipient, and an existing message id must carry the same source and
+    /// recipient. All of that is decided before the row or any external
+    /// request exists, so an alias re-registration can neither capture the
+    /// new turn nor inherit the reply. The message is marked `running`, and
+    /// the durable operation witness is attached, in the same transaction —
+    /// the local queue can never claim a cloud turn and a crash cannot leave
+    /// a half-bound operation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_cloud(
+        &self,
+        alias: &str,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        sender: &Sender,
+        expected_recipient_uid: &str,
+        expected_recipient_uid_context: Option<&str>,
+        expected_sender_uid: Option<&str>,
+        expected_sender_epoch: i64,
+        cloud_agent_id: &str,
+    ) -> Result<(bool, String)> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let recipient = self.agent_in(&tx, alias)?;
+            let contextual = expected_recipient_uid_context.unwrap_or(expected_recipient_uid);
+            if recipient.uid != expected_recipient_uid || recipient.uid != contextual {
+                return Err(Error::rejected(
+                    "the cloud recipient changed before the request was queued; nothing was sent",
+                ));
+            }
+            match sender {
+                Sender::Agent(sender_alias) => {
+                    let row = self.agent_in(&tx, sender_alias)?;
+                    let epoch = crate::cloud_agent::registration_epoch(row.created);
+                    if expected_sender_uid != Some(row.uid.as_str())
+                        || epoch != expected_sender_epoch
+                    {
+                        return Err(Error::gate_coded(
+                            "cloud_agent_source_stale",
+                            "the invoking agent's registration changed before the request \
+                             was queued; nothing was sent",
+                        ));
+                    }
+                }
+                Sender::Operator => {
+                    if expected_sender_uid.is_some() {
+                        return Err(Error::internal(
+                            "an operator cloud send cannot claim an agent sender uid",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(Error::internal(
+                        "a cloud request has an operator or agent sender",
+                    ))
+                }
+            }
+            if let Some(existing) = self.message_in(&tx, id)? {
+                let same = existing.alias == alias
+                    && existing.source == super::cloud_agent::MESSAGE_SOURCE
+                    && existing.body == body
+                    && existing.reply_to.as_deref() == reply_to
+                    && existing.sender_uid.as_deref() == expected_sender_uid
+                    && existing.recipient_uid.as_deref() == Some(recipient.uid.as_str());
+                if !same {
+                    return Err(Error::conflict_coded(
+                        "cloud_agent_message_conflict",
+                        "this cloud operation id is already bound to a different canonical \
+                         message or identity; nothing was sent",
+                    ));
+                }
+                self.cloud_agent_attach_in(&tx, cloud_agent_id, id, id, &recipient.uid)?;
+                return Ok((true, existing.state));
+            }
+            let out = self.enqueue_tx_with_conversation(
+                &tx,
+                alias,
+                body,
+                reply_to,
+                id,
+                super::cloud_agent::MESSAGE_SOURCE,
+                None,
+                None,
+                None,
+                sender,
+                Priority::Normal,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            Self::mark_running_in(&tx, id, &format!("cloud-{id}"))?;
+            self.cloud_agent_attach_in(&tx, cloud_agent_id, id, id, &recipient.uid)?;
+            Ok(out)
+        })
+    }
+
     /// `enqueue_sent` with steering (CAD-158): the new message's rank,
     /// and the still-`queued` messages it replaces — all in ONE
     /// transaction. Every named id must be `alias`'s own, still
@@ -2143,28 +2250,40 @@ impl Store {
         Ok(())
     }
 
+    /// Record that the provider acknowledged a turn start, inside a caller's
+    /// open transaction. Returns the message's alias so the caller can apply
+    /// its own edges without a second write.
+    pub(super) fn mark_running_in(
+        tx: &impl super::StoreConn,
+        message_id: &str,
+        turn_id: &str,
+    ) -> Result<String> {
+        tx.execute(
+            "UPDATE messages SET state='running',turn_id=? WHERE id=?",
+            params![turn_id, message_id],
+        )?;
+        let alias: String =
+            tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                r.get(0)
+            })?;
+        Self::event(
+            tx,
+            &alias,
+            "turn_started",
+            json!({"message": message_id, "turn_id": turn_id}),
+        )?;
+        Ok(alias)
+    }
+
     /// Record that the provider acknowledged a turn start.
     pub fn mark_running(&self, message_id: &str, turn_id: &str) -> Result<()> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
-            tx.execute(
-                "UPDATE messages SET state='running',turn_id=? WHERE id=?",
-                params![turn_id, message_id],
-            )?;
-            let alias: String =
-                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
-                    r.get(0)
-                })?;
-            Self::event(
-                &tx,
-                &alias,
-                "turn_started",
-                json!({"message": message_id, "turn_id": turn_id}),
-            )?;
+            let alias = Self::mark_running_in(tx, message_id, turn_id)?;
             // Task edge: a task-attached kickoff observed running moves the
             // task dispatched → running (guarded — cancelled/advanced tasks
             // are untouched).
-            self.task_on_running(&tx, message_id, &alias)?;
+            self.task_on_running(tx, message_id, &alias)?;
             Ok(())
         })
     }

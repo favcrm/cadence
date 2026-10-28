@@ -1,11 +1,18 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ThreadPage",
-  "description": "`thread_read` (daemon RPC; `GET /api/threads/<alias>` relays it).\nA forward read carries `cursor`; a backward one also `more_before`.",
+  "description": "`thread_read` (daemon RPC; `GET /api/threads/<alias>` relays it).\n\n`cursor` is the last row the page scanned in the direction it was read —\nthe forward resume point, and the newest scanned row of a `tail` page. A\nprojection can filter another source's rows out of a page, so a consumer\nmust move by what was SCANNED and never by what was kept:\n\n- `more_before` (backward) says raw rows remain below the page;\n- `scanned_before` (backward) is the lowest seq scanned, the `before`\n  continuation — present even when the page kept nothing;\n- `more_after` (forward) says the scan filled the page, so raw rows may\n  remain beyond it.",
   "type": "object",
   "properties": {
     "alias": {
       "type": "string"
+    },
+    "cloud_withheld": {
+      "description": "Cloud history is incomplete for this read; ordinary rows remain usable.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "cursor": {
       "type": "integer",
@@ -17,6 +24,12 @@
         "$ref": "#/$defs/ThreadEntryRow"
       }
     },
+    "more_after": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
     "more_before": {
       "type": [
         "boolean",
@@ -25,6 +38,13 @@
     },
     "reply_seq": {
       "type": "integer",
+      "format": "int64"
+    },
+    "scanned_before": {
+      "type": [
+        "integer",
+        "null"
+      ],
       "format": "int64"
     },
     "thread": {

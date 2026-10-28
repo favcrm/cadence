@@ -1,8 +1,8 @@
 //! CAD-1795: the daemon's `master_state` and `thread_read` replies, pinned
 //! byte for byte. The goldens under `src/ui/board_api_golden/` were captured
 //! from the code that built these replies with `json!` literals;
-//! `CADENCE_WRITE_GOLDEN=1` rewrites them. The member views of the same
-//! replies are pinned by `ui::board_api_golden` from these files.
+//! `CADENCE_WRITE_GOLDEN=1` rewrites them. Member privacy and pagination
+//! behavior are checked by `ui::board_api_golden` without pinning metadata bytes.
 
 use super::*;
 use crate::store::NewAgent;

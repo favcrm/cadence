@@ -512,6 +512,92 @@ const CATALOG: &[(&str, &[&str])] = &[
             "cloud_eligible",
         ],
     ),
+    (
+        "cloud_agent_operations",
+        &[
+            "operation_id",
+            "cloud_agent_id",
+            "source_kind",
+            "source_uid",
+            "registration_epoch",
+            "owner_issuer",
+            "owner_subject",
+            "recipient_uid",
+            "sender_label",
+            "thread_id",
+            "conversation_id",
+            "remote_session_id",
+            "request_digest",
+            "request_text",
+            "status",
+            "remote_operation_id",
+            "message_id",
+            "reply_text",
+            "reply_message_id",
+            "error_code",
+            "error_message",
+            "created",
+            "updated",
+            "grant_admitted_at",
+            "claimed_at",
+        ],
+    ),
+    (
+        "cloud_agent_sessions",
+        &[
+            "id",
+            "cloud_agent_id",
+            "source_kind",
+            "source_uid",
+            "registration_epoch",
+            "owner_issuer",
+            "owner_subject",
+            "thread_id",
+            "conversation_id",
+            "remote_session_id",
+            "provider_session_id",
+            "invoker_id",
+            "created",
+        ],
+    ),
+    (
+        "cloud_agent_sources",
+        &[
+            "cloud_agent_id",
+            "source_kind",
+            "source_uid",
+            "registration_epoch",
+            "owner_issuer",
+            "owner_subject",
+            "label",
+            "scope",
+            "granted_by",
+            "granted_at",
+            "invoker_id",
+            "state",
+        ],
+    ),
+    (
+        "cloud_agents",
+        &[
+            "id",
+            "alias",
+            "organization_id",
+            "org_slug",
+            "endpoint",
+            "remote_agent_id",
+            "runtime",
+            "model",
+            "capabilities",
+            "provider_session_id",
+            "provenance",
+            "recipient_uid",
+            "consent_scope",
+            "state",
+            "created",
+            "updated",
+        ],
+    ),
     ("connection_metadata", &["singleton", "workspace_id"]),
     (
         "crm_sends",
@@ -1717,6 +1803,190 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
         )?;
         tx.execute("DELETE FROM topics WHERE type='human_room'", [])?;
     }
+    // CAD-1853 review: the four cloud-agent tables are outside the
+    // coordination profile, so their connection, grant, session and receipt
+    // authority never travels — but the cloud request and result TEXT reuses
+    // the coordination tables (`messages`, `thread_entries`, `threads`,
+    // `events`). Exporting that text against an alias whose authority rows
+    // are omitted would hand whoever restores the package a cloud
+    // conversation that reads as an ordinary local one. Cloud content is
+    // private to the source/owner that was admitted on the live workspace,
+    // so it is omitted together with the authority that admitted it. The
+    // inert alias row itself stays (its `endpoint`/`params` are nulled
+    // below) so an explicit `cloud-agent connect` can reuse it; until then
+    // every cloud projection of that alias fails closed.
+    //
+    // A settled turn also routes its reply as a `worker_result` (or a
+    // `worker_notice`) on the ordinary alias of whoever invoked it, and that
+    // copy is what `agent_show`/`thread_read` of that alias would serve after
+    // a restore. Those rows are not on the cloud alias, so they are collected
+    // by their ORIGIN — `messages.origin` names the cloud message, whose id
+    // is the operation id — recursively, together with the canonical rows
+    // they derive from. Their thread entries, receipts (`messages.result`
+    // and `error`) and events travel with the same closure; the derived row's
+    // own body is never filtered by alias or source.
+    let cloud = crate::cloud_agent::PROVIDER;
+    let cloud_alias = "SELECT alias FROM agents WHERE provider=?1";
+    let cloud_messages = format!(
+        "WITH RECURSIVE cloud_message(id) AS ( \
+           SELECT id FROM messages \
+            WHERE alias IN ({cloud_alias}) OR source='cloud_agent' \
+           UNION \
+           SELECT m.id FROM messages m JOIN cloud_message c ON m.origin=c.id \
+         )"
+    );
+    tx.execute(
+        &format!(
+            "{cloud_messages} DELETE FROM thread_entries WHERE \
+               message_id IN (SELECT id FROM cloud_message) \
+               OR json_extract(payload,'$.message') IN (SELECT id FROM cloud_message) \
+               OR thread_id IN (SELECT id FROM threads WHERE alias IN ({cloud_alias}))"
+        ),
+        [cloud],
+    )?;
+    // The closure is by REFERENCE as well as by row. A completed delivery
+    // duplicates its result into the alias' own `turn_finished` event
+    // (`payload.message` = the delivered message id, `payload.result` = the
+    // result text), so an event on an ordinary alias can carry a cloud reply
+    // that the message row no longer does. Every event naming a closed-over
+    // message — the routed copy, its delivery, or the cloud request itself —
+    // travels with it, whichever alias holds the event. Runs BEFORE the
+    // message delete: the closure is derived from `messages`.
+    tx.execute(
+        &format!(
+            "{cloud_messages} DELETE FROM events WHERE \
+               json_extract(payload,'$.message') IN (SELECT id FROM cloud_message) \
+               OR json_extract(payload,'$.delivery') IN (SELECT id FROM cloud_message)"
+        ),
+        [cloud],
+    )?;
+    // Provider traffic and adapter bookkeeping are TRANSCRIPT material, not
+    // coordination data, and they can embed conversation text with no
+    // canonical id at all: a continuity pack quotes earlier thread content
+    // verbatim, the Codex adapter forwards completed assistant messages with
+    // their full text, and tool use/results and permission denials carry
+    // command, query and output summaries. No id-keyed closure can find any of
+    // that, and a restore resumes the board, tasks, messages and receipts — so
+    // every adapter bookkeeping kind is omitted whole, together with the
+    // generic provider event. This list mirrors the `cadence/<kind>` emitters
+    // under `src/adapter/`: a new adapter kind that can carry content belongs
+    // in it (and in the portable guard's producer shapes).
+    tx.execute(
+        "DELETE FROM events WHERE kind IN ( \
+           'provider_event', 'fake_pack', 'claim_used', 'claude_init', \
+           'claude_result', 'cloud_session', 'codex_quota', 'interrupt_ack', \
+           'pane_root', 'pane_root_unrecorded', 'permission_denied', \
+           'pi_extension_error', 'pi_retry', 'pi_session_reset_failed', \
+           'pi_ui_request', 'ready_claimed', 'serialized_body_limited', \
+           'session_compacted', 'session_minted', 'session_resume_failed', \
+           'stale_result', 'tool_progress', 'tool_result', 'tool_use')",
+        [],
+    )?;
+    // Screen text is transcript material wherever it is stored: a render
+    // failure keeps the pane before and after the paste, an approval menu
+    // keeps the command/subject line it displayed, and a probe's `reason` is
+    // that same extracted line (Claude, Cursor and Devin fill it from the
+    // screen, not from a fixed verdict). Any of those can quote an earlier
+    // private reply while the event names another delivery — or no message at
+    // all. The events stay, with their message, attempt, retry and probe
+    // verdicts; the captured prose does not.
+    tx.execute(
+        "UPDATE events SET payload=json_remove(payload, \
+           '$.before','$.after','$.line','$.probe.reason', \
+           '$.claim_probe','$.reprobe') \
+          WHERE json_valid(payload)",
+        [],
+    )?;
+    // Two coordination events COPY that screen line into their own `reason`
+    // before persisting it: a blocked delivery says which approval menu is
+    // open, and a refused recovery says the same. Keep the event, the
+    // message and the static verdict; drop the copied subject.
+    tx.execute(
+        "UPDATE events SET payload=json_remove(payload,'$.reason') \
+          WHERE kind IN ('gate_wait','submit_recover_refused') \
+            AND json_valid(payload)",
+        [],
+    )?;
+    // A monitor alert materializes the scoped event payload it fired on, so the
+    // same screen prose can sit one level down in `monitor_alerts.payload`.
+    // The alert keeps its identity, task, kind, state and fingerprint; the
+    // copied transcript does not.
+    // Provider error prose has no lineage at all: a failed turn publishes the
+    // provider's own message into `agents.error` and into an `attention`
+    // event, and a history-refusal note is a thread entry that references its
+    // delivery only in the payload. None of those can be traced back to the
+    // cloud row they quoted, so the portable copy does not carry the prose:
+    // the agent keeps its state, the attention marker and the note's
+    // reference, without the quoted text.
+    tx.execute("UPDATE agents SET error=NULL", [])?;
+    // Provider transcript and runtime notes that had no running message when
+    // they arrived are canonical history with NO binding: an unbound entry can
+    // quote a turn whose cloud operation is omitted, and nothing ties it back.
+    // A portable export carries the BOUND conversation, not unbound provider
+    // or runtime transcript.
+    tx.execute("DELETE FROM thread_entries WHERE message_id IS NULL", [])?;
+    // A brokered permission notice copies the tool command/input summary into
+    // its delivery body. The notice row, its sender and its state stay; the
+    // copied prose does not.
+    // A brokered notice quotes the tool command/input summary that produced
+    // it, and that prose is copied into its receipt, its completion event, its
+    // thread entry and the entry's own error payload. The notice row, its
+    // sender, state and binding stay; every copy of the quoted text goes.
+    tx.execute(
+        "UPDATE messages SET body='', result=NULL, error=NULL WHERE source='worker_notice'",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE thread_entries SET text='', \
+           payload=json_remove(payload,'$.error') \
+          WHERE message_id IN (SELECT id FROM messages WHERE source='worker_notice') \
+            AND json_valid(payload)",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE thread_entries SET text='' \
+          WHERE message_id IN (SELECT id FROM messages WHERE source='worker_notice')",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE events SET payload=json_remove(payload,'$.result') \
+          WHERE kind='turn_finished' AND json_valid(payload) \
+            AND json_extract(payload,'$.message') IN \
+                (SELECT id FROM messages WHERE source='worker_notice')",
+        [],
+    )?;
+    // A provider session reset keeps the provider's error text in its event.
+    tx.execute(
+        "UPDATE events SET payload=json_remove(payload,'$.error') \
+          WHERE kind='provider_session_reset' AND json_valid(payload)",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE events SET payload=json_remove(payload,'$.reason') \
+          WHERE kind='attention' AND json_valid(payload)",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE monitor_alerts SET payload=json_remove(payload, \
+           '$.payload.before','$.payload.after','$.payload.line', \
+           '$.payload.probe.reason','$.payload.claim_probe','$.payload.reprobe') \
+          WHERE json_valid(payload)",
+        [],
+    )?;
+    tx.execute(
+        &format!(
+            "{cloud_messages} DELETE FROM messages WHERE id IN (SELECT id FROM cloud_message)"
+        ),
+        [cloud],
+    )?;
+    tx.execute(
+        &format!("DELETE FROM threads WHERE alias IN ({cloud_alias})"),
+        [cloud],
+    )?;
+    tx.execute(
+        &format!("DELETE FROM events WHERE alias IN ({cloud_alias})"),
+        [cloud],
+    )?;
     for table in omitted_names() {
         let present: i64 = tx.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?",
@@ -2365,6 +2635,7 @@ fn exclusions() -> Vec<String> {
         "imported actors disabled: agents.enabled=0; monitors dispatch flags=0",
         "provenance purged: connection_metadata (source UUID recorded in the manifest only), model_defaults, settings_authority",
         "business app data outside the coordination profile: app_*, crm_*, social_publish_intents, cloud_dispatch_outbox, chat_files, artifacts (rows deleted from the private copy; declared omitted, not a full workspace)",
+        "cloud-agent private content: cloud_agents, cloud_agent_sources, cloud_agent_sessions and cloud_agent_operations, plus the cloud alias' messages, thread entries, threads and events and every request/result copy DERIVED from a cloud message by origin (a routed worker_result/worker_notice on an ordinary alias, with its thread entries and receipt) (rows deleted from the private copy). The alias row itself is kept inert with no authority; cloud projections of it fail closed until it is reconnected explicitly",
         "local checkouts, process identity, sockets and runtime files: not included",
     ]
     .iter()

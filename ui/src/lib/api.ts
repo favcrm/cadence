@@ -122,6 +122,13 @@ export interface ThreadPage {
   cursor?: number;
   /** Backward reads (`tail`/`before`): older entries remain. */
   more_before?: boolean;
+  /** Backward reads: the lowest seq the page scanned — the `before`
+   *  continuation past rows a projection filtered out. */
+  scanned_before?: number;
+  /** Forward reads: the scan filled the page, so raw rows may remain. */
+  more_after?: boolean;
+  /** Cloud content is incomplete/unavailable; ordinary rows and cursors remain usable. */
+  cloud_withheld?: string;
   /** CAD-1700: the complete thread's newest visible assistant reply seq
    *  (0 when none), independent of the page cursor. */
   reply_seq?: number;

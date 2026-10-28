@@ -1460,6 +1460,17 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=56", [])?;
                 tx.commit()?;
             }
+            if version < 57 {
+                // CAD-1853: one durable cloud-agent connection, its
+                // per-work-conversation remote session bindings, the
+                // explicit local consent grant and one operation row per
+                // local request. New tables only; Threads remains the
+                // canonical conversation history.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::cloud_agent::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=57", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

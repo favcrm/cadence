@@ -739,6 +739,40 @@ pub static SPECS: &[EndpointSpec] = &[
         launch_default: false,
         internal: false,
     },
+    // CAD-1853: the externally connected AgenticOS cloud conversational
+    // agent. It owns NO local actor, process or adapter: it is reached only
+    // through the published contract and its truthful state is projected
+    // from the cloud-agent rows. Declaring it actorless keeps a daemon
+    // restart from trying to relaunch an unsupported local adapter (which
+    // would fence a healthy remote connection) and keeps every mailbox-only
+    // verb from claiming it.
+    EndpointSpec {
+        provider: "agenticos-cloud",
+        endpoint_kind: "cloud",
+        display: "AgenticOS cloud agent (Worker/Pi Durable)",
+        has_actor: false,
+        attach: Attach::None,
+        ready_gate: false,
+        screen_probe: false,
+        reports: Reporting::TurnResult,
+        report_hint: Reporting::TurnResult,
+        turn_token: None,
+        brokers_requests: false,
+        resumable: false,
+        resume_label: "n/a — remote cloud session",
+        live_settable_params: &[],
+        launch_params: &[],
+        session_id_label: "Remote provider session",
+        respond_rejection: Some(
+            "a cloud agent has no local approval channel — answer remotely in Threads",
+        ),
+        capabilities: &["cloud_agent_conversation"],
+        doctor_caps: &[],
+        probe_bins: &[],
+        session_disposable: false,
+        launch_default: false,
+        internal: false,
+    },
 ];
 
 /// `health.capabilities` entry for daemon-wide model defaults.
@@ -853,14 +887,17 @@ impl Placement {
     }
 }
 
-/// Placement of one registered endpoint. Total by construction: a pair
-/// without an actor is a queue, an endpoint kind named `cloud` is hosted,
-/// everything else runs on the daemon's own host.
+/// Placement of one registered endpoint. Total by construction: an endpoint
+/// kind named `cloud` is hosted (whether or not it owns a local actor), a
+/// non-cloud pair without an actor is a queue, everything else runs on the
+/// daemon's own host.
 pub fn placement(provider: &str, endpoint_kind: &str) -> Placement {
-    if !has_actor(provider, endpoint_kind) {
-        Placement::Queue
-    } else if endpoint_kind == "cloud" {
+    // A hosted cloud runtime has no local actor by design; naming the kind
+    // `cloud` is the truthful placement even when no process runs here.
+    if endpoint_kind == "cloud" {
         Placement::Cloud
+    } else if !has_actor(provider, endpoint_kind) {
+        Placement::Queue
     } else {
         Placement::Local
     }
@@ -2016,23 +2053,41 @@ mod tests {
             "threads",
             "fake_provider_tests",
             "devin_cloud",
+            // CAD-1853: the actorless cloud conversational endpoint's own
+            // capability, unioned once from its spec.
+            "cloud_agent_conversation",
         ] {
             assert!(caps.contains(&name), "missing {name}");
         }
-        assert_eq!(caps.len(), 21);
+        assert_eq!(caps.len(), 22);
     }
 
     #[test]
     fn model_matrix_keeps_devin_and_drops_test_doubles() {
         let rows = model_provider_matrix();
         let ids: Vec<&str> = rows.iter().map(|row| row.id).collect();
+        // `agenticos-cloud` is a real registered provider row (CAD-1853) with
+        // no launch model of its own, exactly like `sandbox`: it stays visible
+        // ineligible so the settings page explains why it has no default.
         assert_eq!(
             ids,
-            vec!["codex", "claude", "pi", "omp", "devin", "cursor", "sandbox"]
+            vec![
+                "codex",
+                "claude",
+                "pi",
+                "omp",
+                "devin",
+                "cursor",
+                "sandbox",
+                "agenticos-cloud"
+            ]
         );
         assert!(rows
             .iter()
             .any(|row| { row.id == "sandbox" && !row.eligible && row.limitation.is_some() }));
+        assert!(rows.iter().any(|row| {
+            row.id == "agenticos-cloud" && !row.eligible && row.limitation.is_some()
+        }));
         assert!(rows.iter().any(|row| row.id == "claude" && row.eligible));
         assert!(rows.iter().any(|row| row.id == "pi" && row.eligible));
         assert!(rows

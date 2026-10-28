@@ -19,7 +19,7 @@ import { IconClose, IconRefresh, IconSearch, IconThreads } from "../../ui/icons"
 import type { Agent } from "../../lib/types";
 import Composer from "../app-shell/chat/Composer";
 import { attachItems, removeAttach, setComposerContent } from "../app-shell/chat/composerStore";
-import { asEntry, newMessageId, type ThreadEntry } from "../home/thread";
+import { asEntry, isCloudEntry, newMessageId, pageCloudWithheld, type ThreadEntry } from "../home/thread";
 import AgentAvatar, { lookFor } from "../agents/AgentAvatar";
 import { activeTasks } from "../agents/AgentBlocks";
 import { lifecycleBadge, lifecycleOf } from "../agents/agentView";
@@ -27,6 +27,7 @@ import { StageLabel, ThreadComposerFrame, Turn } from "./ThreadChatParts";
 import {
   changeSubscriber,
   createTopic,
+  earlierBoundary,
   listWorkConversations,
   postToTopic,
   readTopic,
@@ -657,7 +658,13 @@ function issueProjectMap(issues: { id: string; project: string }[]): IssueProjec
 /** A row's second line from real data only: the last preview; else a group's
  *  post and member counts; else a direct thread's label. */
 function rowDescriptor(row: ConversationRow, t: (english: string) => string = (english) => english): string {
-  if (row.last) return row.last.preview;
+  if (row.last) {
+    // A withheld cloud preview is empty on purpose; say so rather than
+    // rendering a blank second line.
+    return row.last.cloud_withheld
+      ? t("Cloud content unavailable")
+      : row.last.preview;
+  }
   if (row.kind === "group") {
     const members = liveMembers(row).length;
     const parts = [`${members} ${t(members === 1 ? "member" : "members")}`];
@@ -718,6 +725,12 @@ function Timeline({
   const [before, setBefore] = useState<number | null>(null);
   const [more, setMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [withheld, setWithheld] = useState<string | null>(null);
+  const cloudStatus = useRef<string | null>(null);
+  const cloudRead = useRef(0);
+  const cloudAppliedRead = useRef(0);
+  // Retain the window start so clean refreshes can restore evicted rows.
+  const cloudWindowStart = useRef<number | null>(null);
   const [tick, setTick] = useState(0);
   const scopeKey = `${scope.project ?? ""}|${scope.agent ?? ""}|${scope.include_system ? 1 : 0}`;
 
@@ -725,18 +738,24 @@ function Timeline({
   const pull = async (at: ReadPageOptions): Promise<Pulled> => {
     if (dm) {
       // Operator DM: the agent's home thread, read by its conversation id.
+      const read = ++cloudRead.current;
       const p = await api.thread(dm, { ...at, limit: PAGE, conversation: row.id });
       return {
         entries: threadEntries(p.entries),
+        withheld: pageCloudWithheld(p),
+        read,
         cursor: p.cursor ?? at.after ?? 0,
         more_before: p.more_before === true,
+        // The backward continuation the daemon SCANNED past its projection.
+        scanned_before: p.scanned_before ?? null,
         // Raw row count: a malformed row dropped by threadEntries is still a row the daemon sent.
+        more_after: p.more_after,
         full: p.entries.length >= PAGE,
       };
     }
     if (isGroup) {
       const p = await readTopic(row.id, { ...at, limit: PAGE });
-      return { posts: p.posts, cursor: p.cursor, more_before: p.more_before, full: p.posts.length >= PAGE };
+      return { posts: p.posts, cursor: p.cursor, more_before: p.more_before, scanned_before: null, full: p.posts.length >= PAGE };
     }
     const p = await readWorkConversation(row.id, { ...at, limit: PAGE }, scope);
     // The daemon filters system rows after computing `cursor`, so the raw
@@ -745,11 +764,27 @@ function Timeline({
       messages: p.messages,
       cursor: p.cursor,
       more_before: p.more_before,
+      scanned_before: null,
       full: p.cursor > (at.after ?? 0),
     };
   };
-  const absorb = ({ entries: e, posts: po, messages: m }: Pulled) => {
-    if (e) setEntries((cur) => mergeBySeq(cur, e));
+  const absorb = ({ entries: e, posts: po, messages: m, withheld, read }: Pulled) => {
+    if (e) {
+      // Older history may overlap a refresh, but its status cannot undo a
+      // newer observation. A pending read alone does not erase a denial.
+      if (read !== undefined && read >= cloudAppliedRead.current) {
+        cloudAppliedRead.current = read;
+        cloudStatus.current = withheld ?? null;
+        setWithheld(cloudStatus.current);
+      }
+      setEntries((cur) => {
+        const merged = mergeBySeq(cur, e);
+        if (cloudStatus.current !== null && merged.length > 0) {
+          cloudWindowStart.current = Math.min(cloudWindowStart.current ?? merged[0].seq, merged[0].seq);
+        }
+        return cloudStatus.current === null ? merged : merged.filter((entry) => !isCloudEntry(entry));
+      });
+    }
     if (po) setPosts((cur) => mergeBySeq(cur, po));
     if (m) setMessages((cur) => mergeBySeq(cur, m));
   };
@@ -760,6 +795,7 @@ function Timeline({
   // `loadEarlier` is gated by the epoch only, so a live tick does not drop it.
   const epoch = useRef({ id: "", n: 0 });
   const live = useRef(0);
+  useEffect(() => () => { epoch.current.n++; live.current++; }, []);
   const identity = `${row.id}|${scopeKey}`;
   useEffect(() => {
     const reset = epoch.current.id !== identity;
@@ -770,23 +806,53 @@ function Timeline({
       setMessages(null);
       setBefore(null);
       setMore(false);
+      setWithheld(null);
+      cloudStatus.current = null;
+      cloudAppliedRead.current = ++cloudRead.current;
+      cloudWindowStart.current = null;
+      setError(null);
     }
     const n = epoch.current.n;
     const g = ++live.current;
     const current = () => g === live.current && epoch.current.n === n;
     const loaded = reset ? null : dm ? entries : isGroup ? posts : messages;
     // Pages are ascending, so the window's first row is its oldest seq.
-    const oldest = loaded && loaded.length > 0 ? loaded[0].seq : null;
+    const first = loaded && loaded.length > 0 ? loaded[0].seq : null;
+    const oldest = !reset && cloudWindowStart.current !== null
+      ? Math.min(first ?? cloudWindowStart.current, cloudWindowStart.current)
+      : first;
     const fail = (e: unknown) => {
       if (current()) setError(e instanceof ApiError ? e.message : String(e));
     };
+    const step = async (after: number): Promise<void> => {
+      const p = await pull({ after });
+      if (!current()) return;
+      absorb(p);
+      setError(null);
+      // Continue while the daemon says it scanned more, not while rows came
+      // back: a fully filtered page keeps nothing and is not the end.
+      const more = p.more_after ?? p.full;
+      if (more && p.cursor > after) await step(p.cursor);
+    };
+    if (!reset && oldest === null && before !== null) {
+      // An empty window that already knows where it continues: every row it
+      // holds was filtered out. Refreshing must not reopen the tail, because
+      // that would throw away the backward progress the boundary carries —
+      // continue forward from just below it instead.
+      step(before - 1).catch(fail);
+      return;
+    }
     if (oldest === null) {
       pull({ tail: true })
         .then((p) => {
           if (!current()) return;
           absorb(p);
-          setBefore(oldestOf(p));
-          setMore(p.more_before);
+          // The newest page opens the backward window: the boundary it
+          // SCANNED, so a fully filtered tail still lets "Load earlier"
+          // reach the history below it.
+          const backward = earlierBoundary(p, oldestOf(p));
+          setBefore(backward.before);
+          setMore(backward.more);
           setError(null);
         })
         .catch(fail);
@@ -796,19 +862,15 @@ function Timeline({
     // `after` cursor is exclusive), to the current end. Rows already held are
     // replaced by seq, so a queued row's later state is seen. `before` and
     // `more_before` are left alone: they belong to earlier history.
-    const step = async (after: number): Promise<void> => {
-      const p = await pull({ after });
-      if (!current()) return;
-      absorb(p);
-      setError(null);
-      if (p.full && p.cursor > after) await step(p.cursor);
-    };
     step(oldest - 1).catch(fail);
   }, [identity, liveStamp, threadsTick, tick]);
 
-  // (5) Earlier history: page backwards from the oldest loaded seq; a short
-  // page means the start is reached. Nothing is dropped silently. A result
-  // from an old epoch is discarded.
+  // (5) Earlier history: page backwards from the boundary the previous page
+  // SCANNED — never from its oldest KEPT row, because a fully filtered page
+  // keeps nothing and that cursor would re-fetch the same page forever. The
+  // daemon's `more_before` is the exhaustion answer; the boundary must also
+  // actually move, or the control would be offered with nothing to read. A
+  // result from an old epoch is discarded.
   const loadEarlier = async () => {
     if (before === null) return;
     const n = epoch.current.n;
@@ -816,8 +878,10 @@ function Timeline({
       const p = await pull({ before });
       if (epoch.current.n !== n) return;
       absorb(p);
-      setBefore(oldestOf(p) ?? before);
-      setMore(p.more_before);
+      const backward = earlierBoundary(p, oldestOf(p));
+      const next = Math.min(before, backward.before ?? before);
+      setBefore(next);
+      setMore(backward.more && next < before);
     } catch (e) {
       if (epoch.current.n === n) setError(e instanceof ApiError ? e.message : String(e));
     }
@@ -841,6 +905,9 @@ function Timeline({
       </header>
       {dm && <DmContext alias={dm} agents={agents} issueProjects={issueProjects} />}
       <div className="threads-messages" aria-live="polite">
+        {withheld !== null && (
+          <p className="threads-note" role="status">{t("Cloud content unavailable")}</p>
+        )}
         {error ? (
           <p className="threads-note" role="status">{t("This conversation could not load:")} {error}</p>
         ) : (dm ? entries : isGroup ? posts : messages) === null ? (
@@ -865,7 +932,7 @@ function Timeline({
                   ))}
             {isGroup
               ? (posts ?? []).length === 0 && <p className="threads-note">{t("No posts yet.")}</p>
-              : (dm ? entries ?? [] : messages ?? []).length === 0 && <p className="threads-note">{t("No messages yet.")}</p>}
+              : withheld === null && (dm ? entries ?? [] : messages ?? []).length === 0 && <p className="threads-note">{t("No messages yet.")}</p>}
           </>
         )}
       </div>
@@ -905,13 +972,28 @@ type Pulled = {
   entries?: ThreadEntry[];
   posts?: TopicPost[];
   messages?: ThreadMessage[];
+  withheld?: string | null;
+  /** The DM read's issue order, separate from entry sequence/cursors. */
+  read?: number;
   cursor: number;
+  /** Raw rows remain below the backward boundary. */
   more_before: boolean;
-  /** A forward read may have rows past `cursor`. */
+  /** The LOWEST seq this page scanned: the backward continuation, present
+   *  even when the page kept nothing (the daemon's `scanned_before`). */
+  scanned_before: number | null;
+  /** The daemon scanned a full page: raw rows may remain past `cursor`.
+   *  This is the continuation decision now that a projection can filter a
+   *  whole page away — a page can be full without keeping a single row, and
+   *  empty without being the end. Absent on an older daemon. */
+  more_after?: boolean;
+  /** A forward read may have rows past `cursor`. Fallback only, for a
+   *  daemon that does not report `more_after`. */
   full: boolean;
 };
 
-/** The oldest row of a page (pages are ascending): the next `before` cursor. */
+/** The oldest row of a page (pages are ascending). A FALLBACK only: the
+ *  `before` continuation is `scanned_before` (see `earlierBoundary`), which
+ *  a page that kept no rows still carries. */
 function oldestOf(p: Pulled): number | null {
   return p.entries?.[0]?.seq ?? p.posts?.[0]?.seq ?? p.messages?.[0]?.seq ?? null;
 }
@@ -1000,7 +1082,13 @@ function MessageRow({
         me={message.sender.kind === "operator"}
         state={message.state}
       >
-        {message.body}
+        {message.cloud_withheld ? (
+          <span className="threads-note" role="status">
+            {t("Cloud content unavailable")}
+          </span>
+        ) : (
+          message.body
+        )}
       </Turn>
       {(message.issue || message.task_id || message.origin || routed.length > 0 || recipient) && (
         <div className="threads-refs">
@@ -1417,7 +1505,13 @@ function DraftDm({
 }) {
   const [entries, setEntries] = useState<ThreadEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [withheld, setWithheld] = useState<string | null>(null);
   const t = useTranslate();
+  useEffect(() => {
+    setEntries(null);
+    setWithheld(null);
+    setError(null);
+  }, [alias]);
   useEffect(() => {
     let live = true;
     // No `conversation` selector: the home read of an alias with no thread is empty.
@@ -1426,7 +1520,9 @@ function DraftDm({
       .then((p) => {
         if (!live) return;
         setError(null);
-        setEntries(threadEntries(p.entries));
+        const status = pageCloudWithheld(p);
+        setWithheld(status);
+        setEntries(threadEntries(p.entries).filter((entry) => status === null || !isCloudEntry(entry)));
       })
       .catch((e: unknown) => {
         if (live) setError(e instanceof ApiError ? e.message : String(e));
@@ -1443,6 +1539,9 @@ function DraftDm({
       </header>
       <DmContext alias={alias} agents={agents} issueProjects={issueProjects} />
       <div className="threads-messages" aria-live="polite">
+        {withheld !== null && (
+          <p className="threads-note" role="status">{t("Cloud content unavailable")}</p>
+        )}
         {error ? (
           <p className="threads-note" role="status">This conversation could not load: {error}</p>
         ) : entries === null ? (
@@ -1450,7 +1549,7 @@ function DraftDm({
         ) : (
           <>
             {entries.map((e) => <EntryRow key={e.seq} entry={e} issueProjects={issueProjects} />)}
-            {entries.length === 0 && <p className="threads-note">{t("No messages yet. Sending starts the thread.")}</p>}
+            {withheld === null && entries.length === 0 && <p className="threads-note">{t("No messages yet. Sending starts the thread.")}</p>}
           </>
         )}
       </div>

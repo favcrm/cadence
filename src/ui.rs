@@ -50,6 +50,7 @@ mod business_templates;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1337_acceptance;
 mod cli_route;
+mod cloud_agents;
 #[cfg(all(test, feature = "cli-runtime-test"))]
 pub(crate) use cli_route::prime_jwks_for_test as prime_cli_jwks_for_test;
 mod connections;

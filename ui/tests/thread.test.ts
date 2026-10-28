@@ -252,6 +252,150 @@ async function main() {
     equal(threw, true, "a 503 is a failure");
   }
 
+  // CAD-1853: paging past rows a projection filtered out. The daemon reports
+  // what it SCANNED, so a page that kept nothing still advances, and the
+  // forward catch-up trusts the raw-page answer instead of the visible count.
+  {
+    const calls: string[] = [];
+    const filtered: PageReader = {
+      after: async (after, limit) => {
+        calls.push(`after:${after}`);
+        if (after === 100) {
+          // A full raw page the projection reduced to one entry.
+          return {
+            thread: { id: "t1" },
+            entries: [entry(101, "agent", "turn_result", "kept")].slice(0, limit),
+            cursor: 101,
+            more_after: true,
+          };
+        }
+        return {
+          thread: { id: "t1" },
+          entries: [entry(102, "agent", "turn_result", "next")].slice(0, limit),
+          cursor: 102,
+          more_after: false,
+        };
+      },
+      tail: async () => {
+        calls.push("tail");
+        // The newest page is entirely another source's: nothing kept, but the
+        // scan still stopped at 901.
+        return {
+          thread: { id: "t1" },
+          entries: [],
+          cursor: 1000,
+          scanned_before: 901,
+          more_before: true,
+        };
+      },
+      before: async (before, limit) => {
+        calls.push(`before:${before}`);
+        if (before === 901) {
+          return {
+            thread: { id: "t1" },
+            entries: [entry(850, "operator", "message", "older")].slice(0, limit),
+            cursor: 899,
+            scanned_before: 801,
+            more_before: true,
+          };
+        }
+        return {
+          thread: { id: "t1" },
+          entries: [],
+          cursor: 800,
+          scanned_before: 701,
+          more_before: false,
+        };
+      },
+    };
+
+    // The forward catch-up keeps going on `more_after` even though the kept
+    // page was short: the RAW scan filled the page.
+    const held = mergePage(null, {
+      thread: { id: "t1" },
+      entries: [entry(100, "operator", "message", "start")],
+    });
+    const caught = await loadThread(filtered, held, 2);
+    equal(calls, ["after:100", "after:101"], "a full raw page keeps catching up");
+    equal(lastSeq(caught), 102, "catch-up ends on the daemon's exhausted page");
+    calls.length = 0;
+
+    // A fully filtered tail still carries a backward boundary: older history
+    // stays reachable even with nothing held.
+    let s = await loadThread(filtered, null, 100);
+    equal(
+      [s.entries.length, s.older, s.moreBefore],
+      [0, 901, true],
+      "a filtered tail keeps its scanned boundary",
+    );
+    const older = await fetchEarlier(filtered, s, 100)!;
+    equal(calls, ["tail", "before:901"], "earlier continues below the scan, not from an empty page");
+    s = applyEarlier(s, await older);
+    equal(
+      [s.entries.map((e) => e.seq), s.older, s.moreBefore],
+      [[850], 801, true],
+      "a kept page moves the boundary down",
+    );
+    // The next press continues below the SCAN (801), never from the held entry
+    // (850): otherwise a partially filtered page is read again.
+    const bottom = await fetchEarlier(filtered, s, 100)!;
+    equal(calls[calls.length - 1], "before:801", "the next press continues below the scan");
+    s = applyEarlier(s, await bottom);
+    equal(
+      [s.entries.map((e) => e.seq), s.older, s.moreBefore],
+      [[850], 701, false],
+      "a fully filtered page still advances and reports exhaustion",
+    );
+  }
+
+  // CAD-1853: availability is independent of rows and never retains cached
+  // cloud history. Server provenance, not kind/alias/text, selects eviction.
+  {
+    const ordinary = entry(20, "operator", "message", "cloud_agent is just text");
+    const cloud = entry(10, "agent", "turn_result", "private", { payload: { cloud_agent: {} } });
+    const request = entry(11, "operator", "message", "cloud request", { payload: { source: "cloud_agent" } });
+    let s = addPending(mergePage(null, {
+      thread: { id: "t1" }, entries: [cloud, request, ordinary], reply_seq: 50,
+    }), "waiting", "ordinary pending", 1);
+    s = { ...s, cursor: 100, older: 10, moreBefore: true };
+    s = mergePage(s, { entries: [], cloud_withheld: "revoked" });
+    equal(
+      [s.cloudWithheld, s.entries.map((e) => e.seq), s.pending.map((p) => p.message), s.cursor, s.older, s.replySeq],
+      ["revoked", [20], ["waiting"], 100, 10, 50],
+      "denial evicts both cloud provenance shapes but preserves ordinary history, pending and watermarks",
+    );
+    s = reduceFrame(s, { type: "entry", data: JSON.stringify(cloud), id: "10" });
+    equal(s.entries.map((e) => e.seq), [20], "a replay cannot put cloud history back while withheld");
+    s = reduceFrame(s, {
+      type: "entry", data: JSON.stringify({ ...ordinary, text: "ordinary delivery updated" }), id: "20",
+    });
+    equal(s.entries[0].text, "ordinary delivery updated", "overlapping entries still update while cloud is denied");
+    for (const data of ['{"cloud_withheld":"future-code"}', "{}", "null", "not json", '{"cloud_withheld":false}', '{"cloud_withheld":""}']) {
+      s = reduceFrame(s, { type: "cloud_withheld", data, id: null });
+      equal(s.cloudWithheld != null && s.entries.every((e) => e.seq === 20), true, "unknown/malformed status never restores cloud access");
+    }
+    s = reduceFrame(s, { type: "cloud_withheld", data: '{"cloud_withheld":null}', id: null });
+    equal([s.cloudWithheld, s.cloudRefreshNeeded], [null, true], "explicit null clears the notice and requests restoration");
+    const calls: string[] = [];
+    s = await loadThread({
+      after: async () => { throw new Error("restoration must not skip evicted rows via catch-up"); },
+      tail: async () => {
+        calls.push("tail");
+        return { thread: { id: "t1" }, entries: [cloud, request], cursor: 100, more_before: true, scanned_before: 10 };
+      },
+      before: async () => { throw new Error("unexpected earlier read"); },
+    }, s);
+    equal(
+      [calls, s.cloudWithheld, s.cloudRefreshNeeded, s.entries.map((e) => e.seq), s.pending.map((p) => p.message), s.replySeq],
+      [["tail"], null, false, [10, 11, 20], ["waiting"], 50],
+      "restoration rereads the tail and merges ordinary rows/pending without lowering the complete reply watermark",
+    );
+    const empty = reduceFrame(null, { type: "cloud_withheld", data: '{"cloud_withheld":"unreachable"}', id: null });
+    equal([empty.cloudWithheld, empty.entries, empty.pending], ["unreachable", [], []], "status-only frames work before any entry");
+    const clean = mergePage(empty, { thread: { id: "t1" }, entries: [ordinary] });
+    equal([clean.cloudWithheld, clean.entries.map((e) => e.seq)], [null, [20]], "a clean page also clears unavailable status");
+  }
+
   // Plan cards: each epic once, at its first mention.
   {
     equal(planRef(entry(1, "agent", "tool_result", '{"epic": "D-2", "tickets": ["D-3"]}')), "D-2", "json epic");

@@ -42,7 +42,12 @@ pub use threads::{CliAuthority, MemberAuthority};
 pub use threads::{COMPACTED_EVENT as THREAD_COMPACTED_EVENT, PACK_EVENT as THREAD_PACK_EVENT};
 
 mod agents;
+pub mod cloud_agent;
 mod cloud_dispatch_outbox;
+pub use cloud_agent::{
+    CloudAgent, CloudOperation, CloudSession, CloudSource, Owner,
+    CONSENT_SCOPE as CLOUD_AGENT_CONSENT_SCOPE,
+};
 #[cfg(test)]
 mod wait_probe;
 pub(crate) use agents::AGENT_GC_RECORDS_ONLY;
@@ -160,6 +165,12 @@ pub(crate) fn now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// Current epoch seconds for modules that construct store rows (CAD-1853).
+/// The crate-internal `now` stays the one clock.
+pub fn now_public() -> f64 {
+    now()
 }
 
 pub struct Store {
@@ -356,6 +367,14 @@ impl Store {
     /// cannot commit into a lease a successor already took. The
     /// heartbeat's [`Self::fence_writes`] drains the in-flight writer
     /// before it returns, so no write starts post-trip.
+    /// The stable identity of this local store (the canonical database
+    /// path). Used only to namespace opaque cloud conversation keys so two
+    /// local Cadence instances never derive the same key for the same alias;
+    /// it is not a hostname, URL or credential.
+    pub fn instance_identity(&self) -> &str {
+        &self.db_identity
+    }
+
     pub(crate) fn write_tx<R>(
         &self,
         f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,

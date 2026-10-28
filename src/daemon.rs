@@ -225,6 +225,7 @@ mod cad1822_context_refusal_acceptance;
 mod cad1852_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1868_acceptance;
+mod cloud_agent_rpc;
 mod connection_test;
 mod connections_rpc;
 /// CAD-1128: the `connection_custody_*` operator verbs.
@@ -594,6 +595,8 @@ type MembershipLookupForTest = Box<
 
 pub struct Shared {
     pub store: Arc<Store>,
+    #[cfg(feature = "test-seam")]
+    cloud_projection_observer: Option<CloudProjectionObserver>,
     /// Broadcast on any queue/event change.
     changed: Notify,
     /// CAD-1700: the master's push revision (see `bump_master_rev`).
@@ -1207,6 +1210,8 @@ impl Shared {
             state_dir: state_dir.to_path_buf(),
             upload_workspace_dir,
             agent_uid: opts.agent_uid,
+            #[cfg(feature = "test-seam")]
+            cloud_projection_observer: opts.cloud_projection_observer.clone(),
             open_attach: Mutex::new(HashMap::new()),
             adoptions_pending: Mutex::new(adoptions_pending),
             adoptions_notify: Notify::new(),
@@ -3155,12 +3160,14 @@ impl Shared {
                     let (dead, resumable) = self.agent_liveness(&agent);
                     j["dead"] = json!(dead);
                     j["resumable"] = json!(resumable);
-                    // CAD-1266: `inbox_status` answers `None` for any row with
-                    // an actor; skip the store read the answer is known without.
-                    let inbox = if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
-                        None
-                    } else {
+                    // Only queue placement is a mailbox. A hosted runtime
+                    // intentionally has no local actor, but is not an inbox.
+                    let inbox = if registry::placement(&agent.provider, &agent.endpoint_kind)
+                        == registry::Placement::Queue
+                    {
                         self.store.inbox_status(&agent.alias)?
+                    } else {
+                        None
                     };
                     if let Some(inbox) = inbox {
                         j["inbox"] = inbox;
@@ -3182,7 +3189,7 @@ impl Shared {
                     if params.get("board").and_then(Value::as_bool) == Some(true)
                         && registry::has_actor(&agent.provider, &agent.endpoint_kind)
                     {
-                        j["board"] = self.board_view(&agent.alias)?;
+                        j["board"] = self.board_view(&agent.alias, peer_pid)?;
                     }
                     agents.push(j);
                 }
@@ -3254,6 +3261,12 @@ impl Shared {
             "agent_show" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
+                // CAD-1853 review: this projection serialises the alias'
+                // messages (cloud requests and their reply text), so it takes
+                // the same source/owner decision as the dedicated cloud read:
+                // current READ authority for the caller's own source, and
+                // only that source's messages.
+                let mut projection = self.admit_cloud_projection(&alias, peer_pid, "agent show")?;
                 let include_profile_instructions = match params.get("include_profile_instructions")
                 {
                     None | Some(Value::Null) => false,
@@ -3331,6 +3344,20 @@ impl Shared {
                 } else {
                     self.store.messages(&alias)?
                 };
+                // This read observes rows, then projects them: anything the
+                // admission snapshot does not cover — a routed cloud result
+                // that resolved since, or mail that arrived meanwhile — is
+                // outside what authority was proven for, so re-resolve the
+                // page once before deciding. Only rows the fresh admission
+                // names are projected; the rest is withheld, never rendered
+                // as ordinary.
+                if projection.needs_readmission(
+                    &self.store,
+                    messages.iter().map(|message| message.id.as_str()),
+                )? {
+                    projection = self.admit_cloud_projection(&alias, peer_pid, "agent show")?;
+                }
+                let messages = projection.messages(&self.store, messages)?;
                 let mut agent_json = agent.to_json();
                 if profile_snapshot || catalogue_snapshot {
                     agent_json["instructions"] = json!(agent.instructions);
@@ -3340,6 +3367,26 @@ impl Shared {
                 agent_json["turn_project"] = json!(self.turn_project(&agent).map(|t| t.key));
                 agent_json["capabilities"] =
                     registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
+                // CAD-1853: a cloud agent's truthful projection. Its remote
+                // identity, runtime, model label, capability ceiling and
+                // canonical Threads links are distinct from local runtime
+                // capabilities; `agent show` never invents a remote PID,
+                // read receipt, stop or execution authority.
+                if agent.provider == crate::cloud_agent::PROVIDER {
+                    let rows = self.store.cloud_agents_for_alias(&agent.alias)?;
+                    let mut views = Vec::new();
+                    for row in &rows {
+                        views.push(crate::cloud_agent::agent_view(&self.store, row)?);
+                    }
+                    agent_json["cloud_agents"] = json!(views);
+                    // Truthful placement/endpoint: a cloud agent has no local
+                    // process and no inbox; the daemon field must not imply
+                    // either just because the adapter registry is unknown.
+                    agent_json["placement"] = json!("cloud");
+                    agent_json["endpoint"] = Value::Null;
+                    agent_json["pid"] = Value::Null;
+                    agent_json["pid_start"] = Value::Null;
+                }
                 agent_json["native_turn_steering_enabled"] = json!(
                     agent.enabled
                         && matches!(agent.state.as_str(), "idle" | "busy")
@@ -3443,6 +3490,9 @@ impl Shared {
                     // `agent unfence` is the only exit.
                     "unknown": self.store.unknown_messages(&alias)?.len(),
                 });
+                if let Some(reason) = projection.withheld {
+                    out["cloud_withheld"] = json!(reason);
+                }
                 // Exact stored task semantics for a reported-dispatch retry.
                 // Same read authority as this alias's existing event history;
                 // return no source body and never recapture a source file.
@@ -3486,9 +3536,14 @@ impl Shared {
                 }
                 Ok(out)
             }
+            // CAD-1853: the explicit cloud-agent connection and its durable
+            // operation correlation. Admission is the caller rule inside.
+            method if method.starts_with("cloud_agent_") => {
+                self.rpc_cloud_agent(method, params, peer_pid)
+            }
             "agent_send" => self.rpc_send_from(params, peer_pid),
             "agent_ask" => self.rpc_ask(params, peer_pid),
-            "thread_read" => self.rpc_thread_read(params),
+            "thread_read" => self.rpc_thread_read(params, peer_pid),
             "activity_query" => self.rpc_activity_query(params, peer_pid),
             "activity_export" => self.rpc_activity_export(params, peer_pid),
             "pm_activity_prepare" => self.rpc_pm_activity_prepare(params, peer_pid),
@@ -5410,11 +5465,19 @@ pub type DoneRetrySavedHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// its budget. Production leaves it unset.
 pub type FlushGate = Arc<dyn Fn() + Send + Sync>;
 
+/// Test-seam-only observer: called with (alias, final withholding code) after
+/// every completed projection decision, including local denials and empty
+/// admissions. The callback must be nonblocking. Never sourced from an RPC.
+#[cfg(feature = "test-seam")]
+pub type CloudProjectionObserver = std::sync::Arc<dyn Fn(&str, Option<&str>) + Send + Sync>;
+
 /// Per-instance daemon configuration.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
     #[cfg(test)]
     pub(crate) custody_acceptance_shared: Option<Arc<Mutex<Option<Arc<Shared>>>>>,
+    #[cfg(feature = "test-seam")]
+    pub cloud_projection_observer: Option<CloudProjectionObserver>,
     /// In-process fixture override; `serve()` leaves this unset and
     /// resolves the private state record. Never sourced from an RPC.
     pub agent_uid: Option<u32>,
@@ -6022,6 +6085,13 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             })
         })
         .flatten();
+    // CAD-1853: the bounded cloud-agent READBACK driver. It resumes
+    // non-terminal operations after a restart and keeps reconciling an
+    // ordinary queued turn until the contract settles it — never a resubmit.
+    if !fenced {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_cloud_agent_driver());
+    }
     // Report router (CAD-339): workers' reports and unanswered
     // questions reach the master's thread. Idle without a master.
     if !fenced {

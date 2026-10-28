@@ -83,9 +83,10 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// dependency-fetch receipt. v52 (CAD-1548) adds `settings_authority`.
 /// v53 (CAD-804) adds `agents.gc_keep`; v54 (CAD-1239) adds the archive
 /// marker and triggers; v55 (CAD-1353) adds `messages.stall_secs`; v56
-/// (CAD-1726) adds the `artifacts` table. None
-/// changes a latch or witness table, so the bound extends to 56.
-pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 56;
+/// (CAD-1726) adds the `artifacts` table; v57 (CAD-1853) adds the
+/// cloud-agent connection, source, session and operation tables. None
+/// changes a latch or witness table, so the bound extends to 57.
+pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 57;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -1676,6 +1677,31 @@ impl Store {
                     |row| row.get(0),
                 )?;
                 if settings_tables != 1 {
+                    return Err(Error::rejected("owner witness database schema is unsupported"));
+                }
+            }
+            if *db_schema >= 57 {
+                // The v57 migration creates exactly these four cloud-agent
+                // tables: a hand-made 57 database without them is not the
+                // schema this witness accepts.
+                let cloud_tables: i64 = wtx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('cloud_agents','cloud_agent_sources','cloud_agent_sessions','cloud_agent_operations')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if cloud_tables != 4 {
+                    return Err(Error::rejected("owner witness database schema is unsupported"));
+                }
+                // The v57 operation receipt carries both admission witnesses:
+                // the consent lineage it was admitted under and the durable
+                // submission claim. A v57 database without them is not the
+                // schema this witness accepts.
+                let cloud_columns: i64 = wtx.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('cloud_agent_operations') WHERE name IN ('grant_admitted_at','claimed_at')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if cloud_columns != 2 {
                     return Err(Error::rejected("owner witness database schema is unsupported"));
                 }
             }

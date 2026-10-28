@@ -101,8 +101,18 @@ impl Shared {
     /// `thread_read` — a page of an agent's thread after `after`,
     /// optionally long-polling up to `wait` seconds (≤ 30) for the next
     /// entry, the way `agent_events` does. Read-only.
-    pub(super) fn rpc_thread_read(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_thread_read(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // CAD-1853 review: a cloud target's request/reply text reaches this
+        // projection, so it demands the same source/owner authority as the
+        // dedicated cloud read — current READ authority for the caller's own
+        // source, and only that source's rows — so a peer with no grant is
+        // refused and an enrolled peer never sees another source's reply.
+        let mut projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
         // CAD-1098: `conversation` selects one thread of this alias by
         // id (validated; unknown answers an error and creates nothing).
         // Without it the read is the home thread, unchanged.
@@ -146,13 +156,38 @@ impl Shared {
                 Some(thread) => Some(thread.clone()),
                 None => self.store.thread(&alias)?,
             };
-            let (entries, more) = match &conversation {
+            let (raw, more) = match &conversation {
                 Some(thread) => self
                     .store
                     .thread_entries_before_of(&thread.id, before, limit)?,
                 None => self.store.thread_entries_before(&alias, before, limit)?,
             };
-            let cursor = entries.last().map(|e| e.seq).unwrap_or(0);
+            // The page is observed before it is projected, so anything the
+            // admission snapshot does not cover is re-resolved here — before
+            // the boundary and the rows are decided, never after. A backward
+            // page can carry a routed cloud result or a cloud operation that
+            // resolved after this read was admitted, and authority was never
+            // proven for it.
+            if projection.needs_readmission(
+                &self.store,
+                raw.iter().filter_map(|entry| entry.message_id.as_deref()),
+            )? {
+                projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
+            }
+            // The cursor is the last row this page SCANNED, never the last
+            // row the projection kept. A projection filters another source's
+            // cloud entries out; taking the kept page's last seq would pin
+            // the caller's cursor short of rows it must move past, and the
+            // filtered content is exactly what must not be exposed.
+            let cursor = raw.last().map(|e| e.seq).unwrap_or(0);
+            // A backward scan needs the same honesty in the other direction:
+            // the LOWEST seq this page scanned is the continuation point. A
+            // partially (or wholly) filtered page keeps fewer rows than it
+            // scanned, so `entries[0]` may not move at all; without this
+            // boundary the consumer would re-read the same hidden page
+            // forever and never reach the history below it.
+            let scanned_before = raw.first().map(|e| e.seq);
+            let entries = projection.entries(&self.store, raw)?;
             // CAD-1700: the complete watermark of the authorized thread,
             // never just this (bounded) page or the cursor's window.
             let reply_seq = match &thread {
@@ -165,26 +200,61 @@ impl Shared {
                 entries: self.entries_json(&alias, &entries)?,
                 cursor,
                 more_before: Some(more),
+                scanned_before,
+                more_after: None,
+                cloud_withheld: projection.withheld,
                 reply_seq,
             })
             .expect("thread page serializes"));
         }
         let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
         let deadline = Instant::now() + Duration::from_secs(wait);
+        // At most one re-proof per call, so a wait cannot turn a revoked or
+        // unsettled operation into a readback loop.
+        let mut readmitted = false;
         loop {
             let thread = match &conversation {
                 Some(thread) => Some(thread.clone()),
                 None => self.store.thread(&alias)?,
             };
-            let entries = match &conversation {
+            let raw = match &conversation {
                 Some(thread) => self.store.thread_entries_of(&thread.id, after, limit)?,
                 None => self.store.thread_entries(&alias, after, limit)?,
             };
+            // A read that WAITED can observe content that settled after its
+            // admission was taken — its own queued turn woken by another
+            // connection, for instance — and, on an ordinary alias, a routed
+            // cloud result that resolved after admission. Neither was
+            // admitted, so re-resolve this page's whole admission once before
+            // projecting it: the new snapshot either covers each row (under
+            // the platform's own answer, for cloud content) or refuses /
+            // withholds it. Projecting under the old admission would serve a
+            // row authority was never proven for.
+            if !readmitted
+                && projection.needs_readmission(
+                    &self.store,
+                    raw.iter().filter_map(|entry| entry.message_id.as_deref()),
+                )?
+            {
+                projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
+                readmitted = true;
+            }
+            // The cursor is the last row this page SCANNED, never the last
+            // row the projection kept. Filtering another source's cloud
+            // entries out must not leave the caller's `after` on a seq it has
+            // already passed, or a consumer would re-read the same hidden
+            // page forever; the filtered content itself is never exposed.
+            let scanned = raw.last().map(|e| e.seq).unwrap_or(after);
+            // Whether the scan reached the page's end is a property of the
+            // RAW page, never of the kept one: a projection can hide every
+            // row of a full page, so the visible count says nothing about
+            // exhaustion.
+            let more_after = raw.len() as i64 == limit;
+            let entries = projection.entries(&self.store, raw)?;
             if !entries.is_empty()
                 || Instant::now() >= deadline
                 || self.closing.load(Ordering::SeqCst)
             {
-                let cursor = entries.last().map(|e| e.seq).unwrap_or(after);
                 // CAD-1700: the same complete watermark whatever the
                 // cursor — a cold tail or a long catch-up page carries it.
                 let reply_seq = match &thread {
@@ -195,8 +265,11 @@ impl Shared {
                     alias: alias.clone(),
                     thread: thread.as_ref().map(store::Thread::info),
                     entries: self.entries_json(&alias, &entries)?,
-                    cursor,
+                    cursor: scanned,
                     more_before: None,
+                    scanned_before: None,
+                    more_after: Some(more_after),
+                    cloud_withheld: projection.withheld,
                     reply_seq,
                 })
                 .expect("thread page serializes"));
@@ -259,6 +332,34 @@ impl Shared {
         self.operator_chat("thread send", peer_pid)?;
         let human = self.verified_owner_human(params)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // CAD-1591: the identity constraint is parsed BEFORE the cloud
+        // branch so a cloud target can never bypass it.
+        let cloud_expected_uid = match params.get("expected_recipient_uid") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(uid)) if !uid.is_empty() => Some(uid.as_str()),
+            Some(_) => {
+                return Err(Error::rejected(
+                    "expected_recipient_uid must be a nonempty recipient uid string",
+                ));
+            }
+        };
+        if self
+            .store
+            .agent_opt(&alias)?
+            .is_some_and(|agent| agent.provider == crate::cloud_agent::PROVIDER)
+        {
+            let conversation = optional_str(params, "conversation").map(str::to_string);
+            let mut routed = params.clone();
+            routed["alias"] = json!(alias);
+            return self.cloud_send_from(
+                &alias,
+                &routed,
+                peer_pid,
+                conversation.as_deref(),
+                cloud_expected_uid,
+                "cloud agent thread send",
+            );
+        }
         // CAD-1591: the contextual-reply recipient constraint — an
         // optional nonempty uid, checked against the alias's live row
         // inside the enqueue transaction (never a precheck that can

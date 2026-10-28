@@ -1694,6 +1694,77 @@ fn an_expired_session_keeps_its_expiry_fields() {
     assert_eq!(status["live_verified"], false);
 }
 
+/// CAD-1853: cloud-purpose admission must not be added to the default CLI
+/// renewal entrypoint. This drives its real lock/load/due/authority guard;
+/// the transport closure is an observable boundary, never a refusal oracle.
+#[test]
+fn default_cli_renewal_refuses_cloud_or_missing_cli_consent_before_any_post() {
+    for scopes in [
+        json!(["bridge.enroll", "cloud_agent.read", "cloud_agent.write"]),
+        json!(["cli.read", "cli.write", "cloud_agent.write"]),
+        json!(["cli.read"]),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = "https://acme.cadencecloud.app";
+        let issuer = "https://api-v2.agenticos.hk";
+        let target = RemoteTarget {
+            identity: Some(CliIdentityPin {
+                issuer: issuer.into(),
+                subject_id: "user_owner".into(),
+            }),
+            org: ORG.into(),
+            org_id: ORG_ID.into(),
+            endpoint: endpoint.into(),
+        };
+        let at = now().unwrap();
+        store_credential_at(root.path(), ORG, ORG_ID, endpoint, at - 1);
+        let path = root.path().join(format!("cli-{ORG}.json"));
+        let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        saved["issuer"] = json!(issuer);
+        saved["subject_id"] = json!("user_owner");
+        saved["organization_slug"] = json!(ORG);
+        saved["capabilities"] = scopes.clone();
+        saved["cli_session"] = json!({
+            "session_id": "hcs_12345678-1234-4234-8234-123456789abc",
+            "refresh_token": format!("hcr_{}", "A".repeat(43)),
+            "generation": 1,
+            "device_label": "cadence CLI",
+            "idle_expires_at": at + 1000,
+            "absolute_expires_at": at + 10_000
+        });
+        fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        fs::write(root.path().join("trusted-issuer"), format!("{issuer}\n")).unwrap();
+        fs::set_permissions(
+            root.path().join("trusted-issuer"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+        let posts = std::cell::Cell::new(0);
+        let result = renewed_credential_with(
+            root.path(),
+            &target,
+            Instant::now() + Duration::from_secs(5),
+            |_dir, _issuer, _path, _bearer, _body, _deadline| {
+                posts.set(posts.get() + 1);
+                Err(Error::unknown("default CLI must not send this consent"))
+            },
+        );
+        assert!(result.is_err(), "default CLI renewed {scopes}");
+        assert_eq!(
+            posts.get(),
+            0,
+            "default CLI sent cloud or incomplete consent"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "refusal published intent or authority"
+        );
+    }
+}
+
 #[test]
 fn an_unsafe_server_code_is_dropped_from_the_decoded_reason() {
     // Free text or wrong case from a server never becomes the shown reason.

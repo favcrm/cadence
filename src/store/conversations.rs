@@ -190,6 +190,7 @@ impl Store {
                     json!({
                         "id": m.id,
                         "seq": m.seq,
+                        "alias": m.alias,
                         "origin": m.origin,
                         "source": m.source,
                         "state": m.state,

@@ -139,9 +139,9 @@ export function lifecycleBadge(
 }
 
 /** Where an agent runs, derived from its endpoint kind - no stored column.
- * `sandbox` is a cloud sandbox agent; every other kind is local. */
+ * Native cloud conversations and the legacy sandbox kind run remotely. */
 export function agentLocation(a: Agent): "cloud" | "local" {
-  return a.endpoint_kind === "sandbox" ? "cloud" : "local";
+  return a.endpoint_kind === "cloud" || a.endpoint_kind === "sandbox" ? "cloud" : "local";
 }
 
 export function agentStatus(a: Agent): string {
@@ -198,4 +198,14 @@ export function agentMatchesSearch(
     .join(" ")
     .toLowerCase();
   return terms.every((term) => text.includes(term));
+}
+
+/** CAD-1853: the AgenticOS cloud connection is conversational-only, so its
+ *  page shows the cloud projection instead of the local work panels. Another
+ *  provider can also report `endpoint_kind: "cloud"` (Devin does), and its
+ *  tabs, stats and settings must stay exactly as they were. */
+export function conversationalOnlyCloud(
+  a?: Pick<Agent, "provider" | "endpoint_kind"> | null,
+): boolean {
+  return a?.provider === "agenticos-cloud" && a?.endpoint_kind === "cloud";
 }

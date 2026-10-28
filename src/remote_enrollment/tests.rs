@@ -1823,6 +1823,215 @@ impl LoginRuntime for PortalAcceptanceRuntime {
     }
 }
 
+/// CAD-1853: cloud consent is a locally selected login purpose, not a
+/// capability family that an issuer response can select for a default login.
+mod cad1853_cloud_login {
+    use super::*;
+
+    const CLOUD: [&str; 3] = ["bridge.enroll", "cloud_agent.read", "cloud_agent.write"];
+
+    fn grant() -> Value {
+        let mut grant = login_grant_body();
+        grant["organization_slug"] = json!("acme");
+        grant["capabilities"] = json!(CLOUD);
+        grant
+    }
+
+    fn login(reply: Value, dir: &Path) -> (Result<LoginGrant>, PortalAcceptanceRuntime) {
+        let mut runtime = PortalAcceptanceRuntime {
+            issuer: HOSTED_LOGIN_ISSUER.to_string(),
+            grant: Some(reply),
+            requests: Vec::new(),
+            baseline: Instant::now(),
+            elapsed: 0,
+            requested: CLOUD.to_vec(),
+        };
+        let result = login_device_flow(
+            HOSTED_LOGIN_ISSUER,
+            None,
+            Some("acme"),
+            dir,
+            |_, _| Ok(()),
+            &mut runtime,
+            LoginScope::CloudAgent,
+        );
+        (result, runtime)
+    }
+
+    #[test]
+    fn explicit_cloud_login_accepts_only_the_consented_parent_without_cli_rights() {
+        let root = tempfile::tempdir().unwrap();
+        for (index, role) in ["owner", "member"].into_iter().enumerate() {
+            let dir = root.path().join(format!("cloud-{index}"));
+            let mut reply = grant();
+            reply["principal"]["current_role"] = json!(role);
+            if role == "member" {
+                reply["capabilities"] =
+                    json!(["cloud_agent.write", "bridge.enroll", "cloud_agent.read"]);
+            }
+            let expected = reply.clone();
+            let (result, runtime) = login(reply, &dir);
+            let accepted = result.expect("explicit cloud-only device consent must be usable");
+            assert_eq!(runtime.requests.len(), 2);
+            assert!(runtime.grant.is_none());
+            assert_eq!(
+                runtime.requests[0].1["requested_capabilities"],
+                json!(CLOUD)
+            );
+            assert_eq!(accepted.issuer, HOSTED_LOGIN_ISSUER);
+            assert_eq!(accepted.subject_id, "user_1");
+            assert_eq!(accepted.organization_id, "ws_real");
+            assert_eq!(accepted.endpoint, LOGIN_ENDPOINT);
+            assert_eq!(json!(accepted.capabilities), expected["capabilities"]);
+            assert_nothing_stored(&dir);
+            accepted.save_credential(&dir).unwrap();
+            let saved: Value =
+                serde_json::from_slice(&fs::read(dir.join("cli-acme.json")).unwrap()).unwrap();
+            assert_eq!(saved["capabilities"], expected["capabilities"]);
+            assert_eq!(saved["issuer"], HOSTED_LOGIN_ISSUER);
+            assert_eq!(saved["subject_id"], expected["principal"]["subject_id"]);
+            assert_eq!(saved["cli_session"], expected["cli_session"]);
+            assert_eq!(
+                saved["access_token"],
+                expected["credential"]["access_token"]
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_login_refuses_missing_duplicate_unknown_and_unrequested_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cases = Vec::new();
+        for missing in 0..CLOUD.len() {
+            cases.push(json!(CLOUD
+                .iter()
+                .enumerate()
+                .filter_map(|(index, scope)| (index != missing).then_some(*scope))
+                .collect::<Vec<_>>()));
+        }
+        for extra in [
+            "bridge.enroll",
+            "cloud_agent.read",
+            "cloud_agent.write",
+            "cli.read",
+            "cli.write",
+            "wiki.read",
+            "wiki.write",
+            "settings.read",
+            "settings.write",
+            "web.read",
+            "web.prepare",
+            "assist.read",
+            "assist.write",
+            "cloud_agent.admin",
+        ] {
+            let mut scopes = CLOUD.to_vec();
+            scopes.push(extra);
+            cases.push(json!(scopes));
+        }
+        for (index, scopes) in cases.into_iter().enumerate() {
+            let dir = root.path().join(format!("refused-{index}"));
+            let mut reply = grant();
+            reply["capabilities"] = scopes.clone();
+            let (result, runtime) = login(reply, &dir);
+            assert!(result.is_err(), "cloud grant accepted {scopes}");
+            assert_eq!(runtime.requests.len(), 2);
+            assert!(runtime.grant.is_none());
+            assert_nothing_stored(&dir);
+        }
+    }
+
+    #[test]
+    fn cloud_login_retains_real_identity_target_session_expiry_and_issuer_guards() {
+        let root = tempfile::tempdir().unwrap();
+        let at = now().unwrap();
+        for (index, (pointer, wrong)) in [
+            ("/organization_slug", json!("other")),
+            ("/audience", json!("https://other.cadencecloud.app")),
+            ("/principal/kind", json!("service")),
+            ("/principal/current_role", json!("admin")),
+            ("/principal/subject_id", json!("")),
+            ("/credential/issued_at", json!(at + 60)),
+            ("/credential/expires_at", json!(at - 1)),
+            ("/credential/expires_at", json!(at + 301)),
+            ("/cli_session/session_id", json!("hcs_not-a-session")),
+            ("/cli_session/refresh_token", json!("hcr_not-a-token")),
+            ("/cli_session/generation", json!(2)),
+            ("/cli_session/idle_expires_at", json!(at - 1)),
+            ("/cli_session/absolute_expires_at", json!(at - 1)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = root.path().join(format!("identity-{index}"));
+            let mut reply = grant();
+            reply["credential"]["issued_at"] = json!(at);
+            *reply.pointer_mut(pointer).unwrap() = wrong;
+            let (result, runtime) = login(reply, &dir);
+            assert!(result.is_err(), "cloud login accepted mutation {pointer}");
+            assert_eq!(runtime.requests.len(), 2);
+            assert_nothing_stored(&dir);
+        }
+        // Bound legacy workspace selection still cannot be changed by the
+        // issuer. An unbound portal login has no pre-existing human subject;
+        // owner replacement is checked against the frozen pin at renewal.
+        let mut wrong_workspace = grant();
+        wrong_workspace["organization_id"] = json!("ws_other");
+        assert!(login_grant(
+            &wrong_workspace,
+            Some("ws_real"),
+            Some("acme"),
+            HOSTED_LOGIN_ISSUER,
+            &CLOUD,
+        )
+        .is_err());
+
+        let dir = root.path().join("wrong-issuer");
+        trust(&dir, "https://other.example.test");
+        let (result, runtime) = login(grant(), &dir);
+        assert!(result.is_err());
+        assert!(
+            runtime.requests.is_empty(),
+            "untrusted issuer reached transport"
+        );
+        assert_nothing_stored(&dir);
+    }
+
+    #[test]
+    fn default_cli_login_cannot_become_cloud_consented_from_a_response() {
+        let root = tempfile::tempdir().unwrap();
+        for (index, scopes) in [
+            json!(CLOUD),
+            json!(["cli.read"]),
+            json!([
+                "cli.read",
+                "cli.write",
+                "bridge.enroll",
+                "cloud_agent.read",
+                "cloud_agent.write"
+            ]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = root.path().join(format!("cli-{index}"));
+            let mut reply = grant();
+            reply["capabilities"] = scopes;
+            let (result, runtime) = run_wiki_portal_acceptance(reply, &dir);
+            assert!(
+                result.is_err(),
+                "default login accepted cloud or missing CLI consent"
+            );
+            assert_eq!(runtime.requests.len(), 2);
+            assert_eq!(
+                runtime.requests[0].1["requested_capabilities"],
+                json!(["cli.read", "cli.write", "wiki.read", "wiki.write"])
+            );
+            assert_nothing_stored(&dir);
+        }
+    }
+}
+
 fn run_wiki_portal_acceptance(
     grant: Value,
     dir: &Path,

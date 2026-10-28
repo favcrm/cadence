@@ -547,6 +547,11 @@ impl Shared {
         } else {
             self.resolve_alias(raw)?
         };
+        // CAD-1853 review: the alias' event stream carries cloud request and
+        // result detail, so it applies the same source/owner decision as the
+        // dedicated cloud read before projecting anything — current READ
+        // authority, and only the caller's own source's rows.
+        let mut projection = self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
         // CAD-1380: daemon `assist_intent` rows are member-private routing. Only
         // the operator reads them from the shared stream; every other caller gets
         // the same page with those rows removed, cursors unchanged.
@@ -555,15 +560,18 @@ impl Shared {
                 self.connection_caller(peer_pid)?,
                 caller_rule::Who::Operator
             );
-        let visible = |events: Vec<crate::store::Event>| -> Vec<crate::store::Event> {
-            if hide_intents {
+        let visible = |projection: &cloud_agent_rpc::CloudProjection,
+                       events: Vec<crate::store::Event>|
+         -> Result<Vec<crate::store::Event>> {
+            let events = projection.events(&self.store, events)?;
+            Ok(if hide_intents {
                 events
                     .into_iter()
                     .filter(|e| e.kind != "assist_intent")
                     .collect()
             } else {
                 events
-            }
+            })
         };
         let after = optional_i64(params, "after").unwrap_or(0);
         if after < 0 {
@@ -581,25 +589,64 @@ impl Shared {
             if has_older {
                 events.remove(0);
             }
+            // Observed before it is projected: an event naming a row the
+            // admission snapshot does not cover — a routed cloud result that
+            // resolved since, or a turn that settled meanwhile — re-resolves
+            // this page's admission once, exactly as the waiting path does.
+            if projection.needs_readmission(
+                &self.store,
+                events
+                    .iter()
+                    .filter_map(|event| event.payload.get("message").and_then(Value::as_str)),
+            )? {
+                projection = self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
+            }
             let cursor = events.last().map(|e| e.seq).unwrap_or(0);
-            return Ok(json!({
-                "events": visible(events).iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+            let mut page = json!({
+                "events": visible(&projection, events)?.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
                 "cursor": cursor,
                 "has_older": has_older,
-            }));
+            });
+            if let Some(reason) = projection.withheld {
+                page["cloud_withheld"] = json!(reason);
+            }
+            return Ok(page);
         }
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
             let events = self.store.events(&alias, after, 100)?;
             if !events.is_empty() || self.closing.load(Ordering::SeqCst) {
+                // A waiting read can observe an event about a turn that
+                // settled after this admission was taken — or, on an ordinary
+                // alias, an event naming a routed cloud result that resolved
+                // since. Re-resolve the page's whole admission before
+                // projecting it, exactly as `thread_read` does: the old
+                // admission never covered those rows. This page is returned
+                // either way, so one re-resolution is the bound.
+                if projection.needs_readmission(
+                    &self.store,
+                    events
+                        .iter()
+                        .filter_map(|event| event.payload.get("message").and_then(Value::as_str)),
+                )? {
+                    projection = self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
+                }
                 let cursor = events.last().map(|e| e.seq).unwrap_or(after);
-                return Ok(json!({
-                    "events": visible(events).iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+                let mut page = json!({
+                    "events": visible(&projection, events)?.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
                     "cursor": cursor,
-                }));
+                });
+                if let Some(reason) = projection.withheld {
+                    page["cloud_withheld"] = json!(reason);
+                }
+                return Ok(page);
             }
             if Instant::now() >= deadline {
-                return Ok(json!({"events": [], "cursor": after}));
+                let mut page = json!({"events": [], "cursor": after});
+                if let Some(reason) = projection.withheld {
+                    page["cloud_withheld"] = json!(reason);
+                }
+                return Ok(page);
             }
             let step = deadline.min(Instant::now() + Duration::from_secs(1));
             self.changed.wait_until(step);
@@ -1122,20 +1169,31 @@ impl Shared {
     /// CAD-325: the slice of `agent_show` the board renders an agent row
     /// from — running messages, the parked count, queue and fence counts
     /// and the event cursor — without the whole message history.
-    pub(super) fn board_view(&self, alias: &str) -> Result<Value> {
+    pub(super) fn board_view(&self, alias: &str, peer_pid: u32) -> Result<Value> {
         let messages = self.store.running_messages(alias)?;
+        // CAD-1853: a routed cloud reply is a `worker_result` on the
+        // invoker's ordinary alias, and this view carries running message
+        // bodies. Every row asks the one cloud-row policy, or the board list
+        // becomes the body reader that `agent_show` refuses to be.
         // Never the turn token: it is the credential `message result`
         // checks, and the board has no use for it.
-        let running: Vec<Value> = messages
-            .iter()
-            .map(|m| {
-                let mut j = m.to_json();
-                if let Some(o) = j.as_object_mut() {
-                    o.remove("turn_id");
-                }
-                j
-            })
-            .collect();
+        let mut running: Vec<Value> = Vec::with_capacity(messages.len());
+        for m in &messages {
+            if !self.may_read_cloud_row(
+                peer_pid,
+                alias,
+                &m.id,
+                m.sender_uid.as_deref(),
+                m.recipient_uid.as_deref(),
+            )? {
+                continue;
+            }
+            let mut j = m.to_json();
+            if let Some(o) = j.as_object_mut() {
+                o.remove("turn_id");
+            }
+            running.push(j);
+        }
         let parked = self.store.parked_message_count(alias)?;
         Ok(json!({
             "messages": running,

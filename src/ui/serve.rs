@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use super::artifacts;
+use super::cloud_agents;
 use super::human_threads;
 use super::member_view::{member_event, member_running_item, redact_agents_payload};
 use super::notify_service;
@@ -807,8 +808,7 @@ pub(crate) fn agents_payload_typed(
         };
         // Mailboxes are not workers — they still appear on the Agents
         // screen (as kind "inbox") but never count as busy/fenced.
-        let actor = registry::has_actor(provider, kind);
-        if !actor {
+        if registry::placement(provider, kind) == registry::Placement::Queue {
             totals.inboxes += 1;
             // CAD-480: the mailbox's unread backlog and its oldest
             // unread age are the row's queue evidence — the daemon
@@ -2520,6 +2520,28 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                         return;
                     }
                     send(request, topics::read(state_dir, id, &query));
+                    return;
+                }
+            }
+            // CAD-1853: cloud-agent connections. Operator-only reads; the
+            // daemon projects identity/runtime/capabilities and the canonical
+            // Threads link. No second conversation store is read here.
+            if path == "/api/cloud-agents" {
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
+                send(request, cloud_agents::list(state_dir));
+                return;
+            }
+            if let Some(id) = path.strip_prefix("/api/cloud-agents/") {
+                if !id.is_empty() && !id.contains('/') {
+                    if let Err(response) = operator::admit_operator_read(&request, state_dir, opts)
+                    {
+                        send(request, response);
+                        return;
+                    }
+                    send(request, cloud_agents::show(state_dir, id));
                     return;
                 }
             }

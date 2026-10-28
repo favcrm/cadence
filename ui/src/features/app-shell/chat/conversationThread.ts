@@ -3,7 +3,8 @@ import type { Resource } from "../../../lib/cache";
 import { streamInto, type SseErrorState } from "../../../lib/sse";
 import { resources } from "../../../lib/resources";
 import type { MasterState } from "../../../lib/types";
-import { EMPTY_THREAD, applyEarlier, fetchEarlier, lastSeq, reduceFrame, threadItems, type PageReader, type ThreadPageLike, type ThreadState } from "../../home/thread";
+import { privateSessionGeneration } from "../../../lib/privateSession";
+import { EMPTY_THREAD, applyEarlier, fetchEarlier, reduceFrame, resumeSeq, threadItems, type PageReader, type ThreadPageLike, type ThreadState } from "../../home/thread";
 
 /**
  * The one conversation thread engine Home and every app pane share
@@ -34,6 +35,7 @@ export function useThreadStream(
       return;
     }
     onLink("reconnecting");
+    let active = true;
     const sub = streamInto(store, (data, event) => {
       if (event.type === "master") {
         const snapshot = JSON.parse(event.data) as MasterState;
@@ -57,18 +59,30 @@ export function useThreadStream(
         onLink("live");
         return data ?? EMPTY_THREAD;
       }
-      return reduceFrame(data, event);
+      const next = reduceFrame(data, event);
+      if (data?.cloudWithheld != null && next.cloudWithheld == null) {
+        // A fresh tail can restore rows below the stream's resume cursor.
+        // Defer until streamInto has published `next` to the resource.
+        queueMicrotask(() => {
+          if (active && store.get().data?.cloudRefreshNeeded) void store.invalidate();
+        });
+      }
+      return next;
     }, {
       url,
-      events: ["master", "entry"],
-      lastEventId: String(lastSeq(store.get().data) ?? 0),
+      events: ["master", "entry", "cloud_withheld"],
+      // Resume from what the daemon has SCANNED, not from the newest held
+      // entry: a projection can hide rows past the last kept seq, and
+      // resuming below them would re-request the same hidden page on every
+      // (re)connect.
+      lastEventId: String(resumeSeq(store.get().data) ?? 0),
       onOpen: () => onLink("reconnecting"),
       onError: (state) => {
         onLink(state);
         if (state === "stopped") void store.refresh();
       },
     });
-    return () => sub.close();
+    return () => { active = false; sub.close(); };
     // Both callbacks are stable at the call sites; the stream must not
     // reopen when a parent re-renders.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -92,6 +106,7 @@ export type EarlierStep =
  */
 export function earlierStep(store: Resource<ThreadState>, reader: PageReader, limit: number): EarlierStep | null {
   const data = store.get().data;
+  const session = privateSessionGeneration();
   if (!data) return null;
   if (threadItems(data).length > limit) return { kind: "widen" };
   const page = fetchEarlier(reader, data);
@@ -99,5 +114,19 @@ export function earlierStep(store: Resource<ThreadState>, reader: PageReader, li
     store.write((cur) => ({ ...(cur ?? data), moreBefore: false }));
     return { kind: "complete" };
   }
-  return { kind: "fetch", page, land: (older) => store.write((cur) => applyEarlier(cur, older)) };
+  return { kind: "fetch", page, land: (older) => {
+    if (session !== privateSessionGeneration()) return;
+    store.write((cur) => {
+      if (!cur || cur.conversation !== data.conversation) return cur ?? EMPTY_THREAD;
+      // Stream status newer than this read wins. Ordinary older history
+      // still merges; a stale clean page cannot restore cloud access.
+      if (cur.cloudRevision !== data.cloudRevision) {
+        const scoped = { ...older };
+        if (cur.cloudWithheld == null) delete scoped.cloud_withheld;
+        else scoped.cloud_withheld = cur.cloudWithheld;
+        return applyEarlier(cur, scoped);
+      }
+      return applyEarlier(cur, older);
+    });
+  } };
 }

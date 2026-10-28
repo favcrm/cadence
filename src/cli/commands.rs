@@ -85,6 +85,15 @@ pub(crate) enum Commands {
         /// grants no settings authority.
         #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
         settings: bool,
+        /// CAD-1853: request ONLY the cloud-assistant scopes
+        /// (`cloud_agent.read`, `cloud_agent.write`) through one explicit
+        /// device consent. This never widens an existing login and grants no
+        /// CLI/wiki/settings authority.
+        #[arg(
+            long,
+            conflicts_with_all = ["token_stdin", "org", "web", "settings"]
+        )]
+        cloud_agent: bool,
     },
     /// Create a hosted workspace in the browser and approve this CLI. Opens
     /// the AgenticOS registration page, waits for email OTP, workspace
@@ -1246,6 +1255,14 @@ pub(crate) enum Commands {
     Connection {
         #[command(subcommand)]
         action: ConnectionAction,
+    },
+    /// CAD-1853: one explicit connection to a real cloud conversational
+    /// agent. Distinct from `agent connect` (hosted local pickup); it does
+    /// not export credentials, install MCP or change the tenant.
+    #[command(name = "cloud-agent", visible_alias = "cloud")]
+    CloudAgent {
+        #[command(subcommand)]
+        action: CloudAgentAction,
     },
     /// Platform accounts (ADR 0006): the operator enrolls, rotates and
     /// revokes scoped credentials, grants agents scopes and sets

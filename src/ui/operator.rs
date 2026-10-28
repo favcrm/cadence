@@ -385,6 +385,18 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/delivery/*/merge", RouteClass::OperatorOnly),
     route("POST", "/api/delivery/*/decline", RouteClass::OperatorOnly),
     route("POST", "/api/threads/*/messages", RouteClass::OperatorOnly),
+    // CAD-1853: cloud-agent writes mirror the daemon's own operator gate;
+    // a browser request cannot relay a peer identity or remote id.
+    route(
+        "POST",
+        "/api/cloud-agents/*/messages",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/cloud-agents/*/operations/*/read",
+        RouteClass::OperatorOnly,
+    ),
     // CAD-810 / CAD-821: every topic write is the operator's. Listed so the
     // classification is reviewed, and unlisted writes fail closed to the same class.
     route("POST", "/api/topics", RouteClass::OperatorOnly),
