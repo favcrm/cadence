@@ -405,12 +405,34 @@ impl Fx {
     /// draft actions, bound to the hosted account (source, image) and to the
     /// Instagram destination (publication), plus a mounted screen session.
     fn setup(&mut self) {
-        let app = self.root.path().join("app");
+        self.setup_as("social-content");
+    }
+
+    /// `setup` for the Social Content fixture installed under app name
+    /// `name` (CAD-1876: a second, distinct installation).
+    fn setup_as(&mut self, name: &str) {
+        let app = if name == "social-content" {
+            self.root.path().join("app")
+        } else {
+            self.root.path().join(format!("app-{name}"))
+        };
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         copy_dir(
             &std::path::Path::new(manifest_dir).join("tests/fixtures/apps/social-content"),
             &app,
         );
+        for file in ["app.md", "app-chat.json"] {
+            let path = app.join(file);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let text = text
+                .replacen("app: social-content", &format!("app: {name}"), 1)
+                .replacen(
+                    r#""app": "social-content""#,
+                    &format!(r#""app": "{name}""#),
+                    1,
+                );
+            std::fs::write(&path, text).unwrap();
+        }
         copy_dir(
             &std::path::Path::new(manifest_dir)
                 .join("tests/fixtures/apps/ig-tools-fixture/screens"),
@@ -418,7 +440,7 @@ impl Fx {
         );
         let screens = app.join("screens/feed/screens.json");
         let text = std::fs::read_to_string(&screens).unwrap();
-        let text = text.replace("ig-tools-fixture", "social-content").replace(
+        let text = text.replace("ig-tools-fixture", name).replace(
             r#""tools": { "instagram.read": "source" }"#,
             r#""tools": { "instagram.read": "source", "social.draft": "image" }"#,
         );
@@ -1629,5 +1651,302 @@ fn an_image_receipt_is_retained_in_context_before_the_intent_shows_completed() {
     assert!(
         refused2.contains("image receipt is not retained in this context"),
         "{refused2}"
+    );
+}
+
+// ---- CAD-1876: the screen's publish/schedule/reschedule/cancel actions ------
+//
+// Independent refusal acceptance check (written by the Spec/security
+// reviewer from the ticket, not by the implementer). Everything goes through
+// the real daemon RPCs the native board relays `/api/app-social-drafts/
+// {confirm,schedule,reschedule,cancel}` to, with the real session and action
+// token proof: a token for install A naming install B's effect, a missing or
+// forged token, an agent caller, a request-supplied digest, and reschedule
+// or cancel of an unscheduled effect are all refused for their own reason
+// and change nothing; the own-install Schedule -> Reschedule -> Cancel round
+// trip and Publish now succeed.
+
+/// One install's mounted screen: `(install, context, session, action_token)`.
+type Mounted = (String, String, Value, Value);
+
+fn mounted(fx: &Fx) -> Mounted {
+    (
+        fx.install.clone(),
+        fx.context.clone(),
+        fx.session.clone(),
+        fx.action_token.clone(),
+    )
+}
+
+fn mount(fx: &mut Fx, m: &Mounted) {
+    fx.install = m.0.clone();
+    fx.context = m.1.clone();
+    fx.session = m.2.clone();
+    fx.action_token = m.3.clone();
+}
+
+fn social_effect_state(fx: &Fx, install: &str, id: &str) -> Value {
+    RecordStore::open(&fx.dir(), install)
+        .unwrap()
+        .app_social_effect_show(id)
+        .unwrap()["effect"]
+        .clone()
+}
+
+#[test]
+fn cad1876_screen_effect_actions_are_bound_to_the_proven_install_and_session() {
+    let mut fx = Fx::start_small();
+    // Install A: two staged (waiting) effects, one for the schedule round
+    // trip, one for Publish now.
+    let source = fx.fetch();
+    let (d1, r1, _) = fx.draft_with_image("a1", &source);
+    let (d2, r2, _) = fx.draft_with_image("a2", &source);
+    let stage = |fx: &Fx, draft: &str, revision: i64, tag: &str| -> String {
+        fx.screen(
+            "app_effect_stage",
+            json!({"tool_alias": "social.draft",
+                "proof": {"kind": "social_draft", "draft_id": draft, "revision": revision},
+                "request_id": format!("stage-{tag}")}),
+        )
+        .unwrap_or_else(|e| panic!("stage {tag}: {e}"))["effect"]["effect_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let a_sched = stage(&fx, &d1, r1, "a1");
+    let a_pub = stage(&fx, &d2, r2, "a2");
+    let a = mounted(&fx);
+
+    // Install A, second context: its own binding and a mount on A's session.
+    let context2 = fx.op(
+        "app_context_create",
+        json!({"install_id": a.0, "label": "EF two", "input_defaults": {},
+            "request_id": "ctx-1876"}),
+    );
+    let context2 = context2["context"]["id"]
+        .as_str()
+        .or_else(|| context2["id"].as_str())
+        .unwrap()
+        .to_string();
+    let hosted = fx.op("connection_list", json!({}))["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["account"] == "hosted")
+        .unwrap()["id"]
+        .clone();
+    fx.op(
+        "app_binding_create",
+        json!({"install_id": a.0, "context_id": context2, "slot": "image",
+            "connection_id": hosted, "request_id": "bind-image-1876"}),
+    );
+    let mint = fx.op(
+        "app_screen_mint",
+        json!({"install_id": a.0, "context_id": context2, "tag": "feed",
+            "token": a.2["token"], "key": a.2["key"], "origin": "loopback",
+            "generation": 1}),
+    );
+    fx.op(
+        "app_screen_consume",
+        json!({"nonce": mint["mount"].as_str().unwrap().rsplit('/').next().unwrap()}),
+    );
+    let a_ctx2_token = mint["action_token"].clone();
+
+    // Install B: a second Social Content install with its own context,
+    // session, mount and a staged effect.
+    fx.setup_as("social-content-b");
+    let b = mounted(&fx);
+    assert_ne!(a.0, b.0, "a second, distinct install");
+    let fetched = fx
+        .screen(
+            "app_tool_invoke",
+            json!({"tool_alias": "instagram.read", "input": {"handle": HANDLE},
+                "request_id": "fetch-1876-b"}),
+        )
+        .unwrap_or_else(|e| panic!("fetch in B: {e}"));
+    let source_b = (
+        fetched["receipt"]["id"].as_str().unwrap().to_string(),
+        fetched["receipt"]["result"]["posts"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    );
+    let (db, rb, _) = fx.draft_with_image("b", &source_b);
+    let b_effect = stage(&fx, &db, rb, "b");
+    assert_eq!(
+        social_effect_state(&fx, &b.0, &b_effect)["state"],
+        "waiting"
+    );
+
+    // Back to install A's screen.
+    mount(&mut fx, &a);
+    let due = cadence_agent::issue::time::now_epoch() + 3600;
+    let refused = |r: cadence_agent::Result<Value>, want: &str, what: &str| {
+        let e = match r {
+            Ok(v) => panic!("{what} must be refused, got {v}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains(want), "{what}: want {want:?}, got {e:?}");
+    };
+
+    // 1. A's live token and session naming B's effect: refused on every verb.
+    for (method, extra) in [
+        ("app_social_effect_confirm", json!({})),
+        ("app_social_effect_schedule", json!({"due_epoch": due})),
+        (
+            "app_social_effect_reschedule",
+            json!({"due_epoch": due + 60}),
+        ),
+        ("app_social_effect_cancel", json!({})),
+    ] {
+        let mut params = json!({"tool_alias": "social.draft", "effect_id": b_effect});
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        refused(
+            fx.screen(method, params),
+            "social draft effect is outside this installation",
+            &format!("{method} on install B's effect"),
+        );
+    }
+    let b_row = social_effect_state(&fx, &b.0, &b_effect);
+    assert_eq!(b_row["state"], "waiting", "B's effect unchanged: {b_row}");
+    assert!(
+        b_row["due_epoch"].is_null(),
+        "B's effect not scheduled: {b_row}"
+    );
+
+    // 1b. A's own session with the mount of A's second context, naming an
+    // effect staged in A's first context: same install, other context.
+    for (method, extra) in [
+        ("app_social_effect_confirm", json!({})),
+        ("app_social_effect_schedule", json!({"due_epoch": due})),
+    ] {
+        let mut params = json!({"tool_alias": "social.draft", "effect_id": a_sched,
+            "action_token": a_ctx2_token, "token": a.2["token"], "key": a.2["key"],
+            "origin": "loopback"});
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        refused(
+            fx.rpc_as(Asserted::Operator, method, params),
+            "social draft effect is outside this screen context",
+            &format!("{method} from another context's mount"),
+        );
+    }
+    let row = social_effect_state(&fx, &a.0, &a_sched);
+    assert_eq!(row["state"], "waiting", "context-1 effect unchanged: {row}");
+
+    // 2. Missing, forged and other-session action tokens.
+    let raw = |token: Option<Value>, session: &Value| {
+        let mut params = json!({"tool_alias": "social.draft", "effect_id": a_sched,
+            "due_epoch": due, "token": session["token"], "key": session["key"],
+            "origin": "loopback"});
+        if let Some(token) = token {
+            params["action_token"] = token;
+        }
+        fx.rpc_as(Asserted::Operator, "app_social_effect_schedule", params)
+    };
+    refused(raw(None, &a.2), "action_token", "a missing action token");
+    refused(
+        raw(Some(json!("ab".repeat(32))), &a.2),
+        "tool action context is stale or unknown",
+        "a forged action token",
+    );
+    // B's real token presented with A's session cannot borrow B's mount.
+    refused(
+        raw(Some(b.3.clone()), &a.2),
+        "tool action context does not belong to this session",
+        "another session's action token",
+    );
+
+    // 3. No operator proof: an agent caller with A's real token and session.
+    {
+        let mut params = json!({"tool_alias": "social.draft", "effect_id": a_sched,
+            "due_epoch": due, "action_token": a.3, "token": a.2["token"],
+            "key": a.2["key"], "origin": "loopback"});
+        refused(
+            fx.rpc_as(
+                Asserted::Agent("worker".into()),
+                "app_social_effect_schedule",
+                params.clone(),
+            ),
+            "is an operator action",
+            "an agent caller",
+        );
+        // 4. A request-supplied digest is not an allowed field.
+        params["digest"] = json!("sha256:forged");
+        refused(
+            fx.rpc_as(Asserted::Operator, "app_social_effect_schedule", params),
+            "app release payload has unsupported fields",
+            "a request-supplied digest",
+        );
+    }
+
+    // 5. Reschedule or cancel of an effect that is not scheduled.
+    refused(
+        fx.screen(
+            "app_social_effect_reschedule",
+            json!({"tool_alias": "social.draft", "effect_id": a_sched, "due_epoch": due}),
+        ),
+        "social draft effect is not scheduled",
+        "reschedule of an unscheduled effect",
+    );
+    refused(
+        fx.screen(
+            "app_social_effect_cancel",
+            json!({"tool_alias": "social.draft", "effect_id": a_sched}),
+        ),
+        "social draft effect is not scheduled",
+        "cancel of an unscheduled effect",
+    );
+    let row = social_effect_state(&fx, &a.0, &a_sched);
+    assert_eq!(row["state"], "waiting", "nothing changed: {row}");
+    assert_eq!(fx.count(&format!("{PREFIX}/publish")), 0, "nothing sent");
+
+    // Positive control: own-install Schedule -> Reschedule -> Cancel.
+    let scheduled = fx
+        .screen(
+            "app_social_effect_schedule",
+            json!({"tool_alias": "social.draft", "effect_id": a_sched, "due_epoch": due}),
+        )
+        .unwrap_or_else(|e| panic!("own schedule refused: {e}"));
+    assert_eq!(scheduled["effect"]["state"], "scheduled", "{scheduled}");
+    assert_eq!(scheduled["effect"]["due_epoch"], due);
+    let moved = fx
+        .screen(
+            "app_social_effect_reschedule",
+            json!({"tool_alias": "social.draft", "effect_id": a_sched, "due_epoch": due + 600}),
+        )
+        .unwrap_or_else(|e| panic!("own reschedule refused: {e}"));
+    assert_eq!(moved["effect"]["due_epoch"], due + 600, "{moved}");
+    let cancelled = fx
+        .screen(
+            "app_social_effect_cancel",
+            json!({"tool_alias": "social.draft", "effect_id": a_sched}),
+        )
+        .unwrap_or_else(|e| panic!("own cancel refused: {e}"));
+    assert_eq!(cancelled["effect"]["state"], "cancelled", "{cancelled}");
+    assert_eq!(
+        fx.count(&format!("{PREFIX}/publish")),
+        0,
+        "schedule sends nothing"
+    );
+
+    // Positive control: own-install Publish now posts once.
+    let posted = fx
+        .screen(
+            "app_social_effect_confirm",
+            json!({"tool_alias": "social.draft", "effect_id": a_pub}),
+        )
+        .unwrap_or_else(|e| panic!("own Publish now refused: {e}"));
+    assert_eq!(posted["effect"]["state"], "posted", "{posted}");
+    assert_eq!(fx.count(&format!("{PREFIX}/publish")), 1);
+    // B's effect is still untouched at the end.
+    assert_eq!(
+        social_effect_state(&fx, &b.0, &b_effect)["state"],
+        "waiting"
     );
 }
