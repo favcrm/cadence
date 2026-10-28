@@ -610,6 +610,15 @@ pre {
 .turntrace-head {
   color: var(--color-ink-500);
 }
+/* A running turn's trace is a disclosure under the typing bubble, not a
+   second loading bar. The head shrinks to its label. */
+.turn[data-turn-state="running"] .turntrace {
+  margin-top: .35rem;
+}
+.turn[data-turn-state="running"] .turntrace-head {
+  width: fit-content;
+  max-width: 100%;
+}
 .turntrace-title {
   color: var(--color-ink-300);
   font-weight: 500;
@@ -697,7 +706,7 @@ pre {
   min-width: 0;
   max-width: min(100%, 40rem);
   margin-top: .25rem;
-  padding: 1.125rem 1.375rem;
+  padding: .7rem 1rem;
   border-radius: .375rem 1.1rem 1.1rem 1.1rem;
   background: var(--color-ink-850);
   border: 0;
@@ -751,7 +760,14 @@ pre {
   margin-block-end: 0;
 }
 .answer-fail {
-  margin: .25rem 0 .5rem;
+  display: inline-block;
+  width: fit-content;
+  max-width: min(100%, 34rem);
+  margin: .25rem 0 0;
+  padding: .7rem 1rem;
+  border-radius: .375rem 1.1rem 1.1rem 1.1rem;
+  background: color-mix(in srgb, var(--color-fail) 9%, var(--color-ink-850));
+  line-height: 1.45;
 }
 .noanswer {
   margin: .25rem 0 .5rem;
@@ -831,9 +847,8 @@ pre {
   display: inline-flex;
   align-items: center;
   width: fit-content;
-  min-height: 2.25rem;
   margin-top: .15rem;
-  padding: .6rem .95rem;
+  padding: .55rem .85rem;
   border-radius: .375rem 1.1rem 1.1rem 1.1rem;
   background: var(--color-ink-850);
 }

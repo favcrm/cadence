@@ -316,6 +316,7 @@ for (const density of ["full", "compact"] as const) {
   ok(running.includes('data-turn-state="running"'), "streaming: running state");
   ok(running.includes("Thinking…"), "streaming: the trace says it is thinking");
   ok(count(running, 'data-kind="typing"') === 1, "streaming: one typing row");
+  ok(running.indexOf('data-kind="typing"') < running.indexOf('data-kind="turn-trace"'), "streaming: the typing bubble leads the trace");
   ok(count(running, "<i></i>") === 3, "streaming: exactly three dots");
   ok(!running.includes('data-kind="answer"'), "streaming: no answer body");
   ok(!running.toLowerCase().includes("skeleton"), "streaming: no skeleton");
