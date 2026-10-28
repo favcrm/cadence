@@ -948,6 +948,14 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     applyFollow(next.state);
     if (next.scroll === "jump") scrollPanel("jump");
   }, [items, applyFollow, scrollPanel]);
+  // Same gap as Home: a pinned reader stays on the tail when the typing
+  // row paints. The resize observer's new baseline already includes it.
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    if (!el || !follow.current.pinned || follow.current.programmatic) return;
+    const top = tailTop(el.scrollHeight, el.clientHeight);
+    if (Math.abs(el.scrollTop - top) > 1) el.scrollTop = top;
+  });
   const jumpToLatest = () => {
     const next = onPill(follow.current);
     applyFollow(next.state);

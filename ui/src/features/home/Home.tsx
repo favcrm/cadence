@@ -1,5 +1,5 @@
 import { useWriteBlock } from "../auth/WriteGate";
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
@@ -1183,6 +1183,17 @@ function MasterHome({
     applyFollow(next.state);
     if (next.scroll === "jump") scrollPanel("jump");
   }, [items.length, lastKey, scrollPanel]);
+
+  // The resize observer re-baselines on the commit that mounts the typing
+  // row, so it never sees that growth. While the reader is pinned, stick
+  // to the tail after paint — the typing bubble and a growing answer stay
+  // in view. A glide in flight owns the scroll until it settles.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !follow.current.pinned || follow.current.programmatic) return;
+    const top = tailTop(el.scrollHeight, el.clientHeight);
+    if (Math.abs(el.scrollTop - top) > 1) el.scrollTop = top;
+  });
 
   // After the pending row, command card, or working indicator paints.
   // Already sitting on the tail skips the glide and drops the lock, so

@@ -259,7 +259,7 @@ export function ThreadItemView({
       return (
         <Bubble who={displayName(actor.read, actor.scope, t)} at={time(item.entry.created)} live={activity}>
           {failure && (
-            <div className={`mt-0.5 ${bodyText} text-fail break-words`} role="alert" data-kind="turn-failure">
+            <div className={`answer-fail mt-0.5 ${bodyText} text-fail break-words`} role="alert" data-kind="turn-failure">
               {failure}
             </div>
           )}
@@ -834,6 +834,10 @@ export function ThreadTurn({
           {copy && shown && shown.entry.text.trim() !== "" && <CopyControl text={shown.entry.text} />}
         </div>
       )}
+      {/* The typing bubble is the loading state. It leads, so a running
+          turn is not a full-width "Thinking…" bar with the dots buried
+          under it. The trace stays a quiet disclosure beneath. */}
+      {streaming && <TypingDots />}
       {trace.length > 0 && (
         <TurnTrace
           items={trace}
@@ -853,7 +857,6 @@ export function ThreadTurn({
           {t("No answer returned")}
         </div>
       )}
-      {streaming && <TypingDots />}
       {artifacts.length > 0 && (
         <div className="turn-artifacts">
           {artifacts.map((item) =>
