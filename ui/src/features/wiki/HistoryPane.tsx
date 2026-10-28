@@ -29,6 +29,7 @@ export default function HistoryPane({
   const [diff, setDiff] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [canCompare, setCanCompare] = useState(false);
+  const [canOpen, setCanOpen] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -41,6 +42,7 @@ export default function HistoryPane({
         if (cancelled) return;
         const list = resp.entries ?? resp.history ?? [];
         setCanCompare(resp.canCompare !== false);
+        setCanOpen(resp.canOpen !== false);
         setEntries(list);
         const current = resp.rev ?? list[0]?.rev ?? null;
         setCurrentRev(current);
@@ -110,7 +112,7 @@ export default function HistoryPane({
               <span className="wk-vwho">{versionWho(row)}</span>
               <span className="wk-vwhen">{row.when}</span>
               {row.summary && <span className="wk-vsum">{row.summary}</span>}
-              <Link href={navHref({ screen: "wiki", mode: "browse", path, query: null, at: row.rev })}>{t("Open this revision")}</Link>
+              {(canOpen || row.rev === currentRev) && <Link href={navHref({ screen: "wiki", mode: "browse", path, query: null, at: row.rev })}>{t("Open this revision")}</Link>}
             </div>)}
           </div>
           {canCompare && <div className="min-w-0">

@@ -34,7 +34,7 @@ export default function FileExplorer({ label, rows, current, folder, emptyText, 
               </button>
             ) : <span className="wk-caret-space" />}
             <span className="wk-tkind"><KindIcon kind={row.kind} /></span>
-            <Link className="wk-tname" href={hrefFor(row.path)} aria-current={row.path === current ? "page" : undefined} onClick={() => setShown(false)}>
+            <Link className="wk-tname" title={row.name} href={hrefFor(row.path)} aria-current={row.path === current ? "page" : undefined} onClick={() => setShown(false)}>
               {row.name}{row.dir ? "/" : ""}
             </Link>
             {row.own && <span className="kicker">you</span>}

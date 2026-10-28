@@ -306,10 +306,35 @@
   font-weight: 500;
 }
 
+/* CAD-1915: the page and the editor read on one surface token: white in
+   light mode, one step raised above the page in dark mode, with the same
+   hairline. Code blocks keep their deeper fill, so they read as inset. */
 .wk-md {
-  max-width: 72ch;
-  padding: 0;
+  max-width: calc(72ch + 64px);
+  padding: 24px 32px 28px;
+  background: var(--color-ink-850);
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
 }
+
+@media (max-width: 640px) {
+  .wk-md { padding: 16px; }
+}
+
+.wk-front {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 0 0 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--color-ink-700);
+  color: var(--color-ink-500);
+  font-size: var(--text-label);
+}
+
+.wk-front > div { display: flex; gap: 6px; min-width: 0; }
+.wk-front dt { font-family: var(--font-mono); }
+.wk-front dd { margin: 0; color: var(--color-ink-300); overflow-wrap: anywhere; }
 
 .wk-pstage {
   display: grid;
@@ -655,6 +680,7 @@
 .wk-esplit {
   display: grid;
   grid-template-columns: 1fr 1fr;
+  background: var(--color-ink-850);
   border: 1px solid var(--color-ink-700);
   border-radius: 0.5rem;
   overflow: hidden;
@@ -676,7 +702,7 @@
 .wk-eprev { grid-area: 2 / 2; }
 
 .wk-esrc {
-  background: var(--color-ink-900);
+  background: var(--color-ink-850);
   border-right: 1px solid var(--color-ink-700);
   font-family: var(--font-mono);
   font-size: var(--text-label);

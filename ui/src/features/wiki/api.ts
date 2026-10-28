@@ -85,6 +85,8 @@ export interface WikiHistoryResponse {
   history?: WikiVersion[];
   diff?: string;
   canCompare?: boolean;
+  /** CAD-1915: false when the server cannot read a non-current revision (hosted Worker log). */
+  canOpen?: boolean;
 }
 
 /** A wiki route's refusal, with the conflict fields the editor reads. */

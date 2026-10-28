@@ -2,6 +2,7 @@ import { NO_FILTERS } from "../../lib/filters";
 import { locationHref, type Route } from "../../lib/router";
 import { collectionRoot } from "./knowledge";
 import type { CorrectionCitation } from "./knowledge";
+import { parentPath, splitPath } from "./paths";
 
 const REVISION = /^(?:fnv1a:[0-9a-f]{16}|[0-9a-f]{40})$/;
 const PATH = /^(?:global|projects)(?:\/[A-Za-z0-9._~-]+)+$/;
@@ -103,4 +104,55 @@ export function sharedCollectionCitations(text: string): { root: string; citatio
 
 export function citationSpans(text: string): FoundCitation[] {
   return citationsIn(text);
+}
+
+/**
+ * CAD-1915: the in-app href for a link written inside the wiki page at
+ * `pagePath`. A relative target resolves against the page's folder (`./`,
+ * `../` and plain names); an absolute `/wiki/…` target stays as written.
+ * Anything else (a scheme, `//host`, a fragment, a path that climbs above the
+ * root) is not a wiki link and returns null, so the caller keeps its safe
+ * external-link handling.
+ */
+export function wikiLinkHref(pagePath: string, href: string): string | null {
+  if (href.startsWith("/wiki/")) return href;
+  if (!href || href.startsWith("/") || href.startsWith("#") || /^[a-z][a-z0-9+.-]*:/i.test(href)) return null;
+  const target = href.split(/[?#]/, 1)[0];
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(target);
+  } catch {
+    return null;
+  }
+  const parts = splitPath(parentPath(pagePath));
+  for (const part of decoded.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (parts.length === 0) return null;
+      parts.pop();
+    } else parts.push(part);
+  }
+  if (parts.length === 0) return null;
+  const route: Route = { screen: "wiki", mode: "browse", path: parts.join("/"), query: null };
+  return locationHref({ route, project: "all", view: "list", openId: null, filters: NO_FILTERS });
+}
+
+/**
+ * CAD-1915: a page's leading YAML-style frontmatter block (`---` … `---`),
+ * allowed after leading HTML comments and blank lines, split from the body as
+ * `key: value` pairs for a metadata line. Only the leading block is read; the
+ * stored text is never changed, and a body without one is returned as is.
+ */
+export function splitFrontmatter(text: string): { meta: [string, string][]; body: string } {
+  const lead = /^(?:\s*<!--[\s\S]*?-->)*\s*/.exec(text)?.[0] ?? "";
+  const rest = text.slice(lead.length);
+  const block = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(rest);
+  if (!block) return { meta: [], body: text };
+  const meta: [string, string][] = [];
+  for (const line of block[1].split(/\r?\n/)) {
+    const pair = /^([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(line.trim());
+    if (!pair) continue;
+    meta.push([pair[1], pair[2].replace(/^(["'])(.*)\1$/, "$2")]);
+  }
+  return { meta, body: lead + rest.slice(block[0].length) };
 }
