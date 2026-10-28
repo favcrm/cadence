@@ -39,7 +39,8 @@ export function normalizeHistory(value: WikiHistoryResponse & {
   return value.commits ? {
     path: value.path,
     canCompare: false, // The current HTTP surface exposes a log, not diffs or restores.
-    canOpen: false, // …and no historical page text (AOS-452), so only the current revision opens.
+    // A board that keeps no historical page text says so (AOS-452); native omits it.
+    canOpen: value.canOpen,
     entries: value.commits.map((commit) => ({ rev: commit.sha, at: new Date(commit.at * 1000).toISOString(), author: commit.actor, summary: commit.subject })),
   } : value;
 }

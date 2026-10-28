@@ -2,7 +2,7 @@ import { NO_FILTERS } from "../../lib/filters";
 import { locationHref, type Route } from "../../lib/router";
 import { collectionRoot } from "./knowledge";
 import type { CorrectionCitation } from "./knowledge";
-import { parentPath, splitPath } from "./paths";
+import { splitPath } from "./paths";
 
 const REVISION = /^(?:fnv1a:[0-9a-f]{16}|[0-9a-f]{40})$/;
 const PATH = /^(?:global|projects)(?:\/[A-Za-z0-9._~-]+)+$/;
@@ -108,33 +108,24 @@ export function citationSpans(text: string): FoundCitation[] {
 
 /**
  * CAD-1915: the in-app href for a link written inside the wiki page at
- * `pagePath`. A relative target resolves against the page's folder (`./`,
- * `../` and plain names); an absolute `/wiki/…` target stays as written.
- * Anything else (a scheme, `//host`, a fragment, a path that climbs above the
- * root) is not a wiki link and returns null, so the caller keeps its safe
- * external-link handling.
+ * `pagePath`. The target resolves like a browser would against the page's
+ * own URL — `./`, `../`, encoded dot segments and backslashes included — and
+ * is a wiki link only when the result stays on the board under `/wiki/`; its
+ * query (`?at=` revision, section, page) and fragment are kept. Anything else
+ * (a scheme, another host, a bare fragment, a climb out of `/wiki/`) returns
+ * null, so the caller keeps its safe external-link handling.
  */
+const WIKI_BASE = "http://wiki.invalid";
 export function wikiLinkHref(pagePath: string, href: string): string | null {
-  if (href.startsWith("/wiki/")) return href;
-  if (!href || href.startsWith("/") || href.startsWith("#") || /^[a-z][a-z0-9+.-]*:/i.test(href)) return null;
-  const target = href.split(/[?#]/, 1)[0];
-  let decoded: string;
+  if (!href || href.startsWith("#") || /^[a-z][a-z0-9+.-]*:/i.test(href)) return null;
+  let url: URL;
   try {
-    decoded = decodeURIComponent(target);
+    url = new URL(href, `${WIKI_BASE}/wiki/${splitPath(pagePath).map(encodeURIComponent).join("/")}`);
   } catch {
     return null;
   }
-  const parts = splitPath(parentPath(pagePath));
-  for (const part of decoded.split("/")) {
-    if (part === "" || part === ".") continue;
-    if (part === "..") {
-      if (parts.length === 0) return null;
-      parts.pop();
-    } else parts.push(part);
-  }
-  if (parts.length === 0) return null;
-  const route: Route = { screen: "wiki", mode: "browse", path: parts.join("/"), query: null };
-  return locationHref({ route, project: "all", view: "list", openId: null, filters: NO_FILTERS });
+  if (url.origin !== WIKI_BASE || !url.pathname.startsWith("/wiki/") || url.pathname === "/wiki/") return null;
+  return url.pathname + url.search + url.hash;
 }
 
 /**

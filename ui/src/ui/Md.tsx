@@ -78,7 +78,7 @@ const remarkWikiCitations = () => (tree: MdNode) => linkifyCitations(tree);
 // CAD-1915: a wiki page's `<!-- … -->` notes are source annotations, not
 // content. Only html nodes that are nothing but comments are dropped; a
 // comment inside a code fence is a `code` node and stays visible.
-const COMMENT_ONLY = /^(?:\s*<!--[\s\S]*?-->)+\s*$/;
+const COMMENT_ONLY = /^(?:\s*<!--(?:(?!-->)[\s\S])*-->)+\s*$/;
 function dropComments(node: MdNode): void {
   if (!node.children) return;
   node.children = node.children.filter((kid) => !(kid.type === "html" && COMMENT_ONLY.test(kid.value ?? "")));
