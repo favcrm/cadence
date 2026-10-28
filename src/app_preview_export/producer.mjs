@@ -238,6 +238,7 @@ var LINK_ID_MAX = 128;
 var V2_TOP = [
 	"sources",
 	"defaults",
+	"publish_settings",
 	"readiness",
 	"actions",
 	"run_receipts",
@@ -684,6 +685,26 @@ function defaultsOf(installation, context) {
 	}
 	return out;
 }
+/** The app's own publish_settings grammars (cadence-app-social-content
+*  screen-v2.mjs): a field that fails one is omitted, never coerced. */
+var PUBLISH_DEST = /^[A-Za-z0-9._-]{1,120}$/;
+var PUBLISH_ZONE = /^[A-Za-z0-9/_+-]+$/;
+var CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
+/** CAD-1902: the configured publication binding for this install and scope
+*  at the installed bundle, as the frame's read-only publish_settings. The
+*  mounted context's own binding wins over the install-wide one. */
+function publishSettingsOf(installation, contextId, extras) {
+	const candidates = (extras?.bindings ?? []).filter((b) => b.install_id === installation.install_id && b.state === "configured" && b.config.bundle_digest === installation.digest && b.config.publish && typeof b.config.publish === "object" && ((b.context_id ?? "") === contextId || (b.context_id ?? "") === ""));
+	const binding = candidates.find((b) => (b.context_id ?? "") === contextId) ?? candidates.find((b) => (b.context_id ?? "") === "");
+	if (!binding || !Number.isSafeInteger(binding.revision) || binding.revision < 0) return void 0;
+	const publish = binding.config.publish;
+	const out = { revision: binding.revision };
+	if (typeof publish.destination_id === "string" && PUBLISH_DEST.test(publish.destination_id)) out.destination_id = publish.destination_id;
+	if (typeof publish.destination_label === "string" && publish.destination_label.trim().length > 0 && publish.destination_label.length <= 80 && !CONTROL_CHARS.test(publish.destination_label)) out.destination_label = publish.destination_label;
+	if (publish.toolkit === "instagram" || publish.toolkit === "facebook") out.toolkit = publish.toolkit;
+	if (typeof publish.timezone === "string" && PUBLISH_ZONE.test(publish.timezone) && isZone(publish.timezone)) out.timezone = publish.timezone;
+	return out;
+}
 function readinessOf(installation, contextId, extras) {
 	const blockers = [];
 	if (!installation.approved) blockers.push("install_unapproved");
@@ -747,6 +768,7 @@ function screenProjection(installation, tag, contextId, contexts, runs, effects,
 		publish_intents: scopedIntents(intents, installation.install_id, contextId, new Map(scopedRuns.map((r) => [r.id, r.context_id ?? ""])), true),
 		...present({ sources: sourcesOf(installation, scopedRuns, scoped) }),
 		defaults: defaultsOf(installation, active.find((c) => c.id === contextId)),
+		...present({ publish_settings: publishSettingsOf(installation, contextId, scoped) }),
 		readiness: readinessOf(installation, contextId, scoped),
 		actions: scoped ? [...ACTION_VERBS] : [],
 		now: Math.floor(Date.now() / 1e3)

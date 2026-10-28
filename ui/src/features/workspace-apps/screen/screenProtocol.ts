@@ -406,6 +406,13 @@ export interface ScreenSources {
    *  from any run id. A screen keys refresh/edit to this, never a run. */
   tool_receipt_id?: string;
 }
+export interface ScreenPublishSettings {
+  revision: number;
+  destination_id?: string;
+  destination_label?: string;
+  toolkit?: "instagram" | "facebook";
+  timezone?: string;
+}
 export interface ScreenDefaults {
   context_id: string; revision: number;
   values: Record<string, string>;
@@ -481,6 +488,10 @@ export interface ScreenPush {
   sources?: ScreenSources;
   /** screen.v2 only: effective `context_default` values for this scope. */
   defaults?: ScreenDefaults;
+  /** screen.v2 only (CAD-1902): the bound publication target, read-only.
+   *  `revision` is the binding revision; every other field is omitted when
+   *  it does not pass the app's grammar. A grant is never pushed. */
+  publish_settings?: ScreenPublishSettings;
   /** screen.v2 only: plain blocker codes; `ok` when there are none. */
   readiness?: { ok: boolean; blockers: string[] };
   /** screen.v2 only: verbs this host lets this viewer's frame use (none for a non-operator). */
@@ -668,7 +679,7 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
   return null;
 }
 
-const V2_TOP = ["sources", "defaults", "readiness", "actions", "run_receipts", "original_downloads", "media_previews", "media_chat_references", "route", "read_observations", "presentation_locale"] as const;
+const V2_TOP = ["sources", "defaults", "publish_settings", "readiness", "actions", "run_receipts", "original_downloads", "media_previews", "media_chat_references", "route", "read_observations", "presentation_locale"] as const;
 const V2_RUN = ["created", "closed", "phase", "steps", "inputs_used", "caption_excerpt", "artifact_id",
   "review", "approved", "source_post_id", "refusal", "image_ref"] as const;
 /** The publish-intents.v1 shape: every screen.v2 field is removed. */
