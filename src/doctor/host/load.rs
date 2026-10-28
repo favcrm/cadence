@@ -63,6 +63,13 @@ pub(super) fn check_load(scan: &Scan) -> Check {
         );
     }
     let ratio = load1.map(|l| l / cpus);
+    // CAD-998: a latched strict writer refuses every strict admission
+    // and the master's identity — name it with the daemon's reason.
+    let latched = scan
+        .slots
+        .as_ref()
+        .filter(|s| s["strict"]["available"] == false)
+        .map(|s| s["strict"]["reason"].as_str().unwrap_or("?").to_string());
     let level = if ratio.is_some_and(|r| r > warn_ratio * 2.0)
         || io_stall.is_some_and(|s| s > scan.thresholds.io_stall_fail_pct)
     {
@@ -73,6 +80,11 @@ pub(super) fn check_load(scan: &Scan) -> Check {
         Level::Warn
     } else {
         Level::Ok
+    };
+    let level = if latched.is_some() {
+        level.max(Level::Warn)
+    } else {
+        level
     };
     let slots_text = match &scan.slots {
         Some(s) => {
@@ -99,6 +111,10 @@ pub(super) fn check_load(scan: &Scan) -> Check {
         }
         None => "slots: daemon unreachable".to_string(),
     };
+    let slots_text = match &latched {
+        Some(reason) => format!("{slots_text}; strict admission unavailable: {reason}"),
+        None => slots_text,
+    };
     check(
         name,
         level,
@@ -123,7 +139,11 @@ pub(super) fn check_load(scan: &Scan) -> Check {
                 .unwrap_or_else(|| "-".into()),
             slots_text
         ),
-        if level == Level::Ok {
+        if latched.is_some() {
+            "cadence build-slot status  # strict admission retries on the next attempt once the \
+             disk is writable; a rejected slots.json needs the file fixed and a daemon restart"
+                .to_string()
+        } else if level == Level::Ok {
             String::new()
         } else {
             "cadence build-slot status  # who holds the build slots".to_string()

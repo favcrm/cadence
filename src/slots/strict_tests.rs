@@ -962,7 +962,7 @@ fn shared_root_enrollments_restore_and_resolve_deterministically() {
             json!([second.clone(), first.clone()]),
         ] {
             let p = tree();
-            let (s, _dir, _) = restored(&p, &envelope_of(order));
+            let (mut s, _dir, _) = restored(&p, &envelope_of(order));
             assert!(s.strict_available(), "{name}: restore rejected the file");
             assert_eq!(s.enrollments.len(), 2, "{name}");
             let caller = s.strict_caller(400, 200).unwrap();
@@ -1538,4 +1538,312 @@ fn enrolled_roots_on_counts_every_root_and_only_unrevoked_vouches() {
     p.kill(600);
     p.spawn(600, 300, 95);
     assert_eq!(s.enrolled_roots_on(&[610, 600, 300, 200, 100]), vec![3]);
+}
+
+/// CAD-998: a strict write that FAILS latches strict admission with the
+/// error, and the latch heals on the next admission once the path is
+/// writable again — no restart. The failure is a real filesystem one:
+/// a directory squats on the writer's tmp file name.
+#[test]
+fn a_failed_strict_write_heals_on_the_next_admission() {
+    let p = tree();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slots.json");
+    let mut s = strict_slots(&p, 1);
+    s.persist_to(path.clone());
+    enroll(&mut s, "wk", "g1", 200);
+    let squatter = dir.path().join("slots.tmp");
+    std::fs::create_dir(&squatter).unwrap();
+
+    let err = acquire_as(&mut s, 300, 300, "r1", 0.0).unwrap_err();
+    assert!(err.to_string().contains("write"), "{err}");
+    assert!(!s.strict_available());
+    assert!(s.held.is_empty(), "a failed write grants nothing");
+    // Still unwritable: still refused, still latched.
+    assert!(acquire_as(&mut s, 300, 300, "r1", 1.0).is_err());
+    assert!(!s.strict_available());
+
+    std::fs::remove_dir(&squatter).unwrap();
+    let g = acquire_as(&mut s, 300, 300, "r1", 2.0).unwrap();
+    assert_eq!(g["granted"], true, "{g}");
+    assert!(s.strict_available());
+    let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(on_disk["holds"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        on_disk["state_generation"].as_str().unwrap(),
+        s.state_generation.to_string(),
+        "memory and disk agree on the generation after the heal"
+    );
+}
+
+/// CAD-998: a rejected state file is evidence, not a transient write
+/// failure — it stays latched even when the path is writable, and the
+/// file is never retried, rewritten or touched.
+#[test]
+fn a_rejected_state_file_stays_latched_and_untouched() {
+    let p = tree();
+    let text = "{ not json";
+    let (mut s, dir, path) = restored(&p, text);
+    assert!(!s.strict_available());
+    for now in [1.0, 2.0] {
+        assert!(s.enroll("wk", "g1", 200, clk(now)).is_err());
+        assert!(s.strict_caller(300, 200).is_err());
+        assert!(!s.strict_available());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+    assert!(!dir.path().join("slots.tmp").exists());
+}
+
+/// CAD-998 refusal acceptance check (independent, written from the
+/// ticket by the Spec/security reviewer). The heal is no wider than the
+/// ticket allows:
+/// - every EVIDENCE latch (a rejected state file) stays refused with
+///   its own reason through every strict entry point, attempt after
+///   attempt, on a writable path, and the file stays byte-identical
+///   with no tmp file written;
+/// - a write that still fails stays refused and grants nothing — no
+///   enrollment or hold in memory, the file on disk unchanged;
+/// - the boot-rewrite latch (the file read fine, its rewrite failed)
+///   heals once writable, and the heal really lands on disk;
+/// - positive control: a good file on the same harness admits.
+#[test]
+fn cad998_heal_refuses_evidence_and_failing_writes() {
+    const UNAVAILABLE: &str = "Strict build-slot admission is unavailable";
+    let p = tree();
+    let attempts = |s: &mut Slots| -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "enroll",
+                s.enroll("wk2", "g9", 500, clk(5.0))
+                    .map(|_| ())
+                    .unwrap_err()
+                    .to_string(),
+            ),
+            (
+                "strict_caller",
+                s.strict_caller(400, 200)
+                    .map(|_| ())
+                    .unwrap_err()
+                    .to_string(),
+            ),
+            (
+                "enroll_runner",
+                s.enroll_runner("wk", "run-1", "d", 310, clk(5.0))
+                    .map(|_| ())
+                    .unwrap_err()
+                    .to_string(),
+            ),
+            (
+                "acquire_runner",
+                s.acquire_runner("enr-a", SlotKind::Build, clk(5.0))
+                    .map(|_| ())
+                    .unwrap_err()
+                    .to_string(),
+            ),
+        ]
+    };
+
+    // Positive control: a good file restores, admits a strict caller
+    // and accepts an enrollment on the same harness.
+    let good = envelope_of(json!([enrollment_row("enr-a", "wk", 1.0, "active")]));
+    let (mut s, _gd, _) = restored(&p, &good);
+    assert!(s.strict_available(), "positive control: good file rejected");
+    s.strict_caller(400, 200)
+        .expect("positive control: strict caller");
+    s.enroll("wk2", "g9", 500, clk(5.0))
+        .expect("positive control: enroll");
+
+    // 1. Evidence latches: refused with their own reason, file untouched.
+    let evidence: Vec<(&str, String, &str)> = vec![
+        ("unparsable", "{ not json".into(), "is unparsable"),
+        (
+            "unknown envelope",
+            json!({"format": "cadence-slots", "version": 3}).to_string(),
+            "unknown envelope",
+        ),
+        (
+            "unknown version",
+            json!({"version": 7, "holds": []}).to_string(),
+            "unknown version 7",
+        ),
+        (
+            "malformed v1 {}",
+            "{}".into(),
+            "not a well-formed v1 envelope",
+        ),
+        (
+            "non-list holds",
+            json!({"holds": 5}).to_string(),
+            "not a well-formed v1 envelope",
+        ),
+        (
+            "duplicate enrollment",
+            envelope_of(json!([
+                enrollment_row("enr-a", "wk", 1.0, "active"),
+                enrollment_row("enr-a", "wk", 2.0, "active"),
+            ])),
+            "duplicate enrollment enr-a",
+        ),
+    ];
+    for (name, text, why) in &evidence {
+        let (mut s, dir, path) = restored(&p, text);
+        assert!(!s.strict_available(), "{name}: accepted");
+        for round in 0..3 {
+            for (entry, err) in attempts(&mut s) {
+                assert!(
+                    err.contains(UNAVAILABLE) && err.contains(why),
+                    "{name} round {round} {entry}: wrong refusal {err}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    *text,
+                    "{name} round {round} {entry}: evidence file changed"
+                );
+                assert!(
+                    !dir.path().join("slots.tmp").exists(),
+                    "{name}: tmp written"
+                );
+            }
+        }
+        assert!(!s.strict_available(), "{name}: latch cleared");
+        assert!(s.held.is_empty(), "{name}");
+        assert!(s.enrollments.is_empty(), "{name}");
+    }
+
+    // 1b. An unreadable file is evidence too (skipped where the test
+    // runs with CAP_DAC_OVERRIDE and can read a mode-000 file).
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slots.json");
+        std::fs::write(&path, &good).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_err() {
+            let mut s = strict_slots(&p, 2);
+            s.persist_to(path.clone());
+            s.restore(clk(0.0));
+            assert!(!s.strict_available(), "unreadable: accepted");
+            for round in 0..3 {
+                for (entry, err) in attempts(&mut s) {
+                    assert!(
+                        err.contains(UNAVAILABLE) && err.contains("cannot read"),
+                        "unreadable round {round} {entry}: wrong refusal {err}"
+                    );
+                }
+            }
+            assert!(
+                !dir.path().join("slots.tmp").exists(),
+                "unreadable: tmp written"
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), good);
+        }
+    }
+
+    // 2. A write that still fails: refused, nothing granted, disk unchanged.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slots.json");
+    let mut s = strict_slots(&p, 2);
+    s.persist_to(path.clone());
+    enroll(&mut s, "wk", "g1", 200);
+    let before = std::fs::read(&path).unwrap();
+    let generation = s.state_generation;
+    let squatter = dir.path().join("slots.tmp");
+    std::fs::create_dir(&squatter).unwrap();
+    let err = s
+        .enroll("wk2", "g9", 500, clk(1.0))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(UNAVAILABLE)
+            && err.contains("strict state write to")
+            && err.contains("failed"),
+        "{err}"
+    );
+    for round in 0..2 {
+        let err = acquire_as(&mut s, 300, 300, "r1", 2.0 + f64::from(round))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(UNAVAILABLE) && err.contains("strict state write to"),
+            "round {round}: {err}"
+        );
+        for (entry, err) in attempts(&mut s) {
+            assert!(
+                err.contains(UNAVAILABLE) && err.contains("strict state write to"),
+                "round {round} {entry}: {err}"
+            );
+        }
+        assert!(
+            !s.strict_available(),
+            "round {round}: latch cleared while unwritable"
+        );
+        assert!(
+            s.held.is_empty(),
+            "round {round}: a failing write granted a hold"
+        );
+        assert_eq!(s.enrollments.len(), 1, "round {round}: enrollment added");
+        assert_eq!(
+            s.state_generation, generation,
+            "round {round}: generation moved"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "round {round}: disk changed"
+        );
+    }
+
+    // 3. Boot-rewrite latch: the file reads fine, the rewrite fails.
+    // It heals once writable, and the heal lands on disk at the next
+    // generation (memory and disk agree).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slots.json");
+    std::fs::write(&path, &good).unwrap();
+    let squatter = dir.path().join("slots.tmp");
+    std::fs::create_dir(&squatter).unwrap();
+    let mut s = strict_slots(&p, 2);
+    s.persist_to(path.clone());
+    s.restore(clk(0.0));
+    assert!(
+        !s.strict_available(),
+        "boot rewrite failed but strict is available"
+    );
+    let (status, _) = s.status(
+        SlotCaller {
+            lane: "",
+            pids: &[],
+        },
+        0.0,
+    );
+    assert!(
+        status["strict"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("boot rewrite"),
+        "{status}"
+    );
+    let err = s
+        .strict_caller(400, 200)
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(UNAVAILABLE) && err.contains("write"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        good,
+        "unwritable boot: disk changed"
+    );
+    std::fs::remove_dir(&squatter).unwrap();
+    let caller = s
+        .strict_caller(400, 200)
+        .expect("boot latch heals once writable");
+    assert_eq!(caller.enrollment_id, "enr-a");
+    assert!(s.strict_available());
+    let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        on_disk["state_generation"], "4",
+        "the heal did not land on disk: {on_disk}"
+    );
+    assert_eq!(s.state_generation, 4);
 }

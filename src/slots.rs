@@ -643,9 +643,7 @@ impl Slots {
         root_pid: u32,
         clk: SlotClock,
     ) -> Result<(Value, Vec<SlotEvent>)> {
-        if let Some(b) = &self.blocked {
-            return Err(strict_unavailable(&b.reason));
-        }
+        self.heal_write_latch()?;
         if root_pid <= 1 || root_pid == std::process::id() {
             return Err(Error::rejected(format!(
                 "pid {root_pid} cannot be an enrolled provider root — the daemon \
@@ -915,10 +913,8 @@ impl Slots {
     /// enrollments on one root are tried in [`Self::enrollments_at`]
     /// order and the first that verifies wins. There is no fallback —
     /// a failed verification refuses the call.
-    pub fn strict_caller(&self, peer_pid: u32, root_pid: u32) -> Result<StrictCaller> {
-        if let Some(b) = &self.blocked {
-            return Err(strict_unavailable(&b.reason));
-        }
+    pub fn strict_caller(&mut self, peer_pid: u32, root_pid: u32) -> Result<StrictCaller> {
+        self.heal_write_latch()?;
         let mut why = Vec::new();
         for e in self.enrollments_at(root_pid) {
             match self
@@ -978,9 +974,7 @@ impl Slots {
         clk: SlotClock,
         exec: bool,
     ) -> Result<(Value, Vec<SlotEvent>)> {
-        if let Some(b) = &self.blocked {
-            return Err(strict_unavailable(&b.reason));
-        }
+        self.heal_write_latch()?;
         let e = self
             .enrollments
             .iter()
@@ -1037,9 +1031,7 @@ impl Slots {
         pid: u32,
         now: f64,
     ) -> Result<(Value, Vec<SlotEvent>)> {
-        if let Some(b) = &self.blocked {
-            return Err(strict_unavailable(&b.reason));
-        }
+        self.heal_write_latch()?;
         if let Some(runner) = self
             .enrollments
             .iter()
@@ -1252,9 +1244,7 @@ impl Slots {
         pid: u32,
         clk: SlotClock,
     ) -> Result<(String, ProcIdentity, Vec<SlotEvent>)> {
-        if let Some(b) = &self.blocked {
-            return Err(strict_unavailable(&b.reason));
-        }
+        self.heal_write_latch()?;
         if pid <= 1 || pid == std::process::id() {
             return Err(Error::rejected(format!(
                 "pid {pid} cannot be a runner root — the daemon never enrolls \
@@ -1315,9 +1305,7 @@ impl Slots {
         kind: SlotKind,
         clk: SlotClock,
     ) -> Result<(Value, Vec<SlotEvent>)> {
-        if let Some(b) = &self.blocked {
-            return Err(strict_unavailable(&b.reason));
-        }
+        self.heal_write_latch()?;
         let e = self
             .enrollments
             .iter()

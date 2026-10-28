@@ -182,7 +182,7 @@ impl Shared {
             .refuse_unproven_on(&chain)
             .map_err(|why| Error::rejected(format!("Caller pid {peer_pid}: {why}")))?;
         let panes = recorded.live();
-        let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let roots = slots.enrolled_roots_on(&chain);
         let mut nodes: Vec<String> = chain
             .iter()

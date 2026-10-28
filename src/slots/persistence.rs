@@ -35,11 +35,27 @@ impl Slots {
     /// A rejected state file is never overwritten — it is evidence.
     /// Returns whether the file now matches memory.
     pub(super) fn persist(&mut self) -> bool {
-        let Some(path) = self.persist_path.clone() else {
-            return true;
-        };
         if self.blocked.as_ref().is_some_and(|b| b.preserve_file) {
             return false;
+        }
+        match self.try_persist() {
+            Ok(()) => true,
+            Err(e) => {
+                let path = self.persist_path.as_deref().unwrap_or(Path::new(""));
+                eprintln!("slots: persist {} failed: {e}", path.display());
+                false
+            }
+        }
+    }
+
+    /// [`Self::persist`]'s writer, handing back the write error. A
+    /// rejected state file is never written.
+    fn try_persist(&mut self) -> std::io::Result<()> {
+        let Some(path) = self.persist_path.clone() else {
+            return Ok(());
+        };
+        if self.blocked.as_ref().is_some_and(|b| b.preserve_file) {
+            return Err(std::io::Error::other("state file kept as evidence"));
         }
         let v2 =
             self.v2 || !self.enrollments.is_empty() || self.held.iter().any(|h| h.strict.is_some());
@@ -51,17 +67,46 @@ impl Slots {
                 "holds": self.held.iter().map(SlotHold::legacy_json).collect::<Vec<_>>(),
             })
         };
-        match write_atomic(&path, &doc) {
+        write_atomic(&path, &doc)?;
+        if v2 {
+            self.v2 = true;
+            self.state_generation += 1;
+        }
+        Ok(())
+    }
+
+    /// The strict admission gate (CAD-998). `Ok` when strict admission
+    /// is available. A latch from a FAILED WRITE (`preserve_file ==
+    /// false`: disk full, EIO) heals here: memory is authoritative —
+    /// a failed write never swapped it and its rename never happened,
+    /// so disk and memory agree — so one whole-state re-persist
+    /// either lands (the latch clears and the caller proceeds) or
+    /// fails again (stays latched, reason refreshed). A latch that
+    /// kept the state file as evidence (`preserve_file == true`) is
+    /// never retried or written: it clears only on restart. No timer:
+    /// the retry is the next admission itself, and a still-failing
+    /// write costs one small tmp-file open per attempt.
+    pub(super) fn heal_write_latch(&mut self) -> Result<()> {
+        match &self.blocked {
+            None => return Ok(()),
+            Some(b) if b.preserve_file => return Err(strict_unavailable(&b.reason)),
+            Some(_) => {}
+        }
+        match self.try_persist() {
             Ok(()) => {
-                if v2 {
-                    self.v2 = true;
-                    self.state_generation += 1;
-                }
-                true
+                eprintln!("slots: strict state write recovered — strict admission available");
+                self.blocked = None;
+                Ok(())
             }
             Err(e) => {
-                eprintln!("slots: persist {} failed: {e}", path.display());
-                false
+                let path = self.persist_path.as_deref().unwrap_or(Path::new(""));
+                let reason = format!("strict state write to {} failed: {e}", path.display());
+                eprintln!("slots: {reason}");
+                self.blocked = Some(Blocked {
+                    reason: reason.clone(),
+                    preserve_file: false,
+                });
+                Err(strict_unavailable(&reason))
             }
         }
     }
@@ -100,8 +145,8 @@ impl Slots {
     /// The fail-closed strict writer. The next state is written FIRST
     /// and swapped into memory only once the write landed: a failure
     /// leaves disk and memory exactly as they were — no grant, no free
-    /// — and makes strict admission unavailable until a restart loads
-    /// a good file.
+    /// — and latches strict admission until the next admission re-persists
+    /// successfully ([`Self::heal_write_latch`]).
     ///
     /// A revoked or expired enrollment is a TOMBSTONE: it stays while
     /// any hold names it or while its root process is alive or
@@ -114,9 +159,7 @@ impl Slots {
         enrollments: Vec<Enrollment>,
         held: Vec<SlotHold>,
     ) -> Result<()> {
-        if let Some(b) = &self.blocked {
-            return Err(strict_unavailable(&b.reason));
-        }
+        self.heal_write_latch()?;
         let enrollments: Vec<Enrollment> = enrollments
             .into_iter()
             .filter(|e| {
