@@ -1874,7 +1874,10 @@ fn mv_real(
     #[cfg(test)]
     before_mv_lock::run();
     let _lock = pm.lock()?;
-    if entry_kind(dst, to)? != Kind::None {
+    // Check the logical destination, not `dst`: a blob page moves to
+    // `<to>.blob`, and a text page or dir at `<to>` must refuse too.
+    let vault = vault_dir(pm)?;
+    if entry_kind(&resolve(&vault, to)?, to)? != Kind::None {
         return Err(Error::rejected(format!(
             "wiki mv '{from_label}' → '{to}' refused: destination exists"
         )));
@@ -3874,6 +3877,28 @@ mod tests {
     }
 
     // ---- CAD-912: logical entry kinds under the writer lock ----
+
+    #[test]
+    fn cad912_mv_blob_page_onto_text_page_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = cad911_pm(root.path());
+        let state = root.path().join("state");
+        let uploads = cad911_uploads(&state);
+        let tmp = cad911_stage_tmp(&uploads, "b.bin", b"blob page bytes");
+        put_blob(&pm, &state, &Caller::Operator, "global/b", &tmp, None, None).unwrap();
+        write(&pm, &Caller::Operator, "global/t", "text", None).unwrap();
+        let r = mv(&pm, &Caller::Operator, "global/b", "global/t");
+        assert!(
+            matches!(&r, Err(e) if e.to_string().contains("destination exists")),
+            "a blob page must not land beside a text page: {r:?}"
+        );
+        let vault = vault_dir(&pm).unwrap();
+        assert!(vault.join("global/b.blob").exists(), "source pointer stays");
+        assert!(
+            vault.join("global/t.blob").symlink_metadata().is_err(),
+            "no ambiguous pair"
+        );
+    }
 
     fn cad912_blob_page(pm: &Pm, logical: &str) -> PathBuf {
         let vault = vault_dir(pm).unwrap();
