@@ -78,14 +78,15 @@ const readBounded = async (response, limit) => {
 };
 
 const validateMetadata = metadata => {
-  let hasKey = false;
-  let hasJwt = false;
+  let key = null;
+  let jwt = null;
   for (const field of iterFields(metadata)) {
-    if (field.num === 3 && field.wire === 2) hasKey = field.value.length > 0;
-    if (field.num === 21 && field.wire === 2) hasJwt = field.value.length > 0;
+    if (field.num === 3 && field.wire === 2 && field.value.length > 0) key = field.value;
+    if (field.num === 21 && field.wire === 2 && field.value.length > 0) jwt = field.value;
   }
-  if (!hasKey) fail('provider authentication carrier is missing');
-  if (!hasJwt) fail('provider authentication token is missing');
+  if (!key) fail('provider authentication carrier is missing');
+  if (!jwt) fail('provider authentication token is missing');
+  return Buffer.from(jwt).toString('utf8');
 };
 
 const validateAuthBody = body => {
@@ -112,6 +113,7 @@ const validateInferenceWire = (proto, route) => {
   let maxOutput = null;
   let messages = 0;
   let tools = 0;
+  let token = null;
   for (const field of iterFields(proto)) {
     if (!TO_TOP_LEVEL.has(field.num)) fail('inference request carries an unexpected field');
     if (field.num === 21 && field.wire === 2) {
@@ -123,7 +125,7 @@ const validateInferenceWire = (proto, route) => {
     } else if (field.num === 8 && field.wire === 2) {
       maxOutput = completionMaxOutput(field.value);
     } else if (field.num === 1 && field.wire === 2) {
-      validateMetadata(field.value);
+      token = validateMetadata(field.value);
     }
   }
   if (messages === 0 || messages > MAX_MESSAGES) fail('inference prompt count is out of bounds');
@@ -132,6 +134,8 @@ const validateInferenceWire = (proto, route) => {
   if (maxOutput !== route.max_output_tokens) {
     fail('inference output bound differs from the commitment');
   }
+  if (!token) fail('inference metadata is missing');
+  return token;
 };
 
 const completionMaxOutput = buffer => {
@@ -157,6 +161,9 @@ export const installSealedFetch = route => {
     finishSeen: false,
     error: null,
   };
+  // The minted token never leaves this closure: it screens the provider's own
+  // output and is never part of the returned evidence state.
+  let mintedToken = null;
   const origin = route.origin.replace(/\/$/, '');
   const authUrl = `${origin}${AUTH_PATH}`;
   const chatUrl = `${origin}${CHAT_PATH}`;
@@ -201,7 +208,7 @@ export const installSealedFetch = route => {
       const length = body.readUInt32BE(1);
       if (length !== body.length - 5) fail('inference request framing is truncated');
       const proto = boundedGunzip(body.subarray(5), MAX_INFERENCE_REQUEST);
-      validateInferenceWire(proto, route);
+      mintedToken = validateInferenceWire(proto, route);
       // Freeze exactly the admitted bytes for this one request; the buffer is
       // dropped when this call returns.
       const wire = Buffer.from(body);
@@ -231,6 +238,36 @@ export const installSealedFetch = route => {
       });
     }
     fail('unsupported provider destination');
+  };
+
+  // Closure-bound screening only. A match on the complete token or any
+  // eight-character fragment refuses the result; the check never throws, so a
+  // screening edge cannot turn a completed turn into an unknown outcome.
+  state.refusesCredentialEcho = value => {
+    try {
+      if (typeof mintedToken !== 'string' || mintedToken.length < 8) return false;
+      const fragments = [];
+      for (let i = 0; i + 8 <= mintedToken.length; i += 1) {
+        fragments.push(mintedToken.slice(i, i + 8));
+      }
+      const hits = text =>
+        typeof text === 'string' &&
+        text.length >= 8 &&
+        (text.includes(mintedToken) || fragments.some(fragment => text.includes(fragment)));
+      const walk = node => {
+        if (typeof node === 'string') return hits(node);
+        if (Array.isArray(node)) return node.some(walk);
+        if (node && typeof node === 'object') {
+          for (const [key, child] of Object.entries(node)) {
+            if (hits(key) || walk(child)) return true;
+          }
+        }
+        return false;
+      };
+      return walk(value);
+    } catch {
+      return false;
+    }
   };
 
   globalThis.fetch = sealed;

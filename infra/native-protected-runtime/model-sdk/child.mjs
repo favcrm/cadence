@@ -220,11 +220,12 @@ const writeFailure = (seal, code) => {
   );
 };
 
-const reply = (outcome, { error = null, assistant = null } = {}, seal) => ({
+const reply = (outcome, { error = null, assistant = null, usage = null } = {}, seal) => ({
   v: 1,
   outcome,
   error: error ? { code: error } : null,
   assistant,
+  usage,
   usage_present: Boolean(seal?.usageSeen),
   eos: Boolean(seal?.eos),
   auth_requests: seal?.authRequests ?? 0,
@@ -357,6 +358,17 @@ const main = async () => {
     assistant = sanitizeAssistant(terminal, route);
   } catch {
     process.stdout.write(JSON.stringify(reply('unknown', { error: 'outcome_unknown' }, seal)) + '\n');
+    return;
+  }
+  // A provider echoing its own minted token (or an eight-character fragment)
+  // never yields an assistant: truthful usage and the one inference settle as
+  // a closed result_refused with no content.
+  if (seal.refusesCredentialEcho(assistant)) {
+    process.stdout.write(
+      JSON.stringify(
+        reply('result_refused', { error: 'result_refused', usage: assistant.usage }, seal),
+      ) + '\n',
+    );
     return;
   }
   const output = reply('done', { assistant }, seal);

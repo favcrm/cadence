@@ -56,6 +56,12 @@ pub(crate) enum ChildOutcome {
         auth_requests: u8,
         inference_requests: u8,
     },
+    ResultRefused {
+        usage: NativeUsageObservationV1,
+        error: ClosedModelTurnErrorV1,
+        auth_requests: u8,
+        inference_requests: u8,
+    },
     Refused {
         error: ClosedModelTurnErrorV1,
         auth_requests: u8,
@@ -71,7 +77,9 @@ pub(crate) enum ChildOutcome {
 impl ChildOutcome {
     pub(crate) fn billing(&self) -> NativeBillingProjectionV1 {
         match self {
-            Self::Done { .. } => NativeBillingProjectionV1::UPSTREAM_OWNED,
+            Self::Done { .. } | Self::ResultRefused { .. } => {
+                NativeBillingProjectionV1::UPSTREAM_OWNED
+            }
             Self::Refused {
                 inference_requests, ..
             } => {
@@ -88,6 +96,11 @@ impl ChildOutcome {
     pub(crate) fn counts(&self) -> (i64, i64) {
         match self {
             Self::Done {
+                auth_requests,
+                inference_requests,
+                ..
+            }
+            | Self::ResultRefused {
                 auth_requests,
                 inference_requests,
                 ..
@@ -299,6 +312,7 @@ fn parse_reply(raw: &[u8]) -> Result<ChildOutcome> {
             "eos",
             "auth_requests",
             "inference_requests",
+            "usage",
         ],
     )
     .map_err(|_| ambiguous())?;
@@ -346,6 +360,22 @@ fn parse_reply(raw: &[u8]) -> Result<ChildOutcome> {
             Ok(ChildOutcome::Done {
                 assistant,
                 usage,
+                auth_requests: auth_requests as u8,
+                inference_requests: inference_requests as u8,
+            })
+        }
+        "result_refused" => {
+            if inference_requests != 1 || !eos || !usage_present {
+                return Err(ambiguous());
+            }
+            let assistant = m.get("assistant").ok_or_else(ambiguous)?;
+            if !assistant.is_null() {
+                return Err(ambiguous());
+            }
+            let usage = NativeUsageObservationV1::parse(m.get("usage").ok_or_else(ambiguous)?)?;
+            Ok(ChildOutcome::ResultRefused {
+                usage,
+                error: ClosedModelTurnErrorV1::result_refused(),
                 auth_requests: auth_requests as u8,
                 inference_requests: inference_requests as u8,
             })
@@ -434,4 +464,89 @@ pub(crate) fn child_plan(
         "messages": messages,
         "tools": tools,
     })
+}
+
+#[cfg(test)]
+mod result_refused_parse_tests {
+    use super::*;
+
+    fn done_reply() -> String {
+        serde_json::json!({
+            "v": 1,
+            "outcome": "done",
+            "error": null,
+            "assistant": {
+                "role": "assistant", "api": "devin", "provider": "devin",
+                "model": "devin/m", "content": [{"type": "text", "text": "ok"}],
+                "stopReason": "stop", "timestamp": 1,
+                "usage": {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0,
+                          "totalTokens": 2, "cost": {"input": 0, "output": 0,
+                          "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+                "durationMs": 1
+            },
+            "usage": null,
+            "usage_present": true,
+            "eos": true,
+            "auth_requests": 1,
+            "inference_requests": 1
+        })
+        .to_string()
+    }
+
+    fn result_refused_reply(usage: serde_json::Value) -> String {
+        serde_json::json!({
+            "v": 1,
+            "outcome": "result_refused",
+            "error": {"code": "result_refused"},
+            "assistant": null,
+            "usage": usage,
+            "usage_present": true,
+            "eos": true,
+            "auth_requests": 1,
+            "inference_requests": 1
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn done_reply_still_parses() {
+        let outcome = parse_reply(done_reply().as_bytes()).expect("done reply parses");
+        assert!(matches!(outcome, ChildOutcome::Done { .. }));
+    }
+
+    #[test]
+    fn result_refused_keeps_usage_and_no_assistant() {
+        let outcome = parse_reply(
+            result_refused_reply(serde_json::json!({
+                "input": 3, "output": 2, "cacheRead": 1, "cacheWrite": 0, "totalTokens": 6
+            }))
+            .as_bytes(),
+        )
+        .expect("result_refused parses");
+        match outcome {
+            ChildOutcome::ResultRefused { usage, .. } => {
+                assert_eq!(usage.input, 3);
+                assert_eq!(usage.output, 2);
+                assert_eq!(usage.total, 6);
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn result_refused_without_usage_is_ambiguous() {
+        parse_reply(result_refused_reply(serde_json::Value::Null).as_bytes())
+            .expect_err("a result_refused without usage must be refused");
+    }
+
+    #[test]
+    fn result_refused_with_inconsistent_usage_is_ambiguous() {
+        parse_reply(
+            result_refused_reply(serde_json::json!({
+                "input": 3, "output": 2, "cacheRead": 1, "cacheWrite": 0, "totalTokens": 99
+            }))
+            .as_bytes(),
+        )
+        .expect_err("an inconsistent usage must be refused");
+    }
 }

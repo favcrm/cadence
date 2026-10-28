@@ -1292,6 +1292,36 @@ pub(crate) struct NativeUsageObservationV1 {
 }
 
 impl NativeUsageObservationV1 {
+    /// The child's `usage` object for a result_refused outcome: five safe
+    /// integers that reconcile, with no assistant content.
+    pub(crate) fn parse(value: &Value) -> Result<Self> {
+        let m = strict::object_with(
+            value,
+            &["input", "output", "cacheRead", "cacheWrite", "totalTokens"],
+            &[],
+        )?;
+        let input = strict::safe_u64(m, "input")?;
+        let output = strict::safe_u64(m, "output")?;
+        let cache_read = strict::safe_u64(m, "cacheRead")?;
+        let cache_write = strict::safe_u64(m, "cacheWrite")?;
+        let total = strict::safe_u64(m, "totalTokens")?;
+        let sum = input
+            .checked_add(output)
+            .and_then(|v| v.checked_add(cache_read))
+            .and_then(|v| v.checked_add(cache_write))
+            .ok_or_else(invalid)?;
+        if sum != total {
+            return Err(invalid());
+        }
+        Ok(Self {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            total,
+        })
+    }
+
     pub(crate) fn from_assistant(assistant: &NativeAssistantV1) -> Option<Self> {
         let usage = &assistant.usage;
         let sum = usage

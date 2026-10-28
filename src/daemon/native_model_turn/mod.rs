@@ -1266,6 +1266,30 @@ impl NativeModelBroker {
                 let _ = configuration;
                 receipt(&row)
             }
+            sdk::ChildOutcome::ResultRefused { usage, error, .. } => {
+                // The child screened its own output against the minted token:
+                // the inference really ran and consumed usage, but no
+                // assistant content is persisted or projected.
+                let row = shared.store.write_tx(|tx| {
+                    let row = durable::request_in(tx, &request_id)?
+                        .ok_or_else(|| refused("invalid_request", "the request is unknown"))?;
+                    durable::settle_request_in(
+                        tx,
+                        &row,
+                        durable::STATE_RESULT_REFUSED,
+                        None,
+                        Some(usage.to_json().to_string().as_str()),
+                        Some(error.to_json().to_string().as_str()),
+                        &billing.to_json().to_string(),
+                        auth_requests,
+                        inference_requests,
+                        now,
+                    )?;
+                    durable::request_in(tx, &request_id)?
+                        .ok_or_else(|| Error::internal("the request vanished"))
+                })?;
+                receipt(&row)
+            }
             sdk::ChildOutcome::Refused { error, .. } => {
                 let row = if auth_requests > 0 {
                     // A known, complete authentication failure is not a
