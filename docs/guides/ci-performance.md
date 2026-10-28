@@ -58,7 +58,7 @@ with `?key=v0-rust-<key>` — then let the next main push re-write it.
 and the default `cargo build --locked`. The test profile's dependency
 optimization differs from dev, so a test-only warm cache does not cover the
 second build. Producer and restore-only consumers share
-`cross-dual1-${{ matrix.target }}`; bump that epoch together when changing
+`cross-dual2-${{ matrix.target }}`; bump that epoch together when changing
 the warm inputs. Failed warm jobs do not save partial entries under the new
 immutable key. Main remains the only writer; native tests and builds still
 run on PRs and merge groups.

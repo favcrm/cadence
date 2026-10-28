@@ -87,12 +87,14 @@ jobs:
           retention-days: 14
 
   # CAD-926: rust-cache scope. Only `cache-warm` (push to main) SAVES the gate
-  # profiles' caches, under the shared keys gate-test-ld1, gate-release and
-  # gate-clippy (CAD-1493: -ldN is the linker/fingerprint epoch — bump it when
-  # a flag flips; rust-cache never overwrites an existing key). Every
-  # pull_request / merge_group gate job restores the same key and passes
-  # `save-if: false`: a queue ref saved ~1.4 GB per run that no other ref
-  # could read, and the repo sat at 12.7 GB against a 10 GB limit.
+  # profiles' caches, under the shared keys gate-test-ld2, gate-release,
+  # gc2 and gate-release-full (CAD-1493: bump fingerprint epochs when flags
+  # change; rust-cache never overwrites an existing key). CAD-1684 updated
+  # the test and clippy epochs for the dependency debuginfo change.
+  # Every pull_request / merge_group gate job
+  # restores the same key and passes `save-if: false`: a queue ref saved
+  # ~1.4 GB per run that no other ref could read, and the repo sat at 12.7 GB
+  # against a 10 GB limit.
   # release-artifact and release-build keep their own default-keyed caches
   # (they run on main pushes and tags only). cross-build restores the
   # per-target cross-* keys its own cache-warm legs write — restore-only
@@ -313,7 +315,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         with:
-          shared-key: gate-clippy
+          shared-key: gc2
           save-if: false
       - run: cargo clippy --all-targets --locked -- -D warnings
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
@@ -352,7 +354,7 @@ jobs:
           # CAD-1493: key version carries the linker/fingerprint epoch —
           # bump -ldN when a flag flips so the warm leg writes fresh
           # artifacts instead of skipping an existing stale key.
-          shared-key: gate-test-ld1
+          shared-key: gate-test-ld2
           save-if: false
       # CAD-1487: linking dominated a shard while every tests/*.rs file was
       # its own executable; CAD-1727 collapsed them into the one `suite`
@@ -673,8 +675,8 @@ jobs:
   # Nothing `needs` it and it never fails the run.
   # CAD-926: it is also the ONLY saver of the gate jobs' rust-cache. One leg
   # per profile, each with its own target dir and the shared key the gates
-  # restore (gate-test-ld1: test; gate-release: build + ui;
-  # gate-clippy: clippy). The rust-cache step precedes `ci-sccache enable`
+  # restore (gate-test-ld2: test; gate-release: build + ui;
+  # gc2: clippy). The rust-cache step precedes `ci-sccache enable`
   # exactly as in the gates, because the cache key hashes RUST* env vars and
   # enable exports RUSTC_WRAPPER. The builds run without sccache too (the saved
   # target dir is the point), but are skipped when the exact cache key already
@@ -695,9 +697,9 @@ jobs:
       - id: cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # CAD-1493: the test leg's key carries the fingerprint epoch that
-          # the gate reads (gate-test-ld1); release/clippy stay unversioned.
-          shared-key: gate-${{ matrix.profile }}${{ matrix.profile == 'test' && '-ld1' || '' }}
+          # CAD-1493: test and clippy carry fingerprint epochs; release stays
+          # unversioned. Keep these keys aligned with the gate consumers.
+          shared-key: ${{ matrix.profile == 'clippy' && 'gc2' || format('gate-{0}', matrix.profile) }}${{ matrix.profile == 'test' && '-ld2' || '' }}
           # A lint or test failure on main must not freeze the refresh.
           cache-on-failure: true
       # The clippy leg has no sccache: clippy-driver calls are not cacheable
@@ -777,7 +779,7 @@ jobs:
       - id: cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cross-dual1-${{ matrix.target }}
+          shared-key: cross-dual2-${{ matrix.target }}
       - name: Warm the cross-build test and dev profiles
         if: steps.cache.outputs.cache-hit != 'true'
         env:
@@ -1732,7 +1734,7 @@ jobs:
       # Keep the epoch aligned with cache-warm-cross; only main saves it.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cross-dual1-${{ matrix.target }}
+          shared-key: cross-dual2-${{ matrix.target }}
           save-if: false
       # The acceptance links CARGO_BIN_EXE_cadence, so `cargo test` builds
       # the binary too; run it first and let `cargo build` verify the
