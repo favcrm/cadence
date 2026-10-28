@@ -74,9 +74,9 @@ pub mod pi_policy;
 pub mod platform;
 pub mod proc;
 pub(crate) mod protected_pi_profile;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod protected_runtime;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 #[path = "protected_runtime_stub.rs"]
 pub mod protected_runtime;
 pub mod proto;

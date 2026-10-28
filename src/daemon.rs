@@ -265,7 +265,7 @@ mod explorer_acceptance;
 mod hire_rpc;
 mod idea_rpc;
 mod identity;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod installer_client;
 pub(crate) mod installer_enrollment_wire;
 mod lane_relaunch;
