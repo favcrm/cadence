@@ -107,12 +107,14 @@ new ConditionalGet((input, init) => fetch(input, init), () => `${sessionKey() ??
 //#endregion
 //#region src/features/workspace-apps/screen/screenProtocol.ts
 /** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the
-*  port. `call` verbs never spend or publish: the install's own config and
-*  drafts, and the user's own follow-ups to an approved post (reschedule,
-*  cancel), run directly. Every approval is a host-drawn slot: confirm for
-*  publish-now and schedule for a scheduled post (the scheduler sends it with
-*  no later confirm). Every spend, publish or custody verb is a `slot` verb
-*  and waits for a tap on a host-drawn button. */
+*  port. `call` verbs run directly: the install's own config and drafts, and
+*  (CAD-1918, operator decision) the app's own publish confirmation and
+*  schedule — the human's press inside the app is the one approval, bound by
+*  the operator session, the host-held action token and the install-bound
+*  stored effect. `slot` verbs wait for a tap on a host-drawn button: a run
+*  start, the original download and the image picker. Confirm and schedule
+*  also stay slot verbs until every installed app sends them as calls
+*  (Social Content 0.12.10 still sends slots). */
 var CALL_VERBS = [
 	"read.run",
 	"context.defaults.save",
@@ -130,6 +132,8 @@ var CALL_VERBS = [
 	"social.destinations.list",
 	"publish.destination.use",
 	"publish.settings.save",
+	"publish.draft.confirm",
+	"publish.draft.schedule",
 	"publish.draft.reschedule",
 	"publish.draft.cancel",
 	"media.read",
@@ -158,7 +162,7 @@ var MEDIA_VERBS = [
 /** The verbs a screen.v2 PUSH advertises in `actions` — media verbs are
 *  deliberately absent; the channel appends a mount's declared media
 *  rights itself. */
-var ACTION_VERBS = [...CALL_VERBS.filter((v) => !MEDIA_VERBS.includes(v)), ...SLOT_VERBS.filter((v) => v !== ORIGINAL_DOWNLOAD_VERB)];
+var ACTION_VERBS = [.../* @__PURE__ */ new Set([...CALL_VERBS.filter((v) => !MEDIA_VERBS.includes(v)), ...SLOT_VERBS.filter((v) => v !== ORIGINAL_DOWNLOAD_VERB)])];
 var RECORD_CALL_VERBS = [
 	"records.list",
 	"records.show",
@@ -802,7 +806,7 @@ function screenProjection(installation, tag, contextId, contexts, runs, effects,
 //#region scripts/app-fixtures/producer.ts
 var MAX_INPUT = 1048576;
 var MAX_OUTPUT = 8388608;
-var CONTRACT = "app-screen-projection-fixtures/6";
+var CONTRACT = "app-screen-projection-fixtures/7";
 var NOW = 1799999e3;
 var SCENARIOS = [
 	"empty",
