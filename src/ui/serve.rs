@@ -2109,8 +2109,30 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, err_response(400, &e.to_string()));
                     return;
                 }
-                let (mems, errors) = crate::memory::load_all_report(&pm.dir);
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(resp)) => {
+                        send(request, resp);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                let readable = super::project_policy::readable(&pm, &actor);
                 let projects = project::list(&pm.dir).unwrap_or_default();
+                let mut mems = Vec::new();
+                let mut errors = Vec::new();
+                for selected in projects.iter().filter(|p| readable.contains(&p.key)) {
+                    let (project_memories, project_errors) =
+                        crate::memory::load_project_report(&pm.dir, &selected.key);
+                    mems.extend(project_memories);
+                    errors.extend(project_errors);
+                }
                 let payload: Vec<Value> =
                     mems.iter()
                         .filter(|m| {
@@ -2466,7 +2488,32 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, err_response(400, "bad memory path"));
                     return;
                 }
-                match Pm::at(pm_dir).and_then(|pm| crate::memory::find(&pm, Some(key), slug)) {
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(resp)) => {
+                        send(request, resp);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                let pm = match Pm::at(pm_dir) {
+                    Ok(pm) => pm,
+                    Err(e) => {
+                        send(request, err_response(503, &e.to_string()));
+                        return;
+                    }
+                };
+                if !super::project_policy::readable(&pm, &actor).contains(key) {
+                    send(request, err_response(404, "Unknown memory"));
+                    return;
+                }
+                match crate::memory::find(&pm, Some(key), slug) {
                     Ok((proj, m)) => {
                         let fresh = crate::memory::Freshness::for_project(Some(&proj));
                         send(
@@ -2474,7 +2521,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                             json_response(crate::memory::detail_json(&m, &fresh)),
                         )
                     }
-                    Err(e) => send(request, err_response(404, &e.to_string())),
+                    Err(_) => send(request, err_response(404, "Unknown memory")),
                 }
                 return;
             }
