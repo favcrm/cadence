@@ -1256,14 +1256,6 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: ConnectionAction,
     },
-    /// CAD-1853: one explicit connection to a real cloud conversational
-    /// agent. Distinct from `agent connect` (hosted local pickup); it does
-    /// not export credentials, install MCP or change the tenant.
-    #[command(name = "cloud-agent", visible_alias = "cloud")]
-    CloudAgent {
-        #[command(subcommand)]
-        action: CloudAgentAction,
-    },
     /// Platform accounts (ADR 0006): the operator enrolls, rotates and
     /// revokes scoped credentials, grants agents scopes and sets
     /// per-project defaults; an agent reads only its own grants and

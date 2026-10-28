@@ -654,7 +654,7 @@ impl Shared {
                 Error::Rejected(_) => Error::gate_coded(
                     "cloud_agent_peer_credential_required",
                     "this peer source has no enrolled cloud-purpose credential under this \
-                     verified owner; the operator must run `cloud-agent enroll-peer` first \
+                     verified owner; the operator must run `agent cloud enroll-peer` first \
                      — nothing was sent",
                 ),
                 other => other,
@@ -1183,8 +1183,8 @@ impl Shared {
                 {
                     return Err(Error::gate_coded(
                         "cloud_agent_consent_required",
-                        "connecting a cloud agent needs explicit assistant consent: pass \
-                         --accept-assistant-consent. A saved cli.write login does not \
+                        "connecting a cloud agent needs explicit assistant consent: \
+                         `agent connect --cloud`. A saved cli.write login does not \
                          authorize paid model turns",
                     ));
                 }

@@ -1305,6 +1305,31 @@ pub(super) fn run(
         return settings::run_remote(&target, action, grant, wake_timeout, local_state.as_deref());
     }
     if let Commands::Agent { action } = &command {
+        // `--cloud` and `agent cloud` talk to the local daemon. A saved
+        // remote org must not send them over the hosted pickup path:
+        // `agent connect` without `--cloud` is that path.
+        match action {
+            AgentAction::Connect {
+                cloud: true,
+                workspace,
+                alias,
+                ..
+            } => {
+                let state = local_state
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(cadence_agent::client::state_dir)?;
+                return cloud_agent::connect(state, workspace.clone(), alias.clone());
+            }
+            AgentAction::Cloud { action } => {
+                let state = local_state
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(cadence_agent::client::state_dir)?;
+                return cloud_agent::run(state, action.clone());
+            }
+            _ => {}
+        }
         if let Some(bridge) = action.bridge() {
             return local_agent::run(&target, &bridge, wake_timeout, local_state);
         }

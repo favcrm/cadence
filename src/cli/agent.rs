@@ -1,5 +1,6 @@
 //! CAD-535: `cadence agent` — moved verbatim from src/main.rs.
 
+use super::cloud_agent;
 use super::local_agent;
 use super::*;
 
@@ -31,7 +32,10 @@ mod bridge_tests {
     fn hosted_bridge_verbs_map_to_the_existing_actions() {
         assert!(matches!(
             AgentAction::Connect {
+                cloud: false,
+                local: false,
                 alias: Some("w".into()),
+                workspace: None,
                 repo: None,
                 name: None,
             }
@@ -543,18 +547,32 @@ pub(crate) enum AgentAction {
         #[arg(long)]
         clear: bool,
     },
-    /// Bind this machine's local actor to the selected hosted org and
-    /// claim queued work. Local execution by definition; `--org` names
-    /// the board, never the placement.
+    /// Bind this machine to a hosted workspace.
+    ///
+    /// `--local` (the default) claims queued work and runs it here.
+    /// `--cloud` connects that workspace's Worker/Pi agent and is the
+    /// consent for paid model turns. A turn is `cadence send <alias>`.
     Connect {
-        /// Local daemon alias that will read the issue.
+        /// Connect the workspace's Worker/Pi agent. Consents to paid
+        /// model turns. The alias defaults to `cloud`.
+        #[arg(long, conflicts_with = "local")]
+        cloud: bool,
+        /// Claim hosted work and run it on this machine. This is the default.
+        #[arg(long, conflicts_with = "cloud")]
+        local: bool,
+        /// Local alias. For `--local`, the actor that reads the issue.
+        /// For `--cloud`, the Threads alias [default: cloud].
         #[arg(long)]
         alias: Option<String>,
+        /// Saved workspace slug for `--cloud`. Defaults to the only saved
+        /// login; required when more than one is saved.
+        #[arg(long, requires = "cloud")]
+        workspace: Option<String>,
         /// Local git checkout. Without it the alias is only saved.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "cloud")]
         repo: Option<PathBuf>,
         /// Lane slug. Defaults to `work`.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "cloud")]
         name: Option<String>,
     },
     /// Keep picking up later assignments until disconnected or interrupted.
@@ -572,6 +590,14 @@ pub(crate) enum AgentAction {
         #[arg(long)]
         cancel: bool,
     },
+    /// Inspect or reconcile a Worker/Pi connection. Connecting is
+    /// `agent connect --cloud`, not a verb here. `--placement cloud` is
+    /// only a list filter. A turn is `cadence send <alias>`.
+    #[command(name = "cloud")]
+    Cloud {
+        #[command(subcommand)]
+        action: cloud_agent::CloudAgentAction,
+    },
 }
 
 impl AgentAction {
@@ -581,7 +607,10 @@ impl AgentAction {
     pub(crate) fn bridge(&self) -> Option<local_agent::LocalAgentAction> {
         use local_agent::LocalAgentAction as L;
         Some(match self {
-            Self::Connect { alias, repo, name } => L::Connect {
+            Self::Connect { cloud: true, .. } => return None,
+            Self::Connect {
+                alias, repo, name, ..
+            } => L::Connect {
                 alias: alias.clone(),
                 repo: repo.clone(),
                 name: name.clone(),
@@ -1015,6 +1044,13 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
                 .collect();
             client::rpc(&state_dir, "agent_restore", json!({"expected": entries}))?
         }
+        AgentAction::Cloud { action } => return cloud_agent::run(state_dir, action),
+        AgentAction::Connect {
+            cloud: true,
+            workspace,
+            alias,
+            ..
+        } => return cloud_agent::connect(state_dir, workspace, alias),
         // Routed before this function by the caller; refused here so a
         // future routing bypass cannot claim locally.
         AgentAction::Connect { .. }

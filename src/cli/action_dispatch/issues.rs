@@ -7,7 +7,6 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         Commands::Org { action } => org::run(action),
         Commands::Issue { action } => issue::run(state_dir, action),
         Commands::Connection { action } => connection::run(state_dir, action),
-        Commands::CloudAgent { action } => cloud_agent::run(state_dir, action),
         Commands::Platform { action } => platform::run(state_dir, action),
         Commands::Idea { action } => idea::run(&state_dir, action),
         Commands::Plan { action } => plan::run(state_dir, action),

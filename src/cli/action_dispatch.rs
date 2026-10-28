@@ -667,7 +667,6 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         Commands::Org { .. }
         | Commands::Issue { .. }
         | Commands::Connection { .. }
-        | Commands::CloudAgent { .. }
         | Commands::Platform { .. }
         | Commands::Idea { .. }
         | Commands::Plan { .. }

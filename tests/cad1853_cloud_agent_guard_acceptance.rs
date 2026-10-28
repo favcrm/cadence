@@ -5892,23 +5892,23 @@ fn user_cli_cloud_agent_connect_uses_workspace_and_creates_one_real_connection()
         .arg("--state-dir")
         .arg(&fx.state)
         .args([
-            "cloud-agent",
+            "agent",
             "connect",
+            "--cloud",
             "--workspace",
             ORG,
             "--alias",
             "cloud-qa",
-            "--accept-assistant-consent",
         ])
         .env("CADENCE_TEST_SEAM", "1")
         .env("CADENCE_TEST_AS", "operator");
     let output =
-        cadence_agent::reaper::output(&mut command).expect("run cadence cloud-agent connect");
+        cadence_agent::reaper::output(&mut command).expect("run cadence agent connect --cloud");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "CLI cloud-agent connect failed: {status:?}\nstdout: {stdout}\nstderr: {stderr}",
+        "CLI agent connect --cloud failed: {status:?}\nstdout: {stdout}\nstderr: {stderr}",
         status = output.status
     );
     assert!(

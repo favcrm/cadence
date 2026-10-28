@@ -1814,3 +1814,58 @@ fn duplicate_dispatch_names_the_existing_message_and_state() {
     let fresh = json!({"duplicate": false, "message": "cadence-dispatch:t1:r1"});
     assert_eq!(super::job::duplicate_dispatch_line(&fresh), None);
 }
+
+/// CAD-1894: the cloud connection is `agent cloud`, not a top-level command.
+#[test]
+fn cloud_connection_lives_under_agent() {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    assert!(
+        cmd.find_subcommand("cloud-agent").is_none(),
+        "cloud-agent is not a top-level command"
+    );
+    assert!(
+        cmd.find_subcommand("cloud").is_none(),
+        "cloud is not a top-level command"
+    );
+    let help = cmd
+        .find_subcommand_mut("agent")
+        .expect("agent")
+        .find_subcommand_mut("cloud")
+        .expect("agent cloud")
+        .render_help()
+        .to_string();
+    for verb in [
+        "ls",
+        "show",
+        "send",
+        "enroll-peer",
+        "read",
+        "cancel",
+        "disconnect",
+    ] {
+        assert!(
+            help.contains(verb),
+            "agent cloud help omits {verb}:\n{help}"
+        );
+    }
+    assert!(
+        cmd.find_subcommand_mut("agent")
+            .expect("agent")
+            .find_subcommand_mut("cloud")
+            .expect("agent cloud")
+            .find_subcommand("connect")
+            .is_none(),
+        "connecting is agent connect --cloud"
+    );
+    let connect = Cli::command()
+        .find_subcommand_mut("agent")
+        .expect("agent")
+        .find_subcommand_mut("connect")
+        .expect("agent connect")
+        .render_help()
+        .to_string();
+    assert!(connect.contains("--cloud"), "{connect}");
+    assert!(connect.contains("--local"), "{connect}");
+    assert!(!connect.contains("accept-assistant-consent"), "{connect}");
+}
