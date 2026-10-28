@@ -815,6 +815,10 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=20", [])?;
                 tx.commit()?;
             }
+            // migration-lint: allow 21 -- CAD-1085: name the insert's two
+            // columns so a store that already carries the v59 dispatch
+            // additions re-migrates; the inserted values and meaning are
+            // unchanged.
             if version < 21 {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 let mut statement = tx.prepare("PRAGMA table_info(platform_credentials)")?;
