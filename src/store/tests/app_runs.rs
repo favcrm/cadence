@@ -1588,6 +1588,10 @@ fn cad1887_proposed_steps_parser_keeps_only_the_section() {
 fn cad1887_disposition_accepts_one_proposal_and_tickets_only_with_two() {
     let (_dir, s, id, artifact, digest) = reviewed_text_run(ONE_PROPOSAL);
     assert!(s.app_run_show(&id).unwrap()["disposition"].is_null());
+    let upgrade_before = s
+        .app_install_upgrade_ready("install-1")
+        .err()
+        .map(|e| e.to_string());
     let accepted = s
         .app_run_disposition(&id, "decision-1", &artifact, &digest, "accept", None)
         .unwrap();
@@ -1597,10 +1601,6 @@ fn cad1887_disposition_accepts_one_proposal_and_tickets_only_with_two() {
         .app_run_ticket_reserve(&id, "ticket-1", &artifact, &digest, 1, None)
         .unwrap_err();
     assert!(err.to_string().contains("at least two"), "{err}");
-    let upgrade_before = s
-        .app_install_upgrade_ready("install-1")
-        .err()
-        .map(|e| e.to_string());
     let upgrade_after = s
         .app_install_upgrade_ready("install-1")
         .err()
@@ -1736,4 +1736,58 @@ fn cad1887_one_selected_ticket_survives_restart_and_refuses_the_rest() {
     assert_eq!(shown["disposition"]["decision"], "accept");
     assert_eq!(shown["ticket"]["issue_id"], "CAD-1887");
     assert_eq!(shown["ticket"]["index"], 1);
+}
+
+/// A human receipt uses `request_id` for the operation UUID. The caller's
+/// idempotency id has to survive under another field, or a board-owner
+/// audit cannot be tied back to the decision or ticket request.
+#[test]
+fn cad1887_human_receipt_keeps_the_caller_request_id() {
+    let (_dir, s, id, artifact, digest) = reviewed_text_run(TWO_PROPOSALS);
+    let human = json!({
+        "sub": "operator-1",
+        "company": "acme",
+        "session": "session-1",
+        "role": "operator",
+        "display": "Operator",
+    });
+    s.app_run_disposition(
+        &id,
+        "decision-1",
+        &artifact,
+        &digest,
+        "accept",
+        Some(&human),
+    )
+    .unwrap();
+    s.app_run_ticket_reserve(&id, "ticket-1", &artifact, &digest, 1, Some(&human))
+        .unwrap();
+    s.app_run_ticket_bind(&id, "ticket-1", "CAD-1887", Some(&human))
+        .unwrap();
+    for (kind, caller_id) in [
+        ("app_run_disposition_recorded", "decision-1"),
+        ("app_run_ticket_reserved", "ticket-1"),
+        ("app_run_ticket_bound", "ticket-1"),
+    ] {
+        let raw: String = s
+            .conn()
+            .query_row(
+                "SELECT payload FROM events WHERE alias=?1 AND kind=?2",
+                [crate::store::app_runs::APP_RUN_APPROVAL_STREAM, kind],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: serde_json::Value = raw.parse().unwrap();
+        assert_eq!(
+            payload["decision_request_id"], caller_id,
+            "{kind}: {payload}"
+        );
+        assert_eq!(
+            payload["request_id"], payload["correlation_id"],
+            "{kind}: {payload}"
+        );
+        assert_ne!(payload["request_id"], caller_id, "{kind}: {payload}");
+        uuid::Uuid::parse_str(payload["request_id"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["human"]["sub"], "operator-1", "{kind}");
+    }
 }

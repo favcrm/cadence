@@ -3131,7 +3131,10 @@ impl Store {
                 human_receipt(
                     json!({
                         "run_id": run_id,
-                        "request_id": request_id,
+                        // CAD-1374 owns `request_id` on a human receipt: it
+                        // is the operation UUID. The caller's idempotency
+                        // id is kept beside it.
+                        "decision_request_id": request_id,
                         "artifact_id": artifact_id,
                         "digest": digest,
                         "decision": decision,
@@ -3242,7 +3245,7 @@ impl Store {
                 human_receipt(
                     json!({
                         "run_id": run_id,
-                        "request_id": request_id,
+                        "decision_request_id": request_id,
                         "artifact_id": artifact_id,
                         "digest": digest,
                         "index": index,
@@ -3321,7 +3324,7 @@ impl Store {
                 human_receipt(
                     json!({
                         "run_id": run_id,
-                        "request_id": request_id,
+                        "decision_request_id": request_id,
                         "issue_id": issue_id,
                         "digest": row.artifact_digest,
                         "by": "operator",
