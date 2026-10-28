@@ -151,22 +151,9 @@ pub fn artifact_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 pub fn material_digest(value: &Value) -> String {
-    // serde_json's default Map is ordered; rebuilding explicitly also fixes
-    // behavior if preserve_order is enabled by another dependency later.
-    fn canonical(value: &Value) -> Value {
-        match value {
-            Value::Object(fields) => {
-                let ordered: BTreeMap<_, _> = fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), canonical(v)))
-                    .collect();
-                Value::Object(ordered.into_iter().collect())
-            }
-            Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
-            other => other.clone(),
-        }
-    }
-    artifact_digest(format!("cadence-app-material-v1\n{}", canonical(value)).as_bytes())
+    // The canonicalisation is shared with every host: cadence-core's
+    // `material` is the one definition of the bytes a digest covers.
+    artifact_digest(cadence_core::material::material(value).as_bytes())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

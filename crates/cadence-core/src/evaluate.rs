@@ -8,6 +8,7 @@
 use crate::app_compat::parse_requires;
 use crate::frontmatter::split_front;
 use crate::issue::{self, ReadinessInput, ReadinessValue, ValidateInput, ValidateValue};
+use crate::works::{self, Decision, Draft, State, Violation};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -63,6 +64,15 @@ pub enum Operation {
     /// Whether an issue is ready or blocked, given its blockers' statuses.
     #[serde(rename = "issue.readiness")]
     IssueReadiness(ReadinessInput),
+    /// Validate a Works draft's kind, title, tags and closed content payload.
+    #[serde(rename = "works.draft.validate")]
+    WorksDraftValidate(DraftInput),
+    /// Whether a Works review may be recorded for a revision.
+    #[serde(rename = "works.review.check")]
+    WorksReviewCheck(ReviewInput),
+    /// Whether a Works revision is approved material a host may export.
+    #[serde(rename = "works.export.check")]
+    WorksExportCheck(ExportInput),
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -76,6 +86,256 @@ pub struct ManifestPreflightInput {
 #[derive(Serialize, JsonSchema)]
 pub struct ManifestPreflightValue {}
 
+/// One optional draft field. Absent and JSON `null` are different to the
+/// native create: an absent `content` refuses as missing while an explicit
+/// `null` refuses as "not an object". `Option<Value>` collapses both into
+/// `None`, so presence is tracked explicitly and no dependency is added.
+#[derive(Clone, Debug, Default)]
+pub enum Field {
+    #[default]
+    Absent,
+    Present(Value),
+}
+
+impl<'de> Deserialize<'de> for Field {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Value::deserialize(deserializer).map(Field::Present)
+    }
+}
+
+/// Input of `works.draft.validate`: the fields a Works create parses. They
+/// stay untyped so a wrong type reaches the same refusal a native caller gets
+/// instead of failing envelope decoding.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DraftInput {
+    #[serde(default)]
+    #[schemars(with = "Option<Value>")]
+    pub kind: Field,
+    #[serde(default)]
+    #[schemars(with = "Option<Value>")]
+    pub title: Field,
+    #[serde(default)]
+    #[schemars(with = "Option<Value>")]
+    pub content: Field,
+    /// Optional; an absent or null value means no tags.
+    #[serde(default)]
+    #[schemars(with = "Option<Value>")]
+    pub tags: Field,
+}
+
+impl DraftInput {
+    /// The create parameters the shared grammar parses, with absent fields
+    /// still absent and an explicit `null` still present.
+    fn params(&self) -> Value {
+        let mut params = serde_json::Map::new();
+        for (key, field) in [
+            ("kind", &self.kind),
+            ("title", &self.title),
+            ("content", &self.content),
+            ("tags", &self.tags),
+        ] {
+            if let Field::Present(value) = field {
+                params.insert(key.to_string(), value.clone());
+            }
+        }
+        Value::Object(params)
+    }
+}
+
+/// One refused Works domain step, in the native wire shape.
+#[derive(Serialize, JsonSchema)]
+pub struct WorksRefusal {
+    /// `rejected` or `conflict`.
+    pub kind: String,
+    /// `invalid` | `conflict` | `forbidden` | `not_found` | `needs_review`.
+    pub code: String,
+    pub message: String,
+}
+
+impl From<Violation> for WorksRefusal {
+    fn from(violation: Violation) -> Self {
+        Self {
+            kind: violation.kind.into(),
+            code: violation.code.into(),
+            message: violation.message,
+        }
+    }
+}
+
+/// Success value of `works.draft.validate`. The two material fields are the
+/// exact bytes a host hashes: a revision's `contentDigest` is `sha256:` plus
+/// the hex SHA-256 of the UTF-8 `content_material` bytes, and
+/// `payload_material` also covers tags.
+#[derive(Serialize, JsonSchema)]
+pub struct DraftValue {
+    pub valid: bool,
+    /// The normalized kind, present only when the draft is valid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The trimmed title, present only when the draft is valid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Tags after trimming and de-duplication, present only when valid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_material: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_material: Option<String>,
+    pub refusals: Vec<WorksRefusal>,
+}
+
+/// The stored state a Works operation must judge; the host proves it.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewInput {
+    /// The item's current revision.
+    pub current: i64,
+    /// The revision under review.
+    pub revision: i64,
+    /// `none` | `pending` | `approved` | `changes_requested`.
+    pub review_status: String,
+    /// The revision a pending review was requested for.
+    pub pending: Option<i64>,
+    /// Whether the record is trashed. Trash state does not clear a pending
+    /// review, so a review of a trashed record must refuse as missing — the
+    /// host proves this value, it is not a caller claim.
+    pub trashed: bool,
+    /// The stored author of the revision.
+    pub author: String,
+    /// The verified human presenting the decision.
+    pub reviewer: String,
+    /// `approve` or `changes`.
+    pub decision: String,
+    pub note: Option<String>,
+}
+
+/// Success value of `works.review.check`: the state the host must write.
+#[derive(Serialize, JsonSchema)]
+pub struct ReviewValue {
+    pub allowed: bool,
+    /// `approved` or `changes_requested`; absent when refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_status: Option<String>,
+    /// The revision an approval records; absent when refused, or for
+    /// `changes`, which leaves the stored reviewed revision unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_revision: Option<i64>,
+    pub refusals: Vec<WorksRefusal>,
+}
+
+/// Input of `works.export.check`: the stored state plus the requested format.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExportInput {
+    pub current: i64,
+    pub revision: i64,
+    pub review_status: String,
+    /// The revision the last approval covered; `0` before any approval.
+    pub reviewed: i64,
+    pub trashed: bool,
+    /// The host's export format, required, non-blank and bounded.
+    pub format: String,
+}
+
+/// Success value of `works.export.check`.
+#[derive(Serialize, JsonSchema)]
+pub struct ExportValue {
+    pub allowed: bool,
+    /// `draft` | `edited` | `reviewed`.
+    pub review_state: String,
+    /// `ready` | `blocked`.
+    pub export_state: String,
+    /// The card's export explanation for this state.
+    pub reason: String,
+    pub refusals: Vec<WorksRefusal>,
+}
+
+pub fn draft_validate(input: &DraftInput) -> DraftValue {
+    match Draft::parse(&input.params()) {
+        Ok(draft) => DraftValue {
+            valid: true,
+            content_material: Some(draft.content_material()),
+            payload_material: Some(draft.payload_material()),
+            kind: Some(draft.kind),
+            title: Some(draft.title),
+            tags: Some(draft.tags),
+            refusals: Vec::new(),
+        },
+        Err(violation) => DraftValue {
+            valid: false,
+            kind: None,
+            title: None,
+            tags: None,
+            content_material: None,
+            payload_material: None,
+            refusals: vec![violation.into()],
+        },
+    }
+}
+
+pub fn review_check(input: &ReviewInput) -> ReviewValue {
+    // The review gate reads current, review_status, pending and trash state;
+    // `reviewed` is not part of it.
+    let state = State {
+        current: input.current,
+        reviewed: 0,
+        review_status: &input.review_status,
+        pending: input.pending,
+        trashed: input.trashed,
+    };
+    let admitted = works::review_decision(&input.decision, input.note.as_deref())
+        .and_then(|decision| works::review(&state, input.revision).map(|()| decision))
+        .and_then(|decision| works::reviewer(&input.author, &input.reviewer).map(|()| decision));
+    match admitted {
+        Ok(Decision::Approve) => ReviewValue {
+            allowed: true,
+            review_status: Some(Decision::Approve.status().into()),
+            reviewed_revision: Some(input.revision),
+            refusals: Vec::new(),
+        },
+        Ok(Decision::Changes) => ReviewValue {
+            allowed: true,
+            review_status: Some(Decision::Changes.status().into()),
+            reviewed_revision: None,
+            refusals: Vec::new(),
+        },
+        Err(violation) => ReviewValue {
+            allowed: false,
+            review_status: None,
+            reviewed_revision: None,
+            refusals: vec![violation.into()],
+        },
+    }
+}
+
+pub fn export_check(input: &ExportInput) -> ExportValue {
+    let state = State {
+        current: input.current,
+        reviewed: input.reviewed,
+        review_status: &input.review_status,
+        pending: None,
+        trashed: input.trashed,
+    };
+    let admitted =
+        works::check_format(&input.format).and_then(|()| works::export(&state, input.revision));
+    ExportValue {
+        allowed: admitted.is_ok(),
+        review_state: works::review_state(&state).into(),
+        export_state: if works::export_state(&state) {
+            "ready".into()
+        } else {
+            "blocked".into()
+        },
+        reason: works::export_reason(&state).into(),
+        refusals: admitted.err().map(|v| vec![v.into()]).unwrap_or_default(),
+    }
+}
+
 /// The success value of whichever operation ran, keyed by the echoed `op`.
 #[derive(Serialize, JsonSchema)]
 #[serde(tag = "op", content = "value")]
@@ -86,6 +346,12 @@ pub enum OpValue {
     Validate(ValidateValue),
     #[serde(rename = "issue.readiness")]
     Readiness(ReadinessValue),
+    #[serde(rename = "works.draft.validate")]
+    Draft(DraftValue),
+    #[serde(rename = "works.review.check")]
+    Review(ReviewValue),
+    #[serde(rename = "works.export.check")]
+    Export(ExportValue),
 }
 
 /// Success response.
@@ -172,6 +438,9 @@ fn dispatch(input: &[u8]) -> Result<OpValue, Refusal> {
         }
         Operation::IssueValidate(input) => Ok(OpValue::Validate(issue::validate(&input))),
         Operation::IssueReadiness(input) => Ok(OpValue::Readiness(issue::readiness(&input))),
+        Operation::WorksDraftValidate(input) => Ok(OpValue::Draft(draft_validate(&input))),
+        Operation::WorksReviewCheck(input) => Ok(OpValue::Review(review_check(&input))),
+        Operation::WorksExportCheck(input) => Ok(OpValue::Export(export_check(&input))),
     }
 }
 

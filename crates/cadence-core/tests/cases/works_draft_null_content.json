@@ -1,0 +1,25 @@
+{
+  "input": {
+    "v": 1,
+    "op": "works.draft.validate",
+    "input": {
+      "kind": "doc",
+      "title": "Retention",
+      "content": null
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "works.draft.validate",
+    "value": {
+      "valid": false,
+      "refusals": [
+        {
+          "kind": "rejected",
+          "code": "invalid",
+          "message": "works content must be an object"
+        }
+      ]
+    }
+  }
+}

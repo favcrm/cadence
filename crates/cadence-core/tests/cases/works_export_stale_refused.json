@@ -1,0 +1,31 @@
+{
+  "input": {
+    "v": 1,
+    "op": "works.export.check",
+    "input": {
+      "current": 3,
+      "revision": 2,
+      "review_status": "approved",
+      "reviewed": 2,
+      "trashed": false,
+      "format": "pdf"
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "works.export.check",
+    "value": {
+      "allowed": false,
+      "review_state": "edited",
+      "export_state": "blocked",
+      "reason": "Export is blocked until the current revision is reviewed.",
+      "refusals": [
+        {
+          "kind": "rejected",
+          "code": "needs_review",
+          "message": "only the current revision can be exported"
+        }
+      ]
+    }
+  }
+}
