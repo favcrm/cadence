@@ -2830,6 +2830,7 @@ fn login_browser_with(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn login_device_flow(
     issuer: &str,
     org: Option<&str>,
