@@ -529,10 +529,12 @@ fn present_secret<'de, D>(de: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    match Option::<serde_json::Value>::deserialize(de)? {
-        None => Ok(None),
-        Some(serde_json::Value::String(text)) => Ok(Some(text)),
-        Some(_) => Err(serde::de::Error::custom("the credential must be a string")),
+    // A missing field takes `default` (None) without calling this function;
+    // anything present must be a string, so an explicit null is refused
+    // rather than coerced into "no credential".
+    match serde_json::Value::deserialize(de)? {
+        serde_json::Value::String(text) => Ok(Some(text)),
+        _ => Err(serde::de::Error::custom("the credential must be a string")),
     }
 }
 

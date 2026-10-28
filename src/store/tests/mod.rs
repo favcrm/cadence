@@ -409,11 +409,30 @@ fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
     reg(&initialized, "grant-worker", dir.path());
     drop(initialized);
     let db = rusqlite::Connection::open(&path).unwrap();
+    // A genuine v20 store carries none of the CAD-1085 dispatch triggers;
+    // they reference connection_metadata, which this fixture drops.
+    {
+        let mut statement = db
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'cad1085_%'",
+            )
+            .unwrap();
+        let names: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|name| name.unwrap())
+            .collect();
+        drop(statement);
+        for name in names {
+            db.execute_batch(&format!("DROP TRIGGER IF EXISTS {name}"))
+                .unwrap();
+        }
+    }
     db.execute_batch("DROP TABLE platform_credentials;
         CREATE TABLE platform_credentials(platform TEXT NOT NULL,account TEXT NOT NULL,scopes TEXT NOT NULL,fingerprint TEXT NOT NULL,custody TEXT NOT NULL,exchange TEXT NOT NULL,enrolled_at REAL NOT NULL,by TEXT NOT NULL,PRIMARY KEY(platform,account));
         INSERT INTO platform_credentials VALUES('fixture','old-account','[\"widgets:read\"]','old-fingerprint','file','token',1,'operator');
         INSERT INTO platform_credentials VALUES('fixture','second-account','[\"widgets:read\"]','second-fingerprint','file','token',2,'operator');
-        INSERT INTO platform_grants VALUES('grant-worker','fixture','old-account','[\"widgets:read\"]',1,'operator');
+        INSERT INTO platform_grants(agent,platform,account,scopes,granted_at,by) VALUES('grant-worker','fixture','old-account','[\"widgets:read\"]',1,'operator');
         INSERT INTO platform_defaults VALUES('legacy-project','fixture','old-account',1,'operator');
         INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated) VALUES('kept-run','kept-install',1,'digest','{}','digest','grant-worker','kept-request','succeeded',1,1);
         INSERT INTO platform_effects(effect_id,request,agent,platform,account,tool,input,input_summary,preview,scopes,state,staged_at,updated_at) VALUES('kept-effect','kept-effect-request','grant-worker','fixture','old-account','widgets.publish','{}','kept input','kept preview','[\"widgets:publish\"]','verified',1,1);

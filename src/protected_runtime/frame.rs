@@ -125,12 +125,17 @@ mod tests {
         w.write_all(&[b'x'; 80]).unwrap();
         w.write_all(b"\n").unwrap();
         drop(a);
+        // Let the kernel deliver the whole payload so one read sees the
+        // frame and its trailing bytes together; a split read is a timing
+        // artifact, not the refusal this test proves.
+        std::thread::sleep(Duration::from_millis(50));
         assert!(read_frame(&b, Duration::from_secs(1), 32).is_err());
 
         let (a, b) = pair();
         let mut w = &a;
-        w.write_all(b"{} {}\n").unwrap();
+        w.write_all(b"{}\ntrailing").unwrap();
         drop(a);
+        std::thread::sleep(Duration::from_millis(50));
         assert!(read_frame(&b, Duration::from_secs(1), 64).is_err());
     }
 

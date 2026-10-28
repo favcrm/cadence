@@ -362,7 +362,7 @@ pub(crate) fn rotate_source_in(
         .execute_raw(
             "UPDATE native_model_sources SET revision=revision+1,account=?4,origin=?5,\
              origin_kind=?6,catalog_revision=?7,model_uid_map=?8,vault_reference=?9,\
-             key_id=?10,updated_ms=?11 \
+             key_id = ?10,updated_ms = ?11 \
              WHERE workspace_id=?1 AND source_id=?2 AND revision=?3 AND state='active'",
             rusqlite::params![
                 workspace_id,

@@ -619,7 +619,7 @@ fn install_watch(conn: &Connection, watch: &Watch) -> Result<()> {
     // Every source, settings, grant, policy and key input still invalidates it.
     let invalidate_snapshot = match watch.table {
         "native_model_tasks" | "native_model_configurations" | "native_model_requests" => "",
-        _ => "UPDATE connection_metadata SET authorization_revision=authorization_revision+1 WHERE singleton=1;",
+        _ => "UPDATE connection_metadata SET authorization_revision = authorization_revision + 1 WHERE singleton=1;",
     };
     let changed = watch
         .keys
@@ -674,7 +674,7 @@ fn install_authorizing_event_trigger(conn: &Connection) -> Result<()> {
          WHEN NEW.alias='{stream}' AND NEW.kind='{kind}' AND {enabled} BEGIN \
          INSERT INTO connection_authority_changes(table_name,key_json) \
            VALUES('events',json_object('seq',NEW.seq)); \
-         UPDATE connection_metadata SET authorization_revision=authorization_revision+1 WHERE singleton=1; END;",
+         UPDATE connection_metadata SET authorization_revision = authorization_revision + 1 WHERE singleton=1; END;",
         stream = super::events::APPROVAL_STREAM,
         kind = super::events::APP_APPROVED_EVENT,
     ))?;
@@ -712,10 +712,22 @@ pub(super) fn ledger_head_in(conn: &impl StoreConn) -> Result<LedgerHeadV1> {
     if sequence < 0 || epoch <= 0 {
         return Err(int_refusal());
     }
+    // The genesis head is sequence 0 with its epoch-bound canonical digest;
+    // only the first record makes the sequence positive.
+    let sequence_is_zero = sequence == 0;
+    let sequence = if sequence_is_zero {
+        Counter::zero()
+    } else {
+        Counter::new(sequence as u64).map_err(|_| int_refusal())?
+    };
     Ok(LedgerHeadV1 {
-        sequence: Counter::new(sequence as u64).map_err(|_| int_refusal())?,
+        sequence,
         database_epoch: Revision::new(epoch as u64).map_err(|_| int_refusal())?,
-        digest: Digest::try_from(digest).map_err(|_| int_refusal())?,
+        digest: if digest.is_empty() && sequence_is_zero {
+            genesis_ledger_head_v1(Revision::new(epoch as u64).map_err(|_| int_refusal())?).digest
+        } else {
+            Digest::try_from(digest).map_err(|_| int_refusal())?
+        },
     })
 }
 
@@ -980,7 +992,11 @@ pub(crate) fn authority_in(conn: &impl StoreConn) -> Result<Authority> {
         workspace_id,
         database_epoch: Revision::new(database_epoch as u64).map_err(|_| int_refusal())?,
         ledger_head: LedgerHeadV1 {
-            sequence: Counter::new(ledger_sequence as u64).map_err(|_| int_refusal())?,
+            sequence: if ledger_sequence == 0 {
+                Counter::zero()
+            } else {
+                Counter::new(ledger_sequence as u64).map_err(|_| int_refusal())?
+            },
             database_epoch: Revision::new(database_epoch as u64).map_err(|_| int_refusal())?,
             digest: Digest::try_from(ledger_digest).map_err(|_| int_refusal())?,
         },

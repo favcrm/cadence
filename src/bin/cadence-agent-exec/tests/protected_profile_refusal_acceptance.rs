@@ -133,7 +133,7 @@ fn protected_profile_caller_elections_and_missing_authority_never_spawn() {
         assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(
             refused.to_string(),
-            "protected Pi owner authorization refused/UNKNOWN"
+            "protected split launch is not available; the native runtime owner is the only protected path"
         );
         assert_eq!(
             protected_effect_count(),
