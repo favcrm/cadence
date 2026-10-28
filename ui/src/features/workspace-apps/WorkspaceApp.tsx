@@ -58,7 +58,7 @@ import { screenFailurePane, type ScreenPaneState } from "./screen/screenFailure"
 import { socialPublish } from "./socialPublish";
 import { supportsSocialContentWorkspace } from "./socialContentSupport";
 import { isUnchangedUpgradeError } from "../explorer/appErrors";
-import { releaseChangesReach, routineRelease } from "../explorer/automaticUpdates";
+import { installConsentAllowsAutomatic, mayApplyAutomatically, recordedPackageSource, releaseChangesReach } from "../explorer/automaticUpdates";
 
 type Section =
   | "Board"
@@ -352,11 +352,11 @@ export default function WorkspaceApp({
   const [upgradeProposal, setUpgradeProposal] = useState<{ source: string; receipt: UpgradeProposal } | null>(null);
   const [automatic, setAutomatic] = useState(false);
   const [automaticReady, setAutomaticReady] = useState(false);
+  const [savingAutomatic, setSavingAutomatic] = useState(false);
   const [armed, setArmed] = useState(false);
   const automaticRef = useRef(false);
-  const upgradeSourceRef = useRef("");
+  const preferenceWrite = useRef(0);
   const autoCheckKey = useRef("");
-  upgradeSourceRef.current = upgradeSource;
   const [outbox, setOutbox] = useState<WorkspaceOutbox | null>(null);
   const [outboxError, setOutboxError] = useState<string | null>(null);
   const [selectedEffectId, setSelectedEffectId] = useState("");
@@ -480,6 +480,8 @@ export default function WorkspaceApp({
     automaticRef.current = false;
     setArmed(false);
     setAutomaticReady(false);
+    preferenceWrite.current += 1;
+    setSavingAutomatic(false);
     autoCheckKey.current = "";
     void appExplorer.automaticUpdates(installId, controller.signal)
       .then((row) => {
@@ -646,8 +648,8 @@ export default function WorkspaceApp({
     setUpgradeProposal(null);
     setActionStatus(t("Update applied."));
   };
-  const recordedUpgradeSource = data?.installation.install_id === installId && data.installation.source?.kind === "git"
-    ? data.installation.source.url ?? ""
+  const recordedUpgradeSource = data?.installation.install_id === installId
+    ? recordedPackageSource(data.installation.source)
     : "";
   useEffect(() => {
     if (!recordedUpgradeSource) return;
@@ -658,8 +660,9 @@ export default function WorkspaceApp({
       if (!armed) autoCheckKey.current = "";
       return;
     }
-    const source = (upgradeSourceRef.current.trim() || recordedUpgradeSource).trim();
+    const source = recordedUpgradeSource.trim();
     if (!source || !data || data.installation.install_id !== installId) return;
+    if (!installConsentAllowsAutomatic(data.installation)) return;
     const key = [installId, source, data.installation.digest, data.installation.catalog_generation].join("\0");
     if (autoCheckKey.current === key || mutationLock.current) return;
     autoCheckKey.current = key;
@@ -677,10 +680,19 @@ export default function WorkspaceApp({
         });
         if (identity.current !== installId || autoCheckKey.current !== key) return;
         setUpgradeProposal({ source, receipt });
-        if (automaticRef.current && routineRelease(receipt)) {
-          await applyReceipt(source, receipt);
-          if (identity.current === installId) await refresh();
-        }
+        if (!mayApplyAutomatically({ checkedSource: source, recordedSource: recordedUpgradeSource, receipt })) return;
+        const [fresh, preference] = await Promise.all([
+          workspaceApps.detail(installId),
+          appExplorer.automaticUpdates(installId),
+        ]);
+        if (
+          identity.current !== installId ||
+          autoCheckKey.current !== key ||
+          !preference.automatic ||
+          !installConsentAllowsAutomatic(fresh)
+        ) return;
+        await applyReceipt(source, receipt);
+        if (identity.current === installId) await refresh();
       } catch (error) {
         if (identity.current !== installId || autoCheckKey.current !== key || isUnchangedUpgradeError(error)) return;
         if (refused(error)) clearPrivate();
@@ -1442,26 +1454,36 @@ export default function WorkspaceApp({
                         role="switch"
                         aria-checked={automatic}
                         aria-label={t("Automatic updates for {title}").replace("{title}", () => data.installation.title || data.installation.name)}
-                        disabled={!automaticReady || busy}
+                        disabled={!automaticReady || busy || savingAutomatic}
                         onClick={() => {
-                          if (!automaticReady || busy) return;
+                          if (!automaticReady || busy || savingAutomatic) return;
                           const next = !automaticRef.current;
                           const requested = installId;
+                          const confirmed = automaticRef.current;
+                          const write = ++preferenceWrite.current;
+                          setSavingAutomatic(true);
                           setAutomatic(next);
-                          automaticRef.current = next;
+                          if (!next) {
+                            automaticRef.current = false;
+                            setArmed(false);
+                          }
                           void appExplorer.setAutomaticUpdates(requested, next)
                             .then(row => {
-                              if (identity.current !== requested) return;
+                              if (preferenceWrite.current !== write || identity.current !== requested) return;
                               setAutomatic(row.automatic);
                               automaticRef.current = row.automatic;
                               setArmed(row.automatic);
                             })
                             .catch((error: unknown) => {
-                              if (identity.current !== requested) return;
-                              setAutomatic(!next);
-                              automaticRef.current = !next;
+                              if (preferenceWrite.current !== write || identity.current !== requested) return;
+                              setAutomatic(confirmed);
+                              automaticRef.current = confirmed;
+                              setArmed(confirmed);
                               if (refused(error)) clearPrivate();
                               setActionError(message(error));
+                            })
+                            .finally(() => {
+                              if (preferenceWrite.current === write) setSavingAutomatic(false);
                             });
                         }}
                       />
@@ -1484,7 +1506,6 @@ export default function WorkspaceApp({
                           catalogue_resolution: "manual",
                         });
                         setUpgradeProposal({ source, receipt });
-                        if (automaticRef.current && routineRelease(receipt)) await applyReceipt(source, receipt);
                       })}>{t("Check update")}</Button>
                   </div>
                   {upgradeProposal && <div className="wa-stack" aria-live="polite">

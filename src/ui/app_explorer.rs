@@ -165,6 +165,7 @@ pub(super) fn write(
     caller: Option<&operator::Caller>,
     proof_relay: operator::PublicRelay,
     state_dir: &Path,
+    opts: &ServeOpts,
 ) -> HttpResp {
     // No admitted caller, or an agent, never reaches a relay: the member
     // verbs below would otherwise run as the operator.
@@ -184,6 +185,7 @@ pub(super) fn write(
                 &["catalog_id", "expected_digest"],
                 None,
                 proof.as_deref(),
+                None,
             ),
             Err(resp) => resp,
         },
@@ -201,14 +203,22 @@ pub(super) fn write(
             None,
         ),
         WriteAction::AutomaticUpdatesSet => match public_proof(proof_relay) {
-            Ok(proof) => body_rpc_install(
-                request,
-                state_dir,
-                "app_automatic_updates_set",
-                install,
-                &["automatic"],
-                proof.as_deref(),
-            ),
+            Ok(proof) => {
+                let local = if proof.is_none() {
+                    operator::local_operator_proof(request, opts)
+                } else {
+                    None
+                };
+                body_rpc_install(
+                    request,
+                    state_dir,
+                    "app_automatic_updates_set",
+                    install,
+                    &["automatic"],
+                    proof.as_deref(),
+                    local.as_ref(),
+                )
+            }
             Err(resp) => resp,
         },
         WriteAction::RemovePreview => relay(
@@ -225,6 +235,7 @@ pub(super) fn write(
                 install,
                 &["expected_generation", "expected_digest", "request_id"],
                 proof.as_deref(),
+                None,
             ),
             Err(resp) => resp,
         },
@@ -246,6 +257,7 @@ pub(super) fn write(
                 &["install_ids"],
                 member.as_deref(),
                 proof.as_deref(),
+                None,
             ),
             Err(resp) => resp,
         },
@@ -258,6 +270,7 @@ pub(super) fn write(
                 &["install_ids"],
                 None,
                 proof.as_deref(),
+                None,
             ),
             Err(resp) => resp,
         },
@@ -277,6 +290,7 @@ pub(super) fn write(
                 &["catalog_id"],
                 member.as_deref(),
                 proof.as_deref(),
+                None,
             ),
             Err(resp) => resp,
         },
@@ -289,6 +303,7 @@ pub(super) fn write(
                 &["id"],
                 None,
                 proof.as_deref(),
+                None,
             ),
             Err(resp) => resp,
         },
@@ -320,6 +335,7 @@ fn relay_body(
     fields: &[&str],
     member: Option<&str>,
     proof: Option<&str>,
+    local: Option<&operator::LocalOperatorProof>,
 ) -> HttpResp {
     let bytes = match read_body(request, BODY_CAP) {
         Ok(b) => b,
@@ -343,6 +359,11 @@ fn relay_body(
     if let Some(proof) = proof {
         params["public_session"] = json!(proof);
     }
+    if let Some(local) = local {
+        params["session_token"] = json!(local.token);
+        params["session_key"] = json!(local.key);
+        params["session_origin"] = json!(local.origin);
+    }
     match client::rpc(state_dir, method, params) {
         Ok(v) => json_response(v),
         Err(e) => super::home::rpc_err(&e, method),
@@ -356,7 +377,16 @@ fn body_rpc(
     fields: &[&str],
     member: Option<&str>,
 ) -> HttpResp {
-    relay_body(request, state_dir, method, json!({}), fields, member, None)
+    relay_body(
+        request,
+        state_dir,
+        method,
+        json!({}),
+        fields,
+        member,
+        None,
+        None,
+    )
 }
 
 /// Like `body_rpc`, but `install_id` comes from the path, not the
@@ -368,6 +398,7 @@ fn body_rpc_install(
     install_id: &str,
     fields: &[&str],
     proof: Option<&str>,
+    local: Option<&operator::LocalOperatorProof>,
 ) -> HttpResp {
     relay_body(
         request,
@@ -377,6 +408,7 @@ fn body_rpc_install(
         fields,
         None,
         proof,
+        local,
     )
 }
 

@@ -746,7 +746,7 @@ fn explorer_write(
     install: Option<&str>,
 ) -> HttpResp {
     let relay = operator::public_relay(request, opts);
-    app_explorer::write(request, action, install, caller, relay, state_dir)
+    app_explorer::write(request, action, install, caller, relay, state_dir, opts)
 }
 
 /// Seconds a client should wait before retrying a busy daemon.

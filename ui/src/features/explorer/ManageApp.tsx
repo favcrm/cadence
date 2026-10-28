@@ -15,7 +15,7 @@ import { useInstallations } from "../workspace-apps/useInstallations";
 import { installationAppHref } from "../apps/appViewModel";
 import { AppGlyph, useModal } from "./shared";
 import { appErrorCopy, appLoadErrorCopy, isUnchangedUpgradeError } from "./appErrors";
-import { releaseChangesReach, routineRelease } from "./automaticUpdates";
+import { installConsentAllowsAutomatic, mayApplyAutomatically, recordedPackageSource, releaseChangesReach } from "./automaticUpdates";
 import { Loading, Notice } from "../app-shell/shared/States";
 import { useTranslate } from "../../lib/locale";
 import "./explorer.css";
@@ -40,12 +40,12 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
   const [upgradeSource, setUpgradeSource] = useState("");
   const [automatic, setAutomatic] = useState(false);
   const [automaticReady, setAutomaticReady] = useState(false);
+  const [savingAutomatic, setSavingAutomatic] = useState(false);
   const [armed, setArmed] = useState(false);
   const automaticRef = useRef(false);
-  const upgradeSourceRef = useRef("");
+  const preferenceWrite = useRef(0);
   const autoCheckKey = useRef("");
-  const checkRef = useRef<(source: string) => void>(() => {});
-  upgradeSourceRef.current = upgradeSource;
+  const checkRef = useRef<(source: string, mode: "automatic" | "manual") => void>(() => {});
   const [upgradeProposal, setUpgradeProposal] = useState<{
     installId: string;
     source: string;
@@ -89,6 +89,8 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
     automaticRef.current = false;
     setArmed(false);
     setAutomaticReady(false);
+    preferenceWrite.current += 1;
+    setSavingAutomatic(false);
     autoCheckKey.current = "";
     void appExplorer.automaticUpdates(installId, controller.signal)
       .then((row) => {
@@ -110,14 +112,13 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       if (!armed) autoCheckKey.current = "";
       return;
     }
-    if (!inst || inst.removed) return;
-    const recorded = inst.source?.kind === "git" ? inst.source.url ?? "" : "";
-    const source = (upgradeSourceRef.current.trim() || recorded).trim();
+    if (!installConsentAllowsAutomatic(inst)) return;
+    const source = recordedPackageSource(inst.source);
     if (!source) return;
     const key = [installId, source, inst.digest, inst.catalog_generation].join("\0");
     if (autoCheckKey.current === key) return;
     autoCheckKey.current = key;
-    checkRef.current(source);
+    checkRef.current(source, "automatic");
   }, [armed, installId, inst, isOp]);
 
   useEffect(() => {
@@ -241,23 +242,34 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       })
       .finally(() => { if (isCurrentRequest()) setApplying(false); });
   };
-  const checkPackageUpdate = (source = upgradeSource.trim()) => {
+  const checkPackageUpdate = (source: string, mode: "automatic" | "manual") => {
     if (!source) return;
     const requestedInstallId = installId;
     const request = ++checkRequest.current;
     const expectedDigest = inst.digest;
     const expectedGeneration = inst.catalog_generation;
+    const recorded = recordedPackageSource(inst.source);
     const isCurrentRequest = () => currentInstallId.current === requestedInstallId && checkRequest.current === request;
     setChecking(true); setNotice(null); setUpgradeProposal(null);
     void workspaceApps.upgradeCheck(requestedInstallId, {
       source, expected_digest: expectedDigest, expected_generation: expectedGeneration,
       catalogue_resolution: "manual",
     })
-      .then((receipt) => {
+      .then(async (receipt) => {
         if (!isCurrentRequest()) return;
         const proposal = { installId: requestedInstallId, source, expectedDigest, expectedGeneration, receipt };
         setUpgradeProposal(proposal);
-        if (automaticRef.current && routineRelease(receipt)) applyKnown(proposal);
+        // Check update, and any source other than the recorded one, wait
+        // for Apply. Automatic apply re-reads the saved switch and the
+        // install's consent: a stale tab must not turn a revoked app back
+        // on or apply after the switch was turned off.
+        if (mode !== "automatic" || !mayApplyAutomatically({ checkedSource: source, recordedSource: recorded, receipt })) return;
+        const [fresh, preference] = await Promise.all([
+          workspaceApps.detail(requestedInstallId),
+          appExplorer.automaticUpdates(requestedInstallId),
+        ]);
+        if (!isCurrentRequest() || !preference.automatic || !installConsentAllowsAutomatic(fresh)) return;
+        applyKnown(proposal);
       })
       .catch((e: unknown) => {
         if (!isCurrentRequest()) return;
@@ -266,30 +278,42 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       })
       .finally(() => { if (isCurrentRequest()) setChecking(false); });
   };
-  checkRef.current = (source: string) => { checkPackageUpdate(source); };
+  checkRef.current = (source, mode) => { checkPackageUpdate(source, mode); };
   const proposalMatchesCurrent = upgradeProposal != null
     && upgradeProposal.installId === installId
     && upgradeProposal.source === upgradeSource.trim()
     && upgradeProposal.expectedDigest === inst.digest
     && upgradeProposal.expectedGeneration === inst.catalog_generation;
   const toggleAutomatic = () => {
-    if (!automaticReady || removed || checking || applying) return;
+    if (!automaticReady || removed || checking || applying || savingAutomatic) return;
     const next = !automatic;
     const requestedInstallId = installId;
+    const confirmed = automaticRef.current;
+    const write = ++preferenceWrite.current;
+    setSavingAutomatic(true);
     setAutomatic(next);
-    automaticRef.current = next;
+    // Turning it off stops an in-flight automatic apply immediately. Turning
+    // it on does not: the server row is what arms the next check.
+    if (!next) {
+      automaticRef.current = false;
+      setArmed(false);
+    }
     void appExplorer.setAutomaticUpdates(requestedInstallId, next)
       .then((row) => {
-        if (currentInstallId.current !== requestedInstallId) return;
+        if (preferenceWrite.current !== write || currentInstallId.current !== requestedInstallId) return;
         setAutomatic(row.automatic);
         automaticRef.current = row.automatic;
         setArmed(row.automatic);
       })
       .catch((e: unknown) => {
-        if (currentInstallId.current !== requestedInstallId) return;
-        setAutomatic(!next);
-        automaticRef.current = !next;
+        if (preferenceWrite.current !== write || currentInstallId.current !== requestedInstallId) return;
+        setAutomatic(confirmed);
+        automaticRef.current = confirmed;
+        setArmed(confirmed);
         setNotice(appErrorCopy(e, "Automatic updates were not changed. Try again in a moment."));
+      })
+      .finally(() => {
+        if (preferenceWrite.current === write) setSavingAutomatic(false);
       });
   };
 
@@ -321,7 +345,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
               role="switch"
               aria-checked={automatic}
               aria-label={t("Automatic updates for {title}").replace("{title}", () => inst.title)}
-              disabled={!automaticReady || removed || checking || applying}
+              disabled={!automaticReady || removed || checking || applying || savingAutomatic}
               onClick={toggleAutomatic}
             />
           </div>
@@ -337,7 +361,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
               placeholder="/absolute/path or Git URL" autoComplete="off" />
           </label>
           <div className="mt-3">
-            <Button className="btn-sm" disabled={checking || applying || !upgradeSource.trim()} onClick={() => checkPackageUpdate()}>{checking ? t("Checking…") : t("Check update")}</Button>
+            <Button className="btn-sm" disabled={checking || applying || !upgradeSource.trim()} onClick={() => checkPackageUpdate(upgradeSource.trim(), "manual")}>{checking ? t("Checking…") : t("Check update")}</Button>
           </div>
           {proposalMatchesCurrent && upgradeProposal && <div className="mt-3" aria-live="polite">
             <p>{t("Proposed version {version} · {name}").replace("{version}", () => upgradeProposal.receipt.version).replace("{name}", () => upgradeProposal.receipt.name)}</p>

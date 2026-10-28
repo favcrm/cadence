@@ -592,7 +592,14 @@ impl Shared {
             "app_workspace_install_entry" => &["catalog_id", "expected_digest", "public_session"],
             "app_workspace_update_check" => &["install_id"],
             "app_automatic_updates_get" => &["install_id"],
-            "app_automatic_updates_set" => &["install_id", "automatic", "public_session"],
+            "app_automatic_updates_set" => &[
+                "install_id",
+                "automatic",
+                "public_session",
+                "session_token",
+                "session_key",
+                "session_origin",
+            ],
             "app_workspace_remove_preview" => &[
                 "install_id",
                 "expected_generation",
@@ -779,8 +786,8 @@ impl Shared {
                     Some(Value::Bool(value)) => *value,
                     _ => return Err(Error::rejected("automatic must be a boolean")),
                 };
+                self.require_board_person(params)?;
                 self.require_workspace_install(install_id)?;
-                self.explorer_human(params, None)?;
                 self.store.app_automatic_updates_set(install_id, automatic)
             }
             "app_workspace_remove_preview" => {
@@ -905,6 +912,35 @@ impl Shared {
             ));
         }
         Ok(())
+    }
+
+    /// A person at the board, not an operator-shell process. A public
+    /// session names that person. A local or tailnet board relays the
+    /// operator session it read from the cookie. Neither is optional.
+    fn require_board_person(&self, params: &Value) -> Result<()> {
+        if self.explorer_human(params, None)?.is_some() {
+            return Ok(());
+        }
+        let token = params
+            .get("session_token")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if token.is_empty() {
+            return Err(Error::rejected(
+                "automatic updates need a person at the board",
+            ));
+        }
+        let checked = self.rpc_operator_session_check(&json!({
+            "token": token,
+            "key": params.get("session_key").and_then(Value::as_str).unwrap_or(""),
+            "origin": params.get("session_origin").and_then(Value::as_str).unwrap_or(""),
+        }))?;
+        if checked.get("valid") == Some(&Value::Bool(true)) {
+            return Ok(());
+        }
+        Err(Error::rejected(
+            "automatic updates need a person at the board",
+        ))
     }
 
     fn explorer_human(&self, params: &Value, member: Option<&str>) -> Result<Option<Value>> {
