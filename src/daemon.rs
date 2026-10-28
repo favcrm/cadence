@@ -4034,6 +4034,10 @@ impl Shared {
             "app_effect_schedule" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_reschedule" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_cancel" => self.rpc_app_effect(method, params, peer_pid),
+            "app_social_effect_confirm"
+            | "app_social_effect_schedule"
+            | "app_social_effect_reschedule"
+            | "app_social_effect_cancel" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_resolve" => self.rpc_app_effect(method, params, peer_pid),
             "social_publish_media_import" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_schedule" => self.rpc_social_publish(method, params, peer_pid),

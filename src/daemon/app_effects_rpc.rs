@@ -179,6 +179,61 @@ fn social_effect_id(install: &str) -> String {
 }
 
 impl Shared {
+    /// Screen-driven publish/schedule/reschedule/cancel (CAD-1876). The screen
+    /// names only an effect; the live session, mount and context are proven as
+    /// for staging, the effect must belong to that install and context, and the
+    /// frozen digest and current due epoch come from the stored effect, never
+    /// the request. The existing handlers then run their own checks unchanged.
+    fn screen_social_effect(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        pid: u32,
+    ) -> Result<Value> {
+        let (ctx, context) = self.social_draft_action(params, pid, true)?;
+        let id = required_str(params, "effect_id")?;
+        if social_effect_install(id).as_deref() != Some(ctx.install_id.as_str()) {
+            return Err(Error::rejected(
+                "social draft effect is outside this installation",
+            ));
+        }
+        let records =
+            crate::store::app_records::RecordStore::open(&self.state_dir, &ctx.install_id)?;
+        let shown = records.app_social_effect_show(id)?;
+        let effect = &shown["effect"];
+        if effect["install_id"].as_str() != Some(ctx.install_id.as_str())
+            || effect["context_id"].as_str() != Some(context.as_str())
+        {
+            return Err(Error::rejected(
+                "social draft effect is outside this screen context",
+            ));
+        }
+        let digest = effect["digest"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("social draft effect has no frozen digest"))?;
+        let requested_due = || {
+            params
+                .get("due_epoch")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| Error::rejected("due_epoch must be an integer"))
+        };
+        let current_due = || {
+            effect["due_epoch"]
+                .as_i64()
+                .ok_or_else(|| Error::rejected("social draft effect is not scheduled"))
+        };
+        match method {
+            "app_social_effect_confirm" => self.confirm_social_publish(id, digest),
+            "app_social_effect_schedule" => {
+                self.schedule_social_draft(id, digest, requested_due()?)
+            }
+            "app_social_effect_reschedule" => {
+                self.reschedule_social_draft(id, digest, current_due()?, requested_due()?)
+            }
+            _ => self.cancel_social_draft(id, digest, current_due()?),
+        }
+    }
+
     fn stage_social_draft_effect(self: &Arc<Self>, params: &Value, pid: u32) -> Result<Value> {
         let expected = [
             "action_token",
@@ -944,6 +999,23 @@ impl Shared {
                     "origin",
                     "tool_alias",
                 ],
+                "app_social_effect_confirm" | "app_social_effect_cancel" => &[
+                    "action_token",
+                    "tool_alias",
+                    "token",
+                    "key",
+                    "origin",
+                    "effect_id",
+                ],
+                "app_social_effect_schedule" | "app_social_effect_reschedule" => &[
+                    "action_token",
+                    "tool_alias",
+                    "token",
+                    "key",
+                    "origin",
+                    "effect_id",
+                    "due_epoch",
+                ],
                 "app_effect_show" => &["effect_id"],
                 "app_effect_list" => &["install_id", "context_id", "state", "offset", "read_only"],
                 "app_effect_decide" => &["effect_id", "digest", "decision", "execute"],
@@ -1039,6 +1111,10 @@ impl Shared {
                     self.stage_app_artifact(params)
                 }
             }
+            "app_social_effect_confirm"
+            | "app_social_effect_schedule"
+            | "app_social_effect_reschedule"
+            | "app_social_effect_cancel" => self.screen_social_effect(method, params, pid),
             "app_effect_publish_now" => self.publish_social_draft_now(
                 required_str(params, "effect_id")?,
                 required_str(params, "digest")?,

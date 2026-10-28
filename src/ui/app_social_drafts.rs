@@ -21,6 +21,10 @@ pub(super) fn route(path: &str) -> Option<&'static str> {
         "/api/app-social-drafts/sources/show" => Some("app_social_sources_show"),
         "/api/app-social-drafts/sources/save" => Some("app_social_sources_save"),
         "/api/app-social-drafts/effect-stage" => Some("app_effect_stage"),
+        "/api/app-social-drafts/confirm" => Some("app_social_effect_confirm"),
+        "/api/app-social-drafts/schedule" => Some("app_social_effect_schedule"),
+        "/api/app-social-drafts/reschedule" => Some("app_social_effect_reschedule"),
+        "/api/app-social-drafts/cancel" => Some("app_social_effect_cancel"),
         _ => None,
     }
 }
