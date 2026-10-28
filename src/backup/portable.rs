@@ -644,6 +644,7 @@ const CATALOG: &[(&str, &[&str])] = &[
             "enabled",
             "ever_enabled",
             "fenced",
+            "protection_required",
             "limits_json",
             "policy_digest",
         ],
