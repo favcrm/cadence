@@ -31,14 +31,14 @@
 //!    revision, while a target commit that does not exist is an unanswered
 //!    check — unknown and skipped, never reported as an absent path;
 //! 10. an unreadable sibling record makes the project pool unknown, with a
-//!    sanitized scope in `skipped` and no name or content echoed;
+//!     sanitized scope in `skipped` and no name or content echoed;
 //! 11. reordered or repeated scope selectors still describe one scope, while
-//!    different selector sets stay distinct;
+//!     different selector sets stay distinct;
 //! 12. a Git replacement ref cannot swap the bytes or the size bound of a
-//!    cited commit: the analysis reads the object it names, not the
-//!    replacement;
+//!     cited commit: the analysis reads the object it names, not the
+//!     replacement;
 //! 13. a valid Git citation whose project is not registered is an unavailable
-//!    repository — unsupported and unknown, never a missing citation.
+//!     repository — unsupported and unknown, never a missing citation.
 //!
 //! Every fixture is a tempdir; no production tracker, vault or state is read
 //! or written.
@@ -147,11 +147,7 @@ impl Rig {
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
+    let out = cadence_agent::reaper::output(Command::new("git").arg("-C").arg(dir).args(args))
         .expect("`git` is required by this fixture");
     assert!(
         out.status.success(),
