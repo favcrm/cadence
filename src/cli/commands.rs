@@ -85,14 +85,11 @@ pub(crate) enum Commands {
         /// grants no settings authority.
         #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
         settings: bool,
-        /// CAD-1853: request ONLY the cloud-assistant scopes
-        /// (`cloud_agent.read`, `cloud_agent.write`) through one explicit
-        /// device consent. This never widens an existing login and grants no
-        /// CLI/wiki/settings authority.
-        #[arg(
-            long,
-            conflicts_with_all = ["token_stdin", "org", "web", "settings"]
-        )]
+        /// CAD-1853: also request the cloud-agent scopes (`bridge.enroll`,
+        /// `cloud_agent.read`, `cloud_agent.write`) on this same login.
+        /// Combines with `--web` and `--settings`. Without it the login is
+        /// unchanged and cannot spend a cloud agent.
+        #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
         cloud_agent: bool,
     },
     /// Create a hosted workspace in the browser and approve this CLI. Opens

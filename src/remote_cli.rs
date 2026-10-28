@@ -767,9 +767,9 @@ fn renewed_credential_with(
     renewed_credential_for(dir, target, deadline, CredentialPurpose::Cli, post)
 }
 
-/// CAD-1853: the explicit cloud-assistant purpose. The saved login is the
-/// cloud grant, so renewal rotates that consent; it never borrows the CLI
-/// purpose, and a CLI login is never renewed as cloud consent.
+/// CAD-1853: rotate a login that carries the cloud-agent scopes. A board
+/// login without those scopes is not cloud consent. An older grant of
+/// exactly the three cloud scopes still renews.
 fn renewed_cloud_credential_with(
     dir: &Path,
     target: &RemoteTarget,
@@ -862,12 +862,10 @@ fn renew_credential_locked(
     ) -> Result<crate::remote_enrollment::IssuerAnswer>,
 ) -> Result<Credential> {
     let at = now()?;
-    // A cloud-purpose credential is only ever created by `cadence login
-    // --cloud-agent`, so its saved consent is checked even when the access
-    // token is still fresh: a grant that was narrowed or widened upstream is
-    // never rotated under this purpose. The CLI purpose keeps the legacy
-    // tolerance — a login without a renewable session is refused only once
-    // renewal is actually due.
+    // Cloud renewal checks the saved scopes even while the access token is
+    // fresh, so a board login is never rotated as cloud consent. The CLI
+    // purpose keeps the legacy tolerance: a login without a renewable
+    // session is refused only once renewal is actually due.
     if purpose == CredentialPurpose::CloudAgent && !purpose.admits(&cred.capabilities) {
         return Err(purpose_refusal(purpose));
     }
@@ -1114,8 +1112,9 @@ fn validate_renewal_response(
 enum CredentialPurpose {
     /// The default CLI/wiki/settings login: the CLI pair is required.
     Cli,
-    /// The explicit `cadence login --cloud-agent` grant: exactly
-    /// [`crate::remote_enrollment::CLOUD_AGENT_LOGIN_SCOPES`], no CLI scope.
+    /// A login that carries [`crate::remote_enrollment::CLOUD_AGENT_LOGIN_SCOPES`].
+    /// That is the board login plus those scopes, or an older grant of
+    /// exactly those three.
     CloudAgent,
 }
 
@@ -1135,11 +1134,15 @@ impl CredentialPurpose {
             CredentialPurpose::Cli => valid_capabilities(values),
             CredentialPurpose::CloudAgent => {
                 let scopes = crate::remote_enrollment::CLOUD_AGENT_LOGIN_SCOPES;
-                values.len() == scopes.len()
-                    && values.iter().all(|v| scopes.contains(&v.as_str()))
-                    && scopes
+                let once = |scope: &str| {
+                    values
                         .iter()
-                        .all(|c| values.iter().filter(|v| v.as_str() == *c).count() == 1)
+                        .filter(|value| value.as_str() == scope)
+                        .count()
+                        == 1
+                };
+                scopes.iter().all(|scope| once(scope))
+                    && (values.len() == scopes.len() || valid_capabilities(values))
             }
         }
     }
@@ -1151,8 +1154,8 @@ fn purpose_refusal(purpose: CredentialPurpose) -> Error {
             reject("renewable CLI session is invalid or expired — run `cadence login` again")
         }
         CredentialPurpose::CloudAgent => reject(
-            "the saved login is not the explicit cloud-assistant grant, or its renewable \
-             session is invalid or expired — run `cadence login --cloud-agent` again",
+            "the saved login does not carry the cloud-agent scopes, or its renewable \
+             session is invalid or expired — run `cadence login <slug> --cloud-agent` again",
         ),
     }
 }
@@ -1182,17 +1185,22 @@ fn cloud_renewal_refused(error: Error) -> Error {
     Error::gate_coded("cloud_agent_authority_missing", renewal_message(&error))
 }
 
-/// Known, unique capabilities that include the CLI pair. Wiki scopes are
-/// optional, so a CLI-only login remains valid.
+/// Known, unique capabilities that include the CLI pair. Wiki, web and
+/// settings are optional. The cloud-agent scopes are optional too, and only
+/// as the whole set: one or two of them is not a login this client rotates.
 fn valid_capabilities(values: &[String]) -> bool {
     let once = |c: &str| values.iter().filter(|v| v.as_str() == c).count() == 1;
-    values.iter().all(|v| CAPABILITIES.contains(&v.as_str()))
+    let cloud = crate::remote_enrollment::CLOUD_AGENT_LOGIN_SCOPES;
+    let cloud_present = cloud.iter().filter(|scope| once(scope)).count();
+    let known = |scope: &str| CAPABILITIES.contains(&scope) || cloud.contains(&scope);
+    values.iter().all(|v| known(v.as_str()))
         && values
             .iter()
             .enumerate()
             .all(|(i, v)| !values[..i].contains(v))
         && once("cli.read")
         && once("cli.write")
+        && (cloud_present == 0 || cloud_present == cloud.len())
 }
 fn same_capabilities_json(value: &Value, expected: &[String]) -> bool {
     value.as_array().is_some_and(|values| {
@@ -2088,10 +2096,10 @@ pub fn cloud_agent_credential_owned(
         return Err(Error::gate_coded(
             "cloud_agent_scope_revoked",
             format!(
-                "this remote login for org '{}' does not carry the {scope} capability — \
-                 nothing was sent. `cadence login` does not request cloud-agent access by \
-                 default; it needs a login the workspace owner grants with {scope}",
-                target.org
+                "this remote login for org '{org}' does not carry the {scope} capability — \
+                 nothing was sent. Run `cadence login {org} --cloud-agent` to add it to \
+                 this login",
+                org = target.org,
             ),
         ));
     }

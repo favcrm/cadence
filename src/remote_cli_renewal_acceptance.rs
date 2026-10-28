@@ -667,7 +667,6 @@ mod matrix {
                     assert_eq!(path, "/v1/hosted-cadence/cli-session/renew");
                     assert_eq!(bearer, OLD_REFRESH);
                     assert_eq!(body["version"], "hosted-cadence-cli-session.v1");
-                    assert_eq!(body["capabilities"], json!(CLOUD));
                     assert_eq!(body["organization_id"], ORG_ID);
                     assert_eq!(body["organization_slug"], ORG);
                     assert_eq!(body["audience"], target.endpoint);
@@ -679,6 +678,7 @@ mod matrix {
                     // This is disk state read before the real guarded issuer
                     // transport boundary, not an in-memory intent assertion.
                     let durable = load_credential(dir, target).unwrap();
+                    assert_eq!(body["capabilities"], json!(durable.capabilities));
                     let pending = durable.pending.expect("intent must precede POST");
                     assert_eq!(body["operation_id"], pending.operation_id);
                     assert_eq!(pending.expected_generation, 1);
@@ -750,8 +750,7 @@ mod matrix {
                     "cloud_agent.write",
                     "bridge.enroll",
                     "cloud_agent.read",
-                    "cli.read",
-                    "cli.write"
+                    "cli.read"
                 ]),
                 json!([
                     "cloud_agent.write",
@@ -779,6 +778,72 @@ mod matrix {
                     assert_eq!(wire.posts(), 0);
                     assert_eq!(std::fs::read(&path).unwrap(), before);
                 }
+            }
+        }
+
+        #[test]
+        fn board_login_with_cloud_scopes_renews_as_one_grant() {
+            let scopes = [
+                "cli.read",
+                "cli.write",
+                "wiki.read",
+                "wiki.write",
+                "bridge.enroll",
+                "cloud_agent.read",
+                "cloud_agent.write",
+            ];
+            for cloud_purpose in [false, true] {
+                let (root, target, mut prior) = cloud_store(None);
+                prior.capabilities = scopes.iter().map(|scope| (*scope).to_owned()).collect();
+                prior.expires_at = now().unwrap() - 1;
+                save_credential(root.path(), ORG, &prior).unwrap();
+                let pending = PendingRenewal {
+                    operation_id: format!("op_{}", "q".repeat(43)),
+                    expected_generation: 1,
+                };
+                let response = issuer_response(&prior, &pending, &target);
+                let wire = Wire::new(vec![(200, response)]);
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let next = if cloud_purpose {
+                    renewed_cloud_credential_with(
+                        root.path(),
+                        &target,
+                        deadline,
+                        |dir, issuer, path, bearer, body, deadline| {
+                            assert_eq!(body["capabilities"], json!(scopes));
+                            crate::remote_enrollment::cli_session_post_for_test(
+                                dir,
+                                issuer,
+                                path,
+                                bearer,
+                                body,
+                                deadline,
+                                wire.send(),
+                            )
+                        },
+                    )
+                } else {
+                    renewed_credential_with(
+                        root.path(),
+                        &target,
+                        deadline,
+                        |dir, issuer, path, bearer, body, deadline| {
+                            assert_eq!(body["capabilities"], json!(scopes));
+                            crate::remote_enrollment::cli_session_post_for_test(
+                                dir,
+                                issuer,
+                                path,
+                                bearer,
+                                body,
+                                deadline,
+                                wire.send(),
+                            )
+                        },
+                    )
+                }
+                .expect("one login carries the board and the cloud grant");
+                assert_eq!(next.capabilities, prior.capabilities);
+                assert_eq!(wire.posts(), 1, "cloud purpose {cloud_purpose}");
             }
         }
 

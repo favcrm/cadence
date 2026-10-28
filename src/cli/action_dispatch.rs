@@ -307,14 +307,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             let issuer = issuer
                 .as_deref()
                 .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
-            let grant = if *cloud_agent {
-                cadence_agent::remote_enrollment::login_portal_cloud(
-                    issuer,
-                    hint.as_deref().or(slug.as_deref()),
-                    &dir,
-                    |url, code| show_login_code(url, code, *no_open),
-                )?
-            } else if *web || *settings {
+            let grant = if *web || *settings || *cloud_agent {
                 cadence_agent::remote_enrollment::login_portal_scoped(
                     issuer,
                     hint.as_deref().or(slug.as_deref()),
@@ -322,6 +315,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                     |url, code| show_login_code(url, code, *no_open),
                     *web,
                     *settings,
+                    *cloud_agent,
                 )?
             } else if let Some(org) = org.as_deref() {
                 let slug = slug.as_deref().ok_or_else(|| {

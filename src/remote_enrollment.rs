@@ -2336,31 +2336,22 @@ pub(crate) const CLOUD_AGENT_LOGIN_SCOPES: [&str; 3] =
 /// The issuer may narrow the consent: a grant is the CLI pair (always) plus
 /// any unique subset of the other requested capabilities. It never names an
 /// unrequested or duplicate capability, and it never drops a CLI scope.
-///
-/// The cloud-assistant purpose is the one exception: its grant is exactly
-/// [`CLOUD_AGENT_LOGIN_SCOPES`], neither narrowed nor widened. Renewal
-/// rotates that saved consent under the same exact-set rule, so a narrowed
-/// grant saved here could never refresh — it is refused before it is
-/// written.
+/// Requested web scopes and requested cloud-agent scopes are kept whole:
+/// asking for them and receiving only some of them is not a usable login.
 fn consented_caps(caps: &[Value], requested: &[&str]) -> bool {
     let mut seen = BTreeSet::new();
-    if requested.len() == CLOUD_AGENT_LOGIN_SCOPES.len()
-        && CLOUD_AGENT_LOGIN_SCOPES
-            .iter()
-            .all(|c| requested.contains(c))
-    {
-        return caps.len() == requested.len()
-            && caps.iter().all(|c| {
-                c.as_str()
-                    .is_some_and(|c| requested.contains(&c) && seen.insert(c))
-            });
-    }
     caps.iter().all(|c| {
         c.as_str()
             .is_some_and(|c| requested.contains(&c) && seen.insert(c))
     }) && ["cli.read", "cli.write"].iter().all(|c| seen.contains(c))
-        // A web scope must be granted exactly when it was requested.
-        && requested.iter().filter(|c| c.starts_with("web.")).all(|c| seen.contains(c))
+        && requested
+            .iter()
+            .filter(|c| c.starts_with("web."))
+            .all(|c| seen.contains(c))
+        && CLOUD_AGENT_LOGIN_SCOPES
+            .iter()
+            .filter(|c| requested.contains(c))
+            .all(|c| seen.contains(c))
 }
 
 /// Human workspace roles the hosted login exchange returns. Bridge
@@ -2645,11 +2636,6 @@ enum LoginScope {
     Settings,
     /// Both opt-ins on one consent: `--web --settings`.
     WebAndSettings,
-    /// CAD-1853: `cadence login --cloud-agent` requests ONLY the cloud-agent
-    /// scopes. It is a distinct, explicitly consented device grant for the
-    /// cloud assistant; it does not silently widen an existing CLI login and
-    /// carries no cli/wiki/settings authority.
-    CloudAgent,
 }
 
 impl LoginScope {
@@ -2668,7 +2654,6 @@ impl LoginScope {
                 "settings.read",
                 "settings.write",
             ],
-            LoginScope::CloudAgent => CLOUD_AGENT_LOGIN_SCOPES.to_vec(),
         }
     }
 }
@@ -2679,34 +2664,13 @@ pub fn login_portal(
     dir: &Path,
     show_code: impl FnOnce(&str, &str) -> Result<()>,
 ) -> Result<LoginGrant> {
-    login_portal_scoped(issuer, hint, dir, show_code, false, false)
+    login_portal_scoped(issuer, hint, dir, show_code, false, false, false)
 }
 
-/// CAD-1853: the explicit cloud-assistant device grant. One PKCE browser
-/// approval for exactly `cloud_agent.read`/`cloud_agent.write`; no CLI,
-/// wiki or settings capability is requested, and no existing saved login is
-/// mutated or reused.
-pub fn login_portal_cloud(
-    issuer: &str,
-    hint: Option<&str>,
-    dir: &Path,
-    show_code: impl FnOnce(&str, &str) -> Result<()>,
-) -> Result<LoginGrant> {
-    let issuer = origin(issuer, cfg!(test))?;
-    login_device_flow(
-        &issuer,
-        None,
-        hint,
-        dir,
-        show_code,
-        &mut RealLoginRuntime,
-        LoginScope::CloudAgent,
-    )
-}
-
-/// The portal login; `web` adds the Publish Web scopes (`cadence login
+/// The portal login. `web` adds the Publish Web scopes (`cadence login
 /// --web`), `settings` adds the Settings scopes (`cadence login
-/// --settings`), and nothing else changes.
+/// --settings`), and `cloud_agent` adds the cloud-agent scopes (`cadence
+/// login --cloud-agent`). The flags combine. None of them is a second login.
 pub fn login_portal_scoped(
     issuer: &str,
     hint: Option<&str>,
@@ -2714,6 +2678,7 @@ pub fn login_portal_scoped(
     show_code: impl FnOnce(&str, &str) -> Result<()>,
     web: bool,
     settings: bool,
+    cloud_agent: bool,
 ) -> Result<LoginGrant> {
     let issuer = origin(issuer, cfg!(test))?;
     login_device_flow(
@@ -2729,6 +2694,7 @@ pub fn login_portal_scoped(
             (false, true) => LoginScope::Settings,
             (false, false) => LoginScope::Wiki,
         },
+        cloud_agent,
     )
 }
 
@@ -2784,6 +2750,7 @@ fn register_portal_with(
         },
         runtime,
         LoginScope::Wiki,
+        false,
     )
 }
 
@@ -2859,6 +2826,7 @@ fn login_browser_with(
         show_code,
         runtime,
         LoginScope::Wiki,
+        false,
     )
 }
 
@@ -2870,6 +2838,7 @@ fn login_device_flow(
     show_code: impl FnOnce(&str, &str) -> Result<()>,
     runtime: &mut dyn LoginRuntime,
     scope: LoginScope,
+    cloud_agent: bool,
 ) -> Result<LoginGrant> {
     if org.is_some_and(|value| !id(value)) || hint.is_some_and(|value| !slug(value)) {
         return Err(reject("Invalid hosted login request"));
@@ -2887,7 +2856,10 @@ fn login_device_flow(
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(Sha256::digest(verifier.as_bytes()));
     confirm_login_access_ingress(dir, &issuer, &access)?;
-    let requested = scope.requested();
+    let mut requested = scope.requested();
+    if cloud_agent {
+        requested.extend_from_slice(&CLOUD_AGENT_LOGIN_SCOPES);
+    }
     let mut request = json!({"version":DEVICE_VERSION,
         "client_label":"cadence-cli","requested_capabilities":requested,
         "code_challenge":challenge,"cli_session":"renewable"});
