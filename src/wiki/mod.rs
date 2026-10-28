@@ -439,6 +439,42 @@ fn rev_of(abs: &Path) -> Result<String> {
     }
 }
 
+/// What a logical wiki name currently is on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    None,
+    Text,
+    Dir,
+    Blob,
+}
+
+/// The logical entry at `abs`: a text page `x`, a directory `x/` or a
+/// blob pointer `x.blob`. Call it only while holding `pm.lock()`.
+/// Two spellings present at once is ambiguous and refused.
+fn entry_kind(abs: &Path, norm: &str) -> Result<Kind> {
+    let mut ptr = abs.as_os_str().to_owned();
+    ptr.push(".blob");
+    let text = match abs.symlink_metadata() {
+        Ok(m) if m.is_dir() => Some(Kind::Dir),
+        Ok(_) => Some(Kind::Text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let blob = match Path::new(&ptr).symlink_metadata() {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
+    match (text, blob) {
+        (Some(_), true) => Err(Error::rejected(format!(
+            "wiki '{norm}' refused: ambiguous — both '{norm}' and '{norm}.blob' exist"
+        ))),
+        (Some(k), false) => Ok(k),
+        (None, true) => Ok(Kind::Blob),
+        (None, false) => Ok(Kind::None),
+    }
+}
+
 pub(crate) fn rev_bytes(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
@@ -1581,16 +1617,24 @@ pub fn write(
     let _lock = pm.lock()?;
     let gitignore = ensure_layout(pm)?;
 
+    match entry_kind(&abs, &norm)? {
+        Kind::Dir => {
+            return Err(Error::rejected(format!(
+                "wiki write '{norm}' refused: a directory exists there"
+            )))
+        }
+        Kind::Blob => {
+            return Err(Error::rejected(format!(
+                "wiki write '{norm}' refused: a blob page exists there — rm it first"
+            )))
+        }
+        Kind::None | Kind::Text => {}
+    }
     let cur = rev_of(&abs)?;
     if let Some(want) = if_rev {
         if want != cur {
             return Ok(json!({"conflict": "if_rev", "current_rev": cur, "path": norm}));
         }
-    }
-    if abs.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-        return Err(Error::rejected(format!(
-            "wiki write '{norm}' refused: a directory exists there"
-        )));
     }
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1652,32 +1696,51 @@ pub fn mkdir(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
     let abs = resolve(&vault, &norm)?;
     let _lock = pm.lock()?;
     let gitignore = ensure_layout(pm)?;
-    match abs.symlink_metadata() {
-        Ok(m) if m.is_dir() => return Ok(json!({"path": norm, "created": false})),
-        Ok(_) => {
+    match entry_kind(&abs, &norm)? {
+        Kind::Dir => return Ok(json!({"path": norm, "created": false})),
+        Kind::Text | Kind::Blob => {
             return Err(Error::rejected(format!(
                 "wiki mkdir '{norm}' refused: a file exists there"
             )))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+        Kind::None => {}
     }
-    std::fs::create_dir_all(&abs)?;
+    // Directories this call creates, deepest first, for rollback.
+    let mut made: Vec<PathBuf> = Vec::new();
+    for a in abs.ancestors() {
+        if a.symlink_metadata().is_ok() {
+            break;
+        }
+        made.push(a.to_path_buf());
+    }
     let keep = abs.join(".gitkeep");
-    std::fs::write(&keep, "")?;
-    let mut paths = vec![keep];
-    if let Some(g) = gitignore {
-        paths.push(g);
+    let created = std::fs::create_dir_all(&abs)
+        .and_then(|()| std::fs::write(&keep, ""))
+        .map_err(Error::from)
+        .and_then(|()| {
+            let mut paths = vec![keep.clone()];
+            if let Some(g) = gitignore {
+                paths.push(g);
+            }
+            let actor = caller.actor();
+            crate::issue::write::commit_who(
+                pm,
+                &paths,
+                &format!("wiki: mkdir {norm}"),
+                &[],
+                &actor,
+                None,
+            )
+        });
+    if let Err(e) = created {
+        // Remove only what this call made; `remove_dir` leaves a
+        // non-empty directory alone.
+        let _ = std::fs::remove_file(&keep);
+        for d in &made {
+            let _ = std::fs::remove_dir(d);
+        }
+        return Err(e);
     }
-    let actor = caller.actor();
-    crate::issue::write::commit_who(
-        pm,
-        &paths,
-        &format!("wiki: mkdir {norm}"),
-        &[],
-        &actor,
-        None,
-    )?;
     Ok(json!({"path": norm, "created": true}))
 }
 
@@ -1781,6 +1844,23 @@ pub fn mv(pm: &Pm, caller: &Caller, from: &str, to: &str) -> Result<Value> {
     mv_real(pm, caller, &src_abs, &dst_abs, &from_label, &norm_to)
 }
 
+#[cfg(test)]
+mod before_mv_lock {
+    use std::cell::RefCell;
+    type Hook = Box<dyn FnOnce()>;
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+    pub(super) fn set(f: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+    pub(super) fn run() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
 fn mv_real(
     pm: &Pm,
     caller: &Caller,
@@ -1789,14 +1869,16 @@ fn mv_real(
     from_label: &str,
     to: &str,
 ) -> Result<Value> {
-    let vault = vault_dir(pm)?;
-    let dst_pointer = vault.join(format!("{to}.blob"));
-    if dst.symlink_metadata().is_ok() || dst_pointer.symlink_metadata().is_ok() {
+    // CAD-912 test seam (cfg(test) only): runs once between the
+    // pre-lock look and the writer lock, to publish a destination there.
+    #[cfg(test)]
+    before_mv_lock::run();
+    let _lock = pm.lock()?;
+    if entry_kind(dst, to)? != Kind::None {
         return Err(Error::rejected(format!(
             "wiki mv '{from_label}' → '{to}' refused: destination exists"
         )));
     }
-    let _lock = pm.lock()?;
     let gitignore = ensure_layout(pm)?;
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2066,6 +2148,19 @@ pub fn put_blob(
     let pointer = vault.join(format!("{norm}.blob"));
     let _lock = pm.lock()?;
     let gitignore = ensure_layout(pm)?;
+    match entry_kind(&resolve(&vault, &norm)?, &norm)? {
+        Kind::Text => {
+            return Err(Error::rejected(format!(
+                "wiki put_blob '{norm}' refused: a text page exists there — rm it first"
+            )))
+        }
+        Kind::Dir => {
+            return Err(Error::rejected(format!(
+                "wiki put_blob '{norm}' refused: a directory exists there"
+            )))
+        }
+        Kind::None | Kind::Blob => {}
+    }
     if let Some(parent) = pointer.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -2077,12 +2172,6 @@ pub fn put_blob(
             // may already reference — nothing here unlinks it.
             return Ok(json!({"conflict": "if_rev", "current_rev": cur, "path": norm}));
         }
-    }
-    if resolve(&vault, &norm)?.symlink_metadata().is_ok() {
-        // A text page already sits at the logical name.
-        return Err(Error::rejected(format!(
-            "wiki put_blob '{norm}' refused: a text page exists there — rm it first"
-        )));
     }
     let name = norm.rsplit('/').next().unwrap_or(&norm).to_string();
     let pointer_text = serde_json::to_string_pretty(&json!({
@@ -3782,5 +3871,111 @@ mod tests {
         test_pause::at_publish_seam();
         // The pause was consumed: a second unarmed call is a no-op.
         test_pause::at_publish_seam();
+    }
+
+    // ---- CAD-912: logical entry kinds under the writer lock ----
+
+    fn cad912_blob_page(pm: &Pm, logical: &str) -> PathBuf {
+        let vault = vault_dir(pm).unwrap();
+        let p = vault.join(format!("{logical}.blob"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            r#"{"sha256":"00","size":1,"mime":"text/plain","name":"x"}"#,
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn cad912_create_only_text_over_blob_page_is_refused() {
+        let (_root, pm) = range_pm();
+        let ptr = cad912_blob_page(&pm, "global/x");
+        let before = std::fs::read(&ptr).unwrap();
+        let r = write(&pm, &Caller::Operator, "global/x", "hi", Some(ABSENT));
+        assert!(r.is_err(), "text over a blob page must be refused: {r:?}");
+        assert_eq!(std::fs::read(&ptr).unwrap(), before, "blob pointer intact");
+        let vault = vault_dir(&pm).unwrap();
+        assert!(
+            vault.join("global/x").symlink_metadata().is_err(),
+            "no shadow text page"
+        );
+    }
+
+    #[test]
+    fn cad912_mkdir_over_blob_page_is_refused() {
+        let (_root, pm) = range_pm();
+        let ptr = cad912_blob_page(&pm, "global/x");
+        let r = mkdir(&pm, &Caller::Operator, "global/x");
+        assert!(r.is_err(), "mkdir over a blob page must be refused: {r:?}");
+        assert!(ptr.exists());
+        let vault = vault_dir(&pm).unwrap();
+        assert!(
+            vault.join("global/x").symlink_metadata().is_err(),
+            "no dir created"
+        );
+    }
+
+    #[test]
+    fn cad912_put_blob_over_directory_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = cad911_pm(root.path());
+        let state = root.path().join("state");
+        let uploads = cad911_uploads(&state);
+        let tmp = cad911_stage_tmp(&uploads, "d.bin", b"dir collision bytes");
+        mkdir(&pm, &Caller::Operator, "global/x").unwrap();
+        let r = put_blob(&pm, &state, &Caller::Operator, "global/x", &tmp, None, None);
+        assert!(r.is_err(), "blob over a directory must be refused: {r:?}");
+        let vault = vault_dir(&pm).unwrap();
+        assert!(vault.join("global/x/.gitkeep").exists(), "dir intact");
+        assert!(
+            vault.join("global/x.blob").symlink_metadata().is_err(),
+            "no pointer"
+        );
+    }
+
+    #[test]
+    fn cad912_failed_mkdir_commit_leaves_only_preexisting_entries() {
+        let (_root, pm) = range_pm();
+        write(&pm, &Caller::Operator, "global/keep/page", "stay", None).unwrap();
+        let hooks = pm.dir.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let r = mkdir(&pm, &Caller::Operator, "global/keep/a/b");
+        assert!(r.is_err(), "the injected commit failure must surface");
+        let vault = vault_dir(&pm).unwrap();
+        assert!(
+            vault.join("global/keep/a").symlink_metadata().is_err(),
+            "created dirs removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vault.join("global/keep/page")).unwrap(),
+            "stay"
+        );
+    }
+
+    #[test]
+    fn cad912_mv_rechecks_destination_under_the_lock() {
+        let (_root, pm) = range_pm();
+        write(&pm, &Caller::Operator, "global/src", "moving", None).unwrap();
+        let vault = vault_dir(&pm).unwrap();
+        let dst = vault.join("global/dst");
+        let dst_hook = dst.clone();
+        before_mv_lock::set(move || std::fs::write(&dst_hook, "newly published").unwrap());
+        let r = mv(&pm, &Caller::Operator, "global/src", "global/dst");
+        assert!(
+            r.is_err(),
+            "a destination published before the lock must refuse: {r:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "newly published");
+        assert_eq!(
+            std::fs::read_to_string(vault.join("global/src")).unwrap(),
+            "moving"
+        );
     }
 }
