@@ -1,4 +1,5 @@
 import { makePlanner, runCall, type ActionContext } from "../src/features/workspace-apps/screen/screenActions";
+import { parseChild } from "../src/features/workspace-apps/screen/screenProtocol";
 import { accountLabel, connectOutcome, connectReturnTo, connectToast, publishAllowed, publicationBinding, sendSlot, withoutConnectParams } from "../src/features/workspace-apps/socialConnect";
 import type { AppBinding, Installation } from "../src/features/workspace-apps/workspaceApps";
 
@@ -151,6 +152,31 @@ async function main() {
   equal(calls.length, before, "refusals make no daemon request");
   const asSlot = await makePlanner(() => ctx())("publish.draft.schedule", { alias: "social.draft", effect_id: effect, due_epoch: due }, { actionToken: token });
   assert(!("code" in asSlot), "an older app's schedule slot still plans (transition)");
+
+  // CAD-1918 acceptance check (written by the Spec/security reviewer, not the implementer): a frame's
+  // direct confirm or schedule without the host-held mount token, or carrying a forged authority
+  // field, is refused before any daemon request; a records (CRM) frame cannot even parse either
+  // verb as a call, even if its receipt listed it.
+  calls.length = 0;
+  const forgedToken = "cd".repeat(32);
+  for (const [verb, args, actionToken] of [
+    ["publish.draft.confirm", { alias: "social.draft", effect_id: effect }, null],
+    ["publish.draft.schedule", { alias: "social.draft", effect_id: effect, due_epoch: due }, null],
+    ["publish.draft.confirm", { alias: "social.draft", effect_id: effect }, "not-a-token"],
+    ["publish.draft.confirm", { alias: "social.draft", effect_id: effect, action_token: forgedToken }, token],
+    ["publish.draft.confirm", { alias: "social.draft", effect_id: effect, digest: "sha256:forged" }, token],
+    ["publish.draft.schedule", { alias: "social.draft", effect_id: effect, due_epoch: due, action_token: forgedToken }, token],
+    ["publish.draft.schedule", { alias: "social.draft", effect_id: effect, due_epoch: due, install_id: "inst2" }, token],
+  ] as const) {
+    const refused = await direct(verb, args, actionToken);
+    assert(!refused.ok && ["denied", "bad_args"].includes(refused.refusal.code), `${verb} ${JSON.stringify(args)} (token ${actionToken}) is refused: ${JSON.stringify(refused)}`);
+  }
+  equal(calls.length, 0, "a refused frame confirm or schedule makes no daemon request");
+  for (const verb of ["publish.draft.confirm", "publish.draft.schedule"]) {
+    const message = { v: 2, op: "call", id: "c1", verb, args: { alias: "social.draft", effect_id: effect, ...(verb.endsWith("schedule") ? { due_epoch: due } : {}) } };
+    assert(parseChild(message) !== null, `${verb} parses as a call for a Social frame`);
+    equal(parseChild(message, ["records.list", verb]), null, `a records frame's ${verb} call never parses (the port closes)`);
+  }
 }
 
 main().then(() => console.log("socialConnect ok"));
