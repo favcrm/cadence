@@ -33,6 +33,7 @@ import {
 } from "./shared";
 import FileExplorer from "./FileExplorer";
 import PagePane from "./PagePane";
+import { statusText, whoLabel } from "./hosted";
 import EditorPane from "./EditorPane";
 import FolderPane from "./FolderPane";
 import UploadPane from "./UploadPane";
@@ -62,6 +63,8 @@ export interface WikiProps {
   scope?: WikiScope;
   /** Upload through POST /api/wiki/upload (hosted Worker) instead of transfer jobs. */
   multipartUpload?: boolean;
+  /** The signed-in member's subject id, so hosted "edited by" can say "you". */
+  viewerSub?: string | null;
 }
 
 type Open =
@@ -72,7 +75,7 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export default function Wiki({ route, navHref, readOnly, actor, onToast, scope, multipartUpload = false }: WikiProps) {
+export default function Wiki({ route, navHref, readOnly, actor, onToast, scope, multipartUpload = false, viewerSub }: WikiProps) {
   const t = useTranslate();
   const root = scope?.root ?? "";
   const current = route.path ?? root;
@@ -192,6 +195,8 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope, 
             rev: ls.rev,
             edited_by: ls.edited_by,
             mtime: ls.mtime,
+            status: ls.status,
+            status_reason: ls.status_reason,
           },
         );
       }
@@ -312,6 +317,7 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope, 
               dir={dir}
               navHref={navHref}
               readOnly={readOnly}
+              viewerSub={viewerSub}
               section={route.section}
               page={route.page}
               onToast={onToast}
@@ -335,6 +341,7 @@ function BrowsePane({
   dir,
   navHref,
   readOnly,
+  viewerSub,
   section,
   page: citedPage,
   onToast,
@@ -349,6 +356,7 @@ function BrowsePane({
   dir: string;
   navHref: (route: Route) => string;
   readOnly: boolean;
+  viewerSub?: string | null;
   section?: string;
   page?: number;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
@@ -500,18 +508,20 @@ function BrowsePane({
   }
 
   const page = open.page;
-  if (page.kind === "page" || page.historical) return <PagePane page={page} navHref={navHref} readOnly={readOnly || page.historical === true} section={section} citedPage={citedPage} />;
-  return <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} navHref={navHref} />;
+  if (page.kind === "page" || page.historical) return <PagePane page={page} navHref={navHref} readOnly={readOnly || page.historical === true} viewerSub={viewerSub} section={section} citedPage={citedPage} />;
+  return <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} navHref={navHref} viewerSub={viewerSub} />;
 }
 
-function BlobPane({ page, blob, navHref }: {
+function BlobPane({ page, blob, navHref, viewerSub }: {
   page: WikiPage;
   blob: PreviewKind;
   navHref: (route: Route) => string;
+  viewerSub?: string | null;
 }) {
   const t = useTranslate();
   const { src, download, error, loading } = useWikiBlobSource(page.path, blob, true);
   const name = baseName(page.path);
+  const status = statusText(page.status);
   return (
     <>
       <WikiToolbar path={page.path} navHref={navHref} actions={<>
@@ -527,7 +537,13 @@ function BlobPane({ page, blob, navHref }: {
             <track kind="captions" />
           </video>
         ) : blob === "pdf" && src ? (
-          <iframe className="wk-pdf" src={src} sandbox="" title={name} />
+          // Chrome's PDF viewer will not run in a fully sandboxed frame, and the sandbox stays:
+          // the blob opens in its own tab, where the browser's isolated viewer renders it.
+          <div className="wk-download">
+            <span className="chip bg-ink-800 text-ink-400">{kindLabel(name, page.mime)}</span>
+            <div className="wk-etitle">{name}</div>
+            <a className="btn btn-primary" href={src} target="_blank" rel="noopener noreferrer">{t("Open PDF")}</a>
+          </div>
         ) : (
           <div className="wk-download">
             <span className="chip bg-ink-800 text-ink-400">{kindLabel(name, page.mime)}</span>
@@ -545,7 +561,8 @@ function BlobPane({ page, blob, navHref }: {
         <span className="num">{name}</span>
         {page.size != null && <span>{fmtBytes(page.size)}</span>}
         {page.mime && <span>{page.mime}</span>}
-        {page.edited_by && <span>{t("uploaded by")} {page.edited_by}</span>}
+        {page.edited_by && <span>{t("uploaded by")} {whoLabel(page.edited_by, viewerSub, t)}</span>}
+        {status && <span>{t(status.text)}{page.status_reason ? ` — ${page.status_reason}` : ""}</span>}
         {page.mtime && <span>{relTime(page.mtime)}</span>}
       </div>
     </>

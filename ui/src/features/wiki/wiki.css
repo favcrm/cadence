@@ -336,14 +336,6 @@
   background: var(--color-ink-950);
 }
 
-.wk-pdf {
-  width: min(820px, 100%);
-  height: 70vh;
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.375rem;
-  background: var(--color-ink-850);
-}
-
 .wk-download {
   display: grid;
   place-items: center;

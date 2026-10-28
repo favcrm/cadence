@@ -2,6 +2,7 @@ import { createSha256 } from "../app-shell/csvDigest";
 import { sessionHeaders } from "../../lib/sessionKey";
 import { notifyPrivateSessionRequired, privateFetch, type PrivateOperation } from "../../lib/privateSession";
 import { wikiErrorFrom, WikiError, wiki } from "./api";
+import { HOSTED_UPLOAD_MAX_BYTES, statusText } from "./hosted";
 
 export const CHUNK_BYTES = 16384;
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
@@ -27,6 +28,10 @@ export interface ImportResult {
   index: string;
   rev?: string;
   error?: string;
+  /** Hosted only: a plain sentence for the Worker's status (an English locale key). */
+  detail?: string;
+  /** Hosted only: the saved file needs attention (empty, failed or unsupported). */
+  warn?: boolean;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -248,8 +253,8 @@ export async function uploadMultipart(
   if (file.name.includes("/") || file.name.includes("\\") || file.name === "." || file.name === "..") {
     throw new WikiError("Use a file name inside this folder", 400);
   }
-  const cap = entryKind(file.name) === "text" ? MAX_TEXT_BYTES : MAX_FILE_BYTES;
-  if (file.size > cap) throw new WikiError(`over ${Math.round(cap / (1024 * 1024))} MB — rejected`, 400);
+  if (file.size === 0) throw new WikiError("empty file — rejected", 400);
+  if (file.size > HOSTED_UPLOAD_MAX_BYTES) throw new WikiError(`over ${Math.round(HOSTED_UPLOAD_MAX_BYTES / (1024 * 1024))} MB — rejected`, 400);
   const ifRev = await destinationRev(root, file.name, update);
   operation.assertCurrent();
   const form = new FormData();
@@ -273,7 +278,18 @@ export async function uploadMultipart(
   }
   onProgress(100);
   const rev = text(row?.rev) ?? undefined;
-  return { outcome: text(row?.outcome) ?? "applied", extraction: text(row?.extraction) ?? "not_applicable", index: text(row?.index) ?? "covered", ...(rev ? { rev } : {}) };
+  // A text page is searchable at once and carries no status; a blob reports one.
+  const status = text(row?.status) ?? "indexed";
+  const mapped = statusText(status);
+  const reason = text(row?.status_reason);
+  return {
+    outcome: text(row?.outcome) ?? "applied",
+    extraction: status,
+    index: status === "indexed" ? "covered" : status,
+    ...(rev ? { rev } : {}),
+    ...(mapped ? { detail: mapped.text, warn: mapped.warn } : {}),
+    ...(reason ? { error: reason } : {}),
+  };
 }
 
 export async function exportOriginal(path: string, at: string, operation: PrivateOperation): Promise<Blob> {

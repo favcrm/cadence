@@ -9,14 +9,16 @@ import { useTranslate } from "../../lib/locale";
 import { beginPrivateOperation } from "../../lib/privateSession";
 import { exportOriginal } from "./transfer";
 import { baseName } from "./paths";
+import { whoLabel } from "./hosted";
 
 /** The same document toolbar and reader in Wiki and project Context. */
-export default function PagePane({ page, navHref, readOnly, section, citedPage }: {
+export default function PagePane({ page, navHref, readOnly, section, citedPage, viewerSub }: {
   page: WikiPage;
   navHref: (route: Route) => string;
   readOnly: boolean;
   section?: string;
   citedPage?: number;
+  viewerSub?: string | null;
 }) {
   const t = useTranslate();
   const [downloadError, setDownloadError] = useState<string | null>(null);
@@ -54,7 +56,7 @@ export default function PagePane({ page, navHref, readOnly, section, citedPage }
       {citedPage !== undefined && <p className="wk-meta">{t("Cited page")}: {citedPage}</p>}
       {downloadError && <Note warn>{downloadError}</Note>}
       {(page.edited_by || page.mtime) && <p className="wk-meta mb-4">
-        {page.edited_by && <>{t("Edited by")} <b>{page.edited_by}</b></>}
+        {page.edited_by && <>{t("Edited by")} <b>{whoLabel(page.edited_by, viewerSub, t)}</b></>}
         {page.edited_by && page.mtime && " · "}{relTime(page.mtime)}
       </p>}
       <article className="md wk-md issue-reader">
