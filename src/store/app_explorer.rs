@@ -461,6 +461,47 @@ impl Store {
         })
     }
 
+    /// The operator's automatic-update choice. No row means off.
+    pub fn app_automatic_updates_get(&self, install_id: &str) -> Result<Value> {
+        install_id_ok(install_id)?;
+        self.read_tx(|conn| {
+            let automatic = conn.query_opt(
+                "SELECT automatic FROM app_update_preferences WHERE install_id=?",
+                [install_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            Ok(json!({
+                "install_id": install_id,
+                "automatic": automatic.unwrap_or(0) != 0,
+            }))
+        })
+    }
+
+    /// Record the choice. The row does not apply a release; the board does
+    /// that only after a check whose declared access is unchanged.
+    pub fn app_automatic_updates_set(
+        &self,
+        install_id: &str,
+        automatic: bool,
+    ) -> Result<Value> {
+        install_id_ok(install_id)?;
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            tx.execute(
+                "INSERT INTO app_update_preferences(install_id, automatic) VALUES(?,?)
+                 ON CONFLICT(install_id) DO UPDATE SET automatic=excluded.automatic",
+                params![install_id, automatic as i64],
+            )?;
+            Self::event(
+                tx,
+                Self::DAEMON_STREAM,
+                "app_automatic_updates_set",
+                json!({ "install_id": install_id, "automatic": automatic }),
+            )?;
+            Ok(json!({ "install_id": install_id, "automatic": automatic }))
+        })
+    }
+
     /// Every install with a cached "update ready" (the home badge).
     pub fn app_updates_pending(&self) -> Result<Vec<String>> {
         self.read_tx(|conn| {
@@ -470,5 +511,29 @@ impl Store {
                 |r| r.get::<_, String>(0),
             )?)
         })
+    }
+}
+
+#[cfg(test)]
+mod automatic_updates {
+    use super::super::Store;
+
+    #[test]
+    fn the_preference_defaults_off_and_round_trips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+        let id = "inst-1";
+        assert_eq!(store.app_automatic_updates_get(id).unwrap()["automatic"], false);
+        assert_eq!(
+            store.app_automatic_updates_set(id, true).unwrap()["automatic"],
+            true
+        );
+        assert_eq!(store.app_automatic_updates_get(id).unwrap()["automatic"], true);
+        assert_eq!(
+            store.app_automatic_updates_set(id, false).unwrap()["automatic"],
+            false
+        );
+        assert_eq!(store.app_automatic_updates_get(id).unwrap()["automatic"], false);
+        assert!(store.app_automatic_updates_get("bad id").is_err());
     }
 }

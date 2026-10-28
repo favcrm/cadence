@@ -4158,7 +4158,9 @@ impl Shared {
             | "app_workspace_update_check"
             | "app_workspace_remove_preview"
             | "app_workspace_remove"
-            | "app_workspace_restore" => self.rpc_app_explorer(method, params, peer_pid),
+            | "app_workspace_restore"
+            | "app_automatic_updates_get"
+            | "app_automatic_updates_set" => self.rpc_app_explorer(method, params, peer_pid),
             "app_chat_descriptor" => self.rpc_app_chat_descriptor(params, peer_pid),
             "app_assistant_actions" => self.rpc_app_assistant_agent(method, params, peer_pid),
             "app_assistant_invoke" => self.rpc_app_assistant_agent(method, params, peer_pid),

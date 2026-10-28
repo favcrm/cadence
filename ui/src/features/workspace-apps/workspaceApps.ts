@@ -632,6 +632,10 @@ export const appExplorer = {
   requestInstall: (catalogId: string) => request<InstallRequest>("/api/app-catalog/request", undefined, { catalog_id: catalogId }),
   dismissRequest: (id: string) => request<unknown>("/api/app-requests/dismiss", undefined, { id }),
   updateCheck: (installId: string) => request<{ has_update: boolean; digest: string; access_change?: { state: string; added?: string[]; removed?: string[] } }>(`/api/app-installations/${part(installId)}/update-check`, undefined, {}),
+  automaticUpdates: (installId: string, signal?: AbortSignal) =>
+    request<{ install_id: string; automatic: boolean }>(`/api/app-installations/${part(installId)}/automatic-updates`, signal),
+  setAutomaticUpdates: (installId: string, automatic: boolean) =>
+    request<{ install_id: string; automatic: boolean }>(`/api/app-installations/${part(installId)}/automatic-updates`, undefined, { automatic }),
   removePreview: (installId: string) => request<RemovePreview>(`/api/app-installations/${part(installId)}/remove-preview`, undefined, {}),
   remove: (installId: string, body: { expected_generation: string; expected_digest: string; request_id: string }) => request<unknown>(`/api/app-installations/${part(installId)}/remove`, undefined, body),
   restore: (installId: string) => request<{ restored: boolean; digest: string }>(`/api/app-installations/${part(installId)}/restore`, undefined, {}),

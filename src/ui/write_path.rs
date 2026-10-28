@@ -1111,7 +1111,10 @@ pub(crate) fn write_route(
             | RouteId::ArtifactRead
             | RouteId::ArtifactVersions
             | RouteId::AgentDetail
-            | RouteId::AgentRoles => err_response(500, "a read row reached the write dispatcher"),
+            | RouteId::AgentRoles
+            | RouteId::AutomaticUpdatesGet => {
+                err_response(500, "a read row reached the write dispatcher")
+            }
             RouteId::SessionOpen => operator::open(&mut request, state_dir, opts),
             RouteId::SessionLogout => operator::logout(&request, state_dir, opts),
             RouteId::SessionDeviceCode => operator::device_code(&mut request, state_dir, opts),
@@ -1173,6 +1176,14 @@ pub(crate) fn write_route(
                 opts,
                 caller.as_ref(),
                 app_explorer::WriteAction::UpdateCheck,
+                bound.get("id"),
+            ),
+            RouteId::AutomaticUpdatesSet => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::AutomaticUpdatesSet,
                 bound.get("id"),
             ),
             RouteId::ExplorerRemovePreview => explorer_write(

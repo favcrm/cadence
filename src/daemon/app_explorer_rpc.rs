@@ -591,6 +591,8 @@ impl Shared {
             "app_install_request_dismiss" => &["id", "public_session"],
             "app_workspace_install_entry" => &["catalog_id", "expected_digest", "public_session"],
             "app_workspace_update_check" => &["install_id"],
+            "app_automatic_updates_get" => &["install_id"],
+            "app_automatic_updates_set" => &["install_id", "automatic", "public_session"],
             "app_workspace_remove_preview" => &[
                 "install_id",
                 "expected_generation",
@@ -766,6 +768,21 @@ impl Shared {
             "app_workspace_update_check" => {
                 self.rpc_app_workspace_update_check(required_str(params, "install_id")?)
             }
+            "app_automatic_updates_get" => {
+                let install_id = required_str(params, "install_id")?;
+                self.require_workspace_install(install_id)?;
+                self.store.app_automatic_updates_get(install_id)
+            }
+            "app_automatic_updates_set" => {
+                let install_id = required_str(params, "install_id")?;
+                let automatic = match params.get("automatic") {
+                    Some(Value::Bool(value)) => *value,
+                    _ => return Err(Error::rejected("automatic must be a boolean")),
+                };
+                self.require_workspace_install(install_id)?;
+                self.explorer_human(params, None)?;
+                self.store.app_automatic_updates_set(install_id, automatic)
+            }
             "app_workspace_remove_preview" => {
                 self.rpc_app_workspace_remove_preview(required_str(params, "install_id")?)
             }
@@ -871,6 +888,25 @@ impl Shared {
     /// above still decide. An absent proof is the legacy local path and names
     /// no human. A present proof must be a live granted session whose role
     /// fits the write: the named member's `member_as`, else the owner.
+    /// The preference belongs to one workspace install. A missing or legacy
+    /// row is not a place to store it.
+    fn require_workspace_install(&self, install_id: &str) -> Result<()> {
+        let id = app_catalog::InstallationId::parse(install_id)?;
+        let pm_dir = self.pm_dir()?;
+        let pm = self.pm_at(&pm_dir)?;
+        let catalog = app_catalog::Catalog::load(&pm.dir).unwrap_or_default();
+        let entry = catalog
+            .entries()
+            .get(&id)
+            .ok_or_else(|| Error::rejected("unknown installation ID"))?;
+        if entry.storage != app_catalog::Storage::Workspace {
+            return Err(Error::rejected(
+                "automatic updates need a workspace installation",
+            ));
+        }
+        Ok(())
+    }
+
     fn explorer_human(&self, params: &Value, member: Option<&str>) -> Result<Option<Value>> {
         let token = match params.get("public_session") {
             None => return Ok(None),

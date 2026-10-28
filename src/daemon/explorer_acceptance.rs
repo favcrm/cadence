@@ -236,6 +236,11 @@ mod tests {
                 json!({"catalog_id": "crm", "expected_digest": digest}),
             ),
             ("app_workspace_update_check", json!({"install_id": "x"})),
+            ("app_automatic_updates_get", json!({"install_id": "x"})),
+            (
+                "app_automatic_updates_set",
+                json!({"install_id": "x", "automatic": true}),
+            ),
             ("app_workspace_remove_preview", json!({"install_id": "x"})),
             (
                 "app_workspace_remove",

@@ -911,6 +911,14 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("operator_connection (CAD-1129)"),
     ),
     (
+        "app_automatic_updates_get",
+        Rule::Handler("operator_connection (CAD-1129)"),
+    ),
+    (
+        "app_automatic_updates_set",
+        Rule::Handler("operator_connection (CAD-1129)"),
+    ),
+    (
         "app_workspace_remove_preview",
         Rule::Handler("operator_connection (CAD-1129)"),
     ),

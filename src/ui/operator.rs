@@ -2704,6 +2704,7 @@ mod tests {
             "/api/app-favorites/default",
             "/api/app-requests/dismiss",
             "/api/app-installations/inst-1/update-check",
+            "/api/app-installations/inst-1/automatic-updates",
             "/api/app-installations/inst-1/remove-preview",
             "/api/app-installations/inst-1/remove",
             "/api/app-installations/inst-1/restore",

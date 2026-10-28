@@ -77,6 +77,16 @@ fn board_caller(
     operator::board_caller(request, state_dir, opts, false, None)
 }
 
+/// `GET /api/app-installations/{id}/automatic-updates`. Absence is off.
+pub(super) fn automatic_updates_get(state_dir: &Path, install: &str) -> HttpResp {
+    relay(
+        state_dir,
+        "app_automatic_updates_get",
+        json!({"install_id": install}),
+        None,
+    )
+}
+
 /// GET reads: `/api/app-catalog`, `/api/app-catalog/<id>`,
 /// `/api/app-home`, `/api/app-favorites`, `/api/app-requests`.
 pub(super) fn read(
@@ -139,6 +149,7 @@ pub(super) enum WriteAction {
     FavoriteOpened,
     RequestDismiss,
     UpdateCheck,
+    AutomaticUpdatesSet,
     RemovePreview,
     Remove,
     Restore,
@@ -189,6 +200,17 @@ pub(super) fn write(
             json!({"install_id": install}),
             None,
         ),
+        WriteAction::AutomaticUpdatesSet => match public_proof(proof_relay) {
+            Ok(proof) => body_rpc_install(
+                request,
+                state_dir,
+                "app_automatic_updates_set",
+                install,
+                &["automatic"],
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
         WriteAction::RemovePreview => relay(
             state_dir,
             "app_workspace_remove_preview",

@@ -384,6 +384,7 @@ const CATALOG: &[(&str, &[&str])] = &[
             "digest",
         ],
     ),
+    ("app_update_preferences", &["install_id", "automatic"]),
     (
         "artifacts",
         &[
