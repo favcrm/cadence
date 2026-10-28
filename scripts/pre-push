@@ -146,6 +146,9 @@ def plan(root, changed, with_tests):
                   None if ui else "ui/ unchanged"))
     steps.append(("ui lint", ["bun", "run", "--cwd", "ui", "lint"],
                   None if ui else "ui/ unchanged"))
+    # CAD-1285: shipped migration blocks and their SCHEMA constants stay frozen.
+    steps.append(("migration ddl", ["python3", "scripts/check-migration-ddl"],
+                  None if touched(changed, "src/store/") else "src/store/ unchanged"))
     cs = contract_scripts(root)
     need = touched(changed, "scripts/", ".github/", "tests/scripts/")
     if not need:

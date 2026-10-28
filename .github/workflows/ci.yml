@@ -287,6 +287,16 @@ jobs:
       # driven through all four matrix outcomes and must refuse failure/cancelled.
       - run: python3 tests/cad1540_cross_build_gate_acceptance.py
       - run: scripts/design-kit --check
+      # CAD-1285: a shipped `version < N` store migration block, and the
+      # SCHEMA constant it applies, must not change; new DDL gets a new version.
+      - name: Refuse DDL edits to shipped migration blocks
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          python3 scripts/check-migration-ddl --base "$BASE_SHA"
+      - run: python3 tests/cad1285_migration_ddl_acceptance.py
       - name: Check contributor documentation paths
         run: python3 scripts/check-doc-links.py
       - name: Test contributor documentation checker
