@@ -546,6 +546,16 @@ records. Each adapter supplies its real host version and supported contract
 profile. The hosted build pins the canonical native Git revision and verifies
 its source/artifact hashes rather than maintaining a second rule engine.
 
+The `app.requirements.evaluate` command accepts the exact manifest and an
+explicit target profile: host `core` version and `contracts` with their majors
+and `validator` or `sandboxed` stage. It returns the native compatibility
+receipt against that profile. The caller must establish that the profile is
+the target's current, authentic profile; the rules-core release version is not
+the host version. Envelope `ok` means evaluation succeeded, not compatibility;
+read `value.compatible`. A legacy manifest declares no requirements, so it
+returns `declared: false` and no checks, not proof that a target can run it.
+Package inspection, tenant state and authorization are separate decisions.
+
 ## Offline screen-frame previews and projection fixtures
 
 `cadence app frame-kit --out <dir> [--bundle <local-app-bundle>] [--parent-origin <origin>]`

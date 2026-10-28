@@ -30,6 +30,23 @@
       ]
     },
     {
+      "description": "Evaluate `needs.requires` against an explicit target profile.",
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/RequirementsInput"
+        },
+        "op": {
+          "type": "string",
+          "const": "app.requirements.evaluate"
+        }
+      },
+      "required": [
+        "op",
+        "input"
+      ]
+    },
+    {
       "description": "Check an issue id, project key, tags, status and priority.",
       "type": "object",
       "properties": {
@@ -120,6 +137,86 @@
         "id",
         "status",
         "blockers"
+      ]
+    },
+    "RequirementsInput": {
+      "description": "Input of `app.requirements.evaluate`.",
+      "type": "object",
+      "properties": {
+        "manifest": {
+          "description": "The exact `app.md` text.",
+          "type": "string"
+        },
+        "target": {
+          "description": "The host being asked. Required: there is no native, hosted or other\ndefault profile, and a missing one is refused, never assumed.",
+          "$ref": "#/$defs/TargetProfile"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "manifest",
+        "target"
+      ]
+    },
+    "TargetContract": {
+      "description": "One contract a target provides, with the stage it is actually at.",
+      "type": "object",
+      "properties": {
+        "majors": {
+          "description": "The contract majors this target serves, 1 to 8 values in 1..=99.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "stage": {
+          "description": "What the target actually does with the contract — never more.",
+          "$ref": "#/$defs/TargetStage"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "majors",
+        "stage"
+      ]
+    },
+    "TargetProfile": {
+      "description": "A host's own capability profile, supplied by the caller. This crate never\nsubstitutes the native registry ([`crate::app_compat::SUPPORTED_CONTRACTS`])\nfor it: native deliberately provides a different contract set (for example\nit does not serve `app-storage`), so copying it would answer for the wrong\nhost. Contract names are host-owned data here, not entries in this build's\nregistry — a target that really serves a contract may name it.",
+      "type": "object",
+      "properties": {
+        "contracts": {
+          "description": "Every host contract the target provides. An explicit empty map is a\nhost that provides none; omitting the field is an absent profile and\nrefuses.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/TargetContract"
+          }
+        },
+        "core": {
+          "description": "The running *host's* version: an exact semantic version. This is the\nplatform the package would run on, never the rules-core/wasm release\nthat computes the answer — those are different versions, and a caller\nthat cannot prove the host's own version must refuse rather than send\nthe rules version.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "core",
+        "contracts"
+      ]
+    },
+    "TargetStage": {
+      "description": "The stage a target declares for a contract. Closed set: an unknown stage\nis a profile this core cannot evaluate and refuses.",
+      "oneOf": [
+        {
+          "description": "A strict validator exists; nothing executes the declaration.",
+          "type": "string",
+          "const": "validator"
+        },
+        {
+          "description": "A consumer renders or runs the descriptor in a sandbox.",
+          "type": "string",
+          "const": "sandboxed"
+        }
       ]
     },
     "ValidateInput": {

@@ -1,0 +1,42 @@
+{
+  "input": {
+    "v": 1,
+    "op": "app.requirements.evaluate",
+    "input": {
+      "manifest": "---\nname: demo\nneeds:\n  requires:\n    contracts: {app-storage: [1]}\n---\nbody\n",
+      "target": {
+        "core": "0.3.0",
+        "contracts": {}
+      }
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "app.requirements.evaluate",
+    "value": {
+      "schema": 1,
+      "ok": false,
+      "compatible": false,
+      "unmet": "app requires host contract 'app-storage' major 1 — this host supports none (unknown contract)",
+      "declared": true,
+      "core": null,
+      "contracts": {
+        "app-storage": [1]
+      },
+      "host": {
+        "core": "0.3.0",
+        "contracts": {}
+      },
+      "checks": [
+        {
+          "kind": "contract",
+          "contract": "app-storage",
+          "required": [1],
+          "supported": [],
+          "stage": null,
+          "ok": false
+        }
+      ]
+    }
+  }
+}

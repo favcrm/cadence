@@ -27,6 +27,23 @@
       ]
     },
     {
+      "description": "The native receipt [`Compat::report`] produced; its published shape is\n[`RequirementsValue`], and the value is emitted as produced rather than\nre-decoded, so a shape drift is a test failure, never a runtime trap.",
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "app.requirements.evaluate"
+        },
+        "value": {
+          "$ref": "#/$defs/RequirementsValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "op": {
@@ -104,6 +121,211 @@
       "required": [
         "ready",
         "blocked"
+      ]
+    },
+    "RequirementCheck": {
+      "description": "One requirement and whether the target met it.",
+      "oneOf": [
+        {
+          "description": "The manifest's `requires.core` range against the target's version.",
+          "type": "object",
+          "properties": {
+            "host": {
+              "description": "The target's version.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "core"
+            },
+            "ok": {
+              "description": "Whether the target's version falls inside the range.",
+              "type": "boolean"
+            },
+            "required": {
+              "description": "The declared range text.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "host",
+            "ok"
+          ]
+        },
+        {
+          "description": "One declared contract major list against the target's profile.",
+          "type": "object",
+          "properties": {
+            "contract": {
+              "description": "The contract the manifest requires.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "contract"
+            },
+            "ok": {
+              "description": "Whether every required major is supported.",
+              "type": "boolean"
+            },
+            "required": {
+              "description": "The majors the manifest requires.",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              }
+            },
+            "stage": {
+              "description": "The target's stage for `contract`; `null` when it does not\nprovide it.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TargetStage"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "supported": {
+              "description": "The majors the target declares for `contract`; empty when the\ntarget does not provide it.",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "contract",
+            "required",
+            "supported",
+            "ok"
+          ]
+        }
+      ]
+    },
+    "RequirementsHost": {
+      "description": "The version and contracts of the target that produced a receipt.",
+      "type": "object",
+      "properties": {
+        "contracts": {
+          "description": "The target's declared contracts, name → sorted majors.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          }
+        },
+        "core": {
+          "description": "The target's version, as it participated in precedence.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "core",
+        "contracts"
+      ]
+    },
+    "RequirementsValue": {
+      "description": "Success value of `app.requirements.evaluate`: the native compatibility\nreceipt, typed. It is the value [`Compat::report`] produced for the\nsupplied target, so native and non-native hosts quote one receipt shape.\n\nThis type is the *published shape* of the receipt (the op emits the\nreceipt itself); `receipt_matches_the_published_shape` pins it.\n\n**Authority**: the profile is caller data, not authenticated by this\nfunction. `compatible: true` means \"every declared requirement is met by\nthe exact profile supplied\", never \"this tenant is authorized to install\".\nA consumer that admits must first establish that the profile it sends is\nits own current, authentic host profile, and must bind the answer to the\nexact manifest bytes and profile it supplied.\n\n`ok` here is the receipt's compatibility verdict (as in the native\nreceipt), not the envelope's `ok`, which only says the op ran.",
+      "type": "object",
+      "properties": {
+        "checks": {
+          "description": "One entry per checked requirement, in declaration order (core first,\nthen contracts by name).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RequirementCheck"
+          }
+        },
+        "compatible": {
+          "description": "Whether every declared requirement is met by the target.",
+          "type": "boolean"
+        },
+        "contracts": {
+          "description": "The declared contract requirements, name → sorted majors.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          }
+        },
+        "core": {
+          "description": "The declared `requires.core` range text; `null` when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "declared": {
+          "description": "Whether the manifest declared any `needs.requires` at all.",
+          "type": "boolean"
+        },
+        "host": {
+          "description": "The target that was evaluated.",
+          "$ref": "#/$defs/RequirementsHost"
+        },
+        "ok": {
+          "description": "Compatibility verdict, always equal to `compatible`.",
+          "type": "boolean"
+        },
+        "schema": {
+          "description": "Receipt schema; `1` is the only version.",
+          "type": "integer",
+          "format": "uint32",
+          "const": 1,
+          "minimum": 0
+        },
+        "unmet": {
+          "description": "The first unmet requirement in the native wording; `null` when\ncompatible. The full set is in `checks`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "ok",
+        "compatible",
+        "declared",
+        "contracts",
+        "host",
+        "checks"
+      ]
+    },
+    "TargetStage": {
+      "description": "The stage a target declares for a contract. Closed set: an unknown stage\nis a profile this core cannot evaluate and refuses.",
+      "oneOf": [
+        {
+          "description": "A strict validator exists; nothing executes the declaration.",
+          "type": "string",
+          "const": "validator"
+        },
+        {
+          "description": "A consumer renders or runs the descriptor in a sandbox.",
+          "type": "string",
+          "const": "sandboxed"
+        }
       ]
     },
     "ValidateValue": {
