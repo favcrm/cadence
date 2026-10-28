@@ -48,6 +48,9 @@ pub(crate) struct ManagementProfileEvidence {
 }
 
 impl ProtectedRuntimeCoordinator {
+    /// No coordinator can exist on this host; shutdown has nothing to stop.
+    pub(crate) fn stop_all(&self, _reason: &str) {}
+
     pub(crate) fn management_profile_evidence(&self) -> Result<ManagementProfileEvidence> {
         Err(refused())
     }
