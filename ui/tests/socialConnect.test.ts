@@ -1,4 +1,4 @@
-import { makePlanner, runCall, type ActionContext } from "../src/features/workspace-apps/screen/screenActions";
+import { runCall, type ActionContext } from "../src/features/workspace-apps/screen/screenActions";
 import { accountLabel, connectOutcome, connectReturnTo, connectToast, publishAllowed, publicationBinding, sendSlot, withoutConnectParams } from "../src/features/workspace-apps/socialConnect";
 import type { AppBinding, Installation } from "../src/features/workspace-apps/workspaceApps";
 
@@ -88,32 +88,30 @@ async function main() {
   result = await runCall(ctx(), "social.destinations.list", { x: 1 }, ui);
   assert(!result.ok, "list takes no arguments");
 
-  // Use for publishing: a plan with a host label; the run sends the revision it read.
+  // Use for publishing: the user's own choice is a direct call; the host sends the revision it read.
   replies = { "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d1", label: "harbour", toolkit: "instagram" }] } },
     "/contexts/ctx1/bindings": { body: { bindings: [binding({ destination_id: "d0", destination_label: "old", toolkit: "instagram" })] } },
     "/publishing/use": { body: { binding: binding() } } };
   calls.length = 0;
   let changed = 0;
-  const planned = await makePlanner(() => ctx(() => { changed += 1; }))("publish.destination.use", { destination_id: "d1" });
-  assert("run" in planned && planned.label === "Use @harbour for publishing", "label comes from the company's list");
-  const done = await planned.run();
-  assert(done.ok && changed === 1, "the tap runs and the board reloads");
+  const done = await runCall(ctx(() => { changed += 1; }), "publish.destination.use", { destination_id: "d1" }, ui);
+  assert(done.ok && changed === 1, "the user's own choice writes directly and the board reloads");
   equal(calls[calls.length - 1], { path: "/api/app-installations/inst1/publishing/use", body: { destination_id: "d1", context_id: "ctx1", expected_revision: 3 } }, "replace sends the revision it saw");
-  // An account that is not in the company's list never gets a button.
-  const missing = await makePlanner(() => ctx())("publish.destination.use", { destination_id: "other-company" });
-  assert("code" in missing && missing.code === "unknown_destination", "a destination outside the list is refused before any tap");
+  // An account that is not in the company's list is refused.
+  const missing = await runCall(ctx(), "publish.destination.use", { destination_id: "other-company" }, ui);
+  assert(!missing.ok && missing.refusal.code === "unknown_destination", "a destination outside the list is refused before any write");
   // A forged field (a grant, a label) or no destination is refused.
   for (const args of [{}, { destination_id: "d1", grant_id: "dpq_abcdefgh" }, { destination_id: "d1", label: "forged" }]) {
-    const refused = await makePlanner(() => ctx())("publish.destination.use", args as Record<string, unknown>);
-    assert("code" in refused && refused.code === "bad_args", "bad args refused");
+    const refused = await runCall(ctx(), "publish.destination.use", args as Record<string, unknown>, ui);
+    assert(!refused.ok && refused.refusal.code === "bad_args", "bad args refused");
   }
   // No existing binding: create with a request id, no revision.
   replies["/contexts/ctx1/bindings"] = { body: { bindings: [] } };
   calls.length = 0;
-  const fresh = await makePlanner(() => ctx())("publish.destination.use", { destination_id: "d1" });
-  assert("run" in fresh, "plans");
-  await fresh.run();
+  const fresh = await runCall(ctx(), "publish.destination.use", { destination_id: "d1" }, ui);
+  assert(fresh.ok, "creates the binding");
   const sent = calls[calls.length - 1].body as Record<string, unknown>;
   assert(typeof sent.request_id === "string" && !("expected_revision" in sent), "create carries a request id and no revision");
 }
+
 main().then(() => console.log("socialConnect ok"));
