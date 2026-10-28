@@ -1542,12 +1542,29 @@ fn flipped_digest(digest: &str) -> String {
 
 #[test]
 fn cad1887_fresh_schema_includes_the_operator_decision_tables() {
-    let schema = crate::store::app_runs::SCHEMA;
-    let delta = crate::store::app_runs::OPERATOR_DECISION_SCHEMA;
-    assert!(
-        schema.contains(delta),
-        "a fresh store must create the same disposition tables the v59 migration adds"
-    );
+    let (dir, _store) = store();
+    let db = dir.path().join("t.sqlite3");
+    let present = |kind: &str, name: &str| -> bool {
+        Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2",
+                [kind, name],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
+    };
+    assert!(present("table", "app_run_dispositions"));
+    assert!(present("table", "app_run_tickets"));
+    assert!(present("index", "app_run_tickets_issue"));
+    assert!(present("table", "app_runs"));
+    let version: i64 = Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, crate::rollout::SCHEMA_VERSION);
 }
 
 #[test]

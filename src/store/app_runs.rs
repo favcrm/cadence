@@ -467,7 +467,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS app_run_tickets_issue
  ON app_run_tickets(issue_id) WHERE issue_id IS NOT NULL;
 ";
 
-pub(super) const SCHEMA: &str = "\
+pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS app_install_capabilities(
  install_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL CHECK(epoch>0),
  digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('approved','revoked')),
@@ -504,26 +504,6 @@ CREATE TABLE IF NOT EXISTS app_run_artifact_fetches(
  artifact_id TEXT NOT NULL REFERENCES app_run_artifacts(id),
  message_id TEXT NOT NULL, turn_hash TEXT NOT NULL, created REAL NOT NULL,
  PRIMARY KEY(artifact_id,message_id,turn_hash));
-CREATE TABLE IF NOT EXISTS app_run_dispositions(
- run_id TEXT PRIMARY KEY REFERENCES app_runs(id),
- request_id TEXT NOT NULL UNIQUE,
- artifact_id TEXT NOT NULL REFERENCES app_run_artifacts(id),
- artifact_digest TEXT NOT NULL,
- decision TEXT NOT NULL CHECK(decision IN ('accept','decline')),
- created REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS app_run_tickets(
- run_id TEXT PRIMARY KEY REFERENCES app_runs(id),
- request_id TEXT NOT NULL UNIQUE,
- artifact_id TEXT NOT NULL REFERENCES app_run_artifacts(id),
- artifact_digest TEXT NOT NULL,
- suggestion_index INTEGER NOT NULL CHECK(suggestion_index>=1),
- suggestion_count INTEGER NOT NULL CHECK(suggestion_count>=2),
- suggestion_text TEXT NOT NULL CHECK(length(suggestion_text)>0),
- issue_id TEXT,
- created REAL NOT NULL,
- CHECK(issue_id IS NULL OR length(issue_id)>0));
-CREATE UNIQUE INDEX IF NOT EXISTS app_run_tickets_issue
- ON app_run_tickets(issue_id) WHERE issue_id IS NOT NULL;
 ";
 
 pub struct LocalRunProvenance<'a> {

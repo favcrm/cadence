@@ -1486,10 +1486,9 @@ impl Store {
             if version < 59 {
                 // CAD-1887: one operator disposition per run, and at most
                 // one selected ticket. New tables only. v20 already shipped
-                // `app_runs::SCHEMA`, so a store past that block never runs
-                // DDL added there; this idempotent create is what those
-                // stores apply. Fresh opens that already created the tables
-                // from SCHEMA converge here.
+                // `app_runs::SCHEMA`, so these tables are not added there.
+                // This block is the create, for a fresh open and for a store
+                // that already passed v20.
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(super::app_runs::OPERATOR_DECISION_SCHEMA)?;
                 tx.execute("UPDATE schema_version SET version=59", [])?;

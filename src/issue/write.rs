@@ -56,6 +56,9 @@ pub(crate) use rev::{
 };
 pub(crate) use ticket::confirm_committed_selected_issue;
 pub use ticket::materialize_app_run_ticket;
+// The bind acceptance test is the only caller, and it compiles only with
+// the test seam. A plain library build must not carry the re-export.
+#[cfg(all(test, feature = "test-seam"))]
 pub(crate) use ticket::{app_ticket_body, app_ticket_title};
 
 #[cfg(test)]
