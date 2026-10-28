@@ -1,6 +1,6 @@
 [package]
 name = "cadence-agent"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 # CAD-1727: `tests/*.rs` are modules of the one `suite` target below, not
 # one linked executable each. 109 executables cost 15.74 GiB per lane and
@@ -59,6 +59,14 @@ ui = []
 # and review tests can inject proc roots. The compile_error! in
 # src/test_seam.rs keeps these seams out of every release build.
 test-seam = []
+# CAD-1159 SEC-002: admit an owner-elected PUBLIC fixture image-verification
+# root into a separately labelled debug/test-seam constructor artifact. Opt-in
+# only, never a default: the compile_error! in src/test_seam.rs refuses every
+# combination other than debug_assertions + test-seam + this feature, and
+# build.rs admits only the fixed private descriptor
+# .cadence/native-fixture-public-root-v1.txt — no env/argv/request key path.
+native-fixture-admission = []
+
 # CAD-1568: manual cross-repository CLI/runtime acceptance. The ignored
 # packaged-CLI scenario drives a `cargo build --features test-seam` binary
 # against real AOS test handlers; never part of ordinary `cargo test`.

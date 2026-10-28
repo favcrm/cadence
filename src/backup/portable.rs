@@ -625,6 +625,7 @@ const CATALOG: &[(&str, &[&str])] = &[
             "updated",
         ],
     ),
+    (
         "connection_metadata",
         &[
             "singleton",

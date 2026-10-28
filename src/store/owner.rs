@@ -3,6 +3,9 @@
 //! The relay retains path custody, consumes the external obligation before
 //! effects, and reports lost acknowledgements as UNKNOWN (never retries).
 
+//! CAD-1085: the split helper launch is superseded by the native runtime owner;
+//! these helpers stay compiled for the owner-side audit but have no caller.
+#![allow(dead_code)]
 use crate::error::{Error, Result};
 #[path = "owner_transport.rs"]
 mod transport;

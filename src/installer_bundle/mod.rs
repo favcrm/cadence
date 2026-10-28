@@ -3,7 +3,6 @@
 //! Proposed paths below are UNELECTED; no image pins/host custody exist yet.
 #![allow(dead_code)]
 mod carrier;
-pub(crate) mod constructor;
 mod files;
 mod observer;
 // Reuse the reviewed helper's actual seal, not its setuid policy/command parser.
@@ -68,15 +67,14 @@ impl Deadline {
 
 /// Only an independently qualified immutable bootstrap/image owner may produce
 /// this input. No CLI/env/JSON/test-seam constructor in a shipped build.
-#[derive(Clone)]
-pub(crate) struct QualifiedImage {
+struct QualifiedImage {
     client: [u8; 32],
     carrier: [u8; 32],
     observer: [u8; 32],
     namespaces: observer::Namespaces,
 }
 fn production_image() -> Result<QualifiedImage> {
-    constructor::image()
+    Err(refused())
 }
 
 /// Separate independently qualified immutable seal/no-alternate-exec/process
@@ -86,19 +84,12 @@ pub(crate) struct ClosedCarrierCustody {
     image: QualifiedImage,
     pid: u32,
     starttime: u64,
-    owned: Option<constructor::Proof>,
 }
 pub(crate) fn production_closed_custody() -> Result<ClosedCarrierCustody> {
-    let record = constructor::installer()?;
-    Ok(ClosedCarrierCustody {
-        image: production_image()?,
-        pid: record.pid,
-        starttime: record.starttime.parse().map_err(|_| refused())?,
-        owned: Some(constructor::proof()?),
-    })
+    Err(refused()) // exact host-held process construction evidence unavailable
 }
 pub(crate) struct CustodyObservation {
-    facts: Option<observer::Diagnostic>,
+    facts: observer::Diagnostic,
 }
 impl ClosedCarrierCustody {
     pub(crate) fn observe_record(
@@ -117,10 +108,6 @@ impl ClosedCarrierCustody {
         {
             return Err(refused());
         }
-        if let Some(proof) = &self.owned {
-            proof.recheck(until)?;
-            return Ok(CustodyObservation { facts: None });
-        }
         let deadline = Deadline(until);
         // Current image artifacts and target measurements corroborate this
         // private provenance; they NEVER create it or fill remote prctl facts.
@@ -135,17 +122,10 @@ impl ClosedCarrierCustody {
         if facts.starttime() != self.starttime {
             return Err(refused());
         }
-        Ok(CustodyObservation { facts: Some(facts) })
+        Ok(CustodyObservation { facts })
     }
     pub(crate) fn recheck(&self, seen: &CustodyObservation, until: Instant) -> Result<()> {
-        if let Some(proof) = &self.owned {
-            if seen.facts.is_some() {
-                return Err(refused());
-            }
-            return proof.recheck(until);
-        }
-        let facts = seen.facts.as_ref().ok_or_else(refused)?;
-        if facts.starttime() != self.starttime {
+        if seen.facts.starttime() != self.starttime {
             return Err(refused());
         }
         let deadline = Deadline(until);
@@ -156,12 +136,9 @@ impl ClosedCarrierCustody {
             let held = files::HeldArtifact::open(kind, pin, deadline)?;
             held.recheck(deadline)?;
         }
-        facts.recheck(&self.image, deadline)
+        seen.facts.recheck(&self.image, deadline)
     }
     pub(crate) fn require_local_principal(&self, until: Instant) -> Result<()> {
-        if self.owned.is_some() {
-            return constructor::require_self(until);
-        }
         observer::sealed_self()?;
         observer::self_namespaces(&self.image.namespaces, Deadline(until))
     }
@@ -173,13 +150,8 @@ struct WaitingConstruction {
     image: QualifiedImage,
 }
 fn production_construction() -> Result<WaitingConstruction> {
-    Ok(WaitingConstruction {
-        image: production_image()?,
-    })
-}
-
-pub(crate) fn constructor_entry() -> Result<()> {
-    constructor::entry()
+    let _image = production_image()?;
+    Err(refused()) // no independently qualified protected bootstrap/custody
 }
 
 pub(crate) fn carrier_entry() -> Result<()> {
@@ -189,8 +161,18 @@ pub(crate) fn observer_entry() -> Result<()> {
     observer::entry()
 }
 pub(crate) fn client_entry() -> Result<()> {
-    constructor::client_entry()
-    // Fixed sealed transport only; authority remains with actual root custody.
+    fixed_arguments()?;
+    let deadline = Deadline::new();
+    let construction = production_construction()?; // before reading host stdin
+    let stdin = std::io::stdin();
+    use std::os::fd::AsRawFd;
+    // Construction permits only this withheld read. No further exec/fork,
+    // connection or consume before an independently verified owner release.
+    let self_facts = observer::observe(std::process::id(), &construction.image, deadline)?;
+    self_facts.require_construction_measurement()?;
+    let frame = waiting_frame(stdin.as_raw_fd(), deadline)?;
+    crate::daemon::installer_enrolled::release_host_frame_until(&frame.0, deadline.0)
+    // Ok is consumption-only transport evidence, NEVER launch or retirement.
 }
 
 struct HostFrame(Vec<u8>);

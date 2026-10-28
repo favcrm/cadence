@@ -5,6 +5,9 @@
 //! Binding is a public selector, NEVER a forged positive StoreOwnerGrant.
 //! Grant issuance/one-use replay and protected-open/close/witness integration
 //! remain to be exercised once the constructor's real relay contract exists.
+// CAD-1085: the retained-opening replay belongs to the superseded split launch.
+#![allow(dead_code)]
+
 use super::owner;
 use rusqlite::Connection;
 #[cfg(test)]

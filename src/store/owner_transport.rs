@@ -6,6 +6,9 @@
 //! durable external consume/current with exclusive database-directory custody.
 //! A socket peer/Binding cannot issue a grant locally.
 
+//! CAD-1085: the split helper launch is superseded by the native runtime owner;
+//! these helpers stay compiled for the owner-side audit but have no caller.
+#![allow(dead_code)]
 use super::Binding;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};

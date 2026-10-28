@@ -789,6 +789,7 @@ impl Store {
         target_os = "linux",
         target_arch = "x86_64"
     ))]
+    #[allow(dead_code)] // CAD-1085: retained-opening replay belongs to the superseded split launch.
     pub(crate) fn reconsume_owned_opening(&self) -> Result<()> {
         let owner = self
             .seal_state

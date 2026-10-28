@@ -1,6 +1,9 @@
 //! Exactly three stdio pipes from the root-created selected helper. No PID
 //! adoption, authority FD, executable choice or inherited guest credential.
 //! Retained control connection delegates ONLY interrupt/retire/status to root.
+//! CAD-1085: the split helper launch is superseded by the native runtime owner;
+//! these helpers stay compiled for the owner-side audit but have no caller.
+#![allow(dead_code)]
 use super::{
     refused, Authorized, Channel, ProcessPhase, Request, Response, Selection, DEADLINE_SECS,
 };
