@@ -185,7 +185,6 @@ pub(super) fn write(
                 &["catalog_id", "expected_digest"],
                 None,
                 proof.as_deref(),
-                None,
             ),
             Err(resp) => resp,
         },
@@ -204,19 +203,28 @@ pub(super) fn write(
         ),
         WriteAction::AutomaticUpdatesSet => match public_proof(proof_relay) {
             Ok(proof) => {
+                // A public host already named the person. A local or
+                // tailnet board puts the operator cookie it checked into
+                // the same base object. The cookie is not a body field.
+                let mut base = json!({ "install_id": install });
                 let local = if proof.is_none() {
                     operator::local_operator_proof(request, opts)
                 } else {
                     None
                 };
-                body_rpc_install(
+                if let Some(local) = local {
+                    base["session_token"] = json!(local.token);
+                    base["session_key"] = json!(local.key);
+                    base["session_origin"] = json!(local.origin);
+                }
+                relay_body(
                     request,
                     state_dir,
                     "app_automatic_updates_set",
-                    install,
+                    base,
                     &["automatic"],
+                    None,
                     proof.as_deref(),
-                    local.as_ref(),
                 )
             }
             Err(resp) => resp,
@@ -235,7 +243,6 @@ pub(super) fn write(
                 install,
                 &["expected_generation", "expected_digest", "request_id"],
                 proof.as_deref(),
-                None,
             ),
             Err(resp) => resp,
         },
@@ -257,7 +264,6 @@ pub(super) fn write(
                 &["install_ids"],
                 member.as_deref(),
                 proof.as_deref(),
-                None,
             ),
             Err(resp) => resp,
         },
@@ -270,7 +276,6 @@ pub(super) fn write(
                 &["install_ids"],
                 None,
                 proof.as_deref(),
-                None,
             ),
             Err(resp) => resp,
         },
@@ -290,7 +295,6 @@ pub(super) fn write(
                 &["catalog_id"],
                 member.as_deref(),
                 proof.as_deref(),
-                None,
             ),
             Err(resp) => resp,
         },
@@ -303,7 +307,6 @@ pub(super) fn write(
                 &["id"],
                 None,
                 proof.as_deref(),
-                None,
             ),
             Err(resp) => resp,
         },
@@ -323,7 +326,7 @@ fn public_proof(relay: operator::PublicRelay) -> Result<Option<String>, HttpResp
     }
 }
 
-/// Read a bounded JSON body, forward its allow-listed fields onto `base`
+/// Read a bounded JSON body, forward its allow-listed fields onto `params`
 /// (a path-derived id, or empty), plus the caller's `member_as` when the
 /// route admits a member and the attributed verb's `public_session` proof.
 /// Unknown body fields are dropped.
@@ -331,11 +334,10 @@ fn relay_body(
     request: &mut Request,
     state_dir: &Path,
     method: &str,
-    base: Value,
+    mut params: Value,
     fields: &[&str],
     member: Option<&str>,
     proof: Option<&str>,
-    local: Option<&operator::LocalOperatorProof>,
 ) -> HttpResp {
     let bytes = match read_body(request, BODY_CAP) {
         Ok(b) => b,
@@ -345,7 +347,6 @@ fn relay_body(
         Ok(v) => v,
         Err(_) => return err_response(400, "body must be a JSON object"),
     };
-    let mut params = base;
     if let Some(obj) = value.as_object() {
         for f in fields {
             if let Some(v) = obj.get(*f) {
@@ -358,11 +359,6 @@ fn relay_body(
     }
     if let Some(proof) = proof {
         params["public_session"] = json!(proof);
-    }
-    if let Some(local) = local {
-        params["session_token"] = json!(local.token);
-        params["session_key"] = json!(local.key);
-        params["session_origin"] = json!(local.origin);
     }
     match client::rpc(state_dir, method, params) {
         Ok(v) => json_response(v),
@@ -377,16 +373,7 @@ fn body_rpc(
     fields: &[&str],
     member: Option<&str>,
 ) -> HttpResp {
-    relay_body(
-        request,
-        state_dir,
-        method,
-        json!({}),
-        fields,
-        member,
-        None,
-        None,
-    )
+    relay_body(request, state_dir, method, json!({}), fields, member, None)
 }
 
 /// Like `body_rpc`, but `install_id` comes from the path, not the
@@ -398,7 +385,6 @@ fn body_rpc_install(
     install_id: &str,
     fields: &[&str],
     proof: Option<&str>,
-    local: Option<&operator::LocalOperatorProof>,
 ) -> HttpResp {
     relay_body(
         request,
@@ -408,7 +394,6 @@ fn body_rpc_install(
         fields,
         None,
         proof,
-        local,
     )
 }
 

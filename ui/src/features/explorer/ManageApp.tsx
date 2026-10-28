@@ -112,7 +112,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       if (!armed) autoCheckKey.current = "";
       return;
     }
-    if (!installConsentAllowsAutomatic(inst)) return;
+    if (!inst || !installConsentAllowsAutomatic(inst)) return;
     const source = recordedPackageSource(inst.source);
     if (!source) return;
     const key = [installId, source, inst.digest, inst.catalog_generation].join("\0");
