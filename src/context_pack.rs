@@ -263,6 +263,73 @@ pub struct Source {
     pub lesson_ids: Vec<String>,
 }
 
+/// One bounded lesson provenance fact: the exact lesson id and the reason it
+/// was withheld or omitted. Both strings come from project memory, so they are
+/// secret-redacted and capped; optional provenance can never grow into a
+/// mandatory-payload refusal or disclose file-controlled text raw.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LessonNote {
+    pub id: String,
+    pub reason: String,
+}
+
+/// How many per-lesson facts one gap names. The aggregate gap reason keeps
+/// the complete count, so a capped list is visible, never silent.
+pub const LESSON_NOTE_MAX_ENTRIES: usize = 12;
+/// One lesson id stays this small; a malformed id is cut, not dropped.
+pub const LESSON_NOTE_ID_MAX_BYTES: usize = 120;
+/// One withheld/omitted reason stays this small (the dispatch fact bound).
+pub const LESSON_NOTE_REASON_MAX_BYTES: usize = 240;
+/// Shown instead of a lesson fact whose secret redaction failed. The raw text
+/// is never emitted: redaction failure closes disclosure, not the dispatch.
+pub const LESSON_REDACTION_UNAVAILABLE: &str = "[redaction unavailable]";
+
+/// Bound lesson detail for receipt storage: selection order is preserved, the
+/// first [`LESSON_NOTE_MAX_ENTRIES`] survive and every string is redacted then
+/// cut on a char boundary. Deterministic — no clock, no hash order, no
+/// invented ids.
+pub fn lesson_notes<I>(notes: I) -> Vec<LessonNote>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    notes
+        .into_iter()
+        .take(LESSON_NOTE_MAX_ENTRIES)
+        .map(|(id, reason)| LessonNote {
+            id: lesson_text(&id, LESSON_NOTE_ID_MAX_BYTES),
+            reason: lesson_text(&reason, LESSON_NOTE_REASON_MAX_BYTES),
+        })
+        .collect()
+}
+
+/// Redacted, then clipped lesson display text. Redaction runs first so a
+/// credential is never shortened into a shape no rule matches; a redaction
+/// failure yields the marker, never the raw value.
+fn lesson_text(raw: &str, max: usize) -> String {
+    clip_text(redacted_reason(raw), max)
+}
+
+/// Redact one file-controlled reason. Redaction failure closes disclosure: the
+/// marker replaces the text, and the caller never falls back to the raw value.
+fn redacted_reason(raw: &str) -> String {
+    match crate::secret::redact_text(raw) {
+        Ok(text) => text,
+        Err(_) => LESSON_REDACTION_UNAVAILABLE.to_string(),
+    }
+}
+
+/// Cut `text` to at most `max` bytes plus the ellipsis, on a char boundary.
+fn clip_text(text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
 /// One selected-but-withheld source or optional omission.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Gap {
@@ -271,6 +338,16 @@ pub struct Gap {
     pub state: String,
     pub reason: String,
     pub required: bool,
+    /// Per-lesson detail for the synthetic lesson source family: the exact
+    /// ids this gap covers and why each is absent. Build it through
+    /// [`lesson_notes`], the one redaction/bounding boundary: each string is
+    /// secret-redacted before it is capped, and a redaction failure yields a
+    /// marker, never the raw value. Empty for repository documents and for a
+    /// whole-source load failure that names no lesson. Not part of the
+    /// manifest digest: it is bounded visibility for file-controlled reason
+    /// text, not selection identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lessons: Vec<LessonNote>,
 }
 
 /// Optional current-policy lessons, already selected by the native owner.
@@ -489,6 +566,7 @@ pub fn build(
                 state: "not_selected".to_string(),
                 reason: document.selection_reason.clone(),
                 required: document.required,
+                lessons: Vec::new(),
             });
         } else {
             withheld.push(Gap {
@@ -500,6 +578,7 @@ pub fn build(
                     .clone()
                     .unwrap_or_else(|| "source is unavailable".to_string()),
                 required: document.required,
+                lessons: Vec::new(),
             });
         }
     }
@@ -625,14 +704,15 @@ pub fn plan(
                     && gap.get("path").and_then(Value::as_str) == Some(document.path.as_str())
             }) {
                 // Carry the actual prior runtime gap (overflow, read failure).
-                withheld.push(prior.clone());
+                // It can come from a pin/receipt written before the redaction
+                // boundary, so redact it again before it reaches a new receipt.
+                withheld.push(redacted_gap(prior.clone()));
             } else {
-                withheld.push(json!({
-                    "id": document.id, "path": document.path,
-                    "state": "not_resident",
-                    "reason": "not confirmed as delivered in this conversation",
-                    "required": document.required,
-                }));
+                withheld.push(source_gap(
+                    document,
+                    "not_resident",
+                    "not confirmed as delivered in this conversation",
+                ));
             }
         }
         return Ok(Plan {
@@ -716,9 +796,23 @@ pub fn plan(
              content from the earlier revision.\n\n",
             manifest.project_revision
         ));
-        withheld.push(json!({"id": id, "state": "withdrawn",
-                             "reason": "no longer selected for this task",
-                             "required": false}));
+        withheld.push({
+            let mut gap = json!({"id": id, "state": "withdrawn",
+                                 "reason": "no longer selected for this task",
+                                 "required": false});
+            if let Some(ids) = source.get("lesson_ids").and_then(Value::as_array) {
+                let notes = lesson_notes(ids.iter().filter_map(Value::as_str).map(|id| {
+                    (
+                        id.to_string(),
+                        "no longer selected for this task".to_string(),
+                    )
+                }));
+                if !notes.is_empty() {
+                    gap["lessons"] = json!(notes);
+                }
+            }
+            gap
+        });
     }
 
     // Header/footer overhead is constant for this manifest and mode (the
@@ -738,10 +832,7 @@ pub fn plan(
         let text = match read_source(document, reader) {
             Ok(text) => text,
             Err((state, reason)) => {
-                withheld.push(json!({
-                    "id": document.id, "path": document.path, "state": state,
-                    "reason": reason, "required": false,
-                }));
+                withheld.push(source_gap(document, &state, &reason));
                 continue;
             }
         };
@@ -749,11 +840,11 @@ pub fn plan(
         if body_bytes + 2 + reserved_bytes + overhead + context.len() + block.len()
             > MAX_COMBINED_BYTES
         {
-            withheld.push(json!({
-                "id": document.id, "path": document.path, "state": "overflow",
-                "reason": "optional source omitted to keep the combined payload under its cap",
-                "required": false,
-            }));
+            withheld.push(source_gap(
+                document,
+                "overflow",
+                "optional source omitted to keep the combined payload under its cap",
+            ));
             continue;
         }
         context.push_str(&block);
@@ -799,8 +890,63 @@ pub fn acceptance_present(acceptance: &[String], body: &str) -> bool {
 }
 
 fn gap_value(gap: &Gap) -> Value {
-    json!({"id": gap.id, "path": gap.path, "state": gap.state,
-           "reason": gap.reason, "required": gap.required})
+    let mut value = json!({"id": gap.id, "path": gap.path, "state": gap.state,
+           "reason": gap.reason, "required": gap.required});
+    if !gap.lessons.is_empty() {
+        value["lessons"] = json!(gap.lessons);
+    }
+    redacted_gap(value)
+}
+
+/// Redact the file-controlled reason text of one receipt gap before it is
+/// stored or re-emitted. Source identity (`id`, `path`, `state`, `required`)
+/// and per-lesson ids are never altered, and no truncation is added here; a
+/// redaction failure replaces only that reason with the marker. Applied to
+/// manifest gaps and to a prior runtime gap carried into a retained receipt,
+/// because either can come from a pin written before the redaction boundary.
+fn redacted_gap(mut gap: Value) -> Value {
+    if let Some(reason) = gap
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(redacted_reason)
+    {
+        gap["reason"] = json!(reason);
+    }
+    if let Some(notes) = gap.get_mut("lessons").and_then(Value::as_array_mut) {
+        for note in notes.iter_mut() {
+            if let Some(reason) = note
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(redacted_reason)
+            {
+                note["reason"] = json!(reason);
+            }
+        }
+    }
+    gap
+}
+
+/// One whole-source runtime gap (read failure, overflow, not resident). The
+/// synthetic lesson source's exact selected ids stay visible with the reason
+/// the source did not ship; the aggregate reason names the complete count so
+/// a capped detail list is never silent. Repository documents add nothing.
+fn source_gap(document: &Source, state: &str, reason: &str) -> Value {
+    let reason = if document.lesson_ids.is_empty() {
+        reason.to_string()
+    } else {
+        format!("{reason}; {} selected lesson(s)", document.lesson_ids.len())
+    };
+    let mut gap = json!({"id": document.id, "path": document.path, "state": state,
+                         "reason": reason, "required": document.required});
+    if !document.lesson_ids.is_empty() {
+        gap["lessons"] = json!(lesson_notes(
+            document
+                .lesson_ids
+                .iter()
+                .map(|id| (id.clone(), reason.clone()))
+        ));
+    }
+    gap
 }
 
 fn read_source<'a>(
@@ -842,6 +988,10 @@ fn resident_source(entry: &Value, document: &Source) -> bool {
         && entry.get("digest").and_then(Value::as_str) == Some(document.digest.as_str())
 }
 
+/// One included source's receipt. For the synthetic lesson source the exact
+/// emitted ids ride `lesson_ids`, and `disposition` is the reason this turn
+/// carries them (`appended` or `unchanged`); withheld and omitted lessons
+/// ride the gap detail instead.
 fn source_receipt(document: &Source, disposition: &str) -> Value {
     let mut receipt = json!({"id": document.id, "path": document.path, "revision": document.revision,
                             "digest": document.digest, "bytes": document.bytes,

@@ -339,11 +339,14 @@ per independent reviewer (identity, digest, evidence) and PM finalization
 receipts; `src/memory/mod.rs` refuses retrieval without two non-author passes
 and a matching PM finalization; see the [memory implementation](../src/memory/mod.rs)
 and [agent protocol](../skills/cadence/SKILL.md).
-Freshness is a label from the last finalized verify; only an explicit `stale:`
-mark withholds, and no citation re-check exists yet. Path-only matching depends
-on recorded commit paths, so new work without commits can miss a relevant
-lesson. The [development-team proposal](design/DEVELOPMENT-TEAM.md) describes
-future learning behavior separately from these implementation guarantees.
+Issue matching includes validated planned paths as well as recorded commit
+paths, so path-scoped lessons can match before the first commit. The optional
+lesson source records applicability, freshness, accessible Wiki citations and
+declared conditions; inaccessible or unproven citation targets are withheld.
+Conditions and citation analysis are advisory, not proof of a check or authority
+to finalize. Supply receipts distinguish included, withheld and omitted lessons;
+supply does not prove use. Explicit stale and policy validity rules can withhold
+a lesson; age alone changes its freshness label.
 
 ## CLI errors and exit codes
 

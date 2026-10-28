@@ -225,6 +225,11 @@ mod cad1822_context_refusal_acceptance;
 mod cad1852_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1868_acceptance;
+/// CAD-1913: independent adversarial acceptance for planned-path lesson
+/// selection, project isolation and secret non-disclosure at the issue/job
+/// delivery seam. Test-only registration; production carries neither.
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1913_lesson_delivery_isolation_acceptance;
 mod cloud_agent_rpc;
 mod connection_test;
 mod connections_rpc;
