@@ -1823,17 +1823,26 @@ impl LoginRuntime for PortalAcceptanceRuntime {
     }
 }
 
-/// CAD-1853: cloud consent is a locally selected login purpose, not a
-/// capability family that an issuer response can select for a default login.
+/// `--cloud-agent` adds the cloud scopes to the board login. A default
+/// login still cannot receive them from the issuer.
 mod cad1853_cloud_login {
     use super::*;
 
     const CLOUD: [&str; 3] = ["bridge.enroll", "cloud_agent.read", "cloud_agent.write"];
+    const REQUESTED: [&str; 7] = [
+        "cli.read",
+        "cli.write",
+        "wiki.read",
+        "wiki.write",
+        "bridge.enroll",
+        "cloud_agent.read",
+        "cloud_agent.write",
+    ];
 
     fn grant() -> Value {
         let mut grant = login_grant_body();
         grant["organization_slug"] = json!("acme");
-        grant["capabilities"] = json!(CLOUD);
+        grant["capabilities"] = json!(REQUESTED);
         grant
     }
 
@@ -1844,7 +1853,7 @@ mod cad1853_cloud_login {
             requests: Vec::new(),
             baseline: Instant::now(),
             elapsed: 0,
-            requested: CLOUD.to_vec(),
+            requested: REQUESTED.to_vec(),
         };
         let result = login_device_flow(
             HOSTED_LOGIN_ISSUER,
@@ -1853,30 +1862,32 @@ mod cad1853_cloud_login {
             dir,
             |_, _| Ok(()),
             &mut runtime,
-            LoginScope::CloudAgent,
+            LoginScope::Wiki,
+            true,
         );
         (result, runtime)
     }
 
     #[test]
-    fn explicit_cloud_login_accepts_only_the_consented_parent_without_cli_rights() {
+    fn cloud_flag_keeps_the_board_login_and_the_cloud_scopes() {
         let root = tempfile::tempdir().unwrap();
         for (index, role) in ["owner", "member"].into_iter().enumerate() {
             let dir = root.path().join(format!("cloud-{index}"));
             let mut reply = grant();
             reply["principal"]["current_role"] = json!(role);
             if role == "member" {
-                reply["capabilities"] =
-                    json!(["cloud_agent.write", "bridge.enroll", "cloud_agent.read"]);
+                let mut shuffled = REQUESTED.to_vec();
+                shuffled.rotate_left(3);
+                reply["capabilities"] = json!(shuffled);
             }
             let expected = reply.clone();
             let (result, runtime) = login(reply, &dir);
-            let accepted = result.expect("explicit cloud-only device consent must be usable");
+            let accepted = result.expect("board login plus cloud scopes must be usable");
             assert_eq!(runtime.requests.len(), 2);
             assert!(runtime.grant.is_none());
             assert_eq!(
                 runtime.requests[0].1["requested_capabilities"],
-                json!(CLOUD)
+                json!(REQUESTED)
             );
             assert_eq!(accepted.issuer, HOSTED_LOGIN_ISSUER);
             assert_eq!(accepted.subject_id, "user_1");
@@ -1902,11 +1913,17 @@ mod cad1853_cloud_login {
     fn cloud_login_refuses_missing_duplicate_unknown_and_unrequested_authority() {
         let root = tempfile::tempdir().unwrap();
         let mut cases = Vec::new();
-        for missing in 0..CLOUD.len() {
-            cases.push(json!(CLOUD
+        for missing in [
+            "cli.read",
+            "cli.write",
+            "bridge.enroll",
+            "cloud_agent.read",
+            "cloud_agent.write",
+        ] {
+            cases.push(json!(REQUESTED
                 .iter()
-                .enumerate()
-                .filter_map(|(index, scope)| (index != missing).then_some(*scope))
+                .copied()
+                .filter(|scope| *scope != missing)
                 .collect::<Vec<_>>()));
         }
         for extra in [
@@ -1925,7 +1942,7 @@ mod cad1853_cloud_login {
             "assist.write",
             "cloud_agent.admin",
         ] {
-            let mut scopes = CLOUD.to_vec();
+            let mut scopes = REQUESTED.to_vec();
             scopes.push(extra);
             cases.push(json!(scopes));
         }
@@ -1982,7 +1999,7 @@ mod cad1853_cloud_login {
             Some("ws_real"),
             Some("acme"),
             HOSTED_LOGIN_ISSUER,
-            &CLOUD,
+            &REQUESTED,
         )
         .is_err());
 
@@ -2052,6 +2069,7 @@ fn run_wiki_portal_acceptance(
         |_, _| Ok(()),
         &mut runtime,
         LoginScope::Wiki,
+        false,
     );
     (out, runtime)
 }
@@ -2077,6 +2095,7 @@ fn run_portal_acceptance(
         |_, _| Ok(()),
         &mut runtime,
         LoginScope::Wiki,
+        false,
     );
     (out, runtime)
 }
@@ -2569,6 +2588,7 @@ fn hosted_web_consent_requests_only_web_scopes_it_was_asked_for() {
         |_, _| Ok(()),
         &mut runtime,
         LoginScope::Web,
+        false,
     );
     let granted = out.expect("a full web consent was refused");
     assert!(granted.capabilities.iter().any(|c| c == "web.prepare"));
@@ -2622,6 +2642,7 @@ fn hosted_web_consent_requests_only_web_scopes_it_was_asked_for() {
             |_, _| Ok(()),
             &mut runtime,
             LoginScope::Web,
+            false,
         );
         assert!(out.is_err(), "web consent case {case} was accepted");
         assert_nothing_stored(&dir);
@@ -2662,6 +2683,7 @@ fn hosted_portal_rejects_conflicting_exact_issuer_pin_before_request() {
         |_, _| Ok(()),
         &mut runtime,
         LoginScope::Wiki,
+        false,
     );
     assert!(out.is_err());
     assert!(runtime.requests.is_empty(), "pin conflict reached issuer");

@@ -282,36 +282,39 @@ enqueue only and refuses `--wait`.
 
 This unreleased integration connects a **local** Cadence coordinator to the
 matching AgenticOS Worker/Pi cloud-chat runtime. It is not a hosted Linux/git
-executor, the personal assistant, or the existing `agent connect` pickup flow.
-Both native and platform versions must support the new contract.
+executor or the personal assistant. There is no `cloud-agent` command.
+`agent connect --local` (the default) claims hosted work and runs it here.
+`agent connect --cloud` connects the Worker/Pi agent; that flag is the
+consent for paid model turns. A turn is `send`. Both native and platform
+versions must support the new contract.
 
 From an operator connection, grant the saved workspace explicit cloud scopes,
-then connect it to a local alias:
+then connect it:
 
 ```sh
 cadence login acme --cloud-agent
-cadence cloud-agent connect --workspace acme --alias cloud --accept-assistant-consent
+cadence agent connect --cloud
 cadence send cloud --text "Explain this task" --wait 60
 ```
 
 The workspace hint for `login` is positional (`cadence login <slug>`): global
 `--org` is the legacy bound-login workspace id and conflicts with
-`--cloud-agent`. `--workspace` selects the saved cloud login for `connect`; it
-does **not** change the local coordinator, and global `--org` must not be used
-as the cloud connection's target flag. A local `--state-dir` pin remains
-supported.
+`--cloud-agent`. With one saved login, `--cloud` uses it. With more than
+one, pass `--workspace <slug>`. Neither flag changes the local coordinator,
+and global `--org` must not be used as the cloud connection's target. The
+Threads alias defaults to `cloud`; `--alias` overrides it. A local
+`--state-dir` pin remains supported.
 Connect performs identity/capability discovery, not a model invocation.
 Existing `cli.*`, wiki or settings permission does not imply cloud consent.
 
-The login requests `bridge.enroll`, `cloud_agent.read` and
-`cloud_agent.write` — exactly those three, and the issuer may not narrow or
-widen them. That grant is saved as the workspace's login, so CLI, wiki and
-settings verbs for the same workspace need `cadence login <slug>` again; the
-cloud grant carries no `cli.*` authority and renewal never adds any. Cloud
-calls renew it under the cloud purpose: the saved renewable session rotates
-the 300 s access token, and the renewed capability set must still be the same
-three. An operator can enroll a managed local peer with
-`cloud-agent enroll-peer <connection-id> --agent <alias>`. It requires the
+`cadence login acme --cloud-agent` is that same board login plus
+`bridge.enroll`, `cloud_agent.read`, and `cloud_agent.write`. It combines
+with `--web` and `--settings`. The issuer may not drop the CLI pair or those
+three cloud scopes, and a login without the flag cannot gain them from a
+response. One workspace keeps one saved login, so the board and
+`agent connect --cloud` use it together. Renewal rotates that login and must
+return the same scopes. An operator can enroll a managed local peer with
+`agent cloud enroll-peer <connection-id> --agent <alias>`. It requires the
 supported split-UID process boundary and live registration proof; same-UID
 peers are refused before cloud access. Each peer uses its own cloud-only child
 credential, never the human login. Credentials stay with the daemon and are
@@ -345,17 +348,17 @@ when no entries arrive. Home and Threads show **Cloud content unavailable**,
 evict cached cloud-marked rows without discarding ordinary history or pending
 messages, and reload cloud history after read authority is restored.
 
-`cloud-agent ls|show` inspect connections. `cloud-agent read <connection-id>
+`agent cloud ls|show` inspect connections. Connecting is `agent connect --cloud`, not a verb under `agent cloud`. `agent cloud read <connection-id>
 <operation-id>` reconciles an existing receipt without a new submission.
-`cloud-agent send` accepts an explicit `--operation-id`; reuse that ID and the
+`agent cloud send` accepts an explicit `--operation-id`; reuse that ID and the
 identical payload when resolving an interrupted request, not a new ID. A
 `--no-wake` request stays locally queued until explicitly woken. One unsettled
 turn holds its provider session; a busy refusal does not retain another turn.
 Unknown outcomes retain their original binding and reconcile by readback.
 
 This runtime advertises no tools, skills, MCP, profile/memory sync, shell, git,
-business-effect approval or cancellation. `cloud-agent cancel` reports
-unsupported rather than claiming a stop. `cloud-agent disconnect` stops local
+business-effect approval or cancellation. `agent cloud cancel` reports
+unsupported rather than claiming a stop. `agent cloud disconnect` stops local
 admission/readback and drops local consent; it does not cancel accepted remote
 work. A new grant cannot revive queued work whose original cloud authority
 was revoked.

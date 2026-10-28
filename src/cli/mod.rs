@@ -135,7 +135,6 @@ use cadence_agent::error::Error;
 use cadence_agent::error::Result;
 use clap::Parser;
 use clap::Subcommand;
-use cloud_agent::CloudAgentAction;
 use commands::{Commands, PlacementArg};
 use connection::ConnectionAction;
 use daemon::DaemonAction;

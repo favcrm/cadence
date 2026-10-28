@@ -1,28 +1,16 @@
 //! CAD-1853: explicit native connection to a cloud agent.
 //!
-//! This is a distinct external connection, not `agent connect` (hosted
-//! local-agent pickup) and not a hire/location picker. The saved hosted
-//! login for the exact org supplies the credential custody; the daemon
+//! Connecting is `cadence agent connect --cloud`. The verbs here inspect
+//! or reconcile a connection that already exists. There is no top-level
+//! `cloud-agent` command. The saved login supplies custody; the daemon
 //! performs the contract call so no caller ever reads the credential.
 use clap::Subcommand;
 use serde_json::{json, Value};
 
 use super::{print_json, Error, Result};
 
-#[derive(Subcommand)]
+#[derive(Clone, Subcommand)]
 pub(crate) enum CloudAgentAction {
-    /// Connect one hosted workspace's cloud agent; explicit consent required.
-    Connect {
-        /// Saved hosted workspace slug (from `cadence org list`).
-        #[arg(long)]
-        workspace: String,
-        /// Local alias for the canonical Threads work conversation.
-        #[arg(long, default_value = "cloud")]
-        alias: String,
-        /// Explicitly consent to cloud_agent.read/cloud_agent.write model turns.
-        #[arg(long)]
-        accept_assistant_consent: bool,
-    },
     /// List this machine's cloud-agent connections and their truthful state.
     #[command(visible_alias = "list")]
     Ls,
@@ -75,8 +63,8 @@ fn saved_target(org: &str) -> Result<cadence_agent::remote_cli::RemoteTarget> {
         .find(|target| target.org == org)
         .ok_or_else(|| {
             Error::rejected(format!(
-                "org '{org}' has no saved remote login on this host — run `cadence org list` \
-                 and `cadence login --org {org}` first; nothing was sent"
+                "org '{org}' has no saved cloud login on this host — run `cadence org list` \
+                 and `cadence login {org} --cloud-agent` first; nothing was sent"
             ))
         })
 }
@@ -89,27 +77,56 @@ fn home_thread(state_dir: &std::path::Path, id: &str) -> Result<String> {
         .ok_or_else(|| Error::rejected("cloud agent has no canonical work conversation"))
 }
 
+/// `agent connect --cloud`. The flag is the consent: the daemon still
+/// requires `accept_assistant_consent`, and this is the only caller that
+/// sets it.
+pub(super) fn connect(
+    state_dir: std::path::PathBuf,
+    workspace: Option<String>,
+    alias: Option<String>,
+) -> Result<i32> {
+    let workspace = match workspace {
+        Some(slug) => slug,
+        None => default_workspace()?,
+    };
+    let target = saved_target(&workspace)?;
+    let value = super::client::rpc(
+        &state_dir,
+        "cloud_agent_connect",
+        json!({
+            "org": target.org,
+            "org_id": target.org_id,
+            "endpoint": target.endpoint,
+            "alias": alias.unwrap_or_else(|| "cloud".to_string()),
+            "accept_assistant_consent": true,
+        }),
+    )?;
+    print_json(&value);
+    Ok(0)
+}
+
+fn default_workspace() -> Result<String> {
+    let targets = cadence_agent::remote_cli::account_image_targets()?;
+    match targets.len() {
+        1 => Ok(targets[0].org.clone()),
+        0 => Err(Error::usage(
+            "no saved login — run `cadence login <slug> --cloud-agent`, then \
+             `cadence agent connect --cloud`",
+        )),
+        _ => Err(Error::usage(format!(
+            "more than one saved login — pass --workspace <slug> ({})",
+            targets
+                .iter()
+                .map(|target| target.org.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
 pub(super) fn run(state_dir: std::path::PathBuf, action: CloudAgentAction) -> Result<i32> {
     let state = state_dir;
     let value: Value = match action {
-        CloudAgentAction::Connect {
-            workspace,
-            alias,
-            accept_assistant_consent,
-        } => {
-            let target = saved_target(&workspace)?;
-            super::client::rpc(
-                &state,
-                "cloud_agent_connect",
-                json!({
-                    "org": target.org,
-                    "org_id": target.org_id,
-                    "endpoint": target.endpoint,
-                    "alias": alias,
-                    "accept_assistant_consent": accept_assistant_consent,
-                }),
-            )?
-        }
         CloudAgentAction::Ls => super::client::rpc(&state, "cloud_agent_list", json!({}))?,
         CloudAgentAction::Show { cloud_agent_id } => super::client::rpc(
             &state,
