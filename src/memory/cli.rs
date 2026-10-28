@@ -674,7 +674,14 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             let (proj, m) = memory::find(&pm, project.as_deref(), slug)?;
             if *as_json {
                 let fresh = memory::Freshness::for_project(Some(&proj));
-                crate::issue::cli::print_json(&memory::detail_json(&m, &fresh));
+                // A local CLI read proves no operator identity, so the
+                // anonymous reader is used: no access it did not already have.
+                crate::issue::cli::print_json(&memory::detail_json_with_evidence(
+                    &m,
+                    &fresh,
+                    Some(&pm),
+                    None,
+                ));
             } else {
                 let text = std::fs::read_to_string(&m.path)?;
                 println!("{text}");

@@ -174,7 +174,31 @@ pub fn card_json(m: &Memory, fresh: &Freshness) -> Value {
 }
 
 pub fn detail_json(m: &Memory, fresh: &Freshness) -> Value {
+    detail_json_with_evidence(m, fresh, None, None)
+}
+
+/// Detail JSON plus the read-only evidence analysis. Callers that hold the
+/// tracker pass `Some(pm)` so the CLI and the board read surface answer the
+/// same way; a failure is reported as an `unknown` result rather than failing
+/// the read, and nothing here launches a check.
+pub fn detail_json_with_evidence(
+    m: &Memory,
+    fresh: &Freshness,
+    pm: Option<&crate::issue::Pm>,
+    caller: Option<&crate::wiki::Caller>,
+) -> Value {
     let mut v = card_json(m, fresh);
     v["body"] = json!(m.body);
+    if let Some(pm) = pm {
+        let caller = caller.unwrap_or(&crate::wiki::Caller::Public);
+        v["evidence_analysis"] = match super::evidence::analyse_as(pm, m, caller) {
+            Ok(receipt) => receipt.to_json(),
+            Err(error) => json!({
+                "result": "unknown",
+                "error": error.to_string(),
+                "semantic_detection": "not claimed",
+            }),
+        };
+    }
     v
 }
