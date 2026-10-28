@@ -2,7 +2,7 @@
 //!
 //! Resolves each structured citation at the immutable revision it names,
 //! scans the resolved content for secrets, and reports same-scope duplicates
-//! and the documented finite contradiction fixtures as a bounded receipt.
+//! and the documented finite contradiction and overfit fixtures as a bounded receipt.
 //!
 //! Read-only by construction: nothing here launches a check, a runner or a
 //! provider, and a missing or unsupported citation is recorded as such rather
@@ -85,6 +85,7 @@ impl Receipt {
             "limits": {
                 "max_cited_bytes": MAX_CITED_BYTES,
                 "contradiction_fixture": format!("body line `{CONTRADICTION_PREFIX} <slug>`"),
+                "overfit_fixture": "fact line `<environment> cron = <comma-separated minutes> was broken`",
                 "semantic_detection": "not claimed",
             },
         })
@@ -356,6 +357,48 @@ fn contradiction_of(pool: &[Memory], mem: &Memory) -> Option<String> {
     }
     None
 }
+/// Bounded CAD-808 fixture: an incident answer presented as the fact itself.
+/// This deliberately does not inspect cited sources or claim general detection.
+fn overfit_cron_incident(body: &str) -> bool {
+    fn incident_line(fact: &str) -> bool {
+        let mut words = fact.split_ascii_whitespace();
+        let (Some(_environment), Some(cron), Some(equals), Some(minutes), Some(was), Some(broken)) = (
+            words.next(),
+            words.next(),
+            words.next(),
+            words.next(),
+            words.next(),
+            words.next(),
+        ) else {
+            return false;
+        };
+        if words.next().is_some()
+            || !cron.eq_ignore_ascii_case("cron")
+            || equals != "="
+            || !was.eq_ignore_ascii_case("was")
+            || !broken.trim_end_matches('.').eq_ignore_ascii_case("broken")
+        {
+            return false;
+        }
+        let mut count = 0;
+        for minute in minutes.split(',') {
+            if minute.is_empty() || !minute.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            if !minute.parse::<u8>().is_ok_and(|value| value < 60) {
+                return false;
+            }
+            count += 1;
+        }
+        count >= 2
+    }
+    body.lines()
+        .take_while(|line| {
+            let line = line.trim();
+            !line.starts_with("**Why:**") && !line.starts_with("**How to apply:**")
+        })
+        .any(incident_line)
+}
 
 /// Analyse one record's citations and content. Read-only.
 pub fn analyse(pm: &Pm, mem: &Memory) -> Result<Receipt> {
@@ -568,6 +611,10 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
         findings.push(format!(
             "body names {slug} as contradicted in the same project and scope"
         ));
+    }
+    if overfit_cron_incident(&mem.body) {
+        revise = true;
+        findings.push("fact states an incident-specific cron answer; check whether the scheduled job actually fired instead".into());
     }
 
     let outcome = if blocked {
@@ -853,6 +900,48 @@ mod tests {
             wiki_target_revision: None,
         });
         mem
+    }
+
+    #[test]
+    fn bounded_overfit_fixture_distinguishes_incident_answers_from_guidance() {
+        let (root, repo, source, _) = repo_with_two_revisions();
+        let pm = Pm::init(&root.path().join("pm")).unwrap();
+        project_with_repo(&pm, &repo);
+        let reference = EvidenceRef {
+            kind: EvidenceKind::Git,
+            source: "evidence.txt".into(),
+            revision: source.clone(),
+        };
+        let check = |id: &str, body: &str| {
+            let mem = with_condition(memory(id, body, vec![reference.clone()]), &source, &source);
+            analyse(&pm, &mem).unwrap()
+        };
+
+        let incident = check("incident", "staging cron = 7,22,37,52 was broken");
+        assert_eq!(incident.outcome, Outcome::Revise, "{:?}", incident.findings);
+        assert!(incident.findings.iter().any(|f| f.contains("incident")));
+        let multiline = check(
+            "multiline",
+            "An incident was recorded.\nstaging cron = 7,22,37,52 was broken\n\n**Why:** The job missed a run.",
+        );
+        assert_eq!(
+            multiline.outcome,
+            Outcome::Revise,
+            "{:?}",
+            multiline.findings
+        );
+
+        let general = check(
+            "general",
+            "An active schedule does not prove a job fired.\n\n**Why:** CAD-808 cites staging cron = 7,22,37,52 as evidence.\n\n**How to apply:** Check the actual job execution record.",
+        );
+        assert_eq!(general.outcome, Outcome::Pass, "{:?}", general.findings);
+
+        let scoped = check(
+            "scoped",
+            "For scheduler v2.4, use cron = 7,22,37,52 when the documented deployment scope requires it.",
+        );
+        assert_eq!(scoped.outcome, Outcome::Pass, "{:?}", scoped.findings);
     }
 
     #[test]

@@ -1804,6 +1804,14 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/threads/<alias>/stream` | server-sent events — one `event: entry` frame per thread entry with `id: <seq>`; resumes after `Last-Event-ID` (else `?after=`); `: ping` on each idle poll; closes when a daemon poll fails or session admission is lost; the authenticated UI reconnects from the last event ID; `405` on HEAD |
 | `GET /api/master/summary?since=<epoch secs>` | "since you left" (CAD-328) over the daemon's `master_summary` (CAD-339), never posted to the thread: plans proposed and decided, tickets moved, reports, open questions, `routing_backlog`; `400` without a numeric `since`, `501 unsupported_daemon` on a daemon without the master, `503` daemon down |
 
+Memory evidence receipts include two deliberately bounded fixtures. A body line
+`contradicts: <slug>` marks a same-project, same-scope contradiction. The
+overfit fixture flags a fact line shaped `<environment> cron = <comma-separated
+minutes> was broken` as an incident-specific answer; citations and the Why/How
+sections are not searched for this pattern. It does not detect other overfit or
+establish semantic truth. A `pass` means only the receipt's listed mechanical
+checks passed; it is not a review, verification authorization, or finalization.
+
 ### API — writes
 
 Every issue write goes through `issue::write` — the same functions the
