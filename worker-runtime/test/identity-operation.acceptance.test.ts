@@ -108,7 +108,8 @@ function identitySystemOf(messages: readonly Message[]): string {
     .filter(
       (message) =>
         message.role === "system" &&
-        messageText(message).includes(IDENTITY_HEADING),
+        (messageText(message).includes(IDENTITY_HEADING) ||
+          messageText(message).includes("## Company agent identity")),
     )
     .map(messageText)
     .join("\n");
@@ -278,6 +279,94 @@ function profileHost() {
 }
 
 describe("hosted identity operations", () => {
+  it("reuses a company agent snapshot across a real tool handover", async () => {
+    const { database } = sessionDatabase();
+    const snapshots = new IdentitySnapshots(sqlStore(database));
+    const host = profileHost();
+    let loads = 0;
+    const authored = new WeakSet<object>();
+    const registry = createRegistry();
+    registry.install(
+      identityContextExtension(
+        async () => {
+          loads += 1;
+          return assistantIdentityText({
+            scope: "company_agent",
+            identity: {
+              name: host.profile.name ?? "Ledger",
+              look: "bookkeeper",
+              responsibilities: "Reconcile invoices.\nFlag discrepancies.",
+              revision: String(host.profile.revision),
+            },
+          });
+        },
+        authored,
+        snapshots,
+      ),
+    );
+    registry.install(
+      runtimeExtension({ name: "profile-tools", tools: [host.tool] }),
+    );
+    const scripted = scriptedModels(({ hasToolResult }) =>
+      hasToolResult
+        ? assistantReply([{ type: "text", text: "done" }], "stop")
+        : assistantReply(
+            [
+              {
+                type: "toolCall",
+                id: "rename",
+                name: "profile_update",
+                arguments: { name: "Changed" },
+              },
+            ],
+            "toolUse",
+          ),
+    );
+    guardModelRequests(scripted.models, authored);
+    const harness = await Harness.open(
+      new MemoryStorage(),
+      {
+        models: scripted.models,
+        registry,
+      },
+      BACKGROUND_CONTEXT,
+    );
+    try {
+      const conversation = await harness.root(BACKGROUND_CONTEXT, {
+        agent: { model: { provider: "scripted", modelId: "scripted" } },
+      });
+      const operation = await conversation.submit(
+        { type: "input", content: "Reconcile" },
+        BACKGROUND_CONTEXT,
+      );
+      expect((await operation.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      expect(scripted.observations).toHaveLength(2);
+      const first = scripted.observations[0]!;
+      const second = scripted.observations[1]!;
+      expect(first.identitySystem).toContain("name: Ledger");
+      expect(first.identitySystem).toContain(
+        "Reconcile invoices.\nFlag discrepancies.",
+      );
+      expect(first.identitySystem).toContain(
+        "does not add tools, permissions or authority",
+      );
+      expect(first.identitySystem).not.toContain("user_name");
+      expect(first.identitySystem).not.toContain("preferences");
+      expect(second.hasToolResult).toBe(true);
+      expect(second.identitySystem).toBe(first.identitySystem);
+      expect(host.profile.name).toBe("Changed");
+      expect(loads).toBe(1);
+      const rows = database
+        .prepare("SELECT context FROM tenant_identity_snapshots")
+        .all() as Array<{ context: string }>;
+      expect(rows).toHaveLength(1);
+      expect(first.identitySystem).toContain(rows[0]!.context);
+    } finally {
+      await harness.close(BACKGROUND_CONTEXT);
+      database.close();
+    }
+  });
+
   it("keeps one committed identity snapshot across a real tool handover and reads a new one for the next operation", async () => {
     const { database, path } = sessionDatabase();
     const snapshots = new IdentitySnapshots(sqlStore(database));
