@@ -12,11 +12,28 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
+
+
+OWNED = None
+
+
+def _stop(signum, frame):
+    if OWNED:
+        try:
+            cleanup(OWNED)
+        except BaseException:
+            pass
+    os._exit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, _stop)
+signal.signal(signal.SIGINT, _stop)
 
 
 REMOTE = r'''import json, os, platform, re, shutil, signal, subprocess, sys, time, zipfile
@@ -197,6 +214,7 @@ def cleanup(sandbox):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base', help='base commit/ref (default origin/main, then main)')
+    parser.add_argument('--head', help='pushed commit (default HEAD)')
     parser.add_argument('--artifact', help='relative file path under remote checkout to copy back')
     parser.add_argument('--output', help='new local destination for --artifact')
     parser.add_argument('--tests', action='store_true',
@@ -218,7 +236,8 @@ def main():
     untracked = git(root, 'ls-files', '--others', '--exclude-standard', '-z', binary=True)
     if untracked:
         raise Failure('untracked files are not copied; commit, ignore, or remove them before running')
-    head = git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip()
+    current_head = git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip()
+    head = git(root, 'rev-parse', '--verify', (args.head or current_head) + '^{commit}').strip()
     base_ref = args.base or ('refs/remotes/origin/main' if subprocess.run(
         ['git', '-C', str(root), 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 else 'refs/heads/main')
@@ -244,7 +263,7 @@ def main():
         subprocess.run(['git', '-C', str(snapshot), 'bundle', 'create', str(bundle),
                         'HEAD', 'refs/heads/base'], check=True)
         patch = git(root, 'diff', '--binary', '--no-ext-diff', head, binary=True)
-        if git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip() != head:
+        if git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip() != current_head:
             raise Failure('HEAD changed while preparing the sandbox')
         (directory / 'boat-changes.patch').write_bytes(patch)
         patch_sha = hashlib.sha256(patch).hexdigest()
@@ -253,8 +272,11 @@ def main():
         (directory / 'boat-remote.py').write_text(REMOTE)
         sandbox = None
         result = 1
+        failure = None
+        global OWNED
         try:
             sandbox = create_sandbox('cadence-gate-' + uuid.uuid4().hex)
+            OWNED = sandbox
             for name in ('boat-candidate.bundle', 'boat-changes.patch', 'boat-job.json', 'boat-remote.py'):
                 subprocess.run(['boat', '--no-update', 'scp', str(directory / name),
                                 f'{sandbox}:/home/user/{name}'], check=True)
@@ -270,17 +292,17 @@ def main():
                         shutil.copyfileobj(source, target)
                         os.fchmod(target.fileno(), artifact.stat().st_mode & 0o777)
             subprocess.run(['boat', '--no-update', 'usage', sandbox, '--json'], check=False)
-        except BaseException:
-            if args.receipt:
-                print(f'head={head} base={base} patch={patch_sha} sandbox={sandbox or "none"} '
-                      f'rc=1 at={int(time.time())}', flush=True)
-            raise
+        except BaseException as exc:
+            failure = exc
         finally:
             if sandbox and not cleanup(sandbox):
                 result = 1
+            OWNED = None
         if args.receipt:
             print(f'head={head} base={base} patch={patch_sha} sandbox={sandbox or "none"} '
                   f'rc={result} at={int(time.time())}', flush=True)
+        if failure is not None:
+            raise failure
         return result
 
 

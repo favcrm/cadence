@@ -280,6 +280,36 @@ tmp="$gd/cadence-pre-push-receipt.tmp"
 out="$gd/cadence-pre-push-receipt"
 head=$(git rev-parse HEAD 2>/dev/null || echo '?')
 lane=${CADENCE_ALIAS:-$USER}
+# Git passes one line per ref: local-ref local-sha remote-ref remote-sha.
+# Bind the gate to the commit actually being pushed, not merely HEAD, and
+# refuse a multi-head push rather than checking only one of them.
+pushed=
+saw_ref=
+while read -r local_ref local_sha remote_ref remote_sha; do
+    saw_ref=1
+    case "$local_sha" in
+        *[!0]*) ;;
+        *) continue ;;
+    esac
+    case " $pushed " in
+        *" $local_sha "*) ;;
+        *)
+            [ -z "$pushed" ] || pushed="multiple"
+            [ "$pushed" = multiple ] || pushed="$local_sha"
+            ;;
+    esac
+done
+if [ "$pushed" = multiple ]; then
+    printf 'head=%s lane=%s mode=boat steps=refused:multiple-heads rc=1 at=%s\n' \
+        "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
+    exit 1
+fi
+if [ -n "$saw_ref" ] && [ -z "$pushed" ]; then
+    printf 'head=%s lane=%s mode=boat steps=skipped:ref-deletion rc=0 at=%s\n' \
+        "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
+    exit 0
+fi
+[ -n "$pushed" ] || pushed=$head
 # A worktree without scripts/pre-push (a fixture, a sparse lane, a repo that
 # never carried the script) has no gate to run — record that and let the push
 # through rather than blocking on a script that isn't there.
@@ -289,6 +319,11 @@ if [ ! -x scripts/pre-push ]; then
     exit 0
 fi
 if [ "${CADENCE_PRE_PUSH_LOCAL:-}" = 1 ]; then
+    if [ "$pushed" != "$head" ]; then
+        printf 'head=%s lane=%s mode=local steps=refused:head-mismatch rc=1 at=%s\n' \
+            "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
+        exit 1
+    fi
     line=$(scripts/pre-push --receipt ${PRE_PUSH_TESTS:+--tests})
     rc=$?
 else
@@ -297,10 +332,10 @@ else
             "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
         exit 1
     fi
-    output=$(scripts/boat-build --receipt ${PRE_PUSH_TESTS:+--tests})
+    output=$(scripts/boat-build --receipt --head "$pushed" ${PRE_PUSH_TESTS:+--tests})
     rc=$?
     line=$(printf '%s\n' "$output" | tail -n 1)
-    [ -n "$line" ] || line="head=$head lane=$lane mode=boat rc=$rc at=$(date +%s)"
+    [ -n "$line" ] || line="head=$pushed lane=$lane mode=boat rc=$rc at=$(date +%s)"
 fi
 printf '%s\n' "$line" > "$tmp" && mv "$tmp" "$out"
 exit $rc
