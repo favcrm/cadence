@@ -124,6 +124,206 @@ fn resolve_pin(pm: &Pm, caller: &Caller, path: &str, at: &str) -> Result<Pinned>
     })
 }
 
+/// One historical original resolved for memory evidence.
+pub(crate) struct EvidenceText {
+    pub path: String,
+    pub git: String,
+    pub sha256: String,
+    pub body: EvidenceBody,
+}
+
+pub(crate) enum EvidenceBody {
+    Text(String),
+    Blob {
+        size: u64,
+        mime: String,
+        name: String,
+        data_base64: String,
+    },
+}
+
+/// Largest accepted `.blob` pointer JSON (managed sidecars are a few hundred
+/// bytes; the cap only makes this reader's I/O provably bounded).
+const EVIDENCE_POINTER_CAP: u64 = 64 * 1024;
+
+/// Historical original bytes for memory evidence, bounded before I/O.
+///
+/// Same path normalization, ACL and Git source as [`resolve_pin`], with these
+/// restrictions. The selector must be an explicit 40-hex commit: resolving an
+/// `fnv1a:` token inspects up to [`HISTORY_CAP`] historical bodies, so it
+/// cannot promise a single bounded read, and the caller is told so rather than
+/// handed a substituted revision.
+///
+/// A text page is refused from its Git blob size alone when that size exceeds
+/// `max_bytes` (or [`TEXT_CAP`]) — its content is never read. A blob page is
+/// refused from the pointer's recorded size when that size exceeds
+/// `max_bytes` — its content-addressed object is never opened or read.
+/// Within the bound, a blob is opened once under the store's custody checks,
+/// at most `size + 1` bytes are read, the length must equal the pointer's
+/// size, and the digest is computed over exactly the returned buffer.
+///
+/// `Ok(None)` means the pinned commit itself was read and demonstrably holds
+/// neither a text page nor a blob pointer at this path — the definite-absence
+/// answer. An unknown or non-commit selector, an ACL or view refusal, a
+/// directory, an over-limit original, and any custody failure stay `Err`.
+/// A miss never falls back to the live page.
+pub(crate) fn evidence_text(
+    pm: &Pm,
+    caller: &Caller,
+    path: &str,
+    at: &str,
+    max_bytes: usize,
+) -> Result<Option<EvidenceText>> {
+    let norm = normalize(path)?;
+    if norm.is_empty() {
+        return Err(unavailable("the wiki root has no historical file"));
+    }
+    let segs: Vec<&str> = norm.split('/').collect();
+    allowed(caller, Op::Read, &segs)?;
+    if !matches!(super::classify(&segs), super::View::Real) {
+        return Err(unavailable(
+            "profile and memory views have no content-addressed original",
+        ));
+    }
+    let Some(git) = commit_name(at) else {
+        return Err(Error::rejected(format!(
+            "wiki evidence revision '{at}' refused: the bounded reader accepts only a \
+             lowercase 40-hex commit selector — an fnv1a: content token or other name is \
+             never resolved to a commit for evidence"
+        )));
+    };
+    let vault = vault_dir(pm)?;
+    let file_rel = git_rel(pm, &resolve(&vault, &norm)?)?;
+    let pointer_rel = git_rel(pm, &vault.join(format!("{norm}.blob")))?;
+    if object_type(pm, &git)? != "commit" {
+        return Err(unavailable("revision selector is not a commit"));
+    }
+    let Some((blob, kind)) = tree_entry(pm, &git, &file_rel)? else {
+        let Some((pointer_blob, pointer_kind)) = tree_entry(pm, &git, &pointer_rel)? else {
+            // The commit was read and has neither entry: the path is
+            // definitely absent at this revision, not merely unreadable.
+            return Ok(None);
+        };
+        if pointer_kind != "blob" {
+            return Err(unavailable("that path is not a readable source"));
+        }
+        return blob_evidence(pm, &vault, &norm, &git, &pointer_blob, max_bytes).map(Some);
+    };
+    if kind == "tree" {
+        return Err(unavailable("a directory has no original text"));
+    }
+    if kind != "blob" {
+        return Err(unavailable("that path is not a readable source"));
+    }
+    let size = blob_size(pm, &blob)?;
+    if size > max_bytes as u64 {
+        return Err(Error::rejected(format!(
+            "wiki evidence revision '{path}' at {git} refused: the original is {size} \
+             bytes, above the {max_bytes}-byte read bound"
+        )));
+    }
+    if size > TEXT_CAP {
+        return Err(unavailable("historical text is over the read cap"));
+    }
+    let bytes = cat_blob(pm, &blob)?;
+    if bytes.len() as u64 != size {
+        return Err(unavailable(
+            "historical text size changed between its size probe and its read",
+        ));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| {
+        unavailable("historical original is not UTF-8 text and has no blob pointer")
+    })?;
+    Ok(Some(EvidenceText {
+        path: norm,
+        git,
+        sha256: super::transfer::sha256_bytes(text.as_bytes()),
+        body: EvidenceBody::Text(text),
+    }))
+}
+
+/// A historical binary Wiki page within the bound: verify the pointer, then
+/// the object's length, digest and bytes. The pointer's size is checked
+/// against `max_bytes` before the object is opened. The object is then read
+/// from the one descriptor opened under the store's custody checks, at most
+/// `size + 1` bytes, and the digest is computed over exactly the buffer that
+/// is returned — never over a separate pass that a concurrent overwrite could
+/// invalidate.
+fn blob_evidence(
+    pm: &Pm,
+    vault: &Path,
+    path: &str,
+    git: &str,
+    pointer_blob: &str,
+    max_bytes: usize,
+) -> Result<EvidenceText> {
+    let pointer_size = blob_size(pm, pointer_blob)?;
+    if pointer_size > EVIDENCE_POINTER_CAP {
+        return Err(unavailable("historical blob pointer is over the read cap"));
+    }
+    let bytes = cat_blob(pm, pointer_blob)?;
+    if bytes.len() as u64 != pointer_size {
+        return Err(unavailable(
+            "historical blob pointer size changed between its size probe and its read",
+        ));
+    }
+    let pointer: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| unavailable("historical blob pointer is not the stored JSON"))?;
+    let sha = pointer_sha(&pointer)?;
+    let size = pointer
+        .get("size")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| unavailable("historical blob pointer has no size"))?;
+    if size > max_bytes as u64 {
+        return Err(Error::rejected(format!(
+            "wiki evidence revision '{path}' at {git} refused: the blob original is {size} \
+             bytes, above the {max_bytes}-byte read bound"
+        )));
+    }
+    let blob = BlobBody {
+        sha256: sha.clone(),
+        size,
+        mime: json_string(&pointer, "mime"),
+        name: json_string(&pointer, "name"),
+    };
+    // Same symlink-refusing custody open as the regular revision path, but no
+    // hash-to-EOF: the descriptor is read once, capped at one byte past the
+    // expected length so an object extended after the length check is caught
+    // without ever reading beyond `max_bytes + 1`.
+    let (_object, file, _meta) = open_blob_object(vault, &blob)?;
+    let len = usize::try_from(size)
+        .map_err(|_| unavailable("historical blob is too large to read on this platform"))?;
+    let cap = len.saturating_add(1);
+    let mut data = Vec::with_capacity(cap);
+    file.take(cap as u64)
+        .read_to_end(&mut data)
+        .map_err(|_| unavailable("historical blob bytes could not be read"))?;
+    if data.len() != len {
+        return Err(unavailable(
+            "historical blob length does not match the pointer",
+        ));
+    }
+    // Hash the returned buffer itself: the bytes that pass this check are the
+    // bytes handed to the caller, so a concurrent same-length overwrite cannot
+    // slip between verification and return.
+    if super::transfer::sha256_bytes(&data) != sha {
+        return Err(unavailable(
+            "historical blob bytes do not match the pointer digest",
+        ));
+    }
+    Ok(EvidenceText {
+        path: path.to_string(),
+        git: git.to_string(),
+        sha256: sha,
+        body: EvidenceBody::Blob {
+            size,
+            mime: blob.mime,
+            name: blob.name,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&data),
+        },
+    })
+}
+
 /// One historical original slice. `rev` is the requested selector, not the
 /// live page token and not a newer commit that happens to share an FNV tag.
 pub(crate) fn export_slice(
@@ -288,7 +488,12 @@ fn whole_blob_matches(
     Ok(())
 }
 
-fn open_historical_blob(vault: &Path, blob: &BlobBody) -> Result<File> {
+/// Open a published blob object with the store's custody checks and no read of
+/// its bytes: `.blobs/` must be a real directory, the name must be a regular
+/// non-symlink file, and the file's own length must equal the pointer's
+/// recorded size. Hashing stays with the caller, so a bounded reader can cap
+/// its own read instead of hashing to EOF.
+fn open_blob_object(vault: &Path, blob: &BlobBody) -> Result<(PathBuf, File, std::fs::Metadata)> {
     let blobs = super::blobs_dir(vault);
     match blobs.symlink_metadata() {
         Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
@@ -300,7 +505,7 @@ fn open_historical_blob(vault: &Path, blob: &BlobBody) -> Result<File> {
         }
     }
     let object = blobs.join(&blob.sha256);
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&object)
@@ -322,6 +527,11 @@ fn open_historical_blob(vault: &Path, blob: &BlobBody) -> Result<File> {
             "historical blob size does not match the pointer",
         ));
     }
+    Ok((object, file, meta))
+}
+
+fn open_historical_blob(vault: &Path, blob: &BlobBody) -> Result<File> {
+    let (object, mut file, meta) = open_blob_object(vault, blob)?;
     whole_blob_matches(&object, &mut file, &meta, &blob.sha256)?;
     Ok(file)
 }
@@ -524,6 +734,18 @@ fn tree_entry(pm: &Pm, git: &str, rel: &Path) -> Result<Option<(String, String)>
     Ok(Some((blob.to_string(), kind.to_string())))
 }
 
+/// Size of a named Git object, without materializing its content — the
+/// pre-read probe that lets a bounded reader refuse an over-limit blob.
+fn blob_size(pm: &Pm, blob: &str) -> Result<u64> {
+    if commit_name(blob).is_none() {
+        return Err(unavailable("blob name is malformed"));
+    }
+    let out = git_text(&pm.dir, &["cat-file", "-s", blob])?;
+    out.trim()
+        .parse::<u64>()
+        .map_err(|_| unavailable("git did not report a numeric historical blob size"))
+}
+
 fn cat_blob(pm: &Pm, blob: &str) -> Result<Vec<u8>> {
     if commit_name(blob).is_none() {
         return Err(unavailable("blob name is malformed"));
@@ -564,8 +786,13 @@ fn git_text(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let out = crate::reaper::output(Command::new("git").arg("-C").arg(dir).args(args))
-        .map_err(|_| Error::rejected("git is required and was not found on PATH"))?;
+    let out = crate::reaper::output(
+        Command::new("git")
+            .args(["--no-replace-objects", "-C"])
+            .arg(dir)
+            .args(args),
+    )
+    .map_err(|_| Error::rejected("git is required and was not found on PATH"))?;
     if !out.status.success() {
         return Err(unavailable(&format!(
             "git could not read that revision ({})",

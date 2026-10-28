@@ -1299,6 +1299,14 @@ cadence memory lint [--project k]
 `propose` also accepts `--audience project|role|company`, repeated
 `--scope-role`, typed JSON `--evidence-ref` and typed JSON
 `--verification-condition`. Role audience requires explicit selectors.
+Wiki evidence references use the full lowercase 40-hex commit of the Wiki
+tracker, not a live `fnv1a:` token or a content SHA-256. Existing references
+with unsupported selectors remain readable but cannot produce a complete
+evidence analysis. A condition's optional `wiki_target_revision` pins a Wiki
+tracker commit independently of the project-repository `target_revision`.
+When a project target is present without a Wiki target, Wiki applicability is
+reported as skipped rather than compared across repositories.
+
 Company audience changes approval requirements, **not** cross-project
 visibility. `accept`, `verify`, `reject`, `classify`, `revalidate` and
 `invalidate` bind the caller's explicit digest; the CLI does not silently

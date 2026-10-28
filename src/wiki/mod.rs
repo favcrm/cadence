@@ -1066,6 +1066,74 @@ pub fn read_revision(
     Ok(value)
 }
 
+/// Historical Wiki original for memory evidence, bounded before any read.
+///
+/// Same authorization and sandbox path as [`read_revision`], with these
+/// restrictions that keep the read answerable inside a fixed budget:
+///
+/// - `at` MUST be an explicit 40-hex commit selector. An `fnv1a:` token is
+///   never resolved here (that resolution inspects up to [`HISTORY_CAP`]
+///   historical bodies), and an unknown or other name is refused — never
+///   substituted with the newest commit.
+/// - A text original whose Git blob size is above `max_bytes` (or above
+///   [`TEXT_CAP`]) is refused from the size probe alone; its content is never
+///   read.
+/// - A blob page whose pointer records a size above `max_bytes` is refused
+///   before its content-addressed object is opened or read. Within the bound
+///   the object is opened once under the store's custody checks, at most
+///   `size + 1` bytes are read, the length must match the pointer, and the
+///   digest is verified over exactly the bytes returned.
+///
+/// A miss never falls back to the live page. `Ok(None)` is the
+/// definite-absence answer: the pinned commit was read and demonstrably holds
+/// neither a text page nor a blob pointer at that path. An unknown or
+/// non-commit selector, an ACL or view refusal, a directory, an over-limit
+/// original, and every custody failure stay `Err`.
+///
+/// A text reply is `{path, kind:"text", text, rev, at, git, sha256}`; a blob
+/// reply is `{path, kind:"blob", sha256, size, mime, name, data_base64, rev,
+/// at, git}`. `rev`/`at` are the requested commit; `sha256` is the digest of
+/// the returned original (the text bytes, or the verified blob bytes).
+pub fn read_revision_for_evidence(
+    pm: &Pm,
+    caller: &Caller,
+    path: &str,
+    at: &str,
+    max_bytes: usize,
+) -> Result<Option<Value>> {
+    let Some(found) = revision::evidence_text(pm, caller, path, at, max_bytes)? else {
+        return Ok(None);
+    };
+    Ok(Some(match found.body {
+        revision::EvidenceBody::Text(text) => json!({
+            "path": found.path,
+            "kind": "text",
+            "text": text,
+            "rev": at,
+            "at": at,
+            "git": found.git,
+            "sha256": found.sha256,
+        }),
+        revision::EvidenceBody::Blob {
+            size,
+            mime,
+            name,
+            data_base64,
+        } => json!({
+            "path": found.path,
+            "kind": "blob",
+            "sha256": found.sha256,
+            "size": size,
+            "mime": mime,
+            "name": name,
+            "data_base64": data_base64,
+            "rev": at,
+            "at": at,
+            "git": found.git,
+        }),
+    }))
+}
+
 /// Bounded original-body read. Same authorization and sandbox path as
 /// [`read`]. A text page adds `text` and `range`. A blob page keeps the
 /// pointer metadata and adds `range` plus `data_base64` (standard

@@ -104,6 +104,7 @@ mod cad1772_recruit_page_acceptance;
 mod cad1853_cloud_agent_guard_acceptance;
 mod cad1901_memory_project_access_acceptance;
 mod cad348_memory_detail_identity_acceptance;
+mod cad348_memory_evidence_acceptance;
 mod cad508_restart_window;
 mod cad760_board_four_tuple_acceptance;
 mod cad832_sharing_refusal;

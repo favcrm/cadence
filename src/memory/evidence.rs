@@ -63,6 +63,7 @@ pub struct Receipt {
     pub check_id: String,
     pub source_revision: Option<String>,
     pub target_revision: Option<String>,
+    pub wiki_target_revision: Option<String>,
     pub outcome: Outcome,
     pub checked: Vec<String>,
     pub skipped: Vec<String>,
@@ -76,6 +77,7 @@ impl Receipt {
             "check_id": self.check_id,
             "source_revision": self.source_revision,
             "target_revision": self.target_revision,
+            "wiki_target_revision": self.wiki_target_revision,
             "result": self.outcome.as_str(),
             "checked": self.checked,
             "skipped": self.skipped,
@@ -110,13 +112,13 @@ fn git_blob(
     let projects = project::list(&pm.dir)?;
     let Some(selected) = projects.iter().find(|p| p.key == key) else {
         return Ok((
-            Resolution::Missing(format!("project '{key}' is not in the tracker")),
+            Resolution::Unsupported(format!("project '{key}' is not in the tracker")),
             None,
         ));
     };
     let Some(repo) = selected.repos.iter().find_map(|r| r.path.as_deref()) else {
         return Ok((
-            Resolution::Missing(format!(
+            Resolution::Unsupported(format!(
                 "project '{key}' registers no repo to resolve Git evidence against"
             )),
             None,
@@ -130,15 +132,35 @@ fn git_blob(
             None,
         ));
     }
-    let spec = format!("{revision}:{source}");
     let mut cmd = std::process::Command::new("git");
-    cmd.args(["-C"]).arg(&root).args(["cat-file", "-s", &spec]);
-    let size = crate::reaper::output(&mut cmd)?;
-    if !size.status.success() {
+    cmd.args(["--no-replace-objects", "-C"])
+        .arg(&root)
+        .args(["cat-file", "-t", revision]);
+    let commit = crate::reaper::output(&mut cmd)?;
+    if !commit.status.success() || commit.stdout.trim_ascii() != b"commit" {
         return Ok((
-            Resolution::Missing(format!("{source} does not exist at {revision}")),
+            Resolution::Unsupported(format!("Git commit {revision} is unavailable")),
             None,
         ));
+    }
+    let spec = format!("{revision}:{source}");
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["--no-replace-objects", "-C"])
+        .arg(&root)
+        .args(["cat-file", "-s", &spec]);
+    let size = crate::reaper::output(&mut cmd)?;
+    if !size.status.success() {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["--no-replace-objects", "-C"])
+            .arg(&root)
+            .args(["ls-tree", "-z", revision, "--", source]);
+        let tree = crate::reaper::output(&mut cmd)?;
+        let resolution = if tree.status.success() && tree.stdout.is_empty() {
+            Resolution::Missing(format!("{source} does not exist at {revision}"))
+        } else {
+            Resolution::Unsupported(format!("Git source {source} cannot be read at {revision}"))
+        };
+        return Ok((resolution, None));
     }
     let size: usize = String::from_utf8_lossy(&size.stdout)
         .trim()
@@ -153,13 +175,13 @@ fn git_blob(
         ));
     }
     let mut cmd = std::process::Command::new("git");
-    cmd.args(["-C"])
+    cmd.args(["--no-replace-objects", "-C"])
         .arg(&root)
         .args(["cat-file", "blob", &spec]);
     let blob = crate::reaper::output(&mut cmd)?;
     if !blob.status.success() {
         return Ok((
-            Resolution::Missing(format!("{source} does not exist at {revision}")),
+            Resolution::Unsupported(format!("Git source {source} cannot be read at {revision}")),
             None,
         ));
     }
@@ -188,14 +210,14 @@ pub fn resolve(
     match reference.kind {
         EvidenceKind::Git => git_blob(pm, key, &reference.source, &reference.revision),
         EvidenceKind::Wiki => {
-            match crate::wiki::read_revision(
+            match crate::wiki::read_revision_for_evidence(
                 pm,
                 caller,
                 &reference.source,
                 &reference.revision,
-                None,
+                MAX_CITED_BYTES,
             ) {
-                Ok(value) => {
+                Ok(Some(value)) => {
                     let sha256 = value
                         .get("sha256")
                         .and_then(|v| v.as_str())
@@ -210,24 +232,43 @@ pub fn resolve(
                             None,
                         ));
                     }
-                    let text = value
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned);
-                    let bytes = text.as_ref().map(|t| t.len()).or_else(|| {
-                        value
-                            .get("size")
-                            .and_then(|v| v.as_u64())
-                            .map(|n| n as usize)
-                    });
+                    let content = if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
+                        text.as_bytes().to_vec()
+                    } else if let Some(encoded) = value.get("data_base64").and_then(|v| v.as_str())
+                    {
+                        use base64::Engine as _;
+                        match base64::engine::general_purpose::STANDARD.decode(encoded) {
+                            Ok(bytes) => bytes,
+                            Err(_) => {
+                                return Ok((
+                                    Resolution::Unsupported(
+                                        "wiki original could not be decoded".into(),
+                                    ),
+                                    None,
+                                ))
+                            }
+                        }
+                    } else {
+                        return Ok((
+                            Resolution::Unsupported("wiki original bytes are unavailable".into()),
+                            None,
+                        ));
+                    };
                     Ok((
                         Resolution::Resolved {
-                            bytes: bytes.unwrap_or(0),
+                            bytes: content.len(),
                             sha256,
                         },
-                        text.map(String::into_bytes),
+                        Some(content),
                     ))
                 }
+                Ok(None) => Ok((
+                    Resolution::Missing(format!(
+                        "wiki '{}' is absent at {}",
+                        reference.source, reference.revision
+                    )),
+                    None,
+                )),
                 Err(error) => Ok((
                     Resolution::Unsupported(format!(
                         "wiki citation '{}' is not readable by this reader: {error}",
@@ -265,6 +306,18 @@ fn normalised_body(mem: &Memory) -> String {
         .to_lowercase()
 }
 
+fn same_scope(a: &super::Scope, b: &super::Scope) -> bool {
+    fn same_set(a: &[String], b: &[String]) -> bool {
+        a.iter().all(|item| b.contains(item)) && b.iter().all(|item| a.contains(item))
+    }
+    a.project == b.project
+        && (a.project
+            || (same_set(&a.components, &b.components)
+                && same_set(&a.paths, &b.paths)
+                && same_set(&a.providers, &b.providers)
+                && same_set(&a.tags, &b.tags)))
+}
+
 /// Same-project, same-scope duplicates by normalised body.
 fn duplicate_of(pool: &[Memory], mem: &Memory) -> Option<String> {
     let mine = normalised_body(mem);
@@ -275,7 +328,7 @@ fn duplicate_of(pool: &[Memory], mem: &Memory) -> Option<String> {
         .filter(|other| {
             other.front.id != mem.front.id
                 && other.project == mem.project
-                && other.front.scope == mem.front.scope
+                && same_scope(&other.front.scope, &mem.front.scope)
         })
         .find(|other| normalised_body(other) == mine)
         .map(|other| other.front.id.clone())
@@ -296,7 +349,7 @@ fn contradiction_of(pool: &[Memory], mem: &Memory) -> Option<String> {
         if let Some(other) = pool.iter().find(|other| {
             other.front.id == slug
                 && other.project == mem.project
-                && other.front.scope == mem.front.scope
+                && same_scope(&other.front.scope, &mem.front.scope)
         }) {
             return Some(other.front.id.clone());
         }
@@ -314,15 +367,34 @@ pub fn analyse(pm: &Pm, mem: &Memory) -> Result<Receipt> {
 pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result<Receipt> {
     let policy = mem.front.policy.as_ref();
     let condition = policy.and_then(|p| p.verification_condition.as_ref());
-    let refs = policy.map(|p| p.evidence_refs.clone()).unwrap_or_default();
+    let mut refs = policy
+        .into_iter()
+        .flat_map(|p| {
+            p.evidence_refs
+                .iter()
+                .chain(p.attestations.iter().flat_map(|a| a.evidence_refs.iter()))
+        })
+        .peekable();
 
     let mut checked = Vec::new();
     let mut skipped = Vec::new();
     let mut findings = Vec::new();
     let mut blocked = false;
     let mut revise = false;
+    if refs.peek().is_none() {
+        skipped.push("no evidence citations recorded".into());
+    }
 
-    for reference in &refs {
+    for reference in refs {
+        let reference_finding = match scan_content(&reference.source)? {
+            Some(finding) => Some(finding),
+            None => scan_content(&reference.revision)?,
+        };
+        if let Some(finding) = reference_finding {
+            blocked = true;
+            findings.push(format!("citation reference was refused: {finding}"));
+            continue;
+        }
         let (resolution, content) = resolve(pm, &mem.project, caller, reference)?;
         match resolution {
             Resolution::Resolved { bytes, sha256 } => {
@@ -339,8 +411,9 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
                     bytes,
                     sha256
                 ));
-                if let Some(bytes) = content {
-                    if let Ok(text) = String::from_utf8(bytes) {
+                match content {
+                    Some(bytes) => {
+                        let text = String::from_utf8_lossy(&bytes);
                         if let Some(finding) = scan_content(&text)? {
                             blocked = true;
                             findings.push(format!(
@@ -348,7 +421,17 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
                                 reference.source, reference.revision
                             ));
                         }
+                        if matches!(text, std::borrow::Cow::Owned(_)) {
+                            skipped.push(format!(
+                                "content scan incomplete for {}: source is not UTF-8",
+                                reference.source
+                            ));
+                        }
                     }
+                    None => skipped.push(format!(
+                        "content scan skipped for {}: original bytes are unavailable",
+                        reference.source
+                    )),
                 }
                 // Applicability is a separate check at the target the condition
                 // pins, never an assumption that the source still describes it.
@@ -386,6 +469,66 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
                         }
                     }
                 }
+                if reference.kind == EvidenceKind::Wiki {
+                    if let Some(target) = condition.and_then(|c| c.wiki_target_revision.as_deref())
+                    {
+                        if target == reference.revision {
+                            checked.push(format!(
+                                "{} is unchanged at Wiki target {target}",
+                                reference.source
+                            ));
+                        } else {
+                            match crate::wiki::read_revision_for_evidence(
+                                pm,
+                                caller,
+                                &reference.source,
+                                target,
+                                MAX_CITED_BYTES,
+                            ) {
+                                Ok(Some(value)) => {
+                                    match value.get("sha256").and_then(|v| v.as_str()) {
+                                        Some(digest) if digest == sha256 => {
+                                            checked.push(format!(
+                                                "{} is unchanged at Wiki target {target}",
+                                                reference.source
+                                            ));
+                                        }
+                                        Some(_) => {
+                                            revise = true;
+                                            findings.push(format!(
+                                            "{} differs between cited revision {} and Wiki target {target}",
+                                            reference.source, reference.revision
+                                        ));
+                                        }
+                                        None => skipped.push(format!(
+                                            "Wiki target check skipped for {}: no content digest",
+                                            reference.source
+                                        )),
+                                    }
+                                }
+                                Ok(None) => {
+                                    revise = true;
+                                    findings.push(format!(
+                                        "{} is absent at Wiki target {target}",
+                                        reference.source
+                                    ));
+                                }
+                                Err(error) => skipped.push(format!(
+                                    "Wiki target check skipped for {}: {error}",
+                                    reference.source
+                                )),
+                            }
+                        }
+                    } else if condition
+                        .and_then(|c| c.target_revision.as_deref())
+                        .is_some()
+                    {
+                        skipped.push(format!(
+                            "target applicability skipped for {}: no Wiki target revision recorded",
+                            reference.source
+                        ));
+                    }
+                }
             }
             Resolution::Missing(reason) => {
                 blocked = true;
@@ -407,7 +550,13 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
         }
     }
 
-    let (pool, _errors) = super::load_project_report(&pm.dir, &mem.project);
+    let (pool, errors) = super::load_project_report(&pm.dir, &mem.project);
+    if !errors.is_empty() {
+        let project = crate::secret::redact_text(&mem.project)?;
+        skipped.push(format!(
+            "duplicate and contradiction checks incomplete: memories in project {project} could not be read"
+        ));
+    }
     if let Some(slug) = duplicate_of(&pool, mem) {
         revise = true;
         findings.push(format!(
@@ -425,8 +574,10 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
         Outcome::Blocked
     } else if revise {
         Outcome::Revise
-    } else if condition.is_none() {
-        skipped.push("no verification condition recorded".into());
+    } else if condition.is_none() || !skipped.is_empty() {
+        if condition.is_none() {
+            skipped.push("no verification condition recorded".into());
+        }
         Outcome::Unknown
     } else {
         Outcome::Pass
@@ -439,6 +590,7 @@ pub fn analyse_as(pm: &Pm, mem: &Memory, caller: &crate::wiki::Caller) -> Result
             .unwrap_or_else(|| "evidence-analysis".to_string()),
         source_revision: condition.and_then(|c| c.source_revision.clone()),
         target_revision: condition.and_then(|c| c.target_revision.clone()),
+        wiki_target_revision: condition.and_then(|c| c.wiki_target_revision.clone()),
         outcome,
         checked,
         skipped,
@@ -698,6 +850,7 @@ mod tests {
             check_id: "evidence-analysis".into(),
             source_revision: Some(source.into()),
             target_revision: Some(target.into()),
+            wiki_target_revision: None,
         });
         mem
     }
