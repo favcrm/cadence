@@ -62,6 +62,12 @@ threads-required = 'num-test-threads'
 filter = 'test(/^wiki_board_http_guard_acceptance::cad347_/)'
 threads-required = 'num-test-threads'
 
+# CAD-348: the memory-detail acceptance reuses the probe-then-bind board
+# fixture, so reserve the worker pool like the fixtures above.
+[[profile.cadence.overrides]]
+filter = 'test(/^cad348_memory_detail_identity_acceptance::/)'
+threads-required = 'num-test-threads'
+
 [profile.cadence.junit]
 path = "junit.xml"
 report-skipped = "all"

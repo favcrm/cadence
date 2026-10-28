@@ -25,6 +25,7 @@
 
 mod body;
 pub mod cli;
+pub mod evidence;
 mod issue_matching;
 mod matching;
 pub mod policy;
@@ -51,7 +52,10 @@ pub use matching::{
     evidence_json, evidence_label, glob_match, last_verified, match_memories, stale_reason,
     Freshness, MatchCtx, Matched, DEFAULT_STALE_DAYS,
 };
-pub use rendering::{card_json, detail_json, render_lessons, LESSON_MAX_BYTES, LESSON_MAX_ENTRIES};
+pub use rendering::{
+    card_json, detail_json, detail_json_with_evidence, render_lessons, LESSON_MAX_BYTES,
+    LESSON_MAX_ENTRIES,
+};
 
 pub const TYPES: &[&str] = &["rule", "gotcha", "decision", "recipe"];
 pub const STATUSES: &[&str] = &[
@@ -146,7 +150,7 @@ impl NativeIdentity {
 
 /// `scope:` — every axis is optional; an empty scope matches only via
 /// `project: true` (which is itself one of the axes).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<String>,

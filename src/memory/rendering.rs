@@ -174,7 +174,63 @@ pub fn card_json(m: &Memory, fresh: &Freshness) -> Value {
 }
 
 pub fn detail_json(m: &Memory, fresh: &Freshness) -> Value {
+    detail_json_with_evidence(m, fresh, None, None)
+}
+
+/// Detail JSON plus the read-only evidence analysis. Callers that hold the
+/// tracker pass `Some(pm)` so the CLI and the board read surface answer the
+/// same way; a failure is reported as an `unknown` result rather than failing
+/// the read, and nothing here launches a check.
+pub fn detail_json_with_evidence(
+    m: &Memory,
+    fresh: &Freshness,
+    pm: Option<&crate::issue::Pm>,
+    caller: Option<&crate::wiki::Caller>,
+) -> Value {
     let mut v = card_json(m, fresh);
     v["body"] = json!(m.body);
+    if let Some(pm) = pm {
+        let caller = caller.unwrap_or(&crate::wiki::Caller::Public);
+        v["evidence_analysis"] = match super::evidence::analyse_as(pm, m, caller) {
+            Ok(receipt) => receipt.to_json(),
+            Err(error) => {
+                let safe = |text: &str| {
+                    crate::secret::redact_text(text)
+                        .unwrap_or_else(|_| "redaction unavailable".to_string())
+                };
+                let condition = m
+                    .front
+                    .policy
+                    .as_ref()
+                    .and_then(|policy| policy.verification_condition.as_ref());
+                let mut receipt = super::evidence::Receipt {
+                    candidate_digest: semantic_digest(m),
+                    check_id: safe(
+                        condition
+                            .map(|condition| condition.check_id.as_str())
+                            .unwrap_or("evidence-analysis"),
+                    ),
+                    source_revision: condition
+                        .and_then(|condition| condition.source_revision.as_deref())
+                        .map(safe),
+                    target_revision: condition
+                        .and_then(|condition| condition.target_revision.as_deref())
+                        .map(safe),
+                    wiki_target_revision: condition
+                        .and_then(|condition| condition.wiki_target_revision.as_deref())
+                        .map(safe),
+                    outcome: super::evidence::Outcome::Unknown,
+                    checked: Vec::new(),
+                    skipped: vec![
+                        "citation resolution, target applicability, duplicate, contradiction and overfit checks incomplete; see error".to_string(),
+                    ],
+                    findings: Vec::new(),
+                }
+                .to_json();
+                receipt["error"] = json!(safe(&error.to_string()));
+                receipt
+            }
+        };
+    }
     v
 }

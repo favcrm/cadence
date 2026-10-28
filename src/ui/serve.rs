@@ -2516,12 +2516,32 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, err_response(404, "Unknown memory"));
                     return;
                 }
+                let wiki_caller =
+                    match operator::board_caller(&request, state_dir, opts, false, None) {
+                        Ok(operator::Caller::Operator(_)) => crate::wiki::Caller::Operator,
+                        Ok(operator::Caller::Named(named)) => {
+                            crate::wiki::Caller::User(named.author)
+                        }
+                        Ok(operator::Caller::Agent(alias)) => crate::wiki::Caller::Agent {
+                            alias,
+                            project: None,
+                        },
+                        Err(response) => {
+                            send(request, response);
+                            return;
+                        }
+                    };
                 match crate::memory::find(&pm, Some(key), slug) {
                     Ok((proj, m)) => {
                         let fresh = crate::memory::Freshness::for_project(Some(&proj));
                         send(
                             request,
-                            json_response(crate::memory::detail_json(&m, &fresh)),
+                            json_response(crate::memory::detail_json_with_evidence(
+                                &m,
+                                &fresh,
+                                Some(&pm),
+                                Some(&wiki_caller),
+                            )),
                         )
                     }
                     Err(_) => send(request, err_response(404, "Unknown memory")),

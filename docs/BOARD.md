@@ -1299,6 +1299,14 @@ cadence memory lint [--project k]
 `propose` also accepts `--audience project|role|company`, repeated
 `--scope-role`, typed JSON `--evidence-ref` and typed JSON
 `--verification-condition`. Role audience requires explicit selectors.
+Wiki evidence references use the full lowercase 40-hex commit of the Wiki
+tracker, not a live `fnv1a:` token or a content SHA-256. Existing references
+with unsupported selectors remain readable but cannot produce a complete
+evidence analysis. A condition's optional `wiki_target_revision` pins a Wiki
+tracker commit independently of the project-repository `target_revision`.
+When a project target is present without a Wiki target, Wiki applicability is
+reported as skipped rather than compared across repositories.
+
 Company audience changes approval requirements, **not** cross-project
 visibility. `accept`, `verify`, `reject`, `classify`, `revalidate` and
 `invalidate` bind the caller's explicit digest; the CLI does not silently
@@ -1789,12 +1797,24 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/agents` | worker agent rows enriched with the exact task/issue binding (`agent.tasks` × `jobs.issue_id`) + running/queued/fenced/parked totals and `by_issue` for card strips; `endpoint_kind: inbox` mailboxes are counted separately under `inboxes`; `daemon:"unreachable"` when the socket is down |
 | `GET /api/agents/:alias` | the agent drawer: `agent_show` + last 20 events + `tasks`/`on` bindings + `recovery`/`resume` commands; `404` on unknown alias, `400` on alias grammar |
 | `GET /api/memories?project=&status=&type=&component=&path=` | memory cards from projects readable by the caller — same filters as `memory ls`; `memory_errors` includes load failures only for readable projects |
-| `GET /api/memories/:project/:slug` | one readable memory: frontmatter + body; inaccessible and unknown memories share a generic `404`, `400` on grammar |
+| `GET /api/memories/:project/:slug` | one readable memory: frontmatter, body and evidence analysis; Wiki citations use the proven board caller's access. An unattributed or refused caller is refused rather than treated as anonymous; inaccessible and unknown memories share a generic `404`, `400` on grammar |
 | `GET /api/overview` | the Overview screen payload: `needs_me`, `drift`, `projects`, `github`, `daemon`, `generated_at` — same shape as `cadence overview --json` |
 | `GET /api/stream` | server-sent events — `event: issues` on tracker change, `event: jobs`/`event: agents`/`event: monitoring` on daemon state change; each frame's data names the board resources it invalidates (`{"resources":["agents","issue","overview"]}`); `: ping` immediately and every 15 s of silence; `405` on HEAD; deltas only (baselines at connect) |
 | `GET /api/threads/<alias>?after=&limit=` | one page of the agent's durable chat (CAD-319) over the daemon's `thread_read`: `{thread, entries, cursor}`; `?tail=1` (the newest page) or `?before=<seq>` read backwards and add `more_before` (CAD-328; `400` combined with `after`); `404` unknown alias, `501` a daemon without threads. Any admitted board reader can read agent threads, as with `/api/agents/<alias>`; private local/hosted admission happens first. A live turn token quoted in thread prose is only redacted at `export` |
 | `GET /api/threads/<alias>/stream` | server-sent events — one `event: entry` frame per thread entry with `id: <seq>`; resumes after `Last-Event-ID` (else `?after=`); `: ping` on each idle poll; closes when a daemon poll fails or session admission is lost; the authenticated UI reconnects from the last event ID; `405` on HEAD |
 | `GET /api/master/summary?since=<epoch secs>` | "since you left" (CAD-328) over the daemon's `master_summary` (CAD-339), never posted to the thread: plans proposed and decided, tickets moved, reports, open questions, `routing_backlog`; `400` without a numeric `since`, `501 unsupported_daemon` on a daemon without the master, `503` daemon down |
+
+Memory evidence receipts include two deliberately bounded fixtures. A body line
+`contradicts: <slug>` marks a same-project, same-scope contradiction. The
+overfit fixture flags a fact line shaped `<environment> cron = <comma-separated
+minutes> was broken` as an incident-specific answer; citations and the Why/How
+sections are not searched for this pattern. It does not detect other overfit or
+establish semantic truth. Citation-derived receipt text and errors redact
+credential-shaped values, including warn-only and operator-allowlisted matches.
+If analysis fails, the `unknown` receipt retains the candidate and condition
+identifiers and reports the checks as incomplete with a sanitized error.
+A `pass` means only the receipt's listed mechanical checks passed; it is not a
+review, verification authorization, or finalization.
 
 ### API — writes
 

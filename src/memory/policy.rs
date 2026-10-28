@@ -52,12 +52,21 @@ pub struct EvidenceRef {
 }
 
 /// A condition names data, never an executable command or a claimed result.
+///
+/// `target_revision` pins the project the check runs against.
+/// `wiki_target_revision` separately pins the Wiki revision a citation must
+/// still agree with: a Wiki page lives in its own repository, so the project
+/// target cannot stand in for it. It is optional so policies written before
+/// it existed keep their meaning; when absent it is not serialized at all,
+/// so their bytes and semantic digests do not move.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationCondition {
     pub check_id: String,
     pub source_revision: Option<String>,
     pub target_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wiki_target_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -305,6 +314,30 @@ fn immutable_revision(value: &str, git: bool) -> bool {
         && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// A wiki citation is pinned from committed history: the revision reader
+/// resolves one full commit name and never the worktree. `fnv1a:` is the live
+/// page's compare-and-swap token, not approval provenance, and a 64-hex digest
+/// names bytes rather than a retained revision, so neither is an immutable
+/// selector and both are refused instead of being admitted unresolvable.
+/// Records already stored keep their refs — loading never revalidates them —
+/// and any such historical ref still resolves as explicitly unsupported.
+fn wiki_revision(value: &str) -> bool {
+    if value.len() != 40 {
+        return false;
+    }
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn immutable_ref(kind: &EvidenceKind, revision: &str) -> bool {
+    match kind {
+        EvidenceKind::Git => immutable_revision(revision, true),
+        EvidenceKind::Wiki => wiki_revision(revision),
+        EvidenceKind::NativeRecord | EvidenceKind::External => immutable_revision(revision, false),
+    }
+}
+
 pub fn validate_options(options: &ProposalOptions) -> Result<()> {
     if options.roles.len() > 16
         || options.roles.iter().any(|role| !bounded_text(role, 64))
@@ -335,20 +368,45 @@ pub fn validate_options(options: &ProposalOptions) -> Result<()> {
                 "verification conditions name a check identifier and immutable revisions, never commands",
             ));
         }
+        // A Wiki target names a retained tracker commit, the same selector a
+        // Wiki citation must resolve, so a live token, a short name or a
+        // byte digest is refused rather than stored as unverifiable.
+        if condition
+            .wiki_target_revision
+            .as_deref()
+            .is_some_and(|revision| !wiki_revision(revision))
+        {
+            return Err(Error::rejected(
+                "a wiki target must cite a full 40-digit lowercase commit, not a live or digest token",
+            ));
+        }
     }
     Ok(())
 }
 
+/// Each citation names bounded source text and an immutable revision for its
+/// kind: a commit or digest for Git, a full commit for Wiki, a 64-hex digest
+/// for a native record or external source.
 pub fn validate_refs(refs: &[EvidenceRef]) -> Result<()> {
     if refs.len() > 16
-        || refs.iter().any(|reference| {
-            !bounded_text(&reference.source, 2_048)
-                || !immutable_revision(&reference.revision, reference.kind == EvidenceKind::Git)
-        })
+        || refs
+            .iter()
+            .any(|reference| !bounded_text(&reference.source, 2_048))
     {
         return Err(Error::rejected(
             "evidence references require bounded sources and immutable revision digests",
         ));
+    }
+    for reference in refs {
+        if immutable_ref(&reference.kind, &reference.revision) {
+            continue;
+        }
+        let message = if reference.kind == EvidenceKind::Wiki {
+            "wiki evidence must cite a full 40-digit lowercase commit, not a live or digest token"
+        } else {
+            "evidence references require bounded sources and immutable revision digests"
+        };
+        return Err(Error::rejected(message));
     }
     Ok(())
 }
