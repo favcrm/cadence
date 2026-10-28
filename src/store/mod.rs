@@ -37,6 +37,7 @@ pub use platform::{
     SCOPE_REVOKED_EVENT,
 };
 mod effects;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use effects::effect_bind_in;
 pub use effects::{
     presser_json, DraftRow, EffectKey, EffectRow, EFFECT_CANCELLED_EVENT, EFFECT_DECIDED_EVENT,

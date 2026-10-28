@@ -21,6 +21,10 @@
 //! provider, no ambient credential discovery and no tool/agent runtime: the
 //! selected provider protocol is the only thing the private child may speak.
 
+#![cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code, unused_imports)
+)]
 pub(crate) mod catalog;
 pub(crate) mod dto;
 pub(crate) mod sdk;

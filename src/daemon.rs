@@ -894,6 +894,10 @@ pub struct Shared {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     protected: std::sync::OnceLock<Arc<protected_connections::ProtectedConnections>>,
     protected_runtime: std::sync::OnceLock<Arc<protected_runtime::ProtectedRuntimeCoordinator>>,
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     native_model: std::sync::OnceLock<Arc<native_model_turn::NativeModelBroker>>,
     /// CAD-538: the hosted lease this daemon holds when `hosted.lease`
     /// is configured. The heartbeat renews it; its fence is shared with
