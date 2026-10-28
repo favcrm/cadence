@@ -252,14 +252,18 @@ the code you just wrote.
 
 ### Local builds and tests
 
-- Before every push run `scripts/pre-push` (fmt, the live doctor split
-  check, clippy on both feature sets, the release seam, the UI typecheck and
-  the active script contracts for what you changed). `scripts/pre-push
-  --tests` is a focused local diagnostic, not a prerequisite before review;
-  required CI and the merge-group regression floor are unchanged. Neither a
-  local run nor a green suite proves the ticket's outcome. The split
-  manifests are retired; do not run `split-map-sync` until a reviewed
-  inventory restoration establishes its inputs.
+- Before every push the worktree hook runs `scripts/pre-push` (fmt, the live
+  doctor split check, clippy on both feature sets, the release seam, the UI
+  typecheck and the active script contracts for what you changed) in a fresh
+  Boat sandbox via `scripts/boat-build`; the shared host does not compile.
+  A missing Boat CLI or helper refuses the push rather than falling back to a
+  local build. `CADENCE_PRE_PUSH_LOCAL=1` is the explicit emergency path and
+  runs the same plan on this host. `scripts/pre-push --tests` is a focused
+  diagnostic, not a prerequisite before review; required CI and the
+  merge-group regression floor are unchanged. Neither a remote run nor a
+  green suite proves the ticket's outcome. The split manifests are retired;
+  do not run `split-map-sync` until a reviewed inventory restoration
+  establishes its inputs.
 - Prefer `cargo check` over `cargo build` for compile verification:
   `cargo check` stops at the type check, `cargo build` adds codegen and
   linking for this crate's five binary targets, and that extra work is the

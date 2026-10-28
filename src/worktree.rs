@@ -257,35 +257,51 @@ pub const HOOKS_DIR: &str = "cadence-hooks";
 /// The hook script installed at `<git-dir>/cadence-hooks/pre-push`.
 /// Git runs pre-push hooks with GIT_DIR already pointed at the
 /// worktree's git dir and cwd at the worktree root, so the receipt and
-/// `scripts/pre-push` both resolve per-lane. The receipt is written
-/// atomically (tmp+rename) under the worktree's git dir — a `--no-verify`
-/// push leaves no receipt, which is the detection signal (contract D3).
+/// `scripts/boat-build` both resolve per-lane. The check plan runs in a
+/// fresh Boat sandbox so the shared host does not compile; the receipt
+/// records the checked head, base, sandbox and result under this
+/// worktree's git dir. Required CI, review and approval remain
+/// authoritative. A `--no-verify` push leaves no receipt, which is the
+/// detection signal (contract D3).
 const PRE_PUSH_HOOK: &str = r#"#!/bin/sh
-# CAD-1021: run scripts/pre-push on every push; a non-zero step blocks it.
-# The receipt records the checked head, lane and per-step exit codes under
-# this worktree's git dir — a pushed head with no receipt was pushed with
-# --no-verify, and that absence is the audit signal.
+# CAD-1909: run scripts/pre-push in a Boat sandbox; the shared host does not
+# compile. A missing Boat CLI or helper refuses the push rather than falling
+# back to a local build. CADENCE_PRE_PUSH_LOCAL=1 is the explicit emergency
+# path and runs the same plan on this host.
 top=$(git rev-parse --show-toplevel) || exit 1
 gd=$(git rev-parse --absolute-git-dir) || exit 1
 cd "$top" || exit 1
 # git exports GIT_DIR/GIT_WORK_TREE/etc for the hook — unset them before
-# spawning scripts/pre-push so its own `git` calls (and any subprocess that
+# spawning the gate so its own `git` calls (and any subprocess that
 # shells out to git, e.g. the contract tests) resolve the worktree normally
 # instead of running inside the bare-dir context the hook inherits.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX GIT_QUARANTINE_PATH
 tmp="$gd/cadence-pre-push-receipt.tmp"
 out="$gd/cadence-pre-push-receipt"
+head=$(git rev-parse HEAD 2>/dev/null || echo '?')
+lane=${CADENCE_ALIAS:-$USER}
 # A worktree without scripts/pre-push (a fixture, a sparse lane, a repo that
 # never carried the script) has no gate to run — record that and let the push
 # through rather than blocking on a script that isn't there.
 if [ ! -x scripts/pre-push ]; then
-    printf 'head=%s lane=%s kind=none steps=skipped:no-pre-push rc=0 at=%s\n' \
-        "$(git rev-parse HEAD 2>/dev/null || echo '?')" \
-        "${CADENCE_ALIAS:-$USER}" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
+    printf 'head=%s lane=%s mode=boat steps=skipped:no-pre-push rc=0 at=%s\n' \
+        "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
     exit 0
 fi
-line=$(scripts/pre-push --receipt ${PRE_PUSH_TESTS:+--tests})
-rc=$?
+if [ "${CADENCE_PRE_PUSH_LOCAL:-}" = 1 ]; then
+    line=$(scripts/pre-push --receipt ${PRE_PUSH_TESTS:+--tests})
+    rc=$?
+else
+    if [ ! -x scripts/boat-build ]; then
+        printf 'head=%s lane=%s mode=boat steps=refused:no-boat-build rc=1 at=%s\n' \
+            "$head" "$lane" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
+        exit 1
+    fi
+    output=$(scripts/boat-build --receipt ${PRE_PUSH_TESTS:+--tests})
+    rc=$?
+    line=$(printf '%s\n' "$output" | tail -n 1)
+    [ -n "$line" ] || line="head=$head lane=$lane mode=boat rc=$rc at=$(date +%s)"
+fi
 printf '%s\n' "$line" > "$tmp" && mv "$tmp" "$out"
 exit $rc
 "#;

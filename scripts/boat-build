@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Run a worktree check in a fresh Boat sandbox (supplemental, not a gate)."""
+"""Run the worktree check plan in a fresh Boat sandbox.
+
+The worktree pre-push hook uses this as its execution path so the shared host
+does not compile. Required CI, review and approval remain authoritative.
+"""
 
 import argparse
 import hashlib
@@ -29,7 +33,7 @@ if subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).st
 env = dict(os.environ)
 env['CARGO_BUILD_JOBS'] = '1'
 env['CARGO_TERM_COLOR'] = 'never'
-print('SUPPLEMENTAL Boat run; not a pre-push or CI authorization', flush=True)
+print('Boat gate execution; required CI, review and approval remain authoritative', flush=True)
 print('head=' + job['head'] + ' base=' + job['base'], flush=True)
 print('command=' + repr(job['command']), flush=True)
 # Boat's disposable image includes provider CLIs in the suite's fixed system
@@ -195,6 +199,10 @@ def main():
     parser.add_argument('--base', help='base commit/ref (default origin/main, then main)')
     parser.add_argument('--artifact', help='relative file path under remote checkout to copy back')
     parser.add_argument('--output', help='new local destination for --artifact')
+    parser.add_argument('--tests', action='store_true',
+                        help='pass --tests to the default scripts/pre-push plan')
+    parser.add_argument('--receipt', action='store_true',
+                        help='print one receipt line after the run')
     parser.add_argument('command', nargs=argparse.REMAINDER,
                         help='command and arguments after --; default: scripts/pre-push')
     args = parser.parse_args()
@@ -219,8 +227,10 @@ def main():
     if command and command[0] == '--':
         command = command[1:]
     if not command:
-        command = ['scripts/pre-push', '--base', base]
-    print(f'Supplemental only: head={head} base={base}; command={command!r}', flush=True)
+        command = ['scripts/pre-push', '--base', base] + (['--tests'] if args.tests else [])
+    elif args.tests:
+        parser.error('--tests only applies to the default pre-push plan')
+    print(f'Boat execution: head={head} base={base}; command={command!r}', flush=True)
     with tempfile.TemporaryDirectory(prefix='cadence-boat-') as temporary:
         directory = Path(temporary)
         bundle = directory / 'boat-candidate.bundle'
@@ -237,12 +247,14 @@ def main():
         if git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip() != head:
             raise Failure('HEAD changed while preparing the sandbox')
         (directory / 'boat-changes.patch').write_bytes(patch)
-        print(f'tracked_patch_sha256={hashlib.sha256(patch).hexdigest()}', flush=True)
+        patch_sha = hashlib.sha256(patch).hexdigest()
+        print(f'tracked_patch_sha256={patch_sha}', flush=True)
         (directory / 'boat-job.json').write_text(json.dumps({'head': head, 'base': base, 'command': command}))
         (directory / 'boat-remote.py').write_text(REMOTE)
-        sandbox = create_sandbox('cadence-build-' + uuid.uuid4().hex)
+        sandbox = None
         result = 1
         try:
+            sandbox = create_sandbox('cadence-gate-' + uuid.uuid4().hex)
             for name in ('boat-candidate.bundle', 'boat-changes.patch', 'boat-job.json', 'boat-remote.py'):
                 subprocess.run(['boat', '--no-update', 'scp', str(directory / name),
                                 f'{sandbox}:/home/user/{name}'], check=True)
@@ -258,9 +270,17 @@ def main():
                         shutil.copyfileobj(source, target)
                         os.fchmod(target.fileno(), artifact.stat().st_mode & 0o777)
             subprocess.run(['boat', '--no-update', 'usage', sandbox, '--json'], check=False)
+        except BaseException:
+            if args.receipt:
+                print(f'head={head} base={base} patch={patch_sha} sandbox={sandbox or "none"} '
+                      f'rc=1 at={int(time.time())}', flush=True)
+            raise
         finally:
-            if not cleanup(sandbox):
+            if sandbox and not cleanup(sandbox):
                 result = 1
+        if args.receipt:
+            print(f'head={head} base={base} patch={patch_sha} sandbox={sandbox or "none"} '
+                  f'rc={result} at={int(time.time())}', flush=True)
         return result
 
 

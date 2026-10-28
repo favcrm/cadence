@@ -16,12 +16,14 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    remove dead code, duplication and unnecessary abstractions. The
    `code-simplifier` skill can help; it is not another approval stage.
    Adjacent refactors and polish go to a follow-up ticket.
-3. Run `scripts/pre-push` before every push and show the ticket's outcome.
-   For a bug fix, show the failing case once, then fixed. Add checks only
-   under AGENTS.md's behavior-first and gates/security rules; do not restore
-   retired tests or routinely repeat suites. `--tests` is a focused local
-   diagnostic, not a blanket pre-review prerequisite; required CI and full
-   merge-group regression remain unchanged.
+3. The worktree hook runs `scripts/pre-push` on Boat before every push; show
+   the ticket's outcome. A missing Boat CLI or helper refuses the push rather
+   than compiling locally (`CADENCE_PRE_PUSH_LOCAL=1` is the explicit
+   emergency path). For a bug fix, show the failing case once, then fixed.
+   Add checks only under AGENTS.md's behavior-first and gates/security rules;
+   do not restore retired tests or routinely repeat suites. `--tests` is a
+   focused diagnostic, not a blanket pre-review prerequisite; required CI and
+   full merge-group regression remain unchanged.
 4. Under strict requirements, one independent reviewer; two for auth, identity,
    secrets, the daemon trees and UI paths (`docs/roles/one-review-paths.toml`
    lists what gets one).
@@ -228,53 +230,45 @@ path: this keeps final integration coverage even when docs are read indirectly
 by source/tests. Fast-path timings measure PR feedback, not total landing
 latency. #758 bootstraps the policy with a full run because its base lacks it.
 
-## One local entry point
+## One entry point, executed on Boat
 
 ```sh
 scripts/pre-push --list --tests  # inspect what will run, no builds
-scripts/pre-push --tests        # execute; stop at the first nonzero exit
+scripts/boat-build --tests       # execute on Boat; stop at the first nonzero exit
+scripts/boat-build -- cargo build --locked --bin cadence
+scripts/boat-build -- cargo test --locked --lib FILTER -- --test-threads=1
+scripts/boat-build --artifact target/debug/cadence --output /tmp/cadence-build -- cargo build --locked --bin cadence
 ```
+
+The worktree hook uses `scripts/boat-build` by default, so the shared host does
+not compile. A missing Boat CLI or helper refuses the push; it never falls
+back to a local build. `CADENCE_PRE_PUSH_LOCAL=1` is the explicit emergency
+path and runs the same plan on this host.
 
 The diff selects Rust/UI/active script checks. The live doctor source
 inventory always runs. `--tests` always executes the safety floor (two test
 threads), even if its source is unchanged or diff discovery is uncertain.
 Show the behavior you changed; add a focused check only when AGENTS.md requires
 it or the ticket's outcome cannot be shown without one. The floor is not
-that proof.
-Host Rust builds use four jobs and normal build-slot admission. If admission
-is unavailable, report that limitation rather than claiming local validation.
-
-### Supplemental Boat checks
-
-With the Boat CLI installed and logged in, run the current worktree's tracked
-files in a fresh sandbox instead of building on the shared host:
-
-```sh
-scripts/boat-build                                         # pre-push plan
-scripts/boat-build -- cargo build --locked --bin cadence
-scripts/boat-build -- cargo test --locked --lib FILTER -- --test-threads=1
-scripts/boat-build --artifact target/debug/cadence --output /tmp/cadence-build -- cargo build --locked --bin cadence
-```
+that proof. Remote Rust builds use one Cargo job. If Boat is unavailable,
+report that limitation rather than claiming validation.
 
 The helper copies committed Git history plus tracked edits; it refuses
 untracked files rather than silently omitting them. It does not copy ignored
 files or account environment secrets. For UI-related pre-push checks and
 commands starting with `bun`, it installs the exact Bun version pinned by
-`ui/package.json` and the locked UI dependencies. The sandbox has one Cargo
-job and a one-hour lifetime. It reports memory, time and Boat usage, then
-deletes only the sandbox created by that invocation. A failed or interrupted
-creation can have an unknown outcome; do not retry or delete another sandbox
-by name.
-The helper moves preinstalled provider CLI entry points out of the test
-runner's fixed search path **inside the disposable sandbox only**; it does not
-change the host or relax the test isolation guard.
-Only an explicitly requested artifact is copied back, without overwriting an
-existing destination. The sandbox and its caches are deleted after the run.
+`ui/package.json` and the locked UI dependencies. The sandbox has a one-hour
+lifetime. It reports memory, time and Boat usage, then deletes only the
+sandbox created by that invocation. A failed or interrupted creation can have
+an unknown outcome; do not retry or delete another sandbox by name. The helper
+moves preinstalled provider CLI entry points out of the test runner's fixed
+search path **inside the disposable sandbox only**; it does not change the
+host or relax the test isolation guard. Only an explicitly requested artifact
+is copied back, without overwriting an existing destination.
 
-These runs are **supplemental**: they do not authorize a push or replace
-`scripts/pre-push`, required CI, review or operator approval. Commands and
-their output may be retained in Boat's command history; never put secrets in
-command arguments or output.
+The hook's result gates the push, but required CI, review and operator
+approval remain authoritative. Commands and their output may be retained in
+Boat's command history; never put secrets in command arguments or output.
 
 The CAD-811 public-owner fixture uses the board's typed startup receipt, not a
 health probe. Its `Native::try_new_with_roles` refuses a lost bind; only native
