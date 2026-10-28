@@ -308,6 +308,7 @@ mod social_connect_rpc;
 mod social_publish_driver;
 mod social_publish_rpc;
 mod social_publish_start;
+#[cfg(target_os = "linux")]
 pub(crate) mod supervisor_grant;
 #[cfg(all(test, feature = "test-seam"))]
 pub(crate) mod team_assistants_refusal;

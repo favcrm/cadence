@@ -73,6 +73,10 @@ pub mod pi_policy;
 pub mod platform;
 pub mod proc;
 pub(crate) mod protected_pi_profile;
+#[cfg(target_os = "linux")]
+pub mod protected_runtime;
+#[cfg(not(target_os = "linux"))]
+#[path = "protected_runtime_stub.rs"]
 pub mod protected_runtime;
 pub mod proto;
 pub mod reaper;
