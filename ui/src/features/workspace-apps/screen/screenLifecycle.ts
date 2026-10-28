@@ -248,8 +248,7 @@ export abstract class FrameChannel {
 /** Each instance owns one frame generation. Teardown precedes replacement. */
 /** Verbs whose planner runs against the consumed mount receipt: the original download and
  *  the social publish relays send the host-held action token, never a frame-supplied credential. */
-const RECEIPT_TOKEN_VERBS: readonly string[] = [ORIGINAL_DOWNLOAD_VERB, "publish.draft.confirm",
-  "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel"];
+const RECEIPT_TOKEN_VERBS: readonly string[] = [ORIGINAL_DOWNLOAD_VERB, "publish.draft.confirm"];
 
 export class ScreenChannel extends FrameChannel {
   /** Set once, by the child's `ready`: the PUSH shape it negotiated. */
