@@ -117,9 +117,10 @@ artifacts, not a second current admission path.
 
 The version-3 grammar adds one directory, `skills/<tag>/`: an installed skill
 package. It holds a required `skill.json` manifest, flat root text leaves
-(`md`, `txt`, `json`, `yaml`, `yml`, `csv`, `css`, `svg`), and at most one
-`scripts/` (`py`, `sh`, `js`, `mjs`) or `references/` (`md`, `txt`)
-subdirectory. Nothing nests deeper, dotfiles and links refuse, and the caps are
+(`md`, `txt`, `json`, `yaml`, `yml`, `csv`, `css`, `svg`), and may include
+both a `scripts/` subdirectory (`py`, `sh`, `js`, `mjs`) and a `references/`
+subdirectory (`md`, `txt`). Nothing nests deeper, dotfiles and links refuse,
+and the caps are
 16 declared members, 16 KiB per member, 4 KiB for the manifest and 32 KiB per
 package including the manifest. The manifest is a closed decode
 (`{"schema":1,"name":"<tag>","files":[...]}`) and must declare `SKILL.md`; its

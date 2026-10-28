@@ -21,6 +21,7 @@ mod plan;
 mod projects;
 mod rev;
 mod stage;
+mod ticket;
 
 use done::check_done_evidence;
 #[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
@@ -53,6 +54,12 @@ pub(crate) use rev::{
     commit, commit_scoped, commit_who, commit_who_scoped, create_exclusive, file_preimage,
     post_commit_warning, restore_preimage, write_new,
 };
+pub(crate) use ticket::confirm_committed_selected_issue;
+pub use ticket::materialize_app_run_ticket;
+// The bind acceptance test is the only caller, and it compiles only with
+// the test seam. A plain library build must not carry the re-export.
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) use ticket::{app_ticket_body, app_ticket_title};
 
 #[cfg(test)]
 use new::lock_for_new_issue_rounds;
@@ -1243,5 +1250,277 @@ mod tests {
         assert!(clean(&pm), "a refused attach left something behind");
         assert!(!pm.dir.join("cadence/CAD-1/artifacts/note-1.txt").exists());
         std::fs::remove_file(hook).unwrap();
+    }
+
+    #[test]
+    fn selected_app_ticket_is_created_once_and_omits_the_other_proposal() {
+        let (dir, pm) = tracker();
+        let reserved = json!({
+            "request_id": "ticket-req-1",
+            "run_id": "run-0123456789abcdef0123456789abcdef",
+            "artifact_id": "artifact-run-0123456789abcdef0123456789abcdef-s1",
+            "artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "index": 1,
+            "count": 2,
+            "suggestion": "Publish the Tuesday menu on the board.",
+        });
+        let first = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        assert_eq!(first["created"], true);
+        let id = first["id"].as_str().unwrap();
+        let body =
+            std::fs::read_to_string(pm.dir.join("cadence").join(id).join("issue.md")).unwrap();
+        assert!(
+            body.contains("cadence-app-ticket-request: ticket-req-1"),
+            "{body}"
+        );
+        assert!(body.contains("- decision: accept"), "{body}");
+        assert!(
+            body.contains("- artifact: artifact-run-0123456789abcdef0123456789abcdef-s1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("Publish the Tuesday menu on the board."),
+            "{body}"
+        );
+        assert!(
+            !body.contains("Ask the vendor for a written quote."),
+            "{body}"
+        );
+        let second = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        assert_eq!(second["id"], id);
+        assert_eq!(second["created"], false);
+        let other = pm.dir.join("cadence/CAD-1/issue.md");
+        let mut text = std::fs::read_to_string(&other).unwrap();
+        text.push_str("\ncadence-app-ticket-request: ticket-req-1\n");
+        std::fs::write(&other, text).unwrap();
+        let err = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap_err();
+        assert!(err.to_string().contains("more than one"), "{err}");
+    }
+
+    fn app_ticket_reservation() -> Value {
+        json!({
+            "request_id": "ticket-req-1",
+            "run_id": "run-0123456789abcdef0123456789abcdef",
+            "artifact_id": "artifact-run-0123456789abcdef0123456789abcdef-s1",
+            "artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "index": 1,
+            "count": 2,
+            "suggestion": "Publish the Tuesday menu on the board.",
+        })
+    }
+
+    /// A pre-existing issue that only contains the marker line is not the
+    /// selected proposal. Recovery must refuse it and must not create a
+    /// second issue that would leave two markers behind.
+    #[test]
+    fn planted_ticket_marker_is_not_bound() {
+        let (dir, pm) = tracker();
+        let marker = "\ncadence-app-ticket-request: ticket-req-1\n";
+        let planted = pm.dir.join("cadence/CAD-1/issue.md");
+        let mut text = std::fs::read_to_string(&planted).unwrap();
+        text.push_str(marker);
+        std::fs::write(&planted, text).unwrap();
+        let err = materialize_app_run_ticket(&pm, dir.path(), "cadence", &app_ticket_reservation())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match this reservation"),
+            "{err}"
+        );
+        assert!(
+            !pm.dir.join("cadence/CAD-2").exists(),
+            "a mismatched marker still created an issue"
+        );
+    }
+
+    /// The same marker in another project is not this reservation either.
+    #[test]
+    fn ticket_marker_in_another_project_is_not_bound() {
+        let (dir, pm) = tracker();
+        project_add(&pm, "other", "OTH", &[], &[], &[], None).unwrap();
+        new_issue(
+            &pm,
+            dir.path(),
+            Some("other"),
+            "elsewhere",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "t",
+        )
+        .unwrap();
+        let planted = pm.dir.join("other/OTH-1/issue.md");
+        let mut text = std::fs::read_to_string(&planted).unwrap();
+        text.push_str("\ncadence-app-ticket-request: ticket-req-1\n");
+        std::fs::write(&planted, text).unwrap();
+        let err = materialize_app_run_ticket(&pm, dir.path(), "cadence", &app_ticket_reservation())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match this reservation"),
+            "{err}"
+        );
+        assert!(!pm.dir.join("cadence/CAD-2").exists());
+    }
+
+    /// Editing the recorded digest after the commit must not make the next
+    /// retry treat that issue as the selected ticket.
+    #[test]
+    fn edited_ticket_provenance_is_not_reused() {
+        let (dir, pm) = tracker();
+        let reserved = app_ticket_reservation();
+        let first = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        let id = first["id"].as_str().unwrap();
+        let path = pm.dir.join("cadence").join(id).join("issue.md");
+        let text = std::fs::read_to_string(&path).unwrap().replace(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        std::fs::write(&path, text).unwrap();
+        let err = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap_err();
+        assert!(
+            err.to_string().contains("does not match this reservation"),
+            "{err}"
+        );
+        assert!(!pm.dir.join("cadence/CAD-3").exists());
+    }
+
+    /// Two callers that both pass an unlocked pre-check must still commit
+    /// one issue. The marker search and the create share the tracker lock.
+    #[test]
+    fn concurrent_materialize_commits_one_ticket() {
+        let (dir, pm) = tracker();
+        let reserved = app_ticket_reservation();
+        let cwd = dir.path().to_path_buf();
+        let pm_dir = pm.dir.clone();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cwd = cwd.clone();
+            let pm_dir = pm_dir.clone();
+            let reserved = reserved.clone();
+            handles.push(std::thread::spawn(move || {
+                let pm = Pm::at(&pm_dir).unwrap();
+                materialize_app_run_ticket(&pm, &cwd, "cadence", &reserved).unwrap()
+            }));
+        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let id = results[0]["id"].as_str().unwrap();
+        assert!(results.iter().all(|row| row["id"] == id), "{results:?}");
+        assert_eq!(
+            results.iter().filter(|row| row["created"] == true).count(),
+            1,
+            "{results:?}"
+        );
+        let marked = std::fs::read_dir(pm.dir.join("cadence"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let file = entry.path().join("issue.md");
+                file.is_file()
+                    && std::fs::read_to_string(file)
+                        .unwrap()
+                        .contains("cadence-app-ticket-request: ticket-req-1")
+            })
+            .count();
+        assert_eq!(marked, 1, "more than one issue carries the request marker");
+    }
+
+    fn issue_names(pm: &Pm) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(pm.dir.join("cadence"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// CAD-1887 R1. A child is killed after the exact reservation is
+    /// written or staged and before commit. The retry must refuse, bind
+    /// nothing, allocate no second issue, make no commit, and leave the
+    /// crash marker and the issue bytes as the child left them.
+    #[test]
+    fn killed_writer_before_commit_does_not_bind_an_uncommitted_ticket() {
+        for role in ["hold_app_ticket", "hold_app_ticket_staged"] {
+            let (dir, pm) = tracker();
+            let reserved = app_ticket_reservation();
+            let body = super::ticket::app_ticket_body(&reserved).unwrap();
+            let title = super::ticket::app_ticket_title(reserved["suggestion"].as_str().unwrap());
+            assert!(pm.dir.join("cadence/CAD-1/issue.md").is_file());
+            assert!(!pm.dir.join("cadence/CAD-2").exists());
+            let head = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+            let (child, _) = crate::issue::lock_tests::spawn_app_ticket_writer(
+                &pm, role, "cadence", "CAD-2", &title, &body,
+            );
+            crate::issue::lock_tests::sigkill(child);
+            let marker = pm.dir.join(".write.lock");
+            assert!(marker.exists(), "{role}: crash marker missing");
+            let issue = pm.dir.join("cadence/CAD-2/issue.md");
+            let before = std::fs::read(&issue).unwrap();
+            let err =
+                materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not a committed reservation") && msg.contains("refusing to bind"),
+                "{role}: {msg}"
+            );
+            assert!(msg.contains("left unchanged"), "{role}: {msg}");
+            assert_eq!(
+                std::fs::read(&issue).unwrap(),
+                before,
+                "{role}: issue bytes changed"
+            );
+            assert!(marker.exists(), "{role}: recovery marker was cleared");
+            assert!(
+                !pm.dir.join("cadence/CAD-3").exists(),
+                "{role}: a second issue was created"
+            );
+            assert_eq!(
+                crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+                head,
+                "{role}: a commit landed"
+            );
+            if role == "hold_app_ticket_staged" {
+                let staged =
+                    crate::issue::git(&pm.dir, &["diff", "--cached", "--name-only"]).unwrap();
+                assert!(
+                    staged.contains("cadence/CAD-2/issue.md"),
+                    "{role}: staged evidence cleared: {staged}"
+                );
+            } else {
+                let status =
+                    crate::issue::git(&pm.dir, &["status", "--porcelain", "--untracked-files=all"])
+                        .unwrap();
+                assert!(
+                    status.contains("cadence/CAD-2/issue.md"),
+                    "{role}: untracked evidence cleared: {status}"
+                );
+            }
+        }
+    }
+
+    /// The same request after a commit, then a killed holder on the clean
+    /// tree, reuses that committed issue and does not open another one.
+    #[test]
+    fn killed_writer_after_commit_reuses_the_committed_ticket() {
+        let (dir, pm) = tracker();
+        let reserved = app_ticket_reservation();
+        let first = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        assert_eq!(first["created"], true);
+        let id = first["id"].as_str().unwrap().to_string();
+        let issue = pm.dir.join("cadence").join(&id).join("issue.md");
+        let committed = std::fs::read(&issue).unwrap();
+        let before = issue_names(&pm);
+        let (child, _) = crate::issue::lock_tests::spawn_writer(&pm, "hold", false);
+        crate::issue::lock_tests::sigkill(child);
+        assert!(pm.dir.join(".write.lock").exists());
+        let second = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        assert_eq!(second["id"], id);
+        assert_eq!(second["created"], false);
+        assert_eq!(std::fs::read(&issue).unwrap(), committed);
+        assert_eq!(issue_names(&pm), before);
     }
 }

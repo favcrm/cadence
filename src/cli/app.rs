@@ -2006,6 +2006,52 @@ pub(crate) enum RunAction {
         #[arg(long, requires = "message")]
         token: Option<String>,
     },
+    /// Record accept or decline of one reviewed artifact. Does not publish.
+    /// One decision per run; the same request replays and a different
+    /// decision conflicts.
+    Disposition {
+        run_id: String,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        artifact_id: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long, value_enum)]
+        decision: RunDisposition,
+    },
+    /// Write one host issue for one 1-based proposal. Requires an accepted
+    /// disposition of this artifact. The same request returns the same
+    /// issue; any other proposal on the run conflicts.
+    Ticket {
+        run_id: String,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        artifact_id: String,
+        #[arg(long)]
+        digest: String,
+        /// 1-based index into `## Proposed next steps`.
+        #[arg(long)]
+        index: u32,
+        #[arg(long)]
+        project: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub(crate) enum RunDisposition {
+    Accept,
+    Decline,
+}
+
+impl RunDisposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Decline => "decline",
+        }
+    }
 }
 
 fn read_run_inputs(path: &Path) -> Result<serde_json::Value> {
@@ -2395,7 +2441,91 @@ fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
                 params,
             )
         }
+        RunAction::Disposition {
+            run_id,
+            request_id,
+            artifact_id,
+            digest,
+            decision,
+        } => (
+            "app_run_disposition",
+            json!({
+                "run_id": run_id,
+                "request_id": request_id,
+                "artifact_id": artifact_id,
+                "digest": digest,
+                "decision": decision.as_str(),
+            }),
+        ),
+        RunAction::Ticket { .. } => {
+            return Err(Error::internal(
+                "the ticket command writes the tracker before run_params",
+            ));
+        }
     })
+}
+
+fn run_selected_ticket(state_dir: &Path, action: &RunAction) -> Result<serde_json::Value> {
+    let RunAction::Ticket {
+        run_id,
+        request_id,
+        artifact_id,
+        digest,
+        index,
+        project,
+    } = action
+    else {
+        return Err(Error::internal("ticket command expected"));
+    };
+    if *index == 0 {
+        return Err(Error::rejected("suggestion index is 1-based"));
+    }
+    cadence_agent::issue::model::check_key(project)?;
+    let mut reserved = client::rpc(
+        state_dir,
+        "app_run_ticket_reserve",
+        json!({
+            "run_id": run_id,
+            "request_id": request_id,
+            "artifact_id": artifact_id,
+            "digest": digest,
+            "index": index,
+        }),
+    )?;
+    if reserved
+        .get("issue_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+    {
+        if let Some(object) = reserved.as_object_mut() {
+            object.entry("created").or_insert(json!(false));
+        }
+        return Ok(reserved);
+    }
+    let pm = cadence_agent::issue::Pm::open_default()?;
+    let cwd = std::env::current_dir()?;
+    let created =
+        cadence_agent::issue::write::materialize_app_run_ticket(&pm, &cwd, project, &reserved)?;
+    let issue_id = created
+        .get("id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| Error::internal("ticket issue did not return an id"))?;
+    let mut bound = client::rpc(
+        state_dir,
+        "app_run_ticket_bind",
+        json!({
+            "run_id": run_id,
+            "request_id": request_id,
+            "issue_id": issue_id,
+        }),
+    )?;
+    if let Some(object) = bound.as_object_mut() {
+        object.insert(
+            "created".to_string(),
+            created.get("created").cloned().unwrap_or(json!(false)),
+        );
+    }
+    Ok(bound)
 }
 
 /// `cadence app …` (CAD-547). `install`/`update`/`set`/`remove` write
@@ -2611,10 +2741,13 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
             };
             client::rpc(state_dir, method, params)?
         }
-        AppAction::Run { action } => {
-            let (method, params) = run_params(action)?;
-            client::rpc(state_dir, method, params)?
-        }
+        AppAction::Run { action } => match action {
+            RunAction::Ticket { .. } => run_selected_ticket(state_dir, action)?,
+            _ => {
+                let (method, params) = run_params(action)?;
+                client::rpc(state_dir, method, params)?
+            }
+        },
         AppAction::Record { action } => {
             let (method, params) = record_params(action)?;
             client::rpc(state_dir, method, params)?

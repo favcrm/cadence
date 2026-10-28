@@ -132,6 +132,49 @@ pub fn new_issue(
     body: Option<&str>,
     actor: &str,
 ) -> Result<Value> {
+    new_issue_unless(
+        pm,
+        cwd,
+        project_flag,
+        title,
+        priority,
+        parent,
+        blocked_by,
+        owner,
+        component,
+        tags,
+        explicit_id,
+        body,
+        actor,
+        || Ok(None),
+    )
+}
+
+/// [`new_issue`], but `decide` runs after this creation holds the tracker
+/// lock and before any new folder is written. `Some` returns that value
+/// and creates nothing — the app-ticket writer uses it to recheck the
+/// request marker under the same lock that covers the commit.
+#[allow(clippy::too_many_arguments)]
+#[track_caller]
+pub(super) fn new_issue_unless<F>(
+    pm: &Pm,
+    cwd: &Path,
+    project_flag: Option<&str>,
+    title: &str,
+    priority: Option<&str>,
+    parent: Option<&str>,
+    blocked_by: &[String],
+    owner: Option<&str>,
+    component: Option<&str>,
+    tags: &[String],
+    explicit_id: Option<&str>,
+    body: Option<&str>,
+    actor: &str,
+    decide: F,
+) -> Result<Value>
+where
+    F: FnOnce() -> Result<Option<Value>>,
+{
     let project = project::resolve(&pm.dir, project_flag, cwd)?;
     let priority = priority.unwrap_or("P2");
     model::check_priority(priority)?;
@@ -154,6 +197,9 @@ pub fn new_issue(
     // still allocated under the same real kernel lock, so concurrent
     // writers keep getting unique ids.
     let (lock, id) = lock_for_new_issue(pm, &project, explicit_id)?;
+    if let Some(existing) = decide()? {
+        return Ok(existing);
+    }
     let dir = pm.dir.join(&project.key).join(&id);
     if dir.exists() {
         return Err(Error::rejected(format!(

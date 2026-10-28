@@ -86,8 +86,9 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// (CAD-1726) adds the `artifacts` table; v57 (CAD-1853) adds the
 /// cloud-agent connection, source, session and operation tables. v58 adds
 /// `app_update_preferences`, the operator's per-install automatic-update
-/// choice. None changes a latch or witness table, so the bound extends to 58.
-pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 58;
+/// choice. v59 (CAD-1887) adds the operator disposition and selected-ticket
+/// tables. None changes a latch or witness table, so the bound extends to 59.
+pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 59;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -1724,6 +1725,19 @@ impl Store {
                     |row| row.get(0),
                 )?;
                 if preference_columns != 2 {
+                    return Err(Error::rejected("owner witness database schema is unsupported"));
+                }
+            }
+            if *db_schema >= 59 {
+                // v59 is the operator disposition and the one selected
+                // ticket. A hand-made 59 database without both tables is
+                // not the schema this witness accepts.
+                let decision_tables: i64 = wtx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('app_run_dispositions','app_run_tickets')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if decision_tables != 2 {
                     return Err(Error::rejected("owner witness database schema is unsupported"));
                 }
             }
