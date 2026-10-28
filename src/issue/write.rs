@@ -1291,4 +1291,135 @@ mod tests {
         let err = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap_err();
         assert!(err.to_string().contains("more than one"), "{err}");
     }
+
+    fn app_ticket_reservation() -> Value {
+        json!({
+            "request_id": "ticket-req-1",
+            "run_id": "run-0123456789abcdef0123456789abcdef",
+            "artifact_id": "artifact-run-0123456789abcdef0123456789abcdef-s1",
+            "artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "index": 1,
+            "count": 2,
+            "suggestion": "Publish the Tuesday menu on the board.",
+        })
+    }
+
+    /// A pre-existing issue that only contains the marker line is not the
+    /// selected proposal. Recovery must refuse it and must not create a
+    /// second issue that would leave two markers behind.
+    #[test]
+    fn planted_ticket_marker_is_not_bound() {
+        let (dir, pm) = tracker();
+        let marker = "\ncadence-app-ticket-request: ticket-req-1\n";
+        let planted = pm.dir.join("cadence/CAD-1/issue.md");
+        let mut text = std::fs::read_to_string(&planted).unwrap();
+        text.push_str(marker);
+        std::fs::write(&planted, text).unwrap();
+        let err = materialize_app_run_ticket(&pm, dir.path(), "cadence", &app_ticket_reservation())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match this reservation"),
+            "{err}"
+        );
+        assert!(
+            !pm.dir.join("cadence/CAD-2").exists(),
+            "a mismatched marker still created an issue"
+        );
+    }
+
+    /// The same marker in another project is not this reservation either.
+    #[test]
+    fn ticket_marker_in_another_project_is_not_bound() {
+        let (dir, pm) = tracker();
+        project_add(&pm, "other", "OTH", &[], &[], &[], None).unwrap();
+        new_issue(
+            &pm,
+            dir.path(),
+            Some("other"),
+            "elsewhere",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "t",
+        )
+        .unwrap();
+        let planted = pm.dir.join("other/OTH-1/issue.md");
+        let mut text = std::fs::read_to_string(&planted).unwrap();
+        text.push_str("\ncadence-app-ticket-request: ticket-req-1\n");
+        std::fs::write(&planted, text).unwrap();
+        let err = materialize_app_run_ticket(&pm, dir.path(), "cadence", &app_ticket_reservation())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match this reservation"),
+            "{err}"
+        );
+        assert!(!pm.dir.join("cadence/CAD-2").exists());
+    }
+
+    /// Editing the recorded digest after the commit must not make the next
+    /// retry treat that issue as the selected ticket.
+    #[test]
+    fn edited_ticket_provenance_is_not_reused() {
+        let (dir, pm) = tracker();
+        let reserved = app_ticket_reservation();
+        let first = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        let id = first["id"].as_str().unwrap();
+        let path = pm.dir.join("cadence").join(id).join("issue.md");
+        let text = std::fs::read_to_string(&path).unwrap().replace(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        std::fs::write(&path, text).unwrap();
+        let err = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap_err();
+        assert!(
+            err.to_string().contains("does not match this reservation"),
+            "{err}"
+        );
+        assert!(!pm.dir.join("cadence/CAD-3").exists());
+    }
+
+    /// Two callers that both pass an unlocked pre-check must still commit
+    /// one issue. The marker search and the create share the tracker lock.
+    #[test]
+    fn concurrent_materialize_commits_one_ticket() {
+        let (dir, pm) = tracker();
+        let reserved = app_ticket_reservation();
+        let cwd = dir.path().to_path_buf();
+        let pm_dir = pm.dir.clone();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cwd = cwd.clone();
+            let pm_dir = pm_dir.clone();
+            let reserved = reserved.clone();
+            handles.push(std::thread::spawn(move || {
+                let pm = Pm::at(&pm_dir).unwrap();
+                materialize_app_run_ticket(&pm, &cwd, "cadence", &reserved).unwrap()
+            }));
+        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let id = results[0]["id"].as_str().unwrap();
+        assert!(results.iter().all(|row| row["id"] == id), "{results:?}");
+        assert_eq!(
+            results.iter().filter(|row| row["created"] == true).count(),
+            1,
+            "{results:?}"
+        );
+        let marked = std::fs::read_dir(pm.dir.join("cadence"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let file = entry.path().join("issue.md");
+                file.is_file()
+                    && std::fs::read_to_string(file)
+                        .unwrap()
+                        .contains("cadence-app-ticket-request: ticket-req-1")
+            })
+            .count();
+        assert_eq!(marked, 1, "more than one issue carries the request marker");
+    }
 }

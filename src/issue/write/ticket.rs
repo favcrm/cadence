@@ -1,11 +1,12 @@
 //! The one host issue for an accepted app-run disposition.
 //!
 //! The daemon reserves the suggestion and stores its text. This module is
-//! the PM writer: it searches for the request marker and, when that issue
-//! is absent, creates one through [`new_issue`]. A crash between those two
-//! steps retries onto the same issue. Two markers for one request refuse.
+//! the PM writer: under the tracker lock it searches for the request
+//! marker and, when that issue is absent, creates one. A crash between
+//! those steps retries onto the same issue only when its body is this
+//! reservation. A marker that belongs to another project or another
+//! proposal is refused. Two markers for one request refuse.
 
-use super::new_issue;
 use super::*;
 use crate::issue::model;
 
@@ -83,24 +84,29 @@ pub fn app_ticket_body(reserved: &Value) -> Result<String> {
     ))
 }
 
-/// The issue whose body carries this request marker, if there is exactly one.
-pub fn find_app_ticket(pm: &Pm, request_id: &str) -> Result<Option<String>> {
+/// The one issue whose body is exactly this reservation, if the marker
+/// occurs once. A marker in another project, or on an issue whose
+/// provenance is not this reservation, is a conflict — it is not bound.
+fn reserved_ticket(
+    pm: &Pm,
+    project: &str,
+    request_id: &str,
+    expected_body: &str,
+) -> Result<Option<String>> {
     crate::proto::identifier(request_id, "app run ticket request ID")?;
     let marker = app_ticket_marker(request_id);
     let mut found = Vec::new();
-    for project in std::fs::read_dir(&pm.dir)
+    for entry in std::fs::read_dir(&pm.dir)
         .map_err(|e| Error::rejected(format!("cannot read the tracker: {e}")))?
     {
-        let project =
-            project.map_err(|e| Error::rejected(format!("cannot read the tracker: {e}")))?;
-        let name = project.file_name();
-        let Some(name) = name.to_str() else {
+        let entry = entry.map_err(|e| Error::rejected(format!("cannot read the tracker: {e}")))?;
+        let Some(project_name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if name.starts_with('.') || !project.path().is_dir() {
+        if project_name.starts_with('.') || !entry.path().is_dir() {
             continue;
         }
-        for issue in std::fs::read_dir(project.path())
+        for issue in std::fs::read_dir(entry.path())
             .map_err(|e| Error::rejected(format!("cannot read the tracker: {e}")))?
         {
             let issue =
@@ -114,29 +120,43 @@ pub fn find_app_ticket(pm: &Pm, request_id: &str) -> Result<Option<String>> {
             }
             let text = std::fs::read_to_string(&file)
                 .map_err(|e| Error::rejected(format!("cannot read {}: {e}", file.display())))?;
-            if text.lines().any(|line| line == marker) {
-                let id = issue.file_name();
-                let Some(id) = id.to_str() else {
-                    return Err(Error::rejected(
-                        "ticket request marker is in a non-UTF-8 issue folder",
-                    ));
-                };
-                model::check_id(id)?;
-                found.push(id.to_string());
+            if !text.lines().any(|line| line == marker) {
+                continue;
             }
+            let id = issue.file_name();
+            let Some(id) = id.to_str() else {
+                return Err(Error::rejected(
+                    "ticket request marker is in a non-UTF-8 issue folder",
+                ));
+            };
+            model::check_id(id)?;
+            let body = super::parse::parse_issue(&text).ok().map(|(_, body)| body);
+            found.push((project_name.clone(), id.to_string(), body));
         }
     }
-    match found.len() {
-        0 => Ok(None),
-        1 => Ok(Some(found.remove(0))),
-        _ => Err(Error::rejected(
+    if found.len() > 1 {
+        return Err(Error::rejected(
             "ticket request marker matches more than one issue",
-        )),
+        ));
     }
+    let Some((found_project, id, body)) = found.pop() else {
+        return Ok(None);
+    };
+    if found_project != project || body.as_deref() != Some(expected_body) {
+        return Err(Error::rejected(
+            "ticket request marker does not match this reservation",
+        ));
+    }
+    Ok(Some(id))
 }
 
 /// Create the one issue for a daemon reservation, or return the issue a
 /// previous attempt already committed under the same request marker.
+///
+/// The marker is rechecked after the tracker lock is held and before the
+/// new folder is written, so two callers cannot each observe an absence
+/// and commit a second issue. A marker that is not this reservation is
+/// refused instead of bound.
 pub fn materialize_app_run_ticket(
     pm: &Pm,
     cwd: &Path,
@@ -145,12 +165,9 @@ pub fn materialize_app_run_ticket(
 ) -> Result<Value> {
     model::check_key(project)?;
     let request_id = reserved_str(reserved, "request_id")?;
-    if let Some(id) = find_app_ticket(pm, request_id)? {
-        return Ok(json!({"id": id, "created": false}));
-    }
     let suggestion = reserved_str(reserved, "suggestion")?;
     let body = app_ticket_body(reserved)?;
-    let created = new_issue(
+    let mut created = super::new::new_issue_unless(
         pm,
         cwd,
         Some(project),
@@ -164,18 +181,13 @@ pub fn materialize_app_run_ticket(
         None,
         Some(&body),
         "operator",
+        || {
+            reserved_ticket(pm, project, request_id, &body)
+                .map(|id| id.map(|id| json!({"id": id, "created": false})))
+        },
     )?;
-    let id = created
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::internal("new issue did not return an id"))?
-        .to_string();
-    // A second writer can pass the pre-check before this commit lands.
-    // Bind the single marker that remains, and refuse when two survive.
-    match find_app_ticket(pm, request_id)? {
-        Some(found) => Ok(json!({"id": found, "created": found == id})),
-        None => Err(Error::internal(
-            "created ticket does not carry its request marker",
-        )),
+    if created.get("created").is_none() {
+        created["created"] = json!(true);
     }
+    Ok(created)
 }
