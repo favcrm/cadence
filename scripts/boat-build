@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-"""Run the worktree check plan in a fresh Boat sandbox.
+"""Run a worktree command in this worktree's Boat sandbox.
 
-The worktree pre-push hook uses this as its execution path so the shared host
-does not compile. Required CI, review and approval remain authoritative.
+The first command creates the sandbox and compiles cold. A later command
+reuses it, so Cargo keeps target/ and the cargo registry. The sandbox stays
+up for 30 minutes after the last command, then stops and is erased
+(--no-snapshots). --down deletes it now, --fresh replaces it, and --once
+deletes it when the command exits.
+
+What is copied: a shallow git snapshot of the candidate commit and the base
+(from their merge-base forward) and a binary patch of tracked edits. Not an
+rsync, and not a pull from GitHub. Untracked files are refused. The shared
+host does not compile. Required CI, review and approval remain authoritative.
 """
 
 import argparse
@@ -15,16 +23,41 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import uuid
 
 
 OWNED = None
+PUBLISHED = False
+ONCE = False
+LOG_FILE = None
+CREATE_TTL = '3600'
+IDLE_TTL = '1800'
+SANDBOX_ID = re.compile(r'bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}')
+SHA = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
+REMOTE_HOME = '/home/user'
+PROBE = (
+    'import os,subprocess,sys\n'
+    'repo="/home/user/boat-worktree"\n'
+    'shas=sys.argv[1:]\n'
+    'if not os.path.isdir(os.path.join(repo,".git")):\n'
+    '    print("repo miss")\n'
+    '    print("\\n".join("miss "+s for s in shas))\n'
+    '    raise SystemExit(0)\n'
+    'print("repo have")\n'
+    'for s in shas:\n'
+    '    rc=subprocess.run(["git","-C",repo,"cat-file","-e",s+"^{commit}"],'
+    'stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode\n'
+    '    print(("have " if rc==0 else "miss ")+s)\n'
+)
 
 
 def _stop(signum, frame):
-    if OWNED:
+    # A published session stays up so the next command can reuse it.
+    # An unpublished create, or an explicit one-shot run, is deleted.
+    if OWNED and (not PUBLISHED or ONCE):
         try:
             cleanup(OWNED)
         except BaseException:
@@ -36,16 +69,115 @@ signal.signal(signal.SIGTERM, _stop)
 signal.signal(signal.SIGINT, _stop)
 
 
-REMOTE = r'''import json, os, platform, re, shutil, signal, subprocess, sys, time, zipfile
+REMOTE = r'''import json, os, platform, re, shutil, signal, subprocess, sys, tarfile, time, zipfile
 from pathlib import Path
-job = json.loads(Path('/home/user/boat-job.json').read_text())
-repo = '/home/user/boat-worktree'
-subprocess.run(['git', 'clone', '/home/user/boat-candidate.bundle', repo], check=True)
-subprocess.run(['git', 'checkout', '--detach', job['head']], cwd=repo, check=True)
-subprocess.run(['git', 'update-ref', 'refs/remotes/origin/main', job['base']], cwd=repo, check=True)
-if Path('/home/user/boat-changes.patch').stat().st_size:
-    subprocess.run(['git', 'apply', '--binary', '/home/user/boat-changes.patch'], cwd=repo, check=True)
-if subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip() != job['head']:
+home = Path(os.environ.get('CADENCE_BOAT_REMOTE_ROOT', '/home/user'))
+job = json.loads((home / 'boat-job.json').read_text())
+repo = home / 'boat-worktree'
+patch = home / 'boat-changes.patch'
+SHA = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
+for label in ('head', 'base'):
+    if not SHA.fullmatch(job[label]):
+        raise SystemExit('invalid ' + label)
+
+def run(cmd, cwd=None):
+    result = subprocess.run(cmd, cwd=cwd)
+    if result.returncode:
+        raise SystemExit('command failed (%s): %s' % (result.returncode, cmd))
+
+def repo_ok():
+    return subprocess.run(['git', '-C', str(repo), 'rev-parse', '--is-inside-work-tree'],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+def stop_previous():
+    pid_path = home / 'boat-command.pid'
+    if not pid_path.exists():
+        return
+    try:
+        meta = json.loads(pid_path.read_text())
+        pid = int(meta['pid'])
+        expected = [str(part).encode() for part in meta.get('argv', [])]
+        cmdline = Path('/proc/%s/cmdline' % pid).read_bytes().split(b'\0')
+        if expected and cmdline[:len(expected)] == expected:
+            os.killpg(pid, signal.SIGTERM)
+            time.sleep(0.2)
+    except (OSError, ValueError, json.JSONDecodeError, ProcessLookupError):
+        pass
+    pid_path.unlink(missing_ok=True)
+
+# Ignored build caches survive a re-clone. git clean does not delete them.
+PARKS = (('target', 'target'), ('ui/node_modules', 'node_modules'))
+
+def park_ignored():
+    park = home / 'boat-park'
+    park.mkdir(exist_ok=True)
+    for rel, name in PARKS:
+        src = repo.joinpath(*rel.split('/'))
+        if src.exists():
+            dest = park / name
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.move(str(src), str(dest))
+
+def restore_parks():
+    park = home / 'boat-park'
+    if not park.is_dir():
+        return
+    for rel, name in PARKS:
+        src = park / name
+        if not src.exists():
+            continue
+        dest = repo.joinpath(*rel.split('/'))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.move(str(src), str(dest))
+    shutil.rmtree(park, ignore_errors=True)
+
+def extract_snapshot():
+    archive = home / 'boat-snapshot.tar'
+    dest = home / 'boat-snapshot'
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir()
+    with tarfile.open(archive) as tar:
+        for member in tar.getmembers():
+            parts = Path(member.name).parts
+            if (not parts or parts[0] != 'snapshot.git' or '..' in parts
+                    or member.name.startswith('/') or member.issym() or member.islnk()):
+                raise SystemExit('unsafe snapshot member: ' + member.name)
+        extract_kwargs = {'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}
+        tar.extractall(dest, **extract_kwargs)
+    snap = dest / 'snapshot.git'
+    if not (snap / 'HEAD').exists():
+        raise SystemExit('snapshot archive has no snapshot.git')
+    return snap
+
+stop_previous()
+if job.get('snapshot'):
+    if repo.exists():
+        if repo_ok():
+            park_ignored()
+        shutil.rmtree(repo)
+    snap = extract_snapshot()
+    run(['git', 'clone', '--quiet', str(snap), str(repo)])
+    shutil.rmtree(snap.parent, ignore_errors=True)
+    archive = home / 'boat-snapshot.tar'
+    if archive.exists():
+        archive.unlink()
+    restore_parks()
+    print('sync=clone', flush=True)
+elif not repo_ok():
+    raise SystemExit('sandbox has no checkout and this run sent no snapshot')
+else:
+    restore_parks()
+    print('sync=reuse', flush=True)
+run(['git', '-C', str(repo), 'update-ref', 'refs/remotes/origin/main', job['base']])
+run(['git', '-C', str(repo), 'clean', '-fd'])
+run(['git', '-c', 'advice.detachedHead=false', '-C', str(repo), 'checkout', '--quiet', '--force', '--detach', job['head']])
+if patch.stat().st_size:
+    run(['git', '-C', str(repo), 'apply', '--binary', str(patch)])
+if subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip() != job['head']:
     raise SystemExit('candidate head mismatch')
 env = dict(os.environ)
 env['CARGO_BUILD_JOBS'] = '1'
@@ -56,21 +188,24 @@ print('head=' + job['head'] + ' base=' + job['base'], flush=True)
 print('command=' + repr(job['command']), flush=True)
 # Boat's disposable image includes provider CLIs in the suite's fixed system
 # search path. Move only those entry points out of that path, inside this VM.
-quarantine = Path('/tmp/cadence-provider-cli-quarantine')
-quarantine.mkdir(exist_ok=True)
-system_dirs = ['/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin']
-cargo = shutil.which('cargo', path=env.get('PATH'))
-if cargo:
-    system_dirs.insert(0, str(Path(cargo).parent))
-seen = set()
-for directory in system_dirs:
-    for name in ('claude', 'codex', 'cursor-agent', 'cursor', 'agent', 'devin', 'pi', 'gemini'):
-        path = Path(directory, name)
-        if str(path) not in seen and path.is_file() and os.access(path, os.X_OK):
-            seen.add(str(path))
-            dest = quarantine / (str(len(seen)) + '-' + name)
-            subprocess.run(['sudo', 'mv', '--', str(path), str(dest)], check=True)
-            print('Quarantined sandbox provider entry: ' + str(path), flush=True)
+# A hermetic host test sets CADENCE_BOAT_REMOTE_ROOT; production exec does not,
+# and that test must not quarantine the host's own binaries.
+if job.get('quarantine', True) and not os.environ.get('CADENCE_BOAT_REMOTE_ROOT'):
+    quarantine = Path('/tmp/cadence-provider-cli-quarantine')
+    quarantine.mkdir(exist_ok=True)
+    system_dirs = ['/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin']
+    cargo = shutil.which('cargo', path=env.get('PATH'))
+    if cargo:
+        system_dirs.insert(0, str(Path(cargo).parent))
+    seen = set()
+    for directory in system_dirs:
+        for name in ('claude', 'codex', 'cursor-agent', 'cursor', 'agent', 'devin', 'pi', 'gemini'):
+            path = Path(directory, name)
+            if str(path) not in seen and path.is_file() and os.access(path, os.X_OK):
+                seen.add(str(path))
+                dest = quarantine / (str(len(seen)) + '-' + name)
+                subprocess.run(['sudo', 'mv', '--', str(path), str(dest)], check=True)
+                print('Quarantined sandbox provider entry: ' + str(path), flush=True)
 prepare_ui = job['command'][0] == 'bun'
 if job['command'][0] == 'scripts/pre-push':
     diffs = [subprocess.run(['git', 'diff', '--name-only', '-z', spec], cwd=repo, capture_output=True)
@@ -103,9 +238,10 @@ if prepare_ui:
         if subprocess.check_output([str(binary), '--version'], text=True).strip() != version:
             raise SystemExit('downloaded Bun version does not match packageManager')
     print('Installing locked UI dependencies', flush=True)
-    subprocess.run(['bun', 'install', '--frozen-lockfile'], cwd=repo + '/ui', env=env, check=True, timeout=300)
+    subprocess.run(['bun', 'install', '--frozen-lockfile'], cwd=str(repo) + '/ui', env=env, check=True, timeout=300)
 start = time.monotonic()
 proc = subprocess.Popen(job['command'], cwd=repo, env=env, start_new_session=True)
+(home / 'boat-command.pid').write_text(json.dumps({'pid': proc.pid, 'argv': job['command']}))
 minimum = None
 peak_load = 0.0
 pressure = False
@@ -125,9 +261,17 @@ while proc.poll() is None:
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
         break
-    time.sleep(1)
-print(f'elapsed_seconds={time.monotonic() - start:.2f} min_available_mib={minimum} peak_load_1m={peak_load:.2f} exit={proc.returncode}', flush=True)
-sys.exit(1 if pressure else (proc.returncode if proc.returncode >= 0 else 128 - proc.returncode))
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        continue
+print('elapsed_seconds=%.2f min_available_mib=%s peak_load_1m=%.2f exit=%s' % (
+    time.monotonic() - start, minimum, peak_load, proc.returncode), flush=True)
+try:
+    (home / 'boat-command.pid').unlink()
+except OSError:
+    pass
+sys.exit(1 if pressure else (proc.returncode if proc.returncode is not None and proc.returncode >= 0 else 1))
 '''
 
 
@@ -135,13 +279,49 @@ class Failure(Exception):
     pass
 
 
+class Tee:
+    """Copy text and bytes to the original stream and the run log."""
+
+    def __init__(self, stream, log):
+        self.stream = stream
+        self.log = log
+        self.buffer = self
+
+    def write(self, data):
+        if isinstance(data, bytes):
+            self.stream.buffer.write(data)
+            encoded = data
+        else:
+            self.stream.write(data)
+            encoded = data.encode()
+        try:
+            self.log.write(encoded)
+        except OSError:
+            pass
+        self.flush()
+
+    def flush(self):
+        self.stream.flush()
+        try:
+            self.log.flush()
+        except OSError:
+            pass
+
+    def fileno(self):
+        return self.stream.fileno()
+
+    def isatty(self):
+        return False
+
+
 def git(root, *args, binary=False):
-    return subprocess.check_output(['git', '-C', str(root), *args], stderr=subprocess.PIPE,
-                                   text=not binary)
+    return subprocess.check_output(
+        ['git', '-c', 'safe.directory=*', '-C', str(root), *args],
+        stderr=subprocess.PIPE, text=not binary)
 
 
 def create_sandbox(name):
-    command = ['boat', '--no-update', 'new', '--no-env', '--no-snapshots', '--ttl', '3600',
+    command = ['boat', '--no-update', 'new', '--no-env', '--no-snapshots', '--ttl', CREATE_TTL,
                '--type', 'default', '--name', name, '--json']
     proc = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
     created = None
@@ -154,7 +334,7 @@ def create_sandbox(name):
                 continue
             if event.get('event') == 'created':
                 candidate = event.get('id', '')
-                if created or not re.fullmatch(r'bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}', candidate):
+                if created or not SANDBOX_ID.fullmatch(candidate):
                     raise Failure('invalid or duplicate created sandbox ID')
                 created = candidate
                 print(f'Created owned sandbox: {created}', flush=True)
@@ -179,12 +359,28 @@ def create_sandbox(name):
         raise
 
 
-def cleanup(sandbox):
+def _json_text(text):
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _missing_payload(result):
+    payload = _json_text(result.stdout)
+    return payload.get('code') == 'not_found' or payload.get('status') == 404
+
+
+def cleanup(sandbox, missing_ok=False):
     result = subprocess.run(['boat', '--no-update', 'delete', sandbox, '--yes', '--json'],
                             capture_output=True, text=True)
-    if result.returncode:
-        print(f'Deletion failed for owned sandbox {sandbox}: {result.stderr} {result.stdout}', file=sys.stderr)
-        return False
+    if result.returncode or _missing_payload(result):
+        if missing_ok and _missing_payload(result):
+            print(f'Sandbox already gone: {sandbox}', flush=True)
+            return True
+        if result.returncode:
+            print(f'Deletion failed for owned sandbox {sandbox}: {result.stderr} {result.stdout}', file=sys.stderr)
+            return False
     try:
         operation = json.loads(result.stdout)['operation']
         if operation['targetId'] != sandbox:
@@ -212,6 +408,273 @@ def cleanup(sandbox):
     return False
 
 
+def sandbox_name(root):
+    raw = os.environ.get('CADENCE_ALIAS') or root.name
+    slug = re.sub(r'[^A-Za-z0-9-]+', '-', raw).strip('-')[:24] or 'lane'
+    return f'cadence-build-{slug}-{uuid.uuid4().hex[:8]}'
+
+
+def load_session(path):
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or not SANDBOX_ID.fullmatch(str(payload.get('sandbox', ''))):
+        return None
+    return payload
+
+
+def save_session(path, sandbox, root):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps({
+        'version': 1,
+        'sandbox': sandbox,
+        'worktree': str(root.resolve()),
+    }, indent=2) + '\n')
+    os.replace(temporary, path)
+    global PUBLISHED
+    PUBLISHED = True
+
+
+def session_lock(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, 'a+')
+    try:
+        import fcntl
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise Failure('this worktree already has a boat-build running')
+    return handle
+
+
+def sandbox_liveness(sandbox):
+    """Return alive, missing, dead, starting, or unknown."""
+    result = subprocess.run(['boat', '--no-update', 'info', sandbox, '--json'],
+                            capture_output=True, text=True)
+    payload = _json_text(result.stdout)
+    if payload.get('code') == 'not_found' or payload.get('status') == 404:
+        return 'missing', payload
+    if result.returncode:
+        return 'unknown', payload or result.stderr
+    state = ''
+    sandbox_payload = payload.get('sandbox') if isinstance(payload, dict) else None
+    if isinstance(sandbox_payload, dict):
+        state = str(sandbox_payload.get('state') or '')
+    state = state.lower()
+    if state in {'ready', 'idle', 'running'}:
+        return 'alive', payload
+    if state in {'stopped', 'archived', 'stopping', 'archiving', 'error', 'failed', 'deleted', 'destroyed'}:
+        return 'dead', payload
+    if state in {'provisioned', 'cloning', 'pending', 'creating'}:
+        return 'starting', payload
+    return 'unknown', payload
+
+
+def wait_until_alive(sandbox):
+    for _ in range(15):
+        life, payload = sandbox_liveness(sandbox)
+        if life != 'starting':
+            return life, payload
+        time.sleep(2)
+    return 'starting', payload
+
+
+def extend_sandbox(sandbox, ttl):
+    result = subprocess.run(
+        ['boat', '--no-update', 'extend', sandbox, '--ttl', str(ttl), '--json'],
+        capture_output=True, text=True)
+    if result.returncode or _missing_payload(result):
+        detail = (result.stderr or result.stdout or '').strip()
+        print(f'boat extend failed: {detail}', file=sys.stderr)
+        return False
+    return True
+
+
+def boat_exec_output(result):
+    """Plain text from `boat exec`, which returns one JSON object."""
+    payload = _json_text(result.stdout)
+    if isinstance(payload, dict) and 'stdout' in payload:
+        code = payload.get('exitCode')
+        if code is None:
+            code = 0 if payload.get('success') else (result.returncode or 1)
+        return payload.get('stdout') or '', code
+    return result.stdout, result.returncode
+
+
+def probe_commits(sandbox, shas):
+    """Return {'repo': bool, sha: bool} or None when the probe itself failed."""
+    if any(not SHA.fullmatch(sha) for sha in shas):
+        raise Failure('refusing to probe a non-commit id')
+    result = subprocess.run(
+        ['boat', '--no-update', 'exec', sandbox, '--timeout', '60', '--',
+         'python3', '-c', PROBE, *shas],
+        capture_output=True, text=True)
+    text, code = boat_exec_output(result)
+    if code:
+        print(f'commit probe failed: {text or result.stderr}', file=sys.stderr)
+        return None
+    found = {}
+    repo = None
+    for line in text.splitlines():
+        parts = line.split()
+        if parts == ['repo', 'have']:
+            repo = True
+        elif parts == ['repo', 'miss']:
+            repo = False
+        elif len(parts) == 2 and parts[0] in {'have', 'miss'} and parts[1] in shas:
+            found[parts[1]] = parts[0] == 'have'
+    if repo is None or any(sha not in found for sha in shas):
+        return None
+    found['repo'] = repo
+    return found
+
+
+def strip_snapshot_remotes(snap):
+    """Drop fetch URLs so the archive does not record the host path."""
+    config = snap / 'config'
+    try:
+        lines = config.read_text().splitlines(True)
+    except OSError:
+        return
+    kept = []
+    skip = False
+    for line in lines:
+        if line.startswith('[remote '):
+            skip = True
+            continue
+        if skip and line.startswith('['):
+            skip = False
+        if not skip:
+            kept.append(line)
+    config.write_text(''.join(kept))
+
+
+def write_snapshot(root, directory, head, base):
+    """Pack the commits the sandbox needs to check out head and base.
+
+    A full bundle of this repo is the whole object pack (hundreds of MB).
+    The merge-base and its ancestors are not required to diff or to check
+    out these two commits, so the pack is shallow from that boundary.
+    """
+    snap = directory / 'snapshot.git'
+    subprocess.run(['git', 'init', '--bare', '--quiet', str(snap)], check=True)
+    fetch = ['git', '-c', 'safe.directory=*', '-c', 'protocol.file.allow=always',
+             '-C', str(snap), 'fetch', '--quiet', '--no-tags']
+    try:
+        merge_base = git(root, 'merge-base', head, base).strip()
+    except subprocess.CalledProcessError:
+        merge_base = ''
+    if merge_base and SHA.fullmatch(merge_base):
+        ahead = max(
+            int(git(root, 'rev-list', '--count', f'{merge_base}..{head}').strip() or '0'),
+            int(git(root, 'rev-list', '--count', f'{merge_base}..{base}').strip() or '0'),
+        ) + 1
+        fetch.append(f'--depth={ahead}')
+        print(f'snapshot_depth={ahead}', flush=True)
+    else:
+        print('snapshot_depth=full', flush=True)
+    fetch.extend([str(root), f'{head}:refs/heads/candidate', f'{base}:refs/heads/base'])
+    subprocess.run(fetch, check=True)
+    subprocess.run(['git', '-C', str(snap), 'symbolic-ref', 'HEAD', 'refs/heads/candidate'], check=True)
+    for sha in (head, base):
+        subprocess.run(['git', '-C', str(snap), 'cat-file', '-e', f'{sha}^{{commit}}'], check=True)
+    strip_snapshot_remotes(snap)
+    archive = directory / 'boat-snapshot.tar'
+    with tarfile.open(archive, 'w') as tar:
+        tar.add(snap, arcname='snapshot.git', recursive=True)
+    print(f'snapshot_bytes={archive.stat().st_size}', flush=True)
+    return archive
+
+
+def scp_to_sandbox(sandbox, local, name):
+    subprocess.run(['boat', '--no-update', 'scp', str(local), f'{sandbox}:{REMOTE_HOME}/{name}'],
+                   check=True)
+
+
+def stream_exec(sandbox):
+    """Run the remote script and print its output, not Boat's event frames."""
+    proc = subprocess.Popen(
+        ['boat', '--no-update', 'exec', sandbox, '--timeout', '3300', '--stream', '--',
+         'python3', f'{REMOTE_HOME}/boat-remote.py'],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    assert proc.stdout is not None
+    exit_code = None
+    pending = ''
+    while True:
+        chunk = proc.stdout.read(65536)
+        if not chunk:
+            break
+        pending += chunk
+        while '\n' in pending:
+            line, pending = pending.split('\n', 1)
+            exit_code = _emit_exec_line(line, exit_code)
+    if pending.strip():
+        exit_code = _emit_exec_line(pending, exit_code)
+    proc.wait()
+    if exit_code is None:
+        return proc.returncode
+    return exit_code
+
+
+def _emit_exec_line(line, exit_code):
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        print(line, flush=True)
+        return exit_code
+    if not isinstance(event, dict):
+        print(line, flush=True)
+        return exit_code
+    kind = event.get('type')
+    if kind in {'stdout', 'stderr'}:
+        data = event.get('data') or ''
+        stream = sys.stderr if kind == 'stderr' else sys.stdout
+        stream.write(data)
+        stream.flush()
+    elif kind == 'exit' and event.get('exitCode') is not None:
+        return event['exitCode']
+    return exit_code
+
+
+def require_sha(value, label):
+    if not SHA.fullmatch(value):
+        raise Failure(f'{label} is not a commit id')
+    return value
+
+
+def install_log(git_dir):
+    global LOG_FILE
+    try:
+        handle = open(git_dir / 'cadence-boat-build.log', 'wb', buffering=0)
+    except OSError as exc:
+        print(f'boat-build: not writing a run log: {exc}', file=sys.stderr)
+        return
+    LOG_FILE = handle
+    sys.stdout = Tee(sys.stdout, handle)
+    sys.stderr = Tee(sys.stderr, handle)
+    print(f'boat-build: log {git_dir / "cadence-boat-build.log"}', file=sys.stderr, flush=True)
+
+
+def retire(session, session_path):
+    if not cleanup(session['sandbox'], missing_ok=True):
+        raise Failure(f"could not delete sandbox {session['sandbox']}; not creating another")
+    session_path.unlink(missing_ok=True)
+
+
+def resolve_revision(root, head_arg):
+    current = require_sha(git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip(), 'HEAD')
+    head = require_sha(git(root, 'rev-parse', '--verify', f'{(head_arg or current)}^{{commit}}').strip(), 'head')
+    if subprocess.run(
+            ['git', '-C', str(root), 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        base_ref = 'refs/remotes/origin/main'
+    else:
+        base_ref = 'refs/heads/main'
+    return current, head, base_ref
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base', help='base commit/ref (default origin/main, then main)')
@@ -222,9 +685,17 @@ def main():
                         help='pass --tests to the default scripts/pre-push plan')
     parser.add_argument('--receipt', action='store_true',
                         help='print one receipt line after the run')
+    parser.add_argument('--fresh', action='store_true',
+                        help='delete this worktree sandbox and start cold')
+    parser.add_argument('--once', action='store_true',
+                        help='delete the sandbox when the command exits')
+    parser.add_argument('--down', action='store_true',
+                        help='delete this worktree sandbox and exit')
     parser.add_argument('command', nargs=argparse.REMAINDER,
                         help='command and arguments after --; default: scripts/pre-push')
     args = parser.parse_args()
+    if args.down and (args.fresh or args.once or args.tests or args.artifact or args.command):
+        parser.error('--down does not take a command or another run mode')
     if bool(args.artifact) != bool(args.output):
         parser.error('--artifact and --output must be supplied together')
     if args.artifact:
@@ -234,80 +705,171 @@ def main():
         if os.path.lexists(args.output):
             parser.error('--output already exists')
     root = Path(git(Path.cwd(), 'rev-parse', '--show-toplevel').strip())
-    untracked = git(root, 'ls-files', '--others', '--exclude-standard', '-z', binary=True)
-    if untracked:
-        raise Failure('untracked files are not copied; commit, ignore, or remove them before running')
-    current_head = git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip()
-    head = git(root, 'rev-parse', '--verify', (args.head or current_head) + '^{commit}').strip()
-    base_ref = args.base or ('refs/remotes/origin/main' if subprocess.run(
-        ['git', '-C', str(root), 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main'],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 else 'refs/heads/main')
-    base = git(root, 'rev-parse', '--verify', base_ref + '^{commit}').strip()
-    command = args.command
-    if command and command[0] == '--':
-        command = command[1:]
-    if not command:
-        command = ['scripts/pre-push', '--base', base] + (['--tests'] if args.tests else [])
-    elif args.tests:
-        parser.error('--tests only applies to the default pre-push plan')
-    print(f'Boat execution: head={head} base={base}; command={command!r}', flush=True)
-    with tempfile.TemporaryDirectory(prefix='cadence-boat-') as temporary:
-        directory = Path(temporary)
-        bundle = directory / 'boat-candidate.bundle'
-        # Named temporary refs include both commits without bundling unrelated branches.
-        snapshot = directory / 'snapshot.git'
-        subprocess.run(['git', 'init', '--bare', '--quiet', str(snapshot)], check=True)
-        subprocess.run(['git', '-C', str(snapshot), 'fetch', '--quiet', '--no-tags', str(root),
-                        f'{head}:refs/heads/candidate', f'{base}:refs/heads/base'], check=True)
-        subprocess.run(['git', '-C', str(snapshot), 'symbolic-ref', 'HEAD',
-                        'refs/heads/candidate'], check=True)
-        subprocess.run(['git', '-C', str(snapshot), 'bundle', 'create', str(bundle),
-                        'HEAD', 'refs/heads/base'], check=True)
-        # Worktree edits belong to the current HEAD only. A push of another
-        # commit is checked exactly as that commit, without local edits.
+    git_dir = Path(git(root, 'rev-parse', '--absolute-git-dir').strip())
+    install_log(git_dir)
+    session_path = git_dir / 'cadence-boat-session.json'
+    lock = session_lock(git_dir / 'cadence-boat-session.lock')
+    global ONCE, OWNED
+    ONCE = args.once
+    sandbox = None
+    result = 1
+    failure = None
+    reused = False
+    head = base = ''
+    patch_sha = 'none'
+    try:
+        if args.down:
+            session = load_session(session_path)
+            if not session:
+                session_path.unlink(missing_ok=True)
+                print('Boat session: none', flush=True)
+                result = 0
+            else:
+                sandbox = session['sandbox']
+                OWNED = sandbox
+                print(f'Boat session: deleting {sandbox}', flush=True)
+                result = 0 if cleanup(sandbox, missing_ok=True) else 1
+                if result == 0:
+                    session_path.unlink(missing_ok=True)
+                    print(f'Boat session: removed {sandbox}', flush=True)
+                else:
+                    print('boat-build: deletion was not confirmed; session kept', file=sys.stderr)
+            if args.receipt:
+                print(f'head=none base=none patch=none sandbox={sandbox or "none"} '
+                      f'rc={result} reused=0 at={int(time.time())}', flush=True)
+            return result
+
+        untracked = git(root, 'ls-files', '--others', '--exclude-standard', '-z', binary=True)
+        if untracked:
+            raise Failure('untracked files are not copied; commit, ignore, or remove them before running')
+        current_head, head, base_ref = resolve_revision(root, args.head)
+        if args.base:
+            base_ref = args.base
+        base = require_sha(git(root, 'rev-parse', '--verify', f'{base_ref}^{{commit}}').strip(), 'base')
+        command = args.command
+        if command and command[0] == '--':
+            command = command[1:]
+        if not command:
+            command = ['scripts/pre-push', '--base', base] + (['--tests'] if args.tests else [])
+        elif args.tests:
+            parser.error('--tests only applies to the default pre-push plan')
         apply_patch = head == current_head
         patch = git(root, 'diff', '--binary', '--no-ext-diff', head, binary=True) if apply_patch else b''
         if git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip() != current_head:
             raise Failure('HEAD changed while preparing the sandbox')
-        (directory / 'boat-changes.patch').write_bytes(patch)
         patch_sha = hashlib.sha256(patch).hexdigest()
+        print(f'Boat execution: head={head} base={base}; command={command!r}', flush=True)
         print(f'tracked_patch_sha256={patch_sha} applied={apply_patch}', flush=True)
-        (directory / 'boat-job.json').write_text(json.dumps({'head': head, 'base': base, 'command': command}))
-        (directory / 'boat-remote.py').write_text(REMOTE)
-        sandbox = None
-        result = 1
-        failure = None
-        global OWNED
-        try:
-            sandbox = create_sandbox('cadence-gate-' + uuid.uuid4().hex)
-            OWNED = sandbox
-            for name in ('boat-candidate.bundle', 'boat-changes.patch', 'boat-job.json', 'boat-remote.py'):
-                subprocess.run(['boat', '--no-update', 'scp', str(directory / name),
-                                f'{sandbox}:/home/user/{name}'], check=True)
-            result = subprocess.run(['boat', '--no-update', 'exec', sandbox, '--timeout', '3300',
-                                     '--stream', '--', 'python3', '/home/user/boat-remote.py']).returncode
+
+        session = load_session(session_path)
+        if session and session.get('version') != 1:
+            retire(session, session_path)
+            session = None
+        elif session and session.get('worktree') != str(root.resolve()):
+            retire(session, session_path)
+            session = None
+        if session and args.fresh:
+            print(f"Boat session: replacing {session['sandbox']}", flush=True)
+            retire(session, session_path)
+            session = None
+        if session:
+            life, _info = sandbox_liveness(session['sandbox'])
+            if life == 'starting':
+                life, info = wait_until_alive(session['sandbox'])
+            if life == 'alive':
+                sandbox = session['sandbox']
+                OWNED = sandbox
+                if extend_sandbox(sandbox, CREATE_TTL):
+                    reused = True
+                    save_session(session_path, sandbox, root)
+                    print(f'Boat session: reusing {sandbox}', flush=True)
+                else:
+                    life = 'dead'
+            if not reused:
+                if life == 'unknown':
+                    raise Failure(
+                        'cannot tell whether the existing sandbox is running; '
+                        f'not creating another ({session["sandbox"]})')
+                if life == 'starting':
+                    raise Failure(f'sandbox {session["sandbox"]} is still starting; retry')
+                print(f'Boat session: {session["sandbox"]} is {life}; starting a new one', flush=True)
+                retire(session, session_path)
+                session = None
+                sandbox = None
+
+        with tempfile.TemporaryDirectory(prefix='cadence-boat-') as temporary:
+            directory = Path(temporary)
+            archive = None
+            if not reused:
+                archive = write_snapshot(root, directory, head, base)
+                if git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip() != current_head:
+                    raise Failure('HEAD changed while preparing the sandbox')
+                sandbox = create_sandbox(sandbox_name(root))
+                OWNED = sandbox
+                save_session(session_path, sandbox, root)
+                print(f'Boat session: new {sandbox} (cold compile; later commands reuse it for {int(IDLE_TTL) // 60} min)',
+                      flush=True)
+            else:
+                presence = probe_commits(sandbox, [head, base])
+                have_both = bool(presence and presence.get('repo') and presence.get(head) and presence.get(base))
+                if not have_both:
+                    archive = write_snapshot(root, directory, head, base)
+                    if git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip() != current_head:
+                        raise Failure('HEAD changed while preparing the sandbox')
+                    print('Boat sync: commits missing; replacing the checkout and keeping target/', flush=True)
+                else:
+                    print('Boat sync: patch only; target/ stays', flush=True)
+            (directory / 'boat-changes.patch').write_bytes(patch)
+            (directory / 'boat-remote.py').write_text(REMOTE)
+            (directory / 'boat-job.json').write_text(json.dumps({
+                'head': head,
+                'base': base,
+                'command': command,
+                'snapshot': archive is not None,
+                'quarantine': True,
+            }))
+            if archive is not None:
+                scp_to_sandbox(sandbox, archive, 'boat-snapshot.tar')
+            for name in ('boat-changes.patch', 'boat-remote.py', 'boat-job.json'):
+                scp_to_sandbox(sandbox, directory / name, name)
+            result = stream_exec(sandbox)
             if result == 0 and args.artifact:
                 artifact = directory / 'artifact'
-                result = subprocess.run(['boat', '--no-update', 'scp',
-                                         f'{sandbox}:/home/user/boat-worktree/{args.artifact}',
-                                         str(artifact)]).returncode
-                if result == 0:
+                copied = subprocess.run(
+                    ['boat', '--no-update', 'scp',
+                     f'{sandbox}:{REMOTE_HOME}/boat-worktree/{args.artifact}', str(artifact)]).returncode
+                result = copied
+                if copied == 0:
                     with artifact.open('rb') as source, open(args.output, 'xb') as target:
                         shutil.copyfileobj(source, target)
                         os.fchmod(target.fileno(), artifact.stat().st_mode & 0o777)
             subprocess.run(['boat', '--no-update', 'usage', sandbox, '--json'], check=False)
-        except BaseException as exc:
-            failure = exc
-        finally:
-            if sandbox and not cleanup(sandbox):
-                result = 1
-            OWNED = None
-        if args.receipt:
-            print(f'head={head} base={base} patch={patch_sha} sandbox={sandbox or "none"} '
-                  f'rc={result} at={int(time.time())}', flush=True)
-        if failure is not None:
-            raise failure
-        return result
+    except BaseException as exc:
+        failure = exc
+    finally:
+        if PUBLISHED and sandbox and not args.down:
+            if args.once:
+                if cleanup(sandbox):
+                    session_path.unlink(missing_ok=True)
+                elif result == 0:
+                    result = 1
+            else:
+                if extend_sandbox(sandbox, IDLE_TTL):
+                    print(f'idle_seconds={IDLE_TTL}', flush=True)
+                else:
+                    print('boat-build: sandbox left with its current lifetime', file=sys.stderr)
+        if args.receipt and not args.down:
+            print(f'head={head or "none"} base={base or "none"} patch={patch_sha} '
+                  f'sandbox={sandbox or "none"} rc={result} reused={1 if reused else 0} '
+                  f'at={int(time.time())}', flush=True)
+        OWNED = None
+        try:
+            lock.close()
+        except OSError:
+            pass
+    if failure is not None:
+        raise failure
+    return result
 
 
 if __name__ == '__main__':

@@ -288,6 +288,8 @@ jobs:
       - run: python3 tests/cad1540_cross_build_gate_acceptance.py
       # CAD-1910: never operate on a sandbox other than the one just created.
       - run: python3 tests/cad1910_boat_cleanup_refusal.py
+      # Warm Boat session: reuse one sandbox, shallow snapshot, keep target/.
+      - run: python3 tests/boat_build_session.py
       - run: scripts/design-kit --check
       # CAD-1285: a shipped `version < N` store migration block, and the
       # SCHEMA constant it applies, must not change; new DDL gets a new version.

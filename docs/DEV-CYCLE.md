@@ -238,6 +238,7 @@ scripts/boat-build --tests       # execute on Boat; stop at the first nonzero ex
 scripts/boat-build -- cargo build --locked --bin cadence
 scripts/boat-build -- cargo test --locked --lib FILTER -- --test-threads=1
 scripts/boat-build --artifact target/debug/cadence --output /tmp/cadence-build -- cargo build --locked --bin cadence
+scripts/boat-build --down            # delete this worktree's sandbox now
 ```
 
 The worktree hook uses `scripts/boat-build` by default, so the shared host does
@@ -253,18 +254,32 @@ it or the ticket's outcome cannot be shown without one. The floor is not
 that proof. Remote Rust builds use one Cargo job. If Boat is unavailable,
 report that limitation rather than claiming validation.
 
-The helper copies committed Git history plus tracked edits; it refuses
-untracked files rather than silently omitting them. It does not copy ignored
-files or account environment secrets. For UI-related pre-push checks and
-commands starting with `bun`, it installs the exact Bun version pinned by
-`ui/package.json` and the locked UI dependencies. The sandbox has a one-hour
-lifetime. It reports memory, time and Boat usage, then deletes only the
-sandbox created by that invocation. A failed or interrupted creation can have
-an unknown outcome; do not retry or delete another sandbox by name. The helper
-moves preinstalled provider CLI entry points out of the test runner's fixed
-search path **inside the disposable sandbox only**; it does not change the
-host or relax the test isolation guard. Only an explicitly requested artifact
-is copied back, without overwriting an existing destination.
+The helper keeps one Boat sandbox per worktree. A later command reuses it
+while it is running, then leaves it up for 30 minutes. `--down` deletes it,
+`--fresh` replaces it, and `--once` deletes it when the command exits. Idle
+sandboxes were created with snapshots off, so that stop erases the disk and
+the next command starts cold.
+
+The copy is a shallow git snapshot of the candidate and the base, from their
+merge-base forward, plus a binary patch of tracked edits. It is not an rsync
+of the worktree and it does not pull from GitHub. The full history pack is
+not uploaded. Untracked files are refused. Ignored files, including
+`target/`, stay out of the snapshot; a reused sandbox keeps `target/` and the
+cargo registry, so only the changed crates compile. The first command of a
+session is a cold compile and costs one Boat start. Later commands in the
+same 30 minutes do not. Start limits (`boat limits`) are the scarce quota.
+
+It does not copy account environment secrets (`--no-env`). For UI-related
+pre-push checks and commands starting with `bun`, it installs the exact Bun
+version pinned by `ui/package.json` and the locked UI dependencies. The
+create ceiling is one hour, which covers the run; the idle timer after the
+command is 30 minutes. It reports memory, time and Boat usage. A failed or
+interrupted creation can have an unknown outcome; do not retry or delete
+another sandbox by name. The helper moves preinstalled provider CLI entry
+points out of the test runner's fixed search path **inside the sandbox
+only**; it does not change the host or relax the test isolation guard. Only
+an explicitly requested artifact is copied back, without overwriting an
+existing destination.
 
 The hook's result gates the push, but required CI, review and operator
 approval remain authoritative. Commands and their output may be retained in

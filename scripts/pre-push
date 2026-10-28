@@ -189,6 +189,8 @@ def main(argv=None):
     changed = changed_files(root, args.base or default_base(root))
     steps = plan(root, changed, args.tests)
     env = dict(os.environ)
+    # Boat sets CARGO_BUILD_JOBS=1 before this process. 4 is only the host
+    # default when the variable is unset (CADENCE_PRE_PUSH_LOCAL).
     env.setdefault("CARGO_BUILD_JOBS", "4")
     # CAD-1197: a step that runs `cargo test` gets only allowlisted CADENCE_*
     # variables, so a pane's production CADENCE_PM_DIR/CADENCE_STATE_DIR

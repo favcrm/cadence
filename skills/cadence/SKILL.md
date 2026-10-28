@@ -361,15 +361,15 @@ agreed hand-over (recorded on the issue).
 
 Every lane worktree `issue start` mints carries a per-worktree git `pre-push`
 hook (`<worktree-git-dir>/cadence-hooks/pre-push`, via `core.hooksPath` under
-`extensions.worktreeConfig`): `git push` runs `scripts/pre-push` and is
-refused when a step fails, and the hook leaves a receipt
-(`cadence-pre-push-receipt`, `head= lane= kind= steps=… rc= at=`) under the
-worktree's git dir. `--no-verify` still pushes, but the missing receipt is the
-detectable signal. The main checkout has no hook.
+`extensions.worktreeConfig`): `git push` runs `scripts/boat-build`, which
+runs the pre-push plan in that worktree's Boat sandbox, and the push is
+refused when a step fails. The hook stores the helper's last line
+(`head= base= patch= sandbox= rc= reused= at=`) under the worktree's git
+dir. `--no-verify` still pushes, but the missing receipt is the detectable
+signal. The main checkout has no hook. The push does not compile on the host.
 
-The same push path draws on a dedicated `check` slot pool (default 2
-concurrent) that build/test work never fills: a lane's `git push` can run
-`scripts/pre-push` even while every build slot is held. A `check` slot is
+A `check` slot pool (default 2 concurrent) still exists for admitted check
+recipes and is separate from build/test slots. A `check` slot is
 admitted only for a `build.recipes` entry whose `kind: check` —
 `cadence build-slot acquire check --recipe <name>` or
 `build-slot run check --recipe <name> -- <cmd>`; there is no way to name a

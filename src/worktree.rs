@@ -257,8 +257,8 @@ pub const HOOKS_DIR: &str = "cadence-hooks";
 /// The hook script installed at `<git-dir>/cadence-hooks/pre-push`.
 /// Git runs pre-push hooks with GIT_DIR already pointed at the
 /// worktree's git dir and cwd at the worktree root, so the receipt and
-/// `scripts/boat-build` both resolve per-lane. The check plan runs in a
-/// fresh Boat sandbox so the shared host does not compile; the receipt
+/// `scripts/boat-build` both resolve per-lane. The check plan runs in
+/// this worktree's Boat sandbox so the shared host does not compile; the receipt
 /// records the checked head, base, sandbox and result under this
 /// worktree's git dir. Required CI, review and approval remain
 /// authoritative. A `--no-verify` push leaves no receipt, which is the
