@@ -283,5 +283,30 @@ void (async () => {
     const f = mount(full); f.port.receive({ v: 1, op: "ready", accepts });
     check(f.port.closed, `forged opt-in refused: ${JSON.stringify(accepts)}`);
   }
+  // CAD-1902: the configured publication binding is pushed as publish_settings.
+  const publication = (context_id: string | null, label: string, over: Partial<AppBinding> = {}): AppBinding => ({
+    ...binding("publication", context_id), revision: 3,
+    config: { ...binding("publication", context_id).config,
+      publish: { destination_id: "con_46d9dfe7", destination_label: label, toolkit: "instagram", timezone: "Asia/Hong_Kong",
+        grant_id: `${SECRET}-grant` } as never }, ...over });
+  const withPublication = (bindings: AppBinding[]) => project(extras({ bindings: [...extras().bindings, ...bindings] }));
+  const v2Push = (push: ScreenPush) => { const m = mount(push); m.port.receive({ v: 1, op: "ready", accepts: ["screen.v2"] }); return m.port.sent[0] as ScreenPush; };
+  const ps = v2Push(withPublication([publication(null, "@install.wide"), publication("ctx-a", "@food.syntax")])).publish_settings;
+  check(JSON.stringify(ps) === JSON.stringify({ revision: 3, destination_id: "con_46d9dfe7", destination_label: "@food.syntax",
+    toolkit: "instagram", timezone: "Asia/Hong_Kong" }), `the mounted context's binding wins and no grant is pushed: ${JSON.stringify(ps)}`);
+  check(v2Push(withPublication([publication(null, "@install.wide")])).publish_settings?.destination_label === "@install.wide",
+    "the install-wide binding applies when the context has none");
+  check(!("publish_settings" in v2Push(withPublication([publication("ctx-b", "@other")]))), "another context's binding is not pushed");
+  check(!("publish_settings" in v2Push(withPublication([publication("ctx-a", "@old", { config: { ...publication("ctx-a", "@old").config, bundle_digest: sha("c") } })]))),
+    "a binding earned under another bundle digest is not pushed");
+  check(!("publish_settings" in v2Push(withPublication([publication("ctx-a", "@revoked", { state: "revoked" })]))), "a revoked binding is not pushed");
+  const odd = v2Push(withPublication([publication("ctx-a", `bad${String.fromCharCode(7)}label`, { config: { ...binding("publication", "ctx-a").config,
+    publish: { destination_id: "has space", destination_label: `bad${String.fromCharCode(7)}label`, toolkit: "tiktok", timezone: "Not/AZone" } as never } })])).publish_settings;
+  check(JSON.stringify(odd) === JSON.stringify({ revision: 3 }), `fields that fail the app grammar are omitted: ${JSON.stringify(odd)}`);
+  const legacyChild = mount(withPublication([publication("ctx-a", "@food.syntax")])); legacyChild.port.receive({ v: 1, op: "ready" });
+  const intentsOnly = mount(withPublication([publication("ctx-a", "@food.syntax")])); intentsOnly.port.receive({ v: 1, op: "ready", accepts: ["publish-intents.v1"] });
+  check(!("publish_settings" in (legacyChild.port.sent[0] as object)) && !("publish_settings" in (intentsOnly.port.sent[0] as object)),
+    "v1 and publish-intents.v1 children never receive publish_settings");
+
   console.log("screen.v2 projection and image channel checks pass");
 })().catch(error => setTimeout(() => { throw error; }));

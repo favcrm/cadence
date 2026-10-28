@@ -1,6 +1,6 @@
 import type { Installation, AppContext, WorkspaceRun, AppEffect, AppBinding, SourceReceipt, ToolReceipt } from "../workspaceApps";
 import { PUBLISH_LIST_CAP, type PublishIntent } from "../socialPublish";
-import { ACTION_VERBS, shapeFor, type ScreenDefaults, type ScreenIntent, type ScreenIntents, type ScreenPush,
+import { ACTION_VERBS, shapeFor, type ScreenDefaults, type ScreenPublishSettings, type ScreenIntent, type ScreenIntents, type ScreenPush,
   type ScreenRefusal, type ScreenRunV2, type ScreenSourcePost, type ScreenSources } from "./screenProtocol";
 
 /** The verified `socialPublish.list` read, tagged with the scope it was
@@ -301,6 +301,29 @@ function defaultsOf(installation: Installation, context: AppContext | undefined)
   }
   return out;
 }
+/** The app's own publish_settings grammars (cadence-app-social-content
+ *  screen-v2.mjs): a field that fails one is omitted, never coerced. */
+const PUBLISH_DEST = /^[A-Za-z0-9._-]{1,120}$/;
+const PUBLISH_ZONE = /^[A-Za-z0-9/_+-]+$/;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
+/** CAD-1902: the configured publication binding for this install and scope
+ *  at the installed bundle, as the frame's read-only publish_settings. The
+ *  mounted context's own binding wins over the install-wide one. */
+function publishSettingsOf(installation: Installation, contextId: string, extras: ScreenExtras | undefined): ScreenPublishSettings | undefined {
+  const candidates = (extras?.bindings ?? []).filter(b => b.install_id === installation.install_id && b.state === "configured" &&
+    b.config.bundle_digest === installation.digest && b.config.publish && typeof b.config.publish === "object" &&
+    ((b.context_id ?? "") === contextId || (b.context_id ?? "") === ""));
+  const binding = candidates.find(b => (b.context_id ?? "") === contextId) ?? candidates.find(b => (b.context_id ?? "") === "");
+  if (!binding || !Number.isSafeInteger(binding.revision) || binding.revision < 0) return undefined;
+  const publish = binding.config.publish as { destination_id?: unknown; destination_label?: unknown; toolkit?: unknown; timezone?: unknown };
+  const out: ScreenPublishSettings = { revision: binding.revision };
+  if (typeof publish.destination_id === "string" && PUBLISH_DEST.test(publish.destination_id)) out.destination_id = publish.destination_id;
+  if (typeof publish.destination_label === "string" && publish.destination_label.trim().length > 0 &&
+    publish.destination_label.length <= 80 && !CONTROL_CHARS.test(publish.destination_label)) out.destination_label = publish.destination_label;
+  if (publish.toolkit === "instagram" || publish.toolkit === "facebook") out.toolkit = publish.toolkit;
+  if (typeof publish.timezone === "string" && PUBLISH_ZONE.test(publish.timezone) && isZone(publish.timezone)) out.timezone = publish.timezone;
+  return out;
+}
 function readinessOf(installation: Installation, contextId: string, extras: ScreenExtras | undefined): { ok: boolean; blockers: string[] } {
   const blockers: string[] = [];
   if (!installation.approved) blockers.push("install_unapproved");
@@ -349,6 +372,7 @@ export function screenProjection(installation: Installation, tag: string, contex
       new Map(scopedRuns.map(r => [r.id, r.context_id ?? ""])), true),
     ...present({ sources: sourcesOf(installation, scopedRuns, scoped) }),
     defaults: defaultsOf(installation, active.find(c => c.id === contextId)),
+    ...present({ publish_settings: publishSettingsOf(installation, contextId, scoped) }),
     readiness: readinessOf(installation, contextId, scoped),
     // Verbs only a viewer with the operator's board reads may use; the daemon
     // re-proves the operator on every spend. No price is ever pushed.
