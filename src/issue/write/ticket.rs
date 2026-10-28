@@ -160,6 +160,40 @@ fn reserved_ticket(
     Ok(Some(id))
 }
 
+/// The supplied issue is this reservation's selected ticket, already
+/// committed and clean against HEAD. The caller holds the tracker lock.
+/// This reads only: it does not commit, allocate, or clear a crash marker.
+pub(crate) fn confirm_committed_selected_issue(
+    pm: &Pm,
+    issue_id: &str,
+    reserved: &Value,
+) -> Result<()> {
+    let expected = app_ticket_body(reserved)?;
+    let (project, dir) = match super::issue_dir(pm, issue_id) {
+        Ok(found) => found,
+        Err(error) => {
+            if error.to_string().contains("Unknown issue") {
+                return Err(not_selected(issue_id));
+            }
+            return Err(error);
+        }
+    };
+    let path = dir.join("issue.md");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| Error::rejected(format!("cannot read {}: {e}", path.display())))?;
+    let body = super::parse::parse_issue(&text).ok().map(|(_, body)| body);
+    if body.as_deref() != Some(expected.as_str()) {
+        return Err(not_selected(issue_id));
+    }
+    ensure_committed_reservation(pm, &project.key, issue_id, &text)
+}
+
+fn not_selected(issue_id: &str) -> Error {
+    Error::rejected(format!(
+        "ticket bind refused: {issue_id} is not the committed selected issue for this reservation"
+    ))
+}
+
 /// Refuse a reservation whose working-tree bytes are not the committed
 /// blob, or whose issue directory is still dirty. Nothing is written.
 fn ensure_committed_reservation(pm: &Pm, project: &str, id: &str, working: &str) -> Result<()> {

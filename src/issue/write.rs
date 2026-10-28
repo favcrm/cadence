@@ -54,7 +54,9 @@ pub(crate) use rev::{
     commit, commit_scoped, commit_who, commit_who_scoped, create_exclusive, file_preimage,
     post_commit_warning, restore_preimage, write_new,
 };
+pub(crate) use ticket::confirm_committed_selected_issue;
 pub use ticket::materialize_app_run_ticket;
+pub(crate) use ticket::{app_ticket_body, app_ticket_title};
 
 #[cfg(test)]
 use new::lock_for_new_issue_rounds;

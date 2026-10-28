@@ -383,6 +383,11 @@ request conflicts, so the unselected proposals are not written. Decline
 cannot reserve a ticket.
 A crash after the issue commit and before the bind retries onto the marker
 instead of creating a second issue; two markers for one request refuse.
+The bind RPC checks the tracker before it writes. It records the issue only
+when that id is this reservation and the issue file is already committed and
+clean. A missing id, any other committed issue, or the same body still
+uncommitted or staged is refused: the reservation stays unbound, no bound
+event is written, and crash leftovers are left in place.
 
 ## Approval and recovery boundaries
 

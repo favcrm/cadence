@@ -3269,6 +3269,10 @@ impl Store {
 
     /// Attach the tracker issue created for a reservation. The same issue
     /// replays; a second issue for the same run or request conflicts.
+    ///
+    /// Syntax, the reservation pair, and uniqueness are the whole check
+    /// here. This does not read the tracker. The daemon bind path confirms
+    /// the id is the committed selected issue before it calls this.
     pub fn app_run_ticket_bind(
         &self,
         run_id: &str,

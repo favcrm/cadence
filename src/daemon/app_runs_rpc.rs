@@ -1107,15 +1107,68 @@ impl Shared {
                     human,
                 )
             }
-            "app_run_ticket_bind" => self.store.app_run_ticket_bind(
-                required_str(params, "run_id")?,
-                required_str(params, "request_id")?,
-                required_str(params, "issue_id")?,
-                human,
-            ),
+            "app_run_ticket_bind" => self.bind_app_run_ticket(params, human),
             _ => Err(Error::rejected("unknown app lifecycle method")),
         }
     }
+
+    /// CAD-1887: record an issue only when it is this reservation's
+    /// committed selected ticket. The tracker lock is held across the
+    /// check and the SQLite update. A missing id, a different issue, or
+    /// an uncommitted match never binds, and this path does not commit,
+    /// allocate, or clear crash leftovers.
+    fn bind_app_run_ticket(&self, params: &Value, human: Option<&Value>) -> Result<Value> {
+        let run_id = required_str(params, "run_id")?;
+        let request_id = required_str(params, "request_id")?;
+        let issue_id = required_str(params, "issue_id")?;
+        if let Some(reserved) = self.unbound_selected_ticket(run_id, request_id)? {
+            let pm = self.pm()?;
+            // Scope the lock to the claimed issue when it exists so an
+            // unrelated crash does not block a clean ticket, and an
+            // overlapping crash refuses before SQLite. A missing issue
+            // has nothing to lock; the confirm below refuses it.
+            let _lock = match crate::issue::write::issue_dir(&pm, issue_id) {
+                Ok((_, dir)) => Some(pm.lock_for_paths(&[dir.join("issue.md")])?),
+                Err(_) => None,
+            };
+            crate::issue::write::confirm_committed_selected_issue(&pm, issue_id, &reserved)?;
+            let bound = self
+                .store
+                .app_run_ticket_bind(run_id, request_id, issue_id, human)?;
+            drop(_lock);
+            return Ok(bound);
+        }
+        self.store
+            .app_run_ticket_bind(run_id, request_id, issue_id, human)
+    }
+
+    /// The reservation still waiting for its issue, shaped for the
+    /// ticket body check. `None` leaves the store bind to answer
+    /// (missing reservation, mismatched request, or an already-bound
+    /// replay) without a tracker read.
+    fn unbound_selected_ticket(&self, run_id: &str, request_id: &str) -> Result<Option<Value>> {
+        let shown = match self.store.app_run_show(run_id) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+        let ticket = &shown["ticket"];
+        if !ticket.is_object()
+            || ticket.get("request_id").and_then(Value::as_str) != Some(request_id)
+            || !ticket.get("issue_id").is_some_and(Value::is_null)
+        {
+            return Ok(None);
+        }
+        Ok(Some(json!({
+            "run_id": run_id,
+            "request_id": request_id,
+            "artifact_id": ticket["artifact_id"],
+            "artifact_digest": ticket["artifact_digest"],
+            "index": ticket["index"],
+            "count": ticket["count"],
+            "suggestion": ticket["suggestion"],
+        })))
+    }
+
     /// Capture only local receipts under the established lock order. The
     /// caller performs price I/O unlocked, then rechecks these same receipts.
     pub(super) fn prepare_app_run_quotes(
@@ -2042,6 +2095,8 @@ mod cad1123_acceptance;
 mod cad1123_tests;
 #[cfg(test)]
 mod cad1230_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1887_bind_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1887_caller_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
