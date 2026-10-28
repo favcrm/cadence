@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""Run a worktree check in a fresh Boat sandbox (supplemental, not a gate)."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+REMOTE = r'''import json, os, platform, re, shutil, signal, subprocess, sys, time, zipfile
+from pathlib import Path
+job = json.loads(Path('/home/user/boat-job.json').read_text())
+repo = '/home/user/boat-worktree'
+subprocess.run(['git', 'clone', '/home/user/boat-candidate.bundle', repo], check=True)
+subprocess.run(['git', 'checkout', '--detach', job['head']], cwd=repo, check=True)
+subprocess.run(['git', 'update-ref', 'refs/remotes/origin/main', job['base']], cwd=repo, check=True)
+if Path('/home/user/boat-changes.patch').stat().st_size:
+    subprocess.run(['git', 'apply', '--binary', '/home/user/boat-changes.patch'], cwd=repo, check=True)
+if subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip() != job['head']:
+    raise SystemExit('candidate head mismatch')
+env = dict(os.environ)
+env['CARGO_BUILD_JOBS'] = '1'
+env['CARGO_TERM_COLOR'] = 'never'
+print('SUPPLEMENTAL Boat run; not a pre-push or CI authorization', flush=True)
+print('head=' + job['head'] + ' base=' + job['base'], flush=True)
+print('command=' + repr(job['command']), flush=True)
+# Boat's disposable image includes provider CLIs in the suite's fixed system
+# search path. Move only those entry points out of that path, inside this VM.
+quarantine = Path('/tmp/cadence-provider-cli-quarantine')
+quarantine.mkdir(exist_ok=True)
+system_dirs = ['/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin']
+cargo = shutil.which('cargo', path=env.get('PATH'))
+if cargo:
+    system_dirs.insert(0, str(Path(cargo).parent))
+seen = set()
+for directory in system_dirs:
+    for name in ('claude', 'codex', 'cursor-agent', 'cursor', 'agent', 'devin', 'pi', 'gemini'):
+        path = Path(directory, name)
+        if str(path) not in seen and path.is_file() and os.access(path, os.X_OK):
+            seen.add(str(path))
+            dest = quarantine / (str(len(seen)) + '-' + name)
+            subprocess.run(['sudo', 'mv', '--', str(path), str(dest)], check=True)
+            print('Quarantined sandbox provider entry: ' + str(path), flush=True)
+prepare_ui = job['command'][0] == 'bun'
+if job['command'][0] == 'scripts/pre-push':
+    diffs = [subprocess.run(['git', 'diff', '--name-only', '-z', spec], cwd=repo, capture_output=True)
+             for spec in (job['base'] + '...HEAD', 'HEAD')]
+    prepare_ui = any(diff.returncode or any(path.startswith(b'ui/') for path in diff.stdout.split(b'\0'))
+                     for diff in diffs)
+if prepare_ui:
+    manager = json.loads(Path(repo, 'ui/package.json').read_text()).get('packageManager', '')
+    match = re.fullmatch(r'bun@([0-9]+[.][0-9]+[.][0-9]+)', manager)
+    if not match:
+        raise SystemExit('ui/package.json must pin an exact Bun version')
+    version = match.group(1)
+    installed = shutil.which('bun', path=env.get('PATH'))
+    current = subprocess.run([installed, '--version'], capture_output=True, text=True).stdout.strip() if installed else ''
+    if current != version:
+        machine = {'x86_64': 'x64', 'aarch64': 'aarch64'}.get(platform.machine())
+        if not machine:
+            raise SystemExit('unsupported sandbox architecture for pinned Bun')
+        name = 'bun-linux-' + machine
+        archive = '/tmp/cadence-bun.zip'
+        binary = Path('/tmp/cadence-bun/bin/bun')
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        url = f'https://github.com/oven-sh/bun/releases/download/bun-v{version}/{name}.zip'
+        print(f'Installing pinned Bun {version}', flush=True)
+        subprocess.run(['curl', '-fsSL', '--max-time', '120', url, '-o', archive], check=True)
+        with zipfile.ZipFile(archive) as z, z.open(name + '/bun') as source, binary.open('wb') as target:
+            shutil.copyfileobj(source, target)
+        binary.chmod(0o755)
+        env['PATH'] = str(binary.parent) + os.pathsep + env.get('PATH', '')
+        if subprocess.check_output([str(binary), '--version'], text=True).strip() != version:
+            raise SystemExit('downloaded Bun version does not match packageManager')
+    print('Installing locked UI dependencies', flush=True)
+    subprocess.run(['bun', 'install', '--frozen-lockfile'], cwd=repo + '/ui', env=env, check=True, timeout=300)
+start = time.monotonic()
+proc = subprocess.Popen(job['command'], cwd=repo, env=env, start_new_session=True)
+minimum = None
+peak_load = 0.0
+pressure = False
+while proc.poll() is None:
+    with open('/proc/meminfo') as f:
+        values = {p[0].rstrip(':'): int(p[1]) for line in f if len(p := line.split()) >= 2 and p[1].isdigit()}
+    available = values['MemAvailable'] // 1024
+    minimum = available if minimum is None else min(minimum, available)
+    peak_load = max(peak_load, os.getloadavg()[0])
+    if available < 768:
+        pressure = True
+        print('stopping this sandbox job: available memory below 768 MiB', flush=True)
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        break
+    time.sleep(1)
+print(f'elapsed_seconds={time.monotonic() - start:.2f} min_available_mib={minimum} peak_load_1m={peak_load:.2f} exit={proc.returncode}', flush=True)
+sys.exit(1 if pressure else (proc.returncode if proc.returncode >= 0 else 128 - proc.returncode))
+'''
+
+
+class Failure(Exception):
+    pass
+
+
+def git(root, *args, binary=False):
+    return subprocess.check_output(['git', '-C', str(root), *args], stderr=subprocess.PIPE,
+                                   text=not binary)
+
+
+def create_sandbox(name):
+    command = ['boat', '--no-update', 'new', '--no-env', '--no-snapshots', '--ttl', '3600',
+               '--type', 'default', '--name', name, '--json']
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
+    created = None
+    ready = False
+    try:
+        for line in proc.stdout:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get('event') == 'created':
+                candidate = event.get('id', '')
+                if created or not re.fullmatch(r'bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}', candidate):
+                    raise Failure('invalid or duplicate created sandbox ID')
+                created = candidate
+                print(f'Created owned sandbox: {created}', flush=True)
+            elif event.get('event') == 'ready':
+                if not created or event.get('id') != created:
+                    raise Failure('ready sandbox does not match created sandbox')
+                ready = True
+            elif event.get('event') == 'error':
+                print(f"Boat creation error: {event.get('error')} code={event.get('code')} status={event.get('status')}",
+                      file=sys.stderr)
+        if proc.wait() != 0 or not created or not ready:
+            raise Failure('sandbox creation did not reach ready; outcome may be unknown')
+        return created
+    except BaseException:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait()
+        if created:
+            cleanup(created)
+        else:
+            print(f'Creation outcome unknown; do not retry or delete by name: {name}', file=sys.stderr)
+        raise
+
+
+def cleanup(sandbox):
+    result = subprocess.run(['boat', '--no-update', 'delete', sandbox, '--yes', '--json'],
+                            capture_output=True, text=True)
+    if result.returncode:
+        print(f'Deletion failed for owned sandbox {sandbox}: {result.stderr} {result.stdout}', file=sys.stderr)
+        return False
+    try:
+        operation = json.loads(result.stdout)['operation']
+        if operation['targetId'] != sandbox:
+            raise ValueError('wrong target')
+        operation_id = operation['id']
+        for _ in range(30):
+            status = operation['status']
+            if status == 'completed':
+                print(f'Deletion completed: {sandbox} ({operation_id})', flush=True)
+                return True
+            if status == 'blocked':
+                break
+            time.sleep(2)
+            check = subprocess.run(['boat', '--no-update', 'deletion', 'status', operation_id, '--json'],
+                                   capture_output=True, text=True)
+            if check.returncode:
+                print(f'Deletion status failed: {check.stderr} {check.stdout}', file=sys.stderr)
+                break
+            operation = json.loads(check.stdout)['operation']
+            if operation['targetId'] != sandbox or operation['id'] != operation_id:
+                raise ValueError('deletion status changed target or operation')
+        print(f'Deletion not confirmed: sandbox={sandbox} operation={operation_id}', file=sys.stderr)
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f'Deletion outcome unknown for {sandbox}: {exc}', file=sys.stderr)
+    return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--base', help='base commit/ref (default origin/main, then main)')
+    parser.add_argument('--artifact', help='relative file path under remote checkout to copy back')
+    parser.add_argument('--output', help='new local destination for --artifact')
+    parser.add_argument('command', nargs=argparse.REMAINDER,
+                        help='command and arguments after --; default: scripts/pre-push')
+    args = parser.parse_args()
+    if bool(args.artifact) != bool(args.output):
+        parser.error('--artifact and --output must be supplied together')
+    if args.artifact:
+        path = Path(args.artifact)
+        if path.is_absolute() or '..' in path.parts or not path.parts:
+            parser.error('--artifact must be a relative path within the checkout')
+        if os.path.lexists(args.output):
+            parser.error('--output already exists')
+    root = Path(git(Path.cwd(), 'rev-parse', '--show-toplevel').strip())
+    untracked = git(root, 'ls-files', '--others', '--exclude-standard', '-z', binary=True)
+    if untracked:
+        raise Failure('untracked files are not copied; commit, ignore, or remove them before running')
+    head = git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip()
+    base_ref = args.base or ('refs/remotes/origin/main' if subprocess.run(
+        ['git', '-C', str(root), 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 else 'refs/heads/main')
+    base = git(root, 'rev-parse', '--verify', base_ref + '^{commit}').strip()
+    command = args.command
+    if command and command[0] == '--':
+        command = command[1:]
+    if not command:
+        command = ['scripts/pre-push', '--base', base]
+    print(f'Supplemental only: head={head} base={base}; command={command!r}', flush=True)
+    with tempfile.TemporaryDirectory(prefix='cadence-boat-') as temporary:
+        directory = Path(temporary)
+        bundle = directory / 'boat-candidate.bundle'
+        # Named temporary refs include both commits without bundling unrelated branches.
+        snapshot = directory / 'snapshot.git'
+        subprocess.run(['git', 'init', '--bare', '--quiet', str(snapshot)], check=True)
+        subprocess.run(['git', '-C', str(snapshot), 'fetch', '--quiet', '--no-tags', str(root),
+                        f'{head}:refs/heads/candidate', f'{base}:refs/heads/base'], check=True)
+        subprocess.run(['git', '-C', str(snapshot), 'symbolic-ref', 'HEAD',
+                        'refs/heads/candidate'], check=True)
+        subprocess.run(['git', '-C', str(snapshot), 'bundle', 'create', str(bundle),
+                        'HEAD', 'refs/heads/base'], check=True)
+        patch = git(root, 'diff', '--binary', '--no-ext-diff', head, binary=True)
+        if git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip() != head:
+            raise Failure('HEAD changed while preparing the sandbox')
+        (directory / 'boat-changes.patch').write_bytes(patch)
+        print(f'tracked_patch_sha256={hashlib.sha256(patch).hexdigest()}', flush=True)
+        (directory / 'boat-job.json').write_text(json.dumps({'head': head, 'base': base, 'command': command}))
+        (directory / 'boat-remote.py').write_text(REMOTE)
+        sandbox = create_sandbox('cadence-build-' + uuid.uuid4().hex)
+        result = 1
+        try:
+            for name in ('boat-candidate.bundle', 'boat-changes.patch', 'boat-job.json', 'boat-remote.py'):
+                subprocess.run(['boat', '--no-update', 'scp', str(directory / name),
+                                f'{sandbox}:/home/user/{name}'], check=True)
+            result = subprocess.run(['boat', '--no-update', 'exec', sandbox, '--timeout', '3300',
+                                     '--stream', '--', 'python3', '/home/user/boat-remote.py']).returncode
+            if result == 0 and args.artifact:
+                artifact = directory / 'artifact'
+                result = subprocess.run(['boat', '--no-update', 'scp',
+                                         f'{sandbox}:/home/user/boat-worktree/{args.artifact}',
+                                         str(artifact)]).returncode
+                if result == 0:
+                    with artifact.open('rb') as source, open(args.output, 'xb') as target:
+                        shutil.copyfileobj(source, target)
+                        os.fchmod(target.fileno(), artifact.stat().st_mode & 0o777)
+            subprocess.run(['boat', '--no-update', 'usage', sandbox, '--json'], check=False)
+        finally:
+            if not cleanup(sandbox):
+                result = 1
+        return result
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (Failure, OSError, subprocess.CalledProcessError) as exc:
+        print(f'boat-build: {exc}', file=sys.stderr)
+        sys.exit(1)

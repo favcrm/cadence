@@ -286,6 +286,8 @@ jobs:
       # CAD-1540: the cross-build required-check gate — the real gate script is
       # driven through all four matrix outcomes and must refuse failure/cancelled.
       - run: python3 tests/cad1540_cross_build_gate_acceptance.py
+      # CAD-1910: never operate on a sandbox other than the one just created.
+      - run: python3 tests/cad1910_boat_cleanup_refusal.py
       - run: scripts/design-kit --check
       # CAD-1285: a shipped `version < N` store migration block, and the
       # SCHEMA constant it applies, must not change; new DDL gets a new version.

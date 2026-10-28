@@ -244,6 +244,38 @@ that proof.
 Host Rust builds use four jobs and normal build-slot admission. If admission
 is unavailable, report that limitation rather than claiming local validation.
 
+### Supplemental Boat checks
+
+With the Boat CLI installed and logged in, run the current worktree's tracked
+files in a fresh sandbox instead of building on the shared host:
+
+```sh
+scripts/boat-build                                         # pre-push plan
+scripts/boat-build -- cargo build --locked --bin cadence
+scripts/boat-build -- cargo test --locked --lib FILTER -- --test-threads=1
+scripts/boat-build --artifact target/debug/cadence --output /tmp/cadence-build -- cargo build --locked --bin cadence
+```
+
+The helper copies committed Git history plus tracked edits; it refuses
+untracked files rather than silently omitting them. It does not copy ignored
+files or account environment secrets. For UI-related pre-push checks and
+commands starting with `bun`, it installs the exact Bun version pinned by
+`ui/package.json` and the locked UI dependencies. The sandbox has one Cargo
+job and a one-hour lifetime. It reports memory, time and Boat usage, then
+deletes only the sandbox created by that invocation. A failed or interrupted
+creation can have an unknown outcome; do not retry or delete another sandbox
+by name.
+The helper moves preinstalled provider CLI entry points out of the test
+runner's fixed search path **inside the disposable sandbox only**; it does not
+change the host or relax the test isolation guard.
+Only an explicitly requested artifact is copied back, without overwriting an
+existing destination. The sandbox and its caches are deleted after the run.
+
+These runs are **supplemental**: they do not authorize a push or replace
+`scripts/pre-push`, required CI, review or operator approval. Commands and
+their output may be retained in Boat's command history; never put secrets in
+command arguments or output.
+
 The CAD-811 public-owner fixture uses the board's typed startup receipt, not a
 health probe. Its `Native::try_new_with_roles` refuses a lost bind; only native
 `AddrInUse` starts a fresh state/realm on the next candidate from
