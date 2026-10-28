@@ -1422,4 +1422,100 @@ mod tests {
             .count();
         assert_eq!(marked, 1, "more than one issue carries the request marker");
     }
+
+    fn issue_names(pm: &Pm) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(pm.dir.join("cadence"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// CAD-1887 R1. A child is killed after the exact reservation is
+    /// written or staged and before commit. The retry must refuse, bind
+    /// nothing, allocate no second issue, make no commit, and leave the
+    /// crash marker and the issue bytes as the child left them.
+    #[test]
+    fn killed_writer_before_commit_does_not_bind_an_uncommitted_ticket() {
+        for role in ["hold_app_ticket", "hold_app_ticket_staged"] {
+            let (dir, pm) = tracker();
+            let reserved = app_ticket_reservation();
+            let body = super::ticket::app_ticket_body(&reserved).unwrap();
+            let title = super::ticket::app_ticket_title(reserved["suggestion"].as_str().unwrap());
+            assert!(pm.dir.join("cadence/CAD-1/issue.md").is_file());
+            assert!(!pm.dir.join("cadence/CAD-2").exists());
+            let head = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+            let (child, _) = crate::issue::lock_tests::spawn_app_ticket_writer(
+                &pm, role, "cadence", "CAD-2", &title, &body,
+            );
+            crate::issue::lock_tests::sigkill(child);
+            let marker = pm.dir.join(".write.lock");
+            assert!(marker.exists(), "{role}: crash marker missing");
+            let issue = pm.dir.join("cadence/CAD-2/issue.md");
+            let before = std::fs::read(&issue).unwrap();
+            let err =
+                materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not a committed reservation") && msg.contains("refusing to bind"),
+                "{role}: {msg}"
+            );
+            assert!(msg.contains("left unchanged"), "{role}: {msg}");
+            assert_eq!(
+                std::fs::read(&issue).unwrap(),
+                before,
+                "{role}: issue bytes changed"
+            );
+            assert!(marker.exists(), "{role}: recovery marker was cleared");
+            assert!(
+                !pm.dir.join("cadence/CAD-3").exists(),
+                "{role}: a second issue was created"
+            );
+            assert_eq!(
+                crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+                head,
+                "{role}: a commit landed"
+            );
+            if role == "hold_app_ticket_staged" {
+                let staged =
+                    crate::issue::git(&pm.dir, &["diff", "--cached", "--name-only"]).unwrap();
+                assert!(
+                    staged.contains("cadence/CAD-2/issue.md"),
+                    "{role}: staged evidence cleared: {staged}"
+                );
+            } else {
+                let status =
+                    crate::issue::git(&pm.dir, &["status", "--porcelain", "--untracked-files=all"])
+                        .unwrap();
+                assert!(
+                    status.contains("cadence/CAD-2/issue.md"),
+                    "{role}: untracked evidence cleared: {status}"
+                );
+            }
+        }
+    }
+
+    /// The same request after a commit, then a killed holder on the clean
+    /// tree, reuses that committed issue and does not open another one.
+    #[test]
+    fn killed_writer_after_commit_reuses_the_committed_ticket() {
+        let (dir, pm) = tracker();
+        let reserved = app_ticket_reservation();
+        let first = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        assert_eq!(first["created"], true);
+        let id = first["id"].as_str().unwrap().to_string();
+        let issue = pm.dir.join("cadence").join(&id).join("issue.md");
+        let committed = std::fs::read(&issue).unwrap();
+        let before = issue_names(&pm);
+        let (child, _) = crate::issue::lock_tests::spawn_writer(&pm, "hold", false);
+        crate::issue::lock_tests::sigkill(child);
+        assert!(pm.dir.join(".write.lock").exists());
+        let second = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        assert_eq!(second["id"], id);
+        assert_eq!(second["created"], false);
+        assert_eq!(std::fs::read(&issue).unwrap(), committed);
+        assert_eq!(issue_names(&pm), before);
+    }
 }

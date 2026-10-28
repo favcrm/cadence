@@ -3,8 +3,11 @@
 //! The daemon reserves the suggestion and stores its text. This module is
 //! the PM writer: under the tracker lock it searches for the request
 //! marker and, when that issue is absent, creates one. A crash between
-//! those steps retries onto the same issue only when its body is this
-//! reservation. A marker that belongs to another project or another
+//! those steps retries onto the same issue only when that issue is this
+//! reservation and its exact bytes are already committed. A matching body
+//! that is still uncommitted, staged, or otherwise not clean against HEAD
+//! is refused: the interrupted write is left as it is, and no second issue
+//! is allocated. A marker that belongs to another project or another
 //! proposal is refused. Two markers for one request refuse.
 
 use super::*;
@@ -87,6 +90,12 @@ pub fn app_ticket_body(reserved: &Value) -> Result<String> {
 /// The one issue whose body is exactly this reservation, if the marker
 /// occurs once. A marker in another project, or on an issue whose
 /// provenance is not this reservation, is a conflict — it is not bound.
+///
+/// A body match is not enough. The next-id lock is disjoint from a
+/// crashed writer's directory, so this search is the fence: the exact
+/// issue bytes must already be committed and clean against HEAD. An
+/// uncommitted or staged match is refused without allocating another
+/// issue, committing the leftover, or clearing the crash marker.
 fn reserved_ticket(
     pm: &Pm,
     project: &str,
@@ -131,7 +140,7 @@ fn reserved_ticket(
             };
             model::check_id(id)?;
             let body = super::parse::parse_issue(&text).ok().map(|(_, body)| body);
-            found.push((project_name.clone(), id.to_string(), body));
+            found.push((project_name.clone(), id.to_string(), body, text));
         }
     }
     if found.len() > 1 {
@@ -139,7 +148,7 @@ fn reserved_ticket(
             "ticket request marker matches more than one issue",
         ));
     }
-    let Some((found_project, id, body)) = found.pop() else {
+    let Some((found_project, id, body, text)) = found.pop() else {
         return Ok(None);
     };
     if found_project != project || body.as_deref() != Some(expected_body) {
@@ -147,11 +156,74 @@ fn reserved_ticket(
             "ticket request marker does not match this reservation",
         ));
     }
+    ensure_committed_reservation(pm, &found_project, &id, &text)?;
     Ok(Some(id))
+}
+
+/// Refuse a reservation whose working-tree bytes are not the committed
+/// blob, or whose issue directory is still dirty. Nothing is written.
+fn ensure_committed_reservation(pm: &Pm, project: &str, id: &str, working: &str) -> Result<()> {
+    let rel = format!("{project}/{id}/issue.md");
+    let dir_rel = format!("{project}/{id}");
+    let refuse = || {
+        Error::rejected(format!(
+            "ticket request marker matches {id} but that issue is not a committed reservation; \
+             refusing to bind it. The interrupted write is left unchanged"
+        ))
+    };
+    match committed_blob(&pm.dir, &rel)? {
+        Some(head) if head == working.as_bytes() => {}
+        _ => return Err(refuse()),
+    }
+    let status = crate::issue::git(
+        &pm.dir,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            &dir_rel,
+        ],
+    )?;
+    if !status.is_empty() {
+        return Err(refuse());
+    }
+    Ok(())
+}
+
+/// `HEAD:rel` as raw blob bytes. `Ok(None)` when that path is not in HEAD.
+/// Any other git failure stays an error so a broken repository is not
+/// reported as a clean miss.
+fn committed_blob(dir: &std::path::Path, rel: &str) -> Result<Option<Vec<u8>>> {
+    let spec = format!("HEAD:{rel}");
+    let out = crate::reaper::output(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["cat-file", "blob", &spec]),
+    )
+    .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))?;
+    if out.status.success() {
+        return Ok(Some(out.stdout));
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    // Untracked: "exists on disk, but not in 'HEAD'". Absent: "does not
+    // exist in 'HEAD'". Neither is a committed blob.
+    if err.contains("not in")
+        || err.contains("does not exist")
+        || err.contains("Not a valid object name")
+    {
+        return Ok(None);
+    }
+    Err(Error::rejected(format!(
+        "cannot read the committed ticket {rel}: {}",
+        err.trim()
+    )))
 }
 
 /// Create the one issue for a daemon reservation, or return the issue a
 /// previous attempt already committed under the same request marker.
+/// An uncommitted match is an error, not an id.
 ///
 /// The marker is rechecked after the tracker lock is held and before the
 /// new folder is written, so two callers cannot each observe an absence

@@ -124,6 +124,27 @@ fn lock_helper() {
         std::fs::write(&file, text).unwrap();
         git(&pm.dir, &["add", "--", "cadence/CAD-2/issue.md"]).unwrap();
     }
+    if role == "hold_app_ticket" || role == "hold_app_ticket_staged" {
+        // CAD-1887: the writer has the exact reservation on disk, and
+        // dies before commit. Staged and untracked are the same fence.
+        let project = std::env::var("CAD852_TICKET_PROJECT").unwrap();
+        let id = std::env::var("CAD852_TICKET_ID").unwrap();
+        let title = std::env::var("CAD852_TICKET_TITLE").unwrap();
+        let body = std::fs::read_to_string(std::env::var("CAD852_BODY_FILE").unwrap()).unwrap();
+        let dir = pm.dir.join(&project).join(&id);
+        std::fs::create_dir_all(dir.join("comments")).unwrap();
+        std::fs::create_dir_all(dir.join("artifacts")).unwrap();
+        let front = crate::issue::model::Front::new(
+            &id,
+            &title,
+            &crate::issue::time::iso(crate::issue::time::now_epoch()),
+        );
+        super::write::save_front(&dir, &front, &body).unwrap();
+        if role == "hold_app_ticket_staged" {
+            let rel = format!("{project}/{id}/issue.md");
+            git(&pm.dir, &["add", "--", &rel]).unwrap();
+        }
+    }
     std::fs::write(std::env::var("CAD852_READY").unwrap(), "ready").unwrap();
     std::thread::sleep(Duration::from_secs(600));
 }
@@ -152,6 +173,49 @@ pub(super) fn spawn_writer(pm: &Pm, role: &str, setsid: bool) -> (Child, PathBuf
         assert!(
             start.elapsed() < Duration::from_secs(20),
             "writer not ready"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (child, ready)
+}
+
+/// A child that holds the tracker lock and writes one exact app-ticket
+/// issue, then waits to be killed. The body file lives outside the
+/// tracker so it is not itself a leftover.
+pub(super) fn spawn_app_ticket_writer(
+    pm: &Pm,
+    role: &str,
+    project: &str,
+    id: &str,
+    title: &str,
+    body: &str,
+) -> (Child, PathBuf) {
+    let parent = pm.dir.parent().unwrap();
+    let body_file = parent.join(format!("body-{role}"));
+    let err_file = parent.join(format!("err-{role}"));
+    std::fs::write(&body_file, body).unwrap();
+    let ready = parent.join(format!("ready-{role}"));
+    let _ = std::fs::remove_file(&ready);
+    let err = std::fs::File::create(&err_file).unwrap();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "issue::lock_tests::lock_helper", "--nocapture"])
+        .env("CAD852_ROLE", role)
+        .env("CAD852_PM", &pm.dir)
+        .env("CAD852_READY", &ready)
+        .env("CAD852_TICKET_PROJECT", project)
+        .env("CAD852_TICKET_ID", id)
+        .env("CAD852_TICKET_TITLE", title)
+        .env("CAD852_BODY_FILE", &body_file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(err))
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !ready.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "writer not ready: {}",
+            std::fs::read_to_string(&err_file).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
