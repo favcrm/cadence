@@ -208,7 +208,10 @@ export abstract class FrameChannel {
     this.port.onmessage = event => {
       if (this.closed) return;
       const child = parseChild(event.data, this.recordsRights(), this.drawerCapable());
-      if (!child || child.op === "state" && !this.ready) { this.close(true); return; }
+      if (!child || child.op === "state" && !this.ready) {
+        console.warn("screen frame closed: protocol violation (unparsable or early message)");
+        this.close(true); return;
+      }
       if (child.op === "ready") {
         if (this.ready || !this.accept(child)) { this.close(true); return; }
         this.ready = true;
@@ -512,10 +515,16 @@ export class ScreenChannel extends FrameChannel {
     this.wantsSurfaces = accepts.includes(SCREEN_SURFACES_V1);
     return true;
   }
-  /** Only a v2 child, for a ref the last PUSH carried; anything else closes. */
+  /** Only a v2 child, for a ref the last PUSH carried or a call reply just
+   *  returned (CAD-1324); anything else closes. */
   protected asset(ref: string): void {
-    if (this.shape !== "v2" || !this.refs.has(ref) ||
-        (!this.assets.has(ref) && this.assets.size >= ASSET_QUEUE_MAX)) { this.close(true); return; }
+    if (this.shape !== "v2" || !(this.refs.has(ref) || this.dynamicDraftRefs.has(ref)) ||
+        (!this.assets.has(ref) && this.assets.size >= ASSET_QUEUE_MAX)) {
+      // The ref class only: a full ref names a draft, and nothing else about the request is logged.
+      const kind = ref.startsWith("draft-image:") ? "draft-image" : this.refs.has(ref) ? "pushed" : "unknown";
+      console.warn(`screen frame closed: asset request refused (${this.shape === "v2" ? kind : "not v2"})`);
+      this.close(true); return;
+    }
     if (!this.assets.has(ref)) { this.assets.add(ref); this.queue.push(ref); this.pump(); }
   }
   update(projection: ScreenPush): void {
