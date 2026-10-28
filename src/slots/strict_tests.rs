@@ -962,7 +962,7 @@ fn shared_root_enrollments_restore_and_resolve_deterministically() {
             json!([second.clone(), first.clone()]),
         ] {
             let p = tree();
-            let (s, _dir, _) = restored(&p, &envelope_of(order));
+            let (mut s, _dir, _) = restored(&p, &envelope_of(order));
             assert!(s.strict_available(), "{name}: restore rejected the file");
             assert_eq!(s.enrollments.len(), 2, "{name}");
             let caller = s.strict_caller(400, 200).unwrap();
@@ -1538,4 +1538,58 @@ fn enrolled_roots_on_counts_every_root_and_only_unrevoked_vouches() {
     p.kill(600);
     p.spawn(600, 300, 95);
     assert_eq!(s.enrolled_roots_on(&[610, 600, 300, 200, 100]), vec![3]);
+}
+
+/// CAD-998: a strict write that FAILS latches strict admission with the
+/// error, and the latch heals on the next admission once the path is
+/// writable again — no restart. The failure is a real filesystem one:
+/// a directory squats on the writer's tmp file name.
+#[test]
+fn a_failed_strict_write_heals_on_the_next_admission() {
+    let p = tree();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slots.json");
+    let mut s = strict_slots(&p, 1);
+    s.persist_to(path.clone());
+    enroll(&mut s, "wk", "g1", 200);
+    let squatter = dir.path().join("slots.tmp");
+    std::fs::create_dir(&squatter).unwrap();
+
+    let err = acquire_as(&mut s, 300, 300, "r1", 0.0).unwrap_err();
+    assert!(err.to_string().contains("write"), "{err}");
+    assert!(!s.strict_available());
+    assert!(s.held.is_empty(), "a failed write grants nothing");
+    // Still unwritable: still refused, still latched.
+    assert!(acquire_as(&mut s, 300, 300, "r1", 1.0).is_err());
+    assert!(!s.strict_available());
+
+    std::fs::remove_dir(&squatter).unwrap();
+    let g = acquire_as(&mut s, 300, 300, "r1", 2.0).unwrap();
+    assert_eq!(g["granted"], true, "{g}");
+    assert!(s.strict_available());
+    let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(on_disk["holds"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        on_disk["state_generation"].as_str().unwrap(),
+        s.state_generation.to_string(),
+        "memory and disk agree on the generation after the heal"
+    );
+}
+
+/// CAD-998: a rejected state file is evidence, not a transient write
+/// failure — it stays latched even when the path is writable, and the
+/// file is never retried, rewritten or touched.
+#[test]
+fn a_rejected_state_file_stays_latched_and_untouched() {
+    let p = tree();
+    let text = "{ not json";
+    let (mut s, dir, path) = restored(&p, text);
+    assert!(!s.strict_available());
+    for now in [1.0, 2.0] {
+        assert!(s.enroll("wk", "g1", 200, clk(now)).is_err());
+        assert!(s.strict_caller(300, 200).is_err());
+        assert!(!s.strict_available());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+    assert!(!dir.path().join("slots.tmp").exists());
 }

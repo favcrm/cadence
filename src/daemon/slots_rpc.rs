@@ -110,7 +110,7 @@ impl Shared {
             .map_err(|why| Error::rejected(format!("Slot caller pid {peer_pid}: {why}")))?;
         let panes = recorded.live();
         let pane_at = chain.iter().position(|pid| panes.contains_key(pid));
-        let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let root_at = slots.nearest_enrolled_root(&chain);
         match (pane_at, root_at) {
             (Some(p), Some(r)) if p == r => Err(Error::rejected(format!(
