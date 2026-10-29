@@ -239,8 +239,11 @@ the code you just wrote.
   refuses unless the PR is open at that head, every required check is
   present and green, the required verdicts are pinned to the head, a ticket
   comment lists them and, for a `human` diff, an operator approval is
-  recorded. It never records an approval. The queue re-tests on the newest
-  main, so you do not have to rebase first.
+  recorded. It never records an approval. It then signs the head with the
+  operator's delivery-gate key (`~/.config/cadence/delivery-gate/`) and posts
+  the signature on the PR; the queue's required `delivery-gate` check holds
+  any PR without one, so a direct `gh pr merge` never lands (CAD-1925). The
+  queue re-tests on the newest main, so you do not have to rebase first.
 - If the queue ejects the PR (`failed_checks`), read the failed run: the
   cause is often a semantic clash with a PR that just landed. Fix it on the
   branch, show a `git range-diff` against the reviewed head, enqueue again.

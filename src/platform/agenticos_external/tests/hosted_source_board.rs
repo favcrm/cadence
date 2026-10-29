@@ -1344,6 +1344,127 @@ fn cad1303_discard_is_operator_only_refuses_in_use_and_stale_and_hides_for_good(
     drop(stop);
 }
 
+/// CAD-1923: a draft from a source receipt that a newer fetch replaced is
+/// refused with the stable `stale_source` code, over RPC and on the board
+/// relay, so the app can tell it from an unknown failure.
+#[test]
+fn cad1923_a_stale_source_receipt_is_refused_with_a_code_on_the_board_path() {
+    let (mut stop, root, state) = boot_daemon(door_1303);
+    let op = |method: &str, params: Value| operator(&state, method, params);
+    let fixture = social_fixture(root.path());
+    let (install, context) = social_install(&op, &fixture, true);
+    crate::store::app_records::RecordStore::open(&state, &install)
+        .unwrap()
+        .app_social_sources_save(&context, 0, &["juicysuite_crm".to_owned()], "src-1923")
+        .unwrap();
+    let mut port = 3110 + (std::process::id() % 80) as u16;
+    loop {
+        let (startup, ready) = std::sync::mpsc::channel();
+        let board_opts = crate::ui::ServeOpts {
+            host: "127.0.0.1".into(),
+            port,
+            stop: Some(stop.0.clone()),
+            startup: Some(startup),
+            test_seam: true,
+            ..Default::default()
+        };
+        let (state, pm) = (state.clone(), root.path().join("pm"));
+        let thread = std::thread::spawn(move || drop(crate::ui::serve(&state, &pm, &board_opts)));
+        match ready.recv_timeout(Duration::from_secs(20)).unwrap() {
+            Ok(()) => break stop.1.push(thread),
+            Err(_) if port < 3199 => port += 1,
+            Err(kind) => panic!("board could not bind: {kind:?}"),
+        }
+        thread.join().unwrap();
+    }
+    let seam = Seam::token_at(&state).unwrap();
+    let host = format!("cadence-{port}.localhost:{port}");
+    crate::operator_auth::ensure_secret(&state).unwrap();
+    let secret = crate::operator_auth::read_secret(&state).unwrap();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let base = format!("http://127.0.0.1:{port}");
+    let nonce = op(
+        "operator_link_mint",
+        json!({"secret":secret,"origin":"loopback"}),
+    )["nonce"]
+        .clone();
+    let session = board(agent.post(format!("{base}/api/session")), &host, &seam)
+        .header("Content-Type", "application/json")
+        .send(json!({"nonce":nonce}).to_string())
+        .unwrap();
+    let set = session.headers()["set-cookie"].to_str().unwrap();
+    let cookie = set[..set.find(';').unwrap()].to_owned();
+    let token = cookie.split_once('=').unwrap().1.to_owned();
+    let key: Value = session.into_body().read_json().unwrap();
+    let key = key["session_key"].as_str().unwrap().to_owned();
+    let mint = op(
+        "app_screen_mint",
+        json!({"install_id":install,"context_id":context,"tag":"feed","token":token,"key":key,"origin":"loopback","generation":1}),
+    );
+    let nonce = mint["mount"].as_str().unwrap().rsplit('/').next().unwrap();
+    op("app_screen_consume", json!({"nonce":nonce}));
+    let action = mint["action_token"].clone();
+    let rpc = |method: &str, extra: Value| {
+        let mut params = json!({"action_token":action,"token":token,"key":key,"origin":"loopback"});
+        for (k, v) in extra.as_object().unwrap() {
+            params[k] = v.clone();
+        }
+        scoped(Asserted::Operator, || {
+            crate::client::rpc(&state, method, params)
+        })
+    };
+
+    // Two real fetches of the saved handle: the second replaces the first.
+    let fetch = |request: &str| {
+        rpc(
+            "app_tool_invoke",
+            json!({"tool_alias":"instagram.read","input":{"handle":"juicysuite_crm"},"request_id":request}),
+        )
+        .unwrap()["receipt"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let old = fetch("fetch-1923-a");
+    let new = fetch("fetch-1923-b");
+    assert_ne!(old, new, "a second fetch must mint a new receipt");
+    let create = |receipt: &str, request: &str| {
+        json!({"tool_alias":"drafts","request_id":request,"caption":"A caption",
+            "source":{"kind":"tool_receipt","receipt_id":receipt,"post_id":"post-1"}})
+    };
+
+    let error = rpc("app_social_draft_create", create(&old, "d-1923-rpc")).unwrap_err();
+    assert_eq!(error.code(), Some("stale_source"), "{error}");
+    let mut body = create(&old, "d-1923-http");
+    body["action_token"] = action.clone();
+    let mut response = agent
+        .post(format!("{base}/api/app-social-drafts/create"))
+        .header("Host", &host)
+        .header("X-Cadence-Board", "1")
+        .header("Origin", format!("http://{host}"))
+        .header(crate::test_seam::AS_HEADER, Asserted::Operator.as_str())
+        .header(crate::test_seam::TOKEN_HEADER, &seam)
+        .header("Cookie", &cookie)
+        .header("X-Cadence-Session", &key)
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
+        .unwrap();
+    let status = response.status().as_u16();
+    let reply: Value = response.body_mut().read_json().unwrap_or(Value::Null);
+    assert_eq!(
+        (status, reply["code"].as_str()),
+        (400, Some("stale_source")),
+        "{reply}"
+    );
+
+    // The latest receipt still drafts.
+    rpc("app_social_draft_create", create(&new, "d-1923-new")).unwrap();
+    drop(stop);
+}
+
 fn op_err(state: &std::path::Path, method: &str, params: Value) -> String {
     scoped(Asserted::Operator, || {
         crate::client::rpc(state, method, params)

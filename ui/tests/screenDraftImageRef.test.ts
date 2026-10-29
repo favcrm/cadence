@@ -42,7 +42,10 @@ void (async () => {
   const told = mount();
   told.port.receive({ v: 2, op: "call", id: "c1", verb: "social.drafts.show", args: { alias: "social.draft", draft_id: "sdr-1" } });
   await tick();
-  check(told.port.sent.some(m => (m as { op?: string }).op === "reply"), "fixture: the call reply was sent");
+  const replied = told.port.sent.find(m => (m as { op?: string }).op === "reply") as { asset_refs?: string[] } | undefined;
+  check(replied, "fixture: the call reply was sent");
+  // CAD-1921: the reply names the ref it made requestable, so the app can ask at once.
+  check(JSON.stringify(replied.asset_refs) === JSON.stringify(["draft-image:sdr-1:social.draft"]), "the reply names the admitted draft-image ref");
   told.port.receive({ v: 2, op: "asset", ref: "draft-image:sdr-1:social.draft" }); await tick();
   check(!told.port.closed && told.asked.length === 1, "a draft image the host just returned is served without closing");
 

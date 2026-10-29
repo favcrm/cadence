@@ -108,6 +108,7 @@ class Case(scope.Case):
         self.posted = []                     # stdin bodies of `issue comment`
         self.comment_rc = 0
         self.merges = []                     # `gh pr merge` argv, in order
+        self.gate_comments = []              # CAD-1925 delivery-gate PR comments
         self.merge_rc = 0
         self.ci_rc = 0
         self.ci_runs = [CI_RUN]
@@ -188,6 +189,11 @@ class Case(scope.Case):
     def run(self, argv, input_text=None):
         if argv[:3] == ["gh", "pr", "view"]:
             return self.pr_view()
+        if argv[1:3] == [enq.GATE_SCRIPT, "sign"]:
+            return 0, "<!-- cadence-delivery-gate v1 -->\nsigned\n", ""
+        if argv[:3] == ["gh", "pr", "comment"]:
+            self.gate_comments.append(input_text)
+            return 0, "", ""
         if argv[:3] == ["gh", "pr", "merge"]:
             self.merges.append(list(argv))
             return self.merge_rc, "", "merge refused"

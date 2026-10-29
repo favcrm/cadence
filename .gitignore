@@ -79,6 +79,7 @@ docs/roles/*
 !docs/roles/one-review-paths.toml
 !docs/roles/risk-classes.md
 !docs/roles/risk-paths.toml
+!docs/roles/delivery-gate.allowed_signers
 !docs/guides/
 docs/guides/*
 !docs/guides/agenticos-pi-workers.md

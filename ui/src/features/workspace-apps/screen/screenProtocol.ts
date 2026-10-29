@@ -199,7 +199,7 @@ export function parseRunSlotReceipt(value: unknown): RunSlotReceipt | null {
   return { run_id: r.run_id, request_id: r.request_id, state: r.state as RunSlotReceipt["state"] };
 }
 export type ReplyMessage =
-  | { v: 2; op: "reply"; id: string; ok: true; data: unknown }
+  | { v: 2; op: "reply"; id: string; ok: true; data: unknown; asset_refs?: string[] }
   | { v: 2; op: "reply"; id: string; ok: false; refusal: ActionRefusal }
   | { v: 2; op: "tool-reply"; id: string; ok: true; data: unknown }
   | { v: 2; op: "tool-reply"; id: string; ok: false; refusal: ActionRefusal }

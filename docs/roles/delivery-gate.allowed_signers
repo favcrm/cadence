@@ -1,0 +1,3 @@
+# CAD-1925: the key scripts/enqueue-reviewed signs with; the merge queue's delivery-gate job
+# reads this file from the merge group's base. Rotating it is an operator-approved PR.
+cadence-delivery-gate namespaces="cadence-delivery-gate" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICuO8iIJABBGIYdrwvVkVIqfSEnbd/a2Ke/rxUA1e+8I

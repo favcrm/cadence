@@ -1,0 +1,48 @@
+name: delivery-gate
+
+# CAD-1925: the merge queue refuses a PR that did not pass
+# scripts/enqueue-reviewed. That script signs (repo, pr, head) once every
+# delivery rule holds and posts the signature on the PR; this job verifies it
+# for each merge group. The script and the trusted key are read from the merge
+# group's BASE commit, so a PR cannot bring its own verifier or key.
+# On pull_request the job only passes: GitHub requires a required check to be
+# green on the PR head before the PR can enter the queue.
+
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  delivery-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Pull request
+        if: github.event_name == 'pull_request'
+        run: echo "delivery-gate is enforced in the merge queue; enqueue with scripts/enqueue-reviewed"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: github.event_name == 'merge_group'
+        with:
+          ref: ${{ github.event.merge_group.base_sha }}
+          persist-credentials: false
+      - name: Verify the enqueue-reviewed signature
+        if: github.event_name == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+        run: |
+          set -euo pipefail
+          pr=$(scripts/delivery-gate queue-pr "$QUEUE_REF")
+          head=$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)
+          gh api "repos/$REPO/issues/$pr/comments?per_page=100" --paginate --slurp \
+            | jq '[.[][] | select(.body != null) | {id, body}]' > "$RUNNER_TEMP/comments.json"
+          scripts/delivery-gate verify --repo "$REPO" --pr "$pr" --head "$head" \
+            --signers docs/roles/delivery-gate.allowed_signers \
+            --comments "$RUNNER_TEMP/comments.json"
