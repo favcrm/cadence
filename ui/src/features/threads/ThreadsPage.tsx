@@ -371,14 +371,18 @@ export default function ThreadsPage({ operator, onOpenWorkItem }: { operator: bo
     ? (dmReplyIntent ? replyScope(dmReplyIntent) : `threads:${dmAlias}`)
     : null;
   const previousConversation = useRef<string | null>(null);
+  const threadsOwnsCanvas = useRef(false);
   useEffect(() => {
     const previous = previousConversation.current;
     const next = open?.id ?? null;
     previousConversation.current = next;
     const canvas = canvasSnapshot();
-    const action = canvasFollow(canvas, previous, next, composerKey);
-    if (action === "reset") resetCanvas(next, composerKey, canvas.surface);
-    else if (action === "rebind" && next) {
+    const owned = threadsOwnsCanvas.current && canvas.conversation === previous;
+    const action = canvasFollow(canvas, previous, next, composerKey, owned);
+    if (action === "reset") {
+      threadsOwnsCanvas.current = false;
+      resetCanvas(next, composerKey, canvas.surface);
+    } else if (action === "rebind" && next) {
       feedCanvas({
         conversation: next,
         surface: canvas.surface,
@@ -429,6 +433,7 @@ export default function ThreadsPage({ operator, onOpenWorkItem }: { operator: bo
         if (dialog?.open) dialog.close();
         setContextOpen(false);
       }}
+      onArtifactOpen={() => { threadsOwnsCanvas.current = true; }}
     />
   ) : null;
 
@@ -1739,6 +1744,7 @@ function ContextPanel({
   outputRead,
   composerKey,
   onBeforeOpen,
+  onArtifactOpen,
 }: {
   row: ConversationRow;
   writeBlock: string | null;
@@ -1748,6 +1754,7 @@ function ContextPanel({
   outputRead: OutputRead;
   composerKey: string | null;
   onBeforeOpen?: () => void;
+  onArtifactOpen?: () => void;
 }) {
   const t = useTranslate();
   const [error, setError] = useState<string | null>(null);
@@ -1817,6 +1824,7 @@ function ContextPanel({
         composerKey={composerKey}
         conversationId={row.id}
         onBeforeOpen={onBeforeOpen}
+        onArtifactOpen={onArtifactOpen}
       />
       <p className="threads-note">{t("Workspace access applies. Linking work does not grant access.")}</p>
     </div>

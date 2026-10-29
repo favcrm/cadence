@@ -94,8 +94,10 @@ export function canvasFollow(
   previousConversation: string | null,
   nextConversation: string | null,
   nextComposerKey: string | null,
+  /** True only after this page opened an artifact. A matching id is not ownership. */
+  ownedByThreads: boolean,
 ): CanvasFollow {
-  if (!previousConversation || canvas.conversation !== previousConversation) return "keep";
+  if (!ownedByThreads || !previousConversation || canvas.conversation !== previousConversation) return "keep";
   if (nextConversation !== previousConversation) return "reset";
   if (canvas.composerKey !== nextComposerKey) return "rebind";
   return "keep";

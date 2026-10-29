@@ -64,6 +64,7 @@ export default function WorkContext({
   composerKey,
   conversationId,
   onBeforeOpen,
+  onArtifactOpen,
 }: {
   assignees: string[];
   roster: RosterRead;
@@ -73,6 +74,8 @@ export default function WorkContext({
   conversationId: string;
   /** Dismiss the mobile context sheet before the canvas or composer is used. */
   onBeforeOpen?: () => void;
+  /** This page opened the artifact, so later conversation changes may follow that canvas. */
+  onArtifactOpen?: () => void;
 }) {
   const t = useTranslate();
   if (assignees.length === 0) return null;
@@ -189,6 +192,7 @@ export default function WorkContext({
                         size="sm"
                         onClick={() => {
                           onBeforeOpen?.();
+                          onArtifactOpen?.();
                           openRecordedArtifact(conversationId, composerKey, ref);
                         }}
                       >

@@ -62,9 +62,10 @@ assert(draft.text === "", "asking does not write or send a message");
 assert(draft.refs.length === 1, "the draft keeps one citation");
 equal(parseAskRef(draft.refs[0]), { artifact: "art-mock", version: 2 }, "the citation names that artifact version");
 
-equal(canvasFollow({ conversation: "a", composerKey: "threads:a" }, "a", "b", "threads:b"), "reset", "a canvas owned by the previous conversation resets");
-equal(canvasFollow({ conversation: "other", composerKey: null }, "a", "b", "threads:b"), "keep", "a canvas owned elsewhere stays");
-equal(canvasFollow({ conversation: "a", composerKey: "threads:a" }, "a", "a", "threads:a:reply"), "rebind", "the same conversation follows the composer draft");
-equal(canvasFollow({ conversation: "a", composerKey: "threads:a" }, null, "a", "threads:a"), "keep", "the first selection does not reset");
+equal(canvasFollow({ conversation: "a", composerKey: "threads:a" }, "a", "b", "threads:b", true), "reset", "a canvas this page opened resets");
+equal(canvasFollow({ conversation: "a", composerKey: "home" }, "a", "b", "threads:b", false), "keep", "a matching id does not make a Home canvas ours");
+equal(canvasFollow({ conversation: "other", composerKey: null }, "a", "b", "threads:b", true), "keep", "a canvas owned elsewhere stays");
+equal(canvasFollow({ conversation: "a", composerKey: "threads:a" }, "a", "a", "threads:a:reply", true), "rebind", "the same conversation follows the composer draft");
+equal(canvasFollow({ conversation: "a", composerKey: "threads:a" }, null, "a", "threads:a", true), "keep", "the first selection does not reset");
 
 console.log("threadsWork: passed");
