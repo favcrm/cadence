@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""CAD-1925: the merge queue's proof that scripts/enqueue-reviewed passed.
+
+    scripts/delivery-gate sign   --repo R --pr N --head SHA --key PATH
+    scripts/delivery-gate verify --repo R --pr N --head SHA --signers FILE --comments FILE
+    scripts/delivery-gate queue-pr REF
+
+The GitHub merge queue only checks CI, and every session holds the operator's
+gh login, so a direct `gh pr merge` skips the delivery gate. enqueue-reviewed
+therefore signs (repo, pr, head) with an SSH key once every rule holds and
+posts the signature as a PR comment; the `delivery-gate` job of each merge
+group verifies it against docs/roles/delivery-gate.allowed_signers read from
+the merge group's base, so a PR can never trust its own key.
+
+`sign` prints the comment body. `verify` exits 0 only when a comment carrying
+the marker holds a valid signature over exactly this (repo, pr, head); the
+payload is rebuilt from the arguments, never read from the comment. `queue-pr`
+prints the PR number of a gh-readonly-queue/main/pr-N-<sha> ref.
+Exit: 0 ok / 1 refused / 2 usage.
+
+Known limit: the key sits on a host where every session runs as one uid, so
+a session that reads it can sign (CAD-280 separates the operator uid).
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+ME = "delivery-gate"
+MARKER = "<!-- cadence-delivery-gate v1 -->"
+NAMESPACE = "cadence-delivery-gate"
+PRINCIPAL = "cadence-delivery-gate"
+FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+REPO = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+QUEUE_REF = re.compile(r"^(?:refs/heads/)?gh-readonly-queue/main/pr-([1-9][0-9]*)-[0-9a-f]{40}$")
+ARMOR = re.compile(r"-----BEGIN SSH SIGNATURE-----\n[A-Za-z0-9+/=\n]+?-----END SSH SIGNATURE-----")
+
+
+def payload(repo, pr, head):
+    return f"cadence-delivery-gate v1\nrepo {repo}\npr {pr}\nhead {head}\n".encode()
+
+
+def usage(args):
+    """A usage reason, or None."""
+    if not REPO.match(args.repo):
+        return f"bad repo {args.repo!r}"
+    if args.pr < 1:
+        return "pr must be a positive number"
+    if not FULL_SHA.match(args.head):
+        return "head must be the full 40-hex lowercase SHA"
+    return None
+
+
+def sign(args):
+    if not (os.path.isfile(args.key) and os.access(args.key, os.R_OK)):
+        print(f"{ME}: refused: no readable signing key at {args.key}", file=sys.stderr)
+        return 1
+    p = subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-n", NAMESPACE, "-f", args.key],
+                       input=payload(args.repo, args.pr, args.head), capture_output=True)
+    sig = p.stdout.decode(errors="replace").strip()
+    if p.returncode != 0 or not ARMOR.fullmatch(sig):
+        print(f"{ME}: refused: signing failed: {p.stderr.decode(errors='replace').strip()}", file=sys.stderr)
+        return 1
+    print(f"{MARKER}\nDelivery gate passed: {args.repo}#{args.pr} at {args.head}\n\n```\n{sig}\n```")
+    return 0
+
+
+def verify(args):
+    reasons = []
+    try:
+        with open(args.signers, encoding="utf-8") as f:
+            if not any(l.strip() and not l.lstrip().startswith("#") for l in f):
+                reasons.append(f"signers file {args.signers} lists no key")
+    except OSError as e:
+        reasons.append(f"cannot read signers file: {e}")
+    try:
+        with open(args.comments, encoding="utf-8") as f:
+            comments = json.load(f)
+        if not isinstance(comments, list) or not all(
+                isinstance(c, dict) and isinstance(c.get("body"), str) for c in comments):
+            raise ValueError("not an array of comments with a string body")
+    except (OSError, ValueError) as e:
+        reasons.append(f"cannot read comments: {e}")
+        comments = []
+    if reasons:
+        return refuse(reasons)
+    blocks = [(c.get("id"), m.group(0)) for c in comments if MARKER in c["body"]
+              for m in ARMOR.finditer(c["body"].replace("\r\n", "\n"))]
+    if not blocks:
+        return refuse([f"no signed delivery-gate comment on PR #{args.pr}: "
+                       "enqueue with scripts/enqueue-reviewed"])
+    data = payload(args.repo, args.pr, args.head)
+    with tempfile.TemporaryDirectory(prefix="delivery-gate.") as tmp:
+        for cid, block in blocks:
+            sig = os.path.join(tmp, "sig")
+            with open(sig, "w", encoding="utf-8") as f:
+                f.write(block + "\n")
+            p = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", args.signers, "-I", PRINCIPAL,
+                                "-n", NAMESPACE, "-s", sig], input=data, capture_output=True)
+            if p.returncode == 0:
+                print(f"{ME}: accepted: comment {cid} signs {args.repo}#{args.pr} at {args.head}")
+                return 0
+    return refuse([f"no delivery-gate signature on PR #{args.pr} verifies for head {args.head} "
+                   f"({len(blocks)} tried)"])
+
+
+def refuse(reasons):
+    for r in reasons:
+        print(f"{ME}: refused: {r}", file=sys.stderr)
+    return 1
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog=ME)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("sign", "verify"):
+        p = sub.add_parser(name)
+        p.add_argument("--repo", required=True)
+        p.add_argument("--pr", type=int, required=True)
+        p.add_argument("--head", required=True)
+        if name == "sign":
+            p.add_argument("--key", required=True)
+        else:
+            p.add_argument("--signers", required=True)
+            p.add_argument("--comments", required=True)
+    q = sub.add_parser("queue-pr")
+    q.add_argument("ref")
+    args = ap.parse_args(argv)
+    if args.cmd == "queue-pr":
+        m = QUEUE_REF.match(args.ref)
+        if not m:
+            return refuse([f"not a main merge-queue ref: {args.ref!r}"])
+        print(m.group(1))
+        return 0
+    bad = usage(args)
+    if bad:
+        print(f"{ME}: {bad}", file=sys.stderr)
+        return 2
+    return sign(args) if args.cmd == "sign" else verify(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

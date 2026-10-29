@@ -29,7 +29,9 @@ unless ALL of these hold for the pinned head:
     `cadence audit approval` reports an approval in
     force for exactly this head. This script never records an approval.
 
-Then it runs `gh pr merge --auto --squash --match-head-commit <sha>`, polls
+Then it signs (repo, pr, head) with the delivery-gate key (--gate-key) and posts
+the signature on the PR (CAD-1925: the merge queue's `delivery-gate` job holds
+any PR without it), runs `gh pr merge --auto --squash --match-head-commit <sha>`, polls
 isInMergeQueue for up to --poll-secs (default 30), and when the PR is not
 queued runs --disable-auto and exits 1. --dry-run runs every check and
 enqueues nothing. Exit: 0 enqueued (or dry-run clean) / 1 refused / 2 usage.
@@ -50,6 +52,8 @@ from urllib.parse import quote
 
 ME = "enqueue-reviewed"
 DEFAULT_NOTES_DIR = "/var/www/agent-notes"
+GATE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "delivery-gate")
+DEFAULT_GATE_KEY = "~/.config/cadence/delivery-gate/signing_key"  # CAD-1925
 ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
 
 # Human-class path triggers: docs/roles/risk-classes.md (4, 7) and the
@@ -1184,6 +1188,21 @@ def queued(repo, pr):
     return p.get("isInMergeQueue") is True or p.get("state") == "MERGED"
 
 
+def post_gate_signature(args, repo):
+    """Sign (repo, pr, head) and post it on the PR; the merge queue's
+    delivery-gate job verifies it (CAD-1925). Reasons on failure."""
+    key = os.path.expanduser(args.gate_key)
+    rc, out, err = run([sys.executable, GATE_SCRIPT, "sign", "--repo", repo, "--pr", str(args.pr),
+                        "--head", args.head, "--key", key])
+    if rc != 0 or not out.strip():
+        return [f"delivery-gate signature failed: {(err or out).strip()[:200]}"]
+    rc, out, err = run(["gh", "pr", "comment", str(args.pr), "-R", repo, "--body-file", "-"],
+                       input_text=out)
+    if rc != 0:
+        return [f"posting the delivery-gate signature failed: {(err or out).strip()[:200]}"]
+    return []
+
+
 def enqueue(args, repo):
     rc, out, err = run(["gh", "pr", "merge", str(args.pr), "-R", repo, "--auto", "--squash",
                         "--match-head-commit", args.head])
@@ -1218,6 +1237,8 @@ def main(argv):
     ap.add_argument("--notes-dir", default=os.environ.get("CADENCE_NOTES_DIR", DEFAULT_NOTES_DIR))
     ap.add_argument("--author", action="append", default=[], help="an extra alias that authored the PR")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--gate-key", default=os.environ.get("CADENCE_DELIVERY_GATE_KEY", DEFAULT_GATE_KEY),
+                    help="the delivery-gate SSH signing key (CAD-1925)")
     ap.add_argument("--poll-secs", type=float, default=30)
     ap.add_argument("--poll-interval", type=float, default=2)
     args = ap.parse_args(argv)
@@ -1251,6 +1272,8 @@ def main(argv):
                                      or final_evidence.get("ci_run") != evidence.get("ci_run")
                                      or final_evidence.get("ci_proofs") != evidence.get("ci_proofs"))):
                     reasons.append("delivery policy/base/readiness/CI binding changed after evidence collection; revalidate before enqueue")
+                if not reasons:
+                    reasons += post_gate_signature(args, repo)
     except (RuntimeError, KeyError, TypeError) as e:
         reasons, report = [f"cannot read the PR: {e}"], []
     for line in report:
