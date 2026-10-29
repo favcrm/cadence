@@ -443,7 +443,7 @@ impl Shared {
         }
         // The app read costs a record walk and, only when the worker is
         // on some app's team, one bounded `gh pr view --json files`.
-        let touched = self.pr_apps(pm, rec, pr, sha)?;
+        let touched = self.pr_apps(pm, rec, pr, sha, &[rec.worker.as_str()])?;
         rec.touched_apps = touched
             .as_ref()
             .map(|apps| apps.iter().cloned().collect::<Vec<_>>());
@@ -466,23 +466,25 @@ impl Shared {
     /// CAD-622: the apps this PR's head touches — its changed files
     /// under `apps/<name>/`, plus any app whose install record pins
     /// this PR's repository as its git source. `None` is no evidence
-    /// (the file list could not be read, or the tip moved mid-read),
-    /// never "no app"; no `gh` call is made when the worker is on no
-    /// app's team and no app takes its source from this repository.
+    /// (no `aliases` is on any app's team and no app takes its source
+    /// from this repository, so nothing was read; or the file list could
+    /// not be read, or the tip moved mid-read), never "no app".
     fn pr_apps(
         &self,
         pm: &Pm,
         rec: &Record,
         pr: &str,
         sha: &str,
+        aliases: &[&str],
     ) -> Result<Option<std::collections::BTreeSet<String>>> {
         let (slug, _) = crate::issue::task_report::parse_pr_url(pr)?;
         let mut apps = crate::issue::app_guard::apps_from_git_source(&pm.dir, &slug)?;
-        if crate::issue::app_guard::apps_of_agent(&pm.dir, &rec.worker, Some(&self.store))?
-            .is_empty()
-            && apps.is_empty()
-        {
-            return Ok(Some(apps));
+        let teams = crate::issue::app_guard::teams(&pm.dir, Some(&self.store))?;
+        let interested = aliases
+            .iter()
+            .any(|alias| teams.values().any(|team| team.contains(*alias)));
+        if !interested && apps.is_empty() {
+            return Ok(None);
         }
         let Ok(text) = delivery::gh(
             &self.delivery_gh.to_string_lossy(),
@@ -569,7 +571,8 @@ impl Shared {
                 let (Some(pr), Some(head)) = (rec.pr.as_deref(), rec.head.as_deref()) else {
                     return Ok(Default::default());
                 };
-                match self.pr_apps(pm, rec, pr, head)? {
+                let aliases: Vec<&str> = on_team.iter().map(|a| a.as_str()).collect();
+                match self.pr_apps(pm, rec, pr, head, &aliases)? {
                     Some(apps) => apps,
                     None => return Ok(Default::default()),
                 }
@@ -813,7 +816,7 @@ impl Shared {
                 );
                 if !barred.is_empty() {
                     note.push_str(&format!(
-                        "; {} excluded as members of the app's own team",
+                        "; excluded as members of the app's own team: {}",
                         barred.iter().cloned().collect::<Vec<_>>().join(", ")
                     ));
                 }

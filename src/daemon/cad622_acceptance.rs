@@ -141,7 +141,7 @@ impl Fx {
         .unwrap();
         install_app(&pm, team);
         write_gh(root.path());
-        let opts = ServeOptions {
+        let opts = crate::daemon::ServeOptions {
             test_seam: true,
             delivery_gh: Some(root.path().join("gh")),
             ..Default::default()
@@ -334,8 +334,8 @@ fn cad622_a_team_agent_cannot_be_dispatched_to_edit_its_own_app() {
         "the refusal names the agent, the app and the path: {why}"
     );
     assert!(
-        !pm.dir.join(PROJECT).join(ISSUE).join("lane").exists(),
-        "a refused dispatch creates nothing"
+        !fx._root.path().join("widgets/.cadence").exists(),
+        "a refused dispatch creates no worktree"
     );
 }
 
@@ -485,7 +485,10 @@ fn cad622_an_apps_team_reviewer_is_not_routed_the_review() {
     let rec = fx.record();
     assert_eq!(rec.state, delivery::State::Unstaffed);
     let note = rec.note.clone().unwrap_or_default();
-    assert!(note.contains("reviewer excluded as members of the app's own team"), "{note}");
+    assert!(
+        note.contains("excluded as members of the app's own team: reviewer"),
+        "{note}"
+    );
 }
 
 /// 7b. An app's own team reviewer cannot file a verdict on the app's PR.

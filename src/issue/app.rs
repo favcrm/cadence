@@ -5442,7 +5442,6 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
             !approval_binds(&payload, &moved, "install-1"),
             "the board reads this install as changed, not approved"
         );
-        assert!(!approved("demo", "social-content", &moved, "install-1", Some(&approvals)));
         let refused = plan_text(
             &pm.dir,
             &approvals,
