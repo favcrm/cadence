@@ -205,6 +205,10 @@ a.lnk:hover, button.lnk:hover {
 .btn-sm { height: 1.75rem; padding: 0 .6rem; font-size: var(--text-micro); }
 .btn-full { width: 100%; }
 .btn:hover:not(:disabled):not([aria-disabled="true"]) { border-color: var(--color-edge-hover); background: var(--color-ink-800); }
+/* Secondary surfaces and text must switch themes together, not tween through
+   light-on-light frames. Keep hover distinct without animating the fill. */
+.btn:where(:not(.btn-primary, .btn-acc, .btn-ghost, .btn-danger)) { background: var(--color-ink-800); color: var(--color-ink-100); transition: border-color .15s ease; }
+.btn:where(:not(.btn-primary, .btn-acc, .btn-ghost, .btn-danger)):hover:not(:disabled):not([aria-disabled="true"]) { background: var(--color-ink-700); }
 .btn:focus-visible, .field:focus, .select-trigger:focus-visible, .select-search:focus {
   outline: none; border-color: var(--color-accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 10%, transparent);
