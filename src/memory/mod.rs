@@ -54,8 +54,8 @@ pub use matching::{
     Freshness, MatchCtx, Matched, DEFAULT_STALE_DAYS,
 };
 pub use rendering::{
-    card_json, detail_json, detail_json_with_evidence, render_lessons, LESSON_MAX_BYTES,
-    LESSON_MAX_ENTRIES, LESSON_USE_INSTRUCTION,
+    card_json, detail_json, detail_json_with_evidence, render_lessons,
+    LESSON_DISCOVERY_INSTRUCTION, LESSON_MAX_BYTES, LESSON_MAX_ENTRIES, LESSON_USE_INSTRUCTION,
 };
 
 pub const TYPES: &[&str] = &["rule", "gotcha", "decision", "recipe"];
@@ -912,6 +912,31 @@ fn require_retrievable(mem: &Memory) -> Result<()> {
     )))
 }
 
+/// The component and path checks a stored lesson still owns after its
+/// retrieval gap has been downgraded to a warning. An unknown component or
+/// an over-complex glob is a defect in this file whether or not it is
+/// retrievable, so a historical record cannot hide it from a commit.
+fn check_declared_scope(mem: &Memory, components: &[String]) -> Result<()> {
+    let f = &mem.front;
+    for c in &f.scope.components {
+        if !components.is_empty() && !components.iter().any(|d| d == c) {
+            return Err(Error::rejected(format!(
+                "Unknown component '{c}' — {} declares: {}",
+                mem.project,
+                components.join(", ")
+            )));
+        }
+    }
+    for pat in &f.scope.paths {
+        if glob_over_budget(pat) {
+            return Err(Error::rejected(format!(
+                "path scope '{pat}' is too complex — ≤200 chars, ≤2 `**` segments"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Frontmatter + body validation used by every write and by lint.
 /// `components` is the project's declared list (empty = anything goes).
 fn check_front(mem: &Memory, components: &[String]) -> Result<()> {
@@ -951,22 +976,7 @@ fn check_front(mem: &Memory, components: &[String]) -> Result<()> {
     // declared component, and reporting that first would hide the source
     // and retrieval gaps this refusal exists to name together.
     require_retrievable(mem)?;
-    for c in &f.scope.components {
-        if !components.is_empty() && !components.iter().any(|d| d == c) {
-            return Err(Error::rejected(format!(
-                "Unknown component '{c}' — {} declares: {}",
-                mem.project,
-                components.join(", ")
-            )));
-        }
-    }
-    for pat in &f.scope.paths {
-        if glob_over_budget(pat) {
-            return Err(Error::rejected(format!(
-                "path scope '{pat}' is too complex — ≤200 chars, ≤2 `**` segments"
-            )));
-        }
-    }
+    check_declared_scope(mem, components)?;
     let mut errs = Vec::new();
     lint_body(&f.id, &mem.body, &mut |e| errs.push(e));
     if let Some(first) = errs.into_iter().next() {
@@ -1675,6 +1685,13 @@ pub(crate) fn lint_dir_scoped(
                 && retrievable_strict.is_some_and(|strict| !strict.contains(&rel));
             if historical {
                 warn(msg);
+                // The downgrade covers the retrieval gap alone. The same
+                // file's unknown component or unsafe path glob still
+                // refuses the commit, exactly as it did before this
+                // downgrade existed.
+                if let Err(e) = check_declared_scope(m, &proj.components) {
+                    err(format!("{}/memory/{}.md: {e}", m.project, m.front.id));
+                }
             } else {
                 err(msg);
             }
@@ -2335,6 +2352,64 @@ mod tests {
         assert!(full_errors.contains("historical-gap"), "{full_errors}");
         assert!(full_errors.contains("staged-gap"), "{full_errors}");
         assert!(full["ok"].as_bool() == Some(false), "{full}");
+    }
+
+    /// A downgraded historical retrieval gap downgrades that gap alone. An
+    /// undeclared component in the same file still refuses the commit, as
+    /// it did before the downgrade existed.
+    #[test]
+    fn a_downgraded_historical_gap_still_refuses_an_invalid_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = Pm::init(dir.path()).unwrap();
+        let project_dir = dir.path().join("demo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.yaml"),
+            "key: demo\nprefix: D\ncomponents: [api]\n",
+        )
+        .unwrap();
+        pm.commit(
+            &[project_dir.join("project.yaml")],
+            "project fixture\n\nActor: test\n",
+        )
+        .unwrap();
+        let mdir = project_dir.join("memory");
+        std::fs::create_dir_all(&mdir).unwrap();
+        let write = |id: &str, source: Option<&str>, components: Vec<String>| {
+            let mut mem = memory("proposed", 0, None);
+            mem.front.id = id.to_string();
+            mem.front.source = source.map(str::to_string);
+            mem.front.scope = Scope {
+                components,
+                ..Scope::default()
+            };
+            let path = mdir.join(format!("{id}.md"));
+            std::fs::write(&path, parse::render(&mem.front, &mem.body).unwrap()).unwrap();
+        };
+        // Unstaged: no source, no retrieval axis (a whitespace component is
+        // not one), and a component `demo` does not declare.
+        write("historical-bad-component", None, vec![" ".to_string()]);
+        // Staged: a retrievable lesson that is valid on its own.
+        write("staged-ok", Some("CAD-1946"), vec!["api".to_string()]);
+
+        let added = std::process::Command::new("git")
+            .args(["add", "--", "demo/memory/staged-ok.md"])
+            .current_dir(&pm.dir)
+            .status()
+            .unwrap();
+        assert!(added.success(), "git add staged memory file");
+
+        let staged = crate::issue::lint::run_staged(&pm).unwrap();
+        let errors = staged["errors"].to_string();
+        let warnings = staged["warnings"].to_string();
+        assert!(warnings.contains("historical-bad-component"), "{warnings}");
+        assert!(warnings.contains("source is empty"), "{warnings}");
+        assert!(
+            errors.contains("historical-bad-component") && errors.contains("Unknown component"),
+            "{errors}"
+        );
+        assert!(!errors.contains("staged-ok"), "{errors}");
+        assert!(staged["ok"].as_bool() == Some(false), "{staged}");
     }
 
     #[test]
@@ -3128,6 +3203,14 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("verified 2025"), "{text}");
+        for needle in [
+            "cadence memory match",
+            "cadence memory propose",
+            LESSON_DISCOVERY_INSTRUCTION.trim_end(),
+            LESSON_USE_INSTRUCTION.trim_end(),
+        ] {
+            assert!(text.contains(needle), "{needle} missing from {text}");
+        }
     }
 
     #[test]

@@ -40,8 +40,16 @@ When you apply a lesson, file `cadence memory feedback <slug> --kind used` \
 with its `--digest`, your `--message`, and the current turn `--token` from \
 `cadence self`. Do not put that token in `--evidence`.\n";
 
+/// How a reader of supplied lessons finds the rest of the scoped set and
+/// records a new one. Named in the briefing's project-memory section and in
+/// the nonempty lessons header, because a path-scoped gotcha never reaches
+/// the briefing and would otherwise carry no discovery path.
+pub const LESSON_DISCOVERY_INSTRUCTION: &str = "\
+`cadence memory match --issue <ID>` lists everything scoped to a task; \
+`cadence memory propose` records a new lesson.\n";
+
 fn lesson_header() -> String {
-    format!("{LESSON_HEADER_PREFIX}{LESSON_USE_INSTRUCTION}\n")
+    format!("{LESSON_HEADER_PREFIX}{LESSON_DISCOVERY_INSTRUCTION}{LESSON_USE_INSTRUCTION}\n")
 }
 
 /// Per-entry display caps. Applicability, citations and a condition orient

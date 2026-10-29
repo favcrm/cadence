@@ -383,9 +383,9 @@ pub(crate) fn project_memory_section(
     }
     Some(format!(
         "## Project memory — accepted rules ({proj_key})\n\n{items}\n\n{more}{withheld}\
-         `cadence memory match --issue <ID>` lists everything scoped to\n\
-         a task; `cadence memory propose` records a new lesson.\n\
+         {discovery}\n\
          {instruction}\n\n",
+        discovery = crate::memory::LESSON_DISCOVERY_INSTRUCTION.trim_end(),
         instruction = crate::memory::LESSON_USE_INSTRUCTION.trim_end(),
     ))
 }
