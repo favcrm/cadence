@@ -15,6 +15,8 @@ import Link from "../../ui/Link";
 import PageState from "../../ui/PageState";
 import { issuePath } from "../issues/model";
 import { IssueRefLink, OpenWorkItem } from "./IssueRefLink";
+import WorkContext, { type RosterRead } from "./WorkContext";
+import { conversationAssignees, sameOutputRead, type OutputRead } from "./threadsContext";
 import { IconClose, IconRefresh, IconSearch, IconThreads } from "../../ui/icons";
 import type { Agent } from "../../lib/types";
 import Composer from "../app-shell/chat/Composer";
@@ -258,6 +260,21 @@ export default function ThreadsPage({ operator, onOpenWorkItem }: { operator: bo
     .filter((r) => (query.trim() === "" ? true : conversationTitle(r).toLowerCase().includes(query.trim().toLowerCase())));
 
   const open = rows.find((r) => r.id === url.conversation) ?? null;
+  const openConversation = open?.id ?? null;
+  const [outputRead, setOutputRead] = useState<{ forId: string | null; read: OutputRead }>({
+    forId: null,
+    read: { kind: "loading" },
+  });
+  if (outputRead.forId !== openConversation) {
+    setOutputRead({ forId: openConversation, read: { kind: "loading" } });
+  }
+  const onOutputRead = useCallback((forId: string, read: OutputRead) => {
+    setOutputRead((cur) => {
+      if (cur.forId !== forId) return cur;
+      if (sameOutputRead(cur.read, read)) return cur;
+      return { forId, read };
+    });
+  }, []);
   // The agents on the board: the live roster the filter and chooser name. A
   // removed agent is absent from it.
   const agentNames = (agentsState.data?.agents ?? []).map((a) => a.alias).sort();
@@ -368,8 +385,25 @@ export default function ThreadsPage({ operator, onOpenWorkItem }: { operator: bo
     );
   }
 
+  const dmAlias = open ? operatorDmAlias(open) : null;
+  const composerKey = dmAlias
+    ? (dmReplyIntent ? replyScope(dmReplyIntent) : `threads:${dmAlias}`)
+    : null;
+  const roster: RosterRead = agentsState.data
+    ? { status: "ready", agents: agentsState.data.agents }
+    : agentsState.status === "failed"
+      ? { status: "error", error: agentsState.error ?? t("The roster could not load.") }
+      : { status: "loading" };
   const context = humanId ? humanContext : open ? (
-    <ContextPanel row={open} writeBlock={writeBlock} onChanged={() => void loadList()} />
+    <ContextPanel
+      row={open}
+      writeBlock={writeBlock}
+      onChanged={() => void loadList()}
+      roster={roster}
+      issueProjects={issueProjects}
+      outputRead={outputRead.forId === open.id ? outputRead.read : { kind: "loading" }}
+      composerKey={composerKey}
+    />
   ) : null;
 
   const page = (
@@ -473,6 +507,7 @@ export default function ThreadsPage({ operator, onOpenWorkItem }: { operator: bo
               onReplyStart={(m) => startReply(open, m)}
               onReplyCancel={cancelReply}
               onReplySent={sentReply}
+              onOutputRead={onOutputRead}
             />
           ) : draft ? (
             <DraftDm
@@ -527,7 +562,7 @@ export default function ThreadsPage({ operator, onOpenWorkItem }: { operator: bo
 
         {/* The one roster: the rail on desktop. Below the desktop width the
             rail is hidden and Context opens the same panel. */}
-        <aside className="threads-context" aria-label={t("Participants")}>
+        <aside className="threads-context" aria-label={t("Context")}>
           {context}
         </aside>
       </div>
@@ -694,6 +729,7 @@ function Timeline({
   onReplyStart,
   onReplyCancel,
   onReplySent,
+  onOutputRead,
 }: {
   row: ConversationRow;
   /** The list's filter context: the timeline reads the same scope. */
@@ -715,6 +751,8 @@ function Timeline({
   onReplyStart: (message: ThreadMessage) => void;
   onReplyCancel: () => void;
   onReplySent: (intent: ReplyIntent) => void;
+  /** Artifact cards the context panel can show for this conversation. */
+  onOutputRead?: (conversationId: string, read: OutputRead) => void;
 }) {
   const isGroup = row.kind === "group";
   const dm = operatorDmAlias(row);
@@ -864,6 +902,27 @@ function Timeline({
     // `more_before` are left alone: they belong to earlier history.
     step(oldest - 1).catch(fail);
   }, [identity, liveStamp, threadsTick, tick]);
+
+  useEffect(() => {
+    if (!onOutputRead) return;
+    if (!dm) {
+      onOutputRead(row.id, { kind: "absent" });
+      return;
+    }
+    if (error) {
+      onOutputRead(row.id, { kind: "error", error });
+      return;
+    }
+    if (withheld) {
+      onOutputRead(row.id, { kind: "withheld" });
+      return;
+    }
+    if (entries === null) {
+      onOutputRead(row.id, { kind: "loading" });
+      return;
+    }
+    onOutputRead(row.id, { kind: "ready", entries });
+  }, [dm, entries, error, onOutputRead, row.id, withheld]);
 
   // (5) Earlier history: page backwards from the boundary the previous page
   // SCANNED — never from its oldest KEPT row, because a fully filtered page
@@ -1649,10 +1708,18 @@ function ContextPanel({
   row,
   writeBlock,
   onChanged,
+  roster,
+  issueProjects,
+  outputRead,
+  composerKey,
 }: {
   row: ConversationRow;
   writeBlock: string | null;
   onChanged: () => void;
+  roster: RosterRead;
+  issueProjects: IssueProjects;
+  outputRead: OutputRead;
+  composerKey: string | null;
 }) {
   const t = useTranslate();
   const [error, setError] = useState<string | null>(null);
@@ -1714,6 +1781,14 @@ function ContextPanel({
         </form>
       )}
       {error && <p className="threads-note" role="status">{error}</p>}
+      <WorkContext
+        assignees={conversationAssignees(row)}
+        roster={roster}
+        issueProjects={issueProjects}
+        read={outputRead}
+        composerKey={composerKey}
+        conversationId={row.id}
+      />
       <p className="threads-note">{t("Workspace access applies. Linking work does not grant access.")}</p>
     </div>
   );
