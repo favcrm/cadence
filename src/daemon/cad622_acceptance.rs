@@ -1166,15 +1166,19 @@ fn cad622_task_dispatch_refuses_an_own_team_worker() {
     let fx = Fx::new(&[("writer", "writer")], &[]);
     set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
     let task = issue_job(&fx, "c622-job", "lead");
-    let err = scoped(Asserted::Agent("lead".into()), || {
+    let out = scoped(Asserted::Agent("lead".into()), || {
         fx.shared.dispatch(
             "task_dispatch",
             &json!({"task": task, "to": "lead", "by": "lead"}),
             std::process::id(),
         )
     })
-    .expect_err("the fixture has no lane for this issue");
-    assert!(!err.to_string().contains("is on app"), "{err}");
+    .expect("an independent worker's kickoff is admitted");
+    assert_eq!(
+        out["task"]["state"].as_str(),
+        Some("dispatched"),
+        "{out}"
+    );
 }
 
 /// F1: both monitor kickoffs reach the same guard. The automatic watcher
