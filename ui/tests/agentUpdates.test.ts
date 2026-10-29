@@ -1,4 +1,4 @@
-import { agentThreadHref } from "../src/features/agents/AgentBlocks";
+import { agentThreadHref, detailTasksNotOnRoster, partitionActiveTasks } from "../src/features/agents/AgentBlocks";
 import { activeAssignedGroups, agentWorkHref, recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates, updatesNotices } from "../src/features/home/agentUpdateModel";
 import { activityTimeMs } from "../src/lib/fmt";
 import type { Agent, AgentDetail, AgentTask } from "../src/lib/types";
@@ -58,3 +58,7 @@ const failed = updatesNotices({ hasData: true, daemon: "unreachable", refreshErr
 check(failed.unavailable && !failed.empty, "a failed read is not an empty success");
 const partial = updatesNotices({ hasData: true, daemon: "ok", refreshError: true, recentCount: 2 });
 check(partial.partial && !partial.empty && !partial.unavailable, "a partial roster stays partial");
+check(JSON.stringify(detailTasksNotOnRoster(null, ["a", "b"])) === JSON.stringify(["a", "b"]), "a missing roster keeps every detail task id");
+check(JSON.stringify(detailTasksNotOnRoster(partitionActiveTasks(worker("ada", [task("run-1", "running", "Draw the states")])), ["run-1", "detail-only"])) === JSON.stringify(["detail-only"]), "a roster task is not listed twice");
+check(JSON.stringify(detailTasksNotOnRoster(partitionActiveTasks(worker("ada", [])), ["detail-only"])) === JSON.stringify(["detail-only"]), "an empty roster row still shows detail task ids");
+check(JSON.stringify(detailTasksNotOnRoster(partitionActiveTasks(worker("ada", [])), undefined)) === JSON.stringify([]), "missing detail ids stay empty");

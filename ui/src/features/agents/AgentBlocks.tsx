@@ -76,6 +76,22 @@ export function partitionActiveTasks(agent: Agent): {
   return { doing, queue, attention };
 }
 
+/** Detail task ids the roster partition does not already show. A null
+ *  partition means the roster row is absent, so every detail id stays.
+ *  An empty partition is not the same thing: the row loaded and its task
+ *  list was empty, and detail ids still have to be shown. */
+export function detailTasksNotOnRoster(
+  parts: { doing: AgentTask[]; queue: AgentTask[]; attention: AgentTask[] } | null,
+  detailTaskIds: string[] | undefined,
+): string[] {
+  const ids = detailTaskIds ?? [];
+  if (parts === null) return ids;
+  const shown = new Set(
+    [...parts.doing, ...parts.queue, ...parts.attention].map((task) => task.task),
+  );
+  return ids.filter((id) => !shown.has(id));
+}
+
 /** The existing direct conversation. Navigation only — nothing is created. */
 export function agentThreadHref(alias: string): string {
   return `/threads?dm=${encodeURIComponent(alias)}`;

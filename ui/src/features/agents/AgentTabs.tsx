@@ -9,7 +9,7 @@ import Button from "../../ui/Button";
 import { OPERATOR_HIRE_REASON } from "../auth/gate";
 import { HireBlock, WriteGate } from "../auth/WriteGate";
 import type { Agent, AgentAccess, AgentDetail, AgentRole } from "../../lib/types";
-import { AgentActivity, AgentQueue, AssignedTaskList, WorkBlock, agentThreadHref, partitionActiveTasks } from "./AgentBlocks";
+import { AgentActivity, AgentQueue, AssignedTaskList, WorkBlock, agentThreadHref, detailTasksNotOnRoster, partitionActiveTasks } from "./AgentBlocks";
 import Link from "../../ui/Link";
 import { ProfileBlock } from "./AgentProfile";
 import { appliesText } from "./agentRoles";
@@ -314,6 +314,7 @@ function Work({ c }: { c: TabContext }) {
   const detail = c.detail;
   const results = resultRows(detail);
   const parts = c.observed ? partitionActiveTasks(c.observed) : null;
+  const detailOnly = detailTasksNotOnRoster(parts, detail?.tasks);
   const notes = attentionNotes(c.observed, t);
   const unavailable = c.detailFailed && !c.observed;
   const attentionCount = notes.length + (parts?.attention.length ?? 0);
@@ -330,11 +331,11 @@ function Work({ c }: { c: TabContext }) {
       <Panel title="Queue" mark="queue" onTab={c.onTab}>
         {c.observed ? <AgentQueue agent={c.observed} /> : <Note>{t(unavailable ? "Agent details are unavailable." : "Nothing queued.")}</Note>}
         {parts && <AssignedTaskList alias={c.alias} tasks={parts.queue} />}
-        {!parts && (detail?.tasks?.length ?? 0) > 0 && (
+        {detailOnly.length > 0 && (
           <div className="mt-3">
             <h4 className="slabel mb-2">{t("Tasks")} · {t("assigned in flight")}</h4>
             <Rows>
-              {detail!.tasks!.map((task) => (
+              {detailOnly.map((task) => (
                 <Row
                   key={task}
                   left={
