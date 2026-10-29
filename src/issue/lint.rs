@@ -40,7 +40,7 @@ pub fn run_with(
     approvals: Option<&crate::issue::work::Approvals>,
     delivery_approvals: Option<&crate::issue::delivery_policy::DeliveryApprovals>,
 ) -> Result<Value> {
-    run_inner(pm, only_project, approvals, delivery_approvals, None)
+    run_inner(pm, only_project, approvals, delivery_approvals, None, None)
 }
 
 /// Issue folders a scoped lint covers: `(project key, folder name)`.
@@ -74,8 +74,16 @@ pub fn run_staged(pm: &Pm) -> Result<Value> {
     }
     let projects = project::list(&pm.dir)?;
     match scope_of(&projects, &staged) {
-        Some(scope) => run_inner(pm, None, None, None, Some(scope)),
-        None => run_with(pm, None, None, None),
+        Some(scope) => run_inner(pm, None, None, None, Some(scope), None),
+        // A memory path cannot be bounded to one issue, so the rest of
+        // the tracker is still checked. A missing source or retrieval
+        // axis refuses the commit only for a staged memory file; the
+        // same gap in an untouched file is a warning. Full `issue lint`
+        // still reports every such file as an error.
+        None => {
+            let strict = staged_memory_paths(&staged);
+            run_inner(pm, None, None, None, None, Some(&strict))
+        }
     }
 }
 
@@ -102,6 +110,25 @@ fn staged_paths(pm: &Pm) -> Result<Vec<(String, String)>> {
         rows.push((status.to_string(), path.to_string()));
     }
     Ok(rows)
+}
+
+/// Repo-relative `memory/*.md` paths in this commit, excluding deletions.
+/// A missing source or retrieval axis on any other file must not refuse it.
+fn staged_memory_paths(staged: &[(String, String)]) -> HashSet<String> {
+    staged
+        .iter()
+        .filter_map(|(status, path)| {
+            if status.starts_with('D') {
+                return None;
+            }
+            let mut parts = path.split('/');
+            let (_project, folder, file) = (parts.next()?, parts.next()?, parts.next()?);
+            if parts.next().is_some() || folder != "memory" || !file.ends_with(".md") {
+                return None;
+            }
+            Some(path.clone())
+        })
+        .collect()
 }
 
 /// The staged issue folders, or `None` when a staged path is not a plain
@@ -139,13 +166,21 @@ fn run_inner(
     approvals: Option<&crate::issue::work::Approvals>,
     delivery_approvals: Option<&crate::issue::delivery_policy::DeliveryApprovals>,
     scope: Option<Scope>,
+    retrievable_strict: Option<&HashSet<String>>,
 ) -> Result<Value> {
     let mut lint = Lint {
         errors: vec![],
         warnings: vec![],
     };
     let (projects, work_configs) = collect_projects(pm, approvals, delivery_approvals, &mut lint)?;
-    let mut fronts: Fronts = scan_folders(pm, &projects, only_project, &scope, &mut lint);
+    let mut fronts: Fronts = scan_folders(
+        pm,
+        &projects,
+        only_project,
+        &scope,
+        retrievable_strict,
+        &mut lint,
+    );
     // CAD-1256: ids whose own checks run. Everything else in `fronts`
     // (scoped lint only) is context loaded to resolve links and chains.
     let checked: HashSet<String> = fronts.keys().cloned().collect();
@@ -280,6 +315,7 @@ fn scan_folders(
     projects: &[project::Project],
     only_project: Option<&str>,
     scope: &Option<Scope>,
+    retrievable_strict: Option<&HashSet<String>>,
     lint: &mut Lint,
 ) -> Fronts {
     let mut fronts: Fronts = HashMap::new();
@@ -335,9 +371,13 @@ fn scan_folders(
             // its own lint validates them against the body contract.
             if name == "memory" {
                 let (mut merrs, mut mwarns) = (Vec::new(), Vec::new());
-                crate::memory::lint_dir(&path, project, &mut |e| merrs.push(e), &mut |w| {
-                    mwarns.push(w)
-                });
+                crate::memory::lint_dir_scoped(
+                    &path,
+                    project,
+                    &mut |e| merrs.push(e),
+                    &mut |w| mwarns.push(w),
+                    retrievable_strict,
+                );
                 for e in merrs {
                     lint.err(e);
                 }

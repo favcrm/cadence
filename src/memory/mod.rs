@@ -947,6 +947,10 @@ fn check_front(mem: &Memory, components: &[String]) -> Result<()> {
             CONFIDENCES.join(" ")
         )));
     }
+    // Before component and path checks. A whitespace component is not a
+    // declared component, and reporting that first would hide the source
+    // and retrieval gaps this refusal exists to name together.
+    require_retrievable(mem)?;
     for c in &f.scope.components {
         if !components.is_empty() && !components.iter().any(|d| d == c) {
             return Err(Error::rejected(format!(
@@ -963,10 +967,6 @@ fn check_front(mem: &Memory, components: &[String]) -> Result<()> {
             )));
         }
     }
-    // Refuse a blank source or an empty scope on every write, including
-    // lint, so a hand-edited file cannot sit invisible. Matching itself is
-    // unchanged. A role selector is audience policy, not one of these axes.
-    require_retrievable(mem)?;
     let mut errs = Vec::new();
     lint_body(&f.id, &mem.body, &mut |e| errs.push(e));
     if let Some(first) = errs.into_iter().next() {
@@ -1593,6 +1593,21 @@ pub fn lint_dir(
     err: &mut dyn FnMut(String),
     warn: &mut dyn FnMut(String),
 ) {
+    lint_dir_scoped(dir, proj, err, warn, None);
+}
+
+/// Like [`lint_dir`], but a missing source or retrieval axis is a commit
+/// error only for `retrievable_strict` (repo-relative `memory/*.md` paths).
+/// The same gap in any other file is a warning, so one untouched historical
+/// lesson cannot refuse a later commit. `None` reports every such gap as an
+/// error, which is what full `issue lint` and `memory lint` do.
+pub(crate) fn lint_dir_scoped(
+    dir: &Path,
+    proj: &project::Project,
+    err: &mut dyn FnMut(String),
+    warn: &mut dyn FnMut(String),
+    retrievable_strict: Option<&std::collections::HashSet<String>>,
+) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         // An absent dir lints clean — nothing to check.
@@ -1654,7 +1669,15 @@ pub fn lint_dir(
     }
     for m in &mems {
         for e in check_front(m, &proj.components).err().into_iter() {
-            err(format!("{}/memory/{}.md: {e}", m.project, m.front.id));
+            let msg = format!("{}/memory/{}.md: {e}", m.project, m.front.id);
+            let rel = format!("{}/memory/{}.md", m.project, m.front.id);
+            let historical = e.to_string().contains("memory is not retrievable")
+                && retrievable_strict.is_some_and(|strict| !strict.contains(&rel));
+            if historical {
+                warn(msg);
+            } else {
+                err(msg);
+            }
         }
         let mut body_errs = Vec::new();
         lint_body(&m.front.id, &m.body, &mut |e| body_errs.push(e));
@@ -2237,6 +2260,81 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         }
         assert_eq!(tracker_head(&pm), head);
+    }
+
+    /// A project that declares components used to reject a whitespace
+    /// component as unknown before the retrieval check, so a missing
+    /// source was never named.
+    #[test]
+    fn propose_names_retrieval_gaps_when_whitespace_is_not_a_component() {
+        let (dir, pm) = mutation_fixture();
+        std::fs::write(
+            dir.path().join("demo").join("project.yaml"),
+            "key: demo\nprefix: D\ncomponents:\n  - api\n",
+        )
+        .unwrap();
+        let author = proposal_actor("worker-author");
+        let err = propose_lesson(
+            &pm,
+            &author,
+            "whitespace-component",
+            Scope {
+                components: vec![" ".to_string()],
+                ..Scope::default()
+            },
+            None,
+            None,
+            policy::ProposalOptions::default(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("source is empty"), "{msg}");
+        assert!(msg.contains("scope has no retrieval axis"), "{msg}");
+        assert!(!msg.contains("Unknown component"), "{msg}");
+        assert!(!memory_dir(&pm, "demo")
+            .join("whitespace-component.md")
+            .exists());
+    }
+
+    /// Committing one memory file must not fail because a different,
+    /// unstaged lesson has no source or retrieval axis. Full lint still
+    /// reports that historical file.
+    #[test]
+    fn staged_lint_does_not_let_an_unstaged_gap_refuse_the_commit() {
+        let (dir, pm) = mutation_fixture();
+        let mdir = dir.path().join("demo").join("memory");
+        std::fs::create_dir_all(&mdir).unwrap();
+        let write = |id: &str| {
+            let mut mem = memory("proposed", 0, None);
+            mem.front.id = id.to_string();
+            mem.front.source = None;
+            mem.front.scope = Scope::default();
+            let path = mdir.join(format!("{id}.md"));
+            std::fs::write(&path, parse::render(&mem.front, &mem.body).unwrap()).unwrap();
+        };
+        write("historical-gap");
+        write("staged-gap");
+        let added = std::process::Command::new("git")
+            .args(["add", "--", "demo/memory/staged-gap.md"])
+            .current_dir(&pm.dir)
+            .status()
+            .unwrap();
+        assert!(added.success(), "git add staged memory file");
+
+        let staged = crate::issue::lint::run_staged(&pm).unwrap();
+        let errors = staged["errors"].to_string();
+        let warnings = staged["warnings"].to_string();
+        assert!(errors.contains("staged-gap"), "{errors}");
+        assert!(errors.contains("source is empty"), "{errors}");
+        assert!(!errors.contains("historical-gap"), "{errors}");
+        assert!(warnings.contains("historical-gap"), "{warnings}");
+        assert!(staged["ok"].as_bool() == Some(false), "{staged}");
+
+        let full = crate::issue::lint::run(&pm, None).unwrap();
+        let full_errors = full["errors"].to_string();
+        assert!(full_errors.contains("historical-gap"), "{full_errors}");
+        assert!(full_errors.contains("staged-gap"), "{full_errors}");
+        assert!(full["ok"].as_bool() == Some(false), "{full}");
     }
 
     #[test]
