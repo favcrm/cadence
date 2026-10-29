@@ -6,7 +6,37 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// CAD-622: one run's frozen membership as the app-team guard reads it.
+/// `roles` is `Some` for the team-role map this build freezes (`role` →
+/// agent alias, an explicitly empty map included); `None` for a snapshot
+/// written before that member existed, whose role keys were never
+/// recorded. `inputs` is the run's whole frozen input map — content, and
+/// in a legacy snapshot the team-role bindings merged into it. The guard
+/// never reads a content input as an agent; a legacy snapshot's inputs
+/// are kept only so a question naming one of their values can hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunTeam {
+    /// The snapshot's own run id, for a hold that names the run.
+    pub id: String,
+    /// The run's lifecycle state (`awaiting_approval`, `approved`,
+    /// `running`, `succeeded`, `failed`, `cancelled`).
+    pub state: String,
+    /// The frozen role→alias map, or `None` when the snapshot predates it.
+    pub roles: Option<BTreeMap<String, String>>,
+    /// The frozen input map.
+    pub inputs: BTreeMap<String, String>,
+    /// The aliases the run assigned to its steps.
+    pub assigned: Vec<String>,
+    /// False only when the frozen workflow ran on the host, which takes
+    /// no team: such a legacy input map is provably content.
+    pub may_have_roles: bool,
+    /// True when the operator explicitly retired this terminal legacy
+    /// run's unrecorded provenance (`app_run_retire_legacy`): its input
+    /// values no longer hold the app-team check.
+    pub legacy_retired: bool,
+}
 
 pub const ARTIFACT_BYTES: usize = 256 * 1024;
 pub const RUN_ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -14,6 +44,12 @@ pub const RUN_ARTIFACT_BYTES: usize = 1024 * 1024;
 /// CAD-1123 R4: the stream that keeps each app run's approval record.
 /// Not an agent alias and not the pruned daemon stream, so it survives.
 pub const APP_RUN_APPROVAL_STREAM: &str = "app-run-approvals";
+
+/// CAD-622: the durable event that records an operator's explicit
+/// withdrawal of a terminal legacy run's unrecorded role provenance. A
+/// terminal run cannot be cancelled, so this is its retirement; it lives
+/// on the run-indexed approval stream, which is never pruned.
+pub const APP_RUN_LEGACY_RETIRED: &str = "app_run_legacy_retired";
 
 /// CAD-1374: a domain-specific HUMAN receipt. `None` (autonomous or local
 /// operator) returns the legacy payload unchanged. The helper never copies
@@ -494,6 +530,11 @@ CREATE TABLE IF NOT EXISTS app_run_artifact_fetches(
 pub struct LocalRunProvenance<'a> {
     pub selected_source: Option<(&'a str, &'a str)>,
     pub input_origins: &'a BTreeMap<String, String>,
+    /// CAD-622: the installation team's role → alias bindings this run
+    /// froze into its inputs, kept as their own member so the app-team
+    /// guard reads role provenance rather than guessing role names from
+    /// aliases (or from content inputs).
+    pub team_roles: &'a BTreeMap<String, String>,
     pub human: Option<&'a Value>,
 }
 
@@ -674,6 +715,7 @@ impl Store {
             LocalRunProvenance {
                 selected_source: None,
                 input_origins: &BTreeMap::new(),
+                team_roles: &BTreeMap::new(),
                 human: None,
             },
         )
@@ -724,6 +766,7 @@ impl Store {
         let LocalRunProvenance {
             selected_source,
             input_origins,
+            team_roles,
             human,
         } = provenance;
         let operation = uuid::Uuid::new_v4().to_string();
@@ -932,6 +975,13 @@ impl Store {
                     if !input_origins.is_empty() {
                         snapshot["input_origins"] = json!(input_origins);
                     }
+                    // CAD-622: the team-role bindings this run froze stay
+                    // in the snapshot as their own member, so a later team
+                    // edit cannot drop a historical member and a content
+                    // input can never be mistaken for a role name. Written
+                    // even when empty: a new snapshot must never be read as
+                    // a legacy one whose role keys were not recorded.
+                    snapshot["team_roles"] = json!(team_roles);
                     if let Some(proof) = context {
                         snapshot["schema"] = json!(2);
                         snapshot["context"] =
@@ -1056,6 +1106,89 @@ impl Store {
                     Self::app_run_show_in(&*tx, &id)
         })
     }
+    /// CAD-622: each run of `install_id` as the snapshot's frozen
+    /// team-role map (`team_roles`: role → alias, exactly the roles the
+    /// installation team supplied when the run was created), its frozen
+    /// `inputs` and the aliases it assigned to its steps — the run-time
+    /// half of an app's team, read from the run's own snapshot rather
+    /// than the current workflow or team record. A snapshot written
+    /// before `team_roles` existed returns `roles: None`: its inputs
+    /// merged the role bindings into content and nothing recorded which
+    /// keys were roles, so the guard holds rather than inferring them
+    /// from today's team or reading content values as agents. A snapshot
+    /// that cannot be parsed refuses; it is never read as "nobody".
+    pub fn app_run_team_inputs(&self, install_id: &str) -> Result<Vec<RunTeam>> {
+        let texts = self
+            .conn()
+            .prepare("SELECT id,state,snapshot FROM app_runs WHERE install_id=? ORDER BY created")?
+            .query_map([install_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Runs whose terminal legacy ambiguity the operator has retired.
+        let retired: BTreeSet<String> = self
+            .conn()
+            .prepare(
+                "SELECT DISTINCT e.job_id FROM events e JOIN app_runs r ON r.id=e.job_id \
+                 WHERE e.kind=?1 AND e.alias=?2 AND r.install_id=?3",
+            )?
+            .query_map(
+                params![APP_RUN_LEGACY_RETIRED, APP_RUN_APPROVAL_STREAM, install_id],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut out = Vec::new();
+        for (id, state, text) in texts {
+            let snapshot: Value = serde_json::from_str(&text)
+                .map_err(|_| Error::internal("app run snapshot is unreadable"))?;
+            let snapshot = snapshot
+                .as_object()
+                .ok_or_else(|| Error::internal("app run snapshot is unreadable"))?;
+            let roles = match snapshot.get("team_roles") {
+                None => None,
+                Some(value) => Some(
+                    serde_json::from_value(value.clone())
+                        .map_err(|_| Error::internal("app run team roles are unreadable"))?,
+                ),
+            };
+            let inputs = match snapshot.get("inputs") {
+                None => BTreeMap::new(),
+                Some(value) => serde_json::from_value(value.clone())
+                    .map_err(|_| Error::internal("app run inputs are unreadable"))?,
+            };
+            let assigned = snapshot
+                .get("assignments")
+                .and_then(Value::as_object)
+                .map(|m| {
+                    m.values()
+                        .filter_map(|step| step["alias"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // A host-execution workflow names no owner and takes no
+            // team, so it froze no role binding into its inputs.
+            let may_have_roles = snapshot
+                .get("workflow")
+                .and_then(|workflow| workflow.get("execution"))
+                .and_then(Value::as_str)
+                != Some("host");
+            out.push(RunTeam {
+                legacy_retired: retired.contains(&id),
+                id,
+                state,
+                roles,
+                inputs,
+                assigned,
+                may_have_roles,
+            });
+        }
+        Ok(out)
+    }
+
     pub fn app_run_show(&self, id: &str) -> Result<Value> {
         self.read_tx(|conn| Self::app_run_show_in(&conn, id))
     }
@@ -1232,6 +1365,60 @@ impl Store {
                     Self::app_run_show_in(&tx, id)
         })
     }
+
+    /// CAD-622: retire a terminal legacy run's unrecorded role
+    /// provenance. Its snapshot predates `team_roles`, so the app-team
+    /// guard cannot tell which of its inputs were roles, and a terminal
+    /// run cannot be cancelled (`app_run_decide_as` refuses that). The
+    /// operator records an explicit withdrawal instead: a durable,
+    /// run-indexed `app_run_legacy_retired` event. The lifecycle state
+    /// and history are untouched; from the moment the event exists the
+    /// guard stops holding that run's input values. Idempotent.
+    pub fn app_run_retire_legacy(&self, id: &str, human: Option<&Value>) -> Result<Value> {
+        let operation = uuid::Uuid::new_v4().to_string();
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let run = Self::app_run_show_in(&tx, id)?;
+            if run["snapshot"].get("team_roles").is_some() {
+                return Err(Error::rejected(
+                    "only a run frozen before team-role provenance can be retired",
+                ));
+            }
+            let state = run["state"].as_str().unwrap_or_default();
+            if !matches!(state, "succeeded" | "failed") {
+                return Err(Error::rejected(
+                    "only a terminal run needs retirement — cancel a live run instead",
+                ));
+            }
+            let retired = tx
+                .query_row(
+                    "SELECT 1 FROM events WHERE job_id=?1 AND alias=?2 AND kind=?3 LIMIT 1",
+                    params![id, APP_RUN_APPROVAL_STREAM, APP_RUN_LEGACY_RETIRED],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !retired {
+                Self::event_scoped(
+                    &tx,
+                    APP_RUN_APPROVAL_STREAM,
+                    APP_RUN_LEGACY_RETIRED,
+                    human_receipt(
+                        json!({"run_id":id,"snapshot_digest":run["snapshot_digest"],"by":"operator"}),
+                        human,
+                        &operation,
+                        APP_RUN_LEGACY_RETIRED,
+                        &format!("app-run:{id}"),
+                        "retired",
+                    ),
+                    Some(id),
+                    None,
+                )?;
+            }
+            Self::app_run_show_in(&tx, id)
+        })
+    }
+
     pub(super) fn app_current_in(
         conn: &impl super::StoreConn,
         run: &Value,

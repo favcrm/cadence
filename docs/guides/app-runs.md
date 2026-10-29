@@ -335,6 +335,14 @@ Use `cadence app run cancel <run-id>` to prevent further execution, or
 to withdraw its local capability approval. Neither operation converts
 old results into new execution authority.
 
+A run frozen before snapshots recorded their team-role map cannot say
+which of its inputs bound a team role; while its values are unknown the
+app-team check holds any alias among them. A live run is withdrawn by
+`cadence app run cancel <run-id>`. A terminal (`succeeded`/`failed`) run
+cannot be cancelled, so `cadence app run retire-legacy <run-id>` records
+the operator's withdrawal instead: the lifecycle state and history are
+unchanged, and only the unproven role provenance stops constraining.
+
 ## Operator decision and one selected ticket
 
 Installation approval, run approval, quality review, and outward release stay

@@ -178,6 +178,7 @@ fn cad1365_media_producer_records_one_catalog_asset_per_receipt_and_replays() {
             LocalRunProvenance {
                 selected_source: None,
                 input_origins: &inputs,
+                team_roles: &std::collections::BTreeMap::new(),
                 human: None,
             },
             Some(&creator),

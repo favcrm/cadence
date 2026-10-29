@@ -393,6 +393,7 @@ impl Shared {
             workflow,
             inputs,
             input_origins,
+            team_roles,
             owner_pm,
             context,
             binding,
@@ -448,6 +449,7 @@ impl Shared {
                 Some(team) => Some(team.owner_pm.clone()),
                 None => optional_str(params, "owner_pm").map(str::to_string),
             };
+            let mut team_roles: BTreeMap<String, String> = BTreeMap::new();
             if let Some(team) = effective_team {
                 // The team is the only source of worker aliases: a
                 // caller-supplied value for a team role is a forgery.
@@ -461,6 +463,10 @@ impl Shared {
                         ));
                     }
                     inputs.insert(role.clone(), alias.clone());
+                    // CAD-622: the same pair is frozen as team-role
+                    // provenance, so the app-team guard never has to
+                    // infer role names from the merged input map.
+                    team_roles.insert(role.clone(), alias.clone());
                 }
             }
             let context = optional_str(params, "context_id")
@@ -595,6 +601,7 @@ impl Shared {
                 workflow,
                 inputs,
                 input_origins,
+                team_roles,
                 owner_pm,
                 context,
                 binding,
@@ -671,6 +678,7 @@ impl Shared {
                     selected_source: optional_str(params, "source_receipt_id")
                         .zip(optional_str(params, "selected_post_id")),
                     input_origins: &input_origins,
+                    team_roles: &team_roles,
                     human,
                 },
                 Some(&creator),
@@ -868,7 +876,9 @@ impl Shared {
                 "origin",
             ],
             "app_run_approve" => &["run_id", "digest", "public_session"],
-            "app_run_cancel" | "app_run_dispatch" => &["run_id", "public_session"],
+            "app_run_cancel" | "app_run_dispatch" | "app_run_retire_legacy" => {
+                &["run_id", "public_session"]
+            }
             "app_run_show" => &["run_id"],
             "app_run_list" => &["install_id", "context_id"],
             "app_run_artifact" => &["artifact_id", "message", "token"],
@@ -940,6 +950,7 @@ impl Shared {
                 | "app_local_install_revoke"
                 | "app_run_approve"
                 | "app_run_cancel"
+                | "app_run_retire_legacy"
                 | "app_run_dispatch"
                 | "app_run_start"
                 | "app_run_create"
@@ -1060,6 +1071,9 @@ impl Shared {
                     human,
                 )
             }
+            "app_run_retire_legacy" => self
+                .store
+                .app_run_retire_legacy(required_str(params, "run_id")?, human),
             "app_run_dispatch" => {
                 let run = self.dispatch_app_run_as(required_str(params, "run_id")?, human)?;
                 // CAD-1120: a kickoff queued for a worker the idle timer

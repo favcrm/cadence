@@ -12,6 +12,7 @@ pub mod app_assistant;
 pub mod app_campaign_work;
 pub mod app_catalog;
 pub mod app_chat;
+pub mod app_guard;
 pub mod app_listing;
 pub mod app_screen_decl;
 pub mod app_screen_pkg;

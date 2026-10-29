@@ -5366,4 +5366,111 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
             "the frozen value kept its own bytes"
         );
     }
+
+    /// CAD-622: an installed copy stays immutable between approvals — an
+    /// edit to `<pm>/<project>/apps/<name>` moves the digest, the board's
+    /// approval word reads `changed` (the same predicate), and a run's
+    /// gate refuses `app_unapproved` instead of running unreviewed bytes.
+    #[test]
+    fn cad622_an_edit_after_approval_shows_changed_and_stops_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&dir.path().join("pm")).unwrap();
+        crate::issue::write::project_add(&pm, "demo", "DEM", &[], &[], &[], None).unwrap();
+        let base = pm.dir.join("demo").join(DIR).join("social-content");
+        std::fs::create_dir_all(base.join("workflows")).unwrap();
+        std::fs::write(
+            base.join(MANIFEST),
+            "---\napp: social-content\ntitle: Social content\nversion: '1'\nneeds:\n  connections: []\n---\n\nThe guide.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("workflows").join("post.md"),
+            "---\ntitle: \"Post\"\ngoal: \"Write one post\"\ninputs: {}\n---\n\n## Draft\n\nWrite it.\n\n### Acceptance\n- [ ] written\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pm.dir.join("demo").join(DIR).join("social-content.yaml"),
+            serde_yaml::to_string(&Record {
+                schema: 1,
+                app: "social-content".into(),
+                install_id: "install-1".into(),
+                source: Source::Path {
+                    path: "tests/fixtures/apps/social-content".into(),
+                },
+                bindings: Default::default(),
+                team: Default::default(),
+                installed_at: "2026-01-01T00:00:00Z".into(),
+                installed_by: "operator".into(),
+                updated_at: None,
+                removed: None,
+                restore_after: None,
+                purge_after: None,
+                catalogue: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let approved_digest = digest(&pm.dir, "demo", "social-content").unwrap();
+        let payload = json!({
+            "digest": approved_digest,
+            "install_id": "install-1",
+            "by": "operator",
+            "revoked": false,
+        });
+        let mut approvals = std::collections::HashMap::new();
+        approvals.insert(approval_key("demo", "social-content"), payload.clone());
+        let rendered = plan_text(
+            &pm.dir,
+            &approvals,
+            "demo",
+            "social-content",
+            "post",
+            &BTreeMap::new(),
+        )
+        .expect("the approved install renders");
+        assert!(rendered.contains("Write it"));
+
+        // An edit to the installed copy — the bytes the operator approved
+        // are no longer the bytes on disk.
+        let guide = base.join(MANIFEST);
+        let mut text = std::fs::read_to_string(&guide).unwrap();
+        text.push_str("\nAn unapproved addition.\n");
+        std::fs::write(&guide, text).unwrap();
+        let moved = digest(&pm.dir, "demo", "social-content").unwrap();
+        assert_ne!(moved, approved_digest, "the digest covers the guide");
+        assert!(
+            !approval_binds(&payload, &moved, "install-1"),
+            "the board reads this install as changed, not approved"
+        );
+        let refused = plan_text(
+            &pm.dir,
+            &approvals,
+            "demo",
+            "social-content",
+            "post",
+            &BTreeMap::new(),
+        )
+        .expect_err("an edit after approval stops the run");
+        assert!(
+            refused
+                .to_string()
+                .contains("not approved for its current structure"),
+            "{refused}"
+        );
+        // The operator's re-approval restores it.
+        let mut approvals = approvals.clone();
+        approvals.insert(
+            approval_key("demo", "social-content"),
+            json!({"digest": moved, "install_id": "install-1", "revoked": false}),
+        );
+        plan_text(
+            &pm.dir,
+            &approvals,
+            "demo",
+            "social-content",
+            "post",
+            &BTreeMap::new(),
+        )
+        .expect("re-approval admits the new bytes");
+    }
 }

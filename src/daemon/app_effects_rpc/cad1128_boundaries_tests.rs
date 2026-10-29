@@ -402,6 +402,7 @@ fn seeded_encrypted_publication_run(
             crate::store::app_runs::LocalRunProvenance {
                 selected_source: None,
                 input_origins: &std::collections::BTreeMap::new(),
+                team_roles: &std::collections::BTreeMap::new(),
                 human: None,
             },
             None,

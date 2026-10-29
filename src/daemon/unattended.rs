@@ -1343,6 +1343,31 @@ impl Shared {
                 ),
             ));
         }
+        // CAD-622: the grant authorizes a workflow, never an app's own
+        // team authoring a change to that app. The guard runs on the
+        // exact render the grant bound — before any admission side
+        // effect (fresh, recovered or reused) — and membership can have
+        // changed since the grant was issued.
+        let app_paths = crate::issue::app_guard::apps_in_text(&rendered);
+        let guard = crate::issue::app_guard::Ctx {
+            pm_dir: &pm_dir,
+            state_dir: Some(&self.state_dir),
+            store: Some(&self.store),
+        };
+        // The grant stores OWNER/REPO; an installed app's git source is
+        // its host-qualified identity (`github.com/OWNER/REPO`). Pass the
+        // same identity `registered_repo` proves below, or a git-source-only
+        // touch (root-relative `app.md`) never matches the installation.
+        let bound_remote =
+            crate::issue::project::normalize_remote(&format!("github.com/{}", grant.repo));
+        if let Some(why) = crate::issue::app_guard::refusals(
+            guard,
+            &app_paths,
+            &[actor],
+            std::slice::from_ref(&bound_remote),
+        )? {
+            return Err(Error::rejected(why));
+        }
         // The exact render is bound — everything below refuses rather
         // than falling back to an unapproved proposal.
         if !registered_repo(&pm_dir, project, &grant.repo)? {
