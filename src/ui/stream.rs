@@ -79,6 +79,7 @@ pub(crate) fn event_resources(name: &str) -> &'static [&'static str] {
         "issues" => &[
             "issues",
             "projects",
+            "projectPolicy",
             "issue",
             "overview",
             "workflows",

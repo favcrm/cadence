@@ -44,7 +44,10 @@ pub(crate) use plan::{check_structure, create_granted_plan, granted_semantics, G
 pub use plan::{create_plan, decide_plan};
 use projects::check_component;
 pub(crate) use projects::{check_tags, issue_dir, load_front, save_front, split_tags};
-pub use projects::{project_add, set_acceptance, set_project_policy, set_project_remote};
+pub use projects::{
+    private_available, project_add, set_acceptance, set_project_policy, set_project_remote,
+    PRIVATE_UNAVAILABLE,
+};
 #[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
 pub(crate) use rev::blocked_warnings;
 use rev::check_rev;
