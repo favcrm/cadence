@@ -10,6 +10,7 @@ import { beginPrivateOperation } from "../../lib/privateSession";
 import { exportOriginal } from "./transfer";
 import { baseName } from "./paths";
 import { whoLabel } from "./hosted";
+import { splitFrontmatter } from "./citations";
 
 /** The same document toolbar and reader in Wiki and project Context. */
 export default function PagePane({ page, navHref, readOnly, section, citedPage, viewerSub }: {
@@ -60,8 +61,28 @@ export default function PagePane({ page, navHref, readOnly, section, citedPage, 
         {page.edited_by && page.mtime && " · "}{relTime(page.mtime)}
       </p>}
       <article className="md wk-md issue-reader">
-        {page.text?.trim() ? <Md text={page.text} /> : <p className="text-ink-500">{page.historical ? t("This revision has no page text. Download the pinned original.") : t("This page is empty.")}</p>}
+        {page.text?.trim() ? <PageText path={page.path} text={page.text} /> : <p className="text-ink-500">{page.historical ? t("This revision has no page text. Download the pinned original.") : t("This page is empty.")}</p>}
       </article>
+    </>
+  );
+}
+
+/** CAD-1915: the page body, with a leading frontmatter block shown as metadata; the editor preview uses it too. */
+export function PageText({ path, text }: { path: string; text: string }) {
+  const { meta, body } = splitFrontmatter(text);
+  return (
+    <>
+      {meta.length > 0 && (
+        <dl className="wk-front">
+          {meta.map(([key, value]) => (
+            <div key={key}>
+              <dt>{key}</dt>
+              <dd>{value}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+      <Md text={body} wikiPage={path} />
     </>
   );
 }

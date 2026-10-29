@@ -39,6 +39,8 @@ export function normalizeHistory(value: WikiHistoryResponse & {
   return value.commits ? {
     path: value.path,
     canCompare: false, // The current HTTP surface exposes a log, not diffs or restores.
+    // A board may declare whether old revisions open (AOS-452); HistoryPane defaults by host.
+    canOpen: value.canOpen,
     entries: value.commits.map((commit) => ({ rev: commit.sha, at: new Date(commit.at * 1000).toISOString(), author: commit.actor, summary: commit.subject })),
   } : value;
 }

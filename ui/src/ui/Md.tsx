@@ -1,7 +1,7 @@
 import { createContext, isValidElement, useContext, useState, type ReactNode } from "react";
 import Markdown, { defaultUrlTransform, type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { citationSpans, isWikiRevisionHref, wikiRevisionHref } from "../features/wiki/citations";
+import { citationSpans, isWikiRevisionHref, wikiLinkHref, wikiRevisionHref } from "../features/wiki/citations";
 import { useTranslate } from "../lib/localeText";
 import Link from "./Link";
 import SafeLink from "./SafeLink";
@@ -74,6 +74,17 @@ function linkifyCitations(node: MdNode): void {
 }
 
 const remarkWikiCitations = () => (tree: MdNode) => linkifyCitations(tree);
+
+// CAD-1915: a wiki page's `<!-- … -->` notes are source annotations, not
+// content. Only html nodes that are nothing but comments are dropped; a
+// comment inside a code fence is a `code` node and stays visible.
+const COMMENT_ONLY = /^(?:\s*<!--(?:(?!-->)[\s\S])*-->)+\s*$/;
+function dropComments(node: MdNode): void {
+  if (!node.children) return;
+  node.children = node.children.filter((kid) => !(kid.type === "html" && COMMENT_ONLY.test(kid.value ?? "")));
+  node.children.forEach(dropComments);
+}
+const remarkDropComments = () => (tree: MdNode) => dropComments(tree);
 const remarkIssueLinks = () => (tree: MdNode) => linkifyChildren(tree);
 
 // Agent-written Markdown must not initiate third-party image requests. The
@@ -143,11 +154,13 @@ function CodeBlock({ children }: { children?: ReactNode }) {
 const InLinkContext = createContext(false);
 const handlerComponents = new WeakMap<object, Components>();
 let noHandlerComponents: Components | null = null;
+// CAD-1915: one set per wiki page read, so a page's own links open in place.
+const pageComponents = new Map<string, Components>();
 
 /** The renderer set is cached per issue handler. Recreating these component
  *  types on every thread update would make React unmount and reinsert old
  *  code, links and images, which a live log would announce as new content. */
-function buildComponents(onOpen?: (id: string) => void): Components {
+function buildComponents(onOpen?: (id: string) => void, wikiPage?: string): Components {
   return {
     img: ({ src, alt }) => {
       const linked = useContext(InLinkContext);
@@ -167,6 +180,8 @@ function buildComponents(onOpen?: (id: string) => void): Components {
       const issueId = href?.startsWith("issue:") ? href.slice(6) : null;
       const revisionHref = href?.startsWith("wiki-rev:") ? href.slice("wiki-rev:".length) : null;
       const nested = <InLinkContext.Provider value={true}>{children}</InLinkContext.Provider>;
+      const pageHref = wikiPage !== undefined && href && issueId === null && revisionHref === null ? wikiLinkHref(wikiPage, href) : null;
+      if (pageHref !== null) return <Link className="lnk" href={pageHref}>{nested}</Link>;
       if (revisionHref !== null) {
         return isWikiRevisionHref(revisionHref) ? (
           <Link className="lnk" href={revisionHref}>{nested}</Link>
@@ -200,7 +215,17 @@ function buildComponents(onOpen?: (id: string) => void): Components {
   };
 }
 
-function componentsFor(onOpen?: (id: string) => void): Components {
+function componentsFor(onOpen?: (id: string) => void, wikiPage?: string): Components {
+  if (wikiPage !== undefined) {
+    if (onOpen) return buildComponents(onOpen, wikiPage);
+    let page = pageComponents.get(wikiPage);
+    if (!page) {
+      if (pageComponents.size >= 100) pageComponents.clear();
+      page = buildComponents(undefined, wikiPage);
+      pageComponents.set(wikiPage, page);
+    }
+    return page;
+  }
   if (!onOpen) return (noHandlerComponents ??= buildComponents());
   const cached = handlerComponents.get(onOpen);
   if (cached) return cached;
@@ -209,22 +234,28 @@ function componentsFor(onOpen?: (id: string) => void): Components {
   return built;
 }
 
+const PLUGINS = [remarkGfm, remarkWikiCitations, remarkIssueLinks];
+const PAGE_PLUGINS = [...PLUGINS, remarkDropComments];
+
 export default function Md({
   text,
   onOpen,
+  wikiPage,
 }: {
   text: string;
   onOpen?: (id: string) => void;
+  /** CAD-1915: set only by the wiki page view — its links resolve against this path. */
+  wikiPage?: string;
 }) {
   return (
     <Markdown
       // GFM (CAD-551): tables, task lists, strikethrough, autolinks —
       // the providers' answers lean on them.
-      remarkPlugins={[remarkGfm, remarkWikiCitations, remarkIssueLinks]}
+      remarkPlugins={wikiPage === undefined ? PLUGINS : PAGE_PLUGINS}
       // `issue:` ids and pinned wiki revisions are ours; everything else
       // takes react-markdown's safe transform (no `javascript:` and friends).
       urlTransform={(url) => (url.startsWith("issue:") || url.startsWith("wiki-rev:") ? url : defaultUrlTransform(url))}
-      components={componentsFor(onOpen)}
+      components={componentsFor(onOpen, wikiPage)}
     >
       {text}
     </Markdown>

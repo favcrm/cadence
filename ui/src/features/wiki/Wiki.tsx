@@ -285,6 +285,7 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope, 
             <HistoryPane
               path={route.path}
               navHref={navHref}
+              hosted={multipartUpload}
             />
           ) : route.mode === "edit" && route.path ? (
             <EditorPane

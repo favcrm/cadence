@@ -4,7 +4,7 @@ import { sessionStore } from "../../lib/draft";
 import { privateSessionGeneration } from "../../lib/privateSession";
 import { navigate } from "../../lib/useLocation";
 import { useTranslate } from "../../lib/locale";
-import Md from "../../ui/Md";
+import { PageText } from "./PagePane";
 import { IconWarning } from "../../ui/icons";
 import { wiki } from "./api";
 import {
@@ -270,7 +270,7 @@ export default function EditorPane({
         />
         <div className="wk-ehead wk-preview-head" id={previewLabelId}>{t("Preview")}</div>
         <div id={previewId} className="wk-eprev issue-reader" role="region" aria-labelledby={previewLabelId}>
-          <Md text={text} />
+          <PageText path={path} text={text} />
         </div>
       </div>
 
