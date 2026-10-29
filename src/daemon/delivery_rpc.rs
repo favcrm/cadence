@@ -443,7 +443,7 @@ impl Shared {
         }
         // The app read costs a record walk and, only when the worker is
         // on some app's team, one bounded `gh pr view --json files`.
-        let touched = self.pr_apps(pm, rec, pr, sha, &[rec.worker.as_str()])?;
+        let touched = self.pr_apps(pm, pr, sha, &[rec.worker.as_str()])?;
         rec.touched_apps = touched
             .as_ref()
             .map(|apps| apps.iter().cloned().collect::<Vec<_>>());
@@ -472,7 +472,6 @@ impl Shared {
     fn pr_apps(
         &self,
         pm: &Pm,
-        rec: &Record,
         pr: &str,
         sha: &str,
         aliases: &[&str],
@@ -572,7 +571,7 @@ impl Shared {
                     return Ok(Default::default());
                 };
                 let aliases: Vec<&str> = on_team.iter().map(|a| a.as_str()).collect();
-                match self.pr_apps(pm, rec, pr, head, &aliases)? {
+                match self.pr_apps(pm, pr, head, &aliases)? {
                     Some(apps) => apps,
                     None => return Ok(Default::default()),
                 }

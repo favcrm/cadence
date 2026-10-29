@@ -170,10 +170,11 @@ impl Fx {
                 .unwrap();
             shared.store.set_agent_state(alias, "idle", None).unwrap();
         }
+        let state = root.path().to_path_buf();
         Fx {
             _root: root,
             pm_dir,
-            state: root.path().to_path_buf(),
+            state,
             shared,
         }
     }

@@ -69,9 +69,19 @@ pub fn apps_in_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> BTreeSet<S
 /// touches an app. Only the exact `apps/<name>/` spelling counts.
 pub fn apps_in_text(text: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    let mut rest = text;
-    while let Some(at) = rest.find(&format!("{}/", app::DIR)) {
-        rest = &rest[at + app::DIR.len() + 1..];
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(&format!("{}/", app::DIR)) {
+        let at = from + rel;
+        from = at + app::DIR.len() + 1;
+        // The token must start a path: `src/apps/x/` and `myapps/x/`
+        // are not the tracker's `apps/`.
+        let boundary = text[..at].chars().next_back().map_or(true, |c| {
+            !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+        });
+        if !boundary {
+            continue;
+        }
+        let rest = &text[from..];
         let name: String = rest
             .chars()
             .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
