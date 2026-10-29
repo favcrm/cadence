@@ -96,6 +96,7 @@ docs/guides/*
 !docs/guides/external-agents-social.md
 !docs/guides/hosted-image-media.md
 !docs/guides/hosted-workspace.md
+!docs/guides/member-assistant-enrollment.md
 !docs/guides/provider-deployment-metadata.md
 !docs/guides/rollout-checklist.md
 !docs/guides/wiki-knowledge.md

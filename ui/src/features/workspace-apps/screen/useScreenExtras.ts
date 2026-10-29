@@ -19,7 +19,7 @@ const EXCERPT_RUNS = 32;
 export function useScreenExtras(args: {
   enabled: boolean; installation: Installation | null; installId: string; contextId: string;
   runs: WorkspaceRun[]; bindings: AppBinding[]; workers: number | null; onDenied: () => void;
-}): { extras: ScreenExtras | undefined; loadAsset: AssetLoader } {
+}): { extras: ScreenExtras | undefined; loadAsset: AssetLoader; reloadTools: () => Promise<void> } {
   const { enabled, installation, installId, contextId, runs, bindings, workers, onDenied } = args;
   const denied = useRef(onDenied);
   denied.current = onDenied;
@@ -74,14 +74,26 @@ export function useScreenExtras(args: {
   // run-bound read is held. Install-scoped (tools have no context).
   const toolScope = `${installId}:${contextId}`;
   const [tools, setTools] = useState<{ scope: string; value: ScreenExtras["tools"] }>({ scope: "", value: undefined });
-  useEffect(() => {
+  const toolRead = useRef<AbortController | null>(null);
+  const reloadTools = useCallback(async () => {
+    toolRead.current?.abort();
     if (!enabled || !installId || !contextId) { setTools({scope:toolScope,value:[]}); return; }
     const controller = new AbortController();
-    workspaceApps.toolResults(installId, contextId, controller.signal)
-      .then(receipts => { if (!controller.signal.aborted) setTools({ scope: toolScope, value: receipts }); })
-      .catch((error: unknown) => { if (!controller.signal.aborted) { refuse(error); setTools({ scope: toolScope, value: null }); } });
-    return () => controller.abort();
+    toolRead.current = controller;
+    try {
+      const receipts = await workspaceApps.toolResults(installId, contextId, controller.signal);
+      if (!controller.signal.aborted) setTools({ scope: toolScope, value: receipts });
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        if (error instanceof ApiError && [401, 403].includes(error.status)) denied.current();
+        setTools({ scope: toolScope, value: null });
+      }
+    }
   }, [enabled, installId, contextId, toolScope]);
+  useEffect(() => {
+    void reloadTools();
+    return () => toolRead.current?.abort();
+  }, [reloadTools]);
 
   const extras = useMemo<ScreenExtras | undefined>(() => enabled ? {
     installId, contextId, bindings, workers,
@@ -104,5 +116,5 @@ export function useScreenExtras(args: {
     if (asset.receipt_id !== receipt) return null;
     return downscaleToDataUrl(asset.base64, asset.media_type);
   }, []);
-  return { extras, loadAsset };
+  return { extras, loadAsset, reloadTools };
 }

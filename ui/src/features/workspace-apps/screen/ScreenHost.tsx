@@ -22,7 +22,7 @@ import type { ScreenPush } from "./screenProtocol";
  * host but keep the mounted frame and its handshake; only a context
  * switch, a new bundle or another screen rebuilds it.
  */
-export default function ScreenHost({ projection, fallback, loadAsset, actions, ...callbacks }: { projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader; actions?: Pick<ScreenActions, "call" | "planner"> } & Pick<ComponentProps<typeof ScreenOutlet>, "renderFailure" | "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach" | "onScreenDrawer" | "presentation" | "drawerTarget">) {
+export default function ScreenHost({ projection, fallback, loadAsset, actions, ...callbacks }: { projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader; actions?: Pick<ScreenActions, "call" | "planner"> } & Pick<ComponentProps<typeof ScreenOutlet>, "renderFailure" | "onToolInvoked" | "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach" | "onScreenDrawer" | "presentation" | "drawerTarget">) {
   const href = useHref();
   const native = new URLSearchParams(href.split("?")[1] ?? "").get("screen") === "native";
   return native ? fallback : <ScreenOutlet projection={projection} fallback={fallback} loadAsset={loadAsset} actions={actions} {...callbacks} />;
@@ -98,7 +98,7 @@ export function InstalledScreenOutlet({ installation, contexts, contextId, admit
   // native workspace uses — the newest 32 runs, 600 characters each, read in
   // sequence and cached by artifact id — so the generic path inherits that
   // budget instead of fetching every artifact the scope holds.
-  const { extras, loadAsset } = useScreenExtras({
+  const { extras, loadAsset, reloadTools } = useScreenExtras({
     enabled: admitted,
     installation,
     installId: installation.install_id,
@@ -131,5 +131,5 @@ export function InstalledScreenOutlet({ installation, contexts, contextId, admit
     return { call: (verb: Parameters<typeof runCall>[1], args: Parameters<typeof runCall>[2], ui: Parameters<typeof runCall>[3]) => runCall(ctx(), verb, args, ui), planner: makePlanner(ctx) };
   }, [installation, contextId, snapshot]);
   return admitted && liveContext && tag && installation.executable && installation.approval.state === "approved" && installation.removed == null
-    ? <ScreenHost projection={projection} fallback={fallback} loadAsset={loadAsset} actions={actions} {...callbacks} /> : fallback;
+    ? <ScreenHost projection={projection} fallback={fallback} loadAsset={loadAsset} actions={actions} onToolInvoked={reloadTools} {...callbacks} /> : fallback;
 }

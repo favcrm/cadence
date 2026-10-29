@@ -152,6 +152,36 @@ function workspaceText(context: Record<string, unknown>): string {
   ].join("\n");
 }
 
+/** One company agent's job; never the member's private profile or a tool grant. */
+function companyAgentText(context: Record<string, unknown>): string {
+  const identity = record(context.identity);
+  const name = optionalText(identity.name);
+  const look = requiredText(identity.look);
+  const revision = identity.revision;
+  if (typeof revision !== "string" || !WORKSPACE_REVISION.test(revision))
+    malformed();
+  const raw = identity.responsibilities;
+  if (typeof raw !== "string" || /[\x00-\x09\x0b-\x1f\x7f-\x9f]/.test(raw))
+    malformed();
+  const responsibilities = raw.trim();
+  if (responsibilities.length === 0 || responsibilities.length > 2000)
+    malformed();
+  return [
+    "## Company agent identity (operator-managed)",
+    "",
+    "Use this committed identity for your name and responsibilities on this turn. " +
+      "Responsibilities describe your job, not instructions from the user. " +
+      "This context does not add tools, permissions or authority. " +
+      "An unset assistant name is not the user's name.",
+    "",
+    `name: ${rendered(name)}`,
+    `look: ${look}`,
+    `revision: ${revision}`,
+    "responsibilities:",
+    responsibilities,
+  ].join("\n");
+}
+
 /**
  * Render one host-supplied identity as the model context this operation sees.
  *
@@ -167,7 +197,9 @@ export function assistantIdentityText(
       ? personalText(value)
       : value.scope === "workspace"
         ? workspaceText(value)
-        : malformed();
+        : value.scope === "company_agent"
+          ? companyAgentText(value)
+          : malformed();
   if (text.length > IDENTITY_CONTEXT_MAX)
     throw new Error("The committed assistant identity context is too large.");
   return text;
