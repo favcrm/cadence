@@ -43,24 +43,38 @@ For UI changes, run `bun run --cwd ui typecheck`, `bun run --cwd ui test:url-sta
 frontend test directory. Use `bun run --cwd ui test` when that alias is available in
 the checked-out package scripts.
 
-Select the affected Rust test binary and a meaningful filter. For example,
-after admission and isolation are configured:
+Select the affected Rust test binary and a meaningful filter, and run it on
+Boat:
 
 ```bash
-rtk proxy cargo test --locked --features test-seam --test daemon <FILTER> -- --test-threads 2
+scripts/boat-build -- cargo test --locked --features test-seam --test daemon <FILTER> -- --test-threads 1
 ```
 
-Set `CARGO_BUILD_JOBS=4`. Keep host-wide sccache enabled (`SCCACHE_DIR`
-forced to `~/.cache/sccache` in `~/.cargo/config.toml` so a lane tmp
-`XDG_CACHE_HOME` cannot steal port 4226); only use the documented
-one-off `RUSTC_WRAPPER=` diagnostic after a strange build failure. Shared model
-changes also require compilation of all affected targets: a narrow behavior
-selection cannot find an incompatible initializer in another test crate.
+`scripts/boat-build` keeps one sandbox for this worktree. The first command
+sends a shallow git snapshot and compiles cold. A later command within 30
+minutes sends the tracked patch only, and Cargo reuses `target/`.
+`scripts/boat-build --down` deletes that sandbox. When 30 minutes pass
+with no further command, the sandbox stops and is erased, and the next
+command starts cold. Required CI, review and operator approval stay
+authoritative. Untracked files are not copied; `git add` them first. Prefer `cargo check` when you only need a
+compile. Inside the sandbox the helper sets `CARGO_BUILD_JOBS=1`.
 
-On a shared Cadence host, obtain build/test admission before compilation.
-Use an authenticated `cadence build-slot run test -- <command>` when your native
-endpoint can hold a slot. Callers without a pane use an authorized project
-recipe through `cadence build-slot launch <RECIPE> --project cadence --worktree <LANE>`.
+A local compile is the exception, for a binary that has to run here (`cargo
+run`, a board smoke, a release artifact). It still takes a build slot and
+`CARGO_BUILD_JOBS=4`. `CADENCE_PRE_PUSH_LOCAL=1` is the emergency path for
+the push hook. Keep host-wide sccache enabled for that local exception
+(`SCCACHE_DIR` forced to `~/.cache/sccache` in `~/.cargo/config.toml` so a
+lane tmp `XDG_CACHE_HOME` cannot steal port 4226); only use the documented
+one-off `RUSTC_WRAPPER=` diagnostic after a strange local build failure. The
+Boat sandbox does not use the host sccache. Shared model changes also require
+compilation of all affected targets: a narrow behavior selection cannot find
+an incompatible initializer in another test crate.
+
+On a shared Cadence host, a local exception obtains build/test admission
+before compilation. Use an authenticated `cadence build-slot run test --
+<command>` when your native endpoint can hold a slot. Callers without a pane
+use an authorized project recipe through `cadence build-slot launch <RECIPE>
+--project cadence --worktree <LANE>`.
 Check `cadence build-slot --help` and the project's configured recipes; recipe
 names are project configuration, not universal commands. The admitted focused
 test recipe for external reviewers — exact `build.recipes` proposal, fixed
@@ -128,7 +142,7 @@ mkdir -m 700 -p "$XDG_CONFIG_HOME"
 unset CADENCE_TOKEN CADENCE_ISSUER CADENCE_ORG
 bun install --cwd ui --frozen-lockfile
 bun run --cwd ui build
-# On a shared host, obtain the documented build-slot admission first.
+# Local exception: the board process runs on this host. Take a build slot.
 CARGO_BUILD_JOBS=4 cargo build --locked --features ui
 ./target/debug/cadence sandbox up dev --port "$CADENCE_DEV_BOARD_PORT"
 bun run --cwd ui dev --host 127.0.0.1
@@ -141,6 +155,7 @@ board. The Vite development command refuses a missing or out-of-range
 leave Vite running, then rebuild and restart the sandbox:
 
 ```bash
+# Same local exception: the rebuilt binary has to run on this host.
 CARGO_BUILD_JOBS=4 cargo build --locked --features ui
 ./target/debug/cadence sandbox down dev
 ./target/debug/cadence sandbox up dev --port "$CADENCE_DEV_BOARD_PORT"

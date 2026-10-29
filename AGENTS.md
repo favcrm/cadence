@@ -254,35 +254,60 @@ the code you just wrote.
 
 - Before every push the worktree hook runs `scripts/pre-push` (fmt, the live
   doctor split check, clippy on both feature sets, the release seam, the UI
-  typecheck and the active script contracts for what you changed) in a fresh
-  Boat sandbox via `scripts/boat-build`; the shared host does not compile.
-  A missing Boat CLI or helper refuses the push rather than falling back to a
-  local build. `CADENCE_PRE_PUSH_LOCAL=1` is the explicit emergency path and
-  runs the same plan on this host. `scripts/pre-push --tests` is a focused
-  diagnostic, not a prerequisite before review; required CI and the
-  merge-group regression floor are unchanged. Neither a remote run nor a
-  green suite proves the ticket's outcome. The split manifests are retired;
-  do not run `split-map-sync` until a reviewed inventory restoration
-  establishes its inputs.
-- Prefer `cargo check` over `cargo build` for compile verification:
-  `cargo check` stops at the type check, `cargo build` adds codegen and
-  linking for this crate's five binary targets, and that extra work is the
-  expensive part on a shared host (measured here, same tree, warm sccache:
-  1m41s check against 7m11s build). Build only when you need to run the
-  binary — a board smoke run, `cargo run`, a release artifact — and take the
-  build slot first (`cadence build-slot run build -- cargo build`).
+  typecheck and the active script contracts for what you changed) on Boat
+  via `scripts/boat-build`; the shared host does not compile. One sandbox
+  is kept for this worktree. The first command compiles cold. A later
+  command within 30 minutes reuses it. After the last command it stays up
+  for 30 minutes, then stops and is erased, and the next command starts
+  cold. `scripts/boat-build --down` deletes it, `--fresh` replaces it, and
+  `--once` deletes it when the command exits. A missing Boat CLI or helper refuses the push rather than falling
+  back to a local build. `CADENCE_PRE_PUSH_LOCAL=1` is the explicit
+  emergency path and runs the same plan on this host. `scripts/pre-push
+  --tests` is a focused diagnostic, not a prerequisite before review;
+  required CI and the merge-group regression floor are unchanged. Review
+  and operator approval stay authoritative. Neither a remote run nor a
+  green suite proves the ticket's outcome. The split
+  manifests are retired; do not run `split-map-sync` until a reviewed
+  inventory restoration establishes its inputs.
+- Run `cargo check`, `cargo test`, `cargo clippy` and `cargo build` through
+  `scripts/boat-build -- cargo …`. Example: `scripts/boat-build -- cargo
+  test --locked --features test-seam --test daemon <FILTER> --
+  --test-threads 1`. The lane `cargo` shim still queues a host build slot;
+  it does not send the compile to Boat. Stay on this host only for a binary
+  that has to run here (`cargo run`, a board smoke, a release artifact),
+  and only when this run is explicitly local. That exception takes a build
+  slot and `CARGO_BUILD_JOBS=4`.
+- The copy is a shallow git snapshot of the candidate commit and the base,
+  from their merge-base forward, plus a binary patch of tracked edits. It
+  is not an rsync of the worktree and it does not pull from GitHub.
+  Untracked files are refused; `git add` a new file before running. Ignored
+  files, including `target/`, are not uploaded. A reused sandbox keeps
+  `target/` and its cargo registry, so Cargo recompiles what the patch
+  changed. On this repo the shallow snapshot of the current tips is about
+  13MB; the full object pack is about 370MB and is not sent. The first
+  command spends one Boat start and a cold compile. Later commands in that
+  30 minutes spend no extra start. Start limits are the scarce quota
+  (`boat limits`); `--down` when you are finished so the sandbox does not
+  sit for the idle half hour.
+- Prefer `cargo check` over `cargo build` for compile verification.
+  `cargo check` stops at the type check. `cargo build` adds codegen and
+  linking for this crate's five binary targets. On this host, same tree,
+  warm sccache: 1m41s for check and 7m11s for build. A cold Boat compile is
+  slower than those numbers. A warm session is the fast path.
   `scripts/pre-push` is check-level already, so a plain `cargo build`
   before every push buys nothing.
-- sccache is the host-wide rustc wrapper (`~/.cargo/config.toml`). Do not
-  override `RUSTC_WRAPPER`; if a build fails oddly, rerun it once with
-  `RUSTC_WRAPPER=` to rule sccache out. Force `SCCACHE_DIR` (and
+- Inside the sandbox the helper sets `CARGO_BUILD_JOBS=1`. Run filtered
+  test groups only. CI runs the full suite. Copy one binary back with
+  `--artifact <path-in-checkout> --output <new-local-file>` when a local
+  board needs it. `--output` must not already exist. The run log is
+  `<worktree-git-dir>/cadence-boat-build.log`.
+- sccache is the host-wide rustc wrapper (`~/.cargo/config.toml`) for a
+  local exception. The Boat sandbox does not use it. Do not override
+  `RUSTC_WRAPPER` on the host; if a local build fails oddly, rerun it once
+  with `RUSTC_WRAPPER=` to rule sccache out. Force `SCCACHE_DIR` (and
   `SCCACHE_CACHE_SIZE`) in that cargo config so a lane's rewritten
   `HOME`/`XDG_CACHE_HOME` cannot start the shared `:4226` server against a
   tmp cache. The durable dir is `~/.cache/sccache`.
-
-- Many lanes share this host. Use `CARGO_BUILD_JOBS=4` and
-  `--test-threads 2`, and run only filtered test groups; CI runs the full
-  suite.
 - Tests isolate HOME, XDG and TMPDIR under a short `/tmp/<lane>` root (unix
   socket paths are limited to 107 bytes), set `CADENCE_SUITE_LOCK` and pass
   `RUSTUP_HOME` and `CARGO_HOME` through. If a test fails with a timeout or

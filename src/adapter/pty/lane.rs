@@ -502,6 +502,16 @@ pub fn pane_cwd_with(pane_pid: u32, helper: Option<&Path>) -> Option<PaneCwd> {
     }
 }
 
+/// The process `before` is still the process `after`. Pid reuse is a new
+/// start time. A session change or a zombie is not the process whose cwd
+/// the helper just read. Scheduler state (`R`/`S`) and the process group
+/// move during a normal inspect and are not identity: comparing them made
+/// `cad514_inspect_cwd_rejects_forged_identity_and_decodes_path` fail when
+/// `sleep` left `R` before the helper returned.
+fn same_live_process(before: ProcStat, after: ProcStat) -> bool {
+    after.start_time == before.start_time && after.sid == before.sid && after.state != 'Z'
+}
+
 fn read_cwd_with(pid: u32, helper: Option<&Path>) -> Option<PaneCwd> {
     let Some(helper) = helper else {
         return read_cwd(pid);
@@ -516,7 +526,8 @@ fn read_cwd_with(pid: u32, helper: Option<&Path>) -> Option<PaneCwd> {
     let value = |key: &str| stdout.lines().find_map(|line| line.strip_prefix(key));
     let sid = value("sid ")?.parse::<u32>().ok()?;
     let start = value("starttime ")?.parse::<u64>().ok()?;
-    if sid != before.sid || start != before.start_time || proc_stat(pid)? != before {
+    let after = proc_stat(pid)?;
+    if sid != before.sid || start != before.start_time || !same_live_process(before, after) {
         return None;
     }
     let raw = value("cwd ")?;
@@ -559,6 +570,39 @@ fn read_cwd(pid: u32) -> Option<PaneCwd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cwd_reread_ignores_scheduler_state_and_refuses_reuse() {
+        let before = ProcStat {
+            state: 'R',
+            pgid: 1,
+            sid: 2,
+            tpgid: -1,
+            start_time: 10,
+        };
+        let sleeping = ProcStat {
+            state: 'S',
+            pgid: 9,
+            tpgid: 4,
+            ..before
+        };
+        assert!(same_live_process(before, sleeping));
+        assert!(!same_live_process(
+            before,
+            ProcStat {
+                start_time: 11,
+                ..sleeping
+            }
+        ));
+        assert!(!same_live_process(
+            before,
+            ProcStat {
+                state: 'Z',
+                ..before
+            }
+        ));
+        assert!(!same_live_process(before, ProcStat { sid: 9, ..sleeping }));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
