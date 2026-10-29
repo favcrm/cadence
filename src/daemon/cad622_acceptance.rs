@@ -25,7 +25,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::*;
 use crate::issue::{self, app};
@@ -280,6 +280,52 @@ fn install_app(pm: &issue::Pm, team: &[(&str, &str)]) {
         serde_yaml::to_string(&record).unwrap(),
     )
     .unwrap();
+}
+
+/// A workspace installation: `.apps/installations/<id>/record.yaml` with
+/// its team in the daemon's `app-teams.json`.
+fn workspace_install_from(fx: &Fx, id: &str, url: &str, roles: &[(&str, &str)]) {
+    let dir = fx.pm_dir.join(".apps").join("installations").join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let record = app::Record {
+        schema: 1,
+        app: APP.to_string(),
+        install_id: id.to_string(),
+        source: app::Source::Git {
+            url: url.to_string(),
+            sha: "0".repeat(40),
+            dir: None,
+        },
+        bindings: Default::default(),
+        team: Default::default(),
+        installed_at: "2026-01-01T00:00:00Z".into(),
+        installed_by: "operator".into(),
+        updated_at: None,
+        removed: None,
+        restore_after: None,
+        purge_after: None,
+        catalogue: None,
+    };
+    std::fs::write(
+        dir.join("record.yaml"),
+        serde_yaml::to_string(&record).unwrap(),
+    )
+    .unwrap();
+    let mut teams: Value = std::fs::read_to_string(fx.state.join("app-teams.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| json!({"schema": 1, "teams": {}}));
+    teams["teams"][id] = json!({
+        "owner_pm": "lead",
+        "roles": roles.iter().map(|(r, a)| (r.to_string(), a.to_string()))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        "revision": 1,
+    });
+    std::fs::write(fx.state.join("app-teams.json"), teams.to_string()).unwrap();
+}
+
+fn workspace_install(fx: &Fx, id: &str, roles: &[(&str, &str)]) {
+    workspace_install_from(fx, id, "https://github.com/acme/app-repo", roles)
 }
 
 fn dispatch_args(to: &str, repo: PathBuf) -> crate::issue::dispatch::DispatchArgs {
@@ -560,16 +606,27 @@ fn cad622_an_apps_team_reviewer_cannot_file_a_verdict() {
     .expect("an independent reviewer files the verdict");
 }
 
-/// When the PR's own files cannot be read, the guard is flagged (a
-/// daemon event naming the reason), never silently skipped — and the
-/// loop is not stalled by an offline `gh`.
+/// When the PR's own files cannot be read, an own-team author's report is
+/// HELD (refused with the plain reason) — never admitted — and a ticket
+/// with no app-team author is unaffected (positive control).
 #[test]
-fn cad622_unreadable_pr_files_flag_the_guard_instead_of_passing_silently() {
+fn cad622_unreadable_pr_files_hold_an_own_team_authors_report() {
     let fx = Fx::new(&[("writer", "writer")], &["reviewer"]);
-    // A `gh` that cannot read anything.
     std::fs::write(fx._root.path().join("gh"), "#!/bin/sh\nexit 1\n").unwrap();
     fx.seed_loop("writer");
     fx.route().expect("the router pass answers");
+    let rec = fx.record();
+    assert_eq!(
+        rec.state,
+        delivery::State::Working,
+        "an unreadable diff never admits an own-team author"
+    );
+    assert!(rec.head.is_none());
+    let why = fx.why();
+    assert!(
+        why.contains("held until the PR's own changed files can be read"),
+        "{why}"
+    );
     let event = fx
         .shared
         .store
@@ -577,18 +634,218 @@ fn cad622_unreadable_pr_files_flag_the_guard_instead_of_passing_silently() {
         .unwrap()
         .expect("the unreadable diff is flagged");
     assert_eq!(event.payload["issue"].as_str(), Some(ISSUE));
+
+    // Positive control: the same outage does not stall a ticket whose
+    // author is on no app's team.
+    let fx = Fx::new(&[("writer", "writer")], &["reviewer"]);
+    std::fs::write(fx._root.path().join("gh"), "#!/bin/sh\nexit 1\n").unwrap();
+    fx.seed_loop("lead");
+    fx.route().expect("the router pass answers");
+    assert_eq!(fx.record().state, delivery::State::Reviewing);
+}
+
+/// A workspace installation (`.apps/installations/<id>/record.yaml` with
+/// its team in the daemon's `app-teams.json`) is refused exactly like a
+/// legacy project install — with and without a run.
+#[test]
+fn cad622_a_workspace_installation_team_is_refused() {
+    let fx = Fx::new(&[], &[]);
+    workspace_install(&fx, "inst-ws", &[("writer", "writer")]);
+    let pm = fx.pm();
+    set_paths(&pm, &fx.issue, &format!("apps/{APP}/app.md"));
+    let err = crate::issue::dispatch::run(
+        &pm,
+        &fx.issue,
+        &dispatch_args("writer", fx._root.path().join("widgets")),
+        "operator",
+        &fx.state,
+        None,
+        crate::issue::dispatch::DispatchOrigin::Explicit,
+    )
+    .expect_err("a workspace installation's team is a team");
     assert!(
-        event.payload["why"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("could not be read"),
-        "{}",
-        event.payload
+        err.to_string()
+            .contains("writer is on app 'social-content's team"),
+        "{err}"
     );
-    assert_eq!(
-        fx.record().state,
-        delivery::State::Reviewing,
-        "an unreadable diff never invents a refusal"
+
+    // A frozen run names the agent even though the saved team is empty.
+    let fx = Fx::new(&[], &[]);
+    workspace_install(&fx, "inst-ws2", &[]);
+    fx.shared
+        .store
+        .write_tx(|tx| {
+            tx.execute(
+                "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest, \
+                 project_link,owner_pm,request_id,state,approved_digest,created,updated) \
+                 VALUES('run-ws','inst-ws2',1,'b',?,'d',NULL,'lead','r1','approved',NULL,0,0)",
+                rusqlite::params![
+                    json!({"inputs": {}, "assignments": {"1": {"alias": "writer"}}}).to_string()
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let pm = fx.pm();
+    set_paths(&pm, &fx.issue, &format!("apps/{APP}/app.md"));
+    let err = crate::issue::dispatch::run(
+        &pm,
+        &fx.issue,
+        &dispatch_args("writer", fx._root.path().join("widgets")),
+        "operator",
+        &fx.state,
+        None,
+        crate::issue::dispatch::DispatchOrigin::Explicit,
+    )
+    .expect_err("a run's assignment is membership");
+    assert!(
+        err.to_string()
+            .contains("writer is on app 'social-content's team"),
+        "{err}"
+    );
+}
+
+/// The daemon's own dispatch admission refuses a direct `dispatch_send`
+/// from a team PM to a team worker on a ticket that plans the app.
+#[test]
+fn cad622_dispatch_send_refuses_at_the_daemon_boundary() {
+    let fx = Fx::new(&[("writer", "writer")], &[]);
+    set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
+    let err = scoped(Asserted::Agent("lead".into()), || {
+        fx.shared.dispatch(
+            "dispatch_send",
+            &json!({"alias": "writer", "issue": ISSUE, "text": "do it", "reply_to": "lead"}),
+            std::process::id(),
+        )
+    })
+    .expect_err("the daemon refuses an own-team kickoff");
+    assert!(
+        err.to_string()
+            .contains("writer is on app 'social-content's team"),
+        "{err}"
+    );
+    // Positive control: a worker off the app's team is not refused by the
+    // guard (it fails later, on the missing lane, not on the team).
+    let fx = Fx::new(&[("writer", "writer")], &[]);
+    set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
+    let err = scoped(Asserted::Agent("lead".into()), || {
+        fx.shared.dispatch(
+            "dispatch_send",
+            &json!({"alias": "lead", "issue": ISSUE, "text": "do it", "reply_to": "lead"}),
+            std::process::id(),
+        )
+    })
+    .expect_err("the fixture has no lane for this issue");
+    assert!(!err.to_string().contains("is on app"), "{err}");
+}
+
+/// A plan naming the app with the ordinary `./apps/<name>/` spelling is
+/// refused too, and an agent off the team may propose it.
+#[test]
+fn cad622_a_plan_spelling_the_app_as_dot_slash_is_refused() {
+    let fx = Fx::new(&[("writer", "writer")], &[]);
+    let plan = format!(
+        "---\ntitle: \"T\"\ngoal: \"G\"\n---\n\n## Rework\nsize: S\n\nRewrite \
+         ./apps/{APP}/app.md.\n\n### Acceptance\n- [ ] done\n"
+    );
+    let err = scoped(Asserted::Agent("writer".into()), || {
+        fx.shared.dispatch(
+            "plan_propose",
+            &json!({"project": PROJECT, "text": plan}),
+            std::process::id(),
+        )
+    })
+    .expect_err("./apps is the same source path");
+    assert!(
+        err.to_string()
+            .contains("writer is on app 'social-content's team"),
+        "{err}"
+    );
+    scoped(Asserted::Agent("lead".into()), || {
+        fx.shared.dispatch(
+            "plan_propose",
+            &json!({"project": PROJECT, "text": plan}),
+            std::process::id(),
+        )
+    })
+    .expect("an agent off the team may plan it");
+    // A genuinely nested path is not the tracker's apps/.
+    let nested = "---\ntitle: \"T\"\ngoal: \"G\"\n---\n\n## Rework\nsize: S\n\nEdit \
+                  src/apps/x/app.md.\n\n### Acceptance\n- [ ] done\n";
+    scoped(Asserted::Agent("writer".into()), || {
+        fx.shared.dispatch(
+            "plan_propose",
+            &json!({"project": PROJECT, "text": nested}),
+            std::process::id(),
+        )
+    })
+    .expect("src/apps/ is not the tracker's apps/");
+}
+
+/// An app installed from the project's own repository is refused at
+/// dispatch even though the ticket names no `apps/<name>/` path — the
+/// pinned git source is the evidence.
+#[test]
+fn cad622_a_git_source_app_is_refused_at_dispatch() {
+    let fx = Fx::new(&[], &[]);
+    workspace_install_from(
+        &fx,
+        "inst-git",
+        "https://github.com/acme/widgets",
+        &[("writer", "writer")],
+    );
+    let pm = fx.pm();
+    set_paths(&pm, &fx.issue, "app.md,workflows/post.md");
+    let err = crate::issue::dispatch::run(
+        &pm,
+        &fx.issue,
+        &dispatch_args("writer", fx._root.path().join("widgets")),
+        "operator",
+        &fx.state,
+        None,
+        crate::issue::dispatch::DispatchOrigin::Explicit,
+    )
+    .expect_err("the app's git source is its source");
+    assert!(err.to_string().contains("its pinned git source"), "{err}");
+}
+
+/// Membership is read fresh at the verdict: a reviewer that joins the
+/// app's team while the review is outstanding can no longer file PASS.
+#[test]
+fn cad622_membership_changing_before_the_verdict_is_refused() {
+    let fx = Fx::new(&[("writer", "writer")], &["reviewer", "outsider"]);
+    let mut rec = delivery::Record::new(ISSUE, PROJECT, "lead", 0);
+    rec.pr = Some(pr_url());
+    rec.head = Some(HEAD.into());
+    rec.reviewer = Some("outsider".into());
+    rec.enter(delivery::State::Reviewing, 1);
+    fx.save_record(rec);
+    let body =
+        format!("---\nkind: verdict\ntask: {ISSUE}\nverdict: pass\nsha: {HEAD}\n---\n\nFine.\n");
+    scoped(Asserted::Agent("outsider".into()), || {
+        fx.shared
+            .rpc_report_verdict(&json!({"issue": ISSUE, "text": body}), std::process::id())
+    })
+    .expect("an independent reviewer files the verdict");
+
+    // Reopen the review, then put the same reviewer on the app's team.
+    let mut rec = delivery::Record::new(ISSUE, PROJECT, "lead", 0);
+    rec.pr = Some(pr_url());
+    rec.head = Some(HEAD.into());
+    rec.reviewer = Some("outsider".into());
+    rec.enter(delivery::State::Reviewing, 2);
+    fx.save_record(rec);
+    install_app(&fx.pm(), &[("writer", "writer"), ("reviewer", "outsider")]);
+    let err = scoped(Asserted::Agent("outsider".into()), || {
+        fx.shared
+            .rpc_report_verdict(&json!({"issue": ISSUE, "text": body}), std::process::id())
+    })
+    .expect_err("a reviewer that joined the team is refused");
+    assert!(
+        err.to_string()
+            .contains("outsider is on app 'social-content's team")
+            && err.to_string().contains("cannot review"),
+        "{err}"
     );
 }
 
@@ -613,13 +870,20 @@ fn cad622_a_runs_role_input_puts_the_agent_on_the_apps_team() {
             Ok(())
         })
         .unwrap();
-    let teams = crate::issue::app_guard::teams(&pm.dir, Some(&fx.shared.store)).unwrap();
+    let guard = crate::issue::app_guard::Ctx {
+        pm_dir: &pm.dir,
+        state_dir: Some(&fx.state),
+        store: Some(&fx.shared.store),
+    };
+    let teams = crate::issue::app_guard::teams(guard).unwrap();
     assert!(
         teams.get(APP).is_some_and(|t| t.contains("writer")),
         "a run's role input is the app's team: {teams:?}"
     );
     assert!(
-        crate::issue::app_guard::teams(&pm.dir, None).unwrap()[APP].is_empty(),
+        crate::issue::app_guard::teams(crate::issue::app_guard::Ctx::tracker(&pm.dir)).unwrap()
+            [APP]
+            .is_empty(),
         "the saved team alone is empty here"
     );
 }

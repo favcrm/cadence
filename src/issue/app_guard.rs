@@ -5,51 +5,110 @@
 //! independent review → merge → `cadence app update` → operator
 //! re-approval for structural changes). There is no dedicated "Improve
 //! this app" feature. The one exception is the app's own team: an agent
-//! the operator assigned to a role of an installation (`cadence app
-//! set-team`, the saved team on the install record) — or that a run's
-//! frozen role inputs name — never authors a change to that app's
-//! source, because that is an agent widening the scope it was given.
+//! the operator assigned to an installation's team never authors a
+//! change to that app's source, and never reviews one.
 //!
-//! What counts as a change to an app's source:
+//! **What a change touches.** A repo-relative path under `apps/<name>/`
+//! (a ticket's planned `paths:`, a plan naming the path, a PR's changed
+//! files), or a repository an installation pinned as the app's git
+//! source — `app.md` and `workflows/…` at that repository's root need no
+//! `apps/<name>/` directory.
 //!
-//! - a repo-relative path under `apps/<name>/` (a ticket's planned
-//!   `paths:`, a plan that names the path, a PR's changed files);
-//! - the app's git source, when the install record pinned one
-//!   ([`crate::issue::app::Source::Git`]) — a PR to that repository.
+//! **Who is on the team**, from every installation of that app name in
+//! any project — membership is by agent alias, never by a role key, so
+//! renaming a role cannot launder an author, and a ticket in another
+//! project cannot either:
 //!
-//! Who is on the team:
-//!
-//! - the saved team roles of **every** project's install record for
-//!   that app name — membership is by agent alias, never by the role
-//!   key, so renaming a role cannot launder an author, and a ticket in
-//!   another project cannot either;
-//! - with a store, the role inputs of that installation's runs and the
-//!   agents those runs assigned. The run snapshot is frozen at creation,
-//!   so this reads what the run actually named, never the current
+//! - the saved team roles of a legacy project install
+//!   (`<pm>/<project>/apps/<name>.yaml` → `team`);
+//! - the saved team of a workspace installation
+//!   (`.apps/installations/<id>/record.yaml` + the daemon's
+//!   `app-teams.json`, read through the same [`team_of`] the app-run
+//!   RPC uses);
+//! - with a store, each installation's frozen run role inputs and the
+//!   agents its runs assigned — the run snapshot, never the current
 //!   workflow.
 //!
-//! The guard is applied at the earliest seam that knows the app and the
-//! author — `dispatch::run`'s preflight (the ticket's planned paths),
-//! `plan_propose` (the plan's text and its proposer) — and again at the
-//! review loop, where the PR's own changed files are the evidence
-//! (`delivery_rpc`). The CLI-side seams read the saved team only (no
-//! store connection); the daemon adds the run-time half.
+//! **Where it is enforced.** The daemon's own dispatch admission
+//! (`dispatch_send`) with the connection-derived caller and the target
+//! worker; `plan_propose`, including a grant's rendered plan before any
+//! admission side effect; the review loop (the PR's own changed files
+//! plus known git sources), where unavailable evidence holds the record
+//! instead of passing it; review routing and the verdict.
 //!
-//! Fail closed: an install record that cannot be read, or a run snapshot
-//! that cannot be parsed, refuses — it is never read as "no team".
+//! Fail closed: an install record, a team store or a run snapshot that
+//! cannot be read refuses — it is never read as "no team".
 
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::issue::{app, model, project};
 
+/// The three inputs every gate needs: the tracker, the daemon state dir
+/// (the workspace team store) and, where one is open, the store (run
+/// membership). A CLI seam passes what it has; the daemon passes all.
+#[derive(Clone, Copy)]
+pub struct Ctx<'a> {
+    pub pm_dir: &'a Path,
+    pub state_dir: Option<&'a Path>,
+    pub store: Option<&'a crate::store::Store>,
+}
+
+impl<'a> Ctx<'a> {
+    /// The tracker alone — no workspace team store, no run membership.
+    pub fn tracker(pm_dir: &'a Path) -> Self {
+        Self {
+            pm_dir,
+            state_dir: None,
+            store: None,
+        }
+    }
+}
+
+/// What the guard knows about a change: nothing to check, the apps it
+/// conclusively touches, or evidence it could not read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Evidence {
+    /// No author or reviewer is on any app's team and no app takes its
+    /// source from this repository — the question did not arise.
+    NotApplicable,
+    Known {
+        apps: BTreeSet<String>,
+        /// The apps among them recognised by their pinned git source.
+        from_git: BTreeSet<String>,
+    },
+    Unavailable(String),
+}
+
+/// One installation of an app: where it lives, where its bytes come
+/// from, and the agents on its team.
+#[derive(Clone, Debug)]
+pub struct Install {
+    pub app: String,
+    pub project: Option<String>,
+    pub install_id: String,
+    /// The normalized remote of a `Source::Git` install, if any.
+    pub git: Option<String>,
+    pub team: BTreeSet<String>,
+}
+
 /// The app a repo-relative path belongs to: `apps/<name>[/…]` → `<name>`.
-/// A leading `./` or `/` is dropped; any other shape (a deeper `apps/`
-/// component, a `..` escape, a name that is not tag-shaped) is not an
-/// app path.
+/// Leading `./` and `/` segments are dropped; a deeper `apps/` component
+/// (`src/apps/x/`), a `..` escape or a name that is not tag-shaped is
+/// not an app path.
 pub fn app_in_path(path: &str) -> Option<String> {
-    let path = path.trim().trim_start_matches("./").trim_start_matches('/');
+    let mut path = path.trim();
+    loop {
+        let next = path
+            .strip_prefix("./")
+            .or_else(|| path.strip_prefix('/'))
+            .unwrap_or(path);
+        if next == path {
+            break;
+        }
+        path = next;
+    }
     let mut parts = path.split('/');
     if parts.next() != Some(app::DIR) {
         return None;
@@ -58,47 +117,36 @@ pub fn app_in_path(path: &str) -> Option<String> {
     model::valid_tag(name).then(|| name.to_string())
 }
 
-/// Every app named by `paths` — the ticket's declared files, or a PR's
+/// Every app named by `paths` — a ticket's declared files, or a PR's
 /// changed files.
 pub fn apps_in_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
     paths.into_iter().filter_map(app_in_path).collect()
 }
 
-/// Every app a plan's prose names as `apps/<name>/` — a plan ticket has
-/// no `paths:` field, so the path it names is the only evidence a plan
-/// touches an app. Only the exact `apps/<name>/` spelling counts.
+/// Every app a plan's prose names as a source path. A plan ticket has no
+/// `paths:` field, so the path it writes is the evidence it touches the
+/// app. Tokens are normalized first, so `./apps/<name>/` counts exactly
+/// like `apps/<name>/`, while a genuinely nested `src/apps/<name>/`
+/// stays out.
 pub fn apps_in_text(text: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let mut from = 0;
-    while let Some(rel) = text[from..].find(&format!("{}/", app::DIR)) {
-        let at = from + rel;
-        from = at + app::DIR.len() + 1;
-        // The token must start a path: `src/apps/x/` and `myapps/x/`
-        // are not the tracker's `apps/`.
-        let boundary = text[..at]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-')));
-        if !boundary {
-            continue;
-        }
-        let rest = &text[from..];
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
-            .collect();
-        if !name.is_empty() && rest[name.len()..].starts_with('/') && model::valid_tag(&name) {
-            out.insert(name);
-        }
-    }
-    out
+    text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '<' | '>'
+            )
+    })
+    .filter_map(|token| {
+        let token = token.trim_matches(|c: char| {
+            !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_'))
+        });
+        (!token.is_empty()).then_some(token).and_then(app_in_path)
+    })
+    .collect()
 }
 
-/// `(project, app)` for every install record in the tracker — the
-/// enumeration the guard walks, so a ticket in another project cannot
-/// hide a team from it. A record that cannot be listed is skipped; a
-/// record that cannot be read refuses in [`installs`].
-fn installed_apps(pm_dir: &Path) -> Result<Vec<(String, String)>> {
+/// `(project, app)` for every legacy install record in the tracker.
+fn legacy_apps(pm_dir: &Path) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     for p in project::list(pm_dir)? {
         let dir = pm_dir.join(&p.key).join(app::DIR);
@@ -113,11 +161,10 @@ fn installed_apps(pm_dir: &Path) -> Result<Vec<(String, String)>> {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            let Some(stem) = name.strip_suffix(".yaml") else {
-                continue;
-            };
-            if model::valid_tag(stem) {
-                out.push((p.key.clone(), stem.to_string()));
+            if let Some(stem) = name.strip_suffix(".yaml") {
+                if model::valid_tag(stem) {
+                    out.push((p.key.clone(), stem.to_string()));
+                }
             }
         }
     }
@@ -125,31 +172,110 @@ fn installed_apps(pm_dir: &Path) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// Every installed app's team in one walk: app name → the agents on its
-/// team in any project. The saved team roles, plus — when a store is
-/// given — each installation's run role inputs and the agents its runs
-/// assigned. An unreadable record or run snapshot refuses: "no team" is
-/// never inferred from a file the guard could not read.
-pub fn teams(
-    pm_dir: &Path,
-    store: Option<&crate::store::Store>,
-) -> Result<std::collections::BTreeMap<String, BTreeSet<String>>> {
-    let mut out: std::collections::BTreeMap<String, BTreeSet<String>> = Default::default();
-    for (project_key, app_name) in installed_apps(pm_dir)? {
-        let record = app::read_record(pm_dir, &project_key, &app_name)?;
-        let team = out.entry(app_name.clone()).or_default();
-        team.extend(record.team.values().cloned());
-        let Some(store) = store else { continue };
-        // The roles a run input can name: the saved team's keys and the
-        // roles the app's workflows declare. An unreadable workflow only
-        // drops that source; the saved keys still cover it.
-        let mut roles: BTreeSet<String> = record.team.keys().cloned().collect();
-        roles.extend(app::team_roles(pm_dir, &project_key, &app_name).unwrap_or_default());
-        for (inputs, assigned) in store.app_run_team_inputs(&record.install_id)? {
-            team.extend(assigned);
-            for (role, alias) in inputs {
-                if roles.contains(&role) {
-                    team.insert(alias);
+/// `.apps/installations/<id>/record.yaml` — the workspace registry. A
+/// directory without a readable record is not an installation (the
+/// catalog's own rule); a record that will not parse refuses.
+fn workspace_records(pm_dir: &Path) -> Result<Vec<(String, app::Record)>> {
+    let root = pm_dir.join(".apps").join("installations");
+    if root.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Ok(Vec::new());
+    }
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let id = entry.file_name().to_string_lossy().to_string();
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        crate::issue::app_catalog::InstallationId::parse(&id)?;
+        dirs.push((id, entry.path()));
+    }
+    dirs.sort();
+    for (id, dir) in dirs {
+        let file = dir.join("record.yaml");
+        if file.symlink_metadata().is_err() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).map_err(|e| {
+            Error::rejected(format!(
+                "workspace installation {id}: its record cannot be read ({e}) — the \
+                 app-team guard cannot decide who is on its team"
+            ))
+        })?;
+        let record: app::Record = serde_yaml::from_str(&text).map_err(|e| {
+            Error::rejected(format!(
+                "workspace installation {id}: its record is not valid ({e})"
+            ))
+        })?;
+        if record.install_id.is_empty() {
+            let mut record = record;
+            record.install_id = id;
+            out.push((record.install_id.clone(), record));
+        } else {
+            out.push((record.install_id.clone(), record));
+        }
+    }
+    Ok(out)
+}
+
+fn git_of(record: &app::Record) -> Option<String> {
+    match &record.source {
+        app::Source::Git { url, .. } => Some(project::normalize_remote(url).to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// Every installation of every app, in any project, with its resolved
+/// team.
+pub fn installations(ctx: Ctx) -> Result<Vec<Install>> {
+    let mut out: Vec<Install> = Vec::new();
+    for (project_key, name) in legacy_apps(ctx.pm_dir)? {
+        let record = app::read_record(ctx.pm_dir, &project_key, &name)?;
+        out.push(Install {
+            app: name,
+            project: Some(project_key),
+            install_id: record.install_id.clone(),
+            git: git_of(&record),
+            team: record.team.values().cloned().collect(),
+        });
+    }
+    for (id, record) in workspace_records(ctx.pm_dir)? {
+        let mut team: BTreeSet<String> = record.team.values().cloned().collect();
+        if let Some(state) = ctx.state_dir {
+            if let Some(saved) = crate::daemon::app_teams_rpc::team_of(state, &id)? {
+                team.extend(saved.roles.values().cloned());
+            }
+        }
+        out.push(Install {
+            app: record.app.clone(),
+            // A workspace installation has no project link in its record.
+            project: None,
+            install_id: id,
+            git: git_of(&record),
+            team,
+        });
+    }
+    if let Some(store) = ctx.store {
+        for install in &mut out {
+            // The roles a run input can name: the saved team's keys and
+            // the roles the app's workflows declare (legacy installs
+            // have a project; a workspace install's snapshot still
+            // carries the agents it assigned).
+            let mut roles: BTreeSet<String> = install.team.clone();
+            if let Some(project_key) = install.project.as_deref() {
+                roles.extend(
+                    app::team_roles(ctx.pm_dir, project_key, &install.app).unwrap_or_default(),
+                );
+            }
+            for (inputs, assigned) in store.app_run_team_inputs(&install.install_id)? {
+                install.team.extend(assigned);
+                for (role, alias) in inputs {
+                    if roles.contains(&role) {
+                        install.team.insert(alias);
+                    }
                 }
             }
         }
@@ -157,143 +283,138 @@ pub fn teams(
     Ok(out)
 }
 
-/// Every installation of `app`, in any project, with its record. An
-/// unreadable record refuses: "no team" is never inferred from a file
-/// the guard could not read.
-pub fn installs(pm_dir: &Path, app: &str) -> Result<Vec<(String, app::Record)>> {
-    let mut out = Vec::new();
-    for (project_key, name) in installed_apps(pm_dir)? {
-        if name != app {
-            continue;
-        }
-        out.push((
-            project_key.clone(),
-            app::read_record(pm_dir, &project_key, &name)?,
-        ));
+/// Every installed app's team in one walk: app name → the agents on its
+/// team in any project, from any installation.
+pub fn teams(ctx: Ctx) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for install in installations(ctx)? {
+        out.entry(install.app).or_default().extend(install.team);
     }
     Ok(out)
 }
 
 /// The agents on `app`'s team in any project.
-pub fn team_agents(
-    pm_dir: &Path,
-    app: &str,
-    store: Option<&crate::store::Store>,
-) -> Result<BTreeSet<String>> {
-    Ok(teams(pm_dir, store)?.remove(app).unwrap_or_default())
+pub fn team_agents(ctx: Ctx, app: &str) -> Result<BTreeSet<String>> {
+    Ok(teams(ctx)?.remove(app).unwrap_or_default())
 }
 
 /// The apps, in any project, whose team names `agent`.
-pub fn apps_of_agent(
-    pm_dir: &Path,
-    agent: &str,
-    store: Option<&crate::store::Store>,
-) -> Result<BTreeSet<String>> {
-    Ok(teams(pm_dir, store)?
+pub fn apps_of_agent(ctx: Ctx, agent: &str) -> Result<BTreeSet<String>> {
+    Ok(teams(ctx)?
         .into_iter()
         .filter(|(_, team)| team.contains(agent))
         .map(|(app, _)| app)
         .collect())
 }
 
-/// The plain refusal when `author` is on `app`'s team: names the agent,
-/// the app, the project and the change, and says who takes it instead.
-pub fn refusal(
-    pm_dir: &Path,
-    app: &str,
-    touched: &str,
-    author: &str,
-    store: Option<&crate::store::Store>,
-) -> Result<Option<String>> {
-    if !team_agents(pm_dir, app, store)?.contains(author) {
-        return Ok(None);
-    }
-    Ok(Some(author_reason(pm_dir, app, touched, author)?))
+/// The apps installed from the repository `slug` (`owner/name`) — the
+/// app's own git source, whatever its directory layout.
+pub fn apps_from_git_source(ctx: Ctx, slug: &str) -> Result<BTreeSet<String>> {
+    let want = project::normalize_remote(&format!("github.com/{slug}")).to_ascii_lowercase();
+    Ok(installations(ctx)?
+        .into_iter()
+        .filter(|i| i.git.as_deref() == Some(want.as_str()))
+        .map(|i| i.app)
+        .collect())
 }
 
-fn author_reason(pm_dir: &Path, app: &str, touched: &str, author: &str) -> Result<String> {
+/// The apps installed from any of `remotes` (already normalized, or raw
+/// — both are compared normalized).
+pub fn apps_from_remotes(ctx: Ctx, remotes: &[String]) -> Result<BTreeSet<String>> {
+    let want: BTreeSet<String> = remotes
+        .iter()
+        .map(|r| project::normalize_remote(r).to_ascii_lowercase())
+        .filter(|r| !r.is_empty())
+        .collect();
+    if want.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    Ok(installations(ctx)?
+        .into_iter()
+        .filter(|i| i.git.as_ref().is_some_and(|g| want.contains(g)))
+        .map(|i| i.app)
+        .collect())
+}
+
+/// The plain refusal when `author` is on `app`'s team: names the agent,
+/// the app, where it is installed, and the change, and says who takes it
+/// instead.
+pub fn refusal(ctx: Ctx, app: &str, touched: &str, author: &str) -> Result<Option<String>> {
+    if !team_agents(ctx, app)?.contains(author) {
+        return Ok(None);
+    }
+    Ok(Some(author_reason(ctx, app, touched, author)?))
+}
+
+fn author_reason(ctx: Ctx, app: &str, touched: &str, author: &str) -> Result<String> {
     Ok(format!(
         "{author} is on app '{app}'s team ({}) and cannot author a change to that app's \
          source ({touched}) — app changes are ordinary work for the master or any agent \
          not on the app's team (plan → branch → independent review → merge → \
          `cadence app update`), never for the app's own team",
-        projects_of(pm_dir, app)?
+        where_installed(ctx, app)?
     ))
 }
 
-/// The plain refusal when `reviewer` is on `app`'s team: a reviewer
-/// independent of the change, and of the app's own team, files the
-/// verdict.
-pub fn review_refusal(
-    pm_dir: &Path,
-    app: &str,
-    reviewer: &str,
-    store: Option<&crate::store::Store>,
-) -> Result<Option<String>> {
-    if !team_agents(pm_dir, app, store)?.contains(reviewer) {
+/// The plain refusal when `reviewer` is on `app`'s team.
+pub fn review_refusal(ctx: Ctx, app: &str, reviewer: &str) -> Result<Option<String>> {
+    if !team_agents(ctx, app)?.contains(reviewer) {
         return Ok(None);
     }
     Ok(Some(format!(
         "{reviewer} is on app '{app}'s team ({}) and cannot review a change to that app's \
-         source ({}/{app}/) — the review goes to an agent independent of the app's own team",
-        projects_of(pm_dir, app)?,
-        app::DIR
+         source — the review goes to an agent independent of the app's own team",
+        where_installed(ctx, app)?
     )))
 }
 
-fn projects_of(pm_dir: &Path, app: &str) -> Result<String> {
-    Ok(installs(pm_dir, app)?
-        .into_iter()
-        .map(|(project, _)| project)
-        .collect::<Vec<_>>()
-        .join(", "))
+fn where_installed(ctx: Ctx, app: &str) -> Result<String> {
+    let mut where_: Vec<String> = Vec::new();
+    for install in installations(ctx)? {
+        if install.app != app {
+            continue;
+        }
+        where_.push(match &install.project {
+            Some(project) => format!("project {project}"),
+            None => format!("installation {}", install.install_id),
+        });
+    }
+    where_.dedup();
+    Ok(where_.join(", "))
 }
 
-/// [`refusal`] for any of `apps`, each named by its `apps/<name>/`
-/// source path. The first app whose team names an author answers; a
-/// clean change answers `None`.
+/// [`refusal`] for any of `apps` plus every app installed from one of
+/// `remotes`, each named by its source path. The first app whose team
+/// names an author answers; a clean change answers `None`.
 pub fn refusals(
-    pm_dir: &Path,
+    ctx: Ctx,
     apps: &BTreeSet<String>,
     authors: &[&str],
-    store: Option<&crate::store::Store>,
+    remotes: &[String],
 ) -> Result<Option<String>> {
+    let mut apps = apps.clone();
+    apps.extend(apps_from_remotes(ctx, remotes)?);
     if apps.is_empty() {
         return Ok(None);
     }
-    let teams = teams(pm_dir, store)?;
-    for app in apps {
-        let Some(team) = teams.get(app) else {
-            continue;
-        };
+    let teams = teams(ctx)?;
+    let git: BTreeSet<String> = installations(ctx)?
+        .into_iter()
+        .filter_map(|i| i.git.map(|_| i.app))
+        .collect();
+    for app in &apps {
+        let Some(team) = teams.get(app) else { continue };
         let Some(author) = authors.iter().find(|a| !a.is_empty() && team.contains(**a)) else {
             continue;
         };
-        return Ok(Some(author_reason(
-            pm_dir,
-            app,
-            &format!("{}/{app}/", app::DIR),
-            author,
-        )?));
+        let touched = if git.contains(app) {
+            "its pinned git source".to_string()
+        } else {
+            format!("{}/{app}/", app::DIR)
+        };
+        return Ok(Some(author_reason(ctx, app, &touched, author)?));
     }
     Ok(None)
-}
-
-/// The app names `pr`'s repository is the git source of — an install
-/// pinned to a git URL whose repository is this one. Empty when no
-/// installation takes its source from `slug`.
-pub fn apps_from_git_source(pm_dir: &Path, slug: &str) -> Result<BTreeSet<String>> {
-    let want = project::normalize_remote(&format!("github.com/{slug}")).to_ascii_lowercase();
-    let mut out = BTreeSet::new();
-    for (project_key, name) in installed_apps(pm_dir)? {
-        let record = app::read_record(pm_dir, &project_key, &name)?;
-        if let app::Source::Git { url, .. } = &record.source {
-            if project::normalize_remote(url).to_ascii_lowercase() == want {
-                out.insert(name);
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// A refusal-shaped error for the caller that returns `Result`.
@@ -306,8 +427,89 @@ mod tests {
     use super::*;
     use crate::issue::Pm;
 
-    fn tag(name: &str) -> String {
-        name.to_string()
+    fn tracker() -> (tempfile::TempDir, Pm) {
+        let dir = tempfile::Builder::new().prefix("c622").tempdir().unwrap();
+        let pm = Pm::init(&dir.path().join("pm")).unwrap();
+        for (key, prefix) in [("demo", "DEM"), ("other", "OTH")] {
+            crate::issue::write::project_add(&pm, key, prefix, &[], &[], &[], None).unwrap();
+        }
+        (dir, pm)
+    }
+
+    fn record(
+        name: &str,
+        install_id: &str,
+        source: app::Source,
+        team: &[(&str, &str)],
+    ) -> app::Record {
+        app::Record {
+            schema: 1,
+            app: name.to_string(),
+            install_id: install_id.to_string(),
+            source,
+            bindings: Default::default(),
+            team: team
+                .iter()
+                .map(|(role, alias)| (role.to_string(), alias.to_string()))
+                .collect(),
+            installed_at: "2026-01-01T00:00:00Z".into(),
+            installed_by: "operator".into(),
+            updated_at: None,
+            removed: None,
+            restore_after: None,
+            purge_after: None,
+            catalogue: None,
+        }
+    }
+
+    fn install(pm: &Pm, project: &str, name: &str, team: &[(&str, &str)]) {
+        let dir = pm.dir.join(project).join(app::DIR);
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        std::fs::write(
+            dir.join(name).join(app::MANIFEST),
+            format!("---\napp: {name}\ntitle: T\nversion: '1'\nneeds:\n  connections: []\n---\n\nGuide\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.yaml")),
+            serde_yaml::to_string(&record(
+                name,
+                &format!("{project}-{name}"),
+                app::Source::Path { path: "x".into() },
+                team,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A workspace installation: `.apps/installations/<id>/record.yaml`
+    /// with no project, its team in the daemon's `app-teams.json`.
+    fn workspace_install(pm: &Pm, state: &Path, id: &str, name: &str, roles: &[(&str, &str)]) {
+        let dir = pm.dir.join(".apps").join("installations").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("record.yaml"),
+            serde_yaml::to_string(&record(
+                name,
+                id,
+                app::Source::Git {
+                    url: "https://github.com/acme/app-repo".into(),
+                    sha: "0".repeat(40),
+                    dir: None,
+                },
+                &[],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let teams = serde_json::json!({"schema": 1, "teams": {id: {
+            "owner_pm": "lead",
+            "roles": roles.iter().map(|(r, a)| (r.to_string(), a.to_string())).collect::<std::collections::BTreeMap<_,_>>(),
+            "revision": 1,
+        }}});
+        std::fs::create_dir_all(state).unwrap();
+        std::fs::write(state.join("app-teams.json"), teams.to_string()).unwrap();
     }
 
     #[test]
@@ -325,8 +527,6 @@ mod tests {
             app_in_path("/apps/crm/workflows/x.md").as_deref(),
             Some("crm")
         );
-        // Not an app path: another `apps/` depth, a sibling, an escape,
-        // a name that is not tag-shaped.
         assert_eq!(app_in_path("src/apps/x/app.md"), None);
         assert_eq!(app_in_path("appstore/x"), None);
         assert_eq!(app_in_path("apps/../etc/passwd"), None);
@@ -335,109 +535,90 @@ mod tests {
     }
 
     #[test]
-    fn cad622_apps_in_text_needs_the_exact_source_spelling() {
-        let text = "Touch `apps/social-content/app.md` and apps/blog-post/workflows/post.md. \
-                    Not apps/, not src/apps/x/, not apps/Upper/, and apps/crm is a bare name.";
+    fn cad622_apps_in_text_normalizes_the_source_spelling() {
+        let text = "Touch `apps/social-content/app.md`, ./apps/blog-post/workflows/post.md \
+                    and (./apps/crm/app.md). Not src/apps/x/app.md, not apps/, not apps/Upper/.";
         let apps = apps_in_text(text);
-        assert_eq!(
-            apps,
-            [tag("blog-post"), tag("social-content")]
-                .into_iter()
-                .collect()
-        );
-    }
-
-    /// A tracker with two projects and one app installed in each, with
-    /// the saved team the operator set.
-    fn tracker() -> (tempfile::TempDir, Pm) {
-        let dir = tempfile::Builder::new().prefix("c622").tempdir().unwrap();
-        let pm = Pm::init(&dir.path().join("pm")).unwrap();
-        for (key, prefix) in [("demo", "DEM"), ("other", "OTH")] {
-            crate::issue::write::project_add(&pm, key, prefix, &[], &[], &[], None).unwrap();
-        }
-        (dir, pm)
-    }
-
-    fn install(pm: &Pm, project: &str, name: &str, team: &[(&str, &str)]) {
-        let dir = pm.dir.join(project).join(app::DIR);
-        std::fs::create_dir_all(dir.join(name)).unwrap();
-        std::fs::write(
-            dir.join(name).join(app::MANIFEST),
-            format!("---\napp: {name}\ntitle: T\nversion: '1'\nneeds:\n  connections: []\n---\n\nGuide\n"),
-        )
-        .unwrap();
-        let record = app::Record {
-            schema: 1,
-            app: name.to_string(),
-            install_id: format!("{project}-{name}"),
-            source: app::Source::Path {
-                path: format!("tests/fixtures/apps/{name}"),
-            },
-            bindings: Default::default(),
-            team: team
-                .iter()
-                .map(|(role, alias)| (role.to_string(), alias.to_string()))
-                .collect(),
-            installed_at: "2026-01-01T00:00:00Z".into(),
-            installed_by: "operator".into(),
-            updated_at: None,
-            removed: None,
-            restore_after: None,
-            purge_after: None,
-            catalogue: None,
-        };
-        std::fs::write(
-            dir.join(format!("{name}.yaml")),
-            serde_yaml::to_string(&record).unwrap(),
-        )
-        .unwrap();
+        let want: BTreeSet<String> = ["blog-post", "crm", "social-content"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(apps, want);
     }
 
     #[test]
     fn cad622_a_team_agent_is_refused_and_another_agent_is_allowed() {
         let (_root, pm) = tracker();
         install(&pm, "demo", "social-content", &[("writer", "w1")]);
+        let ctx = Ctx::tracker(&pm.dir);
         let apps = apps_in_paths(["apps/social-content/app.md"]);
-        let why = refusals(&pm.dir, &apps, &["w1"], None).unwrap().unwrap();
-        assert!(
-            why.contains("w1 is on app 'social-content's team (demo)"),
-            "{why}"
+        let why = refusals(ctx, &apps, &["w1"], &[]).unwrap().unwrap();
+        assert!(why.contains("w1 is on app 'social-content's team"), "{why}");
+        assert!(why.contains("project demo"), "{why}");
+        assert_eq!(refusals(ctx, &apps, &["master", "w2"], &[]).unwrap(), None);
+    }
+
+    #[test]
+    fn cad622_a_workspace_installation_team_is_read_from_the_daemon_store() {
+        let (root, pm) = tracker();
+        let state = root.path().join("state");
+        workspace_install(
+            &pm,
+            &state,
+            "inst-w1",
+            "social-content",
+            &[("writer", "w1")],
         );
-        assert!(why.contains("apps/social-content/"), "{why}");
-        assert!(why.contains("cannot author"), "{why}");
-        // A positive control: the guard never refuses everyone.
+        let ctx = Ctx {
+            pm_dir: &pm.dir,
+            state_dir: Some(&state),
+            store: None,
+        };
+        // The saved team is not in the record — only in app-teams.json.
+        assert!(teams(ctx).unwrap()["social-content"].contains("w1"));
+        let apps = apps_in_paths(["apps/social-content/app.md"]);
+        assert!(refusals(ctx, &apps, &["w1"], &[]).unwrap().is_some());
+        // And the pinned git source is recognised with no apps/<name>/ dir.
         assert_eq!(
-            refusals(&pm.dir, &apps, &["master", "w2"], None).unwrap(),
-            None
+            apps_from_git_source(ctx, "acme/app-repo").unwrap(),
+            ["social-content".to_string()].into_iter().collect()
         );
+        assert!(refusals(
+            ctx,
+            &BTreeSet::new(),
+            &["w1"],
+            &["github.com/acme/app-repo".into()]
+        )
+        .unwrap()
+        .is_some());
+        // Without the state dir the saved team is not visible — the
+        // seam that lacks the store says so by refusing nothing.
+        let blind = Ctx::tracker(&pm.dir);
+        assert!(teams(blind).unwrap()["social-content"].is_empty());
     }
 
     #[test]
     fn cad622_renaming_the_role_does_not_launder_the_author() {
         let (_root, pm) = tracker();
-        // The same alias under a role key nobody would recognise: the
-        // guard reads the aliases, so the key is irrelevant.
         install(&pm, "demo", "social-content", &[("author", "w1")]);
+        let ctx = Ctx::tracker(&pm.dir);
         let apps = apps_in_paths(["apps/social-content/workflows/post.md"]);
-        let why = refusals(&pm.dir, &apps, &["w1"], None).unwrap();
-        assert!(why.is_some(), "a renamed role must not hide the agent");
-        // And a role key that looks like another agent does not bar it.
+        assert!(refusals(ctx, &apps, &["w1"], &[]).unwrap().is_some());
         install(&pm, "other", "blog-post", &[("w1", "w9")]);
         let apps = apps_in_paths(["apps/blog-post/app.md"]);
-        assert_eq!(refusals(&pm.dir, &apps, &["w1"], None).unwrap(), None);
+        assert_eq!(refusals(ctx, &apps, &["w1"], &[]).unwrap(), None);
     }
 
     #[test]
     fn cad622_another_project_cannot_hide_the_team() {
         let (_root, pm) = tracker();
-        // The team lives with the install in `demo`; the change is a
-        // ticket of `other` (paths are repo-relative, project-free).
         install(&pm, "demo", "social-content", &[("writer", "w1")]);
+        let ctx = Ctx::tracker(&pm.dir);
         let apps = apps_in_paths(["apps/social-content/app.md"]);
-        let why = refusals(&pm.dir, &apps, &["w1"], None).unwrap().unwrap();
-        assert!(why.contains("(demo)"), "{why}");
-        assert_eq!(apps_of_agent(&pm.dir, "w1", None).unwrap().len(), 1);
-        assert!(apps_of_agent(&pm.dir, "w2", None).unwrap().is_empty());
+        let why = refusals(ctx, &apps, &["w1"], &[]).unwrap().unwrap();
+        assert!(why.contains("project demo"), "{why}");
+        assert_eq!(apps_of_agent(ctx, "w1").unwrap().len(), 1);
+        assert!(apps_of_agent(ctx, "w2").unwrap().is_empty());
     }
 
     #[test]
@@ -452,10 +633,8 @@ mod tests {
             "not: a record\n",
         )
         .unwrap();
+        let ctx = Ctx::tracker(&pm.dir);
         let apps = apps_in_paths(["apps/social-content/app.md"]);
-        assert!(
-            refusals(&pm.dir, &apps, &["w2"], None).is_err(),
-            "an unreadable record is never read as no team"
-        );
+        assert!(refusals(ctx, &apps, &["w2"], &[]).is_err());
     }
 }

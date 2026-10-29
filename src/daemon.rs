@@ -51,7 +51,7 @@ mod cad811_screen_services_acceptance;
 
 mod app_screens_rpc;
 mod app_social_drafts_rpc;
-mod app_teams_rpc;
+pub(crate) mod app_teams_rpc;
 mod app_tools_rpc;
 mod approvals_rpc;
 mod area_rpc;

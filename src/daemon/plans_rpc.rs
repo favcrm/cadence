@@ -219,12 +219,19 @@ impl Shared {
         // that app. The saved team and the installation's run role
         // inputs are both read here; a refusal writes nothing.
         let planned = crate::issue::app_guard::apps_in_text(&text);
-        if let Some(why) = crate::issue::app_guard::refusals(
-            &pm.dir,
-            &planned,
-            &[actor.as_str()],
-            Some(&self.store),
-        )? {
+        let remotes: Vec<String> = crate::issue::project::list(&pm.dir)?
+            .into_iter()
+            .find(|p| p.key == project)
+            .map(|p| p.repos.iter().filter_map(|r| r.remote.clone()).collect())
+            .unwrap_or_default();
+        let guard = crate::issue::app_guard::Ctx {
+            pm_dir: &pm.dir,
+            state_dir: Some(&self.state_dir),
+            store: Some(&self.store),
+        };
+        if let Some(why) =
+            crate::issue::app_guard::refusals(guard, &planned, &[actor.as_str()], &remotes)?
+        {
             return Err(Error::rejected(why));
         }
         let allow = crate::secret::Allowlist::load(&self.state_dir)?;

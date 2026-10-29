@@ -1343,6 +1343,25 @@ impl Shared {
                 ),
             ));
         }
+        // CAD-622: the grant authorizes a workflow, never an app's own
+        // team authoring a change to that app. The guard runs on the
+        // exact render the grant bound — before any admission side
+        // effect (fresh, recovered or reused) — and membership can have
+        // changed since the grant was issued.
+        let app_paths = crate::issue::app_guard::apps_in_text(&rendered);
+        let guard = crate::issue::app_guard::Ctx {
+            pm_dir: &pm_dir,
+            state_dir: Some(&self.state_dir),
+            store: Some(&self.store),
+        };
+        if let Some(why) = crate::issue::app_guard::refusals(
+            guard,
+            &app_paths,
+            &[actor],
+            std::slice::from_ref(&grant.repo),
+        )? {
+            return Err(Error::rejected(why));
+        }
         // The exact render is bound — everything below refuses rather
         // than falling back to an unapproved proposal.
         if !registered_repo(&pm_dir, project, &grant.repo)? {

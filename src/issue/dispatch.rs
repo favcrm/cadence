@@ -2123,11 +2123,21 @@ fn preflight(
     // team is read here (no store on this side); the run's role inputs
     // are applied by the daemon's plan and review seams.
     let app_paths = crate::issue::app_guard::apps_in_paths(front.paths.iter().map(String::as_str));
+    let remotes: Vec<String> = project
+        .repos
+        .iter()
+        .filter_map(|r| r.remote.clone())
+        .collect();
+    let guard = crate::issue::app_guard::Ctx {
+        pm_dir: &pm.dir,
+        state_dir: Some(state_dir),
+        store: None,
+    };
     if let Some(why) = crate::issue::app_guard::refusals(
-        &pm.dir,
+        guard,
         &app_paths,
         &[reply_to.as_str(), args.to.as_str()],
-        None,
+        &remotes,
     )? {
         return Err(Error::rejected(why));
     }

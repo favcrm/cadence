@@ -142,6 +142,35 @@ impl Shared {
         claim::check(&front, &requesters, None, VERB, || {
             claim::since(&pm.dir, &project.key, &front, Duration::from_secs(2))
         })?;
+        // CAD-622: an app's own team agents never author changes to that
+        // app's source. This is the daemon's own admission boundary — the
+        // caller is the connection-derived one (never a request field),
+        // and the target worker is named by the request; both are authors
+        // of the work the kickoff opens. The ticket's planned paths and
+        // the project's registered repositories (an app's pinned git
+        // source) are the evidence, and the store adds run membership.
+        let app_paths =
+            crate::issue::app_guard::apps_in_paths(front.paths.iter().map(String::as_str));
+        let remotes: Vec<String> = project
+            .repos
+            .iter()
+            .filter_map(|r| r.remote.clone())
+            .collect();
+        let caller_alias = match &caller {
+            AgentCaller::Agent(a) => Some(a.as_str()),
+            AgentCaller::Operator => None,
+        };
+        let mut authors: Vec<&str> = vec![alias.as_str()];
+        authors.extend(caller_alias);
+        let guard = crate::issue::app_guard::Ctx {
+            pm_dir: &pm.dir,
+            state_dir: Some(&self.state_dir),
+            store: Some(&self.store),
+        };
+        if let Some(why) = crate::issue::app_guard::refusals(guard, &app_paths, &authors, &remotes)?
+        {
+            return Err(Error::rejected(why));
+        }
         let worktree = self.dispatch_lane(VERB, &project, &front)?;
         if let Some(claimed) = optional_str(params, "worktree") {
             let want = Path::new(claimed)

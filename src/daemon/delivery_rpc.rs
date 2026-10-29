@@ -441,83 +441,106 @@ impl Shared {
                 "names {key}, which ticket {other} already holds in the review loop"
             )));
         }
-        // The app read costs a record walk and, only when the worker is
-        // on some app's team, one bounded `gh pr view --json files`.
-        let touched = self.pr_apps(pm, &rec.issue, pr, sha, &[rec.worker.as_str()])?;
-        rec.touched_apps = touched
-            .as_ref()
-            .map(|apps| apps.iter().cloned().collect::<Vec<_>>());
-        if let Some(apps) = &touched {
-            for app in apps {
-                if let Some(why) = crate::issue::app_guard::refusal(
-                    &pm.dir,
-                    app,
-                    &format!("{}/{app}/", crate::issue::app::DIR),
-                    &rec.worker,
-                    Some(&self.store),
-                )? {
-                    return Ok(Some(why));
+        // CAD-622: the apps this PR touches, and whether their teams name
+        // the worker. Unreadable evidence holds the report — it never
+        // admits an own-team author, and a known git source counts even
+        // when the diff cannot be read.
+        let evidence = self.resolve_apps(pm, &rec.issue, pr, sha, &[rec.worker.as_str()])?;
+        match &evidence {
+            crate::issue::app_guard::Evidence::Unavailable(why) => {
+                rec.touched_apps = None;
+                return Ok(Some(format!(
+                    "could not be checked against its app's team: {why} — the report is \
+                     held until the PR's own changed files can be read; re-file it once \
+                     GitHub answers"
+                )));
+            }
+            crate::issue::app_guard::Evidence::NotApplicable => {
+                rec.touched_apps = None;
+            }
+            crate::issue::app_guard::Evidence::Known { apps, from_git } => {
+                rec.touched_apps = Some(apps.iter().cloned().collect());
+                for app in apps {
+                    let touched = if from_git.contains(app) {
+                        "its pinned git source".to_string()
+                    } else {
+                        format!("{}/{app}/", crate::issue::app::DIR)
+                    };
+                    if let Some(why) = crate::issue::app_guard::refusal(
+                        crate::issue::app_guard::Ctx {
+                            pm_dir: &pm.dir,
+                            state_dir: Some(&self.state_dir),
+                            store: Some(&self.store),
+                        },
+                        app,
+                        &touched,
+                        &rec.worker,
+                    )? {
+                        return Ok(Some(why));
+                    }
                 }
             }
         }
         Ok(None)
     }
 
-    /// CAD-622: the apps this PR's head touches — its changed files
-    /// under `apps/<name>/`, plus any app whose install record pins
-    /// this PR's repository as its git source. `None` is no evidence
-    /// (no `aliases` is on any app's team and no app takes its source
-    /// from this repository, so nothing was read; or the file list could
-    /// not be read, or the tip moved mid-read), never "no app".
-    fn pr_apps(
+    /// CAD-622: what this PR's head touches — its changed files under
+    /// `apps/<name>/`, plus every app whose install record pins this
+    /// PR's repository as its git source. `NotApplicable` when nobody in
+    /// `aliases` is on any app's team and no app takes its source from
+    /// this repository (nothing was read); `Unavailable` when the app
+    /// question was asked and the diff could not answer — the caller
+    /// holds, never admits.
+    fn resolve_apps(
         &self,
         pm: &Pm,
         issue: &str,
         pr: &str,
         sha: &str,
         aliases: &[&str],
-    ) -> Result<Option<std::collections::BTreeSet<String>>> {
+    ) -> Result<crate::issue::app_guard::Evidence> {
+        use crate::issue::app_guard::{apps_from_git_source, apps_in_paths, teams, Evidence};
+        let guard = crate::issue::app_guard::Ctx {
+            pm_dir: &pm.dir,
+            state_dir: Some(&self.state_dir),
+            store: Some(&self.store),
+        };
         let (slug, _) = crate::issue::task_report::parse_pr_url(pr)?;
-        let mut apps = crate::issue::app_guard::apps_from_git_source(&pm.dir, &slug)?;
-        let teams = crate::issue::app_guard::teams(&pm.dir, Some(&self.store))?;
-        let interested = aliases
-            .iter()
-            .any(|alias| teams.values().any(|team| team.contains(*alias)));
-        if !interested && apps.is_empty() {
-            return Ok(None);
+        let from_git = apps_from_git_source(guard, &slug)?;
+        let interested = !from_git.is_empty()
+            || aliases.iter().any(|alias| {
+                teams(guard).is_ok_and(|t| t.values().any(|team| team.contains(*alias)))
+            });
+        if !interested {
+            return Ok(Evidence::NotApplicable);
         }
-        // The app-team question was asked and the diff could not answer:
-        // the guard is flagged (the record's note and a daemon event),
-        // never silently skipped. The review itself still proceeds — an
-        // offline `gh` must not stall the loop.
         let unavailable = |why: &str| {
             let _ = self.store.event_public(
                 DAEMON_ALIAS,
                 "review_app_guard_unavailable",
                 json!({"issue": issue, "pr": pr, "head": sha, "why": why}),
             );
+            Evidence::Unavailable(why.to_string())
         };
         let Ok(text) = delivery::gh(
             &self.delivery_gh.to_string_lossy(),
             &["pr", "view", pr, "--json", "files,headRefOid"],
         ) else {
-            unavailable("the PR's changed files could not be read");
-            return Ok(None);
+            return Ok(unavailable("the PR's changed files could not be read"));
         };
         let view: Value = serde_json::from_str(&text)
             .map_err(|e| Error::rejected(format!("gh pr view: unreadable ({e})")))?;
         if view["headRefOid"].as_str() != Some(sha) {
-            unavailable("the PR tip moved while its files were read");
-            return Ok(None);
+            return Ok(unavailable("the PR tip moved while its files were read"));
         }
         let Some(files) = view["files"].as_array() else {
-            unavailable("the PR read returned no file list");
-            return Ok(None);
+            return Ok(unavailable("the PR read returned no file list"));
         };
-        apps.extend(crate::issue::app_guard::apps_in_paths(
+        let mut apps = from_git.clone();
+        apps.extend(apps_in_paths(
             files.iter().filter_map(|f| f["path"].as_str()),
         ));
-        Ok(Some(apps))
+        Ok(Evidence::Known { apps, from_git })
     }
 
     /// The worker reported `sha` done on `pr`.
@@ -561,37 +584,51 @@ impl Shared {
 
     /// CAD-622: the candidates that are on the team of an app this
     /// head's PR touches — they never review a change to that app. The
-    /// app list is the one review routing already read (the record's
-    /// `touched_apps`); a record that carries none pays one bounded
-    /// `gh pr view --json files`, and no evidence bars nobody.
+    /// app set is resolved from the PR's own changed files (and known
+    /// git sources) and persisted on the record, so the verdict rechecks
+    /// the same head-bound evidence. `None` is unavailable evidence: the
+    /// caller holds the review rather than routing it unchecked.
     fn app_barred(
         &self,
         pm: &Pm,
-        rec: &Record,
+        rec: &mut Record,
         candidates: &[Candidate],
-    ) -> Result<std::collections::BTreeSet<String>> {
-        let teams = crate::issue::app_guard::teams(&pm.dir, Some(&self.store))?;
+    ) -> Result<Option<std::collections::BTreeSet<String>>> {
+        use crate::issue::app_guard::{teams, Evidence};
+        let guard = crate::issue::app_guard::Ctx {
+            pm_dir: &pm.dir,
+            state_dir: Some(&self.state_dir),
+            store: Some(&self.store),
+        };
+        let teams = teams(guard)?;
         let on_team: Vec<&String> = candidates
             .iter()
             .map(|c| &c.alias)
             .filter(|alias| teams.values().any(|team| team.contains(*alias)))
             .collect();
-        if on_team.is_empty() {
-            return Ok(Default::default());
+        if on_team.is_empty() && rec.touched_apps.is_none() {
+            return Ok(Some(Default::default()));
         }
-        let apps: std::collections::BTreeSet<String> = match &rec.touched_apps {
-            Some(apps) => apps.iter().cloned().collect(),
+        let evidence = match rec.touched_apps.as_ref() {
+            Some(apps) => Evidence::Known {
+                apps: apps.iter().cloned().collect(),
+                from_git: Default::default(),
+            },
             None => {
                 let (Some(pr), Some(head)) = (rec.pr.as_deref(), rec.head.as_deref()) else {
-                    return Ok(Default::default());
+                    return Ok(Some(Default::default()));
                 };
-                let aliases: Vec<&str> = on_team.iter().map(|a| a.as_str()).collect();
-                match self.pr_apps(pm, &rec.issue, pr, head, &aliases)? {
-                    Some(apps) => apps,
-                    None => return Ok(Default::default()),
-                }
+                let mut aliases: Vec<&str> = on_team.iter().map(|a| a.as_str()).collect();
+                aliases.push(rec.worker.as_str());
+                self.resolve_apps(pm, &rec.issue, pr, head, &aliases)?
             }
         };
+        let apps = match evidence {
+            Evidence::Unavailable(_) => return Ok(None),
+            Evidence::NotApplicable => Default::default(),
+            Evidence::Known { apps, .. } => apps,
+        };
+        rec.touched_apps = Some(apps.iter().cloned().collect());
         let mut barred = std::collections::BTreeSet::new();
         for app in &apps {
             let Some(team) = teams.get(app) else { continue };
@@ -601,7 +638,7 @@ impl Shared {
                 }
             }
         }
-        Ok(barred)
+        Ok(Some(barred))
     }
 
     /// The head moved without a done report from the worker: whoever
@@ -809,7 +846,24 @@ impl Shared {
         // CAD-622: an app's own team agent never reviews a change to that
         // app. The PR's own changed files name the app; only candidates
         // that are on some app's team pay for that read.
-        let barred = self.app_barred(pm, rec, &candidates)?;
+        let Some(barred) = self.app_barred(pm, rec, &candidates)? else {
+            // Unavailable evidence never routes an unchecked review: the
+            // record is held (Unstaffed) and the next pass retries the
+            // same read.
+            if rec.state != State::Unstaffed {
+                rec.enter(State::Unstaffed, now());
+                rec.note = Some(format!(
+                    "{sha} held from review: the PR's changed files could not be read, so \
+                     the app-team check cannot be made"
+                ));
+                let _ = self.store.event_public(
+                    DAEMON_ALIAS,
+                    "review_app_guard_held",
+                    json!({"issue": rec.issue, "sha": sha, "pr": pr}),
+                );
+            }
+            return Ok(());
+        };
         let mut excluded = rec.excluded.clone();
         excluded.extend(barred.iter().cloned());
         let Some(pick) = delivery::pick_reviewer(
@@ -992,14 +1046,45 @@ impl Shared {
             )));
         }
         // CAD-622: an app's own team agent never reviews a change to that
-        // app — the head's touched apps are what review routing saw.
-        if let Some(apps) = rec.touched_apps.as_ref() {
-            for app in apps {
-                if let Some(why) =
-                    crate::issue::app_guard::review_refusal(&pm.dir, app, &who, Some(&self.store))?
-                {
-                    return Err(Error::rejected(why));
+        // app. The head's app set is resolved now when routing did not
+        // persist one, membership is read fresh (an alias can join a team
+        // while a review is outstanding), and unavailable evidence holds
+        // the verdict rather than admitting it.
+        {
+            use crate::issue::app_guard::{review_refusal, Evidence};
+            let guard = crate::issue::app_guard::Ctx {
+                pm_dir: &pm.dir,
+                state_dir: Some(&self.state_dir),
+                store: Some(&self.store),
+            };
+            let evidence = match rec.touched_apps.as_ref() {
+                Some(apps) => Evidence::Known {
+                    apps: apps.iter().cloned().collect(),
+                    from_git: Default::default(),
+                },
+                None => match (rec.pr.as_deref(), rec.head.as_deref()) {
+                    (Some(pr), Some(head)) => {
+                        self.resolve_apps(&pm, id, pr, head, &[who.as_str(), rec.worker.as_str()])?
+                    }
+                    _ => Evidence::NotApplicable,
+                },
+            };
+            match evidence {
+                Evidence::Unavailable(why) => {
+                    return Err(Error::rejected(format!(
+                        "{id}'s verdict is held: the PR's changed files could not be read \
+                         ({why}) — the app-team check is never skipped; file it again when \
+                         GitHub answers"
+                    )));
                 }
+                Evidence::Known { apps, .. } => {
+                    for app in apps {
+                        if let Some(why) = review_refusal(guard, &app, &who)? {
+                            return Err(Error::rejected(why));
+                        }
+                    }
+                }
+                Evidence::NotApplicable => {}
             }
         }
         let head = rec.head.clone().unwrap_or_default();
