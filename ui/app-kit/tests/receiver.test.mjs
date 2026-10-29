@@ -652,3 +652,33 @@ test("an asset request without a timeout waits as before; a bad timeout is refus
     await assert.rejects(receiver.asset("media:2", { timeoutMs: bad }), TypeError);
   }
 });
+
+test("late replies for every ref the host can still hold are dropped, oldest first", async () => {
+  const { host, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const refs = Array.from({ length: 256 }, (_, i) => `media:${i}`);
+  await Promise.all(refs.map((ref) => assert.rejects(receiver.asset(ref, { timeoutMs: 20 }), ScreenTimeoutError)));
+  for (const ref of refs) host.postMessage({ v: 2, op: "asset", ref, data_url: PNG });
+  await tick();
+  await tick();
+  assert.deepEqual(errors, [], "the host answers in queue order; none tears down");
+});
+
+test("a call reply's asset_refs admit those refs; a reply without them (an older host) admits none", async () => {
+  const { host, inbox, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const ref = "draft-image:sdr-1:social.draft";
+  const old = receiver.call("social.drafts.show", { draft_id: "sdr-1" });
+  const first = await waitFor(() => inbox.find((m) => m.op === "call"), "the first call");
+  host.postMessage({ v: 2, op: "reply", id: first.id, ok: true, data: { draft_id: "sdr-1", asset_id: "ast-1" } });
+  assert.deepEqual(await old, { draft_id: "sdr-1", asset_id: "ast-1" });
+  assert.equal(receiver.assetAdmitted(ref), false, "an older host never says so");
+  const told = receiver.call("social.drafts.show", { draft_id: "sdr-1" });
+  const second = await waitFor(() => inbox.filter((m) => m.op === "call")[1], "the second call");
+  host.postMessage({ v: 2, op: "reply", id: second.id, ok: true, data: { draft_id: "sdr-1", asset_id: "ast-1" }, asset_refs: [ref, 7, ""] });
+  assert.deepEqual(await told, { draft_id: "sdr-1", asset_id: "ast-1" }, "the app still gets only data");
+  assert.equal(receiver.assetAdmitted(ref), true);
+  assert.deepEqual(errors, []);
+});

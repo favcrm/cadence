@@ -82,6 +82,10 @@ reference receiver and `screenProtocol.ts`):
   rejects with `ScreenTimeoutError` when the host has not answered in time and
   frees the ref for a re-request; the host's one late answer is dropped, not a
   teardown. Without `timeoutMs` the request waits as before.
+- A call reply may name the asset refs it made servable (`asset_refs`, a host
+  field older hosts never send); `assetAdmitted(ref)` is then true, so an app
+  can request a just-returned draft image at once instead of waiting for the
+  next PUSH. Without it, keep waiting for the PUSH.
 - `tool` additionally requires `accepts` to include `screen-actions.v1`; the
   host closes a port that sends a tool call without the negotiation. One tool
   call is outstanding at a time — a second is refused locally with

@@ -409,8 +409,11 @@ export class ScreenChannel extends FrameChannel {
         const size = jsonBytes(result.data ?? null);
         if (size > Math.max(this.records ? RECORD_REPLY_BYTES_MAX : REPLY_BYTES_MAX, previewBytes)) reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "too_large", text: "That is too large to show." } });
         else {
-          this.rememberDraftAssetRefs(result.data,request.args);
-          reply({ v: 2, op: "reply", id: request.id, ok: true, data: result.data ?? null });
+          const admitted = this.rememberDraftAssetRefs(result.data,request.args);
+          // CAD-1921: name the draft-image refs this reply made requestable, so the app can ask at
+          // once instead of waiting for the next PUSH. Older receivers ignore extra reply keys; a
+          // records frame (whose bridge is exact-key) never gets it, and an older host never sends it.
+          reply({ v: 2, op: "reply", id: request.id, ok: true, data: result.data ?? null, ...(admitted.length && !this.records ? { asset_refs: admitted } : {}) });
         }
       })
       .finally(() => {
@@ -603,9 +606,10 @@ export class ScreenChannel extends FrameChannel {
     this.postSurface();
     this.port?.postMessage(push);
   }
-  private rememberDraftAssetRefs(data:unknown,args:Record<string,unknown>):void {
+  private rememberDraftAssetRefs(data:unknown,args:Record<string,unknown>):string[] {
+    const admitted:string[]=[];
     const alias=args.alias;
-    if(typeof alias!=="string"||!TOOL_ALIAS.test(alias)) return;
+    if(typeof alias!=="string"||!TOOL_ALIAS.test(alias)) return admitted;
     const values=Array.isArray((data as Record<string,unknown>|null)?.drafts)?(data as {drafts:unknown[]}).drafts:[data];
     for(const value of values){
       if(!value||typeof value!=="object"||Array.isArray(value)) continue;
@@ -615,9 +619,10 @@ export class ScreenChannel extends FrameChannel {
       for(const ref of this.dynamicDraftRefs) if(ref.startsWith(prefix)) this.dynamicDraftRefs.delete(ref);
       if(typeof row.asset_id==="string"&&row.asset_id.length>0){
         const ref=`draft-image:${id}:${alias}`;
-        if(ASSET_REF.test(ref)&&this.dynamicDraftRefs.size<128)this.dynamicDraftRefs.add(ref);
+        if(ASSET_REF.test(ref)&&this.dynamicDraftRefs.size<128){this.dynamicDraftRefs.add(ref);admitted.push(ref);}
       }
     }
+    return admitted;
   }
   private pump(): void {
     while (!this.closed && this.loading < ASSET_PARALLEL && this.queue.length) {

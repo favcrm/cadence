@@ -142,6 +142,7 @@ function inert(reason) {
     slot: refuse,
     tool: refuse,
     asset: refuse,
+    assetAdmitted: () => false,
     state: () => false,
     presentation: () => "outlet",
     openDrawer: refuse,
@@ -217,8 +218,12 @@ export function createScreenReceiver(options = {}) {
   const sent = new Map(); // id -> kind, kept for late/replayed replies
   const assets = new Map(); // ref -> resolve
   // CAD-1921: refs whose request timed out. The host may still answer one late;
-  // that answer is dropped once instead of tearing the bridge down. Bounded.
+  // that answer is dropped once instead of tearing the bridge down. Bounded by the
+  // host's own per-frame queue (ASSET_QUEUE_MAX, 256): it closes a frame past that.
   const abandoned = new Set();
+  const MAX_ABANDONED = 256;
+  // CAD-1921: asset refs a call reply said the host now serves (`asset_refs`).
+  const admitted = new Set();
   const identityKeys = ["v", "install_id", "digest", "context_id"];
   let tornDown = false;
   let accepted = false;
@@ -353,6 +358,13 @@ export function createScreenReceiver(options = {}) {
     }
     pending.delete(message.id);
     clearTimeout(entry.timer);
+    if (message.ok === true && Array.isArray(message.asset_refs)) {
+      for (const ref of message.asset_refs.slice(0, MAX_ABANDONED)) {
+        if (typeof ref !== "string" || ref.length === 0 || ref.length > 512) continue;
+        if (admitted.size >= MAX_ABANDONED) admitted.delete(admitted.values().next().value);
+        admitted.add(ref);
+      }
+    }
     if (message.ok === true) entry.resolve(message.data);
     else entry.reject(new ScreenRefusalError(refusal));
     return true;
@@ -513,12 +525,16 @@ export function createScreenReceiver(options = {}) {
       });
       return pendingTool;
     },
+    /** True once a call reply named `ref` as served now; an older host never says so. */
+    assetAdmitted(ref) {
+      return admitted.has(ref);
+    },
     asset(ref, options = {}) {
       if (typeof ref !== "string" || ref.length === 0 || ref.length > 512) {
         return Promise.reject(new TypeError("asset ref must be a non-empty string"));
       }
       const wait = options?.timeoutMs;
-      if (wait !== undefined && !(Number.isSafeInteger(wait) && wait > 0)) {
+      if (wait !== undefined && !(Number.isSafeInteger(wait) && wait > 0 && wait <= 2147483647)) {
         return Promise.reject(new TypeError("asset timeoutMs must be a positive integer"));
       }
       if (tornDown) return Promise.reject(new ScreenClosedError("screen bridge is closed"));
@@ -538,7 +554,7 @@ export function createScreenReceiver(options = {}) {
         if (wait) entry.timer = setTimeout(() => {
           if (assets.get(ref) !== entry) return;
           assets.delete(ref);
-          if (abandoned.size >= 64) abandoned.delete(abandoned.values().next().value);
+          if (abandoned.size >= MAX_ABANDONED) abandoned.delete(abandoned.values().next().value);
           abandoned.add(ref);
           reject(new ScreenTimeoutError(ref, wait));
         }, wait);

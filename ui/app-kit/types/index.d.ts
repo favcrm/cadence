@@ -54,6 +54,8 @@ export interface ScreenReceiver {
   /** `timeoutMs` (CAD-1921): reject with `ScreenTimeoutError` and free the ref
    *  when the host has not answered in time. Without it the request waits. */
   asset(ref: string, options?: { timeoutMs?: number }): Promise<string>;
+  /** CAD-1921: true once a call reply said the host serves `ref` now; an older host never does. */
+  assetAdmitted(ref: string): boolean;
   state(data: string): boolean;
   /** The surface the host currently presents this frame in. */
   presentation(): ScreenPresentationMode;
