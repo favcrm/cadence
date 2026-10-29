@@ -1858,3 +1858,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cad1942_by_reference_refusal.rs"]
+mod cad1942_by_reference_refusal;
