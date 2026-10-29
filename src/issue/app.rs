@@ -5452,7 +5452,9 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         )
         .expect_err("an edit after approval stops the run");
         assert!(
-            refused.to_string().contains("not approved for its current structure"),
+            refused
+                .to_string()
+                .contains("not approved for its current structure"),
             "{refused}"
         );
         // The operator's re-approval restores it.

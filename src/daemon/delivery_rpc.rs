@@ -980,12 +980,9 @@ impl Shared {
         // app — the head's touched apps are what review routing saw.
         if let Some(apps) = rec.touched_apps.as_ref() {
             for app in apps {
-                if let Some(why) = crate::issue::app_guard::review_refusal(
-                    &pm.dir,
-                    app,
-                    &who,
-                    Some(&self.store),
-                )? {
+                if let Some(why) =
+                    crate::issue::app_guard::review_refusal(&pm.dir, app, &who, Some(&self.store))?
+                {
                     return Err(Error::rejected(why));
                 }
             }

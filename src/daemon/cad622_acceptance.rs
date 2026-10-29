@@ -98,7 +98,12 @@ impl Fx {
         std::fs::create_dir_all(&checkout).unwrap();
         for args in [
             vec!["init", "-q"],
-            vec!["remote", "add", "origin", "https://github.com/acme/widgets.git"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widgets.git",
+            ],
         ] {
             assert!(std::process::Command::new("git")
                 .arg("-C")
@@ -382,7 +387,11 @@ fn cad622_renaming_the_team_role_does_not_launder_the_author() {
         crate::issue::dispatch::DispatchOrigin::Explicit,
     )
     .expect_err("a renamed role still names the same agent");
-    assert!(err.to_string().contains("writer is on app 'social-content's team"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("writer is on app 'social-content's team"),
+        "{err}"
+    );
 }
 
 /// 4. Editing the app through a ticket of another project is refused:
@@ -404,7 +413,8 @@ fn cad622_another_project_cannot_launder_the_author() {
     )
     .expect_err("another project cannot hide the app's team");
     assert!(
-        err.to_string().contains("writer is on app 'social-content's team (widgets)"),
+        err.to_string()
+            .contains("writer is on app 'social-content's team (widgets)"),
         "{err}"
     );
 }
@@ -420,18 +430,25 @@ fn cad622_a_plan_touching_its_own_app_is_refused() {
          ### Acceptance\n- [ ] the guide is reworked\n"
     );
     let err = scoped(Asserted::Agent("writer".into()), || {
-        fx.shared
-            .dispatch("plan_propose", &json!({"project": PROJECT, "text": plan}), std::process::id())
+        fx.shared.dispatch(
+            "plan_propose",
+            &json!({"project": PROJECT, "text": plan}),
+            std::process::id(),
+        )
     })
     .expect_err("a team agent cannot plan a change to its own app");
     assert!(
-        err.to_string().contains("writer is on app 'social-content's team"),
+        err.to_string()
+            .contains("writer is on app 'social-content's team"),
         "{err}"
     );
     // Positive control: the same plan from an agent off the team.
     let out = scoped(Asserted::Agent("lead".into()), || {
-        fx.shared
-            .dispatch("plan_propose", &json!({"project": PROJECT, "text": plan}), std::process::id())
+        fx.shared.dispatch(
+            "plan_propose",
+            &json!({"project": PROJECT, "text": plan}),
+            std::process::id(),
+        )
     })
     .expect("an agent off the team may plan the change");
     assert_eq!(out["tickets"].as_array().map(Vec::len), Some(1), "{out}");
@@ -446,7 +463,11 @@ fn cad622_the_review_loop_refuses_a_team_agent_authors_app_pr() {
     fx.seed_loop("writer");
     fx.route().expect("the router pass answers");
     let rec = fx.record();
-    assert_eq!(rec.state, delivery::State::Working, "the head never entered review");
+    assert_eq!(
+        rec.state,
+        delivery::State::Working,
+        "the head never entered review"
+    );
     assert!(rec.head.is_none(), "a refused done report records no head");
     let why = fx.why();
     assert!(
@@ -460,7 +481,12 @@ fn cad622_the_review_loop_refuses_a_team_agent_authors_app_pr() {
     fx.seed_loop("lead");
     fx.route().expect("the router pass answers");
     let rec = fx.record();
-    assert_eq!(rec.state, delivery::State::Reviewing, "{}", rec.note.clone().unwrap_or_default());
+    assert_eq!(
+        rec.state,
+        delivery::State::Reviewing,
+        "{}",
+        rec.note.clone().unwrap_or_default()
+    );
     assert_eq!(rec.head.as_deref(), Some(HEAD));
     assert_eq!(rec.reviewer.as_deref(), Some("reviewer"));
 }
@@ -469,7 +495,10 @@ fn cad622_the_review_loop_refuses_a_team_agent_authors_app_pr() {
 #[test]
 fn cad622_an_apps_team_reviewer_is_not_routed_the_review() {
     // `reviewer` is on the app's team; `outsider` is not. Both idle.
-    let fx = Fx::new(&[("writer", "writer"), ("reviewer", "reviewer")], &["reviewer", "outsider"]);
+    let fx = Fx::new(
+        &[("writer", "writer"), ("reviewer", "reviewer")],
+        &["reviewer", "outsider"],
+    );
     fx.seed_loop("lead");
     fx.route().expect("the router pass answers");
     let rec = fx.record();
@@ -482,7 +511,10 @@ fn cad622_an_apps_team_reviewer_is_not_routed_the_review() {
 
     // With only the team reviewer available, the review stays unstaffed
     // and the note says why.
-    let fx = Fx::new(&[("writer", "writer"), ("reviewer", "reviewer")], &["reviewer"]);
+    let fx = Fx::new(
+        &[("writer", "writer"), ("reviewer", "reviewer")],
+        &["reviewer"],
+    );
     fx.seed_loop("lead");
     fx.route().expect("the router pass answers");
     let rec = fx.record();
@@ -497,7 +529,10 @@ fn cad622_an_apps_team_reviewer_is_not_routed_the_review() {
 /// 7b. An app's own team reviewer cannot file a verdict on the app's PR.
 #[test]
 fn cad622_an_apps_team_reviewer_cannot_file_a_verdict() {
-    let fx = Fx::new(&[("writer", "writer"), ("reviewer", "reviewer")], &["reviewer", "outsider"]);
+    let fx = Fx::new(
+        &[("writer", "writer"), ("reviewer", "reviewer")],
+        &["reviewer", "outsider"],
+    );
     let mut rec = delivery::Record::new(ISSUE, PROJECT, "lead", 0);
     rec.pr = Some(pr_url());
     rec.head = Some(HEAD.into());
@@ -514,7 +549,8 @@ fn cad622_an_apps_team_reviewer_cannot_file_a_verdict() {
     })
     .expect_err("an app's team reviewer must not judge the app's change");
     assert!(
-        err.to_string().contains("reviewer is on app 'social-content's team")
+        err.to_string()
+            .contains("reviewer is on app 'social-content's team")
             && err.to_string().contains("cannot review"),
         "{err}"
     );

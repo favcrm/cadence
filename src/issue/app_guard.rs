@@ -265,10 +265,7 @@ pub fn refusals(
         let Some(team) = teams.get(app) else {
             continue;
         };
-        let Some(author) = authors
-            .iter()
-            .find(|a| !a.is_empty() && team.contains(**a))
-        else {
+        let Some(author) = authors.iter().find(|a| !a.is_empty() && team.contains(**a)) else {
             continue;
         };
         return Ok(Some(author_reason(
@@ -314,10 +311,19 @@ mod tests {
 
     #[test]
     fn cad622_app_in_path_reads_only_the_apps_prefix() {
-        assert_eq!(app_in_path("apps/social-content/app.md").as_deref(), Some("social-content"));
-        assert_eq!(app_in_path("./apps/blog-post/").as_deref(), Some("blog-post"));
+        assert_eq!(
+            app_in_path("apps/social-content/app.md").as_deref(),
+            Some("social-content")
+        );
+        assert_eq!(
+            app_in_path("./apps/blog-post/").as_deref(),
+            Some("blog-post")
+        );
         assert_eq!(app_in_path("apps/blog-post").as_deref(), Some("blog-post"));
-        assert_eq!(app_in_path("/apps/crm/workflows/x.md").as_deref(), Some("crm"));
+        assert_eq!(
+            app_in_path("/apps/crm/workflows/x.md").as_deref(),
+            Some("crm")
+        );
         // Not an app path: another `apps/` depth, a sibling, an escape,
         // a name that is not tag-shaped.
         assert_eq!(app_in_path("src/apps/x/app.md"), None);
@@ -332,7 +338,12 @@ mod tests {
         let text = "Touch `apps/social-content/app.md` and apps/blog-post/workflows/post.md. \
                     Not apps/, not src/apps/x/, not apps/Upper/, and apps/crm is a bare name.";
         let apps = apps_in_text(text);
-        assert_eq!(apps, [tag("blog-post"), tag("social-content")].into_iter().collect());
+        assert_eq!(
+            apps,
+            [tag("blog-post"), tag("social-content")]
+                .into_iter()
+                .collect()
+        );
     }
 
     /// A tracker with two projects and one app installed in each, with
@@ -387,11 +398,17 @@ mod tests {
         install(&pm, "demo", "social-content", &[("writer", "w1")]);
         let apps = apps_in_paths(["apps/social-content/app.md"]);
         let why = refusals(&pm.dir, &apps, &["w1"], None).unwrap().unwrap();
-        assert!(why.contains("w1 is on app 'social-content's team (demo)"), "{why}");
+        assert!(
+            why.contains("w1 is on app 'social-content's team (demo)"),
+            "{why}"
+        );
         assert!(why.contains("apps/social-content/"), "{why}");
         assert!(why.contains("cannot author"), "{why}");
         // A positive control: the guard never refuses everyone.
-        assert_eq!(refusals(&pm.dir, &apps, &["master", "w2"], None).unwrap(), None);
+        assert_eq!(
+            refusals(&pm.dir, &apps, &["master", "w2"], None).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -427,7 +444,10 @@ mod tests {
         let (_root, pm) = tracker();
         install(&pm, "demo", "social-content", &[("writer", "w1")]);
         std::fs::write(
-            pm.dir.join("demo").join(app::DIR).join("social-content.yaml"),
+            pm.dir
+                .join("demo")
+                .join(app::DIR)
+                .join("social-content.yaml"),
             "not: a record\n",
         )
         .unwrap();
