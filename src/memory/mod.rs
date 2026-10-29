@@ -2032,9 +2032,11 @@ mod tests {
         assert!(!msg.contains("source is empty"), "{msg}");
         assert!(!body_path("no-scope").exists());
 
-        let mut roles = policy::ProposalOptions::default();
-        roles.audience = policy::Audience::Role;
-        roles.roles = vec!["dev".to_string()];
+        let roles = policy::ProposalOptions {
+            audience: policy::Audience::Role,
+            roles: vec!["dev".to_string()],
+            ..policy::ProposalOptions::default()
+        };
         let err = propose_lesson(
             &pm,
             &author,
