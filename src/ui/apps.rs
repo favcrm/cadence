@@ -36,7 +36,7 @@
 //! handler runs; the daemon's own `operator_connection` gate still
 //! refuses what the board must not do.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::de::{MapAccess, Visitor};
 use serde::Deserialize;
@@ -60,7 +60,7 @@ const UPLOAD_TOTAL_BYTES: u64 = crate::issue::app::MAX_APP_BYTES;
 /// Optional catalogue locator. Every field is required when the object is
 /// present; unknown keys are refused. It names a release, it does not grant
 /// permission.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CatalogueWire {
     id: String,
@@ -99,14 +99,16 @@ struct InstallBody {
 /// At most this many files — the same bound `snapshot` enforces on disk.
 const UPLOAD_MAX_FILES: usize = 128;
 
-/// The upload body: exactly `{"files": {path: utf8}}`. A custom
+/// The upload body: `{"files": {path: utf8}}`, or — CAD-1942 — a catalogue
+/// locator with no `files`, whose release the board fetches itself. A custom
 /// `Deserialize` is REQUIRED — `serde_json::Value` silently keeps the last
 /// duplicate key, so `{"files":…,"files":…}` would collapse to one map and
 /// defeat the strict-shape gate. This visitor rejects any repeated or unknown
 /// top-level key at parse time.
 #[derive(Debug)]
 struct UploadBody {
-    files: Vec<(String, String)>,
+    /// Absent only beside a catalogue locator (CAD-1942).
+    files: Option<Vec<(String, String)>>,
     /// CAD-1186: optional pin on the staged bundle's digest.
     expected_digest: Option<String>,
     catalogue: Option<CatalogueWire>,
@@ -122,7 +124,7 @@ impl<'de> Deserialize<'de> for UploadBody {
         impl<'de> Visitor<'de> for UploadVisitor {
             type Value = UploadBody;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("an object with exactly one `files` map")
+                f.write_str("an object with one `files` map or a catalogue locator")
             }
             fn visit_map<A>(self, mut map: A) -> std::result::Result<UploadBody, A::Error>
             where
@@ -177,8 +179,10 @@ impl<'de> Deserialize<'de> for UploadBody {
                     // visitor reads its entries with duplicate-path rejection.
                     files = Some(map.next_value::<FilesMap>()?.0);
                 }
-                let files = files.ok_or_else(|| serde::de::Error::missing_field("files"))?;
-                if files.is_empty() {
+                if files.is_none() && catalogue.is_none() {
+                    return Err(serde::de::Error::missing_field("files"));
+                }
+                if files.as_ref().is_some_and(Vec::is_empty) {
                     return Err(serde::de::Error::custom("files map is empty"));
                 }
                 if catalogue.is_some() && catalogue_resolution.is_some() {
@@ -422,6 +426,90 @@ fn merge_catalogue(params: &mut Value, extra: Value) {
     }
 }
 
+/// CAD-1942: the release document the catalog serves for one exact release.
+/// `files` goes through the same strict [`FilesMap`] a posted bundle does —
+/// duplicate paths, per-file caps and the file-count cap apply alike.
+#[derive(Deserialize)]
+struct ReleaseDocument {
+    files: FilesMap,
+    expected_digest: String,
+}
+
+/// CAD-1942: a catalogue install names its release; the board fetches the
+/// bytes from the configured catalog through the same closed release route
+/// `/api/public-apps` relays, and admits them only when they hash to the
+/// locator's digest under the bundle digest the daemon computes. A posted
+/// `files` map (older boards, during rollout) must equal the fetched release.
+/// A forged locator is refused before any network read.
+fn catalogue_release_files(
+    origin: &str,
+    locator: &CatalogueWire,
+    posted: Option<Vec<(String, String)>>,
+) -> Result<Vec<(String, String)>, HttpResp> {
+    let Some(url) = super::public_directory::release_url(
+        origin,
+        &locator.id,
+        &locator.version,
+        &locator.digest,
+    ) else {
+        return Err(err_response(
+            400,
+            "catalogue locator must name a directory id, an exact version and a sha256 digest",
+        ));
+    };
+    let Some((status, bytes)) = super::public_directory::fetch_catalog(&url) else {
+        return Err(err_response(
+            502,
+            "The catalogue release could not be read.",
+        ));
+    };
+    if status != 200 {
+        return Err(err_response(status, "catalogue release is not installable"));
+    }
+    let Ok(document) = serde_json::from_slice::<ReleaseDocument>(&bytes) else {
+        return Err(err_response(
+            502,
+            "The catalogue release could not be read.",
+        ));
+    };
+    let fetched: BTreeMap<String, String> = document.files.0.into_iter().collect();
+    if fetched.is_empty()
+        || document.expected_digest != locator.digest
+        || crate::issue::app_catalog::workspace::bundle_digest(&fetched) != locator.digest
+    {
+        return Err(err_response(
+            409,
+            "catalogue release bytes do not match the locator digest",
+        ));
+    }
+    if let Some(posted) = posted {
+        if posted.into_iter().collect::<BTreeMap<_, _>>() != fetched {
+            return Err(err_response(
+                409,
+                "posted files differ from the catalogue release",
+            ));
+        }
+    }
+    Ok(fetched.into_iter().collect())
+}
+
+/// How the upgrade transport obtains a catalogue release (CAD-1942): the
+/// configured catalog in production, a loopback catalog in tests.
+type ReleaseFetch<'a> = dyn Fn(&CatalogueWire, Option<Vec<(String, String)>>) -> Result<Vec<(String, String)>, HttpResp>
+    + 'a;
+
+/// The configured catalog's release for `locator` (see
+/// [`catalogue_release_files`]).
+fn configured_release_files(
+    locator: &CatalogueWire,
+    posted: Option<Vec<(String, String)>>,
+) -> Result<Vec<(String, String)>, HttpResp> {
+    let Some(origin) = crate::issue::app_catalog::client::catalog_origin() else {
+        return Err(err_response(503, "public directory is not configured"));
+    };
+    catalogue_release_files(&origin, locator, posted)
+}
+
 pub(super) fn hosted_operation_id(request: &Request) -> Option<String> {
     request
         .headers()
@@ -458,14 +546,39 @@ fn workspace_upload_with_mode(
         Err(e) => {
             return err_response(
                 400,
-                &format!("upload body must be {{\"files\":{{path:text}}}} — {e}"),
+                &format!(
+                    "upload body must be {{\"files\":{{path:text}}}} or a catalogue locator — {e}"
+                ),
             )
         }
+    };
+    let locator = body.catalogue.clone();
+    let catalogue = match catalogue_params(body.catalogue, body.catalogue_resolution) {
+        Ok(extra) => extra,
+        Err(message) => return err_response(400, message),
+    };
+    // CAD-1942: a catalogue install names its release; the board fetches it.
+    let files = match (locator, body.files) {
+        (Some(locator), posted) => {
+            if body
+                .expected_digest
+                .as_deref()
+                .is_some_and(|digest| digest != locator.digest)
+            {
+                return err_response(409, "expected_digest does not match the catalogue locator");
+            }
+            match configured_release_files(&locator, posted) {
+                Ok(files) => files,
+                Err(resp) => return resp,
+            }
+        }
+        (None, Some(files)) => files,
+        (None, None) => return err_response(400, "upload body requires a `files` map"),
     };
     // Validate every path key against the flat allowlist + check the decoded
     // aggregate before touching the filesystem.
     let mut total: u64 = 0;
-    for (path, text) in &body.files {
+    for (path, text) in &files {
         if !upload_path_ok(path) {
             return err_response(
                 400,
@@ -480,7 +593,7 @@ fn workspace_upload_with_mode(
     // Stage into a server-derived external temp dir (mode-0700, under the
     // process temp root — never under `pm.dir`), then hand its absolute path
     // to the unchanged path-source installer. `staging` is removed on drop.
-    let (_staging, source) = match stage_files(&body.files) {
+    let (_staging, source) = match stage_files(&files) {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
@@ -491,10 +604,7 @@ fn workspace_upload_with_mode(
     if let Some(digest) = body.expected_digest.as_ref().filter(|_| !check_only) {
         params["expected_digest"] = json!(digest);
     }
-    match catalogue_params(body.catalogue, body.catalogue_resolution) {
-        Ok(extra) => merge_catalogue(&mut params, extra),
-        Err(message) => return err_response(400, message),
-    }
+    merge_catalogue(&mut params, catalogue);
     let method = if check_only {
         "app_workspace_install_check"
     } else {
@@ -528,12 +638,16 @@ fn workspace_upload_with_mode(
 /// derived `source`) OR as the legacy `source` path/URL the caller names
 /// — never both, and never neither. `files` mode keeps the board from
 /// ever trusting a caller-controlled path; `source` mode preserves the
-/// existing CLI/git transport unchanged. Returns `(params, staging)` —
-/// `staging` is `Some` only for `files` mode and must outlive the RPC.
+/// existing CLI/git transport unchanged. CAD-1942: a catalogue locator with
+/// no `source` needs no `files` — `release` fetches the named release (and
+/// compares a posted `files` map with it) only after every shape and pin
+/// check passed. Returns `(params, staging)` — `staging` is `Some` only for
+/// `files` mode and must outlive the RPC.
 fn workspace_upgrade_transport(
     method: &str,
     id: &str,
     wire: UpgradeWire,
+    release: &ReleaseFetch<'_>,
 ) -> std::result::Result<(Value, Option<tempfile::TempDir>), HttpResp> {
     let UpgradeWire {
         files,
@@ -544,6 +658,7 @@ fn workspace_upgrade_transport(
         observed_approval,
         fields,
     } = wire;
+    let locator = catalogue.clone();
     let catalogue = match catalogue_params(catalogue, catalogue_resolution) {
         Ok(extra) => extra,
         Err(message) => return Err(err_response(400, message)),
@@ -554,10 +669,10 @@ fn workspace_upgrade_transport(
             "upgrade body must carry `files` or `source`, never both",
         ));
     }
-    if files.is_none() && source.is_none() {
+    if files.is_none() && source.is_none() && locator.is_none() {
         return Err(err_response(
             400,
-            "upgrade body requires a `files` map or a `source`",
+            "upgrade body requires a `files` map, a `source` or a catalogue locator",
         ));
     }
     let expected: &[&str] = if method == "app_workspace_upgrade" {
@@ -587,6 +702,21 @@ fn workspace_upgrade_transport(
     let claim = match automatic_upgrade_claim(method, automatic, observed_approval) {
         Ok(claim) => claim,
         Err(message) => return Err(err_response(400, message)),
+    };
+    let files = match locator {
+        Some(locator) if source.is_none() => {
+            if fields
+                .get("expected_new_digest")
+                .is_some_and(|digest| digest.as_str() != Some(locator.digest.as_str()))
+            {
+                return Err(err_response(
+                    409,
+                    "expected_new_digest does not match the catalogue locator",
+                ));
+            }
+            Some(release(&locator, files)?)
+        }
+        _ => files,
     };
     if let Some(files) = files {
         // `{files}` mode — server-derived `source` via secure staging.
@@ -1226,10 +1356,11 @@ pub(super) fn workspace(
             Some(id) => id,
             None => return err_response(400, "upgrade needs an installation id"),
         };
-        let (params, staging) = match workspace_upgrade_transport(method, id, wire) {
-            Ok(pair) => pair,
-            Err(resp) => return resp,
-        };
+        let (params, staging) =
+            match workspace_upgrade_transport(method, id, wire, &configured_release_files) {
+                Ok(pair) => pair,
+                Err(resp) => return resp,
+            };
         _upgrade_staging = staging;
         params
     } else if method == "app_workspace_upgrade_recover" {
@@ -1367,6 +1498,156 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const LOCATOR: &str = r#"{"id":"social-content","version":"1.2.3","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+
+    /// CAD-1942: a catalogue install names the release; it does not carry it.
+    /// `files` may be absent only beside a locator, and is never empty.
+    #[test]
+    fn cad1942_reference_only_upload_body_parses() {
+        let reference = format!(r#"{{"catalogue":{LOCATOR},"expected_digest":"sha256:aa"}}"#);
+        assert!(serde_json::from_str::<UploadBody>(&reference).is_ok());
+        for bad in [
+            r#"{"expected_digest":"sha256:aa"}"#.to_string(),
+            format!(r#"{{"catalogue":{LOCATOR},"files":{{}}}}"#),
+            format!(r#"{{"catalogue":{LOCATOR},"catalogue":{LOCATOR}}}"#),
+            format!(r#"{{"catalogue":{LOCATOR},"catalogue_resolution":"manual"}}"#),
+        ] {
+            assert!(serde_json::from_str::<UploadBody>(&bad).is_err(), "{bad}");
+        }
+    }
+
+    fn no_release(
+        _: &CatalogueWire,
+        _: Option<Vec<(String, String)>>,
+    ) -> Result<Vec<(String, String)>, HttpResp> {
+        panic!("this body must not reach a catalogue fetch")
+    }
+
+    /// A loopback catalog serving `release` as version 1.2.3 under its own
+    /// digest, a tampered copy as 6.6.6 under the same digest, and 404 for
+    /// anything else. Returns the origin and its request count.
+    fn fake_catalog(
+        release: &BTreeMap<String, String>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let digest = crate::issue::app_catalog::workspace::bundle_digest(release);
+        let release = release.clone();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                seen.fetch_add(1, SeqCst);
+                let url = request.url().to_string();
+                let pinned = url.contains(&format!("digest={}", digest.replace(':', "%3A")));
+                let body = if pinned && url.contains("version=1.2.3") {
+                    json!({"files": release, "expected_digest": digest})
+                } else if pinned && url.contains("version=6.6.6") {
+                    json!({"files": {"app.md": "tampered"}, "expected_digest": digest})
+                } else {
+                    let _ = request.respond(tiny_http::Response::empty(404));
+                    continue;
+                };
+                let _ = request.respond(tiny_http::Response::from_data(body.to_string()));
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    fn locator(version: &str, digest: &str) -> CatalogueWire {
+        CatalogueWire {
+            id: "social-content".into(),
+            version: version.into(),
+            digest: digest.into(),
+        }
+    }
+
+    /// CAD-1942: a reference-only catalogue upgrade of a release over 64 KiB
+    /// is fetched by the board, verified against the locator digest and
+    /// staged for the unchanged daemon path; a lying catalog, an unknown
+    /// release, a forged locator, differing posted files and a new-digest pin
+    /// that disagrees with the locator are refused.
+    #[test]
+    fn cad1942_catalogue_release_is_fetched_and_verified() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let release: BTreeMap<String, String> = [
+            (
+                "app.md".to_string(),
+                "---\napp: social-content\nversion: '1.2.3'\n---\n".to_string(),
+            ),
+            ("screens/main/app.js".to_string(), "x".repeat(80 * 1024)),
+        ]
+        .into();
+        assert!(release.keys().all(|path| upload_path_ok(path)));
+        let digest = crate::issue::app_catalog::workspace::bundle_digest(&release);
+        let (origin, hits) = fake_catalog(&release);
+        let fetch = |locator: &CatalogueWire, posted: Option<Vec<(String, String)>>| {
+            catalogue_release_files(&origin, locator, posted)
+        };
+        let status = |result: Result<Vec<(String, String)>, HttpResp>| match result {
+            Ok(_) => panic!("refusal expected"),
+            Err(resp) => resp.status_code().0,
+        };
+
+        let body = json!({
+            "catalogue": {"id": "social-content", "version": "1.2.3", "digest": digest},
+            "expected_digest": "sha256:old",
+            "expected_generation": "gen",
+            "expected_new_digest": digest,
+            "request_id": "req-1",
+        });
+        let wire: UpgradeWire = serde_json::from_value(body.clone()).unwrap();
+        let Ok((params, Some(staging))) =
+            workspace_upgrade_transport("app_workspace_upgrade", "inst", wire, &fetch)
+        else {
+            panic!("a reference-only catalogue upgrade is admitted and staged");
+        };
+        let staged = std::fs::read_to_string(staging.path().join("screens/main/app.js")).unwrap();
+        assert!(staged.len() > 64 * 1024);
+        assert_eq!(params["catalogue"]["digest"], json!(digest));
+        assert_eq!(params["expected_new_digest"], json!(digest));
+        assert_eq!(hits.load(SeqCst), 1);
+
+        let Ok(fetched) = fetch(&locator("1.2.3", &digest), None) else {
+            panic!("the pinned release is fetched");
+        };
+        assert_eq!(fetched.into_iter().collect::<BTreeMap<_, _>>(), release);
+        let posted: Vec<(String, String)> = release.clone().into_iter().collect();
+        assert!(fetch(&locator("1.2.3", &digest), Some(posted)).is_ok());
+        let differing = vec![("app.md".to_string(), "other".to_string())];
+        assert_eq!(
+            status(fetch(&locator("1.2.3", &digest), Some(differing))),
+            409
+        );
+        assert_eq!(status(fetch(&locator("6.6.6", &digest), None)), 409);
+        let unknown = format!("sha256:{}", "b".repeat(64));
+        assert_eq!(status(fetch(&locator("1.2.3", &unknown), None)), 404);
+
+        let before = hits.load(SeqCst);
+        let forged = CatalogueWire {
+            id: "../admin".into(),
+            ..locator("1.2.3", &digest)
+        };
+        assert_eq!(status(fetch(&forged, None)), 400);
+        assert_eq!(status(fetch(&locator("1.2.3", "sha256:short"), None)), 400);
+        assert_eq!(
+            hits.load(SeqCst),
+            before,
+            "a forged locator is never fetched"
+        );
+
+        let mut stale = body;
+        stale["expected_new_digest"] = json!(unknown);
+        let wire: UpgradeWire = serde_json::from_value(stale).unwrap();
+        let Err(resp) =
+            workspace_upgrade_transport("app_workspace_upgrade", "inst", wire, &no_release)
+        else {
+            panic!("an expected_new_digest other than the locator is refused");
+        };
+        assert_eq!(resp.status_code().0, 409);
+    }
+
     /// An automatic apply forwards the consent pair. A manual apply omits
     /// it. A partial pair, or the pair on a check, is a 400 and is not
     /// forwarded as a manual upgrade.
@@ -1374,7 +1655,7 @@ mod tests {
     fn automatic_upgrade_claim_is_forwarded_and_closed() {
         let admit = |body: &str| {
             let wire: UpgradeWire = serde_json::from_str(body).unwrap();
-            match workspace_upgrade_transport("app_workspace_upgrade", "inst", wire) {
+            match workspace_upgrade_transport("app_workspace_upgrade", "inst", wire, &no_release) {
                 Ok(admitted) => admitted,
                 Err(_) => panic!("upgrade transport refused a closed body"),
             }
@@ -1400,14 +1681,21 @@ mod tests {
         ] {
             let wire: UpgradeWire = serde_json::from_str(bad).unwrap();
             assert!(
-                workspace_upgrade_transport("app_workspace_upgrade", "inst", wire).is_err(),
+                workspace_upgrade_transport("app_workspace_upgrade", "inst", wire, &no_release)
+                    .is_err(),
                 "{bad}"
             );
         }
 
         let check = r#"{"source":"/tmp/app","expected_digest":"sha256:aa","expected_generation":"gen","automatic":true,"observed_approval":"approved"}"#;
         let wire: UpgradeWire = serde_json::from_str(check).unwrap();
-        assert!(workspace_upgrade_transport("app_workspace_upgrade_check", "inst", wire).is_err());
+        assert!(workspace_upgrade_transport(
+            "app_workspace_upgrade_check",
+            "inst",
+            wire,
+            &no_release
+        )
+        .is_err());
     }
 
     /// The read route's shape: exactly the list, `<project>/<name>`, or

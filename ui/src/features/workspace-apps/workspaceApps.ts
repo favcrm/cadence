@@ -578,21 +578,21 @@ export interface InstallCheck {
   compatibility?: CompatibilityReceipt;
 }
 
-/** The upload transport's body: a flat `{path: utf8}` bundle map plus the
- * pins it stages under — the selected release's expected digest and the
- * catalogue locator it claims. `catalogue` is optional on the wire. */
-export interface FilesUploadBody {
-  files: Record<string, string>;
-  expected_digest?: string;
-  catalogue?: CatalogueLocator;
-}
+/** The upload transport's body: a flat `{path: utf8}` bundle map, or
+ * (CAD-1942) a catalogue locator alone — the board fetches and verifies
+ * that release itself — plus the selected release's expected digest. */
+export type FilesUploadBody = { expected_digest?: string } & (
+  | { files: Record<string, string>; catalogue?: never }
+  | { catalogue: CatalogueLocator; files?: never }
+);
 
-/** An upgrade body is a `files` map OR a legacy `source`, never both —
- * the same closed shape `workspace_upgrade_transport` admits. */
+/** An upgrade body is a `files` map, a legacy `source`, or (CAD-1942) a
+ * catalogue locator alone whose release the board fetches — the same
+ * closed shape `workspace_upgrade_transport` admits. */
 export type UpgradeBody = {
   expected_digest: string; expected_generation: string;
   catalogue?: CatalogueLocator; catalogue_resolution?: "manual";
-} & ({ files: Record<string, string> } | { source: string });
+} & ({ files: Record<string, string> } | { source: string } | { catalogue: CatalogueLocator });
 
 /** A files-mode upgrade check pins the install's recorded digest and the
  * catalog generation it was read under; a checked apply adds the new
@@ -620,14 +620,15 @@ export const appExplorer = {
    * pinned to the checked digest so changed bytes are refused. */
   installSource: (source: string, expectedDigest: string) =>
     request<Installation>("/api/app-installations", undefined, { source, expected_digest: expectedDigest }),
-  /** The guarded files-mode install check: the board stages the bundle
-   * server-side and the daemon reports what it would admit without
-   * writing anything. The reply's `digest` must equal the release's. */
+  /** The guarded install check: the board stages the posted bundle, or the
+   * catalogue release it fetches itself, and the daemon reports what it
+   * would admit without writing anything. The reply's `digest` must equal
+   * the release's. */
   uploadCheck: (body: FilesUploadBody, signal?: AbortSignal) =>
     request<InstallCheck>("/api/app-installations/upload/check", signal, body),
-  /** The guarded files-mode install: the same staged `files` map, pinned
-   * to the checked `expected_digest` and the catalogue locator. The
-   * reply is the committed installation record. */
+  /** The guarded install: the same bundle or catalogue locator, pinned to
+   * the checked `expected_digest`. The reply is the committed installation
+   * record. */
   upload: (body: FilesUploadBody, signal?: AbortSignal) =>
     request<CommittedInstallation>("/api/app-installations/upload", signal, body),
   gitCheck: (url: string) => request<CatalogCard>("/api/app-catalog/git-check", undefined, { url }),
