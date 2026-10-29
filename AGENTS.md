@@ -180,6 +180,15 @@ the code you just wrote.
   relays, so run the same operator proof on the HTTP peer.
 - Restrict actors with allowlists, not denylists.
 
+### Paid platform calls: no spending limit
+
+- A paid platform call (tool, model, media) runs and is charged as long as
+  the account has sufficient balance; the platform's insufficient-balance
+  refusal is the only money check. Do not add caps, per-call maximums or
+  budgets, and do not refuse a settled charge above its quote. Where an API
+  requires `max_charge_minor`, send the live quote as protocol only. Settled
+  by the operator (CAD-1877); do not reopen it in plans or reviews.
+
 ## Working in this repo
 
 ### Before you start, and before every push
