@@ -686,17 +686,15 @@ fn cad622_a_workspace_installation_team_is_refused() {
             Ok(())
         })
         .unwrap();
-    let pm = fx.pm();
-    set_paths(&pm, &fx.issue, &format!("apps/{APP}/app.md"));
-    let err = crate::issue::dispatch::run(
-        &pm,
-        &fx.issue,
-        &dispatch_args("writer", fx._root.path().join("widgets")),
-        "operator",
-        &fx.state,
-        None,
-        crate::issue::dispatch::DispatchOrigin::Explicit,
-    )
+    set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
+    // Run membership is store-backed: the daemon's own admission reads it.
+    let err = scoped(Asserted::Agent("lead".into()), || {
+        fx.shared.dispatch(
+            "dispatch_send",
+            &json!({"alias": "writer", "issue": ISSUE, "text": "do it", "reply_to": "lead"}),
+            std::process::id(),
+        )
+    })
     .expect_err("a run's assignment is membership");
     assert!(
         err.to_string()
