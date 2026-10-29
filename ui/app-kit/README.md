@@ -78,6 +78,10 @@ reference receiver and `screenProtocol.ts`):
 - `call`/`slot`/`tool` and `asset` open only after a `screen.v2` PUSH; before
   that, and on a v1-only mount, they reject with `ScreenClosedError`
   (`code: "gone"`) instead of posting a request the host cannot answer.
+- A host that cannot serve an asset ref sends nothing. `asset(ref, { timeoutMs })`
+  rejects with `ScreenTimeoutError` when the host has not answered in time and
+  frees the ref for a re-request; the host's one late answer is dropped, not a
+  teardown. Without `timeoutMs` the request waits as before.
 - `tool` additionally requires `accepts` to include `screen-actions.v1`; the
   host closes a port that sends a tool call without the negotiation. One tool
   call is outstanding at a time — a second is refused locally with

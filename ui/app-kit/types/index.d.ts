@@ -51,7 +51,9 @@ export interface ScreenReceiver {
   call<T = unknown>(verb: string, args?: unknown): Promise<T>;
   slot(verb: string, args?: unknown, anchor?: unknown): Promise<SlotState>;
   tool<T = unknown>(alias: string, input?: unknown, requestId?: string, generationScope?: GenerationScope): Promise<T>;
-  asset(ref: string): Promise<string>;
+  /** `timeoutMs` (CAD-1921): reject with `ScreenTimeoutError` and free the ref
+   *  when the host has not answered in time. Without it the request waits. */
+  asset(ref: string, options?: { timeoutMs?: number }): Promise<string>;
   state(data: string): boolean;
   /** The surface the host currently presents this frame in. */
   presentation(): ScreenPresentationMode;

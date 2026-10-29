@@ -592,3 +592,63 @@ test("an invalid generation_scope is refused before posting", async () => {
   }
   assert.equal(inbox.filter((m) => m.op === "tool").length, 0);
 });
+
+// CAD-1921: a host that cannot serve a ref never answers it. `asset(ref, {timeoutMs})`
+// rejects, frees the ref for a re-request, and tolerates the host's late answer.
+const PNG = "data:image/png;base64,iVBORw0KGgo=";
+test("an asset request with a timeout rejects, and the same ref can be requested again", async () => {
+  const { host, inbox, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  await assert.rejects(receiver.asset("media:1", { timeoutMs: 20 }), (error) => {
+    assert.ok(error instanceof ScreenTimeoutError);
+    assert.equal(error.code, "timeout");
+    return true;
+  });
+  const again = receiver.asset("media:1", { timeoutMs: 1000 });
+  await waitFor(() => inbox.filter((m) => m.op === "asset").length === 2, "the re-request");
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  assert.equal(await again, PNG);
+  assert.deepEqual(errors, []);
+});
+
+test("a late asset reply after a timeout is dropped once, not a teardown", async () => {
+  const { host, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  await assert.rejects(receiver.asset("media:1", { timeoutMs: 20 }), ScreenTimeoutError);
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  await tick();
+  await tick();
+  assert.deepEqual(errors, [], "the late answer is dropped");
+  // Only that one late answer: a second unsolicited reply still tears down.
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  await waitFor(() => errors.length === 1, "the unsolicited teardown");
+});
+
+test("a late reply that crosses a re-request answers the re-request", async () => {
+  const { host, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  await assert.rejects(receiver.asset("media:1", { timeoutMs: 20 }), ScreenTimeoutError);
+  const again = receiver.asset("media:1", { timeoutMs: 1000 });
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  assert.equal(await again, PNG);
+  // The host may still answer the re-request itself: dropped, not a teardown.
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  await tick();
+  await tick();
+  assert.deepEqual(errors, []);
+});
+
+test("an asset request without a timeout waits as before; a bad timeout is refused", async () => {
+  const { host, pushes, receiver } = connect({ timeoutMs: 20 });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const open = receiver.asset("media:1");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(await Promise.race([open.then(() => "settled", () => "settled"), tick().then(() => "open")]), "open");
+  for (const bad of [0, -1, 1.5, "20", Number.MAX_SAFE_INTEGER + 1]) {
+    await assert.rejects(receiver.asset("media:2", { timeoutMs: bad }), TypeError);
+  }
+});
