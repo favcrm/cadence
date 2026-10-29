@@ -2123,24 +2123,11 @@ fn preflight(
     // team is read here (no store on this side); the run's role inputs
     // are applied by the daemon's plan and review seams.
     let app_paths = crate::issue::app_guard::apps_in_paths(front.paths.iter().map(String::as_str));
-    let remotes: Vec<String> = project
-        .repos
-        .iter()
-        .filter_map(|r| r.remote.clone())
-        .collect();
     let guard = crate::issue::app_guard::Ctx {
         pm_dir: &pm.dir,
         state_dir: Some(state_dir),
         store: None,
     };
-    if let Some(why) = crate::issue::app_guard::refusals(
-        guard,
-        &app_paths,
-        &[reply_to.as_str(), args.to.as_str()],
-        &remotes,
-    )? {
-        return Err(Error::rejected(why));
-    }
     let note_arg = args.note.clone().unwrap_or_else(|| dir.join("issue.md"));
     let note = note_arg
         .canonicalize()
@@ -2199,6 +2186,17 @@ fn preflight(
     // the daemon's own kickoff (`check_job_kickoff`).
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = start::resolve_repo(&project, args.repo.as_deref(), &cwd)?;
+    // CAD-622: the guard runs once the lane's repository is resolved, so
+    // the git-source evidence is exactly that repository — a project's
+    // other registered repos cannot refuse work that never touches them.
+    if let Some(why) = crate::issue::app_guard::refusals(
+        guard,
+        &app_paths,
+        &[reply_to.as_str(), args.to.as_str()],
+        &crate::issue::app_guard::selected_remotes(&project, &root),
+    )? {
+        return Err(Error::rejected(why));
+    }
     let base = start::resolve_base(
         &root,
         args.base.as_deref(),

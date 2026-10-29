@@ -8,8 +8,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-/// CAD-622: one run's frozen role `inputs` and the aliases its steps
-/// assigned — what the app-team guard reads from a run.
+/// CAD-622: one run's frozen team-role bindings (`role` → agent alias,
+/// exactly the roles its installation team supplied at creation) and the
+/// aliases its steps assigned — what the app-team guard reads from a run.
+/// The role keys are kept separate from the aliases: an ordinary content
+/// input is never read as a role name, so its value never becomes a team
+/// member.
 pub type RunTeam = (BTreeMap<String, String>, Vec<String>);
 
 pub const ARTIFACT_BYTES: usize = 256 * 1024;
@@ -498,6 +502,11 @@ CREATE TABLE IF NOT EXISTS app_run_artifact_fetches(
 pub struct LocalRunProvenance<'a> {
     pub selected_source: Option<(&'a str, &'a str)>,
     pub input_origins: &'a BTreeMap<String, String>,
+    /// CAD-622: the installation team's role → alias bindings this run
+    /// froze into its inputs, kept as their own member so the app-team
+    /// guard reads role provenance rather than guessing role names from
+    /// aliases (or from content inputs).
+    pub team_roles: &'a BTreeMap<String, String>,
     pub human: Option<&'a Value>,
 }
 
@@ -678,6 +687,7 @@ impl Store {
             LocalRunProvenance {
                 selected_source: None,
                 input_origins: &BTreeMap::new(),
+                team_roles: &BTreeMap::new(),
                 human: None,
             },
         )
@@ -728,6 +738,7 @@ impl Store {
         let LocalRunProvenance {
             selected_source,
             input_origins,
+            team_roles,
             human,
         } = provenance;
         let operation = uuid::Uuid::new_v4().to_string();
@@ -936,6 +947,13 @@ impl Store {
                     if !input_origins.is_empty() {
                         snapshot["input_origins"] = json!(input_origins);
                     }
+                    // CAD-622: the team-role bindings this run froze stay
+                    // in the snapshot as their own member, so a later team
+                    // edit cannot drop a historical member and a content
+                    // input can never be mistaken for a role name.
+                    if !team_roles.is_empty() {
+                        snapshot["team_roles"] = json!(team_roles);
+                    }
                     if let Some(proof) = context {
                         snapshot["schema"] = json!(2);
                         snapshot["context"] =
@@ -1060,10 +1078,13 @@ impl Store {
                     Self::app_run_show_in(&*tx, &id)
         })
     }
-    /// CAD-622: each run of `install_id` as the frozen snapshot's role
-    /// `inputs` map plus the aliases it assigned to its steps — the
-    /// run-time half of an app's team, read from the run's own snapshot
-    /// rather than the current workflow or team record. A snapshot that
+    /// CAD-622: each run of `install_id` as the snapshot's frozen
+    /// team-role bindings (`team_roles`: role → alias, exactly the roles
+    /// the installation team supplied when the run was created) plus the
+    /// aliases it assigned to its steps — the run-time half of an app's
+    /// team, read from the run's own snapshot rather than the current
+    /// workflow or team record. A renamed, replaced or removed saved role
+    /// therefore cannot drop an alias the run bound. A snapshot that
     /// cannot be parsed refuses; it is never read as "nobody".
     pub fn app_run_team_inputs(&self, install_id: &str) -> Result<Vec<RunTeam>> {
         let texts = self
@@ -1075,8 +1096,8 @@ impl Store {
         for text in texts {
             let snapshot: Value = serde_json::from_str(&text)
                 .map_err(|_| Error::internal("app run snapshot is unreadable"))?;
-            let inputs: BTreeMap<String, String> =
-                serde_json::from_value(snapshot["inputs"].clone()).unwrap_or_default();
+            let roles: BTreeMap<String, String> =
+                serde_json::from_value(snapshot["team_roles"].clone()).unwrap_or_default();
             let assigned = snapshot["assignments"]
                 .as_object()
                 .map(|m| {
@@ -1085,7 +1106,7 @@ impl Store {
                         .collect()
                 })
                 .unwrap_or_default();
-            out.push((inputs, assigned));
+            out.push((roles, assigned));
         }
         Ok(out)
     }

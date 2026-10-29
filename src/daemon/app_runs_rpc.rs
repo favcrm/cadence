@@ -393,6 +393,7 @@ impl Shared {
             workflow,
             inputs,
             input_origins,
+            team_roles,
             owner_pm,
             context,
             binding,
@@ -448,6 +449,7 @@ impl Shared {
                 Some(team) => Some(team.owner_pm.clone()),
                 None => optional_str(params, "owner_pm").map(str::to_string),
             };
+            let mut team_roles: BTreeMap<String, String> = BTreeMap::new();
             if let Some(team) = effective_team {
                 // The team is the only source of worker aliases: a
                 // caller-supplied value for a team role is a forgery.
@@ -461,6 +463,10 @@ impl Shared {
                         ));
                     }
                     inputs.insert(role.clone(), alias.clone());
+                    // CAD-622: the same pair is frozen as team-role
+                    // provenance, so the app-team guard never has to
+                    // infer role names from the merged input map.
+                    team_roles.insert(role.clone(), alias.clone());
                 }
             }
             let context = optional_str(params, "context_id")
@@ -595,6 +601,7 @@ impl Shared {
                 workflow,
                 inputs,
                 input_origins,
+                team_roles,
                 owner_pm,
                 context,
                 binding,
@@ -671,6 +678,7 @@ impl Shared {
                     selected_source: optional_str(params, "source_receipt_id")
                         .zip(optional_str(params, "selected_post_id")),
                     input_origins: &input_origins,
+                    team_roles: &team_roles,
                     human,
                 },
                 Some(&creator),

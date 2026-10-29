@@ -25,16 +25,21 @@
 //!   (`.apps/installations/<id>/record.yaml` + the daemon's
 //!   `app-teams.json`, read through the same [`team_of`] the app-run
 //!   RPC uses);
-//! - with a store, each installation's frozen run role inputs and the
-//!   agents its runs assigned — the run snapshot, never the current
-//!   workflow.
+//! - with a store, each installation's frozen run team-role bindings
+//!   (role → alias, frozen in the run snapshot) and the agents its runs
+//!   assigned — the run snapshot, never the current workflow or team
+//!   record, so a role the operator renamed or replaced keeps the alias
+//!   it bound.
 //!
 //! **Where it is enforced.** The daemon's own dispatch admission
 //! (`dispatch_send`) with the connection-derived caller and the target
-//! worker; `plan_propose`, including a grant's rendered plan before any
-//! admission side effect; the review loop (the PR's own changed files
-//! plus known git sources), where unavailable evidence holds the record
-//! instead of passing it; review routing and the verdict.
+//! worker; the native `task_dispatch` and both monitor kickoffs, which
+//! never pass through `dispatch_send`; `plan_propose`, including a
+//! grant's rendered plan before any admission side effect; the review
+//! loop (the PR's own changed files plus known git sources) for the
+//! worker that authored the head — every entry into review, including a
+//! head that moved after admission — where unavailable evidence holds
+//! the record instead of passing it; review routing and the verdict.
 //!
 //! Fail closed: an install record, a team store or a run snapshot that
 //! cannot be read refuses — it is never read as "no team".
@@ -260,23 +265,15 @@ pub fn installations(ctx: Ctx) -> Result<Vec<Install>> {
     }
     if let Some(store) = ctx.store {
         for install in &mut out {
-            // The roles a run input can name: the saved team's keys and
-            // the roles the app's workflows declare (legacy installs
-            // have a project; a workspace install's snapshot still
-            // carries the agents it assigned).
-            let mut roles: BTreeSet<String> = install.team.clone();
-            if let Some(project_key) = install.project.as_deref() {
-                roles.extend(
-                    app::team_roles(ctx.pm_dir, project_key, &install.app).unwrap_or_default(),
-                );
-            }
-            for (inputs, assigned) in store.app_run_team_inputs(&install.install_id)? {
+            // The run snapshot's frozen team-role bindings and the
+            // agents its steps assigned. The role keys stay role keys:
+            // they are never mixed into the alias set, so an ordinary
+            // content input (`topic: lead`) cannot make `lead` a team
+            // member, and a saved role the operator later renamed or
+            // replaced still carries the alias it bound at run time.
+            for (frozen, assigned) in store.app_run_team_inputs(&install.install_id)? {
                 install.team.extend(assigned);
-                for (role, alias) in inputs {
-                    if roles.contains(&role) {
-                        install.team.insert(alias);
-                    }
-                }
+                install.team.extend(frozen.into_values());
             }
         }
     }
@@ -334,6 +331,44 @@ pub fn apps_from_remotes(ctx: Ctx, remotes: &[String]) -> Result<BTreeSet<String
         .filter(|i| i.git.as_ref().is_some_and(|g| want.contains(g)))
         .map(|i| i.app)
         .collect())
+}
+
+/// The remotes of the one repository a dispatch selected — the project
+/// repo whose checkout is `root`. A project may register several repos;
+/// only the lane's own repository can be the app's git source for this
+/// change, so an unrelated repository never produces evidence against an
+/// author working elsewhere.
+pub fn selected_remotes(project: &project::Project, root: &Path) -> Vec<String> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    project
+        .repos
+        .iter()
+        .filter_map(|repo| {
+            let path = repo.path.as_deref()?;
+            let canon = project::expand_home(path)
+                .canonicalize()
+                .unwrap_or_else(|_| project::expand_home(path));
+            (canon == root).then(|| repo.remote.clone()).flatten()
+        })
+        .collect()
+}
+
+/// The repository a dispatch for `front` selected: the main checkout of
+/// the single open lane the issue's own record names, when that is one
+/// repository. `None` when it has no lane yet or its lanes are ambiguous
+/// (the dispatch refuses that kickoff for its own reason), so no git
+/// source is claimed either.
+pub fn selected_root(project: &project::Project, front: &model::Front) -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = crate::issue::start::open_worktrees(front)
+        .into_iter()
+        .filter_map(|lane| crate::worktree::main_root(&lane).ok())
+        .collect();
+    roots.sort();
+    roots.dedup();
+    match roots.as_slice() {
+        [root] => Some(root.clone()),
+        _ => None,
+    }
 }
 
 /// The plain refusal when `author` is on `app`'s team: names the agent,

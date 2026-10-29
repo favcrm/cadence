@@ -147,15 +147,15 @@ impl Shared {
         // caller is the connection-derived one (never a request field),
         // and the target worker is named by the request; both are authors
         // of the work the kickoff opens. The ticket's planned paths and
-        // the project's registered repositories (an app's pinned git
-        // source) are the evidence, and the store adds run membership.
+        // the lane's own repository (an app's pinned git source) are the
+        // evidence, and the store adds run membership. Only the repository
+        // this dispatch selected can be the app's git source — never
+        // another repo the project registers.
         let app_paths =
             crate::issue::app_guard::apps_in_paths(front.paths.iter().map(String::as_str));
-        let remotes: Vec<String> = project
-            .repos
-            .iter()
-            .filter_map(|r| r.remote.clone())
-            .collect();
+        let remotes = crate::issue::app_guard::selected_root(&project, &front)
+            .map(|root| crate::issue::app_guard::selected_remotes(&project, &root))
+            .unwrap_or_default();
         let caller_alias = match &caller {
             AgentCaller::Agent(a) => Some(a.as_str()),
             AgentCaller::Operator => None,

@@ -344,6 +344,52 @@ impl Shared {
         Ok(json!({"entitled": true}))
     }
 
+    /// CAD-622: the app-team admission every fresh native kickoff shares.
+    /// `task_dispatch` and both monitor paths commit their kickoff through
+    /// `dispatch_task_planned`, never through `dispatch_send`, so they
+    /// need the same store-backed guard here: the caller's claim, the
+    /// job's own PM and the planned worker are all authors of the work
+    /// the kickoff opens; the ticket's planned paths and the job's
+    /// selected repository are the evidence. A refusal leaves the task,
+    /// the job and the queue untouched.
+    pub(super) fn native_app_guard(
+        &self,
+        pm: &crate::issue::Pm,
+        plan: &crate::store::DispatchPlan,
+        caller: Option<&str>,
+    ) -> Result<()> {
+        let Some(issue_id) = plan.job.issue_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(gated) = crate::issue::dispatch::capture_issue(pm, issue_id)? else {
+            return Ok(());
+        };
+        let app_paths =
+            crate::issue::app_guard::apps_in_paths(gated.front.paths.iter().map(String::as_str));
+        let remotes = plan
+            .job
+            .repo
+            .as_deref()
+            .map(|repo| {
+                let root = std::path::Path::new(repo)
+                    .canonicalize()
+                    .unwrap_or_else(|_| std::path::PathBuf::from(repo));
+                crate::issue::app_guard::selected_remotes(&gated.project, &root)
+            })
+            .unwrap_or_default();
+        let mut authors: Vec<&str> = vec![plan.worker.alias.as_str(), plan.job.pm_alias.as_str()];
+        authors.extend(caller.filter(|c| !c.is_empty()));
+        let guard = crate::issue::app_guard::Ctx {
+            pm_dir: &pm.dir,
+            state_dir: Some(&self.state_dir),
+            store: Some(&self.store),
+        };
+        match crate::issue::app_guard::refusals(guard, &app_paths, &authors, &remotes)? {
+            Some(why) => Err(Error::rejected(why)),
+            None => Ok(()),
+        }
+    }
+
     /// `job dispatch` — bookkeeping plus the kickoff enqueue in one
     /// store transaction. Does not bypass the ready gate: `--ready` is
     /// claimed client-side exactly like `send --ready`.
@@ -396,6 +442,11 @@ impl Shared {
         let delivery = if plan.duplicate {
             None
         } else {
+            // CAD-622: a fresh kickoff is a new authoring act — the app-team
+            // guard runs before any context capture or queue write. A
+            // duplicate is the accepted kickoff's own retry, not new work.
+            let pm = self.pm()?;
+            self.native_app_guard(&pm, &plan, optional_str(params, "by"))?;
             Some(self.prepare_job_delivery(&plan, no_lessons)?)
         };
         // CAD-1380 deferred commit: an assist-bound job's dispatch re-proves

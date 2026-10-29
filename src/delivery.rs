@@ -109,6 +109,21 @@ impl State {
     }
 }
 
+/// CAD-622: the apps one exact PR head touches, with the binding that
+/// makes them evidence. The record keeps them only when that PR/head was
+/// accepted, and every reader re-checks the binding against the record's
+/// current `pr`/`head` — a stale or foreign app list is never trusted.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppEvidence {
+    pub pr: String,
+    pub head: String,
+    /// The app names the head's changed files (or a pinned git source)
+    /// name.
+    pub apps: Vec<String>,
+    /// The apps among them recognised by their pinned git source.
+    pub from_git: Vec<String>,
+}
+
 /// One recorded verdict.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VerdictRec {
@@ -310,11 +325,13 @@ pub struct Record {
     /// reviewer — the note says so.
     #[serde(default)]
     pub risk: Option<String>,
-    /// CAD-622: the app names this head's changed files touch, when the
-    /// PR's file list could be read. `None` is no evidence (never read
-    /// as "no app"): the guard only refuses on what it saw.
+    /// CAD-622: the app names the accepted PR head's changed files touch,
+    /// bound to that exact PR and head. `None` is no evidence (never read
+    /// as "no app"): the guard only refuses on what it saw, and a list
+    /// that does not name the record's current head is re-resolved rather
+    /// than trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub touched_apps: Option<Vec<String>>,
+    pub app_evidence: Option<AppEvidence>,
 }
 
 fn not_held(held: &bool) -> bool {
@@ -352,7 +369,7 @@ impl Record {
             ticket_done: None,
             ready_epoch: 0,
             risk: None,
-            touched_apps: None,
+            app_evidence: None,
         }
     }
 
