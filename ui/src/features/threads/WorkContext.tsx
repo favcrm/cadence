@@ -63,6 +63,7 @@ export default function WorkContext({
   read,
   composerKey,
   conversationId,
+  onBeforeOpen,
 }: {
   assignees: string[];
   roster: RosterRead;
@@ -70,6 +71,8 @@ export default function WorkContext({
   read: OutputRead;
   composerKey: string | null;
   conversationId: string;
+  /** Dismiss the mobile context sheet before the canvas or composer is used. */
+  onBeforeOpen?: () => void;
 }) {
   const t = useTranslate();
   if (assignees.length === 0) return null;
@@ -184,12 +187,18 @@ export default function WorkContext({
                       <Button
                         variant="secondary"
                         size="sm"
-                        onClick={() => openRecordedArtifact(conversationId, composerKey, ref)}
+                        onClick={() => {
+                          onBeforeOpen?.();
+                          openRecordedArtifact(conversationId, composerKey, ref);
+                        }}
                       >
                         {t("Open")}
                       </Button>
                       {composerKey && (
-                        <Button variant="ghost" size="sm" onClick={() => askAboutArtifact(composerKey, ref)}>
+                        <Button variant="ghost" size="sm" onClick={() => {
+                          onBeforeOpen?.();
+                          askAboutArtifact(composerKey, ref);
+                        }}>
                           {t("Ask about this")}
                         </Button>
                       )}

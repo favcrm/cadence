@@ -6,6 +6,7 @@ import { askAboutArtifact } from "../src/features/threads/WorkContext";
 import {
   assigneeIssues,
   assigneeTasks,
+  canvasFollow,
   conversationOutputs,
 } from "../src/features/threads/threadsContext";
 import type { Agent, AgentTask } from "../src/lib/types";
@@ -60,5 +61,10 @@ const draft = composerDraftState(key);
 assert(draft.text === "", "asking does not write or send a message");
 assert(draft.refs.length === 1, "the draft keeps one citation");
 equal(parseAskRef(draft.refs[0]), { artifact: "art-mock", version: 2 }, "the citation names that artifact version");
+
+equal(canvasFollow({ conversation: "a", composerKey: "threads:a" }, "a", "b", "threads:b"), "reset", "a canvas owned by the previous conversation resets");
+equal(canvasFollow({ conversation: "other", composerKey: null }, "a", "b", "threads:b"), "keep", "a canvas owned elsewhere stays");
+equal(canvasFollow({ conversation: "a", composerKey: "threads:a" }, "a", "a", "threads:a:reply"), "rebind", "the same conversation follows the composer draft");
+equal(canvasFollow({ conversation: "a", composerKey: "threads:a" }, null, "a", "threads:a"), "keep", "the first selection does not reset");
 
 console.log("threadsWork: passed");

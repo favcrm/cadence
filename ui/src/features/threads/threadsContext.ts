@@ -83,6 +83,24 @@ export function conversationOutputs(entries: readonly ThreadEntry[]): ContextOut
   return outputs;
 }
 
+/** How the open canvas should follow a Threads conversation change.
+ *  `keep` leaves a canvas this page does not own. `reset` drops the
+ *  previous conversation's preview. `rebind` points Ask at the current
+ *  composer draft without clearing tabs. */
+export type CanvasFollow = "keep" | "reset" | "rebind";
+
+export function canvasFollow(
+  canvas: { conversation: string | null; composerKey: string | null },
+  previousConversation: string | null,
+  nextConversation: string | null,
+  nextComposerKey: string | null,
+): CanvasFollow {
+  if (!previousConversation || canvas.conversation !== previousConversation) return "keep";
+  if (nextConversation !== previousConversation) return "reset";
+  if (canvas.composerKey !== nextComposerKey) return "rebind";
+  return "keep";
+}
+
 export function sameOutputRead(a: OutputRead, b: OutputRead): boolean {
   if (a.kind !== b.kind) return false;
   if (a.kind === "error" && b.kind === "error") return a.error === b.error;

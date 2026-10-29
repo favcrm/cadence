@@ -16,7 +16,8 @@ import PageState from "../../ui/PageState";
 import { issuePath } from "../issues/model";
 import { IssueRefLink, OpenWorkItem } from "./IssueRefLink";
 import WorkContext, { type RosterRead } from "./WorkContext";
-import { conversationAssignees, sameOutputRead, type OutputRead } from "./threadsContext";
+import { canvasFollow, conversationAssignees, sameOutputRead, type OutputRead } from "./threadsContext";
+import { canvasSnapshot, feedCanvas, resetCanvas } from "../canvas/canvasStore";
 import { IconClose, IconRefresh, IconSearch, IconThreads } from "../../ui/icons";
 import type { Agent } from "../../lib/types";
 import Composer from "../app-shell/chat/Composer";
@@ -365,6 +366,30 @@ export default function ThreadsPage({ operator, onOpenWorkItem }: { operator: bo
       ? replyIntent
       : null;
 
+  const dmAlias = open ? operatorDmAlias(open) : null;
+  const composerKey = dmAlias
+    ? (dmReplyIntent ? replyScope(dmReplyIntent) : `threads:${dmAlias}`)
+    : null;
+  const previousConversation = useRef<string | null>(null);
+  useEffect(() => {
+    const previous = previousConversation.current;
+    const next = open?.id ?? null;
+    previousConversation.current = next;
+    const canvas = canvasSnapshot();
+    const action = canvasFollow(canvas, previous, next, composerKey);
+    if (action === "reset") resetCanvas(next, composerKey, canvas.surface);
+    else if (action === "rebind" && next) {
+      feedCanvas({
+        conversation: next,
+        surface: canvas.surface,
+        composerKey,
+        cards: [],
+        working: canvas.working,
+        turn: null,
+      });
+    }
+  }, [open?.id, composerKey]);
+
   if (!operator && human.me === null && human.loading) {
     return (
       <section className="threads-page px-4 lg:px-8 py-5" aria-labelledby="threads-title">
@@ -385,10 +410,6 @@ export default function ThreadsPage({ operator, onOpenWorkItem }: { operator: bo
     );
   }
 
-  const dmAlias = open ? operatorDmAlias(open) : null;
-  const composerKey = dmAlias
-    ? (dmReplyIntent ? replyScope(dmReplyIntent) : `threads:${dmAlias}`)
-    : null;
   const roster: RosterRead = agentsState.data
     ? { status: "ready", agents: agentsState.data.agents }
     : agentsState.status === "failed"
@@ -403,6 +424,11 @@ export default function ThreadsPage({ operator, onOpenWorkItem }: { operator: bo
       issueProjects={issueProjects}
       outputRead={outputRead.forId === open.id ? outputRead.read : { kind: "loading" }}
       composerKey={composerKey}
+      onBeforeOpen={() => {
+        const dialog = document.querySelector<HTMLDialogElement>("dialog.threads-context-sheet");
+        if (dialog?.open) dialog.close();
+        setContextOpen(false);
+      }}
     />
   ) : null;
 
@@ -1712,6 +1738,7 @@ function ContextPanel({
   issueProjects,
   outputRead,
   composerKey,
+  onBeforeOpen,
 }: {
   row: ConversationRow;
   writeBlock: string | null;
@@ -1720,6 +1747,7 @@ function ContextPanel({
   issueProjects: IssueProjects;
   outputRead: OutputRead;
   composerKey: string | null;
+  onBeforeOpen?: () => void;
 }) {
   const t = useTranslate();
   const [error, setError] = useState<string | null>(null);
@@ -1788,6 +1816,7 @@ function ContextPanel({
         read={outputRead}
         composerKey={composerKey}
         conversationId={row.id}
+        onBeforeOpen={onBeforeOpen}
       />
       <p className="threads-note">{t("Workspace access applies. Linking work does not grant access.")}</p>
     </div>
