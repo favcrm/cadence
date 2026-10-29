@@ -1591,4 +1591,10 @@ Object.assign(zhTW, {
   "saved, but text extraction failed": "已儲存，但文字擷取失敗",
   "saved, but this file type is not searchable": "已儲存，但此檔案類型無法搜尋",
   "empty file — rejected": "空檔案 — 已拒絕",
+  "Active assigned work": "進行中的指派工作",
+  "Active assigned work could not be read.": "無法讀取進行中的指派工作。",
+  "Some agent records could not be read. Other active work may be missing.": "部分代理程式記錄無法讀取。其他進行中的工作可能未顯示。",
+  "Nothing needs attention.": "沒有需要處理的項目。",
+  "Agent details are unavailable.": "無法取得代理程式詳細資料。",
+  "Needs attention could not be read.": "無法讀取需要處理的項目。",
 });

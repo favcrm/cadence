@@ -1,7 +1,49 @@
 import { agentOn } from "../../lib/agentOn";
-import type { Agent, AgentDetail } from "../../lib/types";
+import type { Agent, AgentDetail, AgentTask } from "../../lib/types";
 import { activityTimeMs } from "../../lib/fmt";
+import { activeTasks } from "../agents/AgentBlocks";
 import { asEntry } from "./thread";
+
+export interface ActiveTaskGroup {
+  alias: string;
+  agent: Agent;
+  tasks: AgentTask[];
+}
+
+/** Active assigned tasks grouped by the agent that holds them.
+ *  Done, failed, cancelled and verified leave the group — the same closed
+ *  set the board already omits from an agent's open tasks. */
+export function activeAssignedGroups(agents: Agent[]): ActiveTaskGroup[] {
+  const groups: ActiveTaskGroup[] = [];
+  for (const agent of agents) {
+    if (agent.alias === "master") continue;
+    const tasks = activeTasks(agent);
+    if (tasks.length === 0) continue;
+    groups.push({ alias: agent.alias, agent, tasks });
+  }
+  return groups;
+}
+
+export function agentWorkHref(alias: string): string {
+  return `/agents/${encodeURIComponent(alias)}?tab=work`;
+}
+
+/** Which Home notices the roster snapshot can honestly show.
+ *  A failed or unreachable read is never the empty-success line. */
+export function updatesNotices(input: {
+  hasData: boolean;
+  daemon?: string;
+  refreshError: boolean;
+  recentCount: number;
+}): { unreachable: boolean; partial: boolean; empty: boolean; unavailable: boolean } {
+  const degraded = input.hasData && (input.daemon === "unreachable" || input.refreshError);
+  return {
+    unreachable: input.hasData && input.daemon === "unreachable",
+    partial: input.hasData && input.refreshError && input.recentCount > 0,
+    empty: input.hasData && input.recentCount === 0 && !degraded,
+    unavailable: input.hasData && input.recentCount === 0 && degraded,
+  };
+}
 
 export interface AgentUpdate {
   key: string;

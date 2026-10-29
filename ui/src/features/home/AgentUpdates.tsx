@@ -6,7 +6,10 @@ import { useQuery, useResource } from "../../lib/useResource";
 import type { Agent } from "../../lib/types";
 import { activityTimeMs } from "../../lib/fmt";
 import { useTranslate } from "../../lib/locale";
-import { recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates, type AgentUpdate } from "./agentUpdateModel";
+import Link from "../../ui/Link";
+import AgentAvatar, { agentLook } from "../agents/AgentAvatar";
+import { activeTasks, agentThreadHref } from "../agents/AgentBlocks";
+import { activeAssignedGroups, agentWorkHref, recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates, updatesNotices, type AgentUpdate } from "./agentUpdateModel";
 import { ageLabel } from "./needs";
 import { agentOn } from "../../lib/agentOn";
 
@@ -145,7 +148,8 @@ function AgentCard({ agent, reports, onAsk, onOpenIssue }: {
   const recent = [...detail.updates, ...thread.updates, ...reports].sort((a, b) => (Date.parse(b.at ?? "") || 0) - (Date.parse(a.at ?? "") || 0)).slice(0, 3);
   const line = statusLine([detail, thread], recent.length);
   const state = agent.fenced ? "Needs attention" : agent.running > 0 ? "Working" : agent.queued > 0 ? "Queued" : agent.state_label ?? agent.state;
-  const context = agent.tasks?.find((t) => t.title || t.job_title)?.title ?? agent.tasks?.find((t) => t.job_title)?.job_title;
+  const active = activeTasks(agent);
+  const context = active.find((task) => task.title || task.job_title)?.title ?? active.find((task) => task.job_title)?.job_title;
   return <li className="agent-update-card">
     <div className="flex items-center gap-2 min-w-0">
       <span className={`agent-presence ${agent.running > 0 ? "is-working" : agent.fenced ? "is-fenced" : ""}`} aria-hidden />
@@ -178,6 +182,48 @@ function AgentCard({ agent, reports, onAsk, onOpenIssue }: {
   </li>;
 }
 
+function ActiveAssigned({ agents }: { agents: Agent[] }) {
+  const t = useTranslate();
+  const groups = activeAssignedGroups(agents);
+  if (groups.length === 0) return null;
+  return (
+    <section aria-label={t("Active assigned work")} data-active-work>
+      <ul>
+        {groups.map((group) => {
+          const look = typeof group.agent.look === "string" ? group.agent.look : undefined;
+          return (
+            <li key={group.alias} className="agent-update-card" data-agent={group.alias}>
+              <Link href={agentWorkHref(group.alias)} className="flex items-center gap-2 min-w-0">
+                <AgentAvatar
+                  slug={agentLook(group.alias, look ? { look } : group.agent.params)}
+                  look={look}
+                  size={28}
+                  still={group.agent.running === 0}
+                  active={group.agent.running > 0}
+                />
+                <span className="text-secondary font-semibold text-ink-100 break-all">{group.alias}</span>
+              </Link>
+              <ul className="agent-update-notes">
+                {group.tasks.map((task) => (
+                  <li key={task.task}>
+                    <Link className="lnk" href={agentThreadHref(group.alias)} data-task={task.task}>
+                      {task.title ?? task.task}
+                    </Link>
+                    <div className="text-micro text-ink-500">
+                      {task.task_state}
+                      {task.job_title ? ` · ${task.job_title}` : ""}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
 export default function AgentUpdates({ onAsk, onOpenIssue }: {
   onAsk: (agent: Agent, update?: AgentUpdate) => void; onOpenIssue: (id: string) => void;
 }) {
@@ -185,16 +231,26 @@ export default function AgentUpdates({ onAsk, onOpenIssue }: {
   const state = useResource(resources.agents);
   const thread = useQuery(resources.masterThread);
   const reports = reportedAgentUpdates(thread.data?.entries ?? []);
-  const agents = recentWorkingAgents((state.data?.agents ?? []).map((agent) => {
+  const roster = state.data?.agents ?? [];
+  const agents = recentWorkingAgents(roster.map((agent) => {
     const created = agent.message?.created;
     const latest = Math.max(activityTimeMs(agent.last_activity), activityTimeMs(reports.get(agent.alias)?.[0]?.at), activityTimeMs(created));
     return { ...agent, last_activity: latest > 0 ? new Date(latest).toISOString() : agent.last_activity };
   }));
+  const notices = updatesNotices({
+    hasData: Boolean(state.data),
+    daemon: state.data?.daemon,
+    refreshError: Boolean(state.data?.refresh_error),
+    recentCount: agents.length,
+  });
   return <div>
     <p className="px-4 py-3 text-label text-ink-500 border-b border-ink-700">{t("Recent work across all projects. Ask the Assistant to check in or explain an update.")}</p>
     {!state.data && <p className="px-4 py-4 text-label text-ink-500">{state.status === "failed" ? `${t("Agent updates unavailable")} — ${state.error}` : t("Reading agent activity…")}</p>}
-    {state.data && state.data.daemon === "unreachable" && <p className="px-4 py-3 text-label text-warn">{t("Daemon unreachable. Showing the last available activity.")}</p>}
-    {state.data && agents.length === 0 && <p className="px-4 py-6 text-label text-ink-400">{t("No agent activity yet. Ask the Assistant to plan the next job.")}</p>}
+    {notices.unreachable && <p className="px-4 py-3 text-label text-warn">{t("Daemon unreachable. Showing the last available activity.")}</p>}
+    {notices.partial && <p className="px-4 py-3 text-label text-warn">{t("Some agent records could not be read. Other active work may be missing.")}</p>}
+    {state.data && <ActiveAssigned agents={roster} />}
+    {notices.empty && <p className="px-4 py-6 text-label text-ink-400">{t("No agent activity yet. Ask the Assistant to plan the next job.")}</p>}
+    {notices.unavailable && <p className="px-4 py-6 text-label text-warn">{t("Active assigned work could not be read.")}</p>}
     <ul>{agents.map((agent) => <AgentCard key={agent.alias} agent={agent} reports={reports.get(agent.alias) ?? []} onAsk={onAsk} onOpenIssue={onOpenIssue} />)}</ul>
     {agents.length === 12 && <p className="px-4 py-3 text-micro text-ink-500">{t("Showing the 12 most recently active agents. See Team overview for everyone.")}</p>}
   </div>;

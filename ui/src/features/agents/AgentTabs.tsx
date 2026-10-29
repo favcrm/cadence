@@ -9,7 +9,8 @@ import Button from "../../ui/Button";
 import { OPERATOR_HIRE_REASON } from "../auth/gate";
 import { HireBlock, WriteGate } from "../auth/WriteGate";
 import type { Agent, AgentAccess, AgentDetail, AgentRole } from "../../lib/types";
-import { AgentActivity, AgentQueue, WorkBlock } from "./AgentBlocks";
+import { AgentActivity, AgentQueue, AssignedTaskList, WorkBlock, agentThreadHref, partitionActiveTasks } from "./AgentBlocks";
+import Link from "../../ui/Link";
 import { ProfileBlock } from "./AgentProfile";
 import { appliesText } from "./agentRoles";
 import {
@@ -35,22 +36,26 @@ export interface TabContext {
   onOpenIssue: (id: string) => void;
   onTab: (tab: AgentTab) => void;
   onSaved: () => void;
+  /** The detail read failed. Roster tasks, when present, stay visible. */
+  detailFailed: boolean;
 }
 
 function Panel({
   title,
   link,
   onTab,
+  mark,
   children,
 }: {
   title: string;
   link?: AgentTab;
   onTab: (tab: AgentTab) => void;
+  mark?: string;
   children: React.ReactNode;
 }) {
   const t = useTranslate();
   return (
-    <section>
+    <section data-work-panel={mark}>
       <div className="ap-panel-h">
         <h3>{t(title)}</h3>
         {link && (
@@ -125,21 +130,44 @@ export function FirstJobs({ alias, tasks }: { alias: string; tasks: string[] }) 
   );
 }
 
-function NowCard({ c }: { c: TabContext }) {
+function NowCard({ c, onlyDoing = false }: { c: TabContext; onlyDoing?: boolean }) {
   const t = useTranslate();
-  const working = c.observed && (c.observed.running > 0 || (c.observed.tasks?.length ?? 0) > 0);
+  const parts = c.observed ? partitionActiveTasks(c.observed) : null;
+  if (c.detailFailed && !c.observed) {
+    return (
+      <div className="ap-now">
+        <b>{t("Agent details are unavailable.")}</b>
+      </div>
+    );
+  }
+  const working = Boolean(
+    c.observed &&
+      (c.observed.running > 0 ||
+        (onlyDoing ? (parts?.doing.length ?? 0) > 0 : (c.observed.tasks?.length ?? 0) > 0)),
+  );
   if (c.observed && working) {
     return (
       <div className="ap-now">
-        <WorkBlock agent={c.observed} onOpenIssue={c.onOpenIssue} />
+        <WorkBlock
+          agent={c.observed}
+          onOpenIssue={c.onOpenIssue}
+          tasks={onlyDoing ? parts?.doing : undefined}
+        />
         <div className="rc-sugs" style={{ marginTop: "0.5rem" }}>
-          <Button size="sm" href={`/threads?dm=${encodeURIComponent(c.alias)}`}>
+          <Button size="sm" href={agentThreadHref(c.alias)}>
             {t("Open thread")}
           </Button>
           <Button size="sm" disabled title={t("Stopping a turn is not wired from the board yet")}>
             {t("Stop turn")}
           </Button>
         </div>
+      </div>
+    );
+  }
+  if (onlyDoing && parts && (parts.queue.length > 0 || parts.attention.length > 0)) {
+    return (
+      <div className="ap-now">
+        <b>{t("Nothing right now")}</b>
       </div>
     );
   }
@@ -262,28 +290,59 @@ function Overview({ c }: { c: TabContext }) {
   );
 }
 
+function attentionNotes(agent: TabContext["observed"], t: (english: string) => string): string[] {
+  if (!agent) return [];
+  const notes: string[] = [];
+  if (agent.fenced) notes.push(t("Recovery required"));
+  if (agent.unknown > 0) notes.push(t("{count} outcome unknown").replace("{count}", String(agent.unknown)));
+  if (agent.stalled) {
+    const secs = agent.silent_secs ?? 0;
+    const time = secs < 60 ? `${Math.floor(secs)}s` : secs < 3600 ? `${Math.floor(secs / 60)}m` : `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+    notes.push(t("Stalled · {time}").replace("{time}", () => time));
+  }
+  if (agent.state === "waiting_input") notes.push(t("Waiting for input"));
+  if (
+    agent.state === "blocked_by_quota" ||
+    agent.quota?.state === "blocked" ||
+    agent.usage_limit?.state === "blocked"
+  ) notes.push(t("blocked by quota"));
+  return notes;
+}
+
 function Work({ c }: { c: TabContext }) {
   const t = useTranslate();
   const detail = c.detail;
   const results = resultRows(detail);
+  const parts = c.observed ? partitionActiveTasks(c.observed) : null;
+  const notes = attentionNotes(c.observed, t);
+  const unavailable = c.detailFailed && !c.observed;
+  const attentionCount = notes.length + (parts?.attention.length ?? 0);
   return (
     <div className="ap-body">
-      <Panel title="Doing now" onTab={c.onTab}>
-        <NowCard c={c} />
+      <Panel title="Doing now" mark="doing" onTab={c.onTab}>
+        <NowCard c={c} onlyDoing />
         {c.observed && (
           <div className="mt-2">
             <AgentActivity agent={c.observed} />
           </div>
         )}
       </Panel>
-      <Panel title="Queue" onTab={c.onTab}>
-        {c.observed ? <AgentQueue agent={c.observed} /> : <Note>{t("Nothing queued.")}</Note>}
-        {(detail?.tasks?.length ?? 0) > 0 && (
+      <Panel title="Queue" mark="queue" onTab={c.onTab}>
+        {c.observed ? <AgentQueue agent={c.observed} /> : <Note>{t(unavailable ? "Agent details are unavailable." : "Nothing queued.")}</Note>}
+        {parts && <AssignedTaskList alias={c.alias} tasks={parts.queue} />}
+        {!parts && (detail?.tasks?.length ?? 0) > 0 && (
           <div className="mt-3">
             <h4 className="slabel mb-2">{t("Tasks")} · {t("assigned in flight")}</h4>
             <Rows>
               {detail!.tasks!.map((task) => (
-                <Row key={task} left={<span className="num">{task}</span>} />
+                <Row
+                  key={task}
+                  left={
+                    <Link className="lnk num" href={agentThreadHref(c.alias)} data-task={task}>
+                      {task}
+                    </Link>
+                  }
+                />
               ))}
             </Rows>
           </div>
@@ -301,8 +360,23 @@ function Work({ c }: { c: TabContext }) {
           </div>
         )}
       </Panel>
-      <Panel title="Results" onTab={c.onTab}>
-        {results.length ? (
+      <Panel title="Needs attention" mark="attention" onTab={c.onTab}>
+        {notes.map((note) => (
+          <p key={note} className="text-label text-warn">{note}</p>
+        ))}
+        {parts && <AssignedTaskList alias={c.alias} tasks={parts.attention} />}
+        {attentionCount === 0 && (
+          <Note>{t(unavailable ? "Needs attention could not be read." : "Nothing needs attention.")}</Note>
+        )}
+      </Panel>
+      <Panel title="Results" mark="results" onTab={c.onTab}>
+        {c.detailFailed && !detail ? (
+          <Note>{t("Agent details are unavailable.")}</Note>
+        ) : detail?.events_error && results.length === 0 ? (
+          <p role="alert" className="text-label text-fail">
+            {t("The event history could not be read:")} {detail.events_error}
+          </p>
+        ) : results.length ? (
           <Rows>
             {results.map((e) => (
               <EventRow key={e.seq} e={e} />
