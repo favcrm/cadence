@@ -61,7 +61,7 @@ export interface ScreenReceiver {
   /** The surface the host currently presents this frame in. */
   presentation(): ScreenPresentationMode;
   /** Ask the host to present the app's surface in the board-wide drawer. */
-  openDrawer(surface: string): Promise<unknown>;
+  openDrawer(surface: string, options?: { size?: "narrow" | "wide" }): Promise<unknown>;
   /** Ask the host to close the board-wide drawer it opened. */
   closeDrawer(): Promise<unknown>;
   teardown(): void;

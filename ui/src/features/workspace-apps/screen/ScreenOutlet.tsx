@@ -17,7 +17,7 @@ import { recordServices, object, exact, type HostCommand } from "./screenService
 import { admitDisplaySession, purgeDisplayCache, withReadObservations } from "./screenDisplayCache";
 import InertPreviewLayer, { type InertPreview } from "./InertPreviewLayer";
 import { parseRoutePatch, routeFromHref, type RoutePatch } from "./screenRoute";
-import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenPresentationMode } from "./screenProtocol";
+import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenPresentationMode, type ScreenDrawerSize } from "./screenProtocol";
 import type { MountReceipt } from "./screenLifecycle";
 import Button from "../../../ui/Button";
 
@@ -59,7 +59,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
    *  `screen-surfaces.v1` capability: an independent open mounts a separate
    *  drawer frame in the shell's fixed overlay instead of promoting this
    *  one. */
-  onScreenDrawer?: (mode: ScreenPresentationMode, surface?: string, independent?: boolean) => void;
+  onScreenDrawer?: (mode: ScreenPresentationMode, surface?: string, independent?: boolean, size?: ScreenDrawerSize) => void;
   /** CAD-1615 — which surface this frame is presented in (legacy). */
   presentation?: ScreenPresentationMode;
   /** CAD-1777 — the host-derived role of THIS outlet. */
@@ -121,16 +121,16 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   // The one place the two overlay verbs act. Kept in a ref so the mount
   // effect (scoped to the frame identity) always calls the current
   // callbacks without restarting the frame.
-  const drawerApi = useRef<{ open: (surface: string) => void; close: () => void }>({ open: () => {}, close: () => {} });
+  const drawerApi = useRef<{ open: (surface: string, size?: ScreenDrawerSize) => void; close: () => void }>({ open: () => {}, close: () => {} });
   drawerApi.current = {
-    open: (surface: string) => {
+    open: (surface: string, size?: ScreenDrawerSize) => {
       if (!primary) return;
       const shell = navigationCallbacks.current.onScreenDrawer;
       // No live shell drawer target: never leave a local "open" state with
       // nothing to show. The frame keeps its normal list.
       if (!shell) return;
       setOverlay(surface);
-      shell("drawer", surface, true);
+      shell("drawer", surface, true, size);
     },
     close: () => {
       setOverlay(null);
@@ -315,7 +315,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
             onSlot: view => { if (isCurrent()) setSlot(view); },
             onLink: url => { if (isCurrent()) setLink(url); },
             onScreenDrawer: onScreenDrawer
-              ? (mode, surface, independent) => {
+              ? (mode, surface, independent, size) => {
                   if (!isCurrent()) return;
                   // A drawer frame may only close itself; it never opens
                   // another drawer. The native parent proof refuses it too.
@@ -323,7 +323,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
                   // Independent opens mount a separate child frame in the
                   // shell's fixed overlay; this primary never moves.
                   if (independent) {
-                    if (mode === "drawer") drawerApi.current.open(surface ?? "");
+                    if (mode === "drawer") drawerApi.current.open(surface ?? "", size);
                     else drawerApi.current.close();
                     return;
                   }

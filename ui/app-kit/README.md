@@ -45,8 +45,14 @@ const receiver = createScreenReceiver({
 
 receiver.presentation();          // current surface, defaults to "outlet"
 await receiver.openDrawer("settings"); // host opens the board-wide drawer
+await receiver.openDrawer("draft", { size: "wide" }); // a wider panel
 await receiver.closeDrawer();          // host returns the frame to the outlet
 ```
+
+`openDrawer(surface, { size })` takes an optional `size` of `"narrow"` (the
+default panel) or `"wide"` (about 736px at desktop widths; the panel is the full
+viewport at the board's narrow breakpoint either way). Any other size rejects
+with a `TypeError` before it is sent, and a host refuses it in place.
 
 `openDrawer`/`closeDrawer` send the host UI verbs `screen.drawer.open` and
 `screen.drawer.close`. They are shell verbs, not app capabilities, so they are

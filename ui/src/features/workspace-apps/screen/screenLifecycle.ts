@@ -2,7 +2,7 @@ import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseChild, pa
   wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_DRAWER_CLOSE, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, CRM_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
   type ActionResult, type AssetReply, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenPush,
-  type ScreenDrawerVerb, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
+  type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
 
 /** Resolves one pushed asset ref to a downscaled `data:` URL, or `null`
@@ -54,7 +54,7 @@ export interface ScreenActions {
    *  `screen-surfaces.v1` capability: an independent open mounts a separate
    *  drawer frame in the shell's own fixed overlay instead of promoting
    *  this frame. */
-  onScreenDrawer?(mode: ScreenPresentationMode, surface?: string, independent?: boolean): void;
+  onScreenDrawer?(mode: ScreenPresentationMode, surface?: string, independent?: boolean, size?: ScreenDrawerSize): void;
   /** CAD-1177: invoke one declared tool alias under the operator's own
    *  session + this mount's server-bound action context. Absent (no tool
    *  context was minted, e.g. a v1/read-only screen) the `tool` op closes. */
@@ -188,7 +188,7 @@ export abstract class FrameChannel {
   protected tool(_request: ToolRequest): void { this.close(true); }
   protected recordsRights(): readonly string[] | undefined { return undefined; }
   /** CAD-1777 — whether this frame may use the host's local drawer UI verbs,
-   *  and which of them. Only the records channel can ever say yes; a
+   *  and which of them. Only the screen channel can ever say yes; a
    *  primary admits both, a drawer frame only `close`. */
   protected drawerCapable(): boolean | readonly ScreenDrawerVerb[] { return false; }
   /** Opaque state is ignored unless this frame kind explicitly understands it. */
@@ -322,24 +322,27 @@ export class ScreenChannel extends FrameChannel {
   private csvBusy = false;
   private csvSlot: string | null = null;
   protected recordsRights(): readonly string[] | undefined { return this.records ? this.receipt.operations ?? [] : undefined; }
-  /** CAD-1777 — the host-local presentation capability of THIS live mount:
-   *  a records frame that negotiated `screen-presentation.v1` or
-   *  `screen-surfaces.v1`, has an admitted action host and a live shell
-   *  drawer callback. A read-only viewer's shell withholds the callback, so
-   *  it never inherits geometry authority from a records receipt. A primary
-   *  admits both verbs; a drawer frame admits only its own close. */
+  /** CAD-1777 / CAD-1932 — the host-local presentation capability of THIS
+   *  live mount: any screen.v2 frame (records or not) that negotiated
+   *  `screen-presentation.v1` or `screen-surfaces.v1`, has an admitted
+   *  action host, a live action context and a live shell drawer callback.
+   *  A read-only viewer's shell withholds the callback, so it never
+   *  inherits geometry authority from a receipt. A primary admits both
+   *  verbs; a drawer frame admits only its own close. */
   private drawerVerbs(): readonly ScreenDrawerVerb[] | null {
-    if (!this.records || this.shape !== "v2" || !(this.wantsPresentation || this.wantsSurfaces) ||
+    if (this.shape !== "v2" || !(this.wantsPresentation || this.wantsSurfaces) ||
         !this.actions?.onScreenDrawer || !this.receipt.action_token) return null;
     return this.surfaceRole === "drawer" ? [SCREEN_DRAWER_CLOSE] : SCREEN_DRAWER_VERBS;
   }
   protected drawerCapable(): readonly ScreenDrawerVerb[] | false { return this.drawerVerbs() ?? false; }
   /** One validated host-local presentation request. It is never dispatched
-   *  to a records service, never spends and never widens rights; malformed
-   *  arguments are refused in place so the frame (and its draft) survives. */
+   *  to a records service or an app action, never spends and never widens
+   *  rights; malformed arguments are refused in place so the frame (and its
+   *  draft) survives. A verb outside this mount's admitted subset (a drawer
+   *  frame's open) closes, as on the records parser. */
   private drawerCall(request: CallRequest & { verb: ScreenDrawerVerb }): void {
     const onDrawer = this.actions?.onScreenDrawer;
-    if (!this.drawerVerbs() || !onDrawer) { this.close(true); return; }
+    if (!this.drawerVerbs()?.includes(request.verb) || !onDrawer) { this.close(true); return; }
     const independent = this.wantsSurfaces;
     const reply = (message: ReplyMessage) => { if (!this.closed) this.port?.postMessage(message); };
     const parsed = parseScreenDrawerCall(request.verb, request.args);
@@ -352,7 +355,7 @@ export class ScreenChannel extends FrameChannel {
       reply({ v: 2, op: "reply", id: request.id, ok: true, data: { mode: "outlet" } });
       return;
     }
-    onDrawer("drawer", parsed.surface, independent);
+    onDrawer("drawer", parsed.surface, independent, parsed.size);
     reply({ v: 2, op: "reply", id: request.id, ok: true, data: { mode: "drawer", surface: parsed.surface } });
   }
   private calls = 0;
@@ -381,9 +384,20 @@ export class ScreenChannel extends FrameChannel {
     const actions = this.actions;
     if (this.crmLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
     if (this.shape !== "v2" || !actions || this.calls >= CALL_QUEUE_MAX) { this.close(true); return; }
-    // CAD-1777 — a records frame's drawer request is host-local UI, never a
-    // records operation: it is answered here and never reaches the services.
-    if (this.records && isScreenDrawerVerb(request.verb)) { this.drawerCall(request as CallRequest & { verb: ScreenDrawerVerb }); return; }
+    // CAD-1777 / CAD-1932 — a drawer request is host-local UI, never a
+    // records operation or an app action: a capable frame (records or not)
+    // is answered here and never reaches the services. A non-records
+    // `screen-presentation.v1` peer without that capability keeps its
+    // CAD-1615 path below; any other non-records frame (no opt-in, or a
+    // surfaces frame without a live action context or shell callback) is
+    // refused in place.
+    if (isScreenDrawerVerb(request.verb)) {
+      if (this.records || this.drawerVerbs()) { this.drawerCall(request as CallRequest & { verb: ScreenDrawerVerb }); return; }
+      if (!this.wantsPresentation || this.wantsSurfaces) {
+        this.port?.postMessage({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "unavailable", text: "This app cannot open a board drawer here." } });
+        return;
+      }
+    }
     const csv = this.records && request.verb === "records.csv.preview";
     if (csv && (this.csvBusy || this.csvSlot)) { this.close(true); return; }
     if (csv) this.csvBusy = true;

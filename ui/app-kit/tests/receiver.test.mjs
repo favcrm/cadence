@@ -153,6 +153,30 @@ test("drawer helpers send host UI verbs and validate the surface", async () => {
   await assert.rejects(receiver.openDrawer("not a surface!"), /surface/);
 });
 
+test("openDrawer passes an optional size and refuses an unknown one", async () => {
+  const { receiver, inbox, host, pushes } = connect({
+    accepts: ["screen.v2", "screen-actions.v1", "screen-presentation.v1"],
+  });
+  await waitFor(() => inbox.find((m) => m.op === "ready"), "ready");
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the push");
+  host.postMessage({ v: 1, op: "presentation", mode: "drawer" });
+  await waitFor(() => receiver.presentation() === "drawer", "the presentation");
+  const opening = receiver.openDrawer("draft", { size: "wide" });
+  const open = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "screen.drawer.open"), "the drawer open");
+  assert.deepEqual(open.args, { surface: "draft", size: "wide" });
+  host.postMessage({ v: 2, op: "reply", id: open.id, ok: true, data: { mode: "drawer", surface: "draft" } });
+  assert.deepEqual(await opening, { mode: "drawer", surface: "draft" });
+  const narrow = receiver.openDrawer("draft", { size: "narrow" });
+  const second = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "screen.drawer.open" && m.id !== open.id), "the narrow open");
+  assert.deepEqual(second.args, { surface: "draft", size: "narrow" });
+  host.postMessage({ v: 2, op: "reply", id: second.id, ok: true, data: { mode: "drawer", surface: "draft" } });
+  await narrow;
+  const sent = inbox.length;
+  await assert.rejects(receiver.openDrawer("draft", { size: "huge" }), /size/);
+  assert.equal(inbox.length, sent, "an unknown size is never sent");
+});
+
 test("drawer helpers refuse without the presentation opt-in", async () => {
   const { receiver, host, pushes } = connect({ accepts: ["screen.v2"] });
   host.postMessage(push());

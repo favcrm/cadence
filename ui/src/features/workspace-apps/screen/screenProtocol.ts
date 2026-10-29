@@ -74,10 +74,10 @@ export type ScreenSurfaceRole = "primary" | "drawer";
 export type ScreenSurface = { v: 1; op: "surface"; role: ScreenSurfaceRole; modal: boolean };
 
 /** CAD-1777 — the two host-local presentation verbs. They are UI
- *  capabilities of the shell (which surface this frame's geometry shows
- *  in), never records operations or authority grants: a records frame is
- *  admitted to them only when it negotiated `screen-presentation.v1`, the
- *  live shell lends a drawer callback, and the frame has an action host. */
+ *  in), never records operations or authority grants: a screen.v2 frame
+ *  (CAD-1932: records or not) is admitted to them only when it negotiated
+ *  `screen-presentation.v1` or `screen-surfaces.v1`, the live shell lends a
+ *  drawer callback, and the frame has an action host. */
 export const SCREEN_DRAWER_OPEN = "screen.drawer.open" as const;
 export const SCREEN_DRAWER_CLOSE = "screen.drawer.close" as const;
 export const SCREEN_DRAWER_VERBS = [SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE] as const;
@@ -86,16 +86,23 @@ export const isScreenDrawerVerb = (verb: string): verb is ScreenDrawerVerb =>
   (SCREEN_DRAWER_VERBS as readonly string[]).includes(verb);
 /** The closed surface idiom a drawer request may name. */
 export const DRAWER_SURFACE = /^[a-z0-9_-]{1,64}$/;
+/** CAD-1932 — the closed panel widths an open may ask for. `narrow` is the
+ *  default; `wide` fits a draft editor. The shell owns the pixels. */
+export type ScreenDrawerSize = "narrow" | "wide";
 /** What a validated drawer request asks the shell to do. */
-export type ScreenDrawerRequest = { mode: "drawer"; surface: string } | { mode: "outlet" };
+export type ScreenDrawerRequest = { mode: "drawer"; surface: string; size?: ScreenDrawerSize } | { mode: "outlet" };
 /** Parse one drawer request's EXACT arguments, or `null` when they are not
- *  the closed shape (`{surface}` for open, `{}` for close). The host's
+ *  the closed shape (`{surface, size?}` for open, `{}` for close). The host's
  *  argument guard and the records dispatch share this one parser, so a
- *  malformed request can never change geometry on either path. */
+ *  malformed request — an unknown size included — can never change
+ *  geometry on either path. */
 export function parseScreenDrawerCall(verb: ScreenDrawerVerb, args: ActionArgs): ScreenDrawerRequest | null {
   if (verb === SCREEN_DRAWER_OPEN) {
-    if (Object.keys(args).sort().join() !== "surface" || typeof args.surface !== "string" || !DRAWER_SURFACE.test(args.surface)) return null;
-    return { mode: "drawer", surface: args.surface };
+    const keys = Object.keys(args).sort().join();
+    if (keys !== "surface" && keys !== "size,surface" || typeof args.surface !== "string" || !DRAWER_SURFACE.test(args.surface)) return null;
+    if (keys === "surface") return { mode: "drawer", surface: args.surface };
+    if (args.size !== "narrow" && args.size !== "wide") return null;
+    return { mode: "drawer", surface: args.surface, size: args.size };
   }
   return Object.keys(args).length === 0 ? { mode: "outlet" } : null;
 }

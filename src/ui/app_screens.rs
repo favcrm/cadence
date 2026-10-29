@@ -66,7 +66,7 @@ pub(super) fn request_credentials(
 /// install/tag are from the URL, the optional context is re-proven by the
 /// daemon for that install, and the optional parent action token is the
 /// trusted host's drawer pairing for a child mount (proven natively to be
-/// a live, consumed, non-read-only PRIMARY of the same records screen and
+/// a live, consumed, non-read-only PRIMARY of the same screen and
 /// context). Session credentials are relayed from the proven request. The
 /// child frame never supplies or receives any of this authority.
 pub(super) fn mount(

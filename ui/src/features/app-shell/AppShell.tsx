@@ -23,7 +23,7 @@ import { resolveChatCollapsed, useChatCollapsed, selectConversation, setDraftSub
 import { installedAppHref } from "../apps/appViewModel";
 import { useLocale } from "../../lib/locale";
 import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
-import type { ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
+import type { ScreenDrawerSize, ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
 import RunLauncher from "./RunLauncher";
 import type { MediaChatAttach } from "../workspace-apps/screen/screenLifecycle";
 import { parseRoutePatch, type RoutePatch } from "../workspace-apps/screen/screenRoute";
@@ -152,7 +152,7 @@ export default function AppShell({
      *  cannot drive it. `independent` marks a negotiated
      *  `screen-surfaces.v1` request, which the shell mounts as its own
      *  fixed child overlay instead of promoting the primary. */
-    onScreenDrawer?: (mode: "outlet" | "drawer", surface?: string, independent?: boolean) => void;
+    onScreenDrawer?: (mode: "outlet" | "drawer", surface?: string, independent?: boolean, size?: "narrow" | "wide") => void;
     presentation: "outlet" | "drawer";
     /** CAD-1777 — the fixed overlay target the primary portals its child
      *  drawer frame into; null while the overlay is closed. */
@@ -214,6 +214,8 @@ export default function AppShell({
   // owns a fixed panel/scrim and hands the primary its portal target, so the
   // drawer is a separate child mount.
   const [independentDrawer, setIndependentDrawer] = useState<string | null>(null);
+  // CAD-1932 — the open's validated width hint; `narrow` is today's panel.
+  const [independentSize, setIndependentSize] = useState<ScreenDrawerSize>("narrow");
   const [drawerTarget, setDrawerTarget] = useState<HTMLElement | null>(null);
   const attachDrawerTarget = useCallback((node: HTMLElement | null) => setDrawerTarget(node), []);
   // CAD-1615: the drawer is a write-shaped action. A read-only or
@@ -222,7 +224,7 @@ export default function AppShell({
   // verb refuses at the host instead of presenting a surface for a viewer
   // who cannot act on it.
   const canDriveScreen = viewer.operator === true && !viewer.readOnly;
-  const onScreenDrawer = useCallback((mode: "outlet" | "drawer", surface?: string, independent?: boolean) => {
+  const onScreenDrawer = useCallback((mode: "outlet" | "drawer", surface?: string, independent?: boolean, size?: ScreenDrawerSize) => {
     // The callback re-checks the capability, so a frame mounted while the
     // operator could drive one never leaves a drawer behind once access drops.
     if (!canDriveScreen) return;
@@ -232,6 +234,7 @@ export default function AppShell({
     if (independent) {
       setScreenDrawer(null);
       setIndependentDrawer(mode === "drawer" ? (surface ?? "") : null);
+      if (mode === "drawer") setIndependentSize(size ?? "narrow");
       return;
     }
     setIndependentDrawer(null);
@@ -1314,7 +1317,7 @@ export default function AppShell({
           the scrim above) is modal. The close control lives above the child
           frame, so it survives a failed child mount. */}
       {independentOpen && (
-        <div ref={drawerPanelRef} className="app-shell-screen-drawer" role="dialog" aria-modal="true" tabIndex={-1}
+        <div ref={drawerPanelRef} className="app-shell-screen-drawer" data-size={independentSize} role="dialog" aria-modal="true" tabIndex={-1}
              aria-label={`${title} ${t("Details")}`}>
           <div className="app-shell-screen-drawer-bar">
             <span className="truncate text-label text-ink-300">{t("Details")}</span>
