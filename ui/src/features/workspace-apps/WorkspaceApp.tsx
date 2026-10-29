@@ -264,7 +264,7 @@ export default function WorkspaceApp({
    *  and the surface the shell is presenting it in. `independent` marks a
    *  negotiated `screen-surfaces.v1` open that the shell mounts as its own
    *  fixed child overlay. */
-  onScreenDrawer?: (mode: "outlet" | "drawer", surface?: string, independent?: boolean) => void;
+  onScreenDrawer?: (mode: "outlet" | "drawer", surface?: string, independent?: boolean, size?: "narrow" | "wide") => void;
   presentation?: "outlet" | "drawer";
   /** CAD-1777 — the shell-owned fixed overlay target for the primary's
    *  child drawer frame; null while it is closed. */

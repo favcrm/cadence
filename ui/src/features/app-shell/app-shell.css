@@ -264,8 +264,13 @@
   justify-items: start;
   padding: 1rem;
 }
+/* CAD-1932 — the `wide` hint fits a draft editor at desktop widths. */
+.app-shell-screen-drawer[data-size="wide"] {
+  width: min(46rem, 100dvw);
+}
 @media (max-width: 1023.98px) {
-  .app-shell-screen-drawer {
+  .app-shell-screen-drawer,
+  .app-shell-screen-drawer[data-size="wide"] {
     width: 100dvw;
     max-width: 100dvw;
     border-left: 0;

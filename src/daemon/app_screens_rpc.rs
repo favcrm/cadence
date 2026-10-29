@@ -32,7 +32,7 @@
 //!
 //! CAD-1777: an optional host `parent_action_token` on mint pairs a
 //! DRAWER child with a live, consumed, non-read-only PRIMARY action
-//! context of the same records screen, install, digest, approval epoch
+//! context of the same screen (any contract, CAD-1932), install, digest, approval epoch
 //! and context — proven natively and re-proved at consume under the
 //! action-context lock. A child consume retires only a prior child of the
 //! same parent (one childslot) and never the parent; consuming or
@@ -373,24 +373,17 @@ impl Shared {
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
         let (digest, approval_epoch, pkg) = self.screen_package_checked(&pm, install_id, tag)?;
-        // CAD-1777: a drawer child is admitted ONLY as a paired
-        // `screen-records.v1` screen over the same live, non-read-only
+        // CAD-1777 / CAD-1932: a drawer child of any screen contract is
+        // admitted ONLY as a paired mount over the same live, non-read-only
         // primary action context. The host's token is a lookup key; every
-        // proof field below is native. Every other contract and every
-        // token-less mint keeps its existing primary behavior.
+        // proof field below is native. Every token-less mint keeps its
+        // existing primary behavior.
         let parent = match parent_action_token {
             None => None,
             Some(parent_token) => {
                 if read_only {
                     return Err(Error::rejected(
                         "a read-only mount cannot host a drawer child",
-                    ));
-                }
-                if pkg.host_contract.as_deref()
-                    != Some(crate::issue::app_screen_decl::HOST_CONTRACT_RECORDS)
-                {
-                    return Err(Error::rejected(
-                        "only a records screen admits a drawer child",
                     ));
                 }
                 let Some(context) = context_id.as_deref() else {

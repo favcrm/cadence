@@ -454,8 +454,9 @@ export function createScreenReceiver(options = {}) {
     },
     /** The surface the host currently presents this frame in. */
     presentation: () => presentation,
-    /** Ask the host to present the app's surface in the board-wide drawer. */
-    openDrawer(surface) {
+    /** Ask the host to present the app's surface in the board-wide drawer.
+     *  `options.size` (CAD-1932) is `"narrow"` (the default) or `"wide"`. */
+    openDrawer(surface, options = {}) {
       if (!presentationAccepted) {
         return Promise.reject(new ScreenClosedError("the host did not opt into screen-presentation.v1"));
       }
@@ -465,7 +466,11 @@ export function createScreenReceiver(options = {}) {
       if (typeof surface !== "string" || !/^[a-z0-9_-]{1,64}$/.test(surface)) {
         return Promise.reject(new TypeError("surface must be 1-64 of a-z, 0-9, _ or -"));
       }
-      return request("call", { verb: "screen.drawer.open", args: { surface } });
+      const size = options?.size;
+      if (size !== undefined && size !== "narrow" && size !== "wide") {
+        return Promise.reject(new TypeError('size must be "narrow" or "wide"'));
+      }
+      return request("call", { verb: "screen.drawer.open", args: size === undefined ? { surface } : { surface, size } });
     },
     /** Ask the host to close the board-wide drawer it opened. */
     closeDrawer() {
