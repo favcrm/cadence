@@ -316,6 +316,7 @@ class Case:
         self.comments = []
         self.posted = []
         self.merges = []
+        self.gate_comments = []              # CAD-1925 delivery-gate PR comments
         self.verdicts = [self.verdict(NOTE_STD, "20261019-093000", "std-reviewer", "standards"),
                          self.verdict(NOTE_SPEC, "20261019-094000", "spec-reviewer", "spec-security")]
 
@@ -399,6 +400,11 @@ class Case:
     def run(self, argv, input_text=None):
         if argv[:3] == ["gh", "pr", "view"]:
             return self.pr_view()
+        if argv[1:3] == [enq.GATE_SCRIPT, "sign"]:
+            return 0, "<!-- cadence-delivery-gate v1 -->\nsigned\n", ""
+        if argv[:3] == ["gh", "pr", "comment"]:
+            self.gate_comments.append(input_text)
+            return 0, "", ""
         if argv[:3] == ["gh", "pr", "merge"]:
             self.merges.append(list(argv))
             return 0, "", ""
