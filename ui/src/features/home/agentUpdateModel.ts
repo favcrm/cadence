@@ -35,11 +35,16 @@ export function updatesNotices(input: {
   daemon?: string;
   refreshError: boolean;
   recentCount: number;
+  /** The agents resource status. `stale` keeps the last payload after a failed refresh. */
+  resourceStatus?: string;
 }): { unreachable: boolean; partial: boolean; empty: boolean; unavailable: boolean } {
-  const degraded = input.hasData && (input.daemon === "unreachable" || input.refreshError);
+  const refreshFailed = input.refreshError
+    || input.resourceStatus === "stale"
+    || input.resourceStatus === "failed";
+  const degraded = input.hasData && (input.daemon === "unreachable" || refreshFailed);
   return {
     unreachable: input.hasData && input.daemon === "unreachable",
-    partial: input.hasData && input.refreshError && input.recentCount > 0,
+    partial: input.hasData && refreshFailed && input.recentCount > 0,
     empty: input.hasData && input.recentCount === 0 && !degraded,
     unavailable: input.hasData && input.recentCount === 0 && degraded,
   };

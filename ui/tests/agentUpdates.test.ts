@@ -58,6 +58,10 @@ const failed = updatesNotices({ hasData: true, daemon: "unreachable", refreshErr
 check(failed.unavailable && !failed.empty, "a failed read is not an empty success");
 const partial = updatesNotices({ hasData: true, daemon: "ok", refreshError: true, recentCount: 2 });
 check(partial.partial && !partial.empty && !partial.unavailable, "a partial roster stays partial");
+const staleEmpty = updatesNotices({ hasData: true, daemon: "ok", refreshError: false, recentCount: 0, resourceStatus: "stale" });
+check(staleEmpty.unavailable && !staleEmpty.empty, "a failed refresh of an empty roster is not an empty success");
+const staleRows = updatesNotices({ hasData: true, daemon: "ok", refreshError: false, recentCount: 2, resourceStatus: "stale" });
+check(staleRows.partial && !staleRows.empty && !staleRows.unavailable, "a failed refresh keeps the last rows and says the read is partial");
 check(JSON.stringify(detailTasksNotOnRoster(null, ["a", "b"])) === JSON.stringify(["a", "b"]), "a missing roster keeps every detail task id");
 check(JSON.stringify(detailTasksNotOnRoster(partitionActiveTasks(worker("ada", [task("run-1", "running", "Draw the states")])), ["run-1", "detail-only"])) === JSON.stringify(["detail-only"]), "a roster task is not listed twice");
 check(JSON.stringify(detailTasksNotOnRoster(partitionActiveTasks(worker("ada", [])), ["detail-only"])) === JSON.stringify(["detail-only"]), "an empty roster row still shows detail task ids");

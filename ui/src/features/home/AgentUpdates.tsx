@@ -242,6 +242,7 @@ export default function AgentUpdates({ onAsk, onOpenIssue }: {
     daemon: state.data?.daemon,
     refreshError: Boolean(state.data?.refresh_error),
     recentCount: agents.length,
+    resourceStatus: state.status,
   });
   return <div>
     <p className="px-4 py-3 text-label text-ink-500 border-b border-ink-700">{t("Recent work across all projects. Ask the Assistant to check in or explain an update.")}</p>
