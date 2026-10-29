@@ -563,6 +563,7 @@ impl Shared {
     /// evidence `pr_admission` resolved for exactly this PR/head; it is
     /// committed here, with the head, so a later reader can never pair a
     /// list with a different diff.
+    #[allow(clippy::too_many_arguments)]
     fn on_done(
         self: &Arc<Self>,
         pm: &Pm,
