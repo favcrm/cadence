@@ -433,7 +433,18 @@ impl Shared {
                 plan.job.id, plan.task.id
             )));
         };
-        let remotes = crate::issue::app_guard::selected_remotes(&gated.project, &root);
+        // The checkout's own source identity, not only the project's
+        // registered paths: a task bound to another local checkout of the
+        // app's pinned git source is matched by its own origin, and an
+        // unprovable checkout refuses instead of becoming an empty app
+        // set.
+        let remotes =
+            crate::issue::app_guard::checkout_remotes(&gated.project, &root).map_err(|e| {
+                Error::rejected(format!(
+                    "task dispatch refused: job '{}' / task '{}' — {}",
+                    plan.job.id, plan.task.id, e
+                ))
+            })?;
         match crate::issue::app_guard::refusals(guard, &app_paths, &authors, &remotes)? {
             Some(why) => Err(Error::rejected(why)),
             None => Ok(()),

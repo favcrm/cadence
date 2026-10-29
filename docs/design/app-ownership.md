@@ -87,10 +87,17 @@ roles (`cadence app set-team`), or by a run's frozen role inputs, never authors 
 change to that app's source — `apps/<name>/` in a repository, or the git source
 the install record pinned — and never reviews one. Membership is by agent alias
 across every project, so renaming a role or filing the work under another project
-does not launder the author. The refusal is applied at dispatch (the ticket's
+does not launder the author. A run freezes its role bindings as their own
+snapshot member; a run written before that member existed cannot say which of
+its inputs were roles, so a question naming one of their values holds (with an
+explicit re-create requirement) rather than reading today's team keys or a
+content value as an agent. The refusal is applied at dispatch (the ticket's
 planned `paths:`), at plan proposal (a plan naming `apps/<name>/`), and again at
 the review loop (the PR's own changed files, and its repository when it is the
 app's git source); review routing and the verdict both exclude the app's team.
+The repository proof resolves the task checkout's own git source, so a checkout
+outside the project's registered paths is matched by its origin and an
+unprovable checkout refuses instead of passing as "no app".
 An installed copy still stays immutable between approvals: an edit to
 `<pm>/<project>/apps/<name>/` moves the structural digest, the board reads the
 install as `changed`, and a run's gate refuses `app_unapproved` until the

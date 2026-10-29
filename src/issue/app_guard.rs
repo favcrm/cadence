@@ -29,7 +29,10 @@
 //!   (role → alias, frozen in the run snapshot) and the agents its runs
 //!   assigned — the run snapshot, never the current workflow or team
 //!   record, so a role the operator renamed or replaced keeps the alias
-//!   it bound.
+//!   it bound. A snapshot written before that provenance existed merged
+//!   its role bindings into content and recorded no role keys, so its
+//!   aliases stay unproven: a question naming one holds rather than
+//!   reading today's role keys — or a content value — as an agent.
 //!
 //! **Where it is enforced.** The daemon's own dispatch admission
 //! (`dispatch_send`) with the connection-derived caller and the target
@@ -96,12 +99,24 @@ pub struct Install {
     /// The normalized remote of a `Source::Git` install, if any.
     pub git: Option<String>,
     /// The agents on the team. Aliases only — a role key never enters
-    /// this set.
+    /// this set, and neither does a content input's value.
     pub team: BTreeSet<String>,
-    /// The installation's own role keys (the saved team's keys), kept
-    /// apart from the aliases: they name which of a run's frozen inputs
-    /// were team-role bindings rather than content.
-    pub roles: BTreeSet<String>,
+    /// Alias → the legacy snapshot that froze it into its input map
+    /// before `team_roles` existed. Whether that input was a team-role
+    /// binding or content was never recorded and the saved team may
+    /// have been edited since, so this is never a member: a question
+    /// about one of these aliases holds instead of guessing.
+    pub unproven: BTreeMap<String, Unproven>,
+}
+
+/// A frozen input from a snapshot written before the run recorded which
+/// of its inputs were team roles.
+#[derive(Clone, Debug)]
+pub struct Unproven {
+    /// The run whose snapshot left this alias's provenance unknown.
+    pub run: String,
+    /// The frozen input key the alias was found under.
+    pub key: String,
 }
 
 /// The app a repo-relative path belongs to: `apps/<name>[/…]` → `<name>`.
@@ -251,16 +266,14 @@ pub fn installations(ctx: Ctx) -> Result<Vec<Install>> {
             install_id: record.install_id.clone(),
             git: git_of(&record),
             team: record.team.values().cloned().collect(),
-            roles: record.team.keys().cloned().collect(),
+            unproven: BTreeMap::new(),
         });
     }
     for (id, record) in workspace_records(ctx.pm_dir)? {
         let mut team: BTreeSet<String> = record.team.values().cloned().collect();
-        let mut roles: BTreeSet<String> = record.team.keys().cloned().collect();
         if let Some(state) = ctx.state_dir {
             if let Some(saved) = crate::daemon::app_teams_rpc::team_of(state, &id)? {
                 team.extend(saved.roles.values().cloned());
-                roles.extend(saved.roles.keys().cloned());
             }
         }
         out.push(Install {
@@ -270,24 +283,44 @@ pub fn installations(ctx: Ctx) -> Result<Vec<Install>> {
             install_id: id,
             git: git_of(&record),
             team,
-            roles,
+            unproven: BTreeMap::new(),
         });
     }
     if let Some(store) = ctx.store {
         for install in &mut out {
             // Each run's frozen membership, from the run's own snapshot:
-            // the `team_roles` map this build writes, the aliases its
-            // steps assigned, and — for a snapshot written before that
-            // map existed — the run's frozen inputs, where only a key the
-            // installation still declares as a role is a team-role
-            // binding. An ordinary content input is never read as a role
-            // name, so its value never becomes a member.
+            // the `team_roles` map this build writes and the aliases its
+            // steps assigned. A snapshot written before `team_roles`
+            // existed merged the team's role bindings into its content
+            // inputs without recording which keys were roles, so no
+            // input value is ever read as a member — not by today's
+            // role keys (which the operator may have renamed or
+            // removed) and not by value. Those aliases stay unproven
+            // until a question names one, which then holds.
             for run in store.app_run_team_inputs(&install.install_id)? {
                 install.team.extend(run.assigned);
-                install.team.extend(run.roles.into_values());
-                for (role, alias) in run.inputs {
-                    if install.roles.contains(&role) {
-                        install.team.insert(alias);
+                match run.roles {
+                    Some(roles) => install.team.extend(roles.into_values()),
+                    // A host-execution workflow froze no team roles, so
+                    // its legacy input map is provably content.
+                    None if !run.may_have_roles => {}
+                    None => {
+                        // A cancelled run is the operator's own withdrawal:
+                        // its unrecorded bindings no longer constrain, which
+                        // is the migration path for a legacy snapshot
+                        // (cancel it, then re-create it with this build).
+                        if run.state == "cancelled" {
+                            continue;
+                        }
+                        for (key, alias) in run.inputs {
+                            if alias.is_empty() || install.team.contains(&alias) {
+                                continue;
+                            }
+                            install.unproven.entry(alias).or_insert(Unproven {
+                                run: run.id.clone(),
+                                key,
+                            });
+                        }
                     }
                 }
             }
@@ -318,6 +351,23 @@ pub fn apps_of_agent(ctx: Ctx, agent: &str) -> Result<BTreeSet<String>> {
         .filter(|(_, team)| team.contains(agent))
         .map(|(app, _)| app)
         .collect())
+}
+
+/// Every app whose legacy snapshots leave some alias's team membership
+/// unproven: app → those aliases. Reviewer exclusion and the review
+/// evidence gate read this conservatively: an agent who might be on an
+/// app's team is never treated as independent of it.
+pub fn unproven_teams(ctx: Ctx) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for install in installations(ctx)? {
+        if install.unproven.is_empty() {
+            continue;
+        }
+        out.entry(install.app)
+            .or_default()
+            .extend(install.unproven.into_keys());
+    }
+    Ok(out)
 }
 
 /// The apps installed from the repository `slug` (`owner/name`) — the
@@ -369,6 +419,48 @@ pub fn selected_remotes(project: &project::Project, root: &Path) -> Vec<String> 
         .collect()
 }
 
+/// The git source a dispatch's checkout actually is, proven from the
+/// checkout itself rather than only from the issue project's registered
+/// paths. `root` is a main-checkout root (`worktree::main_root`), so a
+/// linked worktree names the same repository as its main checkout.
+///
+/// A checkout the project registers answers with its declared remote —
+/// and one whose own `origin` disagrees is unprovable, never trusted. A
+/// checkout outside those paths (a second local clone of the app's
+/// pinned git source, say) is proven by its own origin, matched to the
+/// same normalized form installations are pinned with. Unreadable or
+/// absent evidence is an error, never an empty set: while the app
+/// question is live the caller refuses instead of admitting the author.
+pub fn checkout_remotes(project: &project::Project, root: &Path) -> Result<Vec<String>> {
+    let registered = selected_remotes(project, root);
+    let actual = crate::issue::project::repo_identity(root).and_then(|(_, remote)| remote);
+    let normalized = |remote: &str| project::normalize_remote(remote).to_ascii_lowercase();
+    if !registered.is_empty() {
+        if let Some(actual) = &actual {
+            if !registered
+                .iter()
+                .any(|remote| normalized(remote) == *actual)
+            {
+                return Err(Error::rejected(format!(
+                    "the checkout at {} is registered as {} but its own origin is {actual} \
+                     — the repository identity cannot be proven",
+                    root.display(),
+                    registered.join(", ")
+                )));
+            }
+        }
+        return Ok(registered);
+    }
+    match actual {
+        Some(actual) => Ok(vec![actual]),
+        None => Err(Error::rejected(format!(
+            "the checkout at {} is not a repository this issue project registers and its \
+             git source cannot be read — the app-team check cannot be made",
+            root.display()
+        ))),
+    }
+}
+
 /// The repository a dispatch for `front` selected: the main checkout of
 /// the single open lane the issue's own record names, when that is one
 /// repository. `None` when it has no lane yet or its lanes are ambiguous
@@ -389,28 +481,54 @@ pub fn selected_root(project: &project::Project, front: &model::Front) -> Option
 }
 
 /// Is the app question live for this change at all? True when the change
-/// names an app by path, or one of `authors` is on some app's team. A
-/// caller uses this to refuse rather than admit when the repository it
-/// would have to match is unprovable: nothing to check is not the same
-/// answer as "could not check".
+/// names an app by path, or one of `authors` is on some app's team — or
+/// a legacy snapshot leaves one of them possibly on one. A caller uses
+/// this to refuse rather than admit when the repository it would have to
+/// match is unprovable: nothing to check is not the same answer as
+/// "could not check".
 pub fn app_question_live(ctx: Ctx, apps: &BTreeSet<String>, authors: &[&str]) -> Result<bool> {
     if !apps.is_empty() {
         return Ok(true);
     }
-    let teams = teams(ctx)?;
-    Ok(authors
-        .iter()
-        .any(|author| !author.is_empty() && teams.values().any(|team| team.contains(*author))))
+    Ok(installations(ctx)?.iter().any(|install| {
+        authors.iter().any(|author| {
+            !author.is_empty()
+                && (install.team.contains(*author) || install.unproven.contains_key(*author))
+        })
+    }))
+}
+
+/// The hold when `alias`'s membership in `app` cannot be established: a
+/// legacy snapshot froze it into its inputs before the run recorded
+/// which inputs were team roles. It is never answered as "not a member".
+fn unproven_refusal(ctx: Ctx, app: &str, alias: &str) -> Result<Option<String>> {
+    for install in installations(ctx)? {
+        if install.app != app {
+            continue;
+        }
+        if let Some(unproven) = install.unproven.get(alias) {
+            return Ok(Some(format!(
+                "the app-team check for {alias} on app '{app}' (installation {}) holds: app \
+                 run '{}' was frozen before the run recorded which of its inputs were team \
+                 roles, so whether input '{}' bound {alias} to a team role or was content \
+                 cannot be established — cancel that run (`cadence app run cancel --run-id \
+                 {}`) and re-create it with this build so the binding is recorded, then retry",
+                install.install_id, unproven.run, unproven.key, unproven.run
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// The plain refusal when `author` is on `app`'s team: names the agent,
 /// the app, where it is installed, and the change, and says who takes it
-/// instead.
+/// instead. When the only evidence is a legacy snapshot's unproven
+/// input, the answer holds instead of passing.
 pub fn refusal(ctx: Ctx, app: &str, touched: &str, author: &str) -> Result<Option<String>> {
-    if !team_agents(ctx, app)?.contains(author) {
-        return Ok(None);
+    if team_agents(ctx, app)?.contains(author) {
+        return Ok(Some(author_reason(ctx, app, touched, author)?));
     }
-    Ok(Some(author_reason(ctx, app, touched, author)?))
+    unproven_refusal(ctx, app, author)
 }
 
 fn author_reason(ctx: Ctx, app: &str, touched: &str, author: &str) -> Result<String> {
@@ -425,14 +543,14 @@ fn author_reason(ctx: Ctx, app: &str, touched: &str, author: &str) -> Result<Str
 
 /// The plain refusal when `reviewer` is on `app`'s team.
 pub fn review_refusal(ctx: Ctx, app: &str, reviewer: &str) -> Result<Option<String>> {
-    if !team_agents(ctx, app)?.contains(reviewer) {
-        return Ok(None);
+    if team_agents(ctx, app)?.contains(reviewer) {
+        return Ok(Some(format!(
+            "{reviewer} is on app '{app}'s team ({}) and cannot review a change to that app's \
+             source — the review goes to an agent independent of the app's own team",
+            where_installed(ctx, app)?
+        )));
     }
-    Ok(Some(format!(
-        "{reviewer} is on app '{app}'s team ({}) and cannot review a change to that app's \
-         source — the review goes to an agent independent of the app's own team",
-        where_installed(ctx, app)?
-    )))
+    unproven_refusal(ctx, app, reviewer)
 }
 
 fn where_installed(ctx: Ctx, app: &str) -> Result<String> {
@@ -452,7 +570,8 @@ fn where_installed(ctx: Ctx, app: &str) -> Result<String> {
 
 /// [`refusal`] for any of `apps` plus every app installed from one of
 /// `remotes`, each named by its source path. The first app whose team
-/// names an author answers; a clean change answers `None`.
+/// names an author answers; a legacy snapshot that leaves an author's
+/// membership unproven holds; a clean change answers `None`.
 pub fn refusals(
     ctx: Ctx,
     apps: &BTreeSet<String>,
@@ -470,16 +589,21 @@ pub fn refusals(
         .filter_map(|i| i.git.map(|_| i.app))
         .collect();
     for app in &apps {
-        let Some(team) = teams.get(app) else { continue };
-        let Some(author) = authors.iter().find(|a| !a.is_empty() && team.contains(**a)) else {
-            continue;
-        };
         let touched = if git.contains(app) {
             "its pinned git source".to_string()
         } else {
             format!("{}/{app}/", app::DIR)
         };
-        return Ok(Some(author_reason(ctx, app, &touched, author)?));
+        if let Some(team) = teams.get(app) {
+            if let Some(author) = authors.iter().find(|a| !a.is_empty() && team.contains(**a)) {
+                return Ok(Some(author_reason(ctx, app, &touched, author)?));
+            }
+        }
+        for author in authors.iter().filter(|a| !a.is_empty()) {
+            if let Some(hold) = unproven_refusal(ctx, app, author)? {
+                return Ok(Some(hold));
+            }
+        }
     }
     Ok(None)
 }

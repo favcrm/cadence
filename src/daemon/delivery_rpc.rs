@@ -515,7 +515,9 @@ impl Shared {
         sha: &str,
         aliases: &[&str],
     ) -> Result<crate::issue::app_guard::Evidence> {
-        use crate::issue::app_guard::{apps_from_git_source, apps_in_paths, teams, Evidence};
+        use crate::issue::app_guard::{
+            apps_from_git_source, apps_in_paths, teams, unproven_teams, Evidence,
+        };
         let guard = crate::issue::app_guard::Ctx {
             pm_dir: &pm.dir,
             state_dir: Some(&self.state_dir),
@@ -523,7 +525,15 @@ impl Shared {
         };
         let (slug, _) = crate::issue::task_report::parse_pr_url(pr)?;
         let from_git = apps_from_git_source(guard, &slug)?;
+        // A legacy snapshot that leaves one of these aliases possibly on
+        // an app's team makes the app question real too: the PR's own
+        // files decide whether that app is touched, and the per-app
+        // check then holds instead of reading the alias as independent.
+        let unproven = unproven_teams(guard)?;
         let interested = !from_git.is_empty()
+            || aliases
+                .iter()
+                .any(|alias| unproven.values().any(|set| set.contains(*alias)))
             || aliases.iter().any(|alias| {
                 teams(guard).is_ok_and(|t| t.values().any(|team| team.contains(*alias)))
             });
@@ -653,18 +663,27 @@ impl Shared {
         evidence: &delivery::AppEvidence,
         candidates: &[Candidate],
     ) -> Result<std::collections::BTreeSet<String>> {
-        use crate::issue::app_guard::teams;
+        use crate::issue::app_guard::{teams, unproven_teams};
         let guard = crate::issue::app_guard::Ctx {
             pm_dir: &pm.dir,
             state_dir: Some(&self.state_dir),
             store: Some(&self.store),
         };
         let teams = teams(guard)?;
+        // A legacy snapshot that leaves a candidate possibly on an app's
+        // team excludes that candidate too: an unproven member never
+        // reviews the app it might belong to.
+        let unproven = unproven_teams(guard)?;
         let mut barred = std::collections::BTreeSet::new();
         for app in &evidence.apps {
-            let Some(team) = teams.get(app) else { continue };
             for candidate in candidates {
-                if team.contains(&candidate.alias) {
+                let member = teams
+                    .get(app)
+                    .is_some_and(|team| team.contains(&candidate.alias));
+                let maybe = unproven
+                    .get(app)
+                    .is_some_and(|set| set.contains(&candidate.alias));
+                if member || maybe {
                     barred.insert(candidate.alias.clone());
                 }
             }

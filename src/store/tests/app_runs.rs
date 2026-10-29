@@ -1189,6 +1189,14 @@ fn cad778_frozen_run_with_float_identity_approves() {
         })
         .unwrap();
     let id = run["id"].as_str().unwrap();
+    // CAD-622: a new snapshot always records its team-role map — an empty
+    // map included — so it is never mistaken for a legacy snapshot whose
+    // role keys were never recorded.
+    assert_eq!(
+        run["snapshot"]["team_roles"],
+        json!({}),
+        "a new snapshot carries its team-role provenance"
+    );
     s.app_run_decide(
         id,
         run["snapshot_digest"].as_str(),

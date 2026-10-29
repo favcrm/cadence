@@ -260,6 +260,12 @@ impl Fx {
     /// A run of `install` whose snapshot froze `team_roles` and assigned
     /// nothing — the run-time half of the app's team.
     fn insert_run(&self, id: &str, install: &str, snapshot: Value) {
+        self.insert_run_state(id, install, snapshot, "approved");
+    }
+
+    /// The same, in an explicit lifecycle state (a cancelled run is the
+    /// operator's withdrawal).
+    fn insert_run_state(&self, id: &str, install: &str, snapshot: Value, state: &str) {
         self.shared
             .store
             .write_tx(|tx| {
@@ -267,8 +273,8 @@ impl Fx {
                     "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot, \
                      snapshot_digest,project_link,owner_pm,request_id,state,approved_digest, \
                      created,updated) \
-                     VALUES(?1,?2,1,'b',?3,'d',NULL,'lead','r1','approved',NULL,0,0)",
-                    rusqlite::params![id, install, snapshot.to_string()],
+                     VALUES(?1,?2,1,'b',?3,'d',NULL,'lead','r1',?4,NULL,0,0)",
+                    rusqlite::params![id, install, snapshot.to_string(), state],
                 )?;
                 Ok(())
             })
@@ -482,6 +488,31 @@ fn linked_worktree(fx: &Fx, name: &str) -> PathBuf {
         .status()
         .unwrap()
         .success());
+    dir
+}
+
+/// A local checkout that is not one of the fixture project's registered
+/// repositories — a second clone of an app's git source, say. `remote`
+/// is its own `origin`; `None` leaves the source unreadable.
+fn unregistered_checkout(fx: &Fx, name: &str, remote: Option<&str>) -> PathBuf {
+    let dir = fx._root.path().join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "-q"]);
+    if let Some(remote) = remote {
+        git(&["remote", "add", "origin", remote]);
+    }
     dir
 }
 
@@ -1713,22 +1744,114 @@ fn cad622_native_git_source_evidence_follows_the_task_worktree() {
     assert_eq!(out["task"]["state"].as_str(), Some("dispatched"), "{out}");
 }
 
-/// F2 (round 3): a run snapshot written before `team_roles` existed
-/// carries only `inputs` and `assignments`. Its frozen role binding is
-/// still membership — a replaced saved alias does not launder the old
-/// one — and a content input's value is still not a member.
+/// F1/R3-SOURCE (round 4): the native guard proves the task checkout's
+/// source from the checkout itself, not only from the issue project's
+/// registered paths. A second local checkout of the app's pinned git
+/// source — absent from those paths, with no `job.repo` — still refuses
+/// the app-team worker; a checkout whose source cannot be read holds
+/// instead of becoming an empty app set; an independent worker passes.
 #[test]
-fn cad622_a_legacy_run_snapshot_keeps_the_frozen_alias_barred() {
+fn cad622_native_dispatch_proves_an_unregistered_checkout_source() {
+    let fx = Fx::with_second_repo(&[], &[]);
+    workspace_install_from(
+        &fx,
+        "inst-git6",
+        "https://github.com/acme/widgets",
+        &[("writer", "writer")],
+    );
+    // Root-relative paths: the app is named by the repository, not a
+    // prefix. The checkout is no project repo, but its own origin is the
+    // installed app's pinned source.
+    set_paths(&fx.pm(), &fx.issue, "app.md,workflows/post.md");
+    let elsewhere = unregistered_checkout(
+        &fx,
+        "app-clone",
+        Some("https://github.com/acme/widgets.git"),
+    );
+    let task = issue_job(&fx, "c622-src4", "writer", None, Some(&elsewhere));
+    let err = scoped(Asserted::Agent("lead".into()), || {
+        fx.shared.dispatch(
+            "task_dispatch",
+            &json!({"task": task, "to": "writer", "by": "lead"}),
+            std::process::id(),
+        )
+    })
+    .expect_err("the unregistered checkout is still the app's git source");
+    assert!(err.to_string().contains("its pinned git source"), "{err}");
+
+    // A checkout whose source cannot be read is unprovable, never empty.
+    let fx = Fx::with_second_repo(&[], &[]);
+    workspace_install_from(
+        &fx,
+        "inst-git7",
+        "https://github.com/acme/widgets",
+        &[("writer", "writer")],
+    );
+    set_paths(&fx.pm(), &fx.issue, "app.md,workflows/post.md");
+    let unreadable = unregistered_checkout(&fx, "no-origin", None);
+    let task = issue_job(&fx, "c622-src5", "writer", None, Some(&unreadable));
+    let err = scoped(Asserted::Agent("lead".into()), || {
+        fx.shared.dispatch(
+            "task_dispatch",
+            &json!({"task": task, "to": "writer", "by": "lead"}),
+            std::process::id(),
+        )
+    })
+    .expect_err("an unprovable checkout cannot answer the app question");
+    assert!(
+        err.to_string().contains("git source cannot be read"),
+        "{err}"
+    );
+
+    // Independent-worker control on the same unregistered checkout.
+    let fx = Fx::with_second_repo(&[], &[]);
+    workspace_install_from(
+        &fx,
+        "inst-git8",
+        "https://github.com/acme/widgets",
+        &[("writer", "writer")],
+    );
+    set_paths(&fx.pm(), &fx.issue, "app.md,workflows/post.md");
+    let elsewhere = unregistered_checkout(
+        &fx,
+        "app-clone",
+        Some("https://github.com/acme/widgets.git"),
+    );
+    let task = issue_job(&fx, "c622-src6", "lead", None, Some(&elsewhere));
+    let out = scoped(Asserted::Agent("lead".into()), || {
+        fx.shared.dispatch(
+            "task_dispatch",
+            &json!({"task": task, "to": "lead", "by": "lead"}),
+            std::process::id(),
+        )
+    })
+    .expect("an independent worker is admitted");
+    assert_eq!(out["task"]["state"].as_str(), Some("dispatched"), "{out}");
+}
+
+/// R1-LEGACY (round 4): a run snapshot written before `team_roles`
+/// existed merged its team-role bindings into `inputs` and recorded no
+/// role keys. Nothing can recover which of those keys were roles, so a
+/// question naming one of their values holds instead of reading today's
+/// team keys — the operator may have renamed or removed the role — or
+/// reading content as an agent.
+#[test]
+fn cad622_a_legacy_run_without_role_provenance_holds_the_app_question() {
     let fx = Fx::new(&[], &[]);
-    // The operator replaced the saved alias; the run froze the old one.
-    workspace_install(&fx, "inst-legacy", &[("writer", "new-writer")]);
+    // The operator renamed the role key and replaced its alias; the run
+    // froze the old alias under the old key.
+    workspace_install(&fx, "inst-legacy", &[("author", "new-writer")]);
     fx.insert_run(
         "run-legacy",
         "inst-legacy",
-        json!({"inputs": {"writer": "old-writer"}, "assignments": {}}),
+        json!({
+            "inputs": {"writer": "old-writer", "topic": "Summer ramen"},
+            "assignments": {},
+        }),
     );
     fx.register("old-writer", "worker");
     fx.register("new-writer", "worker");
+    fx.register("outsider", "worker");
     let guard = crate::issue::app_guard::Ctx {
         pm_dir: &fx.pm_dir,
         state_dir: Some(&fx.state),
@@ -1737,10 +1860,17 @@ fn cad622_a_legacy_run_snapshot_keeps_the_frozen_alias_barred() {
     let teams = crate::issue::app_guard::teams(guard).unwrap();
     let team = teams.get(APP).expect("the workspace install's app");
     assert!(
-        team.contains("old-writer"),
-        "the legacy snapshot's frozen role binding stays a member: {team:?}"
+        !team.contains("old-writer"),
+        "an unrecorded role key is never inferred from today's team: {team:?}"
     );
+    assert!(
+        team.contains("new-writer"),
+        "the saved team is still read: {team:?}"
+    );
+
     set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
+    // The old alias may have been the team's writer: the check holds
+    // rather than answering "independent".
     let err = scoped(Asserted::Agent("lead".into()), || {
         fx.shared.dispatch(
             "dispatch_send",
@@ -1749,21 +1879,127 @@ fn cad622_a_legacy_run_snapshot_keeps_the_frozen_alias_barred() {
             std::process::id(),
         )
     })
-    .expect_err("a legacy run's frozen role alias is still the app's team");
+    .expect_err("an unprovable legacy binding holds the app question");
     assert!(
-        err.to_string()
-            .contains("old-writer is on app 'social-content's team"),
+        err.to_string().contains("holds")
+            && err.to_string().contains("run-legacy")
+            && err.to_string().contains("re-create"),
         "{err}"
     );
 
-    // And a legacy content input is not a role binding: `topic: lead`
-    // names content, not an agent on the team.
+    // Control: an agent that appears in no legacy input is not held.
+    let err = scoped(Asserted::Agent("lead".into()), || {
+        fx.shared.dispatch(
+            "dispatch_send",
+            &json!({"alias": "outsider", "issue": ISSUE, "text": "do it",
+                    "reply_to": "lead"}),
+            std::process::id(),
+        )
+    })
+    .expect_err("the fixture has no lane for this issue");
+    assert!(!err.to_string().contains("holds"), "{err}");
+}
+
+/// R4-1 (round 4): a legacy snapshot's content value that happens to
+/// equal an agent alias is never read as a member. Its provenance is
+/// unknown, so a question naming it holds — the answer is never "this
+/// agent is on the team".
+#[test]
+fn cad622_a_legacy_content_value_is_held_not_read_as_a_member() {
     let fx = Fx::new(&[], &[]);
-    workspace_install(&fx, "inst-legacy2", &[("writer", "topic")]);
+    workspace_install(&fx, "inst-legacy2", &[("writer", "new-writer")]);
     fx.insert_run(
         "run-legacy2",
         "inst-legacy2",
-        json!({"inputs": {"writer": "topic", "topic": "lead"}, "assignments": {}}),
+        json!({"inputs": {"writer": "old-writer", "topic": "lead"}, "assignments": {}}),
+    );
+    let guard = crate::issue::app_guard::Ctx {
+        pm_dir: &fx.pm_dir,
+        state_dir: Some(&fx.state),
+        store: Some(&fx.shared.store),
+    };
+    let teams = crate::issue::app_guard::teams(guard).unwrap();
+    let team = teams.get(APP).expect("the workspace install's app");
+    assert!(
+        !team.contains("lead"),
+        "a legacy content input's value is never a member: {team:?}"
+    );
+    assert!(
+        !team.contains("old-writer"),
+        "an unrecorded role key is never inferred from today's team: {team:?}"
+    );
+    let unproven = crate::issue::app_guard::unproven_teams(guard).unwrap();
+    let unproven = unproven.get(APP).expect("the legacy snapshot is held");
+    assert!(
+        unproven.contains("lead") && unproven.contains("old-writer"),
+        "both frozen input values are unproven, neither a member: {unproven:?}"
+    );
+
+    // The migration: a cancelled run is the operator's withdrawal, so its
+    // unrecorded bindings no longer hold the check.
+    let fx = Fx::new(&[], &[]);
+    workspace_install(&fx, "inst-legacy3", &[("author", "new-writer")]);
+    fx.insert_run_state(
+        "run-legacy3",
+        "inst-legacy3",
+        json!({"inputs": {"writer": "old-writer"}, "assignments": {}}),
+        "cancelled",
+    );
+    let guard = crate::issue::app_guard::Ctx {
+        pm_dir: &fx.pm_dir,
+        state_dir: Some(&fx.state),
+        store: Some(&fx.shared.store),
+    };
+    assert!(
+        crate::issue::app_guard::unproven_teams(guard)
+            .unwrap()
+            .is_empty(),
+        "a cancelled legacy run no longer holds the check"
+    );
+
+    // A legacy host-execution snapshot took no team at all: its inputs are
+    // provably content, so nothing is held either.
+    let fx = Fx::new(&[], &[]);
+    workspace_install(&fx, "inst-legacy4", &[("author", "new-writer")]);
+    fx.insert_run(
+        "run-legacy4",
+        "inst-legacy4",
+        json!({
+            "inputs": {"subject": "Summer ramen"},
+            "assignments": {},
+            "workflow": {"execution": "host"},
+        }),
+    );
+    let guard = crate::issue::app_guard::Ctx {
+        pm_dir: &fx.pm_dir,
+        state_dir: Some(&fx.state),
+        store: Some(&fx.shared.store),
+    };
+    assert!(
+        crate::issue::app_guard::unproven_teams(guard)
+            .unwrap()
+            .is_empty(),
+        "a host-execution legacy run froze no roles"
+    );
+}
+
+/// R4-2 (round 4): a new-format snapshot's `team_roles` is the only role
+/// provenance. A later saved-team edit never re-reads the frozen content
+/// inputs, and an explicitly empty map is not a legacy snapshot.
+#[test]
+fn cad622_a_changed_saved_team_never_reads_content_inputs_as_members() {
+    let fx = Fx::new(&[], &[]);
+    // The saved team was edited after the run: `writer` is gone and a
+    // `topic` role exists now.
+    workspace_install(&fx, "inst-ws5", &[("topic", "new-writer")]);
+    fx.insert_run(
+        "run-ws5",
+        "inst-ws5",
+        json!({
+            "team_roles": {"writer": "topic"},
+            "inputs": {"writer": "topic", "topic": "lead"},
+            "assignments": {},
+        }),
     );
     let guard = crate::issue::app_guard::Ctx {
         pm_dir: &fx.pm_dir,
@@ -1774,10 +2010,41 @@ fn cad622_a_legacy_run_snapshot_keeps_the_frozen_alias_barred() {
     let team = teams.get(APP).expect("the workspace install's app");
     assert!(
         team.contains("topic"),
-        "the role binding is a member: {team:?}"
+        "the frozen role binding stays a member: {team:?}"
+    );
+    assert!(
+        team.contains("new-writer"),
+        "the current alias too: {team:?}"
     );
     assert!(
         !team.contains("lead"),
-        "a legacy content input's value is not a member: {team:?}"
+        "a content input's value is never a member, whatever the saved team: {team:?}"
+    );
+    assert!(
+        !crate::issue::app_guard::unproven_teams(guard)
+            .unwrap()
+            .contains_key(APP),
+        "a new-format snapshot leaves nothing unproven"
+    );
+
+    // An explicitly empty `team_roles` map marks a new snapshot too: its
+    // content inputs are never held as possible role bindings.
+    let fx = Fx::new(&[], &[]);
+    workspace_install(&fx, "inst-ws6", &[("writer", "writer")]);
+    fx.insert_run(
+        "run-ws6",
+        "inst-ws6",
+        json!({"team_roles": {}, "inputs": {"topic": "lead"}, "assignments": {}}),
+    );
+    let guard = crate::issue::app_guard::Ctx {
+        pm_dir: &fx.pm_dir,
+        state_dir: Some(&fx.state),
+        store: Some(&fx.shared.store),
+    };
+    assert!(
+        crate::issue::app_guard::unproven_teams(guard)
+            .unwrap()
+            .is_empty(),
+        "an empty new-format role map is not legacy provenance"
     );
 }

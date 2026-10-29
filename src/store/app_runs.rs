@@ -9,16 +9,29 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// CAD-622: one run's frozen membership as the app-team guard reads it.
-/// `roles` is the team-role map this build freezes (`role` → agent
-/// alias); `inputs` is the run's whole frozen input map, the only role
-/// provenance a snapshot written before that map carries; `assigned` is
-/// the aliases its steps were assigned. The role keys stay separate from
-/// the aliases, so a content input's value never becomes a team member.
-#[derive(Clone, Debug, Default)]
+/// `roles` is `Some` for the team-role map this build freezes (`role` →
+/// agent alias, an explicitly empty map included); `None` for a snapshot
+/// written before that member existed, whose role keys were never
+/// recorded. `inputs` is the run's whole frozen input map — content, and
+/// in a legacy snapshot the team-role bindings merged into it. The guard
+/// never reads a content input as an agent; a legacy snapshot's inputs
+/// are kept only so a question naming one of their values can hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunTeam {
-    pub roles: BTreeMap<String, String>,
+    /// The snapshot's own run id, for a hold that names the run.
+    pub id: String,
+    /// The run's lifecycle state (`awaiting_approval`, `approved`,
+    /// `running`, `succeeded`, `failed`, `cancelled`).
+    pub state: String,
+    /// The frozen role→alias map, or `None` when the snapshot predates it.
+    pub roles: Option<BTreeMap<String, String>>,
+    /// The frozen input map.
     pub inputs: BTreeMap<String, String>,
+    /// The aliases the run assigned to its steps.
     pub assigned: Vec<String>,
+    /// False only when the frozen workflow ran on the host, which takes
+    /// no team: such a legacy input map is provably content.
+    pub may_have_roles: bool,
 }
 
 pub const ARTIFACT_BYTES: usize = 256 * 1024;
@@ -955,10 +968,10 @@ impl Store {
                     // CAD-622: the team-role bindings this run froze stay
                     // in the snapshot as their own member, so a later team
                     // edit cannot drop a historical member and a content
-                    // input can never be mistaken for a role name.
-                    if !team_roles.is_empty() {
-                        snapshot["team_roles"] = json!(team_roles);
-                    }
+                    // input can never be mistaken for a role name. Written
+                    // even when empty: a new snapshot must never be read as
+                    // a legacy one whose role keys were not recorded.
+                    snapshot["team_roles"] = json!(team_roles);
                     if let Some(proof) = context {
                         snapshot["schema"] = json!(2);
                         snapshot["context"] =
@@ -1089,36 +1102,65 @@ impl Store {
     /// `inputs` and the aliases it assigned to its steps — the run-time
     /// half of an app's team, read from the run's own snapshot rather
     /// than the current workflow or team record. A snapshot written
-    /// before `team_roles` existed still carries its `inputs`: the guard
-    /// reads a key there as a team role only when the installation still
-    /// declares that role key. A snapshot that cannot be parsed refuses;
-    /// it is never read as "nobody".
+    /// before `team_roles` existed returns `roles: None`: its inputs
+    /// merged the role bindings into content and nothing recorded which
+    /// keys were roles, so the guard holds rather than inferring them
+    /// from today's team or reading content values as agents. A snapshot
+    /// that cannot be parsed refuses; it is never read as "nobody".
     pub fn app_run_team_inputs(&self, install_id: &str) -> Result<Vec<RunTeam>> {
         let texts = self
             .conn()
-            .prepare("SELECT snapshot FROM app_runs WHERE install_id=? ORDER BY created")?
-            .query_map([install_id], |r| r.get::<_, String>(0))?
+            .prepare("SELECT id,state,snapshot FROM app_runs WHERE install_id=? ORDER BY created")?
+            .query_map([install_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut out = Vec::new();
-        for text in texts {
+        for (id, state, text) in texts {
             let snapshot: Value = serde_json::from_str(&text)
                 .map_err(|_| Error::internal("app run snapshot is unreadable"))?;
-            let roles: BTreeMap<String, String> =
-                serde_json::from_value(snapshot["team_roles"].clone()).unwrap_or_default();
-            let inputs: BTreeMap<String, String> =
-                serde_json::from_value(snapshot["inputs"].clone()).unwrap_or_default();
-            let assigned = snapshot["assignments"]
+            let snapshot = snapshot
                 .as_object()
+                .ok_or_else(|| Error::internal("app run snapshot is unreadable"))?;
+            let roles = match snapshot.get("team_roles") {
+                None => None,
+                Some(value) => Some(
+                    serde_json::from_value(value.clone())
+                        .map_err(|_| Error::internal("app run team roles are unreadable"))?,
+                ),
+            };
+            let inputs = match snapshot.get("inputs") {
+                None => BTreeMap::new(),
+                Some(value) => serde_json::from_value(value.clone())
+                    .map_err(|_| Error::internal("app run inputs are unreadable"))?,
+            };
+            let assigned = snapshot
+                .get("assignments")
+                .and_then(Value::as_object)
                 .map(|m| {
                     m.values()
                         .filter_map(|step| step["alias"].as_str().map(str::to_string))
                         .collect()
                 })
                 .unwrap_or_default();
+            // A host-execution workflow names no owner and takes no
+            // team, so it froze no role binding into its inputs.
+            let may_have_roles = snapshot
+                .get("workflow")
+                .and_then(|workflow| workflow.get("execution"))
+                .and_then(Value::as_str)
+                != Some("host");
             out.push(RunTeam {
+                id,
+                state,
                 roles,
                 inputs,
                 assigned,
+                may_have_roles,
             });
         }
         Ok(out)
