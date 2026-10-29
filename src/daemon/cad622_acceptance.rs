@@ -77,6 +77,8 @@ struct Fx {
     pm_dir: PathBuf,
     state: PathBuf,
     shared: Arc<Shared>,
+    /// The issue the dispatch cases work on — the ticket's own project.
+    issue: String,
 }
 
 impl Fx {
@@ -116,11 +118,11 @@ impl Fx {
             None,
         )
         .unwrap();
-        let home = if other {
+        let (home, ticket) = if other {
             issue::write::project_add(&pm, OTHER, "OTH", &[], &[], &[], None).unwrap();
-            OTHER
+            (OTHER, "OTH-1")
         } else {
-            PROJECT
+            (PROJECT, ISSUE)
         };
         issue::write::new_issue(
             &pm,
@@ -133,7 +135,7 @@ impl Fx {
             None,
             None,
             &[],
-            Some(ISSUE),
+            Some(ticket),
             None,
             "operator",
         )
@@ -175,6 +177,7 @@ impl Fx {
             pm_dir,
             state,
             shared,
+            issue: ticket.to_string(),
         }
     }
 
@@ -296,10 +299,10 @@ fn dispatch_args(to: &str, repo: PathBuf) -> crate::issue::dispatch::DispatchArg
     }
 }
 
-fn set_paths(pm: &issue::Pm, paths: &str) {
+fn set_paths(pm: &issue::Pm, id: &str, paths: &str) {
     crate::issue::edit::edit(
         pm,
-        ISSUE,
+        id,
         &crate::issue::edit::EditSpec {
             set: vec![format!("paths={paths}")],
             ..Default::default()
@@ -316,10 +319,10 @@ fn set_paths(pm: &issue::Pm, paths: &str) {
 fn cad622_a_team_agent_cannot_be_dispatched_to_edit_its_own_app() {
     let fx = Fx::new(&[("writer", "writer")], &[]);
     let pm = fx.pm();
-    set_paths(&pm, &format!("apps/{APP}/app.md,src/other.rs"));
+    set_paths(&pm, &fx.issue, &format!("apps/{APP}/app.md,src/other.rs"));
     let err = crate::issue::dispatch::run(
         &pm,
-        ISSUE,
+        &fx.issue,
         &dispatch_args("writer", fx._root.path().join("widgets")),
         "operator",
         &fx.state,
@@ -345,10 +348,10 @@ fn cad622_a_team_agent_cannot_be_dispatched_to_edit_its_own_app() {
 fn cad622_an_agent_off_the_team_may_be_dispatched_to_edit_the_app() {
     let fx = Fx::new(&[("writer", "writer")], &[]);
     let pm = fx.pm();
-    set_paths(&pm, &format!("apps/{APP}/app.md"));
+    set_paths(&pm, &fx.issue, &format!("apps/{APP}/app.md"));
     let err = crate::issue::dispatch::run(
         &pm,
-        ISSUE,
+        &fx.issue,
         &dispatch_args("lead", fx._root.path().join("widgets")),
         "operator",
         &fx.state,
@@ -368,10 +371,10 @@ fn cad622_an_agent_off_the_team_may_be_dispatched_to_edit_the_app() {
 fn cad622_renaming_the_team_role_does_not_launder_the_author() {
     let fx = Fx::new(&[("author", "writer")], &[]);
     let pm = fx.pm();
-    set_paths(&pm, &format!("apps/{APP}/workflows/post.md"));
+    set_paths(&pm, &fx.issue, &format!("apps/{APP}/workflows/post.md"));
     let err = crate::issue::dispatch::run(
         &pm,
-        ISSUE,
+        &fx.issue,
         &dispatch_args("writer", fx._root.path().join("widgets")),
         "operator",
         &fx.state,
@@ -389,10 +392,10 @@ fn cad622_renaming_the_team_role_does_not_launder_the_author() {
 fn cad622_another_project_cannot_launder_the_author() {
     let fx = Fx::with_extra_project(&[("writer", "writer")], &[], true);
     let pm = fx.pm();
-    set_paths(&pm, &format!("apps/{APP}/app.md"));
+    set_paths(&pm, &fx.issue, &format!("apps/{APP}/app.md"));
     let err = crate::issue::dispatch::run(
         &pm,
-        ISSUE,
+        &fx.issue,
         &dispatch_args("writer", fx._root.path().join("widgets")),
         "operator",
         &fx.state,
