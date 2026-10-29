@@ -46,11 +46,11 @@ def payload(repo, pr, head):
 
 def usage(args):
     """A usage reason, or None."""
-    if not REPO.match(args.repo):
+    if not REPO.fullmatch(args.repo):
         return f"bad repo {args.repo!r}"
     if args.pr < 1:
         return "pr must be a positive number"
-    if not FULL_SHA.match(args.head):
+    if not FULL_SHA.fullmatch(args.head):
         return "head must be the full 40-hex lowercase SHA"
     return None
 
@@ -131,7 +131,7 @@ def main(argv):
     q.add_argument("ref")
     args = ap.parse_args(argv)
     if args.cmd == "queue-pr":
-        m = QUEUE_REF.match(args.ref)
+        m = QUEUE_REF.fullmatch(args.ref)
         if not m:
             return refuse([f"not a main merge-queue ref: {args.ref!r}"])
         print(m.group(1))
