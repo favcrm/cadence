@@ -43,6 +43,10 @@ use crate::store;
 /// Longest decline reason.
 const REASON_MAX: usize = 2_000;
 
+#[cfg(all(test, feature = "test-seam"))]
+#[path = "cad622_acceptance.rs"]
+mod cad622_acceptance;
+
 fn now() -> i64 {
     crate::issue::time::now_epoch()
 }
