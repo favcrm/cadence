@@ -45,6 +45,9 @@ function onPopState(): void {
   notify();
 }
 
+/** Fired after every in-app `navigate`, for readers of `location.hash`. */
+export const NAVIGATED = "cadence:navigated";
+
 const snapshot = () => location.pathname + location.search;
 
 export function navigate(href: string, opts: { replace?: boolean } = {}): void {
@@ -68,6 +71,8 @@ export function navigate(href: string, opts: { replace?: boolean } = {}): void {
   if (opts.replace) history.replaceState(null, "", href);
   else history.pushState(null, "", href);
   notify();
+  // pushState is silent and the route snapshot ignores the hash; a page showing `#heading` listens for this.
+  window.dispatchEvent(new Event(NAVIGATED));
 }
 
 /** The current path plus query; re-renders on every navigation. */
