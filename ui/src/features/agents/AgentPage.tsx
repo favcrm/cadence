@@ -175,6 +175,7 @@ export default function AgentPage({
     onOpenIssue,
     onTab,
     onSaved: () => setRetry((n) => n + 1),
+    detailFailed: err !== null,
   };
 
   return (
