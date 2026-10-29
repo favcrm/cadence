@@ -1267,7 +1267,7 @@ Example candidate, not pre-approved guidance:
 
 ```bash
 cadence memory propose --project demo --type gotcha --nature judgement \
-    --scope-path 'src/adapter/**' -m 'Review a context pack against its recorded revision.
+    --scope-path 'src/adapter/**' --source CAD-1 -m 'Review a context pack against its recorded revision.
 
 **Why:** an unpinned source can change after review.
 
@@ -1297,6 +1297,11 @@ cadence memory match --issue <ID> [--provider p] [--role dev] [--json]
 cadence memory lint [--project k]
 ```
 
+`propose` refuses a blank or omitted `--source`, and it refuses a scope
+with no retrieval axis. `--scope-project`, `--scope-component`,
+`--scope-path`, `--scope-tag`, and `--scope-provider` are axes.
+`--scope-role` selects an audience; it is not an axis. An empty scope
+matches nothing, so the write is refused rather than stored invisible.
 `propose` also accepts `--audience project|role|company`, repeated
 `--scope-role`, typed JSON `--evidence-ref` and typed JSON
 `--verification-condition`. Role audience requires explicit selectors.

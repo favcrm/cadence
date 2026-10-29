@@ -38,6 +38,7 @@ pub enum MemoryAction {
         #[arg(long = "scope-project")]
         project_wide: bool,
         /// Where the fact was learned — issue id, note path or commit.
+        /// The daemon refuses a blank or omitted source.
         #[arg(long)]
         source: Option<String>,
         /// low | medium | high [default: medium].
@@ -60,6 +61,7 @@ pub enum MemoryAction {
         /// Company adds policy approval requirements, not cross-project visibility.
         #[arg(long, default_value = "project", value_parser = ["project", "role", "company"])]
         audience: String,
+        /// Audience role selector. Not a retrieval axis; repeatable.
         #[arg(long = "scope-role")]
         roles: Vec<String>,
         /// Immutable source reference as JSON; repeatable.
