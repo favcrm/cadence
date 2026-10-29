@@ -8,6 +8,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+/// CAD-622: one run's frozen role `inputs` and the aliases its steps
+/// assigned — what the app-team guard reads from a run.
+pub type RunTeam = (BTreeMap<String, String>, Vec<String>);
+
 pub const ARTIFACT_BYTES: usize = 256 * 1024;
 pub const RUN_ARTIFACT_BYTES: usize = 1024 * 1024;
 
@@ -1061,10 +1065,7 @@ impl Store {
     /// run-time half of an app's team, read from the run's own snapshot
     /// rather than the current workflow or team record. A snapshot that
     /// cannot be parsed refuses; it is never read as "nobody".
-    pub fn app_run_team_inputs(
-        &self,
-        install_id: &str,
-    ) -> Result<Vec<(BTreeMap<String, String>, Vec<String>)>> {
+    pub fn app_run_team_inputs(&self, install_id: &str) -> Result<Vec<RunTeam>> {
         let texts = self
             .conn()
             .prepare("SELECT snapshot FROM app_runs WHERE install_id=? ORDER BY created")?

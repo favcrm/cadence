@@ -75,9 +75,10 @@ pub fn apps_in_text(text: &str) -> BTreeSet<String> {
         from = at + app::DIR.len() + 1;
         // The token must start a path: `src/apps/x/` and `myapps/x/`
         // are not the tracker's `apps/`.
-        let boundary = text[..at].chars().next_back().map_or(true, |c| {
-            !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
-        });
+        let boundary = text[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-')));
         if !boundary {
             continue;
         }
