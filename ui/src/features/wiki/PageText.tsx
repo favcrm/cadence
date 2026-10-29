@@ -11,9 +11,11 @@ export default function PageText({ path, text }: { path: string; text: string })
     const headings = [...(marker.current?.parentElement?.querySelectorAll("h1,h2,h3,h4,h5,h6") ?? [])];
     assignHeadingIds(headings);
     const scroll = () => {
+      // No hash, an empty one, a malformed one (`#%`) or one with no slug characters: nothing to look up.
       let target = "";
-      try { target = decodeURIComponent(location.hash.slice(1)); } catch { /* a malformed fragment targets nothing */ }
-      headings.find((heading) => heading.id === ID_PREFIX + slug(target))?.scrollIntoView();
+      try { target = slug(decodeURIComponent(location.hash.slice(1))); } catch { return; }
+      if (target === "") return;
+      headings.find((heading) => heading.id === ID_PREFIX + target)?.scrollIntoView();
     };
     scroll();
     window.addEventListener("popstate", scroll);
@@ -41,17 +43,25 @@ export default function PageText({ path, text }: { path: string; text: string })
   );
 }
 
-// Heading ids: GitHub-style slugs (lowercase, spaces to hyphens, punctuation dropped,
-// repeats suffixed -1, -2), prefixed so a page can never claim an id the app uses.
+// Heading ids: GitHub-style slugs (lowercase, spaces to hyphens, punctuation dropped),
+// prefixed so a page can never claim an id the app uses. Every id issued is unique: a repeat
+// takes the first free -1, -2, ... suffix, so with `Foo`, `Foo`, `Foo-1` the second Foo is
+// foo-1 and the literal Foo-1 becomes foo-1-1 (github-slugger's rule). A heading whose slug
+// is empty (an emoji only) gets no id: there is nothing a link could name it by.
 const ID_PREFIX = "user-content-";
 const slug = (text: string) => text.trim().toLowerCase().replace(/[^\p{L}\p{N}\s_-]/gu, "").replace(/\s/g, "-");
 
 function assignHeadingIds(headings: Element[]): void {
-  const seen = new Map<string, number>();
+  const issued = new Set<string>();
   for (const heading of headings) {
     const base = slug(heading.textContent ?? "");
-    const n = seen.get(base) ?? 0;
-    seen.set(base, n + 1);
-    heading.id = ID_PREFIX + (n === 0 ? base : `${base}-${n}`);
+    if (base === "") {
+      heading.removeAttribute("id");
+      continue;
+    }
+    let id = base;
+    for (let n = 1; issued.has(id); n++) id = `${base}-${n}`;
+    issued.add(id);
+    heading.id = ID_PREFIX + id;
   }
 }

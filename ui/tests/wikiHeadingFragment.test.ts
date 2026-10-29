@@ -49,6 +49,24 @@ async function main() {
     equal(scrolled[scrolled.length - 1], "user-content-other-one", "same-page navigation scrolls");
     await React.act(async () => navigate("/wiki/global/book/target.md#missing"));
     equal(scrolled.length, 2, "an unknown fragment scrolls nothing");
+
+    // Every id is unique whatever the order; each heading is addressable by its own id.
+    const idsOf = async (md: string) => {
+      await React.act(async () => root.render(React.createElement(PageText, { path: "global/book/dups.md", text: md })));
+      return [...host.querySelectorAll("h1,h2")].map((h) => h.id);
+    };
+    equal(await idsOf("# Foo\n\n## Foo\n\n## Foo-1\n"), ["user-content-foo", "user-content-foo-1", "user-content-foo-1-1"], "Foo, Foo, Foo-1");
+    equal(await idsOf("## Foo-1\n\n## Foo\n\n# Foo\n"), ["user-content-foo-1", "user-content-foo", "user-content-foo-2"], "reversed");
+    equal(await idsOf("## \u{1F680}\n\n## ok\n"), ["", "user-content-ok"], "an emoji-only heading gets no id");
+
+    // No hash, an empty hash, a malformed hash or a slug-less hash never look anything up.
+    const before = scrolled.length;
+    for (const hash of ["", "#", "#%", "#%F0%9F%9A%80"]) {
+      win.history.replaceState({}, "", "/wiki/global/book/dups.md" + hash);
+      await React.act(async () => navigate("/wiki/global/book/dups.md" + hash));
+      await React.act(async () => root.render(React.createElement(PageText, { path: "global/book/dups.md", text: "## \u{1F680}\n\n## Foo\n" })));
+    }
+    equal(scrolled.length, before, "no scroll without a usable hash");
   } finally {
     await React.act(async () => root.unmount());
     loader.prototype.require = originalRequire;
