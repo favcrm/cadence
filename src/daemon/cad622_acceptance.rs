@@ -566,6 +566,38 @@ fn cad622_an_apps_team_reviewer_cannot_file_a_verdict() {
     .expect("an independent reviewer files the verdict");
 }
 
+/// When the PR's own files cannot be read, the guard is flagged (a
+/// daemon event naming the reason), never silently skipped — and the
+/// loop is not stalled by an offline `gh`.
+#[test]
+fn cad622_unreadable_pr_files_flag_the_guard_instead_of_passing_silently() {
+    let fx = Fx::new(&[("writer", "writer")], &["reviewer"]);
+    // A `gh` that cannot read anything.
+    std::fs::write(fx._root.path().join("gh"), "#!/bin/sh\nexit 1\n").unwrap();
+    fx.seed_loop("writer");
+    fx.route().expect("the router pass answers");
+    let event = fx
+        .shared
+        .store
+        .last_event_of(Store::DAEMON_STREAM, &["review_app_guard_unavailable"])
+        .unwrap()
+        .expect("the unreadable diff is flagged");
+    assert_eq!(event.payload["issue"].as_str(), Some(ISSUE));
+    assert!(
+        event.payload["why"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not be read"),
+        "{}",
+        event.payload
+    );
+    assert_eq!(
+        fx.record().state,
+        delivery::State::Reviewing,
+        "an unreadable diff never invents a refusal"
+    );
+}
+
 /// The guard reads a run's frozen role inputs too, not only the saved
 /// team: an agent a run named as a team role is on that app's team.
 #[test]

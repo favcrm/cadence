@@ -443,7 +443,7 @@ impl Shared {
         }
         // The app read costs a record walk and, only when the worker is
         // on some app's team, one bounded `gh pr view --json files`.
-        let touched = self.pr_apps(pm, pr, sha, &[rec.worker.as_str()])?;
+        let touched = self.pr_apps(pm, &rec.issue, pr, sha, &[rec.worker.as_str()])?;
         rec.touched_apps = touched
             .as_ref()
             .map(|apps| apps.iter().cloned().collect::<Vec<_>>());
@@ -472,6 +472,7 @@ impl Shared {
     fn pr_apps(
         &self,
         pm: &Pm,
+        issue: &str,
         pr: &str,
         sha: &str,
         aliases: &[&str],
@@ -485,18 +486,32 @@ impl Shared {
         if !interested && apps.is_empty() {
             return Ok(None);
         }
+        // The app-team question was asked and the diff could not answer:
+        // the guard is flagged (the record's note and a daemon event),
+        // never silently skipped. The review itself still proceeds — an
+        // offline `gh` must not stall the loop.
+        let unavailable = |why: &str| {
+            let _ = self.store.event_public(
+                DAEMON_ALIAS,
+                "review_app_guard_unavailable",
+                json!({"issue": issue, "pr": pr, "head": sha, "why": why}),
+            );
+        };
         let Ok(text) = delivery::gh(
             &self.delivery_gh.to_string_lossy(),
             &["pr", "view", pr, "--json", "files,headRefOid"],
         ) else {
+            unavailable("the PR's changed files could not be read");
             return Ok(None);
         };
         let view: Value = serde_json::from_str(&text)
             .map_err(|e| Error::rejected(format!("gh pr view: unreadable ({e})")))?;
         if view["headRefOid"].as_str() != Some(sha) {
+            unavailable("the PR tip moved while its files were read");
             return Ok(None);
         }
         let Some(files) = view["files"].as_array() else {
+            unavailable("the PR read returned no file list");
             return Ok(None);
         };
         apps.extend(crate::issue::app_guard::apps_in_paths(
@@ -571,7 +586,7 @@ impl Shared {
                     return Ok(Default::default());
                 };
                 let aliases: Vec<&str> = on_team.iter().map(|a| a.as_str()).collect();
-                match self.pr_apps(pm, pr, head, &aliases)? {
+                match self.pr_apps(pm, &rec.issue, pr, head, &aliases)? {
                     Some(apps) => apps,
                     None => return Ok(Default::default()),
                 }
