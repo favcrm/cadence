@@ -257,14 +257,16 @@ the code you just wrote.
   typecheck and the active script contracts for what you changed) on Boat
   via `scripts/boat-build`; the shared host does not compile. One sandbox
   is kept for this worktree. The first command compiles cold. A later
-  command within 30 minutes reuses it. `scripts/boat-build --down` deletes
-  it, `--fresh` replaces it, and `--once` deletes it when the command
-  exits. A missing Boat CLI or helper refuses the push rather than falling
+  command within 30 minutes reuses it. After the last command it stays up
+  for 30 minutes, then stops and is erased, and the next command starts
+  cold. `scripts/boat-build --down` deletes it, `--fresh` replaces it, and
+  `--once` deletes it when the command exits. A missing Boat CLI or helper refuses the push rather than falling
   back to a local build. `CADENCE_PRE_PUSH_LOCAL=1` is the explicit
   emergency path and runs the same plan on this host. `scripts/pre-push
   --tests` is a focused diagnostic, not a prerequisite before review;
-  required CI and the merge-group regression floor are unchanged. Neither a
-  remote run nor a green suite proves the ticket's outcome. The split
+  required CI and the merge-group regression floor are unchanged. Review
+  and operator approval stay authoritative. Neither a remote run nor a
+  green suite proves the ticket's outcome. The split
   manifests are retired; do not run `split-map-sync` until a reviewed
   inventory restoration establishes its inputs.
 - Run `cargo check`, `cargo test`, `cargo clippy` and `cargo build` through

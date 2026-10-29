@@ -389,16 +389,29 @@ def main():
         require(replacement == load_state(state_path)["id"], "session id does not match the fresh sandbox")
 
         # A second caller loses the lock and does not create a sandbox.
+        # It also must not truncate the log the active invocation still has open.
         import fcntl
         lock_path = repo / ".git" / "cadence-boat-session.lock"
         lock = open(lock_path, "a+")
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        run_log = repo / ".git" / "cadence-boat-build.log"
+        run_log.write_bytes(b"active-run-log\n")
+        active = open(run_log, "ab", buffering=0)
+        active.write(b"before-refusal\n")
         log.write_text("", encoding="utf-8")
         busy = run_helper(repo, env, "--", "true")
+        down = run_helper(repo, env, "--down")
+        active.write(b"after-refusal\n")
+        active.close()
         lock.close()
+        body = run_log.read_bytes()
         require(busy.returncode != 0, "busy session was entered")
         require("already has a boat-build running" in busy.stderr, busy.stderr)
+        require(down.returncode != 0, "busy --down was entered")
+        require("already has a boat-build running" in down.stderr, down.stderr)
         require(not named(log, "new"), "busy run created a sandbox")
+        require(b"\x00" not in body, f"busy refusal punched holes in the active log: {body!r}")
+        require(body == b"active-run-log\nbefore-refusal\nafter-refusal\n", body)
 
         # An unconfirmed deletion does not forget the sandbox.
         state = load_state(state_path)

@@ -706,9 +706,11 @@ def main():
             parser.error('--output already exists')
     root = Path(git(Path.cwd(), 'rev-parse', '--show-toplevel').strip())
     git_dir = Path(git(root, 'rev-parse', '--absolute-git-dir').strip())
+    # The run log is opened with truncation. Take the session lock first so a
+    # refused concurrent caller cannot punch a hole in the active invocation's log.
+    lock = session_lock(git_dir / 'cadence-boat-session.lock')
     install_log(git_dir)
     session_path = git_dir / 'cadence-boat-session.json'
-    lock = session_lock(git_dir / 'cadence-boat-session.lock')
     global ONCE, OWNED
     ONCE = args.once
     sandbox = None

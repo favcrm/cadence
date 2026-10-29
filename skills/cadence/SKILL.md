@@ -368,6 +368,14 @@ refused when a step fails. The hook stores the helper's last line
 dir. `--no-verify` still pushes, but the missing receipt is the detectable
 signal. The main checkout has no hook. The push does not compile on the host.
 
+The helper keeps one Boat sandbox for that worktree. The first command
+creates it and compiles cold. A later command reuses it and sends only the
+tracked patch, so Cargo keeps `target/`. The sandbox stays up for 30
+minutes after the last command, then stops. Snapshots are off, so that
+stop erases the disk and the next command starts cold.
+`scripts/boat-build --down` deletes it sooner. Required CI, review and
+operator approval stay authoritative.
+
 A `check` slot pool (default 2 concurrent) still exists for admitted check
 recipes and is separate from build/test slots. A `check` slot is
 admitted only for a `build.recipes` entry whose `kind: check` —

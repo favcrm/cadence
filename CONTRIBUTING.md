@@ -53,8 +53,10 @@ scripts/boat-build -- cargo test --locked --features test-seam --test daemon <FI
 `scripts/boat-build` keeps one sandbox for this worktree. The first command
 sends a shallow git snapshot and compiles cold. A later command within 30
 minutes sends the tracked patch only, and Cargo reuses `target/`.
-`scripts/boat-build --down` deletes that sandbox. Untracked files are not
-copied; `git add` them first. Prefer `cargo check` when you only need a
+`scripts/boat-build --down` deletes that sandbox. When 30 minutes pass
+with no further command, the sandbox stops and is erased, and the next
+command starts cold. Required CI, review and operator approval stay
+authoritative. Untracked files are not copied; `git add` them first. Prefer `cargo check` when you only need a
 compile. Inside the sandbox the helper sets `CARGO_BUILD_JOBS=1`.
 
 A local compile is the exception, for a binary that has to run here (`cargo
