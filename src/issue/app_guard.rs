@@ -365,8 +365,9 @@ pub fn selected_root(project: &project::Project, front: &model::Front) -> Option
         .collect();
     roots.sort();
     roots.dedup();
+    let declared = crate::issue::start::declared_repos(project);
     match roots.as_slice() {
-        [root] => Some(root.clone()),
+        [root] if declared.contains(root) => Some(root.clone()),
         _ => None,
     }
 }
