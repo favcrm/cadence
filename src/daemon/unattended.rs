@@ -1354,11 +1354,17 @@ impl Shared {
             state_dir: Some(&self.state_dir),
             store: Some(&self.store),
         };
+        // The grant stores OWNER/REPO; an installed app's git source is
+        // its host-qualified identity (`github.com/OWNER/REPO`). Pass the
+        // same identity `registered_repo` proves below, or a git-source-only
+        // touch (root-relative `app.md`) never matches the installation.
+        let bound_remote =
+            crate::issue::project::normalize_remote(&format!("github.com/{}", grant.repo));
         if let Some(why) = crate::issue::app_guard::refusals(
             guard,
             &app_paths,
             &[actor],
-            std::slice::from_ref(&grant.repo),
+            std::slice::from_ref(&bound_remote),
         )? {
             return Err(Error::rejected(why));
         }

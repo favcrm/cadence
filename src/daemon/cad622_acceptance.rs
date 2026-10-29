@@ -1558,6 +1558,62 @@ fn cad622_a_grant_never_admits_an_own_team_proposal() {
     );
 }
 
+/// S6-1: a grant's bare OWNER/REPO slug must match the host-qualified
+/// identity of an installed app's git source, so a git-source-only
+/// proposal from that app's own team is refused before admission.
+#[test]
+fn cad622_a_git_source_grant_is_refused_for_an_own_team_author() {
+    let fx = Fx::new(&[], &[]);
+    workspace_install_from(
+        &fx,
+        "inst-git",
+        "https://github.com/acme/widgets",
+        &[("writer", "writer")],
+    );
+    let pm = fx.pm();
+    let text = "---\ntitle: \"Improve the app\"\ngoal: \"Change the app\"\n---\n\n\
+         ## Rework the guide\nagent: writer\nsize: S\n\nRewrite `app.md`.\n\n\
+         ### Acceptance\n- [ ] reworked\n";
+    crate::issue::workflow::write_file(
+        &pm,
+        PROJECT,
+        "improve",
+        text,
+        true,
+        fx._root.path(),
+        "operator",
+    )
+    .unwrap();
+    let approval = scoped(Asserted::Operator, || {
+        fx.shared.rpc_workflow_approve(
+            &json!({
+                "project": PROJECT,
+                "name": "improve",
+                "unattended": { "repo": REPO, "paths": ["app.md"], "inputs": {} },
+            }),
+            std::process::id(),
+        )
+    })
+    .expect("the operator's live grant");
+    assert!(
+        approval["unattended"]["grant_id"].as_str().is_some(),
+        "the grant is live: {approval}"
+    );
+    let propose = |who: &str| {
+        scoped(Asserted::Agent(who.to_string()), || {
+            fx.shared.rpc_plan_propose(
+                &json!({"project": PROJECT, "workflow": "improve", "inputs": {}}),
+                std::process::id(),
+            )
+        })
+    };
+    let err =
+        propose("writer").expect_err("a git-source-only grant never admits an own-team author");
+    assert!(err.to_string().contains("its pinned git source"), "{err}");
+    let out = propose("lead").expect("an independent proposer is admitted");
+    assert_eq!(out["state"].as_str(), Some("approved"), "{out}");
+}
+
 /// F3: the git-source evidence is the repository the dispatch SELECTED.
 /// A project that also registers an unrelated repo does not refuse work
 /// that never touches the app's own repository.
