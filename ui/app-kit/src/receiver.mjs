@@ -222,8 +222,10 @@ export function createScreenReceiver(options = {}) {
   // host's own per-frame queue (ASSET_QUEUE_MAX, 256): it closes a frame past that.
   const abandoned = new Set();
   const MAX_ABANDONED = 256;
-  // CAD-1921: asset refs a call reply said the host now serves (`asset_refs`).
+  // CAD-1921: asset refs a call reply said the host now serves (`asset_refs`). Bounded like
+  // the host's own reply-learned refs (128); it never forgets a ref a later reply dropped.
   const admitted = new Set();
+  const MAX_ADMITTED = 128;
   const identityKeys = ["v", "install_id", "digest", "context_id"];
   let tornDown = false;
   let accepted = false;
@@ -359,9 +361,9 @@ export function createScreenReceiver(options = {}) {
     pending.delete(message.id);
     clearTimeout(entry.timer);
     if (message.ok === true && Array.isArray(message.asset_refs)) {
-      for (const ref of message.asset_refs.slice(0, MAX_ABANDONED)) {
+      for (const ref of message.asset_refs.slice(0, MAX_ADMITTED)) {
         if (typeof ref !== "string" || ref.length === 0 || ref.length > 512) continue;
-        if (admitted.size >= MAX_ABANDONED) admitted.delete(admitted.values().next().value);
+        if (admitted.size >= MAX_ADMITTED) admitted.delete(admitted.values().next().value);
         admitted.add(ref);
       }
     }
@@ -525,7 +527,8 @@ export function createScreenReceiver(options = {}) {
       });
       return pendingTool;
     },
-    /** True once a call reply named `ref` as served now; an older host never says so. */
+    /** True once a call reply named `ref` as served now; an older host never says so. It
+     *  stays true: decide from the latest reply's own data (e.g. a draft still has an image). */
     assetAdmitted(ref) {
       return admitted.has(ref);
     },

@@ -85,7 +85,8 @@ reference receiver and `screenProtocol.ts`):
 - A call reply may name the asset refs it made servable (`asset_refs`, a host
   field older hosts never send); `assetAdmitted(ref)` is then true, so an app
   can request a just-returned draft image at once instead of waiting for the
-  next PUSH. Without it, keep waiting for the PUSH.
+  next PUSH. Without it, keep waiting for the PUSH. It stays true once set, so
+  still check the latest reply's data (a draft whose image was removed).
 - `tool` additionally requires `accepts` to include `screen-actions.v1`; the
   host closes a port that sends a tool call without the negotiation. One tool
   call is outstanding at a time — a second is refused locally with
