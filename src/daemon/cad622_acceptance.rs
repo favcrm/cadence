@@ -11,22 +11,16 @@
 //! source, and never reviews one.
 //!
 //! Cases, each with a positive control so a test cannot pass by
-//! refusing everything:
-//!
-//!   1. a team agent dispatched to edit its own app is refused, before
-//!      anything is created;
-//!   2. a non-team agent is allowed (the guard is not a blanket ban);
-//!   3. renaming the role key does not launder the author — membership
-//!      is by alias;
-//!   4. editing the app through a ticket of another project is refused
-//!      (the team is read across every project; `apps/<name>/` is
-//!      repo-relative);
-//!   5. a plan naming the app's source is refused to its team agent and
-//!      admitted for another agent;
-//!   6. the review loop refuses a done report whose PR's own changed
-//!      files touch the app the worker is on;
-//!   7. an app's team reviewer is never routed the review, and cannot
-//!      file a verdict if it was.
+//! refusing everything: a team agent dispatched to edit its own app is
+//! refused before anything is created; a non-team agent is allowed;
+//! renaming the role key does not launder the author (membership is by
+//! alias); editing the app through a ticket of another project is
+//! refused; a plan naming the app's source is refused to its team agent
+//! and admitted for another agent; the review loop refuses a done
+//! report whose PR's own changed files touch the app the worker is on;
+//! an app's team reviewer is never routed the review and cannot file a
+//! verdict if it was; and an unreadable diff flags the guard rather
+//! than passing silently.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -318,7 +312,7 @@ fn set_paths(pm: &issue::Pm, id: &str, paths: &str) {
     .unwrap();
 }
 
-/// 1. A team agent dispatched to edit its own app is refused, with the
+/// Case 1: A team agent dispatched to edit its own app is refused, with the
 /// plain reason, and nothing is created.
 #[test]
 fn cad622_a_team_agent_cannot_be_dispatched_to_edit_its_own_app() {
@@ -347,7 +341,7 @@ fn cad622_a_team_agent_cannot_be_dispatched_to_edit_its_own_app() {
     );
 }
 
-/// 2. A non-team agent is allowed: the guard refuses the app's own team,
+/// Case 2: A non-team agent is allowed: the guard refuses the app's own team,
 /// not everyone. The dispatch gets past the guard to the next check.
 #[test]
 fn cad622_an_agent_off_the_team_may_be_dispatched_to_edit_the_app() {
@@ -370,7 +364,7 @@ fn cad622_an_agent_off_the_team_may_be_dispatched_to_edit_the_app() {
     );
 }
 
-/// 3. Renaming the role key does not launder the author — membership is
+/// Case 3: Renaming the role key does not launder the author — membership is
 /// by agent alias.
 #[test]
 fn cad622_renaming_the_team_role_does_not_launder_the_author() {
@@ -394,7 +388,7 @@ fn cad622_renaming_the_team_role_does_not_launder_the_author() {
     );
 }
 
-/// 4. Editing the app through a ticket of another project is refused:
+/// Case 4: Editing the app through a ticket of another project is refused:
 /// the team is read across every project and `apps/<name>/` is
 /// repo-relative.
 #[test]
@@ -419,7 +413,7 @@ fn cad622_another_project_cannot_launder_the_author() {
     );
 }
 
-/// 5. A plan that names the app's source is refused to its team agent
+/// Case 5: A plan that names the app's source is refused to its team agent
 /// and admitted for another agent.
 #[test]
 fn cad622_a_plan_touching_its_own_app_is_refused() {
@@ -454,7 +448,7 @@ fn cad622_a_plan_touching_its_own_app_is_refused() {
     assert_eq!(out["tickets"].as_array().map(Vec::len), Some(1), "{out}");
 }
 
-/// 6. The review loop refuses a done report whose PR's own changed files
+/// Case 6: The review loop refuses a done report whose PR's own changed files
 /// touch the app its author is on — and admits the same PR from an agent
 /// off the team.
 #[test]
