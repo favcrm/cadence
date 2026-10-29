@@ -230,6 +230,10 @@ mod cad1868_acceptance;
 /// delivery seam. Test-only registration; production carries neither.
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1913_lesson_delivery_isolation_acceptance;
+/// CAD-1932: reviewer-owned refusal acceptance for the non-records drawer
+/// parent proof. Test-only registration.
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1932_drawer_acceptance;
 mod cloud_agent_rpc;
 mod connection_test;
 mod connections_rpc;
