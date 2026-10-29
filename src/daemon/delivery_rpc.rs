@@ -746,8 +746,11 @@ impl Shared {
         // after admission is a new diff: if it touches an app the worker
         // is on, the review is refused (the operator decides), and
         // unreadable evidence holds the record instead of routing it.
-        let worker = rec.worker.clone();
-        let Some(evidence) = self.head_app_evidence(pm, rec, &[worker.as_str()])? else {
+        // The roster is read first: a candidate that is on an app's team
+        // makes the app question real even when the worker is not.
+        let agents = self.store.agents()?;
+        let roster: Vec<&str> = agents.iter().map(|a| a.alias.as_str()).collect();
+        let Some(evidence) = self.head_app_evidence(pm, rec, &roster)? else {
             if rec.state != State::Unstaffed {
                 rec.enter(State::Unstaffed, now());
                 rec.note = Some(format!(
@@ -910,7 +913,6 @@ impl Shared {
         let requirement = classification.as_ref().map(|v| &v["requirements"]);
         let profile_review = requirement
             .is_some_and(|r| r["activation"] == "active" && r["class"] == "consequential");
-        let agents = self.store.agents()?;
         let worker_vendor = agents
             .iter()
             .find(|a| a.alias == rec.worker)

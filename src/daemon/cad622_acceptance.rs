@@ -162,7 +162,18 @@ impl Fx {
         }
         issue::write::project_add(&pm, PROJECT, "CAD", &repos, &[], &[], None).unwrap();
         let (home, ticket) = if other {
-            issue::write::project_add(&pm, OTHER, "OTH", &[], &[], &[], None).unwrap();
+            // The second project works in the same checkout — the bypass
+            // this fixture models is the ticket's project, not its repo.
+            issue::write::project_add(
+                &pm,
+                OTHER,
+                "OTH",
+                &[checkout.to_str().unwrap().into()],
+                &[],
+                &[],
+                None,
+            )
+            .unwrap();
             (OTHER, "OTH-1")
         } else {
             (PROJECT, ISSUE)
