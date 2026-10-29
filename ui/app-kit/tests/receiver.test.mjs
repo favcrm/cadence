@@ -592,3 +592,93 @@ test("an invalid generation_scope is refused before posting", async () => {
   }
   assert.equal(inbox.filter((m) => m.op === "tool").length, 0);
 });
+
+// CAD-1921: a host that cannot serve a ref never answers it. `asset(ref, {timeoutMs})`
+// rejects, frees the ref for a re-request, and tolerates the host's late answer.
+const PNG = "data:image/png;base64,iVBORw0KGgo=";
+test("an asset request with a timeout rejects, and the same ref can be requested again", async () => {
+  const { host, inbox, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  await assert.rejects(receiver.asset("media:1", { timeoutMs: 20 }), (error) => {
+    assert.ok(error instanceof ScreenTimeoutError);
+    assert.equal(error.code, "timeout");
+    return true;
+  });
+  const again = receiver.asset("media:1", { timeoutMs: 1000 });
+  await waitFor(() => inbox.filter((m) => m.op === "asset").length === 2, "the re-request");
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  assert.equal(await again, PNG);
+  assert.deepEqual(errors, []);
+});
+
+test("a late asset reply after a timeout is dropped once, not a teardown", async () => {
+  const { host, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  await assert.rejects(receiver.asset("media:1", { timeoutMs: 20 }), ScreenTimeoutError);
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  await tick();
+  await tick();
+  assert.deepEqual(errors, [], "the late answer is dropped");
+  // Only that one late answer: a second unsolicited reply still tears down.
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  await waitFor(() => errors.length === 1, "the unsolicited teardown");
+});
+
+test("a late reply that crosses a re-request answers the re-request", async () => {
+  const { host, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  await assert.rejects(receiver.asset("media:1", { timeoutMs: 20 }), ScreenTimeoutError);
+  const again = receiver.asset("media:1", { timeoutMs: 1000 });
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  assert.equal(await again, PNG);
+  // The host may still answer the re-request itself: dropped, not a teardown.
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  await tick();
+  await tick();
+  assert.deepEqual(errors, []);
+});
+
+test("an asset request without a timeout waits as before; a bad timeout is refused", async () => {
+  const { host, pushes, receiver } = connect({ timeoutMs: 20 });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const open = receiver.asset("media:1");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(await Promise.race([open.then(() => "settled", () => "settled"), tick().then(() => "open")]), "open");
+  for (const bad of [0, -1, 1.5, "20", Number.MAX_SAFE_INTEGER + 1]) {
+    await assert.rejects(receiver.asset("media:2", { timeoutMs: bad }), TypeError);
+  }
+});
+
+test("late replies for every ref the host can still hold are dropped, oldest first", async () => {
+  const { host, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const refs = Array.from({ length: 256 }, (_, i) => `media:${i}`);
+  await Promise.all(refs.map((ref) => assert.rejects(receiver.asset(ref, { timeoutMs: 20 }), ScreenTimeoutError)));
+  for (const ref of refs) host.postMessage({ v: 2, op: "asset", ref, data_url: PNG });
+  await tick();
+  await tick();
+  assert.deepEqual(errors, [], "the host answers in queue order; none tears down");
+});
+
+test("a call reply's asset_refs admit those refs; a reply without them (an older host) admits none", async () => {
+  const { host, inbox, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const ref = "draft-image:sdr-1:social.draft";
+  const old = receiver.call("social.drafts.show", { draft_id: "sdr-1" });
+  const first = await waitFor(() => inbox.find((m) => m.op === "call"), "the first call");
+  host.postMessage({ v: 2, op: "reply", id: first.id, ok: true, data: { draft_id: "sdr-1", asset_id: "ast-1" } });
+  assert.deepEqual(await old, { draft_id: "sdr-1", asset_id: "ast-1" });
+  assert.equal(receiver.assetAdmitted(ref), false, "an older host never says so");
+  const told = receiver.call("social.drafts.show", { draft_id: "sdr-1" });
+  const second = await waitFor(() => inbox.filter((m) => m.op === "call")[1], "the second call");
+  host.postMessage({ v: 2, op: "reply", id: second.id, ok: true, data: { draft_id: "sdr-1", asset_id: "ast-1" }, asset_refs: [ref, 7, ""] });
+  assert.deepEqual(await told, { draft_id: "sdr-1", asset_id: "ast-1" }, "the app still gets only data");
+  assert.equal(receiver.assetAdmitted(ref), true);
+  assert.deepEqual(errors, []);
+});

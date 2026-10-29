@@ -142,6 +142,7 @@ function inert(reason) {
     slot: refuse,
     tool: refuse,
     asset: refuse,
+    assetAdmitted: () => false,
     state: () => false,
     presentation: () => "outlet",
     openDrawer: refuse,
@@ -216,6 +217,15 @@ export function createScreenReceiver(options = {}) {
   const pending = new Map(); // request id -> { resolve, reject, timer }
   const sent = new Map(); // id -> kind, kept for late/replayed replies
   const assets = new Map(); // ref -> resolve
+  // CAD-1921: refs whose request timed out. The host may still answer one late;
+  // that answer is dropped once instead of tearing the bridge down. Bounded by the
+  // host's own per-frame queue (ASSET_QUEUE_MAX, 256): it closes a frame past that.
+  const abandoned = new Set();
+  const MAX_ABANDONED = 256;
+  // CAD-1921: asset refs a call reply said the host now serves (`asset_refs`). Bounded like
+  // the host's own reply-learned refs (128); it never forgets a ref a later reply dropped.
+  const admitted = new Set();
+  const MAX_ADMITTED = 128;
   const identityKeys = ["v", "install_id", "digest", "context_id"];
   let tornDown = false;
   let accepted = false;
@@ -250,7 +260,10 @@ export function createScreenReceiver(options = {}) {
       entry.reject(new ScreenClosedError(`screen bridge closed: ${reason}`));
     }
     pending.clear();
-    for (const entry of assets.values()) entry.fail?.(new ScreenClosedError(`screen bridge closed: ${reason}`));
+    for (const entry of assets.values()) {
+      clearTimeout(entry.timer);
+      entry.fail?.(new ScreenClosedError(`screen bridge closed: ${reason}`));
+    }
     assets.clear();
     if (notify) onError?.(reason);
   };
@@ -347,6 +360,13 @@ export function createScreenReceiver(options = {}) {
     }
     pending.delete(message.id);
     clearTimeout(entry.timer);
+    if (message.ok === true && Array.isArray(message.asset_refs)) {
+      for (const ref of message.asset_refs.slice(0, MAX_ADMITTED)) {
+        if (typeof ref !== "string" || ref.length === 0 || ref.length > 512) continue;
+        if (admitted.size >= MAX_ADMITTED) admitted.delete(admitted.values().next().value);
+        admitted.add(ref);
+      }
+    }
     if (message.ok === true) entry.resolve(message.data);
     else entry.reject(new ScreenRefusalError(refusal));
     return true;
@@ -362,12 +382,14 @@ export function createScreenReceiver(options = {}) {
         if (message.v !== 2) fail("asset reply must be v2");
         if (Object.keys(message).sort().join() !== "data_url,op,ref,v") fail("asset reply has extra or missing keys");
         const entry = assets.get(message.ref);
+        if (!entry && abandoned.delete(message.ref)) return;
         if (!entry) fail("unsolicited asset reply");
         if (typeof message.data_url !== "string" || byteLength(message.data_url) > MAX_ASSET_BYTES) {
           fail("asset reply is over the bound");
         }
         if (!ASSET_DATA_URL.test(message.data_url)) fail("asset reply is not an image data URL");
         assets.delete(message.ref);
+        clearTimeout(entry.timer);
         entry.resolve(message.data_url);
         return;
       }
@@ -505,21 +527,40 @@ export function createScreenReceiver(options = {}) {
       });
       return pendingTool;
     },
-    asset(ref) {
+    /** True once a call reply named `ref` as served now; an older host never says so. It
+     *  stays true: decide from the latest reply's own data (e.g. a draft still has an image). */
+    assetAdmitted(ref) {
+      return admitted.has(ref);
+    },
+    asset(ref, options = {}) {
       if (typeof ref !== "string" || ref.length === 0 || ref.length > 512) {
         return Promise.reject(new TypeError("asset ref must be a non-empty string"));
+      }
+      const wait = options?.timeoutMs;
+      if (wait !== undefined && !(Number.isSafeInteger(wait) && wait > 0 && wait <= 2147483647)) {
+        return Promise.reject(new TypeError("asset timeoutMs must be a positive integer"));
       }
       if (tornDown) return Promise.reject(new ScreenClosedError("screen bridge is closed"));
       if (!liveV2) return Promise.reject(new ScreenClosedError("assets require a screen.v2 PUSH"));
       if (assets.has(ref)) return Promise.reject(new Error(`asset ${ref} is already pending`));
       return new Promise((resolve, reject) => {
-        assets.set(ref, { resolve, fail: reject });
+        const entry = { resolve, fail: reject, timer: null };
+        assets.set(ref, entry);
         try {
           post({ v: 2, op: "asset", ref });
         } catch (error) {
           assets.delete(ref);
           reject(error);
+          return;
         }
+        // A host that cannot serve a ref sends nothing: free the ref so it can be asked for again.
+        if (wait) entry.timer = setTimeout(() => {
+          if (assets.get(ref) !== entry) return;
+          assets.delete(ref);
+          if (abandoned.size >= MAX_ABANDONED) abandoned.delete(abandoned.values().next().value);
+          abandoned.add(ref);
+          reject(new ScreenTimeoutError(ref, wait));
+        }, wait);
       });
     },
     state(data) {
