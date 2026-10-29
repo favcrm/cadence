@@ -447,6 +447,48 @@ pub(crate) fn issue_payloads(pm: &Pm, state_dir: &Path, id: &str) -> Result<(Val
     ))
 }
 
+/// `POST /api/projects/<key>/policy` (CAD-1950): replace a project's
+/// recorded access policy.
+///
+/// The board is a second entry point, not a second writer: this calls the
+/// same [`issue_write::set_project_policy`] the CLI does, so the version
+/// bump, grant validation, the gate refusal and the tracker commit cannot
+/// diverge. The body is `{visibility, members}` in the recorded spelling;
+/// `members` is the full grant list and replaces what was there, exactly
+/// like `issue project policy --grant`.
+fn project_policy_write(request: &mut Request, pm_dir: &Path, key: &str) -> HttpResp {
+    #[derive(Deserialize)]
+    struct PolicyReq {
+        visibility: String,
+        #[serde(default)]
+        members: Vec<String>,
+    }
+    let bytes = match read_body(request, JSON_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: PolicyReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // An unknown spelling is a refusal, never the default visibility.
+    let visibility = match crate::issue::cli::PolicyVisibility::from_wire(&req.visibility) {
+        Some(v) => v.recorded(),
+        None => return err_response(400, "'visibility' must be workspace-visible or private"),
+    };
+    let pm = match Pm::at(pm_dir) {
+        Ok(pm) => pm,
+        Err(e) => return err_response(503, &e.to_string()),
+    };
+    match issue_write::set_project_policy(&pm, key, visibility, &req.members, "operator") {
+        Ok(out) => json_response(out),
+        // A key with no project answers like an absent one, the same way the
+        // read arms do.
+        Err(Error::Rejected(m)) if m.starts_with("no project ") => err_response(404, &m),
+        Err(e) => write_err(&e),
+    }
+}
+
 /// Map a writer error to an HTTP status: unknown ids are 404, rejections
 /// are 400, internals are 500.
 pub(crate) fn write_err(e: &Error) -> HttpResp {
@@ -1236,6 +1278,12 @@ pub(crate) fn write_route(
                 None => err_response(500, "unadmitted write"),
             },
             RouteId::AgentRegister => post_agent(&mut request, state_dir),
+            // CAD-1950: the one writer for a project's access policy — the
+            // same `set_project_policy` the CLI calls, so version bumping,
+            // grant validation and the commit cannot diverge.
+            RouteId::ProjectPolicy => {
+                project_policy_write(&mut request, pm_dir, bound.get("key").unwrap_or_default())
+            }
             RouteId::CatalogInstall => explorer_write(
                 &mut request,
                 state_dir,

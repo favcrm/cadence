@@ -1,6 +1,7 @@
 //! CAD-535: `cadence project` — moved verbatim from src/main.rs.
 
 use super::*;
+use cadence_agent::issue::cli::PolicyVisibility;
 
 /// `cadence project` verbs.
 #[derive(Subcommand)]
@@ -32,6 +33,17 @@ pub(crate) enum ProjectCmd {
         /// `Issue:` trailer.
         #[arg(long)]
         issue: Option<String>,
+        /// Access policy recorded in the project's first commit. Private is
+        /// refused until the isolation gate passes; workspace-visible is the
+        /// default and the only visibility this build records.
+        #[arg(long, value_enum, default_value = "workspace-visible")]
+        visibility: PolicyVisibility,
+        /// Grant a caller access to a private project
+        /// (`users/<handle>` or `operator`); repeatable. Because the policy is
+        /// written once at creation, grants cannot be added later by
+        /// re-running this verb — use `issue project policy`.
+        #[arg(long = "grant")]
+        grants: Vec<String>,
     },
 }
 
@@ -44,6 +56,8 @@ pub(super) fn run_project(state_dir: &Path, action: ProjectCmd) -> Result<i32> {
             goal,
             agents,
             issue,
+            visibility,
+            grants,
         } => {
             if repo
                 .as_ref()
@@ -71,7 +85,8 @@ pub(super) fn run_project(state_dir: &Path, action: ProjectCmd) -> Result<i32> {
                 state_dir,
                 "project_new",
                 json!({"key": key, "repo": repo, "prefix": prefix, "goal": goal,
-                       "agents": agents, "issue": issue}),
+                       "agents": agents, "issue": issue,
+                       "visibility": visibility.wire(), "grants": grants}),
             )?);
             Ok(0)
         }

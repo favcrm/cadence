@@ -893,17 +893,37 @@ pub enum ProjectAction {
 
 /// `--visibility` for `project policy`: the recorded vocabulary, before it
 /// is mapped to the project policy type.
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum PolicyVisibility {
     WorkspaceVisible,
     Private,
 }
 
 impl PolicyVisibility {
-    fn recorded(self) -> crate::issue::project::Visibility {
+    pub(crate) fn recorded(self) -> crate::issue::project::Visibility {
         match self {
             Self::WorkspaceVisible => crate::issue::project::Visibility::WorkspaceVisible,
             Self::Private => crate::issue::project::Visibility::Private,
+        }
+    }
+
+    /// The spelling on the wire and in `project.yaml`, so the CLI flag, the
+    /// daemon payload and the recorded enum cannot drift apart. `pub` because
+    /// the `cadence` binary builds the `project new` payload from it.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::WorkspaceVisible => "workspace-visible",
+            Self::Private => "private",
+        }
+    }
+
+    /// Parse the wire spelling. `None` for anything else — the daemon then
+    /// refuses rather than guessing a visibility.
+    pub(crate) fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "workspace-visible" => Some(Self::WorkspaceVisible),
+            "private" => Some(Self::Private),
+            _ => None,
         }
     }
 }
@@ -956,5 +976,37 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         | IssueAction::Sprint { .. } => maintenance::run(action, state_dir),
         IssueAction::Epic { action } => run_epic(action, state_dir),
         IssueAction::Recover { action } => run_recover(action, state_dir),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CAD-1950: one spelling crosses the CLI/daemon boundary. The flag's
+    /// wire form and the daemon's parser are the same pair, so a change to
+    /// either that the other does not learn is a test failure, not a private
+    /// project silently created workspace-visible.
+    #[test]
+    fn the_visibility_wire_spelling_round_trips() {
+        for option in [
+            PolicyVisibility::WorkspaceVisible,
+            PolicyVisibility::Private,
+        ] {
+            assert_eq!(
+                PolicyVisibility::from_wire(option.wire()),
+                Some(option),
+                "{}",
+                option.wire()
+            );
+        }
+        assert_eq!(
+            PolicyVisibility::WorkspaceVisible.wire(),
+            "workspace-visible"
+        );
+        // Anything else is unknown, never a default.
+        for raw in ["", "workspace_visible", "Private", "public", "secret"] {
+            assert_eq!(PolicyVisibility::from_wire(raw), None, "{raw:?}");
+        }
     }
 }
