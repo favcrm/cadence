@@ -38,11 +38,15 @@ fn package(root: &Path, name: &str, manifest: &str, relative: &str, body: &str) 
     std::fs::write(dir.join(relative), body).unwrap();
 }
 
+struct ProbePaths<'a> {
+    node: &'a Path,
+    cwd: &'a Path,
+    home: &'a Path,
+}
+
 fn probe(
     stage: &str,
-    node: &Path,
-    cwd: &Path,
-    home: &Path,
+    paths: &ProbePaths<'_>,
     policy: Option<&cadence_agent::confine::Policy>,
     mode: &str,
     entry: &Path,
@@ -51,7 +55,7 @@ fn probe(
     eprintln!(
         "CAD1935_BEGIN stage={stage} guarded={} mode={mode} node={} entry={} target={}",
         policy.is_some(),
-        node.display(),
+        paths.node.display(),
         entry.display(),
         target.display()
     );
@@ -61,24 +65,27 @@ fn probe(
             .arg("confine")
             .args(policy.to_args())
             .arg("--")
-            .arg(node);
+            .arg(paths.node);
         command
     } else {
-        Command::new(node)
+        Command::new(paths.node)
     };
-    let output = command
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", home)
-        .env("TMPDIR", cwd)
-        .current_dir(cwd)
-        .arg("-e")
-        .arg(PROBE)
-        .arg(mode)
-        .arg(entry)
-        .arg(target)
-        .output()
-        .unwrap_or_else(|error| panic!("stage={stage}: spawn failed: {error}"));
+    // Project lint requires the subreaper. It captures the same stdio as
+    // `Command::output` and does not change the Landlock assertions.
+    let output = cadence_agent::reaper::output(
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", paths.home)
+            .env("TMPDIR", paths.cwd)
+            .current_dir(paths.cwd)
+            .arg("-e")
+            .arg(PROBE)
+            .arg(mode)
+            .arg(entry)
+            .arg(target),
+    )
+    .unwrap_or_else(|error| panic!("stage={stage}: spawn failed: {error}"));
     eprintln!(
         "CAD1935_END stage={stage} status={} stdout={:?} stderr={:?}",
         output.status,
@@ -253,12 +260,17 @@ fn pinned_worker_extension_imports_without_sibling_authority() {
     let runtime = npm.join("@cad1935/runtime/index.js");
     let codec = npm.join("@cad1935/codec/index.js");
     let unrelated = npm.join("@cad1935/unrelated/index.js");
+    let cwd = path("work");
+    let home = path("home");
+    let paths = ProbePaths {
+        node: &node,
+        cwd: &cwd,
+        home: &home,
+    };
     let run = |stage: &str, guarded: bool, mode: &str, target: &Path| {
         probe(
             stage,
-            &node,
-            &path("work"),
-            &path("home"),
+            &paths,
             if guarded { Some(&policy) } else { None },
             mode,
             &entry,
