@@ -315,9 +315,10 @@ pi:
   pick its own extensions. The installed `package.json` `version` must
   equal the pin and its `pi.extensions` files must exist; they become
   operator-pinned `-e` argv entries (`--no-extensions` stays on), and the
-  package dir joins the confined master's read set, read-only. A
-  missing package, a drifted version or an entry escaping the package
-  dir refuses the launch.
+  package and its validated installed runtime dependency closure join the
+  confined master and worker read sets, read-only. This does not grant the
+  whole npm tree. A missing package, invalid dependency closure, drifted
+  version or an entry escaping the package dir refuses the launch.
 - A hosted AgenticOS image may set
   `CADENCE_PI_AGENTICOS_READ_EXTENSION=/opt/executor/cadence-read.mjs`.
   This is an operator environment opt-in for the **master only**, separate
