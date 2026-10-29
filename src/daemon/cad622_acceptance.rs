@@ -90,11 +90,7 @@ fn set_view(dir: &Path, pr: u64, head: &str, files: &[&str]) {
         "deletions": 0,
         "files": files,
     });
-    std::fs::write(
-        dir.join(format!("gh-view-{pr}.json")),
-        view.to_string(),
-    )
-    .unwrap();
+    std::fs::write(dir.join(format!("gh-view-{pr}.json")), view.to_string()).unwrap();
 }
 
 /// A private tracker with one project, one issue, one installed app and
@@ -127,12 +123,7 @@ impl Fx {
         Self::build(team, reviewers, false, true)
     }
 
-    fn build(
-        team: &[(&str, &str)],
-        reviewers: &[&str],
-        other: bool,
-        second_repo: bool,
-    ) -> Self {
+    fn build(team: &[(&str, &str)], reviewers: &[&str], other: bool, second_repo: bool) -> Self {
         let root = tempfile::Builder::new().prefix("c622d").tempdir().unwrap();
         let pm_dir = root.path().join("pm");
         let pm = issue::Pm::init(&pm_dir).unwrap();
@@ -147,10 +138,7 @@ impl Fx {
             remotes.push("https://github.com/acme/tools.git");
         }
         for (repo, remote) in repos.iter().zip(remotes.iter()) {
-            for args in [
-                vec!["init", "-q"],
-                vec!["remote", "add", "origin", remote],
-            ] {
+            for args in [vec!["init", "-q"], vec!["remote", "add", "origin", remote]] {
                 assert!(std::process::Command::new("git")
                     .arg("-C")
                     .arg(repo)
@@ -258,7 +246,10 @@ impl Fx {
                 model_policy: None,
             })
             .unwrap();
-        self.shared.store.set_agent_state(alias, "idle", None).unwrap();
+        self.shared
+            .store
+            .set_agent_state(alias, "idle", None)
+            .unwrap();
     }
 
     /// What `gh pr view` answers for `pr` from now on.
@@ -1070,7 +1061,10 @@ fn cad622_a_content_input_never_makes_an_agent_a_team_member() {
     };
     let teams = crate::issue::app_guard::teams(guard).unwrap();
     let team = teams.get(APP).expect("the workspace install's app");
-    assert!(team.contains("topic"), "the bound role alias is a member: {team:?}");
+    assert!(
+        team.contains("topic"),
+        "the bound role alias is a member: {team:?}"
+    );
     assert!(
         !team.contains("lead"),
         "a content input's value is not a team member: {team:?}"
@@ -1115,7 +1109,10 @@ fn cad622_a_replaced_saved_role_keeps_the_frozen_alias_barred() {
         team.contains("old-writer"),
         "the frozen role binding stays a member: {team:?}"
     );
-    assert!(team.contains("new-writer"), "the current alias too: {team:?}");
+    assert!(
+        team.contains("new-writer"),
+        "the current alias too: {team:?}"
+    );
     // The daemon's own admission refuses the historical member.
     set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
     let err = scoped(Asserted::Agent("lead".into()), || {
@@ -1174,11 +1171,7 @@ fn cad622_task_dispatch_refuses_an_own_team_worker() {
         )
     })
     .expect("an independent worker's kickoff is admitted");
-    assert_eq!(
-        out["task"]["state"].as_str(),
-        Some("dispatched"),
-        "{out}"
-    );
+    assert_eq!(out["task"]["state"].as_str(), Some("dispatched"), "{out}");
 }
 
 /// F1: both monitor kickoffs reach the same guard. The automatic watcher
@@ -1316,13 +1309,7 @@ fn cad622_a_refused_report_cannot_poison_the_accepted_heads_evidence() {
 
     // The worker files a second report naming an app IT is on. The same
     // pass moves CAD-623, so the whole record map is written.
-    fx.report(
-        ISSUE,
-        "writer",
-        "19700101T000001Z-done.md",
-        HEAD,
-        623,
-    );
+    fx.report(ISSUE, "writer", "19700101T000001Z-done.md", HEAD, 623);
     fx.report("CAD-623", "lead", "19700101T000000Z-done.md", HEAD, 624);
     fx.route().expect("the router pass answers");
     assert_eq!(
@@ -1336,7 +1323,10 @@ fn cad622_a_refused_report_cannot_poison_the_accepted_heads_evidence() {
         "the refused report names the app it touches: {why}"
     );
     let a = fx.record_of(ISSUE);
-    let evidence = a.app_evidence.clone().expect("the head's evidence survives");
+    let evidence = a
+        .app_evidence
+        .clone()
+        .expect("the head's evidence survives");
     assert_eq!(
         evidence.head, HEAD,
         "the accepted head's evidence is untouched"
@@ -1354,9 +1344,8 @@ fn cad622_a_refused_report_cannot_poison_the_accepted_heads_evidence() {
         &fx.pm(),
         &[("writer", "writer"), ("reviewer", reviewer.as_str())],
     );
-    let body = format!(
-        "---\nkind: verdict\ntask: {ISSUE}\nverdict: pass\nsha: {HEAD}\n---\n\nFine.\n"
-    );
+    let body =
+        format!("---\nkind: verdict\ntask: {ISSUE}\nverdict: pass\nsha: {HEAD}\n---\n\nFine.\n");
     let err = scoped(Asserted::Agent(reviewer.clone()), || {
         fx.shared
             .rpc_report_verdict(&json!({"issue": ISSUE, "text": body}), std::process::id())
