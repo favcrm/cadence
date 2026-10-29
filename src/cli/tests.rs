@@ -1869,3 +1869,18 @@ fn cloud_connection_lives_under_agent() {
     assert!(connect.contains("--local"), "{connect}");
     assert!(!connect.contains("accept-assistant-consent"), "{connect}");
 }
+
+/// CAD-1885: `cadence login --help` names the grant the code requests.
+#[test]
+fn cloud_agent_login_help_names_all_three_scopes() {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let help = cmd
+        .find_subcommand_mut("login")
+        .expect("login")
+        .render_help()
+        .to_string();
+    for scope in ["bridge.enroll", "cloud_agent.read", "cloud_agent.write"] {
+        assert!(help.contains(scope), "login help omits {scope}:\n{help}");
+    }
+}
