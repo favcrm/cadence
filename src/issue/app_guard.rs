@@ -95,7 +95,13 @@ pub struct Install {
     pub install_id: String,
     /// The normalized remote of a `Source::Git` install, if any.
     pub git: Option<String>,
+    /// The agents on the team. Aliases only — a role key never enters
+    /// this set.
     pub team: BTreeSet<String>,
+    /// The installation's own role keys (the saved team's keys), kept
+    /// apart from the aliases: they name which of a run's frozen inputs
+    /// were team-role bindings rather than content.
+    pub roles: BTreeSet<String>,
 }
 
 /// The app a repo-relative path belongs to: `apps/<name>[/…]` → `<name>`.
@@ -245,13 +251,16 @@ pub fn installations(ctx: Ctx) -> Result<Vec<Install>> {
             install_id: record.install_id.clone(),
             git: git_of(&record),
             team: record.team.values().cloned().collect(),
+            roles: record.team.keys().cloned().collect(),
         });
     }
     for (id, record) in workspace_records(ctx.pm_dir)? {
         let mut team: BTreeSet<String> = record.team.values().cloned().collect();
+        let mut roles: BTreeSet<String> = record.team.keys().cloned().collect();
         if let Some(state) = ctx.state_dir {
             if let Some(saved) = crate::daemon::app_teams_rpc::team_of(state, &id)? {
                 team.extend(saved.roles.values().cloned());
+                roles.extend(saved.roles.keys().cloned());
             }
         }
         out.push(Install {
@@ -261,19 +270,26 @@ pub fn installations(ctx: Ctx) -> Result<Vec<Install>> {
             install_id: id,
             git: git_of(&record),
             team,
+            roles,
         });
     }
     if let Some(store) = ctx.store {
         for install in &mut out {
-            // The run snapshot's frozen team-role bindings and the
-            // agents its steps assigned. The role keys stay role keys:
-            // they are never mixed into the alias set, so an ordinary
-            // content input (`topic: lead`) cannot make `lead` a team
-            // member, and a saved role the operator later renamed or
-            // replaced still carries the alias it bound at run time.
-            for (frozen, assigned) in store.app_run_team_inputs(&install.install_id)? {
-                install.team.extend(assigned);
-                install.team.extend(frozen.into_values());
+            // Each run's frozen membership, from the run's own snapshot:
+            // the `team_roles` map this build writes, the aliases its
+            // steps assigned, and — for a snapshot written before that
+            // map existed — the run's frozen inputs, where only a key the
+            // installation still declares as a role is a team-role
+            // binding. An ordinary content input is never read as a role
+            // name, so its value never becomes a member.
+            for run in store.app_run_team_inputs(&install.install_id)? {
+                install.team.extend(run.assigned);
+                install.team.extend(run.roles.into_values());
+                for (role, alias) in run.inputs {
+                    if install.roles.contains(&role) {
+                        install.team.insert(alias);
+                    }
+                }
             }
         }
     }
@@ -370,6 +386,21 @@ pub fn selected_root(project: &project::Project, front: &model::Front) -> Option
         [root] if declared.contains(root) => Some(root.clone()),
         _ => None,
     }
+}
+
+/// Is the app question live for this change at all? True when the change
+/// names an app by path, or one of `authors` is on some app's team. A
+/// caller uses this to refuse rather than admit when the repository it
+/// would have to match is unprovable: nothing to check is not the same
+/// answer as "could not check".
+pub fn app_question_live(ctx: Ctx, apps: &BTreeSet<String>, authors: &[&str]) -> Result<bool> {
+    if !apps.is_empty() {
+        return Ok(true);
+    }
+    let teams = teams(ctx)?;
+    Ok(authors
+        .iter()
+        .any(|author| !author.is_empty() && teams.values().any(|team| team.contains(*author))))
 }
 
 /// The plain refusal when `author` is on `app`'s team: names the agent,

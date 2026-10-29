@@ -194,8 +194,7 @@ impl Shared {
                 // CAD-622: the automatic watcher is an authoring kickoff
                 // too — the job's PM and the planned worker are the
                 // authors, and the guard runs before the queue write.
-                let pm = self.pm()?;
-                self.native_app_guard(&pm, &plan, None)?;
+                self.native_app_guard(&plan, None)?;
                 Some(self.prepare_job_delivery(&plan, false)?)
             };
             // Hold the pending-request mutex across the store transaction.
@@ -380,8 +379,7 @@ impl Shared {
         let plan = self.store.plan_task_dispatch(task_id, None, None)?;
         // CAD-622: the explicit monitor handoff is the same fresh kickoff —
         // guard it before the queue write.
-        let pm = self.pm()?;
-        self.native_app_guard(&pm, &plan, None)?;
+        self.native_app_guard(&plan, None)?;
         let delivery = Some(self.prepare_job_delivery(&plan, false)?);
         let (task, message, duplicate, behind_dead) = self.store.dispatch_task_planned(
             &plan,

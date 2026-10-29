@@ -8,13 +8,18 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-/// CAD-622: one run's frozen team-role bindings (`role` → agent alias,
-/// exactly the roles its installation team supplied at creation) and the
-/// aliases its steps assigned — what the app-team guard reads from a run.
-/// The role keys are kept separate from the aliases: an ordinary content
-/// input is never read as a role name, so its value never becomes a team
-/// member.
-pub type RunTeam = (BTreeMap<String, String>, Vec<String>);
+/// CAD-622: one run's frozen membership as the app-team guard reads it.
+/// `roles` is the team-role map this build freezes (`role` → agent
+/// alias); `inputs` is the run's whole frozen input map, the only role
+/// provenance a snapshot written before that map carries; `assigned` is
+/// the aliases its steps were assigned. The role keys stay separate from
+/// the aliases, so a content input's value never becomes a team member.
+#[derive(Clone, Debug, Default)]
+pub struct RunTeam {
+    pub roles: BTreeMap<String, String>,
+    pub inputs: BTreeMap<String, String>,
+    pub assigned: Vec<String>,
+}
 
 pub const ARTIFACT_BYTES: usize = 256 * 1024;
 pub const RUN_ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -1079,13 +1084,15 @@ impl Store {
         })
     }
     /// CAD-622: each run of `install_id` as the snapshot's frozen
-    /// team-role bindings (`team_roles`: role → alias, exactly the roles
-    /// the installation team supplied when the run was created) plus the
-    /// aliases it assigned to its steps — the run-time half of an app's
-    /// team, read from the run's own snapshot rather than the current
-    /// workflow or team record. A renamed, replaced or removed saved role
-    /// therefore cannot drop an alias the run bound. A snapshot that
-    /// cannot be parsed refuses; it is never read as "nobody".
+    /// team-role map (`team_roles`: role → alias, exactly the roles the
+    /// installation team supplied when the run was created), its frozen
+    /// `inputs` and the aliases it assigned to its steps — the run-time
+    /// half of an app's team, read from the run's own snapshot rather
+    /// than the current workflow or team record. A snapshot written
+    /// before `team_roles` existed still carries its `inputs`: the guard
+    /// reads a key there as a team role only when the installation still
+    /// declares that role key. A snapshot that cannot be parsed refuses;
+    /// it is never read as "nobody".
     pub fn app_run_team_inputs(&self, install_id: &str) -> Result<Vec<RunTeam>> {
         let texts = self
             .conn()
@@ -1098,6 +1105,8 @@ impl Store {
                 .map_err(|_| Error::internal("app run snapshot is unreadable"))?;
             let roles: BTreeMap<String, String> =
                 serde_json::from_value(snapshot["team_roles"].clone()).unwrap_or_default();
+            let inputs: BTreeMap<String, String> =
+                serde_json::from_value(snapshot["inputs"].clone()).unwrap_or_default();
             let assigned = snapshot["assignments"]
                 .as_object()
                 .map(|m| {
@@ -1106,7 +1115,11 @@ impl Store {
                         .collect()
                 })
                 .unwrap_or_default();
-            out.push((roles, assigned));
+            out.push(RunTeam {
+                roles,
+                inputs,
+                assigned,
+            });
         }
         Ok(out)
     }

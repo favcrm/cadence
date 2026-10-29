@@ -412,9 +412,16 @@ fn install_named_app(pm: &issue::Pm, name: &str, team: &[(&str, &str)]) {
 }
 
 /// An issue-linked job with one draft task, assigned to `assignee` — the
-/// shape `task_dispatch` and the monitor watcher dispatch.
-fn issue_job(fx: &Fx, id: &str, assignee: &str) -> String {
-    let checkout = fx._root.path().join("widgets");
+/// shape `task_dispatch` and the monitor watcher dispatch. `repo` and
+/// `worktree` are the job's own repository claim and the task's bound
+/// worktree.
+fn issue_job(
+    fx: &Fx,
+    id: &str,
+    assignee: &str,
+    repo: Option<&Path>,
+    worktree: Option<&Path>,
+) -> String {
     fx.shared
         .store
         .create_job(
@@ -424,12 +431,12 @@ fn issue_job(fx: &Fx, id: &str, assignee: &str) -> String {
             &"0".repeat(64),
             "lead",
             Some(ISSUE),
-            Some(checkout.to_str().unwrap()),
+            repo.map(|p| p.to_str().unwrap()),
             None,
             2,
             None,
             None,
-            None,
+            worktree.map(|p| p.to_str().unwrap()),
             None,
             None,
             Some(assignee),
@@ -437,6 +444,45 @@ fn issue_job(fx: &Fx, id: &str, assignee: &str) -> String {
         )
         .expect("issue-bound job");
     format!("{id}-t1")
+}
+
+/// A linked worktree of the fixture's checkout — the path a native job's
+/// task binds. It is the same repository as the main checkout.
+fn linked_worktree(fx: &Fx, name: &str) -> PathBuf {
+    let main = fx._root.path().join("widgets");
+    let dir = fx._root.path().join(name);
+    let run = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&main)
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    };
+    run(&[
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-c",
+        "user.name=fixture",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "base",
+    ]);
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(&main)
+        .args(["worktree", "add", "-q", "--detach"])
+        .arg(&dir)
+        .status()
+        .unwrap()
+        .success());
+    dir
 }
 
 /// A workspace installation: `.apps/installations/<id>/record.yaml` with
@@ -1139,7 +1185,13 @@ fn cad622_a_replaced_saved_role_keeps_the_frozen_alias_barred() {
 fn cad622_task_dispatch_refuses_an_own_team_worker() {
     let fx = Fx::new(&[("writer", "writer")], &[]);
     set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
-    let task = issue_job(&fx, "c622-job", "writer");
+    let task = issue_job(
+        &fx,
+        "c622-job",
+        "writer",
+        Some(&fx._root.path().join("widgets")),
+        None,
+    );
     let err = scoped(Asserted::Agent("lead".into()), || {
         fx.shared.dispatch(
             "task_dispatch",
@@ -1162,7 +1214,13 @@ fn cad622_task_dispatch_refuses_an_own_team_worker() {
     // worker — a separate fixture, since one issue maps to one job.
     let fx = Fx::new(&[("writer", "writer")], &[]);
     set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
-    let task = issue_job(&fx, "c622-job", "lead");
+    let task = issue_job(
+        &fx,
+        "c622-job",
+        "lead",
+        Some(&fx._root.path().join("widgets")),
+        None,
+    );
     let out = scoped(Asserted::Agent("lead".into()), || {
         fx.shared.dispatch(
             "task_dispatch",
@@ -1180,7 +1238,13 @@ fn cad622_task_dispatch_refuses_an_own_team_worker() {
 fn cad622_monitor_dispatch_refuses_an_own_team_worker() {
     let fx = Fx::new(&[("writer", "writer")], &[]);
     set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
-    let task = issue_job(&fx, "c622-mon", "writer");
+    let task = issue_job(
+        &fx,
+        "c622-mon",
+        "writer",
+        Some(&fx._root.path().join("widgets")),
+        None,
+    );
     let err = fx
         .shared
         .monitor_dispatch_task("c622-watch", &task, true)
@@ -1494,4 +1558,226 @@ fn cad622_dispatch_matches_the_selected_repository() {
     )
     .expect_err("the app's git source is its source");
     assert!(err.to_string().contains("its pinned git source"), "{err}");
+}
+
+/// F1 (round 3): a standalone native job — one with no tracker issue —
+/// must not need the tracker at all. The guard opens it only after the
+/// job proves an issue binding.
+#[test]
+fn cad622_issue_free_native_dispatch_needs_no_tracker() {
+    let root = tempfile::Builder::new()
+        .prefix("c622free")
+        .tempdir()
+        .unwrap();
+    // A tracker path with no `pm.yaml`: opening the tracker here fails, so
+    // an issue-free job proves it never opens one.
+    let opts = crate::daemon::ServeOptions {
+        test_seam: true,
+        ..Default::default()
+    };
+    opts.provider_env.set(
+        "CADENCE_PM_DIR",
+        root.path().join("no-tracker").to_str().unwrap(),
+    );
+    let shared = Shared::new(root.path(), &opts).unwrap();
+    assert!(shared.pm().is_err(), "the fixture has no tracker to open");
+    let cwd = root.path().to_str().unwrap().to_string();
+    for (alias, role) in [("lead", "pm"), ("writer", "worker")] {
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias,
+                provider: "fake",
+                endpoint_kind: "fake",
+                role,
+                cwd: &cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: (alias == "writer").then_some(r#"{"upstream":"lead"}"#),
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        shared.store.set_agent_state(alias, "idle", None).unwrap();
+    }
+    shared
+        .store
+        .create_job(
+            "c622-free",
+            Some("standalone"),
+            "spec.md",
+            &"0".repeat(64),
+            "lead",
+            None,
+            None,
+            None,
+            2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("writer"),
+            Some("the work is done"),
+        )
+        .expect("standalone job");
+    let out = scoped(Asserted::Agent("lead".into()), || {
+        shared.dispatch(
+            "task_dispatch",
+            &json!({"task": "c622-free-t1", "to": "writer", "by": "lead"}),
+            std::process::id(),
+        )
+    })
+    .expect("an issue-free job needs no tracker");
+    assert_eq!(out["task"]["state"].as_str(), Some("dispatched"), "{out}");
+}
+
+/// F3 (round 3): the native git-source evidence is the repository the
+/// kickoff's task worktree is in, normalized to its main checkout — not
+/// the job's optional `repo` metadata. A root-relative change, an
+/// app-team worker, an opt-out project and an omitted (or mismatched)
+/// job repository still refuse; an independent worker is admitted.
+#[test]
+fn cad622_native_git_source_evidence_follows_the_task_worktree() {
+    let fx = Fx::with_second_repo(&[], &[]);
+    workspace_install_from(
+        &fx,
+        "inst-git3",
+        "https://github.com/acme/widgets",
+        &[("writer", "writer")],
+    );
+    // Root-relative paths: the app is named by the repository, not a
+    // prefix.
+    set_paths(&fx.pm(), &fx.issue, "app.md,workflows/post.md");
+    let lane = linked_worktree(&fx, "lane-app");
+
+    // Omitted `job.repo`: the task's worktree is the app's git source.
+    let task = issue_job(&fx, "c622-src", "writer", None, Some(&lane));
+    let err = scoped(Asserted::Agent("lead".into()), || {
+        fx.shared.dispatch(
+            "task_dispatch",
+            &json!({"task": task, "to": "writer", "by": "lead"}),
+            std::process::id(),
+        )
+    })
+    .expect_err("the task's own worktree is the app's source");
+    assert!(err.to_string().contains("its pinned git source"), "{err}");
+
+    // A `job.repo` that disagrees with the task's worktree is unprovable,
+    // never an empty app set.
+    let fx = Fx::with_second_repo(&[], &[]);
+    workspace_install_from(
+        &fx,
+        "inst-git4",
+        "https://github.com/acme/widgets",
+        &[("writer", "writer")],
+    );
+    set_paths(&fx.pm(), &fx.issue, "app.md,workflows/post.md");
+    let lane = linked_worktree(&fx, "lane-app");
+    let tools = fx._root.path().join("tools");
+    let task = issue_job(&fx, "c622-src2", "writer", Some(&tools), Some(&lane));
+    let err = scoped(Asserted::Agent("lead".into()), || {
+        fx.shared.dispatch(
+            "task_dispatch",
+            &json!({"task": task, "to": "writer", "by": "lead"}),
+            std::process::id(),
+        )
+    })
+    .expect_err("two repositories cannot answer one app question");
+    assert!(
+        err.to_string()
+            .contains("cannot be made on two repositories"),
+        "{err}"
+    );
+
+    // Independent-worker control: the same worktree, a worker off every
+    // app's team, is admitted.
+    let fx = Fx::with_second_repo(&[], &[]);
+    workspace_install_from(
+        &fx,
+        "inst-git5",
+        "https://github.com/acme/widgets",
+        &[("writer", "writer")],
+    );
+    set_paths(&fx.pm(), &fx.issue, "app.md,workflows/post.md");
+    let lane = linked_worktree(&fx, "lane-app");
+    let task = issue_job(&fx, "c622-src3", "lead", None, Some(&lane));
+    let out = scoped(Asserted::Agent("lead".into()), || {
+        fx.shared.dispatch(
+            "task_dispatch",
+            &json!({"task": task, "to": "lead", "by": "lead"}),
+            std::process::id(),
+        )
+    })
+    .expect("an independent worker is admitted");
+    assert_eq!(out["task"]["state"].as_str(), Some("dispatched"), "{out}");
+}
+
+/// F2 (round 3): a run snapshot written before `team_roles` existed
+/// carries only `inputs` and `assignments`. Its frozen role binding is
+/// still membership — a replaced saved alias does not launder the old
+/// one — and a content input's value is still not a member.
+#[test]
+fn cad622_a_legacy_run_snapshot_keeps_the_frozen_alias_barred() {
+    let fx = Fx::new(&[], &[]);
+    // The operator replaced the saved alias; the run froze the old one.
+    workspace_install(&fx, "inst-legacy", &[("writer", "new-writer")]);
+    fx.insert_run(
+        "run-legacy",
+        "inst-legacy",
+        json!({"inputs": {"writer": "old-writer"}, "assignments": {}}),
+    );
+    fx.register("old-writer", "worker");
+    fx.register("new-writer", "worker");
+    let guard = crate::issue::app_guard::Ctx {
+        pm_dir: &fx.pm_dir,
+        state_dir: Some(&fx.state),
+        store: Some(&fx.shared.store),
+    };
+    let teams = crate::issue::app_guard::teams(guard).unwrap();
+    let team = teams.get(APP).expect("the workspace install's app");
+    assert!(
+        team.contains("old-writer"),
+        "the legacy snapshot's frozen role binding stays a member: {team:?}"
+    );
+    set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
+    let err = scoped(Asserted::Agent("lead".into()), || {
+        fx.shared.dispatch(
+            "dispatch_send",
+            &json!({"alias": "old-writer", "issue": ISSUE, "text": "do it",
+                    "reply_to": "lead"}),
+            std::process::id(),
+        )
+    })
+    .expect_err("a legacy run's frozen role alias is still the app's team");
+    assert!(
+        err.to_string()
+            .contains("old-writer is on app 'social-content's team"),
+        "{err}"
+    );
+
+    // And a legacy content input is not a role binding: `topic: lead`
+    // names content, not an agent on the team.
+    let fx = Fx::new(&[], &[]);
+    workspace_install(&fx, "inst-legacy2", &[("writer", "topic")]);
+    fx.insert_run(
+        "run-legacy2",
+        "inst-legacy2",
+        json!({"inputs": {"writer": "topic", "topic": "lead"}, "assignments": {}}),
+    );
+    let guard = crate::issue::app_guard::Ctx {
+        pm_dir: &fx.pm_dir,
+        state_dir: Some(&fx.state),
+        store: Some(&fx.shared.store),
+    };
+    let teams = crate::issue::app_guard::teams(guard).unwrap();
+    let team = teams.get(APP).expect("the workspace install's app");
+    assert!(
+        team.contains("topic"),
+        "the role binding is a member: {team:?}"
+    );
+    assert!(
+        !team.contains("lead"),
+        "a legacy content input's value is not a member: {team:?}"
+    );
 }

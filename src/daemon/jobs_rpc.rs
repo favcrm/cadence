@@ -349,34 +349,26 @@ impl Shared {
     /// `dispatch_task_planned`, never through `dispatch_send`, so they
     /// need the same store-backed guard here: the caller's claim, the
     /// job's own PM and the planned worker are all authors of the work
-    /// the kickoff opens; the ticket's planned paths and the job's
-    /// selected repository are the evidence. A refusal leaves the task,
-    /// the job and the queue untouched.
+    /// the kickoff opens; the ticket's planned paths and the repository
+    /// the kickoff actually writes to are the evidence. A refusal leaves
+    /// the task, the job and the queue untouched.
+    ///
+    /// The tracker is opened only once the job proves it is bound to an
+    /// issue: a standalone job keeps working without one.
     pub(super) fn native_app_guard(
         &self,
-        pm: &crate::issue::Pm,
         plan: &crate::store::DispatchPlan,
         caller: Option<&str>,
     ) -> Result<()> {
         let Some(issue_id) = plan.job.issue_id.as_deref() else {
             return Ok(());
         };
-        let Some(gated) = crate::issue::dispatch::capture_issue(pm, issue_id)? else {
+        let pm = self.pm()?;
+        let Some(gated) = crate::issue::dispatch::capture_issue(&pm, issue_id)? else {
             return Ok(());
         };
         let app_paths =
             crate::issue::app_guard::apps_in_paths(gated.front.paths.iter().map(String::as_str));
-        let remotes = plan
-            .job
-            .repo
-            .as_deref()
-            .map(|repo| {
-                let root = std::path::Path::new(repo)
-                    .canonicalize()
-                    .unwrap_or_else(|_| std::path::PathBuf::from(repo));
-                crate::issue::app_guard::selected_remotes(&gated.project, &root)
-            })
-            .unwrap_or_default();
         let mut authors: Vec<&str> = vec![plan.worker.alias.as_str(), plan.job.pm_alias.as_str()];
         authors.extend(caller.filter(|c| !c.is_empty()));
         let guard = crate::issue::app_guard::Ctx {
@@ -384,6 +376,64 @@ impl Shared {
             state_dir: Some(&self.state_dir),
             store: Some(&self.store),
         };
+        // Nothing to check is not the same answer as "could not check":
+        // only a change that names an app, or whose author is on an app's
+        // team, pays for — and demands — the repository proof below.
+        if !crate::issue::app_guard::app_question_live(guard, &app_paths, &authors)? {
+            return Ok(());
+        }
+        // The repository the kickoff writes to is the task's own worktree —
+        // the place the kickoff tells the worker to work — normalized to
+        // its main checkout, so a linked worktree names the same
+        // repository as its main checkout. `job.repo` is separate,
+        // optional metadata: a claim that disagrees is unprovable, never
+        // an empty app set.
+        let worktree_root = match plan.task.worktree.as_deref() {
+            Some(worktree) => {
+                let dir = std::path::Path::new(worktree);
+                Some(crate::worktree::main_root(dir).map_err(|e| {
+                    Error::rejected(format!(
+                        "task dispatch refused: task '{}' binds worktree {} whose \
+                         repository cannot be proven ({e}) — the app-team check cannot \
+                         be made",
+                        plan.task.id,
+                        dir.display()
+                    ))
+                })?)
+            }
+            None => None,
+        };
+        let job_root = plan.job.repo.as_deref().map(|repo| {
+            let dir = std::path::Path::new(repo);
+            crate::worktree::main_root(dir)
+                .or_else(|_| dir.canonicalize())
+                .unwrap_or_else(|_| dir.to_path_buf())
+        });
+        let root = match (worktree_root, job_root) {
+            (Some(worktree), Some(job)) if worktree != job => {
+                return Err(Error::rejected(format!(
+                    "task dispatch refused: job '{}' names repository {}, but task '{}' \
+                     binds worktree {} in {} — the app-team check cannot be made on two \
+                     repositories",
+                    plan.job.id,
+                    job.display(),
+                    plan.task.id,
+                    plan.task.worktree.as_deref().unwrap_or_default(),
+                    worktree.display()
+                )));
+            }
+            (Some(root), _) => Some(root),
+            (None, job) => job,
+        };
+        let Some(root) = root else {
+            return Err(Error::rejected(format!(
+                "task dispatch refused: job '{}' names no repository and task '{}' binds \
+                 no worktree, so which repository this kickoff writes to cannot be proven \
+                 — the app-team check for {issue_id} cannot be made",
+                plan.job.id, plan.task.id
+            )));
+        };
+        let remotes = crate::issue::app_guard::selected_remotes(&gated.project, &root);
         match crate::issue::app_guard::refusals(guard, &app_paths, &authors, &remotes)? {
             Some(why) => Err(Error::rejected(why)),
             None => Ok(()),
@@ -445,8 +495,7 @@ impl Shared {
             // CAD-622: a fresh kickoff is a new authoring act — the app-team
             // guard runs before any context capture or queue write. A
             // duplicate is the accepted kickoff's own retry, not new work.
-            let pm = self.pm()?;
-            self.native_app_guard(&pm, &plan, optional_str(params, "by"))?;
+            self.native_app_guard(&plan, optional_str(params, "by"))?;
             Some(self.prepare_job_delivery(&plan, no_lessons)?)
         };
         // CAD-1380 deferred commit: an assist-bound job's dispatch re-proves
