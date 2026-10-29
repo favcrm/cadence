@@ -45,7 +45,6 @@ const APP: &str = "social-content";
 const REPO: &str = "acme/widgets";
 const PR: u64 = 622;
 const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
-const MOVED: &str = "89abcdef0123456789abcdef0123456789abcdef";
 
 fn pr_url() -> String {
     format!("https://github.com/{REPO}/pull/{PR}")

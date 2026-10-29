@@ -79,6 +79,23 @@ changed authorization revision invalidates pending effects as appropriate.
 Project linking never confers connection access or app-edit authority. Preserve
 the app-team self-edit restriction work (CAD-622), independent of project links.
 
+The CAD-622 rule, as delivered: app changes are ordinary work — the master or any
+connected agent authors them (plan, branch, independent review, merge, `cadence
+app update`, and the operator's re-approval for a structural change). The one
+exception is the app's own team. An agent named by an installation's saved team
+roles (`cadence app set-team`), or by a run's frozen role inputs, never authors a
+change to that app's source — `apps/<name>/` in a repository, or the git source
+the install record pinned — and never reviews one. Membership is by agent alias
+across every project, so renaming a role or filing the work under another project
+does not launder the author. The refusal is applied at dispatch (the ticket's
+planned `paths:`), at plan proposal (a plan naming `apps/<name>/`), and again at
+the review loop (the PR's own changed files, and its repository when it is the
+app's git source); review routing and the verdict both exclude the app's team.
+An installed copy still stays immutable between approvals: an edit to
+`<pm>/<project>/apps/<name>/` moves the structural digest, the board reads the
+install as `changed`, and a run's gate refuses `app_unapproved` until the
+operator re-approves.
+
 Keep three approval layers distinct: installation approval authorizes the
 configured capability boundary; run/step execution requires the workflow's
 declared execution approval or explicit scoped standing approval; outbound
