@@ -93,3 +93,5 @@ a `human` trigger still needs the operator, and the file is itself trigger 7.
 
 ## After an auto merge
 ops-1 runs the post-merge list, then a smoke check on the live system (`cadence --version`, `cadence status`, board 200, `cadence doctor`), and sends fable-cc one line: `merged #N <sha> (auto): <title>; tree ok; smoke ok`. If the smoke check fails: open a revert PR immediately (`gh pr create` with `git revert`), mark it `human`, and escalate to fable-cc. Do not merge the revert without approval.
+
+<!-- CAD-1925 live refusal probe: queued without enqueue-reviewed; must never merge -->
