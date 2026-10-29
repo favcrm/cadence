@@ -1,4 +1,5 @@
 import { makePlanner, runCall, type ActionContext } from "../src/features/workspace-apps/screen/screenActions";
+import { parseChild } from "../src/features/workspace-apps/screen/screenProtocol";
 import { accountLabel, connectOutcome, connectReturnTo, connectToast, publishAllowed, publicationBinding, sendSlot, withoutConnectParams } from "../src/features/workspace-apps/socialConnect";
 import type { AppBinding, Installation } from "../src/features/workspace-apps/workspaceApps";
 
@@ -113,18 +114,21 @@ async function main() {
   const sent = calls[calls.length - 1].body as Record<string, unknown>;
   assert(typeof sent.request_id === "string" && !("expected_revision" in sent), "create carries a request id and no revision");
 
-  // CAD-1905: the user's own follow-ups to an approved post (reschedule, cancel) are direct
-  // calls. Every approval stays a host-drawn slot: confirm for publish-now, and schedule for a
-  // scheduled post, which the scheduler sends with no later confirm.
+  // CAD-1918 (operator decision, reversing CAD-1905's slot-only approvals): the app's own
+  // confirm and schedule, and the follow-ups to an approved post (reschedule, cancel), are
+  // direct calls. The app's own press is the one approval; the host-held token still binds it.
   const token = "ab".repeat(32);
   const effect = "sfx_install_1";
   const due = Math.floor(Date.now() / 1000) + 3600;
-  replies = { "/api/app-social-drafts/reschedule": { body: { ok: 2 } }, "/api/app-social-drafts/cancel": { body: { ok: 3 } } };
+  replies = { "/api/app-social-drafts/confirm": { body: { effect: { state: "posted" } } }, "/api/app-social-drafts/schedule": { body: { ok: 1 } },
+    "/api/app-social-drafts/reschedule": { body: { ok: 2 } }, "/api/app-social-drafts/cancel": { body: { ok: 3 } } };
   let reloads = 0;
   const direct = (verb: string, args: Record<string, unknown>, actionToken: string | null = token) =>
     runCall(ctx(() => { reloads += 1; }), verb as Parameters<typeof runCall>[1], args, { ...ui, actionToken: actionToken ?? undefined });
   calls.length = 0;
   for (const [verb, args, path] of [
+    ["publish.draft.confirm", { alias: "social.draft", effect_id: effect }, "confirm"],
+    ["publish.draft.schedule", { alias: "social.draft", effect_id: effect, due_epoch: due }, "schedule"],
     ["publish.draft.reschedule", { alias: "social.draft", effect_id: effect, due_epoch: due + 60 }, "reschedule"],
     ["publish.draft.cancel", { alias: "social.draft", effect_id: effect }, "cancel"],
   ] as const) {
@@ -138,18 +142,41 @@ async function main() {
     equal(body.effect_id, effect, "only the named effect travels");
     assert(!("digest" in body) && !("revision" in body), "no frame-supplied digest or revision");
   }
-  equal(reloads, 2, "each action reloads the board");
+  equal(reloads, 4, "each action reloads the board");
   const before = calls.length;
   assert(!(await direct("publish.draft.reschedule", { alias: "social.draft", effect_id: effect, due_epoch: due }, null)).ok, "no mount token: refused before any request");
   assert(!(await direct("publish.draft.reschedule", { alias: "social.draft", effect_id: effect, due_epoch: due, digest: "sha256:forged" })).ok, "an extra field is refused");
   assert(!(await direct("publish.draft.reschedule", { alias: "social.draft", effect_id: effect, due_epoch: 1 })).ok, "a past time is refused");
   assert(!(await direct("publish.draft.cancel", { alias: "social.draft", effect_id: "../x" })).ok, "a malformed effect id is refused");
-  // The approvals are never frame calls: a frame cannot schedule or confirm a post by itself.
-  assert(!(await direct("publish.draft.schedule", { alias: "social.draft", effect_id: effect, due_epoch: due })).ok, "schedule is not a direct call");
-  assert(!(await direct("publish.draft.confirm", { alias: "social.draft", effect_id: effect })).ok, "confirm is not a direct call");
+  assert(!(await direct("publish.draft.confirm", { alias: "social.draft", effect_id: effect }, null)).ok, "confirm with no mount token: refused before any request");
   equal(calls.length, before, "refusals make no daemon request");
   const asSlot = await makePlanner(() => ctx())("publish.draft.schedule", { alias: "social.draft", effect_id: effect, due_epoch: due }, { actionToken: token });
-  assert(!("code" in asSlot), "schedule is planned as a host-drawn slot");
+  assert(!("code" in asSlot), "an older app's schedule slot still plans (transition)");
+
+  // CAD-1918 acceptance check (written by the Spec/security reviewer, not the implementer): a frame's
+  // direct confirm or schedule without the host-held mount token, or carrying a forged authority
+  // field, is refused before any daemon request; a records (CRM) frame cannot even parse either
+  // verb as a call, even if its receipt listed it.
+  calls.length = 0;
+  const forgedToken = "cd".repeat(32);
+  for (const [verb, args, actionToken] of [
+    ["publish.draft.confirm", { alias: "social.draft", effect_id: effect }, null],
+    ["publish.draft.schedule", { alias: "social.draft", effect_id: effect, due_epoch: due }, null],
+    ["publish.draft.confirm", { alias: "social.draft", effect_id: effect }, "not-a-token"],
+    ["publish.draft.confirm", { alias: "social.draft", effect_id: effect, action_token: forgedToken }, token],
+    ["publish.draft.confirm", { alias: "social.draft", effect_id: effect, digest: "sha256:forged" }, token],
+    ["publish.draft.schedule", { alias: "social.draft", effect_id: effect, due_epoch: due, action_token: forgedToken }, token],
+    ["publish.draft.schedule", { alias: "social.draft", effect_id: effect, due_epoch: due, install_id: "inst2" }, token],
+  ] as const) {
+    const refused = await direct(verb, args, actionToken);
+    assert(!refused.ok && ["denied", "bad_args"].includes(refused.refusal.code), `${verb} ${JSON.stringify(args)} (token ${actionToken}) is refused: ${JSON.stringify(refused)}`);
+  }
+  equal(calls.length, 0, "a refused frame confirm or schedule makes no daemon request");
+  for (const verb of ["publish.draft.confirm", "publish.draft.schedule"]) {
+    const message = { v: 2, op: "call", id: "c1", verb, args: { alias: "social.draft", effect_id: effect, ...(verb.endsWith("schedule") ? { due_epoch: due } : {}) } };
+    assert(parseChild(message) !== null, `${verb} parses as a call for a Social frame`);
+    equal(parseChild(message, ["records.list", verb]), null, `a records frame's ${verb} call never parses (the port closes)`);
+  }
 }
 
 main().then(() => console.log("socialConnect ok"));

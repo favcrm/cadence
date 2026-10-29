@@ -101,13 +101,15 @@ export function parseScreenDrawerCall(verb: ScreenDrawerVerb, args: ActionArgs):
 }
 
 /** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the
- *  port. `call` verbs never spend or publish: the install's own config and
- *  drafts, and the user's own follow-ups to an approved post (reschedule,
- *  cancel), run directly. Every approval is a host-drawn slot: confirm for
- *  publish-now and schedule for a scheduled post (the scheduler sends it with
- *  no later confirm). Every spend, publish or custody verb is a `slot` verb
- *  and waits for a tap on a host-drawn button. */
-export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "publish.destination.use", "publish.settings.save", "publish.draft.reschedule", "publish.draft.cancel", "media.read", "media.publish", "media.chat.attach"] as const;
+ *  port. `call` verbs run directly: the install's own config and drafts, and
+ *  (CAD-1918, operator decision) the app's own publish confirmation and
+ *  schedule — the human's press inside the app is the one approval, bound by
+ *  the operator session, the host-held action token and the install-bound
+ *  stored effect. `slot` verbs wait for a tap on a host-drawn button: a run
+ *  start, the original download and the image picker. Confirm and schedule
+ *  also stay slot verbs until every installed app sends them as calls
+ *  (Social Content 0.12.10 still sends slots). */
+export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "publish.destination.use", "publish.settings.save", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "media.read", "media.publish", "media.chat.attach"] as const;
 export const SLOT_VERBS = ["run.start", "publish.draft.confirm", "publish.draft.schedule", "media.original.download", "social.image.pick"] as const;
 /** CAD-1365 — the protected original download slot. Qualified per mount
  *  (screen-media.v1 + media.read + live token); never a generic action verb. */
@@ -123,7 +125,7 @@ export const isMediaVerb = (verb: string): verb is MediaVerb =>
 /** The verbs a screen.v2 PUSH advertises in `actions` — media verbs are
  *  deliberately absent; the channel appends a mount's declared media
  *  rights itself. */
-export const ACTION_VERBS: string[] = [...CALL_VERBS.filter(v => !(MEDIA_VERBS as readonly string[]).includes(v)), ...SLOT_VERBS.filter(v => v !== ORIGINAL_DOWNLOAD_VERB)];
+export const ACTION_VERBS: string[] = [...new Set([...CALL_VERBS.filter(v => !(MEDIA_VERBS as readonly string[]).includes(v)), ...SLOT_VERBS.filter(v => v !== ORIGINAL_DOWNLOAD_VERB)])];
 export const RECORD_CALL_VERBS = ["records.list", "records.show", "records.create", "records.update", "records.csv.preview", "segments.list", "segments.show", "segments.save", "exclusions.list", "exclusions.show", "exclusions.save", "suppressions.list", "suppressions.add", "audience.preview", "audience.prepare", "audience.show", "content.list", "content.show", "content.save", "content.clone", "content.render", "proposals.list", "proposals.show", "proposals.render", "proposals.apply", "proposals.discard", "sender-bindings.list", "sender-bindings.show", "sender-bindings.save", "content.test-prepare", "content.send-prepare", "sends.prepare", "sends.show", "sends.list", "smtp.show", "origin.show", "campaign-work.show", "campaign-work.save", "screen.preview.show", "screen.preview.clear", "screen.route.patch", "whatsapp.status", "whatsapp.connect_session", "whatsapp.conversations.list", "whatsapp.conversations.show", "whatsapp.messages", "whatsapp.reply.prepare", "whatsapp.reply.status", "whatsapp.templates.list", "whatsapp.template.show", "whatsapp.template.prepare", "whatsapp.template.status", "whatsapp.broadcasts.list", "whatsapp.broadcast.show", "whatsapp.broadcast.estimate", "whatsapp.broadcast.results", "whatsapp.broadcast.draft", "whatsapp.broadcast.test.prepare", "whatsapp.broadcast.prepare", "whatsapp.handoff.set", "chat.whatsapp.open", "whatsapp.draft.show", "whatsapp.draft.discard", "works.query", "works.get", "works.create", "works.patch", "works.trash", "works.restore", "works.request_review"] as const;
 export const RECORD_SLOT_VERBS = ["records.csv.import", "records.csv.confirm", "content.approve", "smtp.manage", "smtp.bind", "smtp.rebind", "smtp.revoke", "smtp.test-send", "sends.approve", "sends.resolve", "origin.manage", "chat.campaign.open", "chat.campaign.brief", "whatsapp.reply.send", "whatsapp.template.send", "whatsapp.broadcast.test.send", "whatsapp.broadcast.send", "whatsapp.broadcast.stop", "whatsapp.handoff.release", "chat.whatsapp.brief", "works.review", "works.export"] as const;
 export const RECORD_OPERATIONS: readonly string[] = [...RECORD_CALL_VERBS, ...RECORD_SLOT_VERBS];
