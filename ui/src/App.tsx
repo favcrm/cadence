@@ -292,7 +292,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const actor = meta?.actor ?? "operator (ui)";
   // Hosted boards upload with one multipart POST to the tenant Worker's wiki (AOS-418, which
   // also produces `Meta.wiki`); local boards use transfer jobs.
-  const multipartUpload = meta?.hosted === true;
+  const hosted = meta ? meta.hosted === true : undefined;
   const viewerSub = meta?.session?.user?.sub ?? null;
   // CAD-1423: change signal for the notification inbox. The verified identity is
   // still read from the daemon by the inbox itself; this only says when to re-check.
@@ -1302,7 +1302,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         {route.screen === "projects" && route.section === "context" && (
           <Context
             noWiki={!wikiAvailable(meta)}
-            multipartUpload={multipartUpload}
+            hosted={hosted}
             viewerSub={viewerSub}
             readOnly={readOnly}
             actor={actor}
@@ -1382,7 +1382,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             </PageState>
           ) : (
             <Wiki
-              multipartUpload={multipartUpload}
+              hosted={hosted}
               viewerSub={viewerSub}
               route={route}
               navHref={hrefFor}

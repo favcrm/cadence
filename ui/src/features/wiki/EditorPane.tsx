@@ -4,7 +4,7 @@ import { sessionStore } from "../../lib/draft";
 import { privateSessionGeneration } from "../../lib/privateSession";
 import { navigate } from "../../lib/useLocation";
 import { useTranslate } from "../../lib/locale";
-import { PageText } from "./PagePane";
+import PageText from "./PageText";
 import { IconWarning } from "../../ui/icons";
 import { wiki } from "./api";
 import {
