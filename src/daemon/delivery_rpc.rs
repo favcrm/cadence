@@ -363,7 +363,7 @@ impl Shared {
         };
         let name = latest["name"].as_str().unwrap_or_default();
         let refusal = match (latest["sha"].as_str(), latest["pr"].as_str()) {
-            (Some(sha), Some(pr)) => match self.pr_refusal(pm, rec, pr, held)? {
+            (Some(sha), Some(pr)) => match self.pr_refusal(pm, rec, pr, sha, held)? {
                 None => {
                     self.on_done(
                         pm,
@@ -416,12 +416,16 @@ impl Shared {
     /// must be in one of the ticket's project repos (`repos[].remote`,
     /// compared normalized), and no other live ticket may hold it —
     /// otherwise the operator's `gh` would enqueue a PR nobody
-    /// dispatched.
+    /// dispatched. CAD-622: and an app's own team agent never authors a
+    /// change to that app's source — the PR's own changed files (or its
+    /// repository, when an installation pinned it as the app's git
+    /// source) name the app.
     fn pr_refusal(
         &self,
         pm: &Pm,
-        rec: &Record,
+        rec: &mut Record,
         pr: &str,
+        sha: &str,
         held: &[(String, String)],
     ) -> Result<Option<String>> {
         if let Some(why) = delivery::project_pr_refusal(&pm.dir, &rec.project, pr)? {
@@ -433,7 +437,67 @@ impl Shared {
                 "names {key}, which ticket {other} already holds in the review loop"
             )));
         }
+        // The app read costs a record walk and, only when the worker is
+        // on some app's team, one bounded `gh pr view --json files`.
+        let touched = self.pr_apps(pm, rec, pr, sha)?;
+        rec.touched_apps = touched
+            .as_ref()
+            .map(|apps| apps.iter().cloned().collect::<Vec<_>>());
+        if let Some(apps) = &touched {
+            for app in apps {
+                if let Some(why) = crate::issue::app_guard::refusal(
+                    &pm.dir,
+                    app,
+                    &format!("{}/{app}/", crate::issue::app::DIR),
+                    &rec.worker,
+                    Some(&self.store),
+                )? {
+                    return Ok(Some(why));
+                }
+            }
+        }
         Ok(None)
+    }
+
+    /// CAD-622: the apps this PR's head touches — its changed files
+    /// under `apps/<name>/`, plus any app whose install record pins
+    /// this PR's repository as its git source. `None` is no evidence
+    /// (the file list could not be read, or the tip moved mid-read),
+    /// never "no app"; no `gh` call is made when the worker is on no
+    /// app's team and no app takes its source from this repository.
+    fn pr_apps(
+        &self,
+        pm: &Pm,
+        rec: &Record,
+        pr: &str,
+        sha: &str,
+    ) -> Result<Option<std::collections::BTreeSet<String>>> {
+        let (slug, _) = crate::issue::task_report::parse_pr_url(pr)?;
+        let mut apps = crate::issue::app_guard::apps_from_git_source(&pm.dir, &slug)?;
+        if crate::issue::app_guard::apps_of_agent(&pm.dir, &rec.worker, Some(&self.store))?
+            .is_empty()
+            && apps.is_empty()
+        {
+            return Ok(Some(apps));
+        }
+        let Ok(text) = delivery::gh(
+            &self.delivery_gh.to_string_lossy(),
+            &["pr", "view", pr, "--json", "files,headRefOid"],
+        ) else {
+            return Ok(None);
+        };
+        let view: Value = serde_json::from_str(&text)
+            .map_err(|e| Error::rejected(format!("gh pr view: unreadable ({e})")))?;
+        if view["headRefOid"].as_str() != Some(sha) {
+            return Ok(None);
+        }
+        let Some(files) = view["files"].as_array() else {
+            return Ok(None);
+        };
+        apps.extend(crate::issue::app_guard::apps_in_paths(
+            files.iter().filter_map(|f| f["path"].as_str()),
+        ));
+        Ok(Some(apps))
     }
 
     /// The worker reported `sha` done on `pr`.
@@ -475,6 +539,50 @@ impl Shared {
         self.start_review(pm, rec, hist)
     }
 
+    /// CAD-622: the candidates that are on the team of an app this
+    /// head's PR touches — they never review a change to that app. The
+    /// app list is the one review routing already read (the record's
+    /// `touched_apps`); a record that carries none pays one bounded
+    /// `gh pr view --json files`, and no evidence bars nobody.
+    fn app_barred(
+        &self,
+        pm: &Pm,
+        rec: &Record,
+        candidates: &[Candidate],
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let teams = crate::issue::app_guard::teams(&pm.dir, Some(&self.store))?;
+        let on_team: Vec<&String> = candidates
+            .iter()
+            .map(|c| &c.alias)
+            .filter(|alias| teams.values().any(|team| team.contains(*alias)))
+            .collect();
+        if on_team.is_empty() {
+            return Ok(Default::default());
+        }
+        let apps: std::collections::BTreeSet<String> = match &rec.touched_apps {
+            Some(apps) => apps.iter().cloned().collect(),
+            None => {
+                let (Some(pr), Some(head)) = (rec.pr.as_deref(), rec.head.as_deref()) else {
+                    return Ok(Default::default());
+                };
+                match self.pr_apps(pm, rec, pr, head)? {
+                    Some(apps) => apps,
+                    None => return Ok(Default::default()),
+                }
+            }
+        };
+        let mut barred = std::collections::BTreeSet::new();
+        for app in &apps {
+            let Some(team) = teams.get(app) else { continue };
+            for alias in &on_team {
+                if team.contains(*alias) {
+                    barred.insert((*alias).clone());
+                }
+            }
+        }
+        Ok(barred)
+    }
+
     /// The head moved without a done report from the worker: whoever
     /// reviewed it may have pushed it, so that reviewer is barred from
     /// this ticket and the review goes to someone else.
@@ -494,6 +602,8 @@ impl Shared {
         rec.ready_evidence = None;
         rec.ready_binding = None;
         rec.outcome_report = None;
+        // CAD-622: the old head's changed files say nothing about this one.
+        rec.touched_apps = None;
         self.start_review(pm, rec, hist)
     }
 
@@ -675,22 +785,35 @@ impl Shared {
                 role: a.role.clone(),
             })
             .collect();
+        // CAD-622: an app's own team agent never reviews a change to that
+        // app. The PR's own changed files name the app; only candidates
+        // that are on some app's team pay for that read.
+        let barred = self.app_barred(pm, rec, &candidates)?;
+        let mut excluded = rec.excluded.clone();
+        excluded.extend(barred.iter().cloned());
         let Some(pick) = delivery::pick_reviewer(
             &rec.worker,
             worker_vendor.as_deref(),
             rec.reviewer.as_deref(),
-            &rec.excluded,
+            &excluded,
             &candidates,
             &pm.config.review,
             hist,
         ) else {
             if rec.state != State::Unstaffed {
                 rec.enter(State::Unstaffed, now());
-                rec.note = Some(format!(
+                let mut note = format!(
                     "no idle reviewer can take {sha}: a fresh review goes only to an idle \
                      agent registered with --role reviewer, never to a busy reviewer, an \
-                     implementer, the author, or another PM's group",
-                ));
+                     implementer, the author, or another PM's group"
+                );
+                if !barred.is_empty() {
+                    note.push_str(&format!(
+                        "; {} excluded as members of the app's own team",
+                        barred.iter().cloned().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                rec.note = Some(note);
                 let _ = self.store.event_public(
                     DAEMON_ALIAS,
                     "review_unstaffed",
@@ -846,6 +969,20 @@ impl Shared {
                 "{id}'s review is assigned to {}, not {who}",
                 rec.reviewer.as_deref().unwrap_or("nobody")
             )));
+        }
+        // CAD-622: an app's own team agent never reviews a change to that
+        // app — the head's touched apps are what review routing saw.
+        if let Some(apps) = rec.touched_apps.as_ref() {
+            for app in apps {
+                if let Some(why) = crate::issue::app_guard::review_refusal(
+                    &pm.dir,
+                    app,
+                    &who,
+                    Some(&self.store),
+                )? {
+                    return Err(Error::rejected(why));
+                }
+            }
         }
         let head = rec.head.clone().unwrap_or_default();
         if sha != head {
@@ -1623,7 +1760,8 @@ impl Shared {
         let Some(pr) = rec.pr.as_deref() else {
             return Ok(Some("the loop records no PR".to_string()));
         };
-        if let Some(why) = self.pr_refusal(pm, rec, pr, &[])? {
+        let mut owned = rec.clone();
+        if let Some(why) = self.pr_refusal(pm, &mut owned, pr, head, &[])? {
             return Ok(Some(format!("the PR {why}")));
         }
         if !self

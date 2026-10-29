@@ -2116,6 +2116,21 @@ fn preflight(
         .ok_or_else(|| {
             Error::rejected("Dispatch needs a return address — pass --reply-to <alias>")
         })?;
+    // CAD-622: an app's own team agents never author changes to that
+    // app's source. The ticket's planned paths are the earliest place a
+    // change is named, and this runs before anything is created — the
+    // worker and the PM asking for the work are both authors. The saved
+    // team is read here (no store on this side); the run's role inputs
+    // are applied by the daemon's plan and review seams.
+    let app_paths = crate::issue::app_guard::apps_in_paths(front.paths.iter().map(String::as_str));
+    if let Some(why) = crate::issue::app_guard::refusals(
+        &pm.dir,
+        &app_paths,
+        &[reply_to.as_str(), args.to.as_str()],
+        None,
+    )? {
+        return Err(Error::rejected(why));
+    }
     let note_arg = args.note.clone().unwrap_or_else(|| dir.join("issue.md"));
     let note = note_arg
         .canonicalize()

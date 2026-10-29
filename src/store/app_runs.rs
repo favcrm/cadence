@@ -1056,6 +1056,39 @@ impl Store {
                     Self::app_run_show_in(&*tx, &id)
         })
     }
+    /// CAD-622: each run of `install_id` as the frozen snapshot's role
+    /// `inputs` map plus the aliases it assigned to its steps — the
+    /// run-time half of an app's team, read from the run's own snapshot
+    /// rather than the current workflow or team record. A snapshot that
+    /// cannot be parsed refuses; it is never read as "nobody".
+    pub fn app_run_team_inputs(
+        &self,
+        install_id: &str,
+    ) -> Result<Vec<(BTreeMap<String, String>, Vec<String>)>> {
+        let texts = self
+            .conn()
+            .prepare("SELECT snapshot FROM app_runs WHERE install_id=? ORDER BY created")?
+            .query_map([install_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut out = Vec::new();
+        for text in texts {
+            let snapshot: Value = serde_json::from_str(&text)
+                .map_err(|_| Error::internal("app run snapshot is unreadable"))?;
+            let inputs: BTreeMap<String, String> =
+                serde_json::from_value(snapshot["inputs"].clone()).unwrap_or_default();
+            let assigned = snapshot["assignments"]
+                .as_object()
+                .map(|m| {
+                    m.values()
+                        .filter_map(|step| step["alias"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push((inputs, assigned));
+        }
+        Ok(out)
+    }
+
     pub fn app_run_show(&self, id: &str) -> Result<Value> {
         self.read_tx(|conn| Self::app_run_show_in(&conn, id))
     }

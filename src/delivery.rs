@@ -310,6 +310,11 @@ pub struct Record {
     /// reviewer — the note says so.
     #[serde(default)]
     pub risk: Option<String>,
+    /// CAD-622: the app names this head's changed files touch, when the
+    /// PR's file list could be read. `None` is no evidence (never read
+    /// as "no app"): the guard only refuses on what it saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touched_apps: Option<Vec<String>>,
 }
 
 fn not_held(held: &bool) -> bool {
@@ -347,6 +352,7 @@ impl Record {
             ticket_done: None,
             ready_epoch: 0,
             risk: None,
+            touched_apps: None,
         }
     }
 

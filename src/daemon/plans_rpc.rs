@@ -214,6 +214,19 @@ impl Shared {
             }
         };
         let pm = self.pm()?;
+        // CAD-622: a plan naming an app's source is authored by its
+        // proposer, and an app's own team agents never author changes to
+        // that app. The saved team and the installation's run role
+        // inputs are both read here; a refusal writes nothing.
+        let planned = crate::issue::app_guard::apps_in_text(&text);
+        if let Some(why) = crate::issue::app_guard::refusals(
+            &pm.dir,
+            &planned,
+            &[actor.as_str()],
+            Some(&self.store),
+        )? {
+            return Err(Error::rejected(why));
+        }
         let allow = crate::secret::Allowlist::load(&self.state_dir)?;
         let out =
             crate::issue::plan::propose(&pm, project, &text, workflow, &allow, &actor, &|| {
