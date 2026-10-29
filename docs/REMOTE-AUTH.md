@@ -10,6 +10,11 @@ collaboration, explicit FYI registration and app lifecycle boundaries, start wit
 [Hosted workspace](guides/hosted-workspace.md). The credential details below
 remain separate from agent registration or package consent.
 
+For Native private-member assistant custody, least-scope board enrollment,
+credential-free preflight and genuine conversation acceptance, see
+[Native member-assistant enrollment](guides/member-assistant-enrollment.md).
+That procedure is not the Worker/Pi Durable deployment path.
+
 The separate CAD-539 provider credential import (`--token-stdin`) does not
 connect issue, message or team commands to hosted Cadence. Its
 `hosted_cadence: not_configured` result describes that provider import, not an

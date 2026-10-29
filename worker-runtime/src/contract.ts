@@ -113,6 +113,8 @@ export interface RuntimeTools {
  *   not be copied into any public projection.
  * - `workspace` is the shared operator-managed coordinator identity. It has no
  *   personal address or preferences.
+ * - `company_agent` is one company agent's identity and job, not a tool grant
+ *   or the member's private profile.
  */
 export type AssistantIdentityContext =
   | {
@@ -138,6 +140,16 @@ export type AssistantIdentityContext =
         readonly name: string | null;
         readonly tone: string | null;
         readonly look: string;
+        readonly revision: string;
+      };
+    }
+  | {
+      readonly scope: "company_agent";
+      readonly identity: {
+        readonly name: string | null;
+        readonly look: string;
+        /** Plain text, trimmed, 1–2000 characters; only newline controls allowed. */
+        readonly responsibilities: string;
         readonly revision: string;
       };
     };
