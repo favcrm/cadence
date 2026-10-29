@@ -124,8 +124,16 @@ export function wikiLinkHref(pagePath: string, href: string): string | null {
   } catch {
     return null;
   }
-  if (url.origin !== WIKI_BASE || !url.pathname.startsWith("/wiki/") || url.pathname === "/wiki/") return null;
-  return url.pathname + url.search + url.hash;
+  if (url.origin !== WIKI_BASE) return null;
+  const tail = url.pathname === "/wiki" ? "" : url.pathname.startsWith("/wiki/") ? url.pathname.slice(6) : null;
+  if (tail === null) return null;
+  for (const segment of tail.split("/")) {
+    let decoded: string;
+    try { decoded = decodeURIComponent(segment); } catch { return null; }
+    // A segment that decodes to a separator or a control character is not a store path.
+    if (/[/\\\u0000-\u001f\u007f]/.test(decoded)) return null;
+  }
+  return (tail === "" || tail === "/" ? "/wiki" : url.pathname) + url.search + url.hash;
 }
 
 /**
@@ -142,8 +150,15 @@ export function splitFrontmatter(text: string): { meta: [string, string][]; body
   const meta: [string, string][] = [];
   for (const line of block[1].split(/\r?\n/)) {
     const pair = /^([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(line.trim());
-    if (!pair) continue;
-    meta.push([pair[1], pair[2].replace(/^(["'])(.*)\1$/, "$2")]);
+    if (pair) {
+      meta.push([pair[1], pair[2].replace(/^(["'])(.*)\1$/, "$2")]);
+      continue;
+    }
+    // A YAML list under a key: its items join that key's value.
+    const item = /^-\s+(.+)$/.exec(line.trim());
+    const last = meta[meta.length - 1];
+    if (item && last) last[1] = last[1] ? `${last[1]}, ${item[1]}` : item[1];
   }
+  if (meta.length === 0) return { meta, body: text };
   return { meta, body: lead + rest.slice(block[0].length) };
 }
