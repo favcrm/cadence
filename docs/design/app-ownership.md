@@ -90,8 +90,10 @@ across every project, so renaming a role or filing the work under another projec
 does not launder the author. A run freezes its role bindings as their own
 snapshot member; a run written before that member existed cannot say which of
 its inputs were roles, so a question naming one of their values holds (with an
-explicit re-create requirement) rather than reading today's team keys or a
-content value as an agent. The refusal is applied at dispatch (the ticket's
+explicit operator withdrawal requirement) rather than reading today's team keys
+or a content value as an agent. The withdrawal is recorded on the run: cancel a
+live run, or retire a terminal one (`app_run_retire_legacy`), whose lifecycle
+state and history stay untouched. The refusal is applied at dispatch (the ticket's
 planned `paths:`), at plan proposal (a plan naming `apps/<name>/`), and again at
 the review loop (the PR's own changed files, and its repository when it is the
 app's git source); review routing and the verdict both exclude the app's team.

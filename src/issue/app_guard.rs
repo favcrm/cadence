@@ -32,7 +32,10 @@
 //!   it bound. A snapshot written before that provenance existed merged
 //!   its role bindings into content and recorded no role keys, so its
 //!   aliases stay unproven: a question naming one holds rather than
-//!   reading today's role keys — or a content value — as an agent.
+//!   reading today's role keys — or a content value — as an agent. The
+//!   hold clears only by an operator withdrawal recorded on the run:
+//!   cancelling a live run, or `app_run_retire_legacy` for a terminal
+//!   one, which leaves its lifecycle state and history untouched.
 //!
 //! **Where it is enforced.** The daemon's own dispatch admission
 //! (`dispatch_send`) with the connection-derived caller and the target
@@ -117,6 +120,10 @@ pub struct Unproven {
     pub run: String,
     /// The frozen input key the alias was found under.
     pub key: String,
+    /// The run's lifecycle state, so the hold can name the withdrawal
+    /// the operator actually has: cancel a live run, retire a terminal
+    /// one.
+    pub state: String,
 }
 
 /// The app a repo-relative path belongs to: `apps/<name>[/…]` → `<name>`.
@@ -305,11 +312,12 @@ pub fn installations(ctx: Ctx) -> Result<Vec<Install>> {
                     // its legacy input map is provably content.
                     None if !run.may_have_roles => {}
                     None => {
-                        // A cancelled run is the operator's own withdrawal:
-                        // its unrecorded bindings no longer constrain, which
-                        // is the migration path for a legacy snapshot
-                        // (cancel it, then re-create it with this build).
-                        if run.state == "cancelled" {
+                        // A cancelled run is the operator's own withdrawal,
+                        // and a retired one is the explicit withdrawal a
+                        // terminal run needs (`app_run_retire_legacy`): in
+                        // both, the unrecorded bindings no longer
+                        // constrain. Until then the hold stands.
+                        if run.state == "cancelled" || run.legacy_retired {
                             continue;
                         }
                         for (key, alias) in run.inputs {
@@ -319,6 +327,7 @@ pub fn installations(ctx: Ctx) -> Result<Vec<Install>> {
                             install.unproven.entry(alias).or_insert(Unproven {
                                 run: run.id.clone(),
                                 key,
+                                state: run.state.clone(),
                             });
                         }
                     }
@@ -434,12 +443,16 @@ pub fn selected_remotes(project: &project::Project, root: &Path) -> Vec<String> 
 pub fn checkout_remotes(project: &project::Project, root: &Path) -> Result<Vec<String>> {
     let registered = selected_remotes(project, root);
     let actual = crate::issue::project::repo_identity(root).and_then(|(_, remote)| remote);
+    // Both sides are folded the same way: `repo_identity` normalizes the
+    // scheme but keeps the path's case, while a registered remote may be
+    // spelled either way. A byte-identical mixed-case origin must not
+    // read as a conflict.
     let normalized = |remote: &str| project::normalize_remote(remote).to_ascii_lowercase();
     if !registered.is_empty() {
         if let Some(actual) = &actual {
             if !registered
                 .iter()
-                .any(|remote| normalized(remote) == *actual)
+                .any(|remote| normalized(remote) == normalized(actual))
             {
                 return Err(Error::rejected(format!(
                     "the checkout at {} is registered as {} but its own origin is {actual} \
@@ -452,7 +465,7 @@ pub fn checkout_remotes(project: &project::Project, root: &Path) -> Result<Vec<S
         return Ok(registered);
     }
     match actual {
-        Some(actual) => Ok(vec![actual]),
+        Some(actual) => Ok(vec![normalized(&actual)]),
         None => Err(Error::rejected(format!(
             "the checkout at {} is not a repository this issue project registers and its \
              git source cannot be read — the app-team check cannot be made",
@@ -507,13 +520,24 @@ fn unproven_refusal(ctx: Ctx, app: &str, alias: &str) -> Result<Option<String>> 
             continue;
         }
         if let Some(unproven) = install.unproven.get(alias) {
+            let remedy = match unproven.state.as_str() {
+                "succeeded" | "failed" => format!(
+                    "retire that run's unrecorded provenance (`cadence app run retire-legacy \
+                     {}`)",
+                    unproven.run
+                ),
+                _ => format!(
+                    "cancel that run (`cadence app run cancel {}`) and re-create it with this \
+                     build so the binding is recorded",
+                    unproven.run
+                ),
+            };
             return Ok(Some(format!(
                 "the app-team check for {alias} on app '{app}' (installation {}) holds: app \
                  run '{}' was frozen before the run recorded which of its inputs were team \
                  roles, so whether input '{}' bound {alias} to a team role or was content \
-                 cannot be established — cancel that run (`cadence app run cancel --run-id \
-                 {}`) and re-create it with this build so the binding is recorded, then retry",
-                install.install_id, unproven.run, unproven.key, unproven.run
+                 cannot be established — {remedy}, then retry",
+                install.install_id, unproven.run, unproven.key
             )));
         }
     }

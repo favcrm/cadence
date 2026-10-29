@@ -876,7 +876,9 @@ impl Shared {
                 "origin",
             ],
             "app_run_approve" => &["run_id", "digest", "public_session"],
-            "app_run_cancel" | "app_run_dispatch" => &["run_id", "public_session"],
+            "app_run_cancel" | "app_run_dispatch" | "app_run_retire_legacy" => {
+                &["run_id", "public_session"]
+            }
             "app_run_show" => &["run_id"],
             "app_run_list" => &["install_id", "context_id"],
             "app_run_artifact" => &["artifact_id", "message", "token"],
@@ -948,6 +950,7 @@ impl Shared {
                 | "app_local_install_revoke"
                 | "app_run_approve"
                 | "app_run_cancel"
+                | "app_run_retire_legacy"
                 | "app_run_dispatch"
                 | "app_run_start"
                 | "app_run_create"
@@ -1068,6 +1071,9 @@ impl Shared {
                     human,
                 )
             }
+            "app_run_retire_legacy" => self
+                .store
+                .app_run_retire_legacy(required_str(params, "run_id")?, human),
             "app_run_dispatch" => {
                 let run = self.dispatch_app_run_as(required_str(params, "run_id")?, human)?;
                 // CAD-1120: a kickoff queued for a worker the idle timer

@@ -114,23 +114,35 @@ impl Fx {
     /// With `other`, a second project exists and the issue lives there —
     /// the "edit the app through a different project" bypass.
     fn with_extra_project(team: &[(&str, &str)], reviewers: &[&str], other: bool) -> Self {
-        Self::build(team, reviewers, other, false)
+        Self::build(team, reviewers, other, false, None)
     }
 
     /// A project that registers a second, unrelated repository as well —
     /// the app's git source is only one of them.
     fn with_second_repo(team: &[(&str, &str)], reviewers: &[&str]) -> Self {
-        Self::build(team, reviewers, false, true)
+        Self::build(team, reviewers, false, true, None)
     }
 
-    fn build(team: &[(&str, &str)], reviewers: &[&str], other: bool, second_repo: bool) -> Self {
+    /// The fixture checkout (and its recorded remote) uses `origin` —
+    /// a mixed-case spelling, say.
+    fn with_origin(origin: &str, team: &[(&str, &str)], reviewers: &[&str]) -> Self {
+        Self::build(team, reviewers, false, false, Some(origin))
+    }
+
+    fn build(
+        team: &[(&str, &str)],
+        reviewers: &[&str],
+        other: bool,
+        second_repo: bool,
+        origin: Option<&str>,
+    ) -> Self {
         let root = tempfile::Builder::new().prefix("c622d").tempdir().unwrap();
         let pm_dir = root.path().join("pm");
         let pm = issue::Pm::init(&pm_dir).unwrap();
         let checkout = root.path().join("widgets");
         std::fs::create_dir_all(&checkout).unwrap();
         let mut repos: Vec<String> = vec![checkout.to_str().unwrap().into()];
-        let mut remotes = vec!["https://github.com/acme/widgets.git"];
+        let mut remotes = vec![origin.unwrap_or("https://github.com/acme/widgets.git")];
         if second_repo {
             let tools = root.path().join("tools");
             std::fs::create_dir_all(&tools).unwrap();
@@ -1829,6 +1841,57 @@ fn cad622_native_dispatch_proves_an_unregistered_checkout_source() {
     assert_eq!(out["task"]["state"].as_str(), Some("dispatched"), "{out}");
 }
 
+/// S5-1 (round 5): both sides of the checkout identity comparison are
+/// folded. A registered checkout whose own origin and recorded remote are
+/// the same mixed-case string is not a conflict, so the app-team check
+/// answers on the team instead of refusing the repository.
+#[test]
+fn cad622_a_mixed_case_registered_origin_is_not_a_conflict() {
+    let fx = Fx::with_origin("https://github.com/Acme/Widgets.git", &[], &[]);
+    workspace_install_from(
+        &fx,
+        "inst-case",
+        "https://github.com/Acme/Widgets",
+        &[("writer", "writer")],
+    );
+    // Root-relative: the app is named only by the repository's own source.
+    set_paths(&fx.pm(), &fx.issue, "app.md,workflows/post.md");
+    let checkout = fx._root.path().join("widgets");
+    let task = issue_job(&fx, "c622-case", "writer", None, Some(&checkout));
+    let err = scoped(Asserted::Agent("lead".into()), || {
+        fx.shared.dispatch(
+            "task_dispatch",
+            &json!({"task": task, "to": "writer", "by": "lead"}),
+            std::process::id(),
+        )
+    })
+    .expect_err("the app-team worker is refused on the team, not the spelling");
+    assert!(err.to_string().contains("its pinned git source"), "{err}");
+    assert!(!err.to_string().contains("cannot be proven"), "{err}");
+
+    // Control: an independent worker on the same mixed-case checkout is
+    // admitted, with the app named so the identity proof actually runs.
+    let fx = Fx::with_origin("https://github.com/Acme/Widgets.git", &[], &[]);
+    workspace_install_from(
+        &fx,
+        "inst-case2",
+        "https://github.com/Acme/Widgets",
+        &[("writer", "writer")],
+    );
+    set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
+    let checkout = fx._root.path().join("widgets");
+    let task = issue_job(&fx, "c622-case2", "lead", None, Some(&checkout));
+    let out = scoped(Asserted::Agent("lead".into()), || {
+        fx.shared.dispatch(
+            "task_dispatch",
+            &json!({"task": task, "to": "lead", "by": "lead"}),
+            std::process::id(),
+        )
+    })
+    .expect("an independent worker passes the identity proof");
+    assert_eq!(out["task"]["state"].as_str(), Some("dispatched"), "{out}");
+}
+
 /// R1-LEGACY (round 4): a run snapshot written before `team_roles`
 /// existed merged its team-role bindings into `inputs` and recorded no
 /// role keys. Nothing can recover which of those keys were roles, so a
@@ -1980,6 +2043,150 @@ fn cad622_a_legacy_content_value_is_held_not_read_as_a_member() {
             .unwrap()
             .is_empty(),
         "a host-execution legacy run froze no roles"
+    );
+}
+
+/// S5-2 (round 5): a terminal legacy run's unproven provenance has a real
+/// operator withdrawal. The hold stands at the admission boundary until
+/// the operator-gated `app_run_retire_legacy` transition records it, and
+/// the run's lifecycle state is untouched.
+#[test]
+fn cad622_a_terminal_legacy_run_can_be_retired_by_the_operator() {
+    let fx = Fx::new(&[], &[]);
+    workspace_install(&fx, "inst-retire", &[("author", "new-writer")]);
+    fx.insert_run_state(
+        "run-retire",
+        "inst-retire",
+        json!({"inputs": {"writer": "old-writer"}, "assignments": {}}),
+        "succeeded",
+    );
+    fx.register("old-writer", "worker");
+    let guard = crate::issue::app_guard::Ctx {
+        pm_dir: &fx.pm_dir,
+        state_dir: Some(&fx.state),
+        store: Some(&fx.shared.store),
+    };
+    assert!(
+        crate::issue::app_guard::unproven_teams(guard)
+            .unwrap()
+            .get(APP)
+            .is_some_and(|set| set.contains("old-writer")),
+        "a terminal legacy run holds before its withdrawal"
+    );
+    set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
+    let attempt = || {
+        scoped(Asserted::Agent("lead".into()), || {
+            fx.shared.dispatch(
+                "dispatch_send",
+                &json!({"alias": "old-writer", "issue": ISSUE, "text": "do it",
+                        "reply_to": "lead"}),
+                std::process::id(),
+            )
+        })
+    };
+    let err = attempt().expect_err("the hold refuses admission");
+    assert!(
+        err.to_string().contains("holds") && err.to_string().contains("retire-legacy run-retire"),
+        "{err}"
+    );
+
+    // The production transition: the operator records the withdrawal on
+    // the run; the terminal state and its history stay as they were.
+    let out = scoped(Asserted::Operator, || {
+        fx.shared.dispatch(
+            "app_run_retire_legacy",
+            &json!({"run_id": "run-retire"}),
+            std::process::id(),
+        )
+    })
+    .expect("the operator retires the terminal legacy run");
+    assert_eq!(
+        out["state"].as_str(),
+        Some("succeeded"),
+        "the lifecycle is untouched: {out}"
+    );
+
+    let guard = crate::issue::app_guard::Ctx {
+        pm_dir: &fx.pm_dir,
+        state_dir: Some(&fx.state),
+        store: Some(&fx.shared.store),
+    };
+    assert!(
+        !crate::issue::app_guard::unproven_teams(guard)
+            .unwrap()
+            .contains_key(APP),
+        "the recorded withdrawal clears the hold"
+    );
+    // The real admission now passes the app-team guard and fails later
+    // for the fixture's missing lane, not for the hold.
+    let err = attempt().expect_err("the fixture has no lane for this issue");
+    assert!(!err.to_string().contains("holds"), "{err}");
+}
+
+/// S5-2: retirement is the operator's, and only a terminal legacy run
+/// needs it — a live run is cancelled, a new-format run has provenance.
+#[test]
+fn cad622_only_a_terminal_legacy_run_can_be_retired() {
+    let retire = |fx: &Fx, run: &str, who: Asserted| {
+        scoped(who, || {
+            fx.shared.dispatch(
+                "app_run_retire_legacy",
+                &json!({"run_id": run}),
+                std::process::id(),
+            )
+        })
+    };
+
+    let fx = Fx::new(&[], &[]);
+    workspace_install(&fx, "inst-live", &[("writer", "new-writer")]);
+    fx.insert_run(
+        "run-live",
+        "inst-live",
+        json!({"inputs": {"writer": "old-writer"}, "assignments": {}}),
+    );
+    let err = retire(&fx, "run-live", Asserted::Operator)
+        .expect_err("a live run is cancelled, not retired");
+    assert!(err.to_string().contains("cancel a live run"), "{err}");
+
+    let fx = Fx::new(&[], &[]);
+    workspace_install(&fx, "inst-new", &[("writer", "new-writer")]);
+    fx.insert_run_state(
+        "run-new",
+        "inst-new",
+        json!({"team_roles": {"writer": "old-writer"}, "assignments": {}}),
+        "succeeded",
+    );
+    let err = retire(&fx, "run-new", Asserted::Operator)
+        .expect_err("a new-format run has recorded provenance");
+    assert!(
+        err.to_string()
+            .contains("only a run frozen before team-role provenance"),
+        "{err}"
+    );
+
+    let fx = Fx::new(&[], &[]);
+    workspace_install(&fx, "inst-gate", &[("writer", "new-writer")]);
+    fx.insert_run_state(
+        "run-gate",
+        "inst-gate",
+        json!({"inputs": {"writer": "old-writer"}, "assignments": {}}),
+        "failed",
+    );
+    let err = retire(&fx, "run-gate", Asserted::Agent("lead".into()))
+        .expect_err("an agent cannot retire a run");
+    assert!(err.to_string().contains("operator action"), "{err}");
+    // The same run is still held: an agent's refusal changed nothing.
+    let guard = crate::issue::app_guard::Ctx {
+        pm_dir: &fx.pm_dir,
+        state_dir: Some(&fx.state),
+        store: Some(&fx.shared.store),
+    };
+    assert!(
+        crate::issue::app_guard::unproven_teams(guard)
+            .unwrap()
+            .get(APP)
+            .is_some_and(|set| set.contains("old-writer")),
+        "the hold survives an unauthorized retirement attempt"
     );
 }
 

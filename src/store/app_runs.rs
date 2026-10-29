@@ -6,7 +6,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// CAD-622: one run's frozen membership as the app-team guard reads it.
 /// `roles` is `Some` for the team-role map this build freezes (`role` →
@@ -32,6 +32,10 @@ pub struct RunTeam {
     /// False only when the frozen workflow ran on the host, which takes
     /// no team: such a legacy input map is provably content.
     pub may_have_roles: bool,
+    /// True when the operator explicitly retired this terminal legacy
+    /// run's unrecorded provenance (`app_run_retire_legacy`): its input
+    /// values no longer hold the app-team check.
+    pub legacy_retired: bool,
 }
 
 pub const ARTIFACT_BYTES: usize = 256 * 1024;
@@ -40,6 +44,12 @@ pub const RUN_ARTIFACT_BYTES: usize = 1024 * 1024;
 /// CAD-1123 R4: the stream that keeps each app run's approval record.
 /// Not an agent alias and not the pruned daemon stream, so it survives.
 pub const APP_RUN_APPROVAL_STREAM: &str = "app-run-approvals";
+
+/// CAD-622: the durable event that records an operator's explicit
+/// withdrawal of a terminal legacy run's unrecorded role provenance. A
+/// terminal run cannot be cancelled, so this is its retirement; it lives
+/// on the run-indexed approval stream, which is never pruned.
+pub const APP_RUN_LEGACY_RETIRED: &str = "app_run_legacy_retired";
 
 /// CAD-1374: a domain-specific HUMAN receipt. `None` (autonomous or local
 /// operator) returns the legacy payload unchanged. The helper never copies
@@ -1119,6 +1129,18 @@ impl Store {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Runs whose terminal legacy ambiguity the operator has retired.
+        let retired: BTreeSet<String> = self
+            .conn()
+            .prepare(
+                "SELECT DISTINCT e.job_id FROM events e JOIN app_runs r ON r.id=e.job_id \
+                 WHERE e.kind=?1 AND e.alias=?2 AND r.install_id=?3",
+            )?
+            .query_map(
+                params![APP_RUN_LEGACY_RETIRED, APP_RUN_APPROVAL_STREAM, install_id],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
         let mut out = Vec::new();
         for (id, state, text) in texts {
             let snapshot: Value = serde_json::from_str(&text)
@@ -1155,6 +1177,7 @@ impl Store {
                 .and_then(Value::as_str)
                 != Some("host");
             out.push(RunTeam {
+                legacy_retired: retired.contains(&id),
                 id,
                 state,
                 roles,
@@ -1342,6 +1365,60 @@ impl Store {
                     Self::app_run_show_in(&tx, id)
         })
     }
+
+    /// CAD-622: retire a terminal legacy run's unrecorded role
+    /// provenance. Its snapshot predates `team_roles`, so the app-team
+    /// guard cannot tell which of its inputs were roles, and a terminal
+    /// run cannot be cancelled (`app_run_decide_as` refuses that). The
+    /// operator records an explicit withdrawal instead: a durable,
+    /// run-indexed `app_run_legacy_retired` event. The lifecycle state
+    /// and history are untouched; from the moment the event exists the
+    /// guard stops holding that run's input values. Idempotent.
+    pub fn app_run_retire_legacy(&self, id: &str, human: Option<&Value>) -> Result<Value> {
+        let operation = uuid::Uuid::new_v4().to_string();
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let run = Self::app_run_show_in(&tx, id)?;
+            if run["snapshot"].get("team_roles").is_some() {
+                return Err(Error::rejected(
+                    "only a run frozen before team-role provenance can be retired",
+                ));
+            }
+            let state = run["state"].as_str().unwrap_or_default();
+            if !matches!(state, "succeeded" | "failed") {
+                return Err(Error::rejected(
+                    "only a terminal run needs retirement — cancel a live run instead",
+                ));
+            }
+            let retired = tx
+                .query_row(
+                    "SELECT 1 FROM events WHERE job_id=?1 AND alias=?2 AND kind=?3 LIMIT 1",
+                    params![id, APP_RUN_APPROVAL_STREAM, APP_RUN_LEGACY_RETIRED],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !retired {
+                Self::event_scoped(
+                    &tx,
+                    APP_RUN_APPROVAL_STREAM,
+                    APP_RUN_LEGACY_RETIRED,
+                    human_receipt(
+                        json!({"run_id":id,"snapshot_digest":run["snapshot_digest"],"by":"operator"}),
+                        human,
+                        &operation,
+                        APP_RUN_LEGACY_RETIRED,
+                        &format!("app-run:{id}"),
+                        "retired",
+                    ),
+                    Some(id),
+                    None,
+                )?;
+            }
+            Self::app_run_show_in(&tx, id)
+        })
+    }
+
     pub(super) fn app_current_in(
         conn: &impl super::StoreConn,
         run: &Value,

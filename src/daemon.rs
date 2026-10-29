@@ -4006,6 +4006,7 @@ impl Shared {
             "app_install_team_show" => self.rpc_app_team(method, params, peer_pid),
             "app_run_approve" => self.rpc_app_local(method, params, peer_pid),
             "app_run_cancel" => self.rpc_app_local(method, params, peer_pid),
+            "app_run_retire_legacy" => self.rpc_app_local(method, params, peer_pid),
             "app_run_dispatch" => self.rpc_app_local(method, params, peer_pid),
             "app_run_show" => self.rpc_app_local(method, params, peer_pid),
             "app_run_list" => self.rpc_app_local(method, params, peer_pid),

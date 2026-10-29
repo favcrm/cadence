@@ -1954,6 +1954,10 @@ pub(crate) enum RunAction {
     },
     /// Cancel a run and prevent further dispatch.
     Cancel { run_id: String },
+    /// Retire a terminal legacy run's unrecorded team-role provenance.
+    /// The run's state and history are unchanged; the app-team check
+    /// stops holding its input values.
+    RetireLegacy { run_id: String },
     /// Dispatch eligible steps of an explicitly approved run.
     Dispatch { run_id: String },
     /// Inspect an exact app-owned run and its output receipts.
@@ -2355,6 +2359,7 @@ fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
             ("app_run_approve", json!({"run_id":run_id,"digest":digest}))
         }
         RunAction::Cancel { run_id } => ("app_run_cancel", json!({"run_id":run_id})),
+        RunAction::RetireLegacy { run_id } => ("app_run_retire_legacy", json!({"run_id":run_id})),
         RunAction::Dispatch { run_id } => ("app_run_dispatch", json!({"run_id":run_id})),
         RunAction::Show { run_id } => ("app_run_show", json!({"run_id":run_id})),
         RunAction::Ls {

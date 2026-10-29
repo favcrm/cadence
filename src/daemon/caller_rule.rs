@@ -717,6 +717,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_install_team_set", Rule::Handler("operator_connection (CAD-1123)")),
     ("app_install_team_show", Rule::Handler("operator_connection (CAD-1123)")),
     ("app_run_cancel", Rule::Handler("operator_connection (CAD-631)")),
+    (
+        "app_run_retire_legacy",
+        Rule::Handler("operator_connection (CAD-622): withdraw a terminal legacy run's unrecorded provenance"),
+    ),
     ("app_run_dispatch", Rule::Handler("operator_connection (CAD-631)")),
     ("app_run_show", Rule::Handler("operator_connection (CAD-631)")),
     ("app_run_list", Rule::Handler("operator_connection (CAD-631)")),
