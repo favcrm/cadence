@@ -61,8 +61,8 @@ export interface WikiProps {
   actor: string;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   scope?: WikiScope;
-  /** Upload through POST /api/wiki/upload (hosted Worker) instead of transfer jobs. */
-  multipartUpload?: boolean;
+  /** A hosted Worker board (undefined until the board's meta is known): uploads go through POST /api/wiki/upload instead of transfer jobs. */
+  hosted?: boolean;
   /** The signed-in member's subject id, so hosted "edited by" can say "you". */
   viewerSub?: string | null;
 }
@@ -75,7 +75,7 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export default function Wiki({ route, navHref, readOnly, actor, onToast, scope, multipartUpload = false, viewerSub }: WikiProps) {
+export default function Wiki({ route, navHref, readOnly, actor, onToast, scope, hosted, viewerSub }: WikiProps) {
   const t = useTranslate();
   const root = scope?.root ?? "";
   const current = route.path ?? root;
@@ -285,7 +285,7 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope, 
             <HistoryPane
               path={route.path}
               navHref={navHref}
-              hosted={multipartUpload}
+              hosted={hosted}
             />
           ) : route.mode === "edit" && route.path ? (
             <EditorPane
@@ -306,7 +306,7 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope, 
               readOnly={readOnly}
               onToast={onToast}
               onUploaded={refresh}
-              multipart={multipartUpload}
+              multipart={hosted === true}
             />
           ) : (
             <BrowsePane

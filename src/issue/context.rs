@@ -24,6 +24,13 @@ pub const MAX_TITLE_BYTES: usize = 160;
 pub const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
 pub const MAX_EXCERPT_BYTES: usize = 16 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+/// Untrusted memory frontmatter copied into the bundle as display metadata:
+/// the on-disk loader parses it without a slug/length check, so every copied
+/// field is bounded here, at the delivery boundary.
+const MAX_MEMORY_ID_BYTES: usize = 128;
+const MAX_MEMORY_FIELD_BYTES: usize = 64;
+/// Git diagnostics and memory reasons are untrusted text kept for diagnosis.
+const MAX_REASON_BYTES: usize = 512;
 const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Canonical context roles. `ops` is an input alias of `devops` (manifests
@@ -235,7 +242,13 @@ fn dirty_probe(root: &Path) -> (Option<bool>, bool, Option<String>) {
         Err(error) => (
             None,
             false,
-            Some(format!("working tree state unavailable: {error}")),
+            Some(
+                shorten(
+                    &format!("working tree state unavailable: {error}"),
+                    MAX_REASON_BYTES,
+                )
+                .0,
+            ),
         ),
     }
 }
@@ -844,11 +857,12 @@ fn memory_context(pm: &Pm, selected: &project::Project, paths: &[String]) -> Val
         .filter(|memory| included_ids.contains(memory.front.id.as_str()))
         .map(|memory| {
             json!({
-                "id": memory.front.id,
-                "kind": memory.front.kind,
-                "confidence": memory.front.confidence,
-                "verified_at": memory::last_verified(memory),
-                "evidence": matched.label(memory),
+                "id": shorten(&memory.front.id, MAX_MEMORY_ID_BYTES).0,
+                "kind": shorten(&memory.front.kind, MAX_MEMORY_FIELD_BYTES).0,
+                "confidence": shorten(&memory.front.confidence, MAX_MEMORY_FIELD_BYTES).0,
+                "verified_at": memory::last_verified(memory)
+                    .map(|at| shorten(at, MAX_MEMORY_FIELD_BYTES).0),
+                "evidence": shorten(&matched.label(memory), MAX_MEMORY_ID_BYTES).0,
             })
         })
         .collect();
@@ -878,11 +892,14 @@ fn memory_context(pm: &Pm, selected: &project::Project, paths: &[String]) -> Val
                     "not applicable to the selected context".to_string()
                 }
             } else {
-                format!("review blocked: memory status is {}", memory.front.status)
+                format!(
+                    "review blocked: memory status is {}",
+                    shorten(&memory.front.status, MAX_MEMORY_FIELD_BYTES).0
+                )
             };
             json!({
-                "id": memory.front.id,
-                "status": memory.front.status,
+                "id": shorten(&memory.front.id, MAX_MEMORY_ID_BYTES).0,
+                "status": shorten(&memory.front.status, MAX_MEMORY_FIELD_BYTES).0,
                 "reason": shorten(&reason, 256).0,
             })
         })
@@ -935,7 +952,7 @@ fn document_value(
                     "selected": false,
                     "selection_reason": selection_reason,
                     "state": error.state(),
-                    "reason": error.reason(),
+                    "reason": shorten(&error.reason(), MAX_REASON_BYTES).0,
                 }),
                 false,
                 None,
@@ -1002,7 +1019,7 @@ fn document_value(
                 "selected": true,
                 "selection_reason": selection_reason,
                 "state": error.state(),
-                "reason": error.reason(),
+                "reason": shorten(&error.reason(), MAX_REASON_BYTES).0,
             }),
             false,
             None,
@@ -1010,34 +1027,63 @@ fn document_value(
     }
 }
 
+/// Bound the serialized response to [`MAX_RESPONSE_BYTES`] by halving excerpts,
+/// widest first, until it fits. Document identity, path, state, size and
+/// requiredness are never dropped; every shortened excerpt is flagged
+/// `truncated` and the reduction count is reported in `limits`.
+///
+/// Excerpts are not the only untrusted content: withheld memory metadata and
+/// Git diagnostics are bounded where they are copied, and this final check
+/// still fails closed when the payload cannot fit without excerpts — optional
+/// sections are dropped with their counts kept, and the last resort is a
+/// `too_large` state instead of oversized bytes.
 fn cap_response(mut payload: Value) -> Value {
     let mut reductions = 0usize;
+    let mut dropped = false;
+    // Withheld memory metadata is untrusted and can alone exceed the bound.
+    // Drop those entries first, so the document excerpts survive a payload
+    // that only memory metadata made too large.
+    if bounded_len(&payload) > MAX_RESPONSE_BYTES {
+        let withheld_bytes = payload
+            .pointer("/memories/withheld")
+            .map(bounded_len)
+            .unwrap_or(0);
+        if withheld_bytes > 2
+            && bounded_len(&payload).saturating_sub(withheld_bytes - 2) <= MAX_RESPONSE_BYTES
+        {
+            drop_memory_entries(&mut payload);
+            dropped = true;
+        }
+    }
     loop {
-        let size = serde_json::to_vec_pretty(&payload)
-            .map(|bytes| bytes.len())
-            .unwrap_or(usize::MAX);
-        if size <= MAX_RESPONSE_BYTES {
+        if bounded_len(&payload) <= MAX_RESPONSE_BYTES {
             break;
         }
         let mut changed = false;
         if let Some(documents) = payload.get_mut("documents").and_then(Value::as_array_mut) {
-            for document in documents.iter_mut().rev() {
-                let Some(excerpt) = document
-                    .get_mut("excerpt")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string)
-                else {
+            // Reduce the widest excerpt first. Taking them in array order
+            // drains the last document to an empty excerpt while every
+            // earlier document keeps its full text; the same byte budget can
+            // instead keep a bounded excerpt of every document.
+            let mut widest: Option<(usize, usize)> = None;
+            for (index, document) in documents.iter().enumerate() {
+                let Some(excerpt) = document.get("excerpt").and_then(Value::as_str) else {
                     continue;
                 };
                 if excerpt.is_empty() {
                     continue;
                 }
-                let (shortened, _) = shorten(&excerpt, excerpt.len() / 2);
-                document["excerpt"] = Value::String(shortened);
-                document["truncated"] = Value::Bool(true);
+                if widest.is_none_or(|(_, best)| excerpt.len() > best) {
+                    widest = Some((index, excerpt.len()));
+                }
+            }
+            if let Some((index, len)) = widest {
+                let (shortened, _) =
+                    shorten(documents[index]["excerpt"].as_str().unwrap_or(""), len / 2);
+                documents[index]["excerpt"] = Value::String(shortened);
+                documents[index]["truncated"] = Value::Bool(true);
                 changed = true;
                 reductions += 1;
-                break;
             }
         }
         if !changed {
@@ -1045,10 +1091,123 @@ fn cap_response(mut payload: Value) -> Value {
         }
     }
     if let Some(limits) = payload.get_mut("limits") {
-        limits["response_truncated"] = Value::Bool(reductions > 0);
+        limits["response_truncated"] = Value::Bool(reductions > 0 || dropped);
         limits["response_excerpt_reductions"] = Value::from(reductions);
     }
+    // The bookkeeping above adds bytes of its own, so the bound is judged on
+    // the final payload, not on the loop's last measurement.
+    if bounded_len(&payload) <= MAX_RESPONSE_BYTES {
+        return payload;
+    }
+    // Non-excerpt content alone exceeds the bound. Memory entries are
+    // evidence, not the document contract: keep every count, drop the entries.
+    drop_memory_entries(&mut payload);
+    if bounded_len(&payload) <= MAX_RESPONSE_BYTES {
+        return mark_truncated(payload);
+    }
+    // Documents keep their identity and state; their bodies are dropped.
+    if let Some(documents) = payload.get_mut("documents").and_then(Value::as_array_mut) {
+        for document in documents.iter_mut() {
+            if document.get("excerpt").is_some() {
+                document["excerpt"] = Value::String(String::new());
+                document["truncated"] = Value::Bool(true);
+            }
+        }
+    }
+    if bounded_len(&payload) <= MAX_RESPONSE_BYTES {
+        return mark_truncated(payload);
+    }
+    // Last resort: the payload cannot carry its own metadata within the
+    // bound. Report the state and the counts, never the oversized bytes.
+    fail_closed(payload)
+}
+
+fn bounded_len(payload: &Value) -> usize {
+    serde_json::to_vec_pretty(payload)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn mark_truncated(mut payload: Value) -> Value {
+    if let Some(limits) = payload.get_mut("limits") {
+        limits["response_truncated"] = Value::Bool(true);
+    }
     payload
+}
+
+/// Drop every memory entry, keeping the totals and the omitted counts that
+/// explain the gap. The lesson text goes too: it repeats entries.
+fn drop_memory_entries(payload: &mut Value) {
+    let Some(memories) = payload.get_mut("memories").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let withheld_total = memories
+        .get("withheld_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let load_errors_total = memories
+        .get("load_errors_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    memories.insert("included".to_string(), Value::Array(Vec::new()));
+    memories.insert("lessons".to_string(), Value::String(String::new()));
+    memories.insert("withheld".to_string(), Value::Array(Vec::new()));
+    memories.insert("withheld_omitted".to_string(), Value::from(withheld_total));
+    memories.insert("load_errors".to_string(), Value::Array(Vec::new()));
+    memories.insert(
+        "load_errors_omitted".to_string(),
+        Value::from(load_errors_total),
+    );
+}
+
+/// The bounded payload cannot fit even with every optional section dropped.
+/// Return the state and counts a caller needs to explain the gap, and no
+/// oversized bytes.
+fn fail_closed(payload: Value) -> Value {
+    let memories = payload.get("memories");
+    let count = |key: &str| {
+        memories
+            .and_then(|memories| memories.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let documents_omitted = payload
+        .get("documents")
+        .and_then(Value::as_array)
+        .map(|documents| documents.len())
+        .unwrap_or(0);
+    let reductions = payload
+        .pointer("/limits/response_excerpt_reductions")
+        .cloned()
+        .unwrap_or(Value::from(0));
+    let mut limits = limits_json(true);
+    limits["response_excerpt_reductions"] = reductions;
+    json!({
+        "project": payload.get("project").cloned().unwrap_or(Value::Null),
+        "state": "too_large",
+        "manifest": {
+            "path": DEFAULT_MANIFEST_PATH,
+            "state": "too_large",
+            "revision": payload.pointer("/manifest/revision").cloned().unwrap_or(Value::Null),
+            "entry_count": payload.pointer("/manifest/entry_count").cloned().unwrap_or(Value::Null),
+            "documents_omitted": documents_omitted,
+            "errors": ["context metadata exceeds the response bound; document bodies and memory entries are omitted"],
+        },
+        "snapshot": payload.get("snapshot").cloned().unwrap_or(Value::Null),
+        "documents": [],
+        "memories": {
+            "included": [],
+            "lessons": "",
+            "withheld": [],
+            "withheld_total": count("withheld_total"),
+            "withheld_omitted": count("withheld_total"),
+            "load_errors": [],
+            "load_errors_total": count("load_errors_total"),
+            "load_errors_omitted": count("load_errors_total"),
+            "matched_total": count("matched_total"),
+        },
+        "limits": limits,
+    })
 }
 
 /// Build a context response. This never returns a filesystem error to callers:
@@ -1063,7 +1222,7 @@ pub fn bundle(
     let source = match resolve_source(selected, expected_revision) {
         Ok(source) => source,
         Err(error) => {
-            let reason = error.message;
+            let reason = shorten(&error.message, MAX_REASON_BYTES).0;
             return json!({
                 "project": selected.key,
                 "state": error.state,
@@ -1099,7 +1258,7 @@ pub fn bundle(
         }
         Err(error) => {
             let state = error.state();
-            let reason = error.reason();
+            let reason = shorten(&error.reason(), MAX_REASON_BYTES).0;
             return cap_response(json!({
                 "project": selected.key,
                 "state": state,
@@ -1399,6 +1558,84 @@ mod tests {
             .unwrap()
             .iter()
             .all(|document| document.get("id").is_some()));
+        // The same budget keeps a bounded excerpt of every document: no
+        // document is drained while another keeps its full text.
+        let excerpts: Vec<usize> = capped["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|document| document["excerpt"].as_str().unwrap().len())
+            .collect();
+        let widest = *excerpts.iter().max().unwrap();
+        let narrowest = *excerpts.iter().min().unwrap();
+        assert!(narrowest > 0, "{excerpts:?}");
+        assert!(widest <= narrowest * 2, "{excerpts:?}");
+    }
+
+    /// A single untrusted memory id can exceed the whole response budget. It
+    /// is dropped with its count kept, and the document excerpt survives.
+    #[test]
+    fn response_bound_drops_oversized_withheld_memory_before_excerpts() {
+        let capped = cap_response(json!({
+            "project": "bounded",
+            "state": "ready",
+            "manifest": {"path": DEFAULT_MANIFEST_PATH, "state": "ready", "revision": "a".repeat(40), "errors": []},
+            "snapshot": {"head_revision": "a".repeat(40)},
+            "documents": [{
+                "id": "scope", "kind": "scope", "path": "docs/scope.md", "title": "scope",
+                "required": true, "selected": true, "selection_reason": "required",
+                "state": "ready", "bytes": 11, "excerpt": "SCOPE-BODY\n", "truncated": false,
+            }],
+            "memories": {
+                "included": [], "lessons": "",
+                "withheld": [{"id": "z".repeat(MAX_RESPONSE_BYTES + 1), "status": "proposed", "reason": "review blocked"}],
+                "withheld_total": 1, "withheld_omitted": 0,
+                "load_errors": [], "load_errors_total": 0, "load_errors_omitted": 0,
+                "matched_total": 0,
+            },
+            "limits": limits_json(false),
+        }));
+        assert!(bounded_len(&capped) <= MAX_RESPONSE_BYTES);
+        assert_eq!(capped["state"], "ready");
+        assert_eq!(capped["limits"]["response_truncated"], true);
+        assert_eq!(capped["documents"][0]["excerpt"], "SCOPE-BODY\n");
+        assert!(capped["memories"]["withheld"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(capped["memories"]["withheld_total"], 1);
+        assert_eq!(capped["memories"]["withheld_omitted"], 1);
+    }
+
+    /// When the payload cannot fit even with every optional section dropped,
+    /// the response fails closed: state and counts, never oversized bytes.
+    #[test]
+    fn response_bound_fails_closed_when_metadata_cannot_fit() {
+        let capped = cap_response(json!({
+            "project": "bounded",
+            "state": "ready",
+            "manifest": {
+                "path": DEFAULT_MANIFEST_PATH, "state": "ready", "revision": "a".repeat(40),
+                "entry_count": 1, "errors": [],
+            },
+            "snapshot": {"head_revision": "a".repeat(40)},
+            "documents": [{
+                "id": "scope", "kind": "scope", "path": "docs/scope.md",
+                "title": "t".repeat(MAX_RESPONSE_BYTES), "required": true, "selected": true,
+                "selection_reason": "required", "state": "ready", "bytes": 11,
+                "excerpt": "", "truncated": true,
+            }],
+            "memories": empty_memories(),
+            "limits": limits_json(false),
+        }));
+        assert!(bounded_len(&capped) <= MAX_RESPONSE_BYTES);
+        assert_eq!(capped["state"], "too_large");
+        assert_eq!(capped["limits"]["response_truncated"], true);
+        assert!(capped["documents"].as_array().unwrap().is_empty());
+        assert_eq!(capped["manifest"]["documents_omitted"], 1);
+        assert_eq!(capped["manifest"]["entry_count"], 1);
+        assert_eq!(capped["manifest"]["revision"], "a".repeat(40));
+        assert_eq!(capped["snapshot"]["head_revision"], "a".repeat(40));
     }
 
     #[test]

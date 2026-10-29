@@ -154,8 +154,9 @@ function CodeBlock({ children }: { children?: ReactNode }) {
 const InLinkContext = createContext(false);
 const handlerComponents = new WeakMap<object, Components>();
 let noHandlerComponents: Components | null = null;
-// CAD-1915: one set per wiki page read, so a page's own links open in place.
-const pageComponents = new Map<string, Components>();
+// CAD-1915: the set for the wiki page being read, so its own links open in
+// place. One slot: the view shows one page at a time, and a new page remounts.
+let pageComponents: { page: string; components: Components } | null = null;
 
 /** The renderer set is cached per issue handler. Recreating these component
  *  types on every thread update would make React unmount and reinsert old
@@ -217,14 +218,8 @@ function buildComponents(onOpen?: (id: string) => void, wikiPage?: string): Comp
 
 function componentsFor(onOpen?: (id: string) => void, wikiPage?: string): Components {
   if (wikiPage !== undefined) {
-    if (onOpen) return buildComponents(onOpen, wikiPage);
-    let page = pageComponents.get(wikiPage);
-    if (!page) {
-      if (pageComponents.size >= 100) pageComponents.clear();
-      page = buildComponents(undefined, wikiPage);
-      pageComponents.set(wikiPage, page);
-    }
-    return page;
+    if (pageComponents?.page !== wikiPage) pageComponents = { page: wikiPage, components: buildComponents(undefined, wikiPage) };
+    return pageComponents.components;
   }
   if (!onOpen) return (noHandlerComponents ??= buildComponents());
   const cached = handlerComponents.get(onOpen);

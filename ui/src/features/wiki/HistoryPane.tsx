@@ -18,11 +18,11 @@ import { Failure, Loading, Note, WikiToolbar } from "./shared";
 export default function HistoryPane({
   path,
   navHref,
-  hosted = false,
+  hosted,
 }: {
   path: string;
   navHref: (route: Route) => string;
-  /** A hosted Worker board keeps no historical page text yet (AOS-452), so by default only the current revision opens. */
+  /** A hosted Worker board keeps no historical page text yet (AOS-452), so only the current revision opens there; undefined = not known yet, treated as hosted. */
   hosted?: boolean;
 }) {
   const t = useTranslate();
@@ -32,7 +32,8 @@ export default function HistoryPane({
   const [diff, setDiff] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [canCompare, setCanCompare] = useState(false);
-  const [canOpen, setCanOpen] = useState(true);
+  const [replyCanOpen, setReplyCanOpen] = useState<boolean | undefined>(undefined);
+  const canOpen = replyCanOpen ?? hosted === false;
 
   useEffect(() => {
     let cancelled = false;
@@ -45,7 +46,7 @@ export default function HistoryPane({
         if (cancelled) return;
         const list = resp.entries ?? resp.history ?? [];
         setCanCompare(resp.canCompare !== false);
-        setCanOpen(resp.canOpen ?? !hosted);
+        setReplyCanOpen(resp.canOpen);
         setEntries(list);
         const current = resp.rev ?? list[0]?.rev ?? null;
         setCurrentRev(current);
@@ -57,7 +58,7 @@ export default function HistoryPane({
     return () => {
       cancelled = true;
     };
-  }, [path, hosted]);
+  }, [path]);
 
   useEffect(() => {
     if (!selected || !currentRev || selected === currentRev) {

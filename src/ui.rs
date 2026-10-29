@@ -1609,6 +1609,48 @@ mod tests {
         assert_eq!(context_query("role=OPS"), Err("bad context role"));
     }
 
+    /// CAD-224: a duplicated or unknown context query key is refused before
+    /// any project is resolved, and a revision that is not a full 40-hex SHA
+    /// can never become an observed-revision comparison.
+    #[test]
+    fn context_query_refuses_duplicate_unknown_and_unbounded_values() {
+        assert_eq!(
+            context_query("role=pm&role=qa"),
+            Err("duplicate context query key")
+        );
+        let revision = "a".repeat(40);
+        assert_eq!(
+            context_query(&format!(
+                "expected_revision={revision}&expected_revision={revision}"
+            )),
+            Err("duplicate context query key")
+        );
+        assert_eq!(
+            context_query(&format!("role=pm&expected_revision={revision}"))
+                .unwrap()
+                .1
+                .as_deref(),
+            Some(revision.as_str())
+        );
+        assert_eq!(
+            context_query("project=cadence"),
+            Err("unknown context query key")
+        );
+        assert_eq!(
+            context_query("role"),
+            Err("context query values must use key=value")
+        );
+        assert_eq!(
+            context_query("expected_revision=main"),
+            Err("bad expected revision")
+        );
+        assert_eq!(
+            context_query(&format!("expected_revision={}", "a".repeat(39))),
+            Err("bad expected revision")
+        );
+        assert_eq!(context_query("role=pm&"), context_query("role=pm"));
+    }
+
     /// Brand files sit at the dist root (Vite copies `ui/public/`); they
     /// must come back as themselves with an image type, never as the
     /// SPA's HTML fallback.

@@ -122,6 +122,10 @@ path = "tests/cad1534_lane_base_acceptance.rs"
 [[test]]
 name = "cad1676_seat_dispatch_acceptance"
 path = "tests/cad1676_seat_dispatch_acceptance.rs"
+# CAD-224: the read-only project-context slice's independent acceptance.
+[[test]]
+name = "cad224_context_slice_acceptance"
+path = "tests/cad224_context_slice_acceptance.rs"
 [[test]]
 name = "cad848_deletion_refusal"
 path = "tests/cad848_deletion_refusal.rs"
