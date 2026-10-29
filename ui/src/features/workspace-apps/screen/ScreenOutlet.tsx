@@ -41,13 +41,15 @@ function mountRefusalCode(body: unknown): string | null {
  *  its host-private action token to that child's mount request. Role is
  *  host-derived: `surfaceRole` is set by the host's own mount, never by the
  *  frame. */
-export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, surfaceRole = "primary", drawerTarget, parentActionToken }: {
+export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, surfaceRole = "primary", drawerTarget, parentActionToken }: {
   projection: ScreenPush; fallback: ReactNode;
   /** Render the specific pane for a mount failure; absent keeps `fallback`. */
   renderFailure?: ScreenFailurePane;
   loadAsset?: AssetLoader;
   /** The operator's verbs for this frame (HP3); absent for a non-operator, so every `call`/`slot` closes it. */
   actions?: Pick<ScreenActions, "call" | "planner">;
+  /** Refresh retained tool receipts after a successful invoke, without remounting. */
+  onToolInvoked?: () => Promise<void>;
   onRoute?: (patch: RoutePatch, navigation: ScreenNavigation) => void;
   onCommand?: (command: HostCommand) => void;
   onNavigation?: (navigation: ScreenNavigation | null) => void;
@@ -85,6 +87,8 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   loader.current = loadAsset;
   const acting = useRef(actions);
   acting.current = actions;
+  const toolInvoked = useRef(onToolInvoked);
+  toolInvoked.current = onToolInvoked;
   const [preview, setPreview] = useState<InertPreview | null>(null);
   const [remoteImages, setRemoteImages] = useState<string[]>([]);
   const [slot, setSlot] = useState<SlotView | null>(null);
@@ -327,8 +331,11 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
                   navigationCallbacks.current.onScreenDrawer?.(mode, surface, false);
                 }
               : undefined,
-            ...(actionToken ? { invoke: (alias: string, input: Record<string, unknown>, requestId: string, scope?:import("./screenProtocol").GenerationScope) =>
-              invokeTool(actionToken!, alias, input, requestId, scope) } : {}),
+            ...(actionToken ? { invoke: async (alias: string, input: Record<string, unknown>, requestId: string, scope?:import("./screenProtocol").GenerationScope) => {
+              const result = await invokeTool(actionToken!, alias, input, requestId, scope);
+              if (result.ok && isCurrent()) await toolInvoked.current?.();
+              return result;
+            } } : {}),
           } : undefined, undefined, unsaved => {
             if (!isCurrent() || mounted.current !== receipt || channel.current !== owned) return;
             clearLeaveGuard();
@@ -441,6 +448,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         }
         loadAsset={loadAsset}
         actions={actions}
+        onToolInvoked={onToolInvoked}
         surfaceRole="drawer"
         parentActionToken={drawerToken}
         onRoute={navigationCallbacks.current.onRoute}
