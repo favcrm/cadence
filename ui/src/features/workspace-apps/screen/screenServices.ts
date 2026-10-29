@@ -8,7 +8,7 @@ import type { RecordCard, SlotPlan } from "./screenSlot";
 export const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 export function exact(v: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(v).every(k => keys.includes(k)); }
 const TOKEN = /^[a-f0-9]{64}$/;
-const WRITES = new Set(["records.create", "records.update", "segments.save", "exclusions.save", "suppressions.add", "audience.prepare", "content.save", "content.clone", "proposals.apply", "proposals.discard", "sender-bindings.save", "whatsapp.draft.discard", "campaign-work.save"]);
+const WRITES = new Set(["records.create", "records.update", "segments.save", "exclusions.save", "suppressions.add", "audience.prepare", "content.save", "content.clone", "proposals.apply", "proposals.discard", "sender-bindings.save", "whatsapp.draft.discard", "campaign-work.save", "sends.cancel"]);
 const SECRET_FIELDS = new Set(["action_token", "confirmation_token", "confirmation_nonce", "confirm_token", "csv_confirm_token", "scope_proof", "password", "credentials", "credential", "secret", "session_key", "host_command"]);
 /** Service-only DTO projection. Private CSV delegation stays in this closure. */
 function sanitized(value: unknown): unknown {
