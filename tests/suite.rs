@@ -105,6 +105,7 @@ mod cad1853_cloud_agent_guard_acceptance;
 mod cad1901_memory_project_access_acceptance;
 mod cad1935_pi_worker_dependencies;
 mod cad1939_destinations;
+mod cad1939_refusal_acceptance;
 mod cad348_memory_detail_identity_acceptance;
 mod cad348_memory_evidence_acceptance;
 mod cad508_restart_window;
