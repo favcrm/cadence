@@ -26,14 +26,31 @@ pub(super) fn proxy_public_catalog(path: &str, raw_query: &str) -> super::write_
     let Some(origin) = catalog_origin() else {
         return super::serve::err_response(503, "public directory is not configured");
     };
-    // Only the exact, already-validated package read uses the closed broker.
-    // Metadata stays on api.internal; self-hosted origins serve their own bytes.
-    let fetch_origin = if origin == "http://api.internal" && upstream.contains("/release?") {
+    fetch_public_catalog(&format!("{}{upstream}", fetch_origin(&origin, &upstream)))
+}
+
+/// Only the exact, already-validated package read uses the closed broker.
+/// Metadata stays on api.internal; self-hosted origins serve their own bytes.
+fn fetch_origin<'a>(origin: &'a str, upstream: &str) -> &'a str {
+    if origin == "http://api.internal" && upstream.contains("/release?") {
         HOSTED_PACKAGE_ORIGIN
     } else {
-        &origin
-    };
-    fetch_public_catalog(&format!("{fetch_origin}{upstream}"))
+        origin
+    }
+}
+
+/// CAD-1942: the URL of one exact release document, built through the same
+/// closed route the board's `/api/public-apps/<id>/release` proxy admits, so
+/// a catalogue install fetches exactly what that proxy would. `None` when the
+/// locator is not a pinned release (a bad id, version token or digest).
+pub(super) fn release_url(origin: &str, id: &str, version: &str, digest: &str) -> Option<String> {
+    let query = format!(
+        "version={}&digest={}",
+        query_component(version),
+        query_component(digest)
+    );
+    let upstream = catalog_upstream(&format!("/api/public-apps/{id}/release"), &query)?;
+    Some(format!("{}{upstream}", fetch_origin(origin, &upstream)))
 }
 
 /// The upstream path, or `None` when the request is not one of the closed
@@ -125,29 +142,8 @@ fn query_component(value: &str) -> String {
 }
 
 fn fetch_public_catalog(url: &str) -> super::write_path::HttpResp {
-    use std::time::Duration;
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(8)))
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .build();
-    let agent = ureq::Agent::new_with_config(config);
-    let mut response = match agent.get(url).call() {
-        Ok(response) => response,
-        Err(_) => return super::serve::err_response(502, "The public directory didn't load."),
-    };
-    let status = response.status().as_u16();
-    if !matches!(status, 200 | 404 | 409) {
+    let Some((status, bytes)) = fetch_catalog(url) else {
         return super::serve::err_response(502, "The public directory didn't load.");
-    }
-    let bytes = match response
-        .body_mut()
-        .with_config()
-        .limit(CATALOG_BODY_CAP)
-        .read_to_vec()
-    {
-        Ok(bytes) => bytes,
-        Err(_) => return super::serve::err_response(502, "The public directory didn't load."),
     };
     if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
         return super::serve::err_response(502, "The public directory didn't load.");
@@ -157,6 +153,31 @@ fn fetch_public_catalog(url: &str) -> super::write_path::HttpResp {
     resp.add_header(tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap());
     resp.add_header(tiny_http::Header::from_bytes("Cache-Control", "no-store").unwrap());
     resp
+}
+
+/// One bounded catalog read: no redirects, an 8-second budget and the 8 MiB
+/// body cap. `Some((status, body))` only for 200, 404 or 409; anything else,
+/// a transport failure or an over-cap body is `None`.
+pub(super) fn fetch_catalog(url: &str) -> Option<(u16, Vec<u8>)> {
+    use std::time::Duration;
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(8)))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    let mut response = agent.get(url).call().ok()?;
+    let status = response.status().as_u16();
+    if !matches!(status, 200 | 404 | 409) {
+        return None;
+    }
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(CATALOG_BODY_CAP)
+        .read_to_vec()
+        .ok()?;
+    Some((status, bytes))
 }
 
 #[cfg(test)]
