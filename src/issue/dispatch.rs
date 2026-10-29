@@ -2084,6 +2084,33 @@ fn early_kickoff(d: &EarlyDispatch<'_>) -> Result<EarlyKickoff> {
     Ok(EarlyKickoff::ReuseJob { job: binding.job })
 }
 
+/// The repository this dispatch selects — `resolve_repo`'s own rule
+/// (explicit `--repo`, then the cwd's declared repo, then the project's
+/// only repo), answered without its refusal so the app guard can run
+/// before any daemon call. `None` when the selection is ambiguous: the
+/// dispatch refuses that itself, and no git source is claimed either.
+fn selected_repo_root(
+    project: &crate::issue::project::Project,
+    flag: Option<&Path>,
+    cwd: &Path,
+) -> Option<PathBuf> {
+    let candidates = start::declared_repos(project);
+    if let Some(dir) = flag {
+        return crate::worktree::main_root(dir)
+            .ok()
+            .filter(|root| candidates.contains(root));
+    }
+    if let Some((root, _)) = crate::issue::project::repo_identity(cwd) {
+        if candidates.contains(&root) {
+            return Some(root);
+        }
+    }
+    if candidates.len() == 1 {
+        return crate::worktree::main_root(&candidates[0]).ok();
+    }
+    None
+}
+
 fn preflight(
     pm: &Pm,
     id: &str,
@@ -2121,13 +2148,31 @@ fn preflight(
     // change is named, and this runs before anything is created — the
     // worker and the PM asking for the work are both authors. The saved
     // team is read here (no store on this side); the run's role inputs
-    // are applied by the daemon's plan and review seams.
+    // are applied by the daemon's plan and review seams. The repository
+    // is the one this dispatch selects, resolved by `resolve_repo`'s own
+    // rule below without its refusal, so the guard can run before any
+    // daemon call.
     let app_paths = crate::issue::app_guard::apps_in_paths(front.paths.iter().map(String::as_str));
     let guard = crate::issue::app_guard::Ctx {
         pm_dir: &pm.dir,
         state_dir: Some(state_dir),
         store: None,
     };
+    let selected_root = selected_repo_root(
+        &project,
+        args.repo.as_deref(),
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    );
+    if let Some(why) = crate::issue::app_guard::refusals(
+        guard,
+        &app_paths,
+        &[reply_to.as_str(), args.to.as_str()],
+        &selected_root
+            .map(|root| crate::issue::app_guard::selected_remotes(&project, &root))
+            .unwrap_or_default(),
+    )? {
+        return Err(Error::rejected(why));
+    }
     let note_arg = args.note.clone().unwrap_or_else(|| dir.join("issue.md"));
     let note = note_arg
         .canonicalize()
@@ -2186,17 +2231,6 @@ fn preflight(
     // the daemon's own kickoff (`check_job_kickoff`).
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = start::resolve_repo(&project, args.repo.as_deref(), &cwd)?;
-    // CAD-622: the guard runs once the lane's repository is resolved, so
-    // the git-source evidence is exactly that repository — a project's
-    // other registered repos cannot refuse work that never touches them.
-    if let Some(why) = crate::issue::app_guard::refusals(
-        guard,
-        &app_paths,
-        &[reply_to.as_str(), args.to.as_str()],
-        &crate::issue::app_guard::selected_remotes(&project, &root),
-    )? {
-        return Err(Error::rejected(why));
-    }
     let base = start::resolve_base(
         &root,
         args.base.as_deref(),

@@ -239,7 +239,8 @@ impl Fx {
         crate::issue::Pm::at(&self.pm_dir).unwrap()
     }
 
-    /// Register one more idle fake agent.
+    /// Register one more idle fake agent. A worker names `lead` as its
+    /// PM, so `lead` may dispatch to it (the steer gate).
     fn register(&self, alias: &str, role: &str) {
         let cwd = self._root.path().to_str().unwrap().to_string();
         self.shared
@@ -252,7 +253,7 @@ impl Fx {
                 cwd: &cwd,
                 sandbox: "read-only",
                 instructions: None,
-                params: None,
+                params: (role == "worker").then_some(r#"{"upstream":"lead"}"#),
                 team_role: None,
                 model_policy: None,
             })
@@ -417,6 +418,34 @@ fn install_named_app(pm: &issue::Pm, name: &str, team: &[(&str, &str)]) {
         serde_yaml::to_string(&record).unwrap(),
     )
     .unwrap();
+}
+
+/// An issue-linked job with one draft task, assigned to `assignee` — the
+/// shape `task_dispatch` and the monitor watcher dispatch.
+fn issue_job(fx: &Fx, id: &str, assignee: &str) -> String {
+    let checkout = fx._root.path().join("widgets");
+    fx.shared
+        .store
+        .create_job(
+            id,
+            Some("kickoff"),
+            "spec.md",
+            &"0".repeat(64),
+            "lead",
+            Some(ISSUE),
+            Some(checkout.to_str().unwrap()),
+            None,
+            2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(assignee),
+            Some("the work is done"),
+        )
+        .expect("issue-bound job");
+    format!("{id}-t1")
 }
 
 /// A workspace installation: `.apps/installations/<id>/record.yaml` with
@@ -1113,32 +1142,7 @@ fn cad622_a_replaced_saved_role_keeps_the_frozen_alias_barred() {
 fn cad622_task_dispatch_refuses_an_own_team_worker() {
     let fx = Fx::new(&[("writer", "writer")], &[]);
     set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
-    let checkout = fx._root.path().join("widgets");
-    let job = |id: &str, assignee: &str| {
-        fx.shared
-            .store
-            .create_job(
-                id,
-                Some("kickoff"),
-                "spec.md",
-                &"0".repeat(64),
-                "lead",
-                Some(ISSUE),
-                Some(checkout.to_str().unwrap()),
-                None,
-                2,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(assignee),
-                Some("the work is done"),
-            )
-            .expect("issue-bound job");
-        format!("{id}-t1")
-    };
-    let task = job("c622-job", "writer");
+    let task = issue_job(&fx, "c622-job", "writer");
     let err = scoped(Asserted::Agent("lead".into()), || {
         fx.shared.dispatch(
             "task_dispatch",
@@ -1157,8 +1161,11 @@ fn cad622_task_dispatch_refuses_an_own_team_worker() {
     assert_eq!(task_row.state, "draft");
     assert!(task_row.dispatch_message.is_none());
 
-    // Positive control: the same ticket and job, an independent worker.
-    let task = job("c622-job2", "lead");
+    // Positive control: the same ticket and job shape, an independent
+    // worker — a separate fixture, since one issue maps to one job.
+    let fx = Fx::new(&[("writer", "writer")], &[]);
+    set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
+    let task = issue_job(&fx, "c622-job", "lead");
     let err = scoped(Asserted::Agent("lead".into()), || {
         fx.shared.dispatch(
             "task_dispatch",
@@ -1176,40 +1183,19 @@ fn cad622_task_dispatch_refuses_an_own_team_worker() {
 fn cad622_monitor_dispatch_refuses_an_own_team_worker() {
     let fx = Fx::new(&[("writer", "writer")], &[]);
     set_paths(&fx.pm(), &fx.issue, &format!("apps/{APP}/app.md"));
-    let checkout = fx._root.path().join("widgets");
-    fx.shared
-        .store
-        .create_job(
-            "c622-mon",
-            Some("kickoff"),
-            "spec.md",
-            &"0".repeat(64),
-            "lead",
-            Some(ISSUE),
-            Some(checkout.to_str().unwrap()),
-            None,
-            2,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("writer"),
-            Some("the work is done"),
-        )
-        .expect("issue-bound job");
+    let task = issue_job(&fx, "c622-mon", "writer");
     let err = fx
         .shared
-        .monitor_dispatch_task("c622-watch", "c622-mon-t1", true)
+        .monitor_dispatch_task("c622-watch", &task, true)
         .expect_err("the automatic monitor kickoff must run the app-team guard");
     assert!(
         err.to_string()
             .contains("writer is on app 'social-content's team"),
         "{err}"
     );
-    let task = fx.shared.store.task("c622-mon-t1").expect("task reads");
-    assert_eq!(task.state, "draft");
-    assert!(task.dispatch_message.is_none());
+    let task_row = fx.shared.store.task(&task).expect("task reads");
+    assert_eq!(task_row.state, "draft");
+    assert!(task_row.dispatch_message.is_none());
 }
 
 /// R2-HEAD: a clean admitted head is reviewed; the worker then pushes an
