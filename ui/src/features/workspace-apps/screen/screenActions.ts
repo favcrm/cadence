@@ -75,6 +75,7 @@ export function plainRefusal(error: unknown): ActionRefusal {
   if (error.code === "draft_in_use") return { code: "draft_in_use", text: "This draft is approved or published, so it can't be discarded." };
   if (error.code === "stale_revision") return { code: "stale_revision", text: "That changed somewhere else. Reload and try again." };
   if (error.code === "draft_not_found") return { code: "draft_not_found", text: "That draft is no longer here." };
+  if (error.code === "stale_source") return { code: "stale_source", text: "That post was fetched again since; clone it as a new post." };
   const text = error.message.toLowerCase();
   if (text.includes("320 pixels")) return { code: "image_too_small", text: "Use a photo at least 320 pixels on each side." };
   if (text.includes("4:5 to 1.91:1")) return { code: "image_aspect", text: "Use a photo between 4:5 and 1.91:1." };

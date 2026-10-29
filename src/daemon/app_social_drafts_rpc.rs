@@ -215,7 +215,9 @@ impl Shared {
                     ));
                 }
                 if !records.app_social_freshness_contains(context, receipt_id)? {
-                    return Err(Error::rejected(
+                    // CAD-1923: coded so the app can clone it as a manual-source draft.
+                    return Err(Error::invalid(
+                        "stale_source",
                         "source receipt is not the latest successful fetch for a saved handle",
                     ));
                 }
