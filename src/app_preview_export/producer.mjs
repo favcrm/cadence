@@ -198,6 +198,7 @@ var RECORD_CALL_VERBS = [
 	"sends.prepare",
 	"sends.show",
 	"sends.list",
+	"sends.cancel",
 	"smtp.show",
 	"origin.show",
 	"campaign-work.show",
