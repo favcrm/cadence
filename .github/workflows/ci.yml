@@ -290,6 +290,8 @@ jobs:
       - run: python3 tests/cad1910_boat_cleanup_refusal.py
       # Warm Boat session: reuse one sandbox, shallow snapshot, keep target/.
       - run: python3 tests/boat_build_session.py
+      # CAD-1919: do not reset a warm checkout while its previous command is alive.
+      - run: python3 tests/cad1919_previous_command_refusal.py
       - run: scripts/design-kit --check
       # CAD-1285: a shipped `version < N` store migration block, and the
       # SCHEMA constant it applies, must not change; new DDL gets a new version.
