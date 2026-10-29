@@ -556,8 +556,13 @@ impl MediaResolver {
     /// CAD-1290: the company's active, publishable destinations for one
     /// toolkit, for the owner to choose from. `None` when the read failed.
     pub fn list_active(&self, toolkit: &str) -> Option<Vec<DestinationRow>> {
+        self.list_active_in(&[toolkit])
+    }
+
+    /// CAD-1939: the same list for several toolkits from one read.
+    pub fn list_active_in(&self, toolkits: &[&str]) -> Option<Vec<DestinationRow>> {
         let mut rows = self.rows().ok()?;
-        rows.retain(|r| r.toolkit == toolkit && r.publishable && r.available);
+        rows.retain(|r| toolkits.contains(&r.toolkit.as_str()) && r.publishable && r.available);
         Some(rows)
     }
 

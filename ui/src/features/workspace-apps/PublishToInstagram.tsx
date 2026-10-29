@@ -5,14 +5,16 @@ import Button from "../../ui/Button";
 import { navigate } from "../../lib/useLocation";
 import { useTranslate } from "../../lib/locale";
 import { retainedRequest, completeRequest } from "./requests";
-import { accountLabel, connectReturnTo, publicationBinding, sendSlot } from "./socialConnect";
+import { accountLabel, connectReturnTo, destinationBinding, destinationBindings, sendSlot, bindingToUse, type PublishToolkit } from "./socialConnect";
 import { workspaceApps, type AppBinding, type Installation, type PublishDestination } from "./workspaceApps";
 
 type Listed = { unavailable: boolean; destinations: PublishDestination[] } | "loading";
 
-const CONNECT_UNAVAILABLE = "Instagram connect isn’t available for this workspace yet.";
-const CONNECT_FAILED = "Couldn’t open the Instagram connect page. Try again.";
+const CONNECT_UNAVAILABLE = "Connecting accounts isn’t available for this workspace yet.";
+const CONNECT_FAILED = "Couldn’t open the connect page. Try again.";
 const USE_FAILED = "Couldn’t use that account for publishing. Reload and try again — nothing was changed.";
+const STOP_FAILED = "Couldn’t stop publishing to that account. Reload and try again — nothing was changed.";
+const TOOLKIT_LABEL: Record<string, string> = { instagram: "Instagram", facebook: "Facebook Page" };
 
 function PublishingHelp({ text, label }: { text: string; label: string }) {
   const id = useId();
@@ -85,6 +87,8 @@ function PublishingHelp({ text, label }: { text: string; label: string }) {
  * publishing" to point this install's publication binding at one of them for
  * the active context. The daemon re-checks the account against the company's
  * own list, and the binding revision, so a stale or forged choice refuses there.
+ * CAD-1939: Facebook Pages too, and each account used is its own binding:
+ * "Use" adds one, "Stop" retires one while another stays.
  */
 export function PublishToInstagram({ installation, bindings, contextId, canWrite, busy, refreshKey, mutate }: {
   installation: Installation; bindings: AppBinding[]; contextId: string | null; canWrite: boolean; busy: boolean;
@@ -95,7 +99,7 @@ export function PublishToInstagram({ installation, bindings, contextId, canWrite
   const t = useTranslate();
   const installId = installation.install_id;
   const slot = sendSlot(installation);
-  const binding = slot ? publicationBinding(bindings, slot, contextId, installation.digest) : null;
+  const used = slot ? destinationBindings(bindings, slot, contextId, installation.digest) : [];
   const [listed, setListed] = useState<Listed>("loading");
   const [note, setNote] = useState<string | null>(null);
   const load = useCallback((signal?: AbortSignal) => {
@@ -123,53 +127,71 @@ export function PublishToInstagram({ installation, bindings, contextId, canWrite
     return () => window.clearInterval(timer);
   }, [installId, refreshKey]);
   if (!slot) return null;
-  const connect = async () => {
+  const connect = async (toolkit: PublishToolkit) => {
     setNote(null);
     try {
       // CAD-1438: this panel only mounts on the canonical `/apps/<key>` route
       // (uniqueness proven before mount), so the install's own key is its path.
-      const reply = await workspaceApps.connectLink(installId, connectReturnTo(window.location.origin, installation.name, installId));
+      const reply = await workspaceApps.connectLink(installId, connectReturnTo(window.location.origin, installation.name, installId), undefined, toolkit);
       if (reply.hosted && reply.url) window.location.assign(reply.url);
       else if (reply.hosted) setNote(CONNECT_UNAVAILABLE);
       else navigate("/settings/connections");
     } catch { setNote(CONNECT_FAILED); }
   };
-  const current = binding?.config.publish ?? null;
   const rows = listed === "loading" ? [] : listed.destinations;
-  const stale = !!current && listed !== "loading" && !listed.unavailable && !rows.some(row => row.destination_id === current.destination_id);
+  const expired = listed === "loading" || listed.unavailable ? [] : used.flatMap(value => {
+    const publish = value.config.publish;
+    return publish && !rows.some(row => row.destination_id === publish.destination_id && row.toolkit === publish.toolkit) ? [publish] : [];
+  });
+  const current = used.length > 0;
   return (
-    <section className="wa-panel wa-stack wa-publish-settings" aria-label={t("Publish to Instagram")} data-publish-instagram>
+    <section className="wa-panel wa-stack wa-publish-settings" aria-label={t("Publish to Instagram and Facebook")} data-publish-instagram>
       <div className="wa-publish-heading">
-        <h2>{t("Publish to Instagram")}</h2>
-        <PublishingHelp label={t("About Instagram publishing")}
-          text={t("Choose the Instagram account this app publishes to in the current context. Connect or reconnect an account to update the list.")} />
+        <h2>{t("Publish to Instagram and Facebook")}</h2>
+        <PublishingHelp label={t("About publishing accounts")}
+          text={t("Choose the Instagram accounts and Facebook Pages this app publishes to in the current context. Connect or reconnect an account to update the list.")} />
       </div>
-      {listed === "loading" && <p className="wa-muted" role="status">{t("Checking Instagram…")}</p>}
+      {listed === "loading" && <p className="wa-muted" role="status">{t("Checking accounts…")}</p>}
       {listed !== "loading" && listed.unavailable && (
-        <p className="wa-alert" role="alert">{t("Couldn’t check Instagram right now.")} <Button size="sm" onClick={() => load()}>{t("Try again")}</Button></p>
+        <p className="wa-alert" role="alert">{t("Couldn’t check your accounts right now.")} <Button size="sm" onClick={() => load()}>{t("Try again")}</Button></p>
       )}
-      {listed !== "loading" && !listed.unavailable && rows.length === 0 && !stale && <p className="wa-muted">{t("Not connected")}</p>}
-      {stale && current && (
-        <p className="wa-alert">{t("Connection expired — {account} can’t publish until you reconnect.").replace("{account}", () => accountLabel(current.destination_label))}</p>
-      )}
+      {listed !== "loading" && !listed.unavailable && rows.length === 0 && expired.length === 0 && <p className="wa-muted">{t("Not connected")}</p>}
+      {expired.map(publish => (
+        <p key={`${publish.toolkit}:${publish.destination_id}`} className="wa-alert">{t("Connection expired — {account} can’t publish until you reconnect.").replace("{account}", () => accountLabel(publish.destination_label))}</p>
+      ))}
       {!current && rows.length > 0 && <p className="wa-muted">{t("Choosing an account enables publishing. You can’t restore preview mode from these settings.")}</p>}
       {!canWrite && <p className="wa-muted">{t("Read-only — publishing settings can’t be changed here.")}</p>}
       {busy && <p className="wa-muted" role="status">{t("Updating app settings…")}</p>}
       <ul className="wa-publish-accounts">
         {rows.map(row => {
-          const using = current?.destination_id === row.destination_id;
+          const using = destinationBinding(bindings, slot, contextId, installation.digest, row.destination_id, row.toolkit);
           return (
-            <li key={row.destination_id} className="wa-publish-account" data-destination={row.destination_id}>
+            <li key={`${row.toolkit}:${row.destination_id}`} className="wa-publish-account" data-destination={row.destination_id} data-toolkit={row.toolkit}>
               <strong>{accountLabel(row.label || row.destination_id)}</strong>
-              {using ? <span className="wa-kicker">{t("Publishing here")}</span> : (
+              <span className="wa-muted">{t(TOOLKIT_LABEL[row.toolkit] ?? row.toolkit)}</span>
+              {using ? <>
+                <span className="wa-kicker">{t("Publishing here")}</span>
+                {used.length > 1 && (
+                  <Button className="wa-publish-account-action" size="sm" disabled={!canWrite || busy}
+                    onClick={() => void mutate(async () => {
+                      try {
+                        await workspaceApps.revokeBinding(installId, using.id, using.revision);
+                      } catch {
+                        throw new Error(STOP_FAILED);
+                      }
+                    })}>{t("Stop publishing here")}</Button>
+                )}
+              </> : (
                 <Button className="wa-publish-account-action" size="sm" variant="primary" disabled={!canWrite || busy}
                   onClick={() => void mutate(async () => {
-                    const key = JSON.stringify([installId, "use-destination", contextId, slot, row.destination_id, binding?.revision ?? 0]);
+                    const target = bindingToUse(bindings, slot, contextId, installation.digest, row.destination_id, row.toolkit);
+                    const key = JSON.stringify([installId, "use-destination", contextId, slot, row.toolkit, row.destination_id, target?.revision ?? 0]);
                     try {
                       await workspaceApps.useDestination(installId, {
                         destination_id: row.destination_id,
+                        toolkit: row.toolkit,
                         ...(contextId ? { context_id: contextId } : {}),
-                        ...(binding ? { expected_revision: binding.revision } : { request_id: retainedRequest(key) }),
+                        ...(target ? { expected_revision: target.revision } : { request_id: retainedRequest(key) }),
                       });
                       completeRequest(key);
                     } catch {
@@ -184,7 +206,8 @@ export function PublishToInstagram({ installation, bindings, contextId, canWrite
       {note && <p className="wa-alert" role="alert">{t(note)}</p>}
       {canWrite && listed !== "loading" && (
         <div className="wa-row">
-          <Button onClick={() => void connect()} disabled={busy}>{stale ? t("Reconnect") : rows.length ? t("Connect another account") : t("Connect Instagram")}</Button>
+          <Button onClick={() => void connect("instagram")} disabled={busy}>{expired.length ? t("Reconnect") : rows.length ? t("Connect another account") : t("Connect Instagram")}</Button>
+          <Button onClick={() => void connect("facebook")} disabled={busy}>{t("Connect a Facebook Page")}</Button>
         </div>
       )}
     </section>

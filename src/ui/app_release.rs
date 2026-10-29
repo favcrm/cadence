@@ -147,6 +147,12 @@ struct Create {
 #[serde(deny_unknown_fields)]
 struct ConnectLink {
     return_to: String,
+    #[serde(
+        default,
+        deserialize_with = "nonnull_context",
+        skip_serializing_if = "Option::is_none"
+    )]
+    toolkit: Option<String>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -168,6 +174,12 @@ struct UseDestination {
         skip_serializing_if = "Option::is_none"
     )]
     timezone: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "nonnull_context",
+        skip_serializing_if = "Option::is_none"
+    )]
+    toolkit: Option<String>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

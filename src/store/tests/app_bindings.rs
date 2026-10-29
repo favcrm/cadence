@@ -696,3 +696,87 @@ fn cad1328_context_update_re_pins_only_the_context_of_its_own_bindings() {
     assert_eq!(show(&b["id"])["config"], b["config"]);
     assert_eq!(show(&foreign["id"]), foreign);
 }
+
+/// CAD-1939: one send slot holds one live binding per publish destination.
+/// The first destination keeps the plain scope (so every slot lookup sees
+/// exactly it, as before); a second destination is its own row; the same
+/// destination twice is refused; revoking one leaves the other.
+#[test]
+fn cad1939_one_live_binding_per_destination_under_one_slot() {
+    let (_dir, s) = store();
+    let digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let config = |toolkit: &str, destination: &str| {
+        json!({"schema":1,"install_id":"install-a","context":{"id":"brand"},
+            "bundle_digest":digest,"connection_id":"local-id",
+            "publish":{"destination_id":destination,"destination_label":destination,
+                "toolkit":toolkit,"timezone":"Asia/Hong_Kong"}})
+    };
+    let ig = s
+        .app_binding_create_destination(
+            "install-a",
+            Some("brand"),
+            "publication",
+            &config("instagram", "ig-1"),
+            "use-ig",
+        )
+        .unwrap();
+    let fb = s
+        .app_binding_create_destination(
+            "install-a",
+            Some("brand"),
+            "publication",
+            &config("facebook", "page-1"),
+            "use-fb",
+        )
+        .unwrap();
+    let ig_id = ig["binding"]["id"].as_str().unwrap();
+    let fb_id = fb["binding"]["id"].as_str().unwrap();
+    assert_ne!(ig_id, fb_id);
+    // The plain slot lookup is still exactly the first destination's row.
+    assert_eq!(
+        s.app_binding_for_slot("install-a", Some("brand"), "publication", digest)
+            .unwrap()
+            .unwrap()
+            .id,
+        ig_id
+    );
+    let live = s
+        .app_bindings_for_slot_destinations("install-a", Some("brand"), "publication", digest)
+        .unwrap();
+    assert_eq!(
+        live.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+        vec![ig_id, fb_id]
+    );
+    // The same destination twice is refused; a plain create still refuses
+    // an occupied slot as before.
+    assert!(s
+        .app_binding_create_destination(
+            "install-a",
+            Some("brand"),
+            "publication",
+            &config("facebook", "page-1"),
+            "use-fb-again",
+        )
+        .is_err());
+    assert!(s
+        .app_binding_create(
+            "install-a",
+            Some("brand"),
+            "publication",
+            &config("facebook", "page-2"),
+            "plain-create",
+        )
+        .is_err());
+    // Another context is not this context's destination.
+    assert!(s
+        .app_bindings_for_slot_destinations("install-a", Some("other"), "publication", digest)
+        .unwrap()
+        .is_empty());
+    // Retiring the Page's binding leaves the Instagram one live and untouched.
+    s.app_binding_revoke("install-a", fb_id, 1).unwrap();
+    let live = s
+        .app_bindings_for_slot_destinations("install-a", Some("brand"), "publication", digest)
+        .unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!((live[0].id.as_str(), live[0].revision), (ig_id, 1));
+}

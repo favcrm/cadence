@@ -390,6 +390,23 @@ impl Shared {
         else {
             return Ok(None);
         };
+        self.app_binding_live_proof(install, context, slot, proof, bundle, files)
+            .map(Some)
+    }
+
+    /// The live check of [`Self::app_binding_live`] for one configured row
+    /// the caller already selected (CAD-1939: one of a slot's destination
+    /// bindings): the same encrypted-binding refusal, receipt drift check
+    /// and compatible migration.
+    pub(super) fn app_binding_live_proof(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        slot: &str,
+        proof: BindingProof,
+        bundle: &Value,
+        files: &BTreeMap<String, String>,
+    ) -> Result<BindingProof> {
         // Runtime use is unsupported even when a historical metadata binding
         // exists. Refuse before readiness re-derivation or compatible migration.
         self.refuse_encrypted_binding(&proof.config)?;
@@ -401,11 +418,8 @@ impl Shared {
             &proof.config,
         );
         match binding_drift(&proof.config, &fresh) {
-            BindingDrift::Same => Ok(Some(proof)),
-            BindingDrift::Compatible(_) => self
-                .store
-                .app_binding_migrate(install, &proof, &fresh)
-                .map(Some),
+            BindingDrift::Same => Ok(proof),
+            BindingDrift::Compatible(_) => self.store.app_binding_migrate(install, &proof, &fresh),
             BindingDrift::NeedsConfirm(changes) => {
                 let fields: Vec<&str> = changes
                     .iter()

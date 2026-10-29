@@ -116,7 +116,7 @@ export function parseScreenDrawerCall(verb: ScreenDrawerVerb, args: ActionArgs):
  *  start, the original download and the image picker. Confirm and schedule
  *  also stay slot verbs until every installed app sends them as calls
  *  (Social Content 0.12.10 still sends slots). */
-export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "publish.destination.use", "publish.settings.save", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "media.read", "media.publish", "media.chat.attach"] as const;
+export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "publish.destination.use", "publish.destination.remove", "publish.settings.save", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "media.read", "media.publish", "media.chat.attach"] as const;
 export const SLOT_VERBS = ["run.start", "publish.draft.confirm", "publish.draft.schedule", "media.original.download", "social.image.pick"] as const;
 /** CAD-1365 — the protected original download slot. Qualified per mount
  *  (screen-media.v1 + media.read + live token); never a generic action verb. */

@@ -303,16 +303,19 @@ async function request<T>(path: string, signal?: AbortSignal, body?: object): Pr
   }, signal);
 }
 
-/** One of the company's connected Instagram accounts (CAD-1290). */
+/** One of the company's connected Instagram accounts or Facebook Pages (CAD-1290, CAD-1939). */
 export interface PublishDestination { destination_id: string; label: string; toolkit: string }
 export const workspaceApps = {
   /** CAD-1290: the host-composed AgenticOS connect link; `hosted:false` on a local board. */
-  connectLink: (id: string, returnTo: string, signal?: AbortSignal) =>
-    request<{ hosted: boolean; url?: string; unavailable?: boolean }>(`${installation(id)}/publishing/connect-link`, signal, { return_to: returnTo }),
+  connectLink: (id: string, returnTo: string, signal?: AbortSignal, toolkit?: string) =>
+    request<{ hosted: boolean; url?: string; unavailable?: boolean }>(`${installation(id)}/publishing/connect-link`, signal, { return_to: returnTo, ...(toolkit ? { toolkit } : {}) }),
   destinations: (id: string, signal?: AbortSignal) =>
     request<{ unavailable: boolean; destinations: PublishDestination[] }>(`${installation(id)}/publishing/destinations`, signal),
-  useDestination: (id: string, body: { destination_id: string; timezone?: string; request_id?: string; expected_revision?: number; context_id?: string }) =>
+  useDestination: (id: string, body: { destination_id: string; toolkit?: string; timezone?: string; request_id?: string; expected_revision?: number; context_id?: string }) =>
     request<{ binding: AppBinding }>(`${installation(id)}/publishing/use`, undefined, body),
+  /** CAD-1939: retire one binding (one destination) at the revision the caller read. */
+  revokeBinding: (id: string, bindingId: string, expectedRevision: number) =>
+    request<{ binding: AppBinding }>(`${installation(id)}/bindings/${part(bindingId)}/revoke`, undefined, { expected_revision: expectedRevision }),
   installations: (signal?: AbortSignal) => request<Installation[]>("/api/app-installations", signal),
   detail: (id: string, signal?: AbortSignal) => request<Installation>(installation(id), signal),
   upgradeCheck: (id: string, body: UpgradeCheckBody, signal?: AbortSignal) =>

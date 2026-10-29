@@ -1,6 +1,6 @@
 import { makePlanner, runCall, type ActionContext } from "../src/features/workspace-apps/screen/screenActions";
 import { parseChild } from "../src/features/workspace-apps/screen/screenProtocol";
-import { accountLabel, connectOutcome, connectReturnTo, connectToast, publishAllowed, publicationBinding, sendSlot, withoutConnectParams } from "../src/features/workspace-apps/socialConnect";
+import { accountLabel, connectOutcome, connectReturnTo, connectToast, destinationBinding, publishAllowed, publicationBinding, sendSlot, withoutConnectParams } from "../src/features/workspace-apps/socialConnect";
 import type { AppBinding, Installation } from "../src/features/workspace-apps/workspaceApps";
 
 // CAD-1290: the hosted connect link, the return signal and "Use for publishing".
@@ -33,19 +33,20 @@ const binding = (publish?: { destination_id: string; destination_label: string; 
   config: { bundle_digest: "sha256:d1", connection_id: "c", provider: "local", account: "local", mapping: {} as never, ...(publish ? { publish } : {}) }, ...over });
 
 async function main() {
-  // The return signal: only Instagram's three outcomes, and the params leave the URL.
+  // The return signal: only the publishable toolkits' three outcomes, and the params leave the URL.
   equal(connectOutcome("?aos_connect=connected&toolkit=instagram"), "connected", "connected");
   equal(connectOutcome("?aos_connect=failed&toolkit=instagram&x=1"), "failed", "failed");
   equal(connectOutcome("?aos_connect=cancelled&toolkit=instagram"), "cancelled", "cancelled");
-  equal(connectOutcome("?aos_connect=connected&toolkit=facebook"), null, "another toolkit is not ours");
+  equal(connectOutcome("?aos_connect=connected&toolkit=facebook"), "connected", "CAD-1939: a Facebook Page connect is ours");
+  equal(connectOutcome("?aos_connect=connected&toolkit=linkedin"), null, "another toolkit is not ours");
   equal(connectOutcome("?aos_connect=connected"), null, "a missing toolkit is not ours");
   equal(connectOutcome("?aos_connect=hacked&toolkit=instagram"), null, "an unknown outcome is not ours");
   equal(withoutConnectParams("?aos_connect=connected&toolkit=instagram&screen=native"), "?screen=native", "other params stay");
   equal(withoutConnectParams("?aos_connect=failed&toolkit=instagram"), "", "nothing left");
-  equal(connectToast("connected").text, "Instagram connected", "connected copy");
+  equal(connectToast("connected").text, "Account connected", "connected copy");
   equal(connectToast("failed").text, "Connection failed — try again", "failed copy");
   equal(connectToast("connected", publishAllowed("?aos_connect=connected&toolkit=instagram&aos_publish=allowed")).text, "Publishing allowed", "allowed copy");
-  equal(connectToast("connected", publishAllowed("?aos_connect=connected&toolkit=instagram&aos_publish=skipped")).text, "Instagram connected", "skipped keeps the connected copy");
+  equal(connectToast("connected", publishAllowed("?aos_connect=connected&toolkit=instagram&aos_publish=skipped")).text, "Account connected", "skipped keeps the connected copy");
   equal(withoutConnectParams("?aos_connect=connected&aos_publish=allowed&toolkit=instagram&screen=native"), "?screen=native", "aos_publish leaves the URL");
   equal(connectToast("cancelled"), connectToast("failed"), "cancelled reads as not connected");
   // CAD-1438: return_to spells the canonical `/apps/<key>` route.
@@ -57,6 +58,27 @@ async function main() {
   assert(!publicationBinding([binding()], "publication", null, "sha256:d1"), "another scope is not the binding");
   assert(!publicationBinding([binding()], "publication", "ctx1", "sha256:old"), "an old bundle is not the binding");
   assert(!publicationBinding([binding(undefined, { state: "revoked" })], "publication", "ctx1", "sha256:d1"), "a revoked binding is not the binding");
+  // CAD-1939: a destination's own binding, never another destination's.
+  const igBinding = binding({ destination_id: "d1", destination_label: "harbour", toolkit: "instagram" });
+  const fbBinding = binding({ destination_id: "p1", destination_label: "Harbour Page", toolkit: "facebook" }, { id: "b2", revision: 7 });
+  equal(destinationBinding([igBinding, fbBinding], "publication", "ctx1", "sha256:d1", "p1")?.id, "b2", "the Page's own binding");
+  equal(destinationBinding([igBinding, fbBinding], "publication", "ctx1", "sha256:d1", "d1", "instagram")?.id, "b1", "the account's own binding");
+  assert(!destinationBinding([igBinding], "publication", "ctx1", "sha256:d1", "d1", "facebook"), "another toolkit is not that binding");
+
+  // CAD-1939: the connections link may name the Facebook toolkit; the host passes it to the connect link.
+  replies = { "/publishing/connect-link": { body: { hosted: true, url: "https://api.example/account/ws/connections/connect?toolkit=facebook&return_to=x" } } };
+  calls.length = 0;
+  {
+    let opened: string | null = null;
+    const fb = await runCall(ctx(), "open-link", { url: "/settings/connections", toolkit: "facebook" }, { showLink: () => {}, assign: (url: string) => { opened = url; } });
+    assert(fb.ok && opened !== null, "a Facebook connect opens the host-composed link");
+    equal(calls[0].body, { return_to: "https://ef.cadencecloud.app/apps/social-content?screen=native&install=inst1", toolkit: "facebook" }, "the toolkit reaches the connect link");
+    for (const args of [{ url: "/settings/connections", toolkit: "linkedin" }, { url: "https://evil.example/x", toolkit: "facebook" }]) {
+      const bad = await runCall(ctx(), "open-link", args, { showLink: () => {} });
+      assert(!bad.ok && bad.refusal.code === "bad_args", "an unknown toolkit or a toolkit on another link is refused");
+    }
+  }
+  calls.length = 0;
 
   // Hosted: the app's Manage connections link opens the host-composed AgenticOS URL top-level.
   replies = { "/publishing/connect-link": { body: { hosted: true, url: "https://api.example/account/ws/connections/connect?toolkit=instagram&return_to=x" } } };
@@ -83,21 +105,46 @@ async function main() {
   assert(assigned === null && navigated === "/settings/connections", "a local board keeps /settings/connections");
 
   // Destinations list verb: exact args, label from the host.
-  replies = { "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d1", label: "harbour", toolkit: "instagram" }] } } };
+  replies = { "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d1", label: "harbour", toolkit: "instagram" }] } },
+    "/contexts/ctx1/bindings": { body: { bindings: [] } } };
   result = await runCall(ctx(), "social.destinations.list", {}, ui);
-  equal(result, { ok: true, data: { unavailable: false, destinations: [{ destination_id: "d1", label: "@harbour" }] } }, "list");
+  equal(result, { ok: true, data: { unavailable: false, destinations: [{ destination_id: "d1", label: "@harbour", toolkit: "instagram", used: false }] } }, "list");
+  // CAD-1939: Instagram accounts and Facebook Pages both list, each with its toolkit.
+  // Any number of each; `used` marks the destinations this context publishes to now.
+  replies = { "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d1", label: "harbour", toolkit: "instagram" },
+    { destination_id: "d2", label: "kowloon", toolkit: "instagram" }, { destination_id: "p1", label: "Harbour Page", toolkit: "facebook" },
+    { destination_id: "p2", label: "Kowloon Page", toolkit: "facebook" }] } },
+    "/contexts/ctx1/bindings": { body: { bindings: [binding({ destination_id: "d2", destination_label: "kowloon", toolkit: "instagram" }),
+      binding({ destination_id: "p1", destination_label: "Harbour Page", toolkit: "facebook" }, { id: "b2" })] } } };
+  result = await runCall(ctx(), "social.destinations.list", {}, ui);
+  equal(result, { ok: true, data: { unavailable: false, destinations: [{ destination_id: "d1", label: "@harbour", toolkit: "instagram", used: false },
+    { destination_id: "d2", label: "@kowloon", toolkit: "instagram", used: true }, { destination_id: "p1", label: "Harbour Page", toolkit: "facebook", used: true },
+    { destination_id: "p2", label: "Kowloon Page", toolkit: "facebook", used: false }] } }, "IG and FB rows with toolkit and used");
   result = await runCall(ctx(), "social.destinations.list", { x: 1 }, ui);
   assert(!result.ok, "list takes no arguments");
 
-  // Use for publishing: the user's own choice is a direct call; the host sends the revision it read.
+  // Use for publishing: the user's own choice is a direct call; the host sends the revision it read
+  // for that destination's own binding.
   replies = { "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d1", label: "harbour", toolkit: "instagram" }] } },
-    "/contexts/ctx1/bindings": { body: { bindings: [binding({ destination_id: "d0", destination_label: "old", toolkit: "instagram" })] } },
+    "/contexts/ctx1/bindings": { body: { bindings: [binding({ destination_id: "d1", destination_label: "harbour", toolkit: "instagram" })] } },
     "/publishing/use": { body: { binding: binding() } } };
   calls.length = 0;
   let changed = 0;
   const done = await runCall(ctx(() => { changed += 1; }), "publish.destination.use", { destination_id: "d1" }, ui);
   assert(done.ok && changed === 1, "the user's own choice writes directly and the board reloads");
-  equal(calls[calls.length - 1], { path: "/api/app-installations/inst1/publishing/use", body: { destination_id: "d1", context_id: "ctx1", expected_revision: 3 } }, "replace sends the revision it saw");
+  equal(calls[calls.length - 1], { path: "/api/app-installations/inst1/publishing/use", body: { destination_id: "d1", toolkit: "instagram", context_id: "ctx1", expected_revision: 3 } }, "updating a destination sends the revision of its own binding");
+  // CAD-1939: another destination's binding is not replaced: a new destination adds its own binding.
+  replies["/contexts/ctx1/bindings"] = { body: { bindings: [binding({ destination_id: "d0", destination_label: "old", toolkit: "instagram" })] } };
+  calls.length = 0;
+  const added = await runCall(ctx(), "publish.destination.use", { destination_id: "d1", toolkit: "instagram" }, ui);
+  assert(added.ok, "adds the destination");
+  const addBody = calls[calls.length - 1].body as Record<string, unknown>;
+  assert(typeof addBody.request_id === "string" && !("expected_revision" in addBody) && addBody.toolkit === "instagram", "adding carries a request id, the toolkit and no revision");
+  // A slot binding with no destination yet takes the first one, at its revision (as before).
+  replies["/contexts/ctx1/bindings"] = { body: { bindings: [binding()] } };
+  calls.length = 0;
+  assert((await runCall(ctx(), "publish.destination.use", { destination_id: "d1" }, ui)).ok, "the bare binding takes the destination");
+  equal((calls[calls.length - 1].body as Record<string, unknown>).expected_revision, 3, "the bare binding is updated at its revision");
   // An account that is not in the company's list is refused.
   const missing = await runCall(ctx(), "publish.destination.use", { destination_id: "other-company" }, ui);
   assert(!missing.ok && missing.refusal.code === "unknown_destination", "a destination outside the list is refused before any write");
@@ -113,6 +160,31 @@ async function main() {
   assert(fresh.ok, "creates the binding");
   const sent = calls[calls.length - 1].body as Record<string, unknown>;
   assert(typeof sent.request_id === "string" && !("expected_revision" in sent), "create carries a request id and no revision");
+
+  // CAD-1939: retire one destination's binding at the revision read; the last one is never removed here.
+  replies = { "/contexts/ctx1/bindings": { body: { bindings: [igBinding, fbBinding] } }, "/bindings/b2/revoke": { body: { binding: fbBinding } } };
+  calls.length = 0;
+  const removed = await runCall(ctx(), "publish.destination.remove", { destination_id: "p1", toolkit: "facebook" }, ui);
+  assert(removed.ok, "removes one destination");
+  equal(calls[calls.length - 1], { path: "/api/app-installations/inst1/bindings/b2/revoke", body: { expected_revision: 7 } }, "revokes that destination's own binding at its revision");
+  replies["/contexts/ctx1/bindings"] = { body: { bindings: [igBinding] } };
+  calls.length = 0;
+  const last = await runCall(ctx(), "publish.destination.remove", { destination_id: "d1" }, ui);
+  assert(!last.ok && last.refusal.code === "last_destination" && !calls.some(call => call.path.endsWith("/revoke")), "the last destination stays");
+  const unknown = await runCall(ctx(), "publish.destination.remove", { destination_id: "p9" }, ui);
+  assert(!unknown.ok && unknown.refusal.code === "unknown_destination", "a destination with no binding here is refused");
+
+  // CAD-1939: stage may name the destination; the field travels only as a non-empty string.
+  replies = { "/api/app-social-drafts/effect-stage": { body: { effect: { effect_id: "sfx_x" } } } };
+  calls.length = 0;
+  const stageUi = { ...ui, actionToken: "ab".repeat(32) };
+  const staged = await runCall(ctx(), "social.drafts.publish.stage", { alias: "social.draft", draft_id: "dr1", revision: 2, request_id: "rq1", destination_id: "p1" }, stageUi);
+  assert(staged.ok, "stage with a destination");
+  equal((calls[calls.length - 1].body as Record<string, unknown>).destination_id, "p1", "the destination reaches the daemon");
+  const plain = await runCall(ctx(), "social.drafts.publish.stage", { alias: "social.draft", draft_id: "dr1", revision: 2, request_id: "rq2" }, stageUi);
+  assert(plain.ok && !("destination_id" in (calls[calls.length - 1].body as Record<string, unknown>)), "stage without a destination is unchanged");
+  const badStage = await runCall(ctx(), "social.drafts.publish.stage", { alias: "social.draft", draft_id: "dr1", revision: 2, request_id: "rq3", destination_id: "" }, stageUi);
+  assert(!badStage.ok && badStage.refusal.code === "bad_args", "an empty destination is refused");
 
   // CAD-1918 (operator decision, reversing CAD-1905's slot-only approvals): the app's own
   // confirm and schedule, and the follow-ups to an approved post (reschedule, cancel), are
