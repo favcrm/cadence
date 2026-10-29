@@ -234,11 +234,34 @@ pub fn project_add(
     Ok(out)
 }
 
+/// The one refusal sentence for private, shared by every writer so the CLI,
+/// the daemon and the board cannot describe the gate differently.
+pub const PRIVATE_UNAVAILABLE: &str =
+    "private projects are not available yet — the isolation gate \
+     has not passed; only workspace-visible can be recorded";
+
+/// May this build record `private` (CAD-1950, AOS-274 / SEC-006)?
+///
+/// The isolation gate stays closed until CAD-1950 records, per enforcement
+/// path, a test proving a non-granted caller is served nothing:
+/// `project_policy::readable` and `refused` for listings and single rows,
+/// `retain_overview` for the overview payload, and `reads_every_project`
+/// for the shared live stream (which is one un-filterable model, so a
+/// caller who cannot read every project is refused live updates rather
+/// than served filtered frames).
+///
+/// It is one function on purpose: `set_project_policy`, `project new` and
+/// the board's Settings page read the same answer, so flipping it is one
+/// place and the UI cannot offer a write the tracker will refuse.
+pub fn private_available() -> bool {
+    false
+}
+
 /// Replace a project's recorded access policy (AOS-274).
 ///
 /// Takes the tracker lock, re-reads the project, keeps its identity, bumps
 /// the policy version and commits `project.yaml` only. `Private` is refused
-/// until the isolation gate passes — `workspace-visible` is the only
+/// until [`private_available`] answers yes — `workspace-visible` is the only
 /// visibility this build may record.
 pub fn set_project_policy(
     pm: &Pm,
@@ -250,11 +273,8 @@ pub fn set_project_policy(
     // Validate before any join. A remote key is caller input; `../…` or a
     // slash must never become a path outside the tracker.
     let key = crate::issue::model::check_key(key)?;
-    if visibility == project::Visibility::Private {
-        return Err(Error::rejected(
-            "private projects are not available yet — the isolation gate has not passed; \
-             only workspace-visible can be recorded",
-        ));
+    if visibility == project::Visibility::Private && !private_available() {
+        return Err(Error::rejected(PRIVATE_UNAVAILABLE));
     }
     let dir = project_dir(pm, &key)?;
     let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;

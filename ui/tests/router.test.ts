@@ -32,6 +32,7 @@ const paths: [string, Route][] = [
   ["/projects/cadence/epics", { screen: "projects", slug: "cadence", section: "epics" }],
   ["/projects/cadence/milestones", { screen: "projects", slug: "cadence", section: "milestones" }],
   ["/projects/cadence/workflows", { screen: "projects", slug: "cadence", section: "workflows" }],
+  ["/projects/cadence/settings", { screen: "projects", slug: "cadence", section: "settings" }],
   ["/projects/cadence/issues/CAD-607", { screen: "issue", project: "cadence", id: "CAD-607", tab: "overview" }],
   ["/apps", { screen: "apps", project: null, name: null }],
   ["/apps/social-content", { screen: "workspaceAppKey", appKey: "social-content" }],
@@ -67,7 +68,7 @@ equal(projectScope({ screen: "workspaceAppKey", appKey: "crm" }), "none", "frien
 for (const path of ["/app-installations", "/app-installations/..", "/app-installations/a%2Fb", "/app-installations/a/extra"]) {
   equal(matchRoute(path).screen, "notFound", `invalid installation route ${path}`);
 }
-for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/issues/CAD-1/extra", "/agents/a/b", "/apps/%2F", "/apps/%E0", "/apps/catalog", "/apps/manage", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0", "/settings/connections/new/smtp/extra", "/settings/connections/account", "/settings/connections/bogus", "/settings/connections/new/%E0", "/settings/account/unwanted", "/settings/memory/extra", "/settings/update/extra", "/settings/permissions/extra", "/settings/email/extra", "/settings/connections/account/x/y", "/settings/connections/new//smtp", "/settings/connections/account//c-1", "/settings/connections//new"]) {
+for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/secrets", "/projects/cadence/issues/CAD-1/extra", "/agents/a/b", "/apps/%2F", "/apps/%E0", "/apps/catalog", "/apps/manage", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0", "/settings/connections/new/smtp/extra", "/settings/connections/account", "/settings/connections/bogus", "/settings/connections/new/%E0", "/settings/account/unwanted", "/settings/memory/extra", "/settings/update/extra", "/settings/permissions/extra", "/settings/email/extra", "/settings/connections/account/x/y", "/settings/connections/new//smtp", "/settings/connections/account//c-1", "/settings/connections//new"]) {
   equal(matchRoute(dead).screen, "notFound", `not found ${dead}`);
 }
 equal(matchRoute("/my-work/extra").screen, "notFound", "My work has no nested routes");
