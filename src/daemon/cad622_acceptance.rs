@@ -163,7 +163,7 @@ impl Fx {
                     cwd: &cwd,
                     sandbox: "read-only",
                     instructions: None,
-                    params: None,
+                    params: (alias == "writer").then_some(r#"{"upstream":"lead"}"#),
                     team_role: None,
                     model_policy: None,
                 })
@@ -377,7 +377,7 @@ fn cad622_a_team_agent_cannot_be_dispatched_to_edit_its_own_app() {
     .expect_err("a team agent must not be dispatched to edit its own app");
     let why = err.to_string();
     assert!(
-        why.contains("writer is on app 'social-content's team (widgets)")
+        why.contains("writer is on app 'social-content's team (project widgets)")
             && why.contains("cannot author a change to that app's source (apps/social-content/)"),
         "the refusal names the agent, the app and the path: {why}"
     );
@@ -454,7 +454,7 @@ fn cad622_another_project_cannot_launder_the_author() {
     .expect_err("another project cannot hide the app's team");
     assert!(
         err.to_string()
-            .contains("writer is on app 'social-content's team (widgets)"),
+            .contains("writer is on app 'social-content's team (project widgets)"),
         "{err}"
     );
 }
@@ -511,7 +511,7 @@ fn cad622_the_review_loop_refuses_a_team_agent_authors_app_pr() {
     assert!(rec.head.is_none(), "a refused done report records no head");
     let why = fx.why();
     assert!(
-        why.contains("writer is on app 'social-content's team (widgets)")
+        why.contains("writer is on app 'social-content's team (project widgets)")
             && why.contains("apps/social-content/"),
         "the refusal is plain and specific: {why}"
     );
@@ -635,9 +635,9 @@ fn cad622_unreadable_pr_files_hold_an_own_team_authors_report() {
         .expect("the unreadable diff is flagged");
     assert_eq!(event.payload["issue"].as_str(), Some(ISSUE));
 
-    // Positive control: the same outage does not stall a ticket whose
-    // author is on no app's team.
-    let fx = Fx::new(&[("writer", "writer")], &["reviewer"]);
+    // Positive control: the same outage does not stall a ticket in a
+    // workspace where nobody is on an app's team.
+    let fx = Fx::new(&[], &["reviewer"]);
     std::fs::write(fx._root.path().join("gh"), "#!/bin/sh\nexit 1\n").unwrap();
     fx.seed_loop("lead");
     fx.route().expect("the router pass answers");
