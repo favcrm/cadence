@@ -177,7 +177,7 @@ fn cad347_real_native_pm_unregistered_and_setsid_callers_cannot_mint_operator_au
             "project": "cad347-native",
             "id": slug,
             "kind": "decision",
-            "scope": {},
+            "scope": {"project": true},
             "source": "CAD-347 independent raw-native authority acceptance",
             "confidence": "high",
             "text": "Require operator authority for this judgement\n\n**Why:** two agent reviews do not authorize agent-claimed judgement\n\n**How to apply:** derive approval from the native connection\n",

@@ -57,6 +57,12 @@ fn lesson_body(fact: &str) -> String {
     )
 }
 
+/// Project-wide retrieval axis. An empty scope is no longer a valid
+/// proposal, and these fixtures are about authority, not applicability.
+fn project_scope() -> Value {
+    json!({"project": true})
+}
+
 /// `rpc_memory_propose` params: explicit slug, kind and scope.
 fn propose_params(slug: &str, kind: &str, scope: Value, fact: &str) -> Value {
     json!({
@@ -402,7 +408,7 @@ fn cad347_vendor_candidate(world: &World, slug: &str, audience: &str) -> String 
     let mut params = propose_params(
         slug,
         "decision",
-        json!({}),
+        project_scope(),
         "Prefer independently accountable evidence review for this judgement",
     );
     params["source"] = json!("CAD-347 independent vendor acceptance");
@@ -547,7 +553,7 @@ fn cad347_new_proposal_rejects_trusted_and_unknown_request_fields_without_effect
         let mut params = propose_params(
             &slug,
             "decision",
-            json!({}),
+            project_scope(),
             "Only daemon-owned evidence can authorize this judgement",
         );
         params[field] = value;
@@ -586,7 +592,7 @@ fn cad347_imported_frontmatter_cannot_select_legacy_or_supply_trusted_authority(
             serde_yaml::to_string(&front).unwrap(),
             seed.body
         );
-        let mut params = propose_params(&slug, "decision", json!({}), "unused");
+        let mut params = propose_params(&slug, "decision", project_scope(), "unused");
         params.as_object_mut().unwrap().remove("text");
         params["from"] = json!(raw);
         let before = world.snap();
@@ -703,7 +709,7 @@ fn cad347_mechanical_promotion_stays_blocked_without_genuine_executor_evidence()
     let mut control_params = propose_params(
         control_slug,
         "decision",
-        json!({}),
+        project_scope(),
         "An operator judgement approval is not a mechanical check",
     );
     control_params["nature"] = json!("judgement");
@@ -724,7 +730,7 @@ fn cad347_mechanical_promotion_stays_blocked_without_genuine_executor_evidence()
         let mut params = propose_params(
             &slug,
             "rule",
-            json!({}),
+            project_scope(),
             "Mechanical validity requires a genuine qualifying executor receipt",
         );
         params["nature"] = json!("mechanical");
@@ -777,7 +783,7 @@ fn cad347_verification_metadata_never_accepts_command_fields_or_executes_them() 
             let mut params = propose_params(
                 &slug,
                 "rule",
-                json!({}),
+                project_scope(),
                 "A declared verification condition never authorizes command execution",
             );
             params["nature"] = json!("mechanical");
@@ -1326,7 +1332,7 @@ fn cad347_new_agent_claimed_judgement_two_agent_reviews_cannot_replace_operator(
     let mut params = propose_params(
         slug,
         "decision",
-        json!({}),
+        project_scope(),
         "Prefer an explicit operator decision for judgement approval",
     );
     params["source"] = json!("CAD-347 independent authority acceptance");
@@ -1422,7 +1428,7 @@ fn cad225_lesson_needs_two_distinct_reviewer_proofs_pm_finalize_then_reuse() {
 
     // ── Refusals: none of these may touch the tracker ─────────────
     let bad64 = "0".repeat(64);
-    let mut smuggled = propose_params("claim-smuggle", "gotcha", json!({}), "FACT");
+    let mut smuggled = propose_params("claim-smuggle", "gotcha", project_scope(), "FACT");
     smuggled["reviewer"] = json!("pm");
     refuse(&world, |w| {
         w.memory_propose(agent("worker-author"), smuggled)
@@ -1492,7 +1498,7 @@ fn cad225_lesson_needs_two_distinct_reviewer_proofs_pm_finalize_then_reuse() {
     refuse(&world, |w| {
         w.memory_propose(
             agent("worker-author"),
-            propose_params("lane-lesson", "gotcha", json!({}), "OVERWRITE FACT"),
+            propose_params("lane-lesson", "gotcha", project_scope(), "OVERWRITE FACT"),
         )
     });
 
@@ -1903,7 +1909,7 @@ fn cad225_memory_rpcs_refuse_non_agent_and_identity_incomplete_callers() {
         "worker-a",
         "review-target",
         "gotcha",
-        json!({}),
+        project_scope(),
         "TARGET FACT",
     );
     let d = crate::memory::semantic_digest(&proposed);
@@ -1922,7 +1928,7 @@ fn cad225_memory_rpcs_refuse_non_agent_and_identity_incomplete_callers() {
         refuse(&world, |w| {
             w.memory_propose(
                 who.clone(),
-                propose_params("should-not-exist", "gotcha", json!({}), "NOPE FACT"),
+                propose_params("should-not-exist", "gotcha", project_scope(), "NOPE FACT"),
             )
         });
         assert_eq!(std::fs::read(&proposed.path).unwrap(), baseline_bytes);
@@ -2777,7 +2783,7 @@ fn cad347_external_source_judgement_requires_operator_release_without_fake_fresh
     let mut params = propose_params(
         slug,
         "decision",
-        json!({}),
+        project_scope(),
         "An external judgement remains unavailable until explicitly released by the operator",
     );
     params["source"] = json!("https://example.invalid/cad347/external-judgement");
