@@ -114,7 +114,7 @@ pub(super) fn handle(
 
 /// The relayed actor, derived by `board_caller` (never from the request):
 /// the operator session, or a platform-verified `owner`. Allowlist.
-fn approver(caller: &Caller) -> Option<&str> {
+pub(crate) fn approver(caller: &Caller) -> Option<&str> {
     match caller {
         Caller::Operator(actor) => Some(actor),
         Caller::Named(named) if named.operator => Some(&named.actor),

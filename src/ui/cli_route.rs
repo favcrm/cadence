@@ -391,6 +391,41 @@ fn readable_projects(pm: &Pm, actor: &CliActor) -> std::collections::BTreeSet<St
     super::project_policy::readable(pm, &actor.policy_spelling())
 }
 
+/// `repo`, `pr` and `head` only. `envelope` is set for enqueue so the
+/// daemon re-verifies the caller; a check does not carry it.
+fn gate_relay(args: &Value, envelope: Option<&str>, state_dir: &Path, method: &str) -> HttpResp {
+    let Some(object) = args.as_object() else {
+        return cli_fail(
+            400,
+            "invalid_request",
+            "delivery gate arguments must be an object",
+        );
+    };
+    for key in object.keys() {
+        if key != "repo" && key != "pr" && key != "head" {
+            return cli_fail(
+                400,
+                "invalid_request",
+                "delivery gate arguments admit only repo, pr and head",
+            );
+        }
+    }
+    let Some(repo) = object.get("repo").and_then(Value::as_str) else {
+        return cli_fail(400, "invalid_request", "delivery gate needs arguments.repo");
+    };
+    let Some(pr) = object.get("pr").and_then(Value::as_u64).filter(|n| *n > 0) else {
+        return cli_fail(400, "invalid_request", "delivery gate needs arguments.pr");
+    };
+    let Some(head) = object.get("head").and_then(Value::as_str) else {
+        return cli_fail(400, "invalid_request", "delivery gate needs arguments.head");
+    };
+    let mut params = json!({"repo": repo, "pr": pr, "head": head});
+    if let Some(envelope) = envelope {
+        params["cli_envelope"] = json!(envelope);
+    }
+    rpc(state_dir, method, params)
+}
+
 /// The verb → the same call the CLI/board makes for it. `actor` is the
 /// verified envelope identity — `handle` for author/provenance fields.
 /// No request field ever renames it. `envelope` is the raw compact JWS
@@ -664,6 +699,13 @@ fn dispatch(
                     "payload": Value::Object(op_payload),
                 }),
             )
+        }
+        // CAD-1946: the hosted gate. Arguments are only repo, pr and head.
+        // The envelope is relayed on enqueue so the daemon can tell an
+        // owner from an agent; the check is a read of the same script.
+        Verb::DeliveryCheck => gate_relay(args, None, state_dir, "delivery_gate_check"),
+        Verb::DeliveryEnqueue => {
+            gate_relay(args, Some(envelope), state_dir, "delivery_gate_enqueue")
         }
         // ---- cli.write ----
         Verb::IssueNew => match pm_at(pm_dir) {

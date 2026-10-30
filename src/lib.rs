@@ -47,6 +47,7 @@ pub mod contract_fixture;
 pub mod daemon;
 pub mod delegation;
 pub mod delivery;
+pub mod delivery_gate;
 // CAD-777: board sign-in through the AgenticOS device grant.
 pub mod device_login;
 pub mod devin_catalog;

@@ -77,6 +77,19 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const m = /^\/api\/issues\/([\w-]+)$/.exec(url.pathname);
   if (m && issues[m[1]]) return json(issues[m[1]]);
   if (url.pathname === "/api/approvals/state") return json(approval);
+  if (url.pathname === "/api/delivery/gate") return json({
+    ok: false,
+    operator_approval: true,
+    reasons: ["human-class diff has no operator approval recorded"],
+    rows: [
+      { id: "reviews", label: "Independent review", ok: true },
+      { id: "checks", label: "Checks passed", ok: true },
+      { id: "approval", label: "Your approval", ok: false },
+    ],
+    repo: "acme/app",
+    pr: 9,
+    head: SHA,
+  });
   if (url.pathname === "/api/agents") return json({ agents: [], by_issue: {} });
   return json({});
 }) as typeof fetch;
@@ -243,7 +256,7 @@ async function render(needs: unknown[], readOnly: boolean, opts: { keepLocal?: b
   const drawerControls: [string, string[]][] = [
     ["plan", ["Approve plan", "Change something…", "Send back…"]],
     ["idea_plan", ["Approve idea", "Send back…", "Not ready? Park it for later"]],
-    ["merge_decision", ["Publish", "Approve this version", "Send back…"]],
+    ["merge_decision", ["Approve and merge", "Send back…"]],
   ];
   for (const [kind, names] of drawerControls) {
     await click(labelled(card(kind), "Review"));
@@ -264,23 +277,26 @@ async function render(needs: unknown[], readOnly: boolean, opts: { keepLocal?: b
 async function publish() {
   const view = await render([rows.merge], false);
   await click(labelled(view.card("merge_decision"), "Review"));
-  await settle(() => assert(labelled(view.host.querySelector('[data-drawer="review"]')!, "Publish"), "merge drawer renders"));
+  await settle(() => assert(labelled(view.host.querySelector('[data-drawer="review"]')!, "Approve and merge"), "merge drawer renders"));
   const drawer = view.host.querySelector('[data-drawer="review"]')!;
-  await settle(() => assert(!isDisabled(labelled(drawer, "Publish")!), "Publish is offered for a row that names its head"));
-  await click(labelled(drawer, "Publish"));
+  await settle(() => assert(!isDisabled(labelled(drawer, "Approve and merge")!), "Approve and merge is offered when only the approval is missing"));
+  await click(labelled(drawer, "Approve and merge"));
   return { ...view, drawer };
 }
 {
-  replies = { "/api/delivery/D-2/merge": { status: 200, body: { state: "queued" } } };
+  replies = { "/api/delivery/gate/enqueue": { status: 200, body: { ok: true } } };
   const view = await publish();
-  const merge = posts.find((p) => p.path === "/api/delivery/D-2/merge");
-  assert(merge, "Publish posts the merge");
-  assert(merge.body.sha === SHA, `the merge carries the row's pinned head, got ${JSON.stringify(merge.body)}`);
+  const approve = posts.find((p) => p.path === "/api/approvals/approve");
+  const merge = posts.find((p) => p.path === "/api/delivery/gate/enqueue");
+  assert(approve, "Approve and merge records the approval");
+  assert(merge, "Approve and merge enqueues");
+  assert(approve.body.head === SHA, `the approval carries the row's pinned head, got ${JSON.stringify(approve.body)}`);
+  assert(merge.body.head === SHA, `the enqueue carries the row's pinned head, got ${JSON.stringify(merge.body)}`);
   await view.done();
 }
 {
   replies = {
-    "/api/delivery/D-2/merge": {
+    "/api/delivery/gate/enqueue": {
       status: 409,
       body: { error: "head moved: gh pr merge exited 1 (pid 4242): cadence delivery merge D-2", code: "head_moved" },
     },

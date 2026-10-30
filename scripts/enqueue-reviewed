@@ -889,11 +889,18 @@ def check_scope(issue, title, branch, ticket, paths, risk_text, one_text, verdic
         return [f"scope approval check failed: {e}"]
 
 
-def evaluate(args, repo, *, require_comment=True, evidence=None):
-    """(reasons, report lines). Preparing evidence skips only comment presence."""
+def evaluate(args, repo, *, require_comment=True, evidence=None, summary=None):
+    """(reasons, report lines). Preparing evidence skips only comment presence.
+
+    `summary`, when passed, receives the requirements the check actually
+    used (`collected`, `operator_approval`, `browser_qa`, `reviews`,
+    `class`). A failed requirements read leaves it empty — never a guess.
+    """
     reasons, report = [], []
     if evidence is not None:
         evidence.clear()
+    if summary is not None:
+        summary.clear()
     approval_evidence = evidence if evidence is not None else {}
     pr, head = args.pr, args.head
     fields = "number,state,title,headRefName,headRefOid,baseRefName,baseRefOid,mergeStateStatus,autoMergeRequest,statusCheckRollup,author"
@@ -996,6 +1003,12 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                     or authority["binding"]["project"] != ticket.get("project")):
                 raise RuntimeError("authoritative requirements binding differs from the ticket project, PR base or repository")
             req = authority["requirements"]
+            if summary is not None:
+                summary["collected"] = True
+                summary["class"] = req["class"]
+                summary["operator_approval"] = bool(req["operator_approval"])
+                summary["browser_qa"] = bool(req["browser_qa"])
+                summary["reviews"] = req["reviews"]
             need_qa = need_qa or req["browser_qa"]
             report.append(f"delivery requirements: {req['class']} ({req['activation']}); policy {authority['binding']['policy_digest']}")
             report.extend(f"delivery reason: {reason}" for reason in req["reasons"])
@@ -1212,7 +1225,8 @@ def enqueue(args, repo):
         deadline = time.monotonic() + args.poll_secs
         while True:
             if queued(repo, args.pr):
-                print(f"{ME}: PR #{args.pr} is in the merge queue at {args.head}")
+                stream = sys.stderr if getattr(args, "json", False) else sys.stdout
+                print(f"{ME}: PR #{args.pr} is in the merge queue at {args.head}", file=stream)
                 return 0
             if time.monotonic() >= deadline:
                 break
@@ -1229,6 +1243,88 @@ def enqueue(args, repo):
     return 1
 
 
+def gate_rows(reasons, summary):
+    """Plain checklist rows for the approval card.
+
+    Every reason is either a known row or `other`. An unclassified
+    reason is never dropped, and a requirements read that did not
+    answer does not become a pass.
+    """
+    summary = summary or {}
+    collected = bool(summary.get("collected"))
+    if any(r.startswith("cannot read the PR:") for r in reasons):
+        return [{"id": "gate", "label": "Can't check right now", "ok": False,
+                 "detail": "Nothing was approved."}]
+
+    def row(rid, label, ok, detail=None):
+        item = {"id": rid, "label": label, "ok": bool(ok)}
+        if detail:
+            item["detail"] = detail
+        return item
+
+    used = set()
+
+    def take(pred):
+        hit = []
+        for i, reason in enumerate(reasons):
+            if i not in used and pred(reason):
+                used.add(i)
+                hit.append(reason)
+        return hit
+
+    head = take(lambda r: (
+        "not the pinned" in r or ", not OPEN" in r or "merge conflicts" in r
+        or r.startswith("auto-merge is already")))
+    reviews = take(lambda r: any(s in r for s in (
+        "no pass verdict", "no pass Standards", "no pass Spec/security",
+        "same reviewer", "not independent", "combined review", "is not a pass",
+        "no 'From:' reviewer", "cannot order two verdicts")))
+    qa = take(lambda r: "Browser QA" in r)
+    checks = take(lambda r: (
+        r.startswith("required ") or r.startswith("no required checks")
+        or "ci.yml" in r or "rulesets" in r or "branch protection" in r
+        or r.startswith("cannot read the rulesets") or r.startswith("cannot parse")))
+    approval = take(lambda r: "operator approval" in r or "scope approval" in r)
+    rows = []
+    if head:
+        moved = any("not the pinned" in r for r in head)
+        rows.append(row(
+            "head",
+            "A newer version came in" if moved else "This pull request can't merge yet",
+            False,
+            "It needs a fresh review." if moved else head[0]))
+    rows.append(row("reviews", "Independent review", not reviews, reviews[0] if reviews else None))
+    if summary.get("browser_qa") or qa:
+        rows.append(row("browser_qa", "Tested in the browser", not qa, qa[0] if qa else None))
+    rows.append(row("checks", "Checks passed", not checks, checks[0] if checks else None))
+    if summary.get("operator_approval") or approval or not collected:
+        if not collected and not approval:
+            rows.append(row("approval", "Your approval", False,
+                            "The check could not tell whether your approval is required."))
+        else:
+            rows.append(row("approval", "Your approval", not approval, approval[0] if approval else None))
+    other = [r for i, r in enumerate(reasons) if i not in used]
+    if other:
+        rows.append(row("other", "Something else is missing", False, other[0]))
+    if not collected and not reasons:
+        return [row("gate", "Can't check right now", False, "Nothing was approved.")]
+    return rows
+
+
+def gate_document(repo, pr, head, reasons, report, summary, ok):
+    summary = summary or {}
+    return {
+        "ok": bool(ok),
+        "reasons": reasons,
+        "report": report,
+        "repo": repo,
+        "pr": pr,
+        "head": head,
+        "operator_approval": summary.get("operator_approval") if summary.get("collected") else None,
+        "rows": gate_rows(reasons, summary),
+    }
+
+
 def main(argv):
     ap = argparse.ArgumentParser(prog=ME, description="Enqueue a PR only when review, checks and approval hold.")
     ap.add_argument("pr", type=int)
@@ -1237,33 +1333,54 @@ def main(argv):
     ap.add_argument("--notes-dir", default=os.environ.get("CADENCE_NOTES_DIR", DEFAULT_NOTES_DIR))
     ap.add_argument("--author", action="append", default=[], help="an extra alias that authored the PR")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--json", action="store_true",
+                    help="print one JSON object on stdout; progress stays on stderr")
+    ap.add_argument("--check", action="store_true",
+                    help="hosted check: dry-run JSON, and the evidence comment is not required "
+                         "(enqueue writes that comment itself)")
     ap.add_argument("--gate-key", default=os.environ.get("CADENCE_DELIVERY_GATE_KEY", DEFAULT_GATE_KEY),
                     help="the delivery-gate SSH signing key (CAD-1925)")
     ap.add_argument("--poll-secs", type=float, default=30)
     ap.add_argument("--poll-interval", type=float, default=2)
     args = ap.parse_args(argv)
     args.head = args.head.lower()
+    if args.check:
+        # The hosted check is a dry run that does not demand the evidence
+        # comment. Enqueue writes that comment itself; requiring it here
+        # is what made the operator hand-build one.
+        args.dry_run = True
+        args.json = True
     if args.pr < 1 or not FULL_SHA.match(args.head):
-        print(f"{ME}: --head must be the full 40-hex SHA and <pr> a positive number", file=sys.stderr)
+        if args.json:
+            print(json.dumps(gate_document(args.repo or "", args.pr, args.head,
+                                           ["--head must be the full 40-hex SHA and <pr> a positive number"],
+                                           [], {}, False)))
+        else:
+            print(f"{ME}: --head must be the full 40-hex SHA and <pr> a positive number", file=sys.stderr)
         return 2
     repo = args.repo
+    summary = {}
     try:
         if not repo:
             repo = gh_json(["repo", "view", "--json", "nameWithOwner"])["nameWithOwner"]
         if not re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", repo):
-            print(f"{ME}: bad repo {repo!r}", file=sys.stderr)
+            reason = f"bad repo {repo!r}"
+            if args.json:
+                print(json.dumps(gate_document(repo, args.pr, args.head, [reason], [], {}, False)))
+            else:
+                print(f"{ME}: {reason}", file=sys.stderr)
             return 2
         if args.dry_run:
-            reasons, report = evaluate(args, repo)
+            reasons, report = evaluate(args, repo, require_comment=not args.check, summary=summary)
         else:
             evidence = {}
-            reasons, report = evaluate(args, repo, require_comment=False, evidence=evidence)
+            reasons, report = evaluate(args, repo, require_comment=False, evidence=evidence, summary=summary)
             if not reasons:
                 reasons += post_evidence(args, repo, evidence)
             if not reasons:
                 # Re-read every gate after the write, including approvals and comments.
                 final_evidence = {}
-                reasons, report = evaluate(args, repo, evidence=final_evidence)
+                reasons, report = evaluate(args, repo, evidence=final_evidence, summary=summary)
                 reasons += check_evidence_head(args, repo, evidence)
                 if (not reasons and (final_evidence.get("binding") != evidence.get("binding")
                                      or final_evidence.get("requirements") != evidence.get("requirements")
@@ -1276,6 +1393,15 @@ def main(argv):
                     reasons += post_gate_signature(args, repo)
     except (RuntimeError, KeyError, TypeError) as e:
         reasons, report = [f"cannot read the PR: {e}"], []
+        summary = {}
+    code = 1 if reasons else 0
+    if code == 0 and not args.dry_run:
+        code = enqueue(args, repo)
+        if code != 0 and not reasons:
+            reasons = ["the merge did not enter the queue"]
+    if args.json:
+        print(json.dumps(gate_document(repo or "", args.pr, args.head, reasons, report, summary, code == 0)))
+        return code
     for line in report:
         print(f"{ME}: {line}")
     if reasons:
@@ -1285,7 +1411,7 @@ def main(argv):
     if args.dry_run:
         print(f"{ME}: dry run: every rule holds for PR #{args.pr} at {args.head}; nothing enqueued")
         return 0
-    return enqueue(args, repo)
+    return code
 
 
 if __name__ == "__main__":

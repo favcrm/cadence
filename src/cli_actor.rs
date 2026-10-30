@@ -82,6 +82,11 @@ pub enum Verb {
     // settings.read — master launch diagnosis for the authorized
     // management agent (CAD-1586); writes nothing.
     MasterStatus,
+    // CAD-1946: hosted delivery gate. Check is a read. Enqueue writes
+    // the signature and enables auto-merge; the handler, not the scope,
+    // refuses a member and an agent when an operator approval is required.
+    DeliveryCheck,
+    DeliveryEnqueue,
 }
 
 /// The scope a verb needs — `cli.write` never implies `cli.read`, and
@@ -123,6 +128,8 @@ impl Verb {
             "project_policy" => Verb::ProjectPolicy,
             "settings_agents" => Verb::SettingsAgents,
             "master_status" => Verb::MasterStatus,
+            "delivery_check" => Verb::DeliveryCheck,
+            "delivery_enqueue" => Verb::DeliveryEnqueue,
             _ => return None,
         })
     }
@@ -148,6 +155,8 @@ impl Verb {
             // CAD-1586: master diagnosis is a settings-scoped read —
             // the management agent needs it, and cli.* never covers it.
             Verb::MasterStatus => Scope::SettingsRead,
+            Verb::DeliveryCheck => Scope::Read,
+            Verb::DeliveryEnqueue => Scope::Write,
         }
     }
 }

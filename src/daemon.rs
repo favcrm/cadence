@@ -726,6 +726,10 @@ pub struct Shared {
     /// CAD-431: serializes every transition of the worker loop's
     /// record (`delivery.json`).
     delivery_lock: Mutex<()>,
+    /// CAD-1946: serializes a merge enqueue with a revoke's auto-merge
+    /// disable. Not `delivery_lock` — the enqueue script calls back into
+    /// this daemon, and that lock must not be held across the callback.
+    gate_lock: Mutex<()>,
     /// CAD-140: the `gh` the approve-and-land transaction runs — the
     /// operator's own binary in production (`gh` on PATH, like the
     /// review read); fixtures inject their fake here.
@@ -1286,6 +1290,7 @@ impl Shared {
             dispatch_lock: Mutex::new(()),
             unattended_lock: std::sync::RwLock::new(()),
             delivery_lock: Mutex::new(()),
+            gate_lock: Mutex::new(()),
             delivery_gh: opts
                 .delivery_gh
                 .clone()
@@ -4258,6 +4263,8 @@ impl Shared {
             "answer_route" => self.rpc_answer_route(params, peer_pid),
             "delivery_list" => self.rpc_delivery_list(params),
             "delivery_requirements" => self.rpc_delivery_requirements(params),
+            "delivery_gate_check" => self.rpc_delivery_gate_check(params),
+            "delivery_gate_enqueue" => self.rpc_delivery_gate_enqueue(params, peer_pid),
             "delivery_review_evidence" => self.rpc_delivery_review_evidence(params, peer_pid),
             "delivery_observe" => self.rpc_delivery_observe(params, peer_pid),
             "delivery_merge" => self.rpc_delivery_merge(params, peer_pid),
@@ -6557,6 +6564,175 @@ pub use timers::{
     AUTO_RESUME_FAILED_EVENT, AUTO_STOP_ATTACH_NOTE, AUTO_STOP_DEFAULT_SECS, AUTO_STOP_EVENT,
     AUTO_STOP_FLOOR_SECS,
 };
+
+impl Shared {
+    /// Turn auto-merge off for the PR an approval named. A PR that was
+    /// not queued answers `unchanged`. GitHub being unreachable answers
+    /// `unknown` and does not undo the revoke: the approval is already
+    /// withdrawn, and the caller can see the queue was not confirmed off.
+    fn disable_auto_merge(&self, record: Option<&Value>) -> &'static str {
+        let Some(record) = record else {
+            return "unknown";
+        };
+        let Some(repo) = record["scope"]["repo"].as_str() else {
+            return "unknown";
+        };
+        let Some(pr) = record["scope"]["pr"].as_u64() else {
+            return "unknown";
+        };
+        let pr = pr.to_string();
+        let gh = self.delivery_gh.to_string_lossy().to_string();
+        // After the revoke is stored. Held across the GitHub call so an
+        // enqueue cannot enable auto-merge between this revoke and the
+        // disable: enqueue holds the same lock for its whole script.
+        let _gate = self
+            .gate_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match crate::delivery::gh(&gh, &["pr", "merge", &pr, "-R", repo, "--disable-auto"]) {
+            Ok(_) => "off",
+            Err(error) => {
+                let text = error.to_string().to_ascii_lowercase();
+                if text.contains("not enabled")
+                    || text.contains("auto merge is not")
+                    || text.contains("not in the merge queue")
+                {
+                    "unchanged"
+                } else {
+                    "unknown"
+                }
+            }
+        }
+    }
+
+    fn gate_run(&self, params: &Value, enqueue: bool) -> Result<crate::delivery_gate::Run> {
+        const ALLOWED: &[&str] = &["repo", "pr", "head", "cli_envelope"];
+        if let Some(object) = params.as_object() {
+            if let Some(key) = object.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
+                return Err(Error::rejected(format!(
+                    "delivery gate: request field '{key}' is not accepted"
+                )));
+            }
+        }
+        let pm = self.pm()?;
+        let repo = self.project_repo(&pm, params, "delivery gate")?;
+        let pr = params
+            .get("pr")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+            .ok_or_else(|| Error::rejected("delivery gate: pr must be a pull request number"))?;
+        let head = required_str(params, "head")?.to_string();
+        if head.len() != 40
+            || !head
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(Error::rejected(
+                "delivery gate: head must be the full 40-character lowercase hexadecimal SHA",
+            ));
+        }
+        Ok(crate::delivery_gate::Run {
+            script: crate::delivery_gate::find_script(&pm.dir)?,
+            cadence: std::env::current_exe().map_err(|e| {
+                Error::rejected(format!(
+                    "delivery gate: cannot find the cadence binary ({e}) — nothing was checked"
+                ))
+            })?,
+            state_dir: self.state_dir.clone(),
+            pm_dir: pm.dir.clone(),
+            notes_dir: crate::delivery_gate::notes_dir(),
+            repo,
+            pr,
+            head,
+            enqueue,
+            gate_key: if enqueue {
+                Some(crate::delivery_gate::signing_key(&self.state_dir)?)
+            } else {
+                None
+            },
+            timeout: std::time::Duration::from_secs(if enqueue { 180 } else { 90 }),
+        })
+    }
+
+    /// The hosted check: the same script as `enqueue-reviewed --dry-run`,
+    /// without demanding the evidence comment enqueue itself writes.
+    pub(super) fn rpc_delivery_gate_check(&self, params: &Value) -> Result<Value> {
+        let spec = self.gate_run(params, false)?;
+        crate::delivery_gate::run(&spec)
+    }
+
+    /// Run the script for real: sign the head and enable auto-merge
+    /// pinned to it. An operator may enqueue when the check is clean.
+    /// A registered agent may enqueue only when the check says an
+    /// operator approval is not required. A member never enqueues.
+    /// A check that is not clean returns the refusal and does not sign.
+    pub(super) fn rpc_delivery_gate_enqueue(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let preview = self.gate_run(params, false)?;
+        let answer = crate::delivery_gate::run(&preview)?;
+        if answer.get("ok") != Some(&Value::Bool(true)) {
+            return Ok(answer);
+        }
+        let needs = answer
+            .get("operator_approval")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                Error::rejected(
+                    "delivery gate: the check could not say whether an operator approval \
+                     is required — nothing was enqueued",
+                )
+            })?;
+        self.admit_gate_enqueue(params, peer_pid, needs)?;
+        let _lock = self
+            .gate_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let spec = self.gate_run(params, true)?;
+        crate::delivery_gate::run(&spec)
+    }
+
+    fn admit_gate_enqueue(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+        needs_approval: bool,
+    ) -> Result<()> {
+        if params.get("cli_envelope").is_some() {
+            let principal = self.cli_principal(
+                params,
+                peer_pid,
+                "delivery enqueue",
+                crate::cli_actor::Scope::Write,
+            )?;
+            // An agent can be minted with the owner role. The kind is
+            // what makes this a person. `actor == "operator"` is one
+            // spelling of that person, not the only one.
+            let owner = principal.actor.principal_kind == "user"
+                && principal.actor.role_at_issue == "owner";
+            let agent = principal.actor.principal_kind == "agent";
+            if owner || (agent && !needs_approval) {
+                return Ok(());
+            }
+            return Err(Error::invalid(
+                "approver_not_allowed",
+                "only the operator can enqueue a change that needs approval, and only a \
+                 registered agent can enqueue one that does not",
+            ));
+        }
+        if self
+            .operator_connection("delivery enqueue", params, peer_pid)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if !needs_approval && self.slot_identity(peer_pid)?.is_some() {
+            return Ok(());
+        }
+        Err(Error::invalid(
+            "approver_not_allowed",
+            "only the operator can enqueue a change that needs approval",
+        ))
+    }
+}
 #[allow(unused_imports)]
 use watch::{
     checkpoint_wal, epoch_secs, fmt_duration, mono_secs, wal_observe_only, wal_pass, Checkpoint,

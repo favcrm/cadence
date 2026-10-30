@@ -628,6 +628,22 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             args.insert("payload".into(), Value::Object(payload));
             "settings_agents"
         }
+        Commands::Delivery {
+            action: super::delivery::DeliveryAction::Check { repo, pr, head, .. },
+        } => {
+            args.insert("repo".into(), json!(repo));
+            args.insert("pr".into(), json!(pr));
+            args.insert("head".into(), json!(head));
+            "delivery_check"
+        }
+        Commands::Delivery {
+            action: super::delivery::DeliveryAction::Enqueue { repo, pr, head, .. },
+        } => {
+            args.insert("repo".into(), json!(repo));
+            args.insert("pr".into(), json!(pr));
+            args.insert("head".into(), json!(head));
+            "delivery_enqueue"
+        }
         _ => return Err(unavailable(command)),
     };
     Ok((verb, args))
@@ -1190,6 +1206,7 @@ fn unavailable(command: &Commands) -> Error {
          send/message send (--message required), message read, inbox (peek), \
          issue project policy, wiki ls, wiki search, wiki cat, \
          wiki put (text), wiki cp, settings agents <verb>, master status, \
+         delivery check, delivery enqueue, \
          team list, team invites, team invite, team revoke-invite, \
          team set-role, team remove. \
          Use `--org local` or `cadence org switch` to run locally.",
@@ -1517,6 +1534,14 @@ pub(super) fn run(
             // printing and recomputes the capacity count it projects.
             if let Some(want) = placement_of(&command) {
                 retain_by_placement(&mut body, want);
+            }
+            if let Commands::Delivery {
+                action:
+                    super::delivery::DeliveryAction::Check { json, .. }
+                    | super::delivery::DeliveryAction::Enqueue { json, .. },
+            } = &command
+            {
+                return super::delivery::print_gate(&body, *json);
             }
             match remote_blob_cat(&target, &command, &body, deadline, wake_timeout) {
                 Ok(true) => return Ok(0),

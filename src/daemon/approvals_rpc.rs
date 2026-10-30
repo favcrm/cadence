@@ -186,7 +186,12 @@ impl Shared {
     }
 
     /// The repo of `params` as a registered project's lowercase slug.
-    fn project_repo(&self, pm: &crate::issue::Pm, params: &Value, verb: &str) -> Result<String> {
+    pub(super) fn project_repo(
+        &self,
+        pm: &crate::issue::Pm,
+        params: &Value,
+        verb: &str,
+    ) -> Result<String> {
         let raw = required_str(params, "repo")?;
         let repo = crate::delegation::repo_slug(raw).ok_or_else(|| {
             Error::rejected(format!("{verb}: repo '{raw}' is not a plain owner/name"))
@@ -254,10 +259,14 @@ impl Shared {
         let source = approver_source(&self.pm()?.config, &actor)?;
         let id = required_str(params, "id")?;
         let reason = required_str(params, "reason")?;
+        let record = self.store.approval_record(id)?;
         let new = self
             .store
             .revoke_board_approval(id, &source, reason, APPROVAL_RECORDED_VIA)?;
-        Ok(json!({"state": "revoked", "duplicate": !new, "approval_id": id}))
+        let auto_merge = self.disable_auto_merge(record.as_ref());
+        Ok(
+            json!({"state": "revoked", "duplicate": !new, "approval_id": id, "auto_merge": auto_merge}),
+        )
     }
 
     /// `approval_revoke` — the only way an approval is withdrawn. A
@@ -267,9 +276,11 @@ impl Shared {
         let id = required_str(params, "id")?;
         let source = required_str(params, "source")?;
         let reason = required_str(params, "reason")?;
+        let record = self.store.approval_record(id)?;
         let new = self
             .store
             .revoke_approval(id, source, reason, APPROVAL_RECORDED_VIA)?;
+        let auto_merge = self.disable_auto_merge(record.as_ref());
         Ok(json!({
             "state": "revoked",
             "duplicate": !new,
@@ -277,6 +288,7 @@ impl Shared {
             "source": source,
             "reason": reason,
             "recorded_via": APPROVAL_RECORDED_VIA,
+            "auto_merge": auto_merge,
         }))
     }
 

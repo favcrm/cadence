@@ -28,10 +28,10 @@ use super::write_path::{
 use super::{
     agent_access, app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer,
     app_records, app_release, app_runs, app_screens, approvals, apps, assist_route,
-    business_templates, cli_route, connections, credential_entry, crm_send, delivery_sync,
-    endpoints, home, lane, locale, member_assist, my_work, operator, platform_account, read_model,
-    social_publish, stages, threads, topics, updates, wiki, wiki_envelope, work_conversations,
-    workflows,
+    business_templates, cli_route, connections, credential_entry, crm_send, delivery_gate,
+    delivery_sync, endpoints, home, lane, locale, member_assist, my_work, operator,
+    platform_account, read_model, social_publish, stages, threads, topics, updates, wiki,
+    wiki_envelope, work_conversations, workflows,
 };
 use super::{
     push_device_login_config, ready_file, startup_failed_file, tailnet_url, ServeOpts,
@@ -1823,6 +1823,11 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         // CAD-1218: whether the shown head has an approval (drawer state).
         "/api/approvals/state" => {
             let resp = approvals::state(&request, state_dir, opts, raw_query);
+            send(request, resp);
+        }
+        // CAD-1946: the merge checklist for the head the card is showing.
+        "/api/delivery/gate" => {
+            let resp = delivery_gate::state(&request, state_dir, opts, raw_query);
             send(request, resp);
         }
         // CAD-615: the operator's master permission rules and pending

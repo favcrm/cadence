@@ -235,6 +235,7 @@ the code you just wrote.
 
 ### Merging
 
+- Ask what is missing with `cadence delivery check --repo <owner/name> --pr <n> --head <full-sha>`. On a hosted org the daemon runs the same `scripts/enqueue-reviewed` decision and prints its refusal lines. It does not fall back to a local daemon. `cadence delivery enqueue` with the same flags signs that head and enables auto-merge pinned to it. The operator may enqueue when the check is clean. A registered agent may enqueue only when the check says an operator approval is not required. Agents never record an approval. The board's Approve change card is this check: Approve and merge is offered only when every other row holds.
 - Enqueue with `scripts/enqueue-reviewed <n> --head <full-reviewed-sha>`. It
   refuses unless the PR is open at that head, every required check is
   present and green, the required verdicts are pinned to the head, a ticket

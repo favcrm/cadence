@@ -504,6 +504,32 @@ class EvidencePosting(unittest.TestCase):
         self.assertNotIn("pass", body.lower().replace("compass", ""))
         self.assertNotIn(APPROVAL_ID, body)
 
+    def test_check_does_not_require_the_evidence_comment(self):
+        """The comment is enqueue's output. A check must not demand it."""
+        rc, out, err = self.run_main("--dry-run", "--json")
+        self.assertEqual(rc, 1, (out, err))
+        dry = json.loads(out)
+        self.assertFalse(dry["ok"])
+        self.assertTrue(any("no ticket comment" in r for r in dry["reasons"]), dry)
+        rc, out, err = self.run_main("--check")
+        self.assertEqual(rc, 0, (out, err))
+        checked = json.loads(out)
+        self.assertTrue(checked["ok"], checked)
+        self.assertEqual(checked["operator_approval"], True)
+        self.assertTrue(all(row["ok"] for row in checked["rows"]), checked["rows"])
+        self.assertEqual(self.c.posted, [])
+        self.assertEqual(self.c.merges, [])
+
+    def test_gate_rows_keep_an_unclassified_reason(self):
+        rows = enq.gate_rows(
+            ["PR #5 head is ccc, not the pinned aaa", "something new the card has not named"],
+            {"collected": True, "operator_approval": True, "browser_qa": False},
+        )
+        ids = [row["id"] for row in rows]
+        self.assertIn("head", ids)
+        self.assertIn("other", ids)
+        self.assertFalse(all(row["ok"] for row in rows))
+
 
 if __name__ == "__main__":
     unittest.main()

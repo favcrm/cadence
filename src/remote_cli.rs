@@ -124,6 +124,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
     "master_status",
+    // CAD-1946: the hosted merge gate. The container runs the same
+    // enqueue-reviewed decision; the client only sends repo, pr and head.
+    "delivery_check",
+    "delivery_enqueue",
 ];
 
 /// Scope a cli authorize request asks for. Existing container verbs keep
@@ -133,6 +137,8 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
     match verb {
         "team_list" | "team_invites" => &["cli.read"],
         "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => &["cli.write"],
+        "delivery_check" => &["cli.read"],
+        "delivery_enqueue" => &["cli.write"],
         _ => &["cli.read", "cli.write"],
     }
 }
@@ -156,7 +162,7 @@ fn team_mutation_verb(verb: &str) -> bool {
 /// `message_send` is the historical member of this set; the team mutations
 /// join it for the reason above.
 fn mutating_cli_verb(verb: &str) -> bool {
-    verb == "message_send" || team_mutation_verb(verb)
+    verb == "message_send" || verb == "delivery_enqueue" || team_mutation_verb(verb)
 }
 
 /// The read a caller must run before repeating a mutating verb whose answer
@@ -167,6 +173,8 @@ fn mutating_cli_verb(verb: &str) -> bool {
 fn lost_mutation_note(verb: &str) -> &'static str {
     if verb == "message_send" {
         "the send may or may not have been recorded"
+    } else if verb == "delivery_enqueue" {
+        "the merge may or may not have been queued — run `delivery check` for the same repo, pr and head before trying again"
     } else {
         "the team change may or may not have been applied — inspect `team list` or \
          `team invites` with the same explicit --org before repeating it"

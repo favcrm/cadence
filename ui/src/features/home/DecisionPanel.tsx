@@ -7,7 +7,8 @@ import { READ_ONLY_COPY } from "./AnswerForm";
 import { useTranslate } from "../../lib/locale";
 import { useApproveHead } from "./ApproveHead";
 import { useIdeaDecision } from "./IdeaCard";
-import { useMergeDecision } from "./MergeForm";
+import { plainRefusal, useMergeDecision } from "./MergeForm";
+import { api } from "../../lib/api";
 import { usePlanDecision } from "./PlanCard";
 import { ageWords, changeSize, firstSentence, type HomeNeed } from "./needs";
 
@@ -345,33 +346,104 @@ function IdeaReview({ need, readOnly, index, total, onDone, onClose }: DecisionP
   );
 }
 
+type GateRow = { id: string; label: string; ok: boolean; detail?: string };
+type GateView =
+  | { kind: "loading" }
+  | { kind: "down" }
+  | { kind: "ready"; ok: boolean; rows: GateRow[] };
+
+function useDeliveryGate(pr: string | null, head: string | null) {
+  const target = pr ? /([\w.-]+\/[\w.-]+)#(\d+)/.exec(pr) ?? /github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/.exec(pr) : null;
+  const repo = target?.[1];
+  const number = target ? Number(target[2]) : 0;
+  const [view, setView] = useState<GateView>({ kind: "loading" });
+  useEffect(() => {
+    if (!repo || !number || !head) {
+      setView({ kind: "down" });
+      return;
+    }
+    let live = true;
+    setView({ kind: "loading" });
+    api
+      .deliveryGate(repo, number, head)
+      .then((out) => {
+        if (!live) return;
+        setView({ kind: "ready", ok: out.ok === true, rows: Array.isArray(out.rows) ? out.rows : [] });
+      })
+      .catch(() => {
+        if (live) setView({ kind: "down" });
+      });
+    return () => {
+      live = false;
+    };
+  }, [repo, number, head]);
+  return { repo, number, view };
+}
+
 function MergeReview({ need, readOnly, index, total, onDone, onClose }: DecisionPanelProps) {
   const action = need.action as HomeNeed["action"] & { type: "merge" };
   const block = useWriteBlock(readOnly);
   const t = useTranslate();
   const [sendBack, setSendBack] = useState(false);
   const [takeBack, setTakeBack] = useState(false);
+  const [merging, setMerging] = useState(false);
+  const [mergeError, setMergeError] = useState<string | null>(null);
   const issue = useIssue(action.issue);
-  const a = useApproveHead(action.pr, action.sha && action.sha.trim() ? action.sha : null);
-  const m = useMergeDecision(need as HomeNeed & { action: { type: "merge" } }, (t) =>
-    onDone(need.key, t.startsWith("declined") ? "Sent back" : "Published"),
+  const head = action.sha && action.sha.trim() ? action.sha : null;
+  const a = useApproveHead(action.pr, head);
+  const gate = useDeliveryGate(action.pr, head);
+  const m = useMergeDecision(need as HomeNeed & { action: { type: "merge" } }, (text) =>
+    onDone(need.key, text.startsWith("declined") ? "Sent back" : "Published"),
   );
   const size = changeSize(need.title);
-  const ticks = [
-    action.reviewer ? "Reviewed and passed by a second agent" : null,
-    action.verdict ? action.verdict : null,
-    m.head ? "Checked at the exact version you are about to publish" : null,
-  ].filter((t): t is string => !!t);
+  const rows = gate.view.kind === "ready" ? gate.view.rows : [];
+  const approval = rows.find((row) => row.id === "approval");
+  const headRow = rows.find((row) => row.id === "head");
+  const headMoved = headRow?.ok === false && headRow.label === "A newer version came in";
+  const othersOk = rows.filter((row) => row.id !== "approval").every((row) => row.ok);
+  const onlyApproval = gate.view.kind === "ready" && !gate.view.ok && othersOk && !!approval && !approval.ok;
+  const ready = gate.view.kind === "ready" && gate.view.ok;
+  const missing = rows.filter((row) => !row.ok).length;
+  const subtitle =
+    gate.view.kind === "down"
+      ? "Can't check right now — nothing was approved"
+      : headMoved
+        ? "A newer version came in — it needs a fresh review"
+        : ready || onlyApproval
+          ? "Ready to merge"
+          : missing === 1
+            ? "Needs 1 more thing"
+            : missing > 1
+              ? `Needs ${missing} more things`
+              : "Checking…";
   const lead = firstSentence(issue?.body);
-  const off = !!block || !m.head || a.member;
+  const off = !!block || !head || a.member || gate.view.kind !== "ready";
+  const showMerge = !off && (ready || onlyApproval) && !headMoved;
+  const approveAndMerge = () => {
+    if (!gate.repo || !gate.number || !head) return;
+    setMerging(true);
+    setMergeError(null);
+    const go = onlyApproval ? api.approveHead(gate.repo, gate.number, head).then(() => undefined) : Promise.resolve();
+    go
+      .then(() => api.deliveryEnqueue(gate.repo!, gate.number, head))
+      .then((out) => {
+        if (out && out.ok === false) {
+          setMergeError("Didn't merge — a check failed.");
+          return;
+        }
+        onDone(need.key, "Published");
+      })
+      .catch((error: unknown) => setMergeError(plainRefusal(error)))
+      .finally(() => setMerging(false));
+  };
   // One line per distinct error: a repeat of the same text shows once.
-  const errors = [...new Set([a.error, m.error].filter((t): t is string => !!t))];
+  const errors = [...new Set([a.error, m.error, mergeError].filter((text): text is string => !!text))];
   return (
     <Shell
       need={need}
       verb="Approve change"
       title={issue?.title ?? need.shortTitle ?? "Publish a change"}
-      subtitle={`${t("Ready")} ${waiting(need, t)}`}
+      subtitle={t(subtitle)}
       body={
         <>
           {lead && <p className="rv-lead">{lead}</p>}
@@ -381,8 +453,21 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: Decision
               <p className="rv-note">{size}</p>
             </>
           )}
-          <Ticks items={ticks} />
-          {!m.head && <p className="rv-error">{t("This has no checked version to approve. It needs a fresh review.")}</p>}
+          {rows.length > 0 && (
+            <>
+              <h4 className="rv-h">{t("Checked")}</h4>
+              <ul className="rv-ticks">
+                {rows.map((row) => (
+                  <li key={row.id} title={row.detail}>
+                    {row.ok ? "✓ " : ""}
+                    {t(row.label)}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          {gate.view.kind === "down" && <p className="rv-error">{t("Can't check right now — nothing was approved")}</p>}
+          {!head && <p className="rv-error">{t("This has no checked version to approve. It needs a fresh review.")}</p>}
           {sendBack && (
             <SendBack
               label="Send back"
@@ -435,26 +520,22 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: Decision
           total={total}
           onClose={onClose}
           primary={
-            <Button variant="primary" loading={m.busy === "merge"} disabled={off || m.busy !== null} onClick={() => { a.clearError(); m.merge(); }}>
-              {m.busy === "merge" ? t("Publishing…") : t("Publish")}
-            </Button>
+            showMerge || block ? (
+              <Button
+                variant="primary"
+                loading={merging}
+                disabled={!showMerge || merging}
+                title={block ? t(READ_ONLY_COPY) : undefined}
+                onClick={approveAndMerge}
+              >
+                {merging ? t("Approved — merging") : onlyApproval ? t("Approve and merge") : t("Merge")}
+              </Button>
+            ) : null
           }
           secondary={
-            <>
-              {a.available && !a.approved && !a.revoked && (
-                <Button
-                  disabled={!!block || a.member || a.busy !== null || m.busy !== null}
-                  loading={a.busy === "approve"}
-                  title={block ? t(READ_ONLY_COPY) : undefined}
-                  onClick={() => { m.clearError(); a.approve(); }}
-                >
-                  {t("Approve this version")}
-                </Button>
-              )}
-              <Button disabled={!!block || m.busy !== null} onClick={() => { setSendBack((s) => !s); m.clearError(); }}>
-                Send back…
-              </Button>
-            </>
+            <Button disabled={!!block || m.busy !== null} onClick={() => { setSendBack((s) => !s); m.clearError(); }}>
+              Send back…
+            </Button>
           }
         />
       }

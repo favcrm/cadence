@@ -44,6 +44,23 @@ cadence audit scope --issue CAD-92   # CAD-1106: ticket scope pre-approvals (id,
 counts (digest equals the sha256 of the trimmed current ticket body,
 `recorded_via` `operator-connection`, not revoked).
 
+`cadence delivery check` and `cadence delivery enqueue` (CAD-1946) run that
+same script on the daemon. The client sends only the repo, the PR and the
+full head. The check is `--check`: a dry run that does not require the
+evidence comment, because enqueue writes the comment itself. Enqueue signs
+`(repo, pr, head)` with the key at `<state>/delivery-gate/signing_key` (or
+the historical `~/.config/cadence/delivery-gate/signing_key` when the state
+dir has none) and enables auto-merge pinned to that head. The merge-group
+job still verifies the signature from the base commit; the gate does not
+write a GitHub check. The JSON document (`ok`, `reasons`, `rows`,
+`operator_approval`) is the card's checklist. It is not a second record: the
+approval stream and the signature comment stay the evidence. A missing or
+unreadable answer is a refusal, never a pass. Verdict notes are still the
+files the script reads (`CADENCE_NOTES_DIR`, otherwise `/var/www/agent-notes`).
+Revoking an approval turns auto-merge off for the pull request the record
+names. A registered agent may enqueue only when the check says an operator
+approval is not required, and an agent never records that approval.
+
 `audit verdicts` uses the same note parser as the audit. A reviewer is the
 first whitespace token of `From:`, lower-cased (the rest is prose). Its kind
 comes from the exact title (`Standards`, `Spec/security`, `Browser QA`,

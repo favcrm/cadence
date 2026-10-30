@@ -1331,8 +1331,9 @@ pub(crate) enum Commands {
     /// a REVISE back (at most 2, then the operator decides) or a PASS
     /// on; a PASS on a green head is one "merge?" row in Needs-you.
     /// `ls` reads the loop. `sync`, `merge` and `decline` are the
-    /// operator's and run GitHub (`gh`) with the operator's own
-    /// credentials from this process — the daemon never does.
+    /// operator's. `check` and `enqueue` run on the daemon: it shells
+    /// `scripts/enqueue-reviewed` for the registered repo, and `enqueue`
+    /// signs with the delivery-gate key. The client does not.
     Delivery {
         #[command(subcommand)]
         action: DeliveryAction,

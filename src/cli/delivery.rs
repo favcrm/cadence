@@ -83,6 +83,42 @@ pub(crate) enum DeliveryAction {
         #[arg(long)]
         request_file: PathBuf,
     },
+    /// What is still missing before this head can merge. The daemon
+    /// runs `scripts/enqueue-reviewed --check` and prints its refusal
+    /// lines. On a hosted org this is the remote verb; it does not
+    /// fall back to a local daemon.
+    Check {
+        /// `owner/name` of a repo registered on this org.
+        #[arg(long)]
+        repo: String,
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Full 40-hex head the review covered.
+        #[arg(long)]
+        head: String,
+        /// Print the gate's JSON document.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sign the head and enable auto-merge pinned to it, when the check
+    /// is clean. Operator only when the check requires an operator
+    /// approval; a registered agent may enqueue only when it does not.
+    /// The command never records an approval.
+    Enqueue {
+        /// `owner/name` of a repo registered on this org.
+        #[arg(long)]
+        repo: String,
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Full 40-hex head the review covered.
+        #[arg(long)]
+        head: String,
+        /// Print the gate's JSON document.
+        #[arg(long)]
+        json: bool,
+    },
     /// Decline the merge decision (or an escalated review) with a
     /// reason. Operator only.
     Decline {
@@ -92,6 +128,40 @@ pub(crate) enum DeliveryAction {
         #[arg(long)]
         reason: String,
     },
+}
+
+pub(super) fn print_gate(value: &serde_json::Value, json_out: bool) -> Result<i32> {
+    if json_out {
+        print_json(value);
+        return Ok(if value.get("ok") == Some(&serde_json::Value::Bool(true)) {
+            0
+        } else {
+            1
+        });
+    }
+    if let Some(report) = value.get("report").and_then(|v| v.as_array()) {
+        for line in report {
+            if let Some(text) = line.as_str() {
+                println!("enqueue-reviewed: {text}");
+            }
+        }
+    }
+    let ok = value.get("ok") == Some(&serde_json::Value::Bool(true));
+    if let Some(reasons) = value.get("reasons").and_then(|v| v.as_array()) {
+        for reason in reasons {
+            if let Some(text) = reason.as_str() {
+                eprintln!("enqueue-reviewed: refused: {text}");
+            }
+        }
+    }
+    if ok {
+        println!(
+            "enqueue-reviewed: every rule holds for PR #{} at {}",
+            value.get("pr").and_then(|v| v.as_u64()).unwrap_or(0),
+            value.get("head").and_then(|v| v.as_str()).unwrap_or("")
+        );
+    }
+    Ok(if ok { 0 } else { 1 })
 }
 
 pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i32> {
@@ -190,6 +260,32 @@ pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i
                 "delivery_approve",
                 json!({"issue": issue, "sha": sha}),
             )?
+        }
+        DeliveryAction::Check {
+            repo,
+            pr,
+            head,
+            json,
+        } => {
+            let value = client::rpc(
+                state_dir,
+                "delivery_gate_check",
+                json!({"repo": repo, "pr": pr, "head": head}),
+            )?;
+            return print_gate(&value, json);
+        }
+        DeliveryAction::Enqueue {
+            repo,
+            pr,
+            head,
+            json,
+        } => {
+            let value = client::rpc(
+                state_dir,
+                "delivery_gate_enqueue",
+                json!({"repo": repo, "pr": pr, "head": head}),
+            )?;
+            return print_gate(&value, json);
         }
         DeliveryAction::ReviewEvidence { request_file } => {
             let request: serde_json::Value = serde_json::from_slice(&std::fs::read(request_file)?)

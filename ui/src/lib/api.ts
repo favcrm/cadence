@@ -1385,6 +1385,25 @@ export const api = {
     get<{ state: "in-force" | "revoked" | "missing"; approval_id?: string; board_revocable?: boolean }>(
       `/api/approvals/state?repo=${encodeURIComponent(repo)}&pr=${pr}&head=${encodeURIComponent(head)}`,
     ),
+  /** `GET /api/delivery/gate` (CAD-1946) — the merge checklist for this head.
+   *  The daemon runs the same gate as enqueue-reviewed. A failure to answer
+   *  is not a pass. */
+  deliveryGate: (repo: string, pr: number, head: string) =>
+    get<{
+      ok: boolean;
+      reasons: string[];
+      operator_approval: boolean | null;
+      rows: { id: string; label: string; ok: boolean; detail?: string }[];
+      repo: string;
+      pr: number;
+      head: string;
+    }>(
+      `/api/delivery/gate?repo=${encodeURIComponent(repo)}&pr=${pr}&head=${encodeURIComponent(head)}`,
+    ),
+  /** `POST /api/delivery/gate/enqueue` (CAD-1946) — sign and queue this head
+   *  when the check is clean. Does not record an approval. */
+  deliveryEnqueue: (repo: string, pr: number, head: string) =>
+    post<{ ok: boolean; reasons?: string[] }>("/api/delivery/gate/enqueue", { repo, pr, head }),
   /** `POST /api/approvals/<id>/revoke` (CAD-1218) — withdraw that approval. */
   revokeApproval: (id: string, reason: string) =>
     post<Record<string, unknown>>(`/api/approvals/${encodeURIComponent(id)}/revoke`, { reason }),

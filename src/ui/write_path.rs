@@ -22,8 +22,8 @@ use super::ServeOpts;
 use super::{
     app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_media, app_records,
     app_release, app_runs, app_screens, app_social_drafts, approvals, apps, business_templates,
-    connections, credential_entry, crm_send, crm_smtp, endpoints, home, lane, operator, read_model,
-    social_publish, stages, threads, updates, whatsapp, wiki, workflows,
+    connections, credential_entry, crm_send, crm_smtp, delivery_gate, endpoints, home, lane,
+    operator, read_model, social_publish, stages, threads, updates, whatsapp, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -1460,6 +1460,19 @@ pub(crate) fn write_route(
     }
     // CAD-1218: the operator's PR-head approval and its revoke — guarded,
     // operator-only, and only a `Caller::Operator` inside `approvals`.
+    if path == "/api/delivery/gate/enqueue" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let Some(caller) = &caller else {
+            send(request, err_response(500, "unadmitted write"));
+            return;
+        };
+        let resp = delivery_gate::enqueue(&mut request, state_dir, caller);
+        send(request, resp);
+        return;
+    }
     if let Some(route) = approvals::route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));

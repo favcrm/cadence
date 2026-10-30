@@ -1085,6 +1085,16 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "delivery_decline",
         Rule::Handler("operator_connection (CAD-431)"),
     ),
+    // CAD-1946: the check is a read of the gate script. Enqueue is the
+    // handler's own admit: an operator, or a registered agent only when
+    // the check says an operator approval is not required.
+    ("delivery_gate_check", Rule::Read),
+    (
+        "delivery_gate_enqueue",
+        Rule::Handler(
+            "admit_gate_enqueue (CAD-1946): operator, or a registered agent only when no operator approval is required",
+        ),
+    ),
     (
         "interrupt",
         Rule::Handler("authorize_agent_mutation / master_dispatched (CAD-323)"),

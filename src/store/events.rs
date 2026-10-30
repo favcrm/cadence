@@ -1381,6 +1381,18 @@ impl Store {
         })
     }
 
+    /// The recorded approval payload for `id`, revoked or not. The
+    /// revoke path reads the repo and PR from it so it can turn
+    /// auto-merge off. `None` when the stream has no such record.
+    pub fn approval_record(&self, id: &str) -> Result<Option<Value>> {
+        self.read_tx(|conn| {
+            let stream = Self::approval_stream(&conn)?;
+            Ok(stream.into_iter().find_map(|(kind, payload, _)| {
+                (kind == APPROVAL_RECORDED_EVENT && payload["approval_id"] == id).then_some(payload)
+            }))
+        })
+    }
+
     /// A live (unrevoked) scope pre-approval by id: `(issue, digest)`.
     pub fn scope_approval(&self, id: &str) -> Result<Option<(String, String)>> {
         self.read_tx(|conn| {
