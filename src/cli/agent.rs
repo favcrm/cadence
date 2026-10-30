@@ -1,6 +1,7 @@
 //! CAD-535: `cadence agent` — moved verbatim from src/main.rs.
 
 use super::cloud_agent;
+use super::join;
 use super::local_agent;
 use super::*;
 
@@ -38,6 +39,7 @@ mod bridge_tests {
                 workspace: None,
                 repo: None,
                 name: None,
+                fyi_only: false,
             }
             .bridge(),
             Some(local_agent::LocalAgentAction::Connect { .. })
@@ -514,6 +516,156 @@ pub(crate) enum AgentAction {
         #[arg(long = "expect-rev")]
         expected: Vec<String>,
     },
+    /// Join a new worker agent to a group. `<group>` is the PM agent —
+    /// its alias or provider-native id — and `<provider>` is devin,
+    /// codex, claude, pi, cursor or fake. The worker's results route back
+    /// to the PM by default (its params gain `"upstream"`). This
+    /// terminal attaches once the endpoint is open, same rules as
+    /// `cadence devin`. `--cloud` (provider devin) opens a Devin Cloud
+    /// session; `--cloud-params` is the same semicolon-separated
+    /// `key=value` list as `cadence devin --cloud-params`. From inside
+    /// an agent's pane only a group root (no upstream) may join, and
+    /// only into its own group (CAD-149). This is the canonical path;
+    /// the root `join` spelling still parses.
+    Join {
+        /// Group handle — the PM agent's alias or native session id.
+        group: String,
+        /// Worker provider: devin, codex, claude, pi, cursor or fake.
+        provider: String,
+        /// Resume an existing native session as the worker (devin slug,
+        /// a Claude session id with --tui, or a Cursor chat id).
+        #[arg(short = 'r', long)]
+        resume: Option<String>,
+        /// Run the worker's interactive terminal in an owned tmux pane
+        /// — the provider's pty endpoint (claude: `cadence agent join <pm>
+        /// claude --tui`; devin is always a TUI and needs no flag).
+        #[arg(long)]
+        tui: bool,
+        /// Do not attach this terminal once the endpoint is up.
+        #[arg(long)]
+        detach: bool,
+        /// Working directory for the worker [default: the group agent's cwd].
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Routing alias [default: <provider>-<random>].
+        #[arg(long)]
+        alias: Option<String>,
+        /// pm, worker, or reviewer. `reviewer` is who a delivery review
+        /// may be routed to; it does not grant PM authority.
+        #[arg(long, default_value = "worker")]
+        role: String,
+        /// Worker filesystem sandbox, recorded on registration. Codex
+        /// sends it on `thread/start`; for a codex worker the default
+        /// is workspace-write — `read-only` only when asked. Other
+        /// providers store the value without consuming it and keep the
+        /// read-only default.
+        #[arg(long, value_parser = ["read-only", "workspace-write"])]
+        sandbox: Option<String>,
+        /// File with role instructions, embedded in the worker's briefing
+        /// under a role-instructions section (codex also receives them
+        /// natively as developer instructions). Refused with
+        /// `--no-bootstrap` on every provider but codex — the briefing is
+        /// their only delivery channel there.
+        #[arg(long)]
+        instructions_file: Option<PathBuf>,
+        /// Saved Agents settings profile. Its instructions and defaults are
+        /// resolved by the daemon and snapshotted for this new session.
+        #[arg(long, conflicts_with_all = ["instructions_file", "no_bootstrap"])]
+        profile: Option<String>,
+        /// Run the worker in an isolated checkout of the PM's repo:
+        /// `git worktree add <repo>/.cadence/wt/<name> -b cadence/<name>`.
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Skip the briefing file, AGENTS.md block and bootstrap
+        /// message entirely.
+        #[arg(long)]
+        no_bootstrap: bool,
+        /// Opt the worker into verified auto-ready (pty providers only):
+        /// the daemon probes the pane and self-claims when visibly idle.
+        #[arg(long)]
+        auto_ready: bool,
+        /// Write the cadence marker block into the worker's repo
+        /// AGENTS.md once the endpoint opens (persisted, re-applied on
+        /// resume). Off by default — joins leave the repo untouched.
+        #[arg(long)]
+        agents_md: bool,
+        /// Model flag for providers `claude`, `cursor`, `codex` and `pi`
+        /// (e.g. sonnet, haiku, gpt-5.6-luna, anthropic/claude-sonnet-4).
+        #[arg(long)]
+        model: Option<String>,
+        /// Use the provider's native model instead of a daemon default.
+        /// This does not pass a model argument to the provider.
+        #[arg(long, conflicts_with = "model")]
+        provider_default_model: bool,
+        /// Team role used only to look up a model default. Does not
+        /// change runtime pm/worker authorization. `ops` is stored as
+        /// `devops`.
+        #[arg(long)]
+        team_role: Option<String>,
+        /// Reasoning effort for providers `claude`, `codex` and `pi`
+        /// (`--effort`; pi's `set_thinking_level` vocabulary also takes
+        /// `off` and `minimal`). Each provider's vocabulary is validated
+        /// against the launch params at registration; for pi the
+        /// adapter also verifies what stuck through `get_state`.
+        #[arg(long, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh", "max"])]
+        effort: Option<String>,
+        /// Codex approval policy, stored in params and replayed on
+        /// resume [default: never]. Refused for other providers.
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(
+            registry::CODEX_APPROVAL_POLICIES.iter().copied()))]
+        approval_policy: Option<String>,
+        /// Permission mode, replayed on resume. Claude takes its own
+        /// modes [default: manual]; devin takes auto, accept-edits,
+        /// smart or dangerous; cursor takes auto-review or force.
+        /// Refused with `--cloud`.
+        #[arg(long)]
+        permission_mode: Option<String>,
+        /// Extra auto-allowed tool patterns for provider `claude`;
+        /// repeatable. `Bash(cadence *)` is always included.
+        #[arg(long)]
+        allow: Vec<String>,
+        /// Permission-mode shortcut: bypassPermissions for claude,
+        /// dangerous for devin, force for cursor.
+        #[arg(long, conflicts_with = "permission_mode")]
+        bypass: bool,
+        /// Seconds without any provider event before a claude, codex or
+        /// pi turn is declared unknown [default: 900]. Managed endpoint only.
+        #[arg(long, conflicts_with = "tui", value_parser = clap::value_parser!(u64).range(1..))]
+        turn_idle_secs: Option<u64>,
+        /// Optional absolute turn cap in seconds for provider `claude`,
+        /// `codex` or `pi`. Managed endpoint only.
+        #[arg(long, conflicts_with = "tui", value_parser = clap::value_parser!(u64).range(1..))]
+        turn_max_secs: Option<u64>,
+        /// Broker a claude worker's tool-permission prompts through
+        /// `agent requests` / `agent respond` instead of auto-denying
+        /// them. Managed endpoint only; refused with `--bypass` and
+        /// `--tui`.
+        #[arg(long, conflicts_with_all = ["bypass", "tui"])]
+        broker_approvals: bool,
+        /// Seconds a brokered prompt waits on an operator decision
+        /// before the tool call is denied [default: 900].
+        #[arg(long, requires = "broker_approvals", value_parser = clap::value_parser!(u64).range(1..))]
+        permission_timeout_secs: Option<u64>,
+        /// Open a Devin Cloud session instead of a local pty. Provider
+        /// must be `devin`.
+        #[arg(long)]
+        cloud: bool,
+        /// Semicolon-separated cloud create params. Requires `--cloud`.
+        #[arg(long, value_name = "PARAMS", requires = "cloud")]
+        cloud_params: Option<String>,
+        /// Landlock-confine the worker (provider `pi`, CAD-556): the
+        /// child sees only its worktree, the repo's shared git dir and
+        /// dep caches, the toolchain, its own state dir and the PM
+        /// tracker — `agent show` prints the emitted policy. Refused
+        /// on a host without Landlock; unset defers to the pm.yaml
+        /// `[host] confine_pi_workers` default.
+        #[arg(long)]
+        confine: bool,
+        /// Explicitly unconfined — overrides a `[host]
+        /// confine_pi_workers` default for this one worker.
+        #[arg(long, conflicts_with = "confine")]
+        no_confine: bool,
+    },
     /// List a hosted workspace directory page. Presence is observed, not execution capability.
     Directory {
         /// Previous page's after_id (lag_<UUID>); null means exhausted.
@@ -574,6 +726,9 @@ pub(crate) enum AgentAction {
         /// Lane slug. Defaults to `work`.
         #[arg(long, conflicts_with = "cloud")]
         name: Option<String>,
+        /// Register this explicit agent for FYI only; preserve the assignment default.
+        #[arg(long, conflicts_with = "cloud")]
+        fyi_only: bool,
     },
     /// Keep picking up later assignments until disconnected or interrupted.
     Watch,
@@ -589,6 +744,24 @@ pub(crate) enum AgentAction {
         to: Option<String>,
         #[arg(long)]
         cancel: bool,
+    },
+    /// Report a claim this machine already holds.
+    Report {
+        assignment: String,
+        /// `running`, `blocked`, `failed`, or `result`.
+        #[arg(long)]
+        state: String,
+        #[arg(long)]
+        text: Option<String>,
+        /// 40 or 64 lowercase hex characters. Required for result.
+        #[arg(long)]
+        head: Option<String>,
+    },
+    /// Save one optional legacy tool/publisher credential; does not activate tooling.
+    Tool {
+        /// Legacy `provider.draft` or `publish.send`; normal account images need neither.
+        #[arg(long)]
+        lane: String,
     },
     /// Inspect or reconcile a Worker/Pi connection. Connecting is
     /// `agent connect --cloud`, not a verb here. `--placement cloud` is
@@ -609,12 +782,16 @@ impl AgentAction {
         Some(match self {
             Self::Connect { cloud: true, .. } => return None,
             Self::Connect {
-                alias, repo, name, ..
+                alias,
+                repo,
+                name,
+                fyi_only,
+                ..
             } => L::Connect {
                 alias: alias.clone(),
                 repo: repo.clone(),
                 name: name.clone(),
-                fyi_only: false,
+                fyi_only: *fyi_only,
             },
             Self::Directory { after_id } => L::Directory {
                 after_id: after_id.clone(),
@@ -645,6 +822,18 @@ impl AgentAction {
                 to: to.clone(),
                 cancel: *cancel,
             },
+            Self::Report {
+                assignment,
+                state,
+                text,
+                head,
+            } => L::Report {
+                assignment: assignment.clone(),
+                state: state.clone(),
+                text: text.clone(),
+                head: head.clone(),
+            },
+            Self::Tool { lane } => L::Tool { lane: lane.clone() },
             _ => return None,
         })
     }
@@ -1044,6 +1233,74 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
                 .collect();
             client::rpc(&state_dir, "agent_restore", json!({"expected": entries}))?
         }
+        AgentAction::Join {
+            group,
+            provider,
+            resume,
+            tui,
+            detach,
+            cwd,
+            alias,
+            role,
+            sandbox,
+            instructions_file,
+            worktree,
+            no_bootstrap,
+            auto_ready,
+            agents_md,
+            model,
+            provider_default_model,
+            team_role,
+            effort,
+            approval_policy,
+            permission_mode,
+            allow,
+            bypass,
+            turn_idle_secs,
+            turn_max_secs,
+            broker_approvals,
+            permission_timeout_secs,
+            cloud,
+            cloud_params,
+            confine,
+            no_confine,
+            profile,
+        } => {
+            return join::run(
+                state_dir,
+                group,
+                provider,
+                resume,
+                tui,
+                detach,
+                cwd,
+                alias,
+                role,
+                sandbox,
+                instructions_file,
+                worktree,
+                no_bootstrap,
+                auto_ready,
+                agents_md,
+                model,
+                provider_default_model,
+                team_role,
+                effort,
+                approval_policy,
+                permission_mode,
+                allow,
+                bypass,
+                turn_idle_secs,
+                turn_max_secs,
+                broker_approvals,
+                permission_timeout_secs,
+                cloud,
+                cloud_params,
+                confine,
+                no_confine,
+                profile,
+            );
+        }
         AgentAction::Cloud { action } => return cloud_agent::run(state_dir, action),
         AgentAction::Connect {
             cloud: true,
@@ -1060,9 +1317,11 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
         | AgentAction::Watch
         | AgentAction::Assignments
         | AgentAction::Disconnect
-        | AgentAction::Reassign { .. } => {
+        | AgentAction::Reassign { .. }
+        | AgentAction::Report { .. }
+        | AgentAction::Tool { .. } => {
             return Err(Error::usage(
-                "agent connect/watch/assignments/disconnect/reassign/directory/notify/inbox require a selected hosted org. Nothing was sent or claimed.",
+                "agent connect/watch/assignments/disconnect/reassign/directory/notify/inbox/report/tool require a selected hosted org. Nothing was sent or claimed.",
             ))
         }
     };

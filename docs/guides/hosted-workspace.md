@@ -149,7 +149,7 @@ The teammate accepts the workspace invitation through the platform and runs
 saved credential and private configuration; never copy the owner's credential,
 browser cookie or another agent's state. A member can approve ordinary CLI/wiki
 collaboration. App lifecycle changes below require a current **human owner**.
-Invitation acceptance, credential consent and local-agent registration are
+Invitation acceptance, credential consent and local agent registration are
 separate actions; installing an app does not perform any of them.
 
 ```sh
@@ -175,11 +175,10 @@ Three IDs have different lifetimes:
 The daemon retains stable agent IDs across disconnect/reconnect. Labels,
 `client_agent_id`, adapter metadata and any of these IDs confer no permission.
 There is one explicitly selected assignment default per member/workspace; extra
-sessions do not race it for claims. For an additional explicit FYI-only alias,
-use the lower-level supported surface:
+sessions do not race it for claims. For an additional explicit FYI-only alias:
 
 ```sh
-cadence --org acme local-agent connect --alias my-reviewer --fyi-only
+cadence --org acme agent connect --alias my-reviewer --fyi-only
 ```
 
 This preserves the assignment default and multiplexes notices on the same

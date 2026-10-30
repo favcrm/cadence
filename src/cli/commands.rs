@@ -730,7 +730,8 @@ pub(crate) enum Commands {
     },
     /// Enqueue a durable message to an agent — the hot-path alias for
     /// `message send`. Returns once the message is durable; delivery and
-    /// reporting continue asynchronously.
+    /// reporting continue asynchronously. Off the default help;
+    /// `message send` is the canonical path.
     ///
     /// `cadence send <ALIAS> --text <body>`: the recipient is the
     /// positional alias (or `--to <ALIAS>`, exactly one of the two) and
@@ -795,13 +796,6 @@ pub(crate) enum Commands {
               conflicts_with_all = ["nudge", "priority", "supersedes"])]
         wait: Option<u64>,
     },
-    /// Hosted coordination for this user's local agent (CAD-1460).
-    /// Requires a selected remote org. It does not run in the container.
-    #[command(hide = true)]
-    LocalAgent {
-        #[command(subcommand)]
-        action: local_agent::LocalAgentAction,
-    },
     /// Administer people on the selected hosted workspace.
     /// Owner and member can list the directory. Invitations, role
     /// changes and removal are owner-only and use the hosted CLI call.
@@ -814,7 +808,8 @@ pub(crate) enum Commands {
     /// One-step issue dispatch: `issue start` (idempotent, owner =
     /// the worker) then exactly one templated kickoff message, a
     /// tracker comment and a `message` ref on the issue. With `--job`
-    /// the kickoff goes through `job dispatch` instead.
+    /// the kickoff goes through `job dispatch` instead. Off the
+    /// default help; the root spelling stays callable.
     Dispatch {
         /// Issue id (e.g. CAD-55).
         issue: String,
@@ -877,7 +872,8 @@ pub(crate) enum Commands {
     /// session; `--cloud-params` is the same semicolon-separated
     /// `key=value` list as `cadence devin --cloud-params`. From inside
     /// an agent's pane only a group root (no upstream) may join, and
-    /// only into its own group (CAD-149).
+    /// only into its own group (CAD-149). Off the default help;
+    /// `agent join` is the canonical path and this spelling still parses.
     Join {
         /// Group handle — the PM agent's alias or native session id.
         group: String,
@@ -1261,17 +1257,19 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: PlatformAction,
     },
-    /// Plans (CAD-359/360): a proposed epic with its tickets. `propose`
-    /// writes it from a Markdown file; the operator `approve`s or
-    /// `reject`s it (operator connection only); until approved none of
-    /// its tickets dispatch. `show` prints state, tickets and
-    /// size-weighted progress.
     /// Idea pipeline (CAD-139): research and a plan can run, then the
     /// operator decides. Nothing is created until that decision.
     Idea {
         #[command(subcommand)]
         action: IdeaAction,
     },
+    /// Plans (CAD-359/360): a proposed epic with its tickets. `propose`
+    /// writes it from a Markdown file; the operator `approve`s or
+    /// `reject`s it (operator connection only); until approved none of
+    /// its tickets dispatch. `show` prints plan state, tickets and
+    /// size-weighted progress. Off the default help. Propose, approve
+    /// and reject are `issue epic`; `plan ls` and `plan show` stay
+    /// until they match `issue epic ls` and `issue epic show`.
     Plan {
         #[command(subcommand)]
         action: PlanAction,
