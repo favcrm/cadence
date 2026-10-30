@@ -28,9 +28,29 @@ pub const LESSON_MAX_ENTRIES: usize = 12;
 pub const LESSON_MAX_BYTES: usize = 4 * 1024;
 
 /// What a reader must not infer from the entries that follow.
-const LESSON_HEADER: &str = "# Lessons — matched project memories\n\n\
+const LESSON_HEADER_PREFIX: &str = "# Lessons — matched project memories\n\n\
     Cited references are recorded pointers, not resolved evidence; a declared \
     check condition is advisory and never run here.\n\n";
+
+/// Named wherever a lesson is supplied. No turn token is interpolated, and
+/// rendering this sentence does not record use. A task report's
+/// `context_feedback` is a different channel and does not renew supply.
+pub const LESSON_USE_INSTRUCTION: &str = "\
+When you apply a lesson, file `cadence memory feedback <slug> --kind used` \
+with its `--digest`, your `--message`, and the current turn `--token` from \
+`cadence self`. Do not put that token in `--evidence`.\n";
+
+/// How a reader of supplied lessons finds the rest of the scoped set and
+/// records a new one. Named in the briefing's project-memory section and in
+/// the nonempty lessons header, because a path-scoped gotcha never reaches
+/// the briefing and would otherwise carry no discovery path.
+pub const LESSON_DISCOVERY_INSTRUCTION: &str = "\
+`cadence memory match --issue <ID>` lists everything scoped to a task; \
+`cadence memory propose` records a new lesson.\n";
+
+fn lesson_header() -> String {
+    format!("{LESSON_HEADER_PREFIX}{LESSON_DISCOVERY_INSTRUCTION}{LESSON_USE_INSTRUCTION}\n")
+}
 
 /// Per-entry display caps. Applicability, citations and a condition orient
 /// the reader; they never push an entry or the file past its bound.
@@ -312,7 +332,7 @@ fn push_note(out: &mut String, note: &str) {
 /// An injected entry always outranks a tail note: a note that cannot fit
 /// is dropped, and the caller still sees the omission in `slugs`.
 pub fn render_lessons(matched: &Matched) -> (String, Vec<String>) {
-    let mut out = String::from(LESSON_HEADER);
+    let mut out = lesson_header();
     let mut slugs = Vec::new();
     let mut omitted = 0usize;
     for m in matched.lessons.iter().take(LESSON_MAX_ENTRIES) {

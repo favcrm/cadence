@@ -296,7 +296,7 @@ fn accept_lesson_with(
         project,
         "rule",
         scope,
-        None,
+        Some("CAD-1913"),
         Some("high"),
         None,
         Some(&lesson_body(claim)),

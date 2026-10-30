@@ -14,8 +14,9 @@
 //! remain readable but never become retrieval authority.
 //!
 //! Retrieval requires an accepted, policy-qualified and applicable claim.
-//! Scope axes retain their union semantics; role restrictions are an
-//! additional gate. `matching` withholds explicit staleness, unknown target
+//! Scope axes retain their union semantics; a write requires a nonempty
+//! source and at least one axis. Role restrictions are an additional gate,
+//! not an axis. `matching` withholds explicit staleness, unknown target
 //! roles and v2 unused expiry, separately from verification-age labels.
 //! Source attestation and policy review never invent mechanical freshness.
 //!
@@ -53,8 +54,8 @@ pub use matching::{
     Freshness, MatchCtx, Matched, DEFAULT_STALE_DAYS,
 };
 pub use rendering::{
-    card_json, detail_json, detail_json_with_evidence, render_lessons, LESSON_MAX_BYTES,
-    LESSON_MAX_ENTRIES,
+    card_json, detail_json, detail_json_with_evidence, render_lessons,
+    LESSON_DISCOVERY_INSTRUCTION, LESSON_MAX_BYTES, LESSON_MAX_ENTRIES, LESSON_USE_INSTRUCTION,
 };
 
 pub const TYPES: &[&str] = &["rule", "gotcha", "decision", "recipe"];
@@ -148,8 +149,9 @@ impl NativeIdentity {
     }
 }
 
-/// `scope:` — every axis is optional; an empty scope matches only via
-/// `project: true` (which is itself one of the axes).
+/// `scope:` — retrieval is the union of `project`, component, path, tag,
+/// and provider. A write must set one of those axes. An empty scope
+/// matches nothing. A role selector is not an axis.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -869,6 +871,72 @@ fn glob_over_budget(pat: &str) -> bool {
     pat.len() > 200 || pat.matches("**").count() > 2
 }
 
+fn axis_value(values: &[String]) -> bool {
+    values.iter().any(|value| !value.trim().is_empty())
+}
+
+/// `project`, or one nonempty component, path, tag, or provider.
+fn scope_has_retrieval_axis(scope: &Scope) -> bool {
+    scope.project
+        || axis_value(&scope.components)
+        || axis_value(&scope.paths)
+        || axis_value(&scope.tags)
+        || axis_value(&scope.providers)
+}
+
+/// Refuse a write whose source is blank or whose scope has no retrieval
+/// axis. `matching::applies` would otherwise never select it. Name every
+/// missing gap in the one refusal.
+fn require_retrievable(mem: &Memory) -> Result<()> {
+    let source_ok = mem
+        .front
+        .source
+        .as_deref()
+        .is_some_and(|source| !source.trim().is_empty());
+    let scope_ok = scope_has_retrieval_axis(&mem.front.scope);
+    if source_ok && scope_ok {
+        return Ok(());
+    }
+    let mut gaps = Vec::new();
+    if !source_ok {
+        gaps.push("source is empty");
+    }
+    if !scope_ok {
+        gaps.push(
+            "scope has no retrieval axis — set project or at least one component, path, tag, or provider; a role selector is not a scope axis",
+        );
+    }
+    Err(Error::rejected(format!(
+        "memory is not retrievable: {}",
+        gaps.join("; ")
+    )))
+}
+
+/// The component and path checks a stored lesson still owns after its
+/// retrieval gap has been downgraded to a warning. An unknown component or
+/// an over-complex glob is a defect in this file whether or not it is
+/// retrievable, so a historical record cannot hide it from a commit.
+fn check_declared_scope(mem: &Memory, components: &[String]) -> Result<()> {
+    let f = &mem.front;
+    for c in &f.scope.components {
+        if !components.is_empty() && !components.iter().any(|d| d == c) {
+            return Err(Error::rejected(format!(
+                "Unknown component '{c}' — {} declares: {}",
+                mem.project,
+                components.join(", ")
+            )));
+        }
+    }
+    for pat in &f.scope.paths {
+        if glob_over_budget(pat) {
+            return Err(Error::rejected(format!(
+                "path scope '{pat}' is too complex — ≤200 chars, ≤2 `**` segments"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Frontmatter + body validation used by every write and by lint.
 /// `components` is the project's declared list (empty = anything goes).
 fn check_front(mem: &Memory, components: &[String]) -> Result<()> {
@@ -904,22 +972,11 @@ fn check_front(mem: &Memory, components: &[String]) -> Result<()> {
             CONFIDENCES.join(" ")
         )));
     }
-    for c in &f.scope.components {
-        if !components.is_empty() && !components.iter().any(|d| d == c) {
-            return Err(Error::rejected(format!(
-                "Unknown component '{c}' — {} declares: {}",
-                mem.project,
-                components.join(", ")
-            )));
-        }
-    }
-    for pat in &f.scope.paths {
-        if glob_over_budget(pat) {
-            return Err(Error::rejected(format!(
-                "path scope '{pat}' is too complex — ≤200 chars, ≤2 `**` segments"
-            )));
-        }
-    }
+    // Before component and path checks. A whitespace component is not a
+    // declared component, and reporting that first would hide the source
+    // and retrieval gaps this refusal exists to name together.
+    require_retrievable(mem)?;
+    check_declared_scope(mem, components)?;
     let mut errs = Vec::new();
     lint_body(&f.id, &mem.body, &mut |e| errs.push(e));
     if let Some(first) = errs.into_iter().next() {
@@ -1546,6 +1603,21 @@ pub fn lint_dir(
     err: &mut dyn FnMut(String),
     warn: &mut dyn FnMut(String),
 ) {
+    lint_dir_scoped(dir, proj, err, warn, None);
+}
+
+/// Like [`lint_dir`], but a missing source or retrieval axis is a commit
+/// error only for `retrievable_strict` (repo-relative `memory/*.md` paths).
+/// The same gap in any other file is a warning, so one untouched historical
+/// lesson cannot refuse a later commit. `None` reports every such gap as an
+/// error, which is what full `issue lint` and `memory lint` do.
+pub(crate) fn lint_dir_scoped(
+    dir: &Path,
+    proj: &project::Project,
+    err: &mut dyn FnMut(String),
+    warn: &mut dyn FnMut(String),
+    retrievable_strict: Option<&std::collections::HashSet<String>>,
+) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         // An absent dir lints clean — nothing to check.
@@ -1607,7 +1679,22 @@ pub fn lint_dir(
     }
     for m in &mems {
         for e in check_front(m, &proj.components).err().into_iter() {
-            err(format!("{}/memory/{}.md: {e}", m.project, m.front.id));
+            let msg = format!("{}/memory/{}.md: {e}", m.project, m.front.id);
+            let rel = format!("{}/memory/{}.md", m.project, m.front.id);
+            let historical = e.to_string().contains("memory is not retrievable")
+                && retrievable_strict.is_some_and(|strict| !strict.contains(&rel));
+            if historical {
+                warn(msg);
+                // The downgrade covers the retrieval gap alone. The same
+                // file's unknown component or unsafe path glob still
+                // refuses the commit, exactly as it did before this
+                // downgrade existed.
+                if let Err(e) = check_declared_scope(m, &proj.components) {
+                    err(format!("{}/memory/{}.md: {e}", m.project, m.front.id));
+                }
+            } else {
+                err(msg);
+            }
         }
         let mut body_errs = Vec::new();
         lint_body(&m.front.id, &m.body, &mut |e| body_errs.push(e));
@@ -1621,18 +1708,6 @@ pub fn lint_dir(
                     m.project, m.front.id
                 ));
             }
-        }
-        if m.front.status == "accepted"
-            && m.front.scope.paths.is_empty()
-            && !m.front.scope.project
-            && m.front.scope.components.is_empty()
-            && m.front.scope.tags.is_empty()
-            && m.front.scope.providers.is_empty()
-        {
-            warn(format!(
-                "{}/memory/{}.md: accepted but has no scope — it matches nothing",
-                m.project, m.front.id
-            ));
         }
     }
 }
@@ -1900,6 +1975,441 @@ mod tests {
             assert!(!msg.contains(&digest[..40]), "{msg}");
             assert!(!memory_dir(&pm, "demo").join("leaky.md").exists());
         }
+    }
+
+    fn tracker_head(pm: &Pm) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&pm.dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "tracker rev-parse");
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    fn propose_lesson(
+        pm: &Pm,
+        author: &policy::NativeActor,
+        slug: &str,
+        scope: Scope,
+        source: Option<&str>,
+        from_text: Option<&str>,
+        options: policy::ProposalOptions,
+    ) -> Result<Value> {
+        let body = "fact\n\n**Why:** evidence\n\n**How to apply:** use it\n";
+        propose_native(
+            pm,
+            "demo",
+            "rule",
+            scope,
+            source,
+            Some("medium"),
+            from_text,
+            from_text.is_none().then_some(body),
+            Some(slug),
+            options,
+            author,
+        )
+    }
+
+    /// CAD-1947: a proposal that cannot be retrieved is refused before
+    /// any tracker commit. A role selector is not a retrieval axis.
+    #[test]
+    fn propose_refuses_empty_source_or_empty_scope_before_commit() {
+        let (_dir, pm) = mutation_fixture();
+        let author = proposal_actor("worker-author");
+        let head = tracker_head(&pm);
+        let body_path = |slug: &str| memory_dir(&pm, "demo").join(format!("{slug}.md"));
+
+        let err = propose_lesson(
+            &pm,
+            &author,
+            "no-axis",
+            Scope::default(),
+            None,
+            None,
+            policy::ProposalOptions::default(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("source is empty"), "{msg}");
+        assert!(msg.contains("scope has no retrieval axis"), "{msg}");
+        assert!(!body_path("no-axis").exists());
+
+        let err = propose_lesson(
+            &pm,
+            &author,
+            "blank-source",
+            Scope {
+                project: true,
+                ..Scope::default()
+            },
+            Some(" \t"),
+            None,
+            policy::ProposalOptions::default(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("source is empty"), "{msg}");
+        assert!(!msg.contains("scope has no retrieval axis"), "{msg}");
+        assert!(!body_path("blank-source").exists());
+
+        let err = propose_lesson(
+            &pm,
+            &author,
+            "no-scope",
+            Scope {
+                components: vec!["  ".to_string()],
+                ..Scope::default()
+            },
+            Some("CAD-1947"),
+            None,
+            policy::ProposalOptions::default(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("scope has no retrieval axis"), "{msg}");
+        assert!(!msg.contains("source is empty"), "{msg}");
+        assert!(!body_path("no-scope").exists());
+
+        let roles = policy::ProposalOptions {
+            audience: policy::Audience::Role,
+            roles: vec!["dev".to_string()],
+            ..policy::ProposalOptions::default()
+        };
+        let err = propose_lesson(
+            &pm,
+            &author,
+            "role-only",
+            Scope::default(),
+            Some("CAD-1947"),
+            None,
+            roles,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("role selector is not a scope axis"), "{msg}");
+        assert!(!body_path("role-only").exists());
+        assert_eq!(tracker_head(&pm), head);
+    }
+
+    /// CAD-1947: one axis is enough. An http(s) source stays quarantined.
+    #[test]
+    fn propose_accepts_one_scope_axis_and_quarantines_external_source() {
+        let (_dir, pm) = mutation_fixture();
+        let author = proposal_actor("worker-author");
+        let cases = [
+            (
+                "by-project",
+                Scope {
+                    project: true,
+                    ..Scope::default()
+                },
+                "CAD-1947",
+                "proposed",
+            ),
+            (
+                "by-component",
+                Scope {
+                    components: vec!["api".to_string()],
+                    ..Scope::default()
+                },
+                "CAD-1947",
+                "proposed",
+            ),
+            (
+                "by-path",
+                Scope {
+                    paths: vec!["src/**".to_string()],
+                    ..Scope::default()
+                },
+                "CAD-1947",
+                "proposed",
+            ),
+            (
+                "by-tag",
+                Scope {
+                    tags: vec!["memory".to_string()],
+                    ..Scope::default()
+                },
+                "CAD-1947",
+                "proposed",
+            ),
+            (
+                "by-provider",
+                Scope {
+                    providers: vec!["pi".to_string()],
+                    ..Scope::default()
+                },
+                "CAD-1947",
+                "proposed",
+            ),
+            (
+                "external-url",
+                Scope {
+                    project: true,
+                    ..Scope::default()
+                },
+                "https://example.com/notes/lesson",
+                "quarantined",
+            ),
+        ];
+        for (slug, scope, source, status) in cases {
+            let proposed = propose_lesson(
+                &pm,
+                &author,
+                slug,
+                scope,
+                Some(source),
+                None,
+                policy::ProposalOptions::default(),
+            )
+            .unwrap_or_else(|err| panic!("{slug}: {err}"));
+            assert_eq!(proposed["status"], status, "{slug}");
+            let (_, stored) = find(&pm, Some("demo"), slug).unwrap();
+            assert_eq!(stored.front.status, status, "{slug}");
+            assert_ne!(stored.front.status, "accepted", "{slug}");
+        }
+    }
+
+    /// CAD-1947: caller-supplied status, author, or approval fields cannot
+    /// make a new file accepted.
+    #[test]
+    fn propose_rejects_caller_supplied_acceptance() {
+        let (_dir, pm) = mutation_fixture();
+        let author = proposal_actor("worker-author");
+        let head = tracker_head(&pm);
+        let accepted = "---\nstatus: accepted\nsource: CAD-1947\n---\n\n\
+            fact\n\n**Why:** evidence\n\n**How to apply:** use it\n";
+        let err = propose_lesson(
+            &pm,
+            &author,
+            "forged-status",
+            Scope {
+                project: true,
+                ..Scope::default()
+            },
+            Some("CAD-1947"),
+            Some(accepted),
+            policy::ProposalOptions::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("lifecycle decision"), "{err}");
+        assert!(!memory_dir(&pm, "demo").join("forged-status.md").exists());
+
+        let forged_author = "---\nauthor: intruder\nstatus: accepted\nsource: CAD-1947\n---\n\n\
+            fact\n\n**Why:** evidence\n\n**How to apply:** use it\n";
+        let err = propose_lesson(
+            &pm,
+            &author,
+            "forged-author",
+            Scope {
+                project: true,
+                ..Scope::default()
+            },
+            Some("CAD-1947"),
+            Some(forged_author),
+            policy::ProposalOptions::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("author"), "{err}");
+        assert!(!memory_dir(&pm, "demo").join("forged-author.md").exists());
+        assert_eq!(tracker_head(&pm), head);
+    }
+
+    /// CAD-1947: lint reports a stored file with a blank source or an
+    /// empty scope and does not rewrite it. A file that has both lints
+    /// as it did before.
+    #[test]
+    fn lint_reports_blank_source_or_empty_scope_without_rewriting() {
+        let (dir, pm) = mutation_fixture();
+        let proj = project::list(&pm.dir)
+            .unwrap()
+            .into_iter()
+            .find(|project| project.key == "demo")
+            .unwrap();
+        let mdir = dir.path().join("demo").join("memory");
+        std::fs::create_dir_all(&mdir).unwrap();
+        let mut blank_source = memory("proposed", 0, None);
+        blank_source.front.id = "blank-source".to_string();
+        blank_source.front.source = Some("  ".to_string());
+        let mut empty_scope = memory("accepted", 0, None);
+        empty_scope.front.id = "empty-scope".to_string();
+        empty_scope.front.scope = Scope::default();
+        empty_scope.front.source = Some("CAD-1947".to_string());
+        let mut kept = memory("proposed", 0, None);
+        kept.front.id = "kept-rule".to_string();
+        let mut written = Vec::new();
+        for mem in [&blank_source, &empty_scope, &kept] {
+            let path = mdir.join(format!("{}.md", mem.front.id));
+            let text = parse::render(&mem.front, &mem.body).unwrap();
+            std::fs::write(&path, &text).unwrap();
+            written.push((path, text));
+        }
+        let head = tracker_head(&pm);
+        let mut errs = Vec::new();
+        let mut warns = Vec::new();
+        lint_dir(&mdir, &proj, &mut |err| errs.push(err), &mut |warn| {
+            warns.push(warn)
+        });
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("blank-source") && err.contains("source is empty")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("empty-scope") && err.contains("scope has no retrieval axis")
+            }),
+            "{errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("kept-rule")),
+            "{errs:?}"
+        );
+        assert!(
+            !warns
+                .iter()
+                .any(|warn| { warn.contains("blank-source") || warn.contains("empty-scope") }),
+            "blank source and empty scope are errors, not warnings: {warns:?}"
+        );
+        for (path, text) in written {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+        assert_eq!(tracker_head(&pm), head);
+    }
+
+    /// A project that declares components used to reject a whitespace
+    /// component as unknown before the retrieval check, so a missing
+    /// source was never named.
+    #[test]
+    fn propose_names_retrieval_gaps_when_whitespace_is_not_a_component() {
+        let (dir, pm) = mutation_fixture();
+        std::fs::write(
+            dir.path().join("demo").join("project.yaml"),
+            "key: demo\nprefix: D\ncomponents:\n  - api\n",
+        )
+        .unwrap();
+        let author = proposal_actor("worker-author");
+        let err = propose_lesson(
+            &pm,
+            &author,
+            "whitespace-component",
+            Scope {
+                components: vec![" ".to_string()],
+                ..Scope::default()
+            },
+            None,
+            None,
+            policy::ProposalOptions::default(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("source is empty"), "{msg}");
+        assert!(msg.contains("scope has no retrieval axis"), "{msg}");
+        assert!(!msg.contains("Unknown component"), "{msg}");
+        assert!(!memory_dir(&pm, "demo")
+            .join("whitespace-component.md")
+            .exists());
+    }
+
+    /// Committing one memory file must not fail because a different,
+    /// unstaged lesson has no source or retrieval axis. Full lint still
+    /// reports that historical file.
+    #[test]
+    fn staged_lint_does_not_let_an_unstaged_gap_refuse_the_commit() {
+        let (dir, pm) = mutation_fixture();
+        let mdir = dir.path().join("demo").join("memory");
+        std::fs::create_dir_all(&mdir).unwrap();
+        let write = |id: &str| {
+            let mut mem = memory("proposed", 0, None);
+            mem.front.id = id.to_string();
+            mem.front.source = None;
+            mem.front.scope = Scope::default();
+            let path = mdir.join(format!("{id}.md"));
+            std::fs::write(&path, parse::render(&mem.front, &mem.body).unwrap()).unwrap();
+        };
+        write("historical-gap");
+        write("staged-gap");
+        let added = std::process::Command::new("git")
+            .args(["add", "--", "demo/memory/staged-gap.md"])
+            .current_dir(&pm.dir)
+            .status()
+            .unwrap();
+        assert!(added.success(), "git add staged memory file");
+
+        let staged = crate::issue::lint::run_staged(&pm).unwrap();
+        let errors = staged["errors"].to_string();
+        let warnings = staged["warnings"].to_string();
+        assert!(errors.contains("staged-gap"), "{errors}");
+        assert!(errors.contains("source is empty"), "{errors}");
+        assert!(!errors.contains("historical-gap"), "{errors}");
+        assert!(warnings.contains("historical-gap"), "{warnings}");
+        assert!(staged["ok"].as_bool() == Some(false), "{staged}");
+
+        let full = crate::issue::lint::run(&pm, None).unwrap();
+        let full_errors = full["errors"].to_string();
+        assert!(full_errors.contains("historical-gap"), "{full_errors}");
+        assert!(full_errors.contains("staged-gap"), "{full_errors}");
+        assert!(full["ok"].as_bool() == Some(false), "{full}");
+    }
+
+    /// A downgraded historical retrieval gap downgrades that gap alone. An
+    /// undeclared component in the same file still refuses the commit, as
+    /// it did before the downgrade existed.
+    #[test]
+    fn a_downgraded_historical_gap_still_refuses_an_invalid_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = Pm::init(dir.path()).unwrap();
+        let project_dir = dir.path().join("demo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.yaml"),
+            "key: demo\nprefix: D\ncomponents: [api]\n",
+        )
+        .unwrap();
+        pm.commit(
+            &[project_dir.join("project.yaml")],
+            "project fixture\n\nActor: test\n",
+        )
+        .unwrap();
+        let mdir = project_dir.join("memory");
+        std::fs::create_dir_all(&mdir).unwrap();
+        let write = |id: &str, source: Option<&str>, components: Vec<String>| {
+            let mut mem = memory("proposed", 0, None);
+            mem.front.id = id.to_string();
+            mem.front.source = source.map(str::to_string);
+            mem.front.scope = Scope {
+                components,
+                ..Scope::default()
+            };
+            let path = mdir.join(format!("{id}.md"));
+            std::fs::write(&path, parse::render(&mem.front, &mem.body).unwrap()).unwrap();
+        };
+        // Unstaged: no source, no retrieval axis (a whitespace component is
+        // not one), and a component `demo` does not declare.
+        write("historical-bad-component", None, vec![" ".to_string()]);
+        // Staged: a retrievable lesson that is valid on its own.
+        write("staged-ok", Some("CAD-1946"), vec!["api".to_string()]);
+
+        let added = std::process::Command::new("git")
+            .args(["add", "--", "demo/memory/staged-ok.md"])
+            .current_dir(&pm.dir)
+            .status()
+            .unwrap();
+        assert!(added.success(), "git add staged memory file");
+
+        let staged = crate::issue::lint::run_staged(&pm).unwrap();
+        let errors = staged["errors"].to_string();
+        let warnings = staged["warnings"].to_string();
+        assert!(warnings.contains("historical-bad-component"), "{warnings}");
+        assert!(warnings.contains("source is empty"), "{warnings}");
+        assert!(
+            errors.contains("historical-bad-component") && errors.contains("Unknown component"),
+            "{errors}"
+        );
+        assert!(!errors.contains("staged-ok"), "{errors}");
+        assert!(staged["ok"].as_bool() == Some(false), "{staged}");
     }
 
     #[test]
@@ -2693,6 +3203,14 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("verified 2025"), "{text}");
+        for needle in [
+            "cadence memory match",
+            "cadence memory propose",
+            LESSON_DISCOVERY_INSTRUCTION.trim_end(),
+            LESSON_USE_INSTRUCTION.trim_end(),
+        ] {
+            assert!(text.contains(needle), "{needle} missing from {text}");
+        }
     }
 
     #[test]
@@ -2746,10 +3264,19 @@ mod tests {
             !text.contains(&instruction),
             "withheld application instructions must not become supplied guidance"
         );
+        assert!(
+            text.contains(LESSON_USE_INSTRUCTION.trim_end()),
+            "a withheld-only lessons file still names authenticated used-feedback: {text}"
+        );
+        for flag in ["--kind used", "--digest", "--message", "--token"] {
+            assert!(text.contains(flag), "{flag} missing from {text}");
+        }
 
-        // Nothing matched at all: still no file.
+        // Nothing matched at all: still no file, and no feedback instruction.
         let none = match_memories(&[], &MatchCtx::default(), &fresh_at("2026-03-01T00:00:00Z"));
-        assert_eq!(render_lessons(&none), (String::new(), vec![]));
+        let (empty, slugs) = render_lessons(&none);
+        assert_eq!((empty.as_str(), slugs.as_slice()), ("", [].as_slice()));
+        assert!(!empty.contains("cadence memory feedback"));
     }
 
     #[test]
