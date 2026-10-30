@@ -1085,14 +1085,23 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         try:
             authority = requirements_inspection(issue, repo, pr, head)
             if authority is None:
-                # CAD-1946 v0: no daemon answered, so no approved policy can be
-                # read. The legacy strict floor below is the requirement set —
-                # one-review list, human paths/size, the operator check and the
-                # full CI floor — never a relaxation.
+                # CAD-1946 v0: no daemon answered. Only a caller that has said
+                # so may fall back — without --daemonless an unanswerable verb
+                # is a refusal, never a downgrade of a working daemon's own
+                # refusal (which the CLI reports on stderr with empty stdout).
+                if not getattr(args, "daemonless", False):
+                    raise RuntimeError(
+                        "`cadence delivery requirements` did not answer here; rerun with "
+                        "--daemonless only on a host with no Cadence daemon")
                 daemonless = True
-                report.append("delivery requirements: no daemon answer — the legacy strict "
-                              "floor applies (one review off the one-review list, else two; "
+                report.append("delivery requirements: no daemon answer (--daemonless) — the legacy "
+                              "strict floor applies (one review off the one-review list, else two; "
                               "operator approval on a human-class diff; full CI)")
+                # The daemon also bound the repo to the ticket's project
+                # remotes. That list lives in the daemon's tracker, so without
+                # one the binding cannot be checked — say so, do not imply it.
+                report.append("project repository binding: unchecked (no daemon can read the "
+                              "project's remotes)")
             else:
                 if (authority["binding"]["base"] != base_oid
                         or authority["binding"]["base_ref"] != base
@@ -1140,6 +1149,13 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                 f"PR base {base!r} is not the repository default {default!r}; "
                 "no daemon can read an approved integration target")
 
+    # The risk manifest, read once: it decides the human class below, and in
+    # daemonless mode whether the one-review floor may apply at all.
+    rc, risk_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                            f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={base_oid}"])
+    risk_text = risk_text if rc == 0 and base_oid else None
+    risk = risk_globs(risk_text)
+
     verdicts, counted = [], []
     if issue:
         try:
@@ -1160,6 +1176,11 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             # the one-review list read at the base. `native_one` only ever
             # narrows the answer the evaluator gave.
             effective_one = one if authority is None else (one and native_one)
+            if daemonless and risk is None:
+                # The native classifier parses both lists together, so an
+                # unreadable risk manifest made the whole list set absent and
+                # forced two reviews. Keep that floor.
+                effective_one = False
             rs, counted = check_reviews(verdicts, effective_one, need_qa, authors, issue)
             reasons += rs
         elif klass == "routine":
@@ -1180,10 +1201,6 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         report.append("counted verdicts: " + (", ".join(f"{n['reviewer']} {n['kind']} ({n['name']})" for n in counted) or "none"))
 
     # Human class: paths, size, or any head-pinned note whose Risk is not exactly `auto`.
-    rc, risk_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
-                            f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={base_oid}"])
-    risk_text = risk_text if rc == 0 and base_oid else None
-    risk = risk_globs(risk_text)
     why = [] if risk is not None else [f"cannot read {RISK_PATHS_FILE} at the base (fail closed)"]
     why += [p for p in paths if is_human_path(p, risk or ())][:5]
     if lines > HUMAN_LINES:
@@ -1361,6 +1378,10 @@ def main(argv):
     ap.add_argument("--notes-dir", default=os.environ.get("CADENCE_NOTES_DIR", DEFAULT_NOTES_DIR))
     ap.add_argument("--author", action="append", default=[], help="an extra alias that authored the PR")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--daemonless", action="store_true",
+                    help="this host has no Cadence daemon: run the legacy strict floor "
+                         "instead of requiring an authoritative delivery-requirements "
+                         "answer (CAD-1946 v0). Never pass it where a daemon runs.")
     ap.add_argument("--gate-key", default=os.environ.get("CADENCE_DELIVERY_GATE_KEY", DEFAULT_GATE_KEY),
                     help="the delivery-gate SSH signing key (CAD-1925)")
     ap.add_argument("--poll-secs", type=float, default=30)

@@ -59,6 +59,8 @@ class Daemonless(scope.Case):
         super().__init__(tmp)
         self.per_head = False
         self.approval_comments = []
+        self.no_verdicts = False
+        self.risk_rc = 0
         self.signers = ""
         self.scope_calls = 0
         # One combined PASS pinned to HEAD, on the one-review list.
@@ -84,6 +86,13 @@ class Daemonless(scope.Case):
             return 3, "", UNAVAILABLE
         if argv[:3] == ["cadence", "audit", "approval"]:
             return 3, "", UNAVAILABLE
+        if argv[0] == "cadence" and "audit" in argv and "verdicts" in argv:
+            # A saved remote org routes `audit` to the hosted transport, which
+            # has no such verb; `--org local` is the same file read.
+            if "--org" not in argv:
+                return 3, "", UNAVAILABLE
+            return 0, json.dumps({"verdicts": [] if self.no_verdicts else [self.note()],
+                                  "skipped": []}), ""
         if argv[:3] == ["cadence", "audit", "scope"]:
             self.scope_calls += 1
             return 3, "", UNAVAILABLE
@@ -93,11 +102,16 @@ class Daemonless(scope.Case):
                 return 0, self.signers, ""
             if "/issues/5/comments" in url:
                 return 0, json.dumps([self.approval_comments]), ""
+            if f"/contents/{enq.RISK_PATHS_FILE}?ref=" in url and self.risk_rc != 0:
+                return self.risk_rc, "", "Not Found"
+            if "/issues/5/comments" in url:
+                return 0, json.dumps([self.approval_comments]), ""
         return super().run(argv)
 
-    def evaluate(self, require_comment=False):
+    def evaluate(self, require_comment=False, daemonless=True):
         """The pre-post pass `main()` runs; the comment gate is its own phase."""
-        args = types.SimpleNamespace(pr=5, head=HEAD, author=[], notes_dir=str(self.tmp))
+        args = types.SimpleNamespace(pr=5, head=HEAD, author=[], notes_dir=str(self.tmp),
+                                     daemonless=daemonless)
         saved = enq.run, enq.pr_changes
         enq.run = self.run
         enq.pr_changes = lambda *a: ([("M", "100644", "100644", p) for p in self.paths], 40)
@@ -189,13 +203,50 @@ class DaemonlessMerge(unittest.TestCase):
         self.refused("no operator approval")
 
     def test_the_queue_signature_never_stands_in_for_an_approval(self):
-        """A delivery-gate queue comment signs different bytes; it is not an approval."""
+        """A queue signature signs different bytes; the approval marker does not change that."""
         sign = subprocess.run([sys.executable, str(enq.GATE_SCRIPT), "sign", "--repo", "o/r",
                                "--pr", "5", "--head", HEAD, "--key", self.c.key],
                               capture_output=True, text=True)
         self.assertEqual(sign.returncode, 0, sign.stderr)
-        self.c.approval_comments = [{"id": 901, "body": sign.stdout}]
-        self.refused("no operator approval")
+        # Same comment shape the approval has, so the marker filter lets it through
+        # and only the cryptography decides.
+        body = (f"<!-- cadence-operator-approval v1 -->\nSource: {SOURCE}\n\n"
+                + "\n".join(sign.stdout.splitlines()[1:]))
+        self.c.approval_comments = [{"id": 901, "body": body}]
+        self.refused("carried no signature that verifies")
+
+    # -- the fallback is opt-in, and keeps the native floors ----------------
+
+    def test_without_the_flag_an_unanswerable_verb_refuses(self):
+        """A working daemon's refusal must never become a silent downgrade."""
+        self.approval()
+        reasons, _ = self.c.evaluate(daemonless=False)
+        self.assertTrue(any("did not answer here" in r for r in reasons), reasons)
+
+    def test_an_unreadable_risk_manifest_keeps_two_reviews(self):
+        """Native parsed both lists together; an unreadable one keeps two reviews."""
+        self.approval()
+        self.c.risk_rc = 1
+        reasons, report = self.c.evaluate()
+        self.assertTrue(any("Spec/security" in r for r in reasons), (reasons, report))
+
+    def test_the_verdict_read_retries_the_local_org(self):
+        self.approval()
+        reasons, report = self.c.evaluate()
+        self.assertEqual(reasons, [], report)
+        self.assertTrue(any(r.startswith("counted verdicts: rev") for r in report), report)
+
+    def test_a_missing_review_refuses(self):
+        self.approval()
+        self.c.no_verdicts = True
+        reasons, _ = self.c.evaluate()
+        self.assertTrue(any("verdict" in r for r in reasons), reasons)
+
+    def test_an_absent_or_red_ci_run_refuses(self):
+        self.approval()
+        self.c.ci_runs = []
+        reasons, _ = self.c.evaluate()
+        self.assertTrue(any("ci.yml" in r or "not a completed success" in r for r in reasons), reasons)
 
     # -- the scope fallback is gone without a daemon ------------------------
 

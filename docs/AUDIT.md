@@ -45,13 +45,18 @@ counts (digest equals the sha256 of the trimmed current ticket body,
 `recorded_via` `operator-connection`, not revoked).
 
 **With no local daemon (CAD-1946 v0)** — a hosted org, where the local daemon
-is retired — the same script still decides, and the record it leaves is:
+is retired — the same script still decides, when invoked with `--daemonless`,
+and the record it leaves is:
 
 - **requirements**: no `delivery requirements` answer, so the legacy strict
   floor applies (one review off the one-review list read at the base, else
-  two; the operator check on a human-class diff; the full check floor). No
-  approved `PROJECT.md` policy can be read without the daemon, so a leaner
-  class is never claimed.
+  two — and always two when the risk manifest cannot be read, since the
+  native classifier parsed both lists together; the operator check on a
+  human-class diff; the full check floor; the repository default branch as
+  the only admitted target). No approved `PROJECT.md` policy can be read
+  without the daemon, so a leaner class is never claimed, and the
+  project-to-repository binding the daemon also checked is reported as
+  **unchecked** rather than implied.
 - **verdicts**: `cadence --org local audit verdicts` — the same file parser,
   pinned to the local org because a saved remote org routes `audit` to the
   hosted transport, which has no such verb.
@@ -60,15 +65,20 @@ is retired — the same script still decides, and the record it leaves is:
   against `docs/roles/delivery-gate.allowed_signers` read at the PR's base.
   It adds no new key or trust root, and a queue signature cannot substitute
   for it because the signed payloads differ. Scope approvals need the store
-  and are not used, so every PR takes its own per-head approval.
+  and are not used, so every PR takes its own per-head approval. Note that
+  the *displayed* heading of such a comment is not signed; the tuple is
+  rebuilt from the arguments, so editing the prose cannot authorize a
+  different head.
 - **enqueue**: unchanged — `(repo, pr, head)` is signed and auto-merge is
   enabled pinned to that head, and the merge queue's `delivery-gate` job
   still verifies the signature from the merge group's base.
 
 Every absent answer still refuses; the fallback above is the strict floor,
-never a relaxation. The same-uid limit on the key (see
-`scripts/delivery-gate`) applies to the approval exactly as it already does
-to the queue signature.
+never a relaxation. **The approval is key-holder authorization, not proof of a
+person**: the key is readable by every session under the operator's uid, the
+same limit `scripts/delivery-gate` records for the queue signature, and the
+daemon's own approval path — which derived the caller and refused an agent
+pane — is not available here (CAD-280).
 
 `audit verdicts` uses the same note parser as the audit. A reviewer is the
 first whitespace token of `From:`, lower-cased (the rest is prose). Its kind

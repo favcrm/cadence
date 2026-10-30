@@ -224,10 +224,18 @@ the code you just wrote.
   <full-sha> --source "<who decided, where>"`. It reuses the delivery-gate
   key and the `docs/roles/delivery-gate.allowed_signers` entry read at the
   PR's base, so it adds no new trust anchor; the `source` is inside the
-  signed payload and a comment naming another head does not verify. Scope
-  approvals (`audit approve --issue --action scope`) need the daemon's
+  signed payload and a signature over another head or repo does not verify.
+  Scope approvals (`audit approve --issue --action scope`) need the daemon's
   store and are therefore unavailable there: every PR takes its own
-  per-head approval. The key's same-uid limit below applies unchanged.
+  per-head approval.
+  - **What it does not prove.** This is *key-holder* authorization, not
+    proof that a person approved: the key is readable by every session under
+    the operator's uid, so an agent that can read it can sign — exactly the
+    limit `scripts/delivery-gate` already records for the queue signature
+    (CAD-280). The daemon's own approval path also derived the caller from
+    the connection and refused an agent pane; this path cannot. It refuses
+    an agent *without* the key; it cannot refuse one holding it. Do not
+    describe it as "an agent cannot approve".
 - Approve once per ticket: the operator may run `cadence audit approve
   --issue <ID> --action scope` once, and `scripts/enqueue-reviewed` then
   accepts it for every in-scope PR of that ticket. Traps: the ticket body
@@ -253,13 +261,22 @@ the code you just wrote.
   the signature on the PR; the queue's required `delivery-gate` check holds
   any PR without one, so a direct `gh pr merge` never lands (CAD-1925). The
   queue re-tests on the newest main, so you do not have to rebase first.
-- It runs on a host with no daemon (CAD-1946 v0): it reads the hosted ticket
-  and posts the evidence comment through the remote CLI, reads the verdict
-  notes and the operator approval without a local store, and applies the
-  legacy strict floor — one review off the one-review list read at the base,
-  else two; the operator check on a human-class diff; the full CI floor —
-  because no approved project policy can be read without the daemon. It
-  never treats an unavailable answer as a pass.
+- It runs on a host with no daemon (CAD-1946 v0) when invoked with
+  `--daemonless`: it reads the hosted ticket and posts the evidence comment
+  through the remote CLI, reads the verdict notes and the operator approval
+  without a local store, and applies the legacy strict floor — one review off
+  the one-review list read at the base, else two; the operator check on a
+  human-class diff; the full CI floor; the default branch as the only target;
+  two reviews whenever the risk manifest cannot be read — because no approved
+  project policy can be read without the daemon. **Never pass `--daemonless`
+  where a daemon runs:** without it, an unanswerable `delivery requirements`
+  is a refusal, so a working daemon's own refusal is never downgraded. It
+  never treats an unavailable answer as a pass. The daemon also bound the
+  repository to the ticket's project remotes; that list lives in the tracker,
+  so in daemonless mode the binding is reported as unchecked rather than
+  implied.
+- It must run from a checkout of the repository: the diff is read with `git`,
+  so a directory without an `origin` refuses before any decision.
 - If the queue ejects the PR (`failed_checks`), read the failed run: the
   cause is often a semantic clash with a PR that just landed. Fix it on the
   branch, show a `git range-diff` against the reviewed head, enqueue again.
