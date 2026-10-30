@@ -154,6 +154,24 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
     }
 }
 
+/// The login that grants a scope the client refuses without. Only a flag
+/// whose meaning is exact is named; anything else says what to request.
+fn login_hint(scope: &str, org: &str) -> String {
+    match scope {
+        "audit.approve" => format!(
+            " Run `cadence login {org} --audit-approve`: a default login never \
+             requests it, and the owner's merge approval and delivery record need it."
+        ),
+        "settings.read" | "settings.write" => {
+            format!(" Run `cadence login {org} --settings` to request settings access.")
+        }
+        "web.read" | "web.prepare" => {
+            format!(" Run `cadence login {org} --web` to request publish access.")
+        }
+        other => format!(" Log in again with a grant that carries {other}."),
+    }
+}
+
 /// The four team mutations: the Worker commits them in the same D1 batch
 /// that records the receipt, so a lost or ambiguous answer follows a
 /// possible commit exactly as a lost send answer does. The two read-only
@@ -1699,6 +1717,12 @@ enum Refusal {
     Uncertain,
     /// An action may have committed; reconcile it before any repeat.
     MutationUncertain,
+    /// A definite, caller-fixable refusal. Nothing was written; the request
+    /// itself must change before another attempt.
+    Rejected,
+    /// The org does not serve this verb in its deployed build. Retrying or
+    /// logging in again changes nothing; the client or the org must move.
+    Unsupported,
     /// Other 5xx: retry later; saved credentials and pending renewal are kept.
     Availability,
     /// An answer whose shape we do not recognise. Conservative fallback.
@@ -1712,6 +1736,8 @@ impl Refusal {
             Self::Authentication => "authentication",
             Self::Uncertain => "uncertain",
             Self::MutationUncertain => "outcome_unknown",
+            Self::Rejected => "rejected",
+            Self::Unsupported => "unsupported",
             Self::Availability => "availability",
             Self::Unknown => "unknown",
         }
@@ -1722,6 +1748,18 @@ impl Refusal {
 /// at its own gate, so a fresh login would not change it. Allowlisted: an
 /// unknown reason is never trusted as policy.
 const POLICY_REASONS: &[&str] = &["scope_not_granted", "grant_narrowed", "binding_mismatch"];
+
+/// A refusal that names exactly what to fix and has written nothing: a review
+/// whose digest is not the stored revision's, a reviewer who authored the
+/// artifact, a second verdict from the same reviewer, or a delivery record
+/// naming a repository this organization has not authorized. Each is a
+/// fixable request, not an unknown answer and not a retry-later condition.
+const DEFINITE_REFUSAL_CODES: &[&str] = &[
+    "digest_mismatch",
+    "self_review",
+    "review_exists",
+    "not_authorized",
+];
 
 /// The Cadence container's own envelope gate (`src/ui/wiki_envelope.rs`) answers
 /// a 403 `insufficient_scope` when the signed grant does not cover the action or
@@ -1753,6 +1791,11 @@ fn refusal_fields(body: Option<&Value>) -> (Option<&str>, Option<&str>) {
     let code = error
         .and_then(|e| e.get("code"))
         .or_else(|| body.and_then(|b| b.get("code")))
+        // The tenant board names a structured refusal with `state` rather than
+        // `error.code` (a delivery record naming an unauthorized repo says
+        // `state: "not_authorized"`). A bounded token is safe to show; the
+        // free-text `reason` beside it is not.
+        .or_else(|| body.and_then(|b| b.get("state")))
         .and_then(Value::as_str);
     let reason = error.and_then(|e| e.get("reason")).and_then(Value::as_str);
     (safe(code), safe(reason))
@@ -1788,11 +1831,16 @@ fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>
     let known_reason =
         reason.filter(|r| POLICY_REASONS.contains(r) || ENVELOPE_REASONS.contains(r));
     let category = match status {
+        // A verb the deployed build does not implement: nothing ran, and no
+        // amount of retrying or re-login changes it.
+        501 => Refusal::Unsupported,
         // Explicit post-effect uncertainty was handled above.
         500..=599 => Refusal::Availability,
         // A non-auth refusal keeps its safe code (for example `payload_too_large`
         // or a legacy `too_large`) so the caller sees what was refused. It is not
         // a login or availability claim.
+        // A review refusal names exactly what to fix and wrote nothing.
+        400 | 409 if code.is_some_and(|c| DEFINITE_REFUSAL_CODES.contains(&c)) => Refusal::Rejected,
         400 | 409 | 413 | 422 => Refusal::Unknown,
         401 | 403 => match (code, known_reason) {
             // A policy outcome proven at a gate is authorization, whatever the code.
@@ -1844,6 +1892,15 @@ fn refusal_message(refusal: Refusal, reason: Option<&str>, status: u16) -> Strin
             "the remote action may already have committed ({category}, HTTP {status}{code}); \
              inspect `team list` or `team invites` with the same explicit --org before \
              repeating the mutation. Nothing was retried; saved credentials are kept"
+        ),
+        Refusal::Rejected => format!(
+            "the remote rejected this request ({category}, HTTP {status}{code}) and wrote nothing — \
+             fix the request and try again; nothing was retried"
+        ),
+        Refusal::Unsupported => format!(
+            "this org does not serve the verb yet ({category}, HTTP {status}{code}) — the \
+             deployed build is older than the client; a fresh login does not change it. \
+             Nothing was retried"
         ),
         Refusal::Availability => format!(
             "the remote is unavailable ({category}, HTTP {status}{code}) — retry later; \
@@ -2850,6 +2907,24 @@ fn call_verb_until_retry(
                 )));
             }
         }
+        // A CLI verb asks for the scopes its action needs. Refusing here, before
+        // a request is built, turns a gateway 401 into the one command that
+        // fixes it: a plain `cadence login` never carries `audit.approve`, so
+        // the owner's merge approval and the delivery record both need the
+        // opt-in login. A legacy login with no recorded capabilities is left to
+        // the server's own check.
+        if matches!(surface, Surface::Cli) && !cred.capabilities.is_empty() {
+            if let Some(missing) = cli_requested_scopes(verb)
+                .iter()
+                .find(|scope| !cred.capabilities.iter().any(|c| c == *scope))
+            {
+                return Err(reject(format!(
+                    "`{verb}` needs the {missing} scope, which this remote login lacks — \
+                     nothing was sent.{}",
+                    login_hint(missing, &target.org)
+                )));
+            }
+        }
         // CAD-1586: `settings_agents` needs the operation's narrow
         // settings.* scope; `master_status` needs settings.read. A login
         // without the needed scope is refused here, before a request is
@@ -2976,15 +3051,17 @@ fn call_verb_until_retry(
         // definite refusal. The platform's explicit uncertainty codes keep
         // their own decoded message, which names the code.
         let team_mutation_unknown = team_mutation_verb(verb)
-            && status >= 500
+            && status >= 502
             && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
             && !board_gate_refused(body.as_ref())
             && !matches!(
                 refusal_code.as_deref(),
                 Some("mutation_outcome_uncertain" | "invite_email_uncertain")
             );
+        // 501 means the verb is not implemented, so nothing ran; only a real
+        // gateway/server failure can leave the write ambiguous.
         let artifact_outcome_unknown = matches!(verb, "issue_attach" | "issue_review")
-            && status >= 500
+            && status >= 502
             && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
             && !board_gate_refused(body.as_ref());
         let unknown_correlation = refusal_correlation(body.as_ref());

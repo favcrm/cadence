@@ -1766,6 +1766,86 @@ fn default_cli_renewal_refuses_cloud_or_missing_cli_consent_before_any_post() {
 }
 
 #[test]
+fn a_missing_audit_scope_is_refused_locally_with_the_login_that_grants_it() {
+    // A default login carries cli.* only. The owner's merge approval and the
+    // delivery record both need `audit.approve`, so the client refuses before a
+    // request is built and names the opt-in login instead of leaving the caller
+    // with a gateway 401 they cannot act on.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    store_credential(&dir, &target.endpoint);
+    let path = dir.join(format!("cli-{ORG}.json"));
+    let mut stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    stored["capabilities"] = json!(["cli.read", "cli.write", "wiki.read", "wiki.write"]);
+    fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+    for (verb, args) in [
+        (
+            "audit_approve",
+            json!({"pr": 1445, "head": "e".repeat(40), "source": "probe"}),
+        ),
+        (
+            "delivery_policy_set",
+            json!({"project": "cadence", "repos": ["favcrm/cadence"]}),
+        ),
+    ] {
+        let args = args.as_object().cloned().unwrap_or_default();
+        let out = call_verb_in(&target, verb, args, 10, &dir, |_| {}, |_| {});
+        let err = out.unwrap_err();
+        let shown = err.to_string();
+        assert_eq!(err.kind(), "rejected", "{verb}: {shown}");
+        assert!(shown.contains("audit.approve"), "{verb}: {shown}");
+        assert!(shown.contains("--audit-approve"), "{verb}: {shown}");
+        assert!(shown.contains("nothing was sent"), "{verb}: {shown}");
+    }
+}
+
+#[test]
+fn a_review_refusal_is_definite_and_an_unserved_verb_is_not_retryable() {
+    // The three codes a hosted review uses to say "fix the request" are
+    // rejections, not unknown answers: nothing was written.
+    for code in ["digest_mismatch", "self_review", "review_exists"] {
+        let body = json!({"error": {"code": code}});
+        let (refusal, shown) = decode_refusal(409, Some(&body));
+        assert_eq!(refusal, Refusal::Rejected, "{code}");
+        assert_eq!(shown.as_deref(), Some(code), "{code}");
+        let text = refusal_message(refusal, shown.as_deref(), 409);
+        assert!(text.contains("wrote nothing"), "{code}: {text}");
+        assert!(!text.contains("cadence login"), "{code}: {text}");
+    }
+    // A 501 is the deployed build lacking the verb: no retry, no re-login.
+    let (refusal, shown) =
+        decode_refusal(501, Some(&json!({"error": {"code": "not_implemented"}})));
+    assert_eq!(refusal, Refusal::Unsupported);
+    let text = refusal_message(refusal, shown.as_deref(), 501);
+    assert!(text.contains("does not serve"), "{text}");
+    assert!(!text.contains("retry later"), "{text}");
+    // The tenant board names a structured refusal with `state`, not
+    // `error.code`: a delivery record naming an unauthorized repo.
+    let (refusal, shown) = decode_refusal(
+        409,
+        Some(&json!({"state": "not_authorized", "repos": ["a/b"],
+                     "reason": "these repositories are not authorized"})),
+    );
+    assert_eq!(refusal, Refusal::Rejected);
+    assert_eq!(shown.as_deref(), Some("not_authorized"));
+    let text = refusal_message(refusal, shown.as_deref(), 409);
+    assert!(text.contains("not_authorized"), "{text}");
+    assert!(
+        !text.contains("these repositories"),
+        "free text leaked: {text}"
+    );
+    // An unlisted 409 code keeps the conservative generic refusal.
+    let (refusal, _) = decode_refusal(409, Some(&json!({"error": {"code": "midway_collision"}})));
+    assert_eq!(refusal, Refusal::Unknown);
+}
+
+#[test]
 fn an_unsafe_server_code_is_dropped_from_the_decoded_reason() {
     // Free text or wrong case from a server never becomes the shown reason.
     let (refusal, reason) = decode_refusal(
