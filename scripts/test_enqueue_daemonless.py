@@ -151,6 +151,13 @@ class DaemonlessMerge(unittest.TestCase):
         self.assertTrue(any("two independent reviews" in r or "Spec/security" in r
                             for r in reasons), reasons)
 
+    def test_a_non_default_base_is_refused_without_a_daemon(self):
+        """The daemon also refused a base that was not the default or an approved target."""
+        self.approval()
+        self.c.base_ref = "release/next"
+        reasons, _ = self.c.evaluate()
+        self.assertTrue(any("is not the repository default" in r for r in reasons), reasons)
+
     # -- the operator approval is the signed comment ------------------------
 
     def test_a_signed_approval_for_this_head_is_accepted(self):

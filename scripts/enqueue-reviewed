@@ -679,7 +679,6 @@ def requirements_inspection(issue, repo, pr, head):
 
 
 APPROVAL_MARKER = "<!-- cadence-operator-approval v1 -->"
-APPROVAL_SOURCE = re.compile(r"^Source: (.+)$", re.M)
 
 
 def pr_comments(repo, pr):
@@ -731,21 +730,18 @@ def check_signed_approval(repo, pr, head, base_oid, report, evidence=None):
         comments_path = os.path.join(tmp, "comments.json")
         with open(comments_path, "w", encoding="utf-8") as f:
             json.dump(blocks, f)
-        sources = []
-        for block in blocks:
-            m = APPROVAL_SOURCE.search(block["body"].replace("\r\n", "\n"))
-            if m:
-                sources.append(m.group(1).strip())
-        for source in sources:
-            rc, out, err = run([sys.executable, GATE_SCRIPT, "verify-approval",
-                                "--repo", repo, "--pr", str(pr), "--head", head,
-                                "--signers", signers_path, "--comments", comments_path])
-            if rc == 0:
-                if evidence is not None:
-                    evidence["approval"] = f"signed comment (source {source!r})"
-                report.append(f"approval in force: signed operator approval for exactly head "
-                              f"{head}, source {source!r} (verified against {SIGNERS_FILE} at the base)")
-                return []
+        # One call: `verify-approval` reads each comment's own Source line, so
+        # parsing the format here would be a second model of it.
+        rc, _, _ = run([sys.executable, GATE_SCRIPT, "verify-approval",
+                        "--repo", repo, "--pr", str(pr), "--head", head,
+                        "--signers", signers_path, "--comments", comments_path])
+        if rc == 0:
+            # The signed comment on the PR is the record; it carries the source.
+            if evidence is not None:
+                evidence["approval"] = "signed operator approval comment"
+            report.append(f"approval in force: signed operator approval for exactly head "
+                          f"{head} (verified against {SIGNERS_FILE} at the base)")
+            return []
     return [f"human-class diff has no operator approval for exactly head {head}: "
             f"{len(blocks)} approval comment(s) carried no signature that verifies "
             f"against {SIGNERS_FILE} at the base"]
@@ -1126,6 +1122,23 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                     required_comment_evidence.append(f"Required check run: {name} = {proofs[name]}")
         except RuntimeError as e:
             reasons.append(str(e))
+
+    if daemonless:
+        # `delivery requirements` also refuses a base that is neither the
+        # repository default nor an approved integration_branch. Without the
+        # daemon that approval cannot be read, so the default branch is the
+        # only target admitted — the same rule at its strictest.
+        rc, out, _ = run(["gh", "repo", "view", repo, "--json", "defaultBranchRef"])
+        try:
+            default = json.loads(out)["defaultBranchRef"]["name"]
+        except (ValueError, KeyError, TypeError):
+            default = None
+        if not isinstance(default, str) or not default:
+            reasons.append("cannot read the repository's default branch (fail closed)")
+        elif base != default:
+            reasons.append(
+                f"PR base {base!r} is not the repository default {default!r}; "
+                "no daemon can read an approved integration target")
 
     verdicts, counted = [], []
     if issue:
