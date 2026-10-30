@@ -1766,6 +1766,31 @@ fn default_cli_renewal_refuses_cloud_or_missing_cli_consent_before_any_post() {
 }
 
 #[test]
+fn a_review_refusal_is_definite_and_an_unserved_verb_is_not_retryable() {
+    // The three codes a hosted review uses to say "fix the request" are
+    // rejections, not unknown answers: nothing was written.
+    for code in ["digest_mismatch", "self_review", "review_exists"] {
+        let body = json!({"error": {"code": code}});
+        let (refusal, shown) = decode_refusal(409, Some(&body));
+        assert_eq!(refusal, Refusal::Rejected, "{code}");
+        assert_eq!(shown.as_deref(), Some(code), "{code}");
+        let text = refusal_message(refusal, shown.as_deref(), 409);
+        assert!(text.contains("wrote nothing"), "{code}: {text}");
+        assert!(!text.contains("cadence login"), "{code}: {text}");
+    }
+    // A 501 is the deployed build lacking the verb: no retry, no re-login.
+    let (refusal, shown) =
+        decode_refusal(501, Some(&json!({"error": {"code": "not_implemented"}})));
+    assert_eq!(refusal, Refusal::Unsupported);
+    let text = refusal_message(refusal, shown.as_deref(), 501);
+    assert!(text.contains("does not serve"), "{text}");
+    assert!(!text.contains("retry later"), "{text}");
+    // An unlisted 409 code keeps the conservative generic refusal.
+    let (refusal, _) = decode_refusal(409, Some(&json!({"error": {"code": "midway_collision"}})));
+    assert_eq!(refusal, Refusal::Unknown);
+}
+
+#[test]
 fn an_unsafe_server_code_is_dropped_from_the_decoded_reason() {
     // Free text or wrong case from a server never becomes the shown reason.
     let (refusal, reason) = decode_refusal(

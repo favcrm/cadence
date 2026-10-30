@@ -1699,6 +1699,12 @@ enum Refusal {
     Uncertain,
     /// An action may have committed; reconcile it before any repeat.
     MutationUncertain,
+    /// A definite, caller-fixable refusal. Nothing was written; the request
+    /// itself must change before another attempt.
+    Rejected,
+    /// The org does not serve this verb in its deployed build. Retrying or
+    /// logging in again changes nothing; the client or the org must move.
+    Unsupported,
     /// Other 5xx: retry later; saved credentials and pending renewal are kept.
     Availability,
     /// An answer whose shape we do not recognise. Conservative fallback.
@@ -1712,6 +1718,8 @@ impl Refusal {
             Self::Authentication => "authentication",
             Self::Uncertain => "uncertain",
             Self::MutationUncertain => "outcome_unknown",
+            Self::Rejected => "rejected",
+            Self::Unsupported => "unsupported",
             Self::Availability => "availability",
             Self::Unknown => "unknown",
         }
@@ -1722,6 +1730,12 @@ impl Refusal {
 /// at its own gate, so a fresh login would not change it. Allowlisted: an
 /// unknown reason is never trusted as policy.
 const POLICY_REASONS: &[&str] = &["scope_not_granted", "grant_narrowed", "binding_mismatch"];
+
+/// A hosted review refuses with one of these and has written nothing: the
+/// digest is not the stored revision's, the caller authored the artifact, or
+/// this reviewer already holds a verdict on it. Each is a fixable request, not
+/// an unknown answer and not a retry-later condition.
+const REVIEW_REFUSAL_CODES: &[&str] = &["digest_mismatch", "self_review", "review_exists"];
 
 /// The Cadence container's own envelope gate (`src/ui/wiki_envelope.rs`) answers
 /// a 403 `insufficient_scope` when the signed grant does not cover the action or
@@ -1788,11 +1802,16 @@ fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>
     let known_reason =
         reason.filter(|r| POLICY_REASONS.contains(r) || ENVELOPE_REASONS.contains(r));
     let category = match status {
+        // A verb the deployed build does not implement: nothing ran, and no
+        // amount of retrying or re-login changes it.
+        501 => Refusal::Unsupported,
         // Explicit post-effect uncertainty was handled above.
         500..=599 => Refusal::Availability,
         // A non-auth refusal keeps its safe code (for example `payload_too_large`
         // or a legacy `too_large`) so the caller sees what was refused. It is not
         // a login or availability claim.
+        // A review refusal names exactly what to fix and wrote nothing.
+        400 | 409 if code.is_some_and(|c| REVIEW_REFUSAL_CODES.contains(&c)) => Refusal::Rejected,
         400 | 409 | 413 | 422 => Refusal::Unknown,
         401 | 403 => match (code, known_reason) {
             // A policy outcome proven at a gate is authorization, whatever the code.
@@ -1844,6 +1863,15 @@ fn refusal_message(refusal: Refusal, reason: Option<&str>, status: u16) -> Strin
             "the remote action may already have committed ({category}, HTTP {status}{code}); \
              inspect `team list` or `team invites` with the same explicit --org before \
              repeating the mutation. Nothing was retried; saved credentials are kept"
+        ),
+        Refusal::Rejected => format!(
+            "the remote rejected this request ({category}, HTTP {status}{code}) and wrote nothing — \
+             fix the request and try again; nothing was retried"
+        ),
+        Refusal::Unsupported => format!(
+            "this org does not serve the verb yet ({category}, HTTP {status}{code}) — the \
+             deployed build is older than the client; a fresh login does not change it. \
+             Nothing was retried"
         ),
         Refusal::Availability => format!(
             "the remote is unavailable ({category}, HTTP {status}{code}) — retry later; \
@@ -2976,15 +3004,17 @@ fn call_verb_until_retry(
         // definite refusal. The platform's explicit uncertainty codes keep
         // their own decoded message, which names the code.
         let team_mutation_unknown = team_mutation_verb(verb)
-            && status >= 500
+            && status >= 502
             && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
             && !board_gate_refused(body.as_ref())
             && !matches!(
                 refusal_code.as_deref(),
                 Some("mutation_outcome_uncertain" | "invite_email_uncertain")
             );
+        // 501 means the verb is not implemented, so nothing ran; only a real
+        // gateway/server failure can leave the write ambiguous.
         let artifact_outcome_unknown = matches!(verb, "issue_attach" | "issue_review")
-            && status >= 500
+            && status >= 502
             && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
             && !board_gate_refused(body.as_ref());
         let unknown_correlation = refusal_correlation(body.as_ref());
