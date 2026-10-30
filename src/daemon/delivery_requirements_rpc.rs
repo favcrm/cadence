@@ -21,22 +21,70 @@ fn reject(why: impl std::fmt::Display) -> Error {
     Error::rejected(format!("delivery requirements: {why}"))
 }
 
-fn gh(shared: &Shared, args: &[&str]) -> Result<String> {
-    crate::delivery::gh(
-        shared
-            .delivery_gh
-            .to_str()
-            .unwrap_or("/nonexistent/gh-not-on-path-at-boot"),
-        args,
-    )
+/// One `gh` read. The daemon runs the binary it resolved at boot; a
+/// hosted-org CLI runs the caller's own `gh` (CAD-1946).
+pub(crate) trait GhRead {
+    fn gh_read(&self, args: &[&str]) -> Result<String>;
 }
 
-fn api(shared: &Shared, endpoint: &str) -> Result<Value> {
-    let text = gh(shared, &["api", endpoint])?;
+impl GhRead for Shared {
+    fn gh_read(&self, args: &[&str]) -> Result<String> {
+        crate::delivery::gh(
+            self.delivery_gh
+                .to_str()
+                .unwrap_or("/nonexistent/gh-not-on-path-at-boot"),
+            args,
+        )
+    }
+}
+
+/// The tracker-side inputs of [`classify_from`]. The daemon reads them
+/// from its PM and approval store; a hosted-org CLI reads them from the
+/// hosted tracker (CAD-1946). Either way the classification below is the
+/// one implementation — only where the inputs come from differs.
+pub(crate) trait RequirementInputs: GhRead {
+    /// The key of the project the ticket belongs to.
+    fn issue_project(&self, issue: &str) -> Result<String>;
+    /// `Some(why)` when the PR's repository is not a declared remote of
+    /// `project` ([`crate::delivery::pr_refusal_for_remotes`]).
+    fn pr_refusal(&self, project: &str, pr_url: &str) -> Result<Option<String>>;
+    /// The effective policy and its recorded approval, read afresh on
+    /// every call so the drift re-read compares two real reads.
+    fn policy(
+        &self,
+        project: &str,
+    ) -> Result<(delivery_policy::Resolved, Option<delivery_policy::Approved>)>;
+}
+
+impl RequirementInputs for Shared {
+    fn issue_project(&self, issue: &str) -> Result<String> {
+        let pm = self.pm()?;
+        let issue = issue::board::find_issue(&pm.dir, issue)?;
+        Ok(issue::project::load(&pm.dir.join(&issue.project).join("project.yaml"))?.key)
+    }
+
+    fn pr_refusal(&self, project: &str, pr_url: &str) -> Result<Option<String>> {
+        crate::delivery::project_pr_refusal(&self.pm()?.dir, project, pr_url)
+    }
+
+    fn policy(
+        &self,
+        project: &str,
+    ) -> Result<(delivery_policy::Resolved, Option<delivery_policy::Approved>)> {
+        policy_snapshot(self, &self.pm()?.dir, project)
+    }
+}
+
+fn gh<G: GhRead + ?Sized>(source: &G, args: &[&str]) -> Result<String> {
+    source.gh_read(args)
+}
+
+fn api<G: GhRead + ?Sized>(source: &G, endpoint: &str) -> Result<Value> {
+    let text = gh(source, &["api", endpoint])?;
     serde_json::from_str(&text).map_err(|e| reject(format!("unreadable GitHub response: {e}")))
 }
 
-fn pr_view(shared: &Shared, slug: &str, number: u64) -> Result<Value> {
+fn pr_view<G: GhRead + ?Sized>(shared: &G, slug: &str, number: u64) -> Result<Value> {
     let text = gh(
         shared,
         &[
@@ -52,7 +100,7 @@ fn pr_view(shared: &Shared, slug: &str, number: u64) -> Result<Value> {
     serde_json::from_str(&text).map_err(|e| reject(format!("unreadable PR view: {e}")))
 }
 
-fn default_branch(shared: &Shared, repo: &str) -> Result<String> {
+fn default_branch<G: GhRead + ?Sized>(shared: &G, repo: &str) -> Result<String> {
     let text = gh(
         shared,
         &["repo", "view", repo, "--json", "defaultBranchRef"],
@@ -123,7 +171,11 @@ fn title_names_issue(title: &str, issue: &str) -> bool {
 
 type TreeEntry = (String, String);
 
-fn tree_modes(shared: &Shared, repo: &str, sha: &str) -> Result<HashMap<String, TreeEntry>> {
+fn tree_modes<G: GhRead + ?Sized>(
+    shared: &G,
+    repo: &str,
+    sha: &str,
+) -> Result<HashMap<String, TreeEntry>> {
     let tree = api(shared, &format!("repos/{repo}/git/trees/{sha}?recursive=1"))?;
     if tree["truncated"].as_bool() != Some(false) {
         return Err(reject(
@@ -176,7 +228,12 @@ fn changed_mode(tree: &HashMap<String, TreeEntry>, path: &str) -> Result<String>
     Ok(mode.clone())
 }
 
-fn content_at_base(shared: &Shared, repo: &str, path: &str, base: &str) -> Option<String> {
+fn content_at_base<G: GhRead + ?Sized>(
+    shared: &G,
+    repo: &str,
+    path: &str,
+    base: &str,
+) -> Option<String> {
     let endpoint = format!("repos/{repo}/contents/{path}?ref={base}");
     let value = api(shared, &endpoint).ok()?;
     if value["encoding"].as_str()? != "base64" {
@@ -239,12 +296,20 @@ pub(super) fn classify_with_policy(
     shared: &Shared,
     params: &Value,
 ) -> Result<(Value, delivery_policy::Resolved)> {
+    classify_from(shared, params)
+}
+
+/// The requirements classification over any [`RequirementInputs`]: the
+/// request binding, the project/remote check, the live PR and base-pinned
+/// trusted lists, [`requirements::classify`], and the drift re-read.
+pub(crate) fn classify_from<I: RequirementInputs + ?Sized>(
+    shared: &I,
+    params: &Value,
+) -> Result<(Value, delivery_policy::Resolved)> {
     let (issue_id, pr_url, requested_head) = request_fields(params)?;
 
-    let pm = shared.pm()?;
-    let issue = issue::board::find_issue(&pm.dir, issue_id)?;
-    let project = issue::project::load(&pm.dir.join(&issue.project).join("project.yaml"))?;
-    if let Some(why) = crate::delivery::project_pr_refusal(&pm.dir, &project.key, pr_url)? {
+    let project_key = shared.issue_project(issue_id)?;
+    if let Some(why) = shared.pr_refusal(&project_key, pr_url)? {
         return Err(reject(why));
     }
     let (slug, number) = issue::task_report::parse_pr_url(pr_url)?;
@@ -275,7 +340,7 @@ pub(super) fn classify_with_policy(
     // Resolve the effective policy once — the target gate and the
     // requirements evaluator below share it. The reread at the end
     // still re-resolves for drift detection.
-    let (resolved, approved) = policy_snapshot(shared, &pm.dir, &project.key)?;
+    let (resolved, approved) = shared.policy(&project_key)?;
     if base_ref != default && !approved_integration_target(base_ref, &resolved, approved.as_ref()) {
         return Err(reject(format!(
             "PR base {base_ref:?} is neither the repository default {default:?} \
@@ -361,7 +426,7 @@ pub(super) fn classify_with_policy(
     // Refuse a mixed-head answer: re-read all external and operator-owned
     // inputs that determine the result before returning it.
     let after = pr_view(shared, &repo, number)?;
-    let (after_resolved, _) = policy_snapshot(shared, &pm.dir, &project.key)?;
+    let (after_resolved, _) = shared.policy(&project_key)?;
     if after["state"].as_str() != Some("OPEN")
         || after["title"]
             .as_str()
@@ -382,7 +447,7 @@ pub(super) fn classify_with_policy(
         ));
     }
     Ok((
-        json!({"issue": issue_id, "project": project.key, "repo": repo, "pr": number,
+        json!({"issue": issue_id, "project": project_key, "repo": repo, "pr": number,
         "head": head, "base": base, "base_ref": base_ref, "merge_base": merge_base,
         "policy_digest": result.policy_digest, "requirements": result, "changes": changes}),
         resolved,

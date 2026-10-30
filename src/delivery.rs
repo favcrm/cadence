@@ -1054,6 +1054,25 @@ pub fn awaiting_github(rec: &Record) -> bool {
 /// done report names a PR; the board's unattended sync applies it again
 /// before its `gh` reads one.
 pub fn project_pr_refusal(pm_dir: &Path, project: &str, pr: &str) -> Result<Option<String>> {
+    pr_refusal_for_remotes(project, pr, || {
+        Ok(crate::issue::project::list(pm_dir)?
+            .into_iter()
+            .find(|p| p.key == project)
+            .iter()
+            .flat_map(|p| p.repos.iter())
+            .filter_map(|r| r.remote.clone())
+            .collect())
+    })
+}
+
+/// [`project_pr_refusal`] over the project's declared `repos[].remote`
+/// values, however they were read — the local tracker or a hosted org's
+/// (CAD-1946). `remotes` runs only for a well-formed PR URL.
+pub fn pr_refusal_for_remotes(
+    project: &str,
+    pr: &str,
+    remotes: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<Option<String>> {
     let Some(key) = pr_ref(pr) else {
         return Ok(Some(format!(
             "names `pr: {pr}`, which is not a pull request URL"
@@ -1062,13 +1081,8 @@ pub fn project_pr_refusal(pm_dir: &Path, project: &str, pr: &str) -> Result<Opti
     let (slug, _) = crate::issue::task_report::parse_pr_url(pr)?;
     let want =
         crate::issue::project::normalize_remote(&format!("github.com/{slug}")).to_ascii_lowercase();
-    let found = crate::issue::project::list(pm_dir)?
-        .into_iter()
-        .find(|p| p.key == project);
-    let remotes: Vec<String> = found
+    let remotes: Vec<String> = remotes()?
         .iter()
-        .flat_map(|p| p.repos.iter())
-        .filter_map(|r| r.remote.as_deref())
         .map(|r| crate::issue::project::normalize_remote(r).to_ascii_lowercase())
         .collect();
     if remotes.contains(&want) {
@@ -1221,6 +1235,8 @@ fn gh_via(gh_bin: &str, polled: bool, args: &[&str]) -> Result<String> {
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
+
+pub mod hosted_gate;
 
 #[cfg(test)]
 mod cad1751_pause_refusal_acceptance;

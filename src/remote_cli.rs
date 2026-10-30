@@ -124,6 +124,13 @@ pub const REMOTE_VERBS: &[&str] = &[
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
     "master_status",
+    // CAD-1946: the merge gate. Reads (cli.read) and the operator's merge
+    // approval (`audit.approve`, which only `cadence login --audit-approve`
+    // requests; the hosted org admits it for the human owner only).
+    "delivery_policy",
+    "audit_approval",
+    "audit_scope",
+    "audit_approve",
 ];
 
 /// Scope a cli authorize request asks for. Existing container verbs keep
@@ -131,7 +138,10 @@ pub const REMOTE_VERBS: &[&str] = &[
 /// for the scope that verb requires.
 fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
     match verb {
-        "team_list" | "team_invites" => &["cli.read"],
+        "team_list" | "team_invites" | "delivery_policy" | "audit_approval" | "audit_scope" => {
+            &["cli.read"]
+        }
+        "audit_approve" => &["audit.approve"],
         "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => &["cli.write"],
         _ => &["cli.read", "cli.write"],
     }
@@ -429,6 +439,8 @@ const CAPABILITIES: &[&str] = &[
     // existing login without them stays valid for every other verb.
     "settings.read",
     "settings.write",
+    // CAD-1946: opt-in like settings — the operator's merge approval.
+    "audit.approve",
 ];
 const RENEW_BEFORE: u64 = 60;
 const SKEW: u64 = 5;

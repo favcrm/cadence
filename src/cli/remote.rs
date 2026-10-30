@@ -1191,7 +1191,8 @@ fn unavailable(command: &Commands) -> Error {
          issue project policy, wiki ls, wiki search, wiki cat, \
          wiki put (text), wiki cp, settings agents <verb>, master status, \
          team list, team invites, team invite, team revoke-invite, \
-         team set-role, team remove. \
+         team set-role, team remove, delivery requirements, audit approval, \
+         audit scope, audit approve (merge). \
          Use `--org local` or `cadence org switch` to run locally.",
         name(command)
     ))
@@ -1470,6 +1471,9 @@ pub(super) fn run(
             },
         );
     }
+    if let Some(code) = merge_gate(&target, &command, wake_timeout)? {
+        return Ok(code);
+    }
     let (verb, args) = verb_for(&command)?;
     // CAD-1568: a remote send keeps its caller-chosen `--message` id for
     // reconciliation. An `unknown` outcome — the response was lost after
@@ -1544,6 +1548,96 @@ pub(super) fn run(
             Ok(5)
         }
     }
+}
+
+/// CAD-1946: the merge gate's commands against a hosted org — the reads
+/// `scripts/enqueue-reviewed` makes and the operator's merge approval.
+/// `None` for every other command. Output and exit codes match the local
+/// commands; the checks live in [`cadence_agent::delivery::hosted_gate`].
+fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> Result<Option<i32>> {
+    use cadence_agent::delivery::hosted_gate;
+    let repo_or_origin = |repo: &Option<String>| -> Result<String> {
+        match repo {
+            Some(r) => Ok(r.clone()),
+            None => cadence_agent::audit::origin_slug(&std::env::current_dir()?).ok_or_else(|| {
+                Error::rejected("no github.com origin remote in the cwd — pass --repo owner/name")
+            }),
+        }
+    };
+    let printed = |(doc, code): (Value, i32)| {
+        print_json(&doc);
+        Some(code)
+    };
+    Ok(match command {
+        Commands::Delivery {
+            action: DeliveryAction::Requirements {
+                issue, pr, head, ..
+            },
+        } => printed((
+            hosted_gate::requirements(target, wake_timeout, issue, pr, head)?,
+            0,
+        )),
+        Commands::Audit {
+            action: Some(AuditAction::Approval { pr, head, repo }),
+            ..
+        } => {
+            let head = super::audit::full_head(head)?;
+            let repo = repo_or_origin(repo)?;
+            printed(hosted_gate::approval(
+                target,
+                wake_timeout,
+                &repo,
+                *pr,
+                &head,
+            )?)
+        }
+        Commands::Audit {
+            action: Some(AuditAction::Scope { issue }),
+            ..
+        } => printed(hosted_gate::scope(target, wake_timeout, issue.trim())?),
+        Commands::Audit {
+            action:
+                Some(AuditAction::Approve {
+                    pr,
+                    head,
+                    issue,
+                    delegated,
+                    scope,
+                    source,
+                    repo,
+                    action,
+                    id,
+                }),
+            ..
+        } => {
+            // The stored login is the human's; a managed caller spending
+            // it would approve as the operator (the CAD-1586 rule above).
+            if target.identity.is_some()
+                || std::env::var_os("CADENCE_ALIAS").is_some()
+                || std::env::var_os("CADENCE_GRANT_TOKEN").is_some()
+            {
+                return Err(Error::rejected(
+                    "remote `audit approve` refused for a managed caller: an approval is \
+                     the operator's own act and the stored login is not an agent's to spend. \
+                     Nothing was sent.",
+                ));
+            }
+            if issue.is_some() || *delegated || scope.is_some() || id.is_some() || action != "merge"
+            {
+                return Err(Error::usage(
+                    "remote `audit approve` records a merge approval only: --issue/--action \
+                     scope, --delegated, --scope and --id are not available on a hosted org. \
+                     Nothing was sent.",
+                ));
+            }
+            let pr = pr.ok_or_else(|| Error::rejected("--pr is required"))?;
+            let head = super::audit::full_head(head.as_deref().unwrap_or_default())?;
+            let repo = repo_or_origin(repo)?;
+            let receipt = hosted_gate::approve(target, wake_timeout, &repo, pr, &head, source)?;
+            printed((receipt, 0))
+        }
+        _ => None,
+    })
 }
 
 /// CAD-1593: `restore` against a remote org. Only `--portable` forms exist

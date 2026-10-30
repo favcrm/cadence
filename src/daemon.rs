@@ -266,6 +266,7 @@ pub(crate) mod custody_acceptance_fixture;
 #[cfg(all(test, unix, feature = "test-seam"))]
 mod custody_security_r2;
 mod delivery_requirements_rpc;
+pub(crate) use delivery_requirements_rpc::{classify_from, GhRead, RequirementInputs};
 mod delivery_rpc;
 mod dispatch_rpc;
 mod effect_rpc;

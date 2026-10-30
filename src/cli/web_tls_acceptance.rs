@@ -127,6 +127,7 @@ fn real_login(auth_dir: &Path, slug: &str) -> LoginGrant {
         true,
         false,
         false,
+        false,
     )
     .expect("real device-flow login")
 }

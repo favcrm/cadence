@@ -428,9 +428,15 @@ pub fn parse(text: &str) -> Result<Option<DeliveryPolicy>> {
 /// Strict load: no file/section is `Ok(None)`; a symlinked, unreadable
 /// or malformed one refuses — an approval never guesses.
 pub fn load(pm_dir: &Path, key: &str) -> Result<Option<DeliveryPolicy>> {
-    match work::read_project_md(pm_dir, key)? {
+    parse_project(key, work::read_project_md(pm_dir, key)?.as_deref())
+}
+
+/// [`load`] over a PROJECT.md text already read — locally or from a
+/// hosted org (CAD-1946). `None` is "no PROJECT.md".
+pub fn parse_project(key: &str, text: Option<&str>) -> Result<Option<DeliveryPolicy>> {
+    match text {
         None => Ok(None),
-        Some(text) => parse(&text).map_err(|e| Error::rejected(format!("{key}: {e}"))),
+        Some(text) => parse(text).map_err(|e| Error::rejected(format!("{key}: {e}"))),
     }
 }
 
