@@ -30,6 +30,14 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: RemoteAction,
     },
+    /// Start a GitHub App connection for the saved hosted org (CAD-1946).
+    /// The CLI asks the issuer for a device code, shows the URL, and polls
+    /// until the owner finishes in a browser. It never receives a GitHub
+    /// token and cannot authorize on the owner's behalf.
+    Connect {
+        #[command(subcommand)]
+        action: ConnectAction,
+    },
     /// Sign in through the hosted AgenticOS portal and map the approved
     /// workspace to a remote org (CAD-1019, CAD-1329). Bare `login` opens
     /// the portal's workspace picker at the hosted issuer; an optional
@@ -1859,5 +1867,21 @@ pub(crate) enum TeamAction {
     Remove {
         /// Member user id from `team list`.
         user_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ConnectAction {
+    /// Connect GitHub to the saved hosted org.
+    Github {
+        /// AgenticOS HTTPS issuer origin. Defaults to the hosted issuer.
+        #[arg(long)]
+        issuer: Option<String>,
+        /// Print the URL and code without opening a browser.
+        #[arg(long)]
+        no_open: bool,
+        /// Seconds to keep polling before giving up (default 600).
+        #[arg(long, value_name = "SECS", default_value_t = 600)]
+        wait: u64,
     },
 }

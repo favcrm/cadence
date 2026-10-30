@@ -283,6 +283,30 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             }
             return Ok(0);
         }
+        Commands::Connect { action } => {
+            let commands::ConnectAction::Github {
+                issuer,
+                no_open,
+                wait,
+            } = action;
+            let issuer = issuer
+                .as_deref()
+                .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
+            let poll = cadence_agent::github_connect::connect(
+                issuer,
+                std::time::Duration::from_secs(*wait),
+                |url, code| {
+                    let _ = show_login_code(url, code, *no_open);
+                },
+            )?;
+            let line = cadence_agent::github_connect::outcome_line(&poll)
+                .unwrap_or_else(|| "The connection did not settle in time.".to_string());
+            eprintln!("{line}");
+            return Ok(match poll {
+                cadence_agent::github_connect::Poll::Connected(_) => 0,
+                _ => 1,
+            });
+        }
         Commands::Login {
             hint,
             issuer,
@@ -624,6 +648,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
     match command {
         Commands::Remote { .. }
         | Commands::Register { .. }
+        | Commands::Connect { .. }
         | Commands::Login { .. }
         | Commands::Auth { .. }
         | Commands::Web { .. } => {
