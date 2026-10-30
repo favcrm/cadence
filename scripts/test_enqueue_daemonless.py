@@ -62,6 +62,7 @@ class Daemonless(scope.Case):
         self.no_verdicts = False
         self.combined_only = False
         self.risk_rc = 0
+        self.one_review_rc = 0
         self.signers = ""
         self.scope_calls = 0
         # One combined PASS pinned to HEAD, on the one-review list.
@@ -120,6 +121,8 @@ class Daemonless(scope.Case):
                 return 0, json.dumps([self.approval_comments]), ""
             if f"/contents/{enq.RISK_PATHS_FILE}?ref=" in url and self.risk_rc != 0:
                 return self.risk_rc, "", "Not Found"
+            if f"/contents/{enq.ONE_REVIEW_FILE}?ref=" in url and self.one_review_rc != 0:
+                return self.one_review_rc, "", "Not Found"
             if "/issues/5/comments" in url:
                 return 0, json.dumps([self.approval_comments]), ""
         return super().run(argv)
@@ -166,8 +169,8 @@ class DaemonlessMerge(unittest.TestCase):
         self.approval()
         reasons, report = self.c.evaluate()
         self.assertEqual(reasons, [], report)
-        self.assertTrue(any("set aside" in r and UNAVAILABLE.split(";")[0][:20] in r
-                            or "set aside" in r for r in report), report)
+        self.assertTrue(any("set aside" in r and "not available on a remote org" in r
+                            for r in report), report)
         self.assertTrue(any("legacy strict floor applies" in r for r in report), report)
         self.assertFalse(any("authoritative" in r for r in reasons), reasons)
 
@@ -249,6 +252,14 @@ class DaemonlessMerge(unittest.TestCase):
         self.assertTrue(any(r.startswith("class: human") for r in report), report)
         self.assertTrue(any("reviews required: two" in r for r in report), report)
 
+    def test_an_unreadable_one_review_manifest_keeps_the_operator_floor(self):
+        """Native needs both manifests; unreadable either one demands approval."""
+        self.c.one_review_rc = 1
+        self.c.approval_comments = []
+        reasons, report = self.c.evaluate()
+        self.assertTrue(any("cannot read docs/roles/one-review-paths.toml" in r for r in report), report)
+        self.assertTrue(any("no operator approval" in r for r in reasons), reasons)
+
     def test_a_missing_review_refuses(self):
         self.approval()
         self.c.no_verdicts = True
@@ -257,9 +268,13 @@ class DaemonlessMerge(unittest.TestCase):
 
     def test_an_absent_or_red_ci_run_refuses(self):
         self.approval()
+        self.c.ci_runs_ok = [dict(scope.CI_RUN)]
         self.c.ci_runs = []
         reasons, _ = self.c.evaluate()
-        self.assertTrue(any("ci.yml" in r or "not a completed success" in r for r in reasons), reasons)
+        self.assertTrue(any("no ci.yml PR run" in r for r in reasons), reasons)
+        self.c.ci_runs = [dict(self.c.ci_runs_ok[0], conclusion="failure")]
+        reasons, _ = self.c.evaluate()
+        self.assertTrue(any("not a completed success" in r for r in reasons), reasons)
 
     # -- the scope fallback is gone without a daemon ------------------------
 

@@ -268,7 +268,9 @@ the code you just wrote.
   always** (it never claims the one-review waiver: the native list validation
   cannot be reproduced faithfully, and a partial or control-character-bearing
   diff would otherwise slip through); the operator check on a human-class
-  diff; the full CI floor; the default branch as the only target — because no
+  diff; the full CI floor; the default branch as the only target; and the
+  operator requirement kept when *either* trusted manifest is unreadable —
+  because no
   approved project policy can be read without the daemon. **Never pass `--daemonless`
   where a daemon runs:** without it, an unanswerable `delivery requirements`
   is a refusal, so a working daemon's own refusal is never downgraded. It

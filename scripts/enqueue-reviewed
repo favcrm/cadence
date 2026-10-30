@@ -1215,6 +1215,12 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     # Human class: paths, size, or any head-pinned note whose Risk is not exactly `auto`.
     why = [] if risk is not None else [f"cannot read {RISK_PATHS_FILE} at the base (fail closed)"]
     why += [p for p in paths if is_human_path(p, risk or ())][:5]
+    if daemonless and one_text is None:
+        # The native classifier needs BOTH manifests: an unreadable pair made
+        # the list set absent and demanded the operator approval. Without the
+        # authoritative answer that condition must still be reproduced, or a
+        # readable risk list alone would quietly drop the operator floor.
+        why.append(f"cannot read {ONE_REVIEW_FILE} at the base (fail closed)")
     if lines > HUMAN_LINES:
         why.append(f"{lines} changed lines")
     not_auto = [v for v in verdicts if v["risk"] != "auto"]
