@@ -628,6 +628,78 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             args.insert("payload".into(), Value::Object(payload));
             "settings_agents"
         }
+        // CAD-1946: the merge gate's three reads. The hosted org answers
+        // each from its own evaluator, approval store and notes dir; the
+        // caller names only the ticket, the PR and the head.
+        Commands::Delivery {
+            action:
+                super::delivery::DeliveryAction::Requirements {
+                    issue,
+                    pr,
+                    head,
+                    json: _,
+                },
+        } => {
+            args.insert("issue".into(), json!(issue));
+            args.insert("pr".into(), json!(pr));
+            args.insert("head".into(), json!(head));
+            "delivery_requirements"
+        }
+        Commands::Audit {
+            action:
+                Some(super::audit::AuditAction::Approval {
+                    pr,
+                    head,
+                    repo,
+                    issue,
+                }),
+            ..
+        } => {
+            let Some(issue) = issue else {
+                return Err(unsupported(
+                    "audit approval",
+                    "omit --issue",
+                    "the hosted read binds the approval to the ticket's live PR head",
+                ));
+            };
+            let repo = match repo {
+                Some(r) => r.clone(),
+                None => cadence_agent::audit::origin_slug(&std::env::current_dir()?).ok_or_else(
+                    || {
+                        Error::rejected(
+                            "no github.com origin remote in the cwd — pass --repo owner/name",
+                        )
+                    },
+                )?,
+            };
+            args.insert("issue".into(), json!(issue.trim()));
+            args.insert("repo".into(), json!(repo));
+            args.insert("pr".into(), json!(pr));
+            args.insert("head".into(), json!(head.trim().to_ascii_lowercase()));
+            "audit_approval"
+        }
+        Commands::Audit {
+            action:
+                Some(super::audit::AuditAction::Verdicts {
+                    issue,
+                    pr,
+                    head,
+                    notes_dir,
+                }),
+            ..
+        } => {
+            if notes_dir.is_some() {
+                return Err(unsupported(
+                    "audit verdicts",
+                    "--notes-dir",
+                    "the hosted org reads its own configured notes directory",
+                ));
+            }
+            args.insert("issue".into(), json!(issue.trim()));
+            args.insert("pr".into(), json!(pr));
+            args.insert("head".into(), json!(head.trim().to_ascii_lowercase()));
+            "audit_verdicts"
+        }
         _ => return Err(unavailable(command)),
     };
     Ok((verb, args))
@@ -1190,6 +1262,7 @@ fn unavailable(command: &Commands) -> Error {
          send/message send (--message required), message read, inbox (peek), \
          issue project policy, wiki ls, wiki search, wiki cat, \
          wiki put (text), wiki cp, settings agents <verb>, master status, \
+         delivery requirements, audit approval, audit verdicts, \
          team list, team invites, team invite, team revoke-invite, \
          team set-role, team remove. \
          Use `--org local` or `cadence org switch` to run locally.",
@@ -1232,6 +1305,8 @@ fn name(command: &Commands) -> &'static str {
         Commands::Team { .. } => "team <verb>",
         Commands::Settings { .. } => "settings agents <verb>",
         Commands::Master { .. } => "master <verb>",
+        Commands::Delivery { .. } => "delivery <verb>",
+        Commands::Audit { .. } => "audit <verb>",
         _ => "<command>",
     }
 }
@@ -1530,6 +1605,11 @@ pub(super) fn run(
                 "{}",
                 serde_json::to_string_pretty(&body).unwrap_or_default()
             );
+            // `audit approval` exits 0 only for an approval in force, as
+            // the local read does.
+            if verb == "audit_approval" && body["state"] != "in-force" {
+                return Ok(1);
+            }
             Ok(0)
         }
         cadence_agent::remote_cli::RemoteAnswer::Conflict(body) => {

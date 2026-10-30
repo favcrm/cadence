@@ -14,8 +14,9 @@ unless ALL of these hold for the pinned head:
     rulesets) is PRESENT and SUCCESS at that head. Missing or pending fails,
     and so does a base branch for which no required check can be read: an
     invalid workflow yields zero checks, and "nothing failed" is not a pass;
-  * the verdict notes in the notes dir, parsed by `cadence audit verdicts`
-    (the audit's own note parser; reviewer = first token of `From:`), give the
+  * the verdict notes, parsed by `cadence audit verdicts` (the audit's own
+    note parser; reviewer = first token of `From:`) from the org's configured
+    notes dir, or from --notes-dir on a local org only, give the
     required count of PASS verdicts pinned to this exact head from distinct
     reviewers, none of them the PR author: two (Standards plus Spec/security),
     or one (`Review (standards+spec)`) when every change is on the one-review
@@ -28,6 +29,11 @@ unless ALL of these hold for the pinned head:
     any head-pinned note whose Risk is not exactly `auto`),
     `cadence audit approval` reports an approval in
     force for exactly this head. This script never records an approval.
+
+The three `cadence` reads (`delivery requirements`, `audit approval`, `audit
+verdicts`) go to whichever org `cadence` resolves. On a hosted org the org
+answers them itself (CAD-1946); an unreachable org or a malformed answer is a
+refusal, never a pass.
 
 Then it signs (repo, pr, head) with the delivery-gate key (--gate-key) and posts
 the signature on the PR (CAD-1925: the merge queue's `delivery-gate` job holds
@@ -51,7 +57,6 @@ import unicodedata
 from urllib.parse import quote
 
 ME = "enqueue-reviewed"
-DEFAULT_NOTES_DIR = "/var/www/agent-notes"
 GATE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "delivery-gate")
 DEFAULT_GATE_KEY = "~/.config/cadence/delivery-gate/signing_key"  # CAD-1925
 ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
@@ -491,9 +496,13 @@ def required_check_reasons(repo, head, base_oid, required, rollup, runs):
 # ---- verdict notes (parsed by `cadence audit verdicts`) --------------------
 
 def read_verdicts(notes_dir, issue, pr, head):
-    """(verdicts, skipped) from the audit's own note parser. Raises on failure."""
-    rc, out, err = run(["cadence", "audit", "verdicts", "--issue", issue, "--pr", str(pr),
-                        "--head", head, "--notes-dir", notes_dir])
+    """(verdicts, skipped) from the audit's own note parser. Raises on failure.
+
+    No --notes-dir means the org's own notes dir; a hosted org refuses the flag."""
+    argv = ["cadence", "audit", "verdicts", "--issue", issue, "--pr", str(pr), "--head", head]
+    if notes_dir:
+        argv += ["--notes-dir", notes_dir]
+    rc, out, err = run(argv)
     try:
         doc = json.loads(out)
         verdicts, skipped = doc["verdicts"], doc.get("skipped", [])
@@ -656,8 +665,9 @@ def requirements_inspection(issue, repo, pr, head):
         raise RuntimeError(f"cannot use authoritative `cadence delivery requirements` result: {e}; {(err or out).strip()[:200]}")
 
 
-def check_approval(repo, pr, head, report, evidence=None):
-    rc, out, err = run(["cadence", "audit", "approval", "--pr", str(pr), "--head", head, "--repo", repo])
+def check_approval(issue, repo, pr, head, report, evidence=None):
+    rc, out, err = run(["cadence", "audit", "approval", "--pr", str(pr), "--head", head, "--repo", repo,
+                        "--issue", issue or ""])
     try:
         state = json.loads(out)
     except ValueError:
@@ -1069,7 +1079,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")
     if why:
         report.append("class: human (" + "; ".join(why) + ")")
-        rs = check_approval(repo, pr, head, report, approval_evidence)
+        rs = check_approval(issue, repo, pr, head, report, approval_evidence)
         if rs:  # legacy CAD-1106 scope fallback only
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
                              risk_text, one_text, verdicts, counted, report, approval_evidence)
@@ -1082,7 +1092,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         report.append("class: auto (every head-pinned note says Risk: auto; no path or size trigger)")
     authoritative_operator = bool(authority and authority["requirements"]["operator_approval"])
     if authoritative_operator and not why:
-        rs = check_approval(repo, pr, head, report, approval_evidence)
+        rs = check_approval(issue, repo, pr, head, report, approval_evidence)
         if rs:
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
                              risk_text, one_text, verdicts, counted, report, approval_evidence)
@@ -1234,7 +1244,7 @@ def main(argv):
     ap.add_argument("pr", type=int)
     ap.add_argument("--head", required=True, help="the full 40-hex head SHA the review covered")
     ap.add_argument("--repo")
-    ap.add_argument("--notes-dir", default=os.environ.get("CADENCE_NOTES_DIR", DEFAULT_NOTES_DIR))
+    ap.add_argument("--notes-dir", default=os.environ.get("CADENCE_NOTES_DIR"))
     ap.add_argument("--author", action="append", default=[], help="an extra alias that authored the PR")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--gate-key", default=os.environ.get("CADENCE_DELIVERY_GATE_KEY", DEFAULT_GATE_KEY),

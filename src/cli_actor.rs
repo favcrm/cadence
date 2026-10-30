@@ -82,6 +82,12 @@ pub enum Verb {
     // settings.read — master launch diagnosis for the authorized
     // management agent (CAD-1586); writes nothing.
     MasterStatus,
+    // cli.read, human Owner only — the merge gate's three reads
+    // (CAD-1946). Each answers from this org's own evaluator, approval
+    // store and notes; none writes a gate decision.
+    DeliveryRequirements,
+    AuditApproval,
+    AuditVerdicts,
 }
 
 /// The scope a verb needs — `cli.write` never implies `cli.read`, and
@@ -123,6 +129,9 @@ impl Verb {
             "project_policy" => Verb::ProjectPolicy,
             "settings_agents" => Verb::SettingsAgents,
             "master_status" => Verb::MasterStatus,
+            "delivery_requirements" => Verb::DeliveryRequirements,
+            "audit_approval" => Verb::AuditApproval,
+            "audit_verdicts" => Verb::AuditVerdicts,
             _ => return None,
         })
     }
@@ -138,7 +147,10 @@ impl Verb {
             | Verb::IssueHistory
             | Verb::MessageRead
             | Verb::MessageInbox
-            | Verb::TeamList => Scope::Read,
+            | Verb::TeamList
+            | Verb::DeliveryRequirements
+            | Verb::AuditApproval
+            | Verb::AuditVerdicts => Scope::Read,
             Verb::IssueNew
             | Verb::IssueComment
             | Verb::IssueSet

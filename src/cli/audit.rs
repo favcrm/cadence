@@ -59,6 +59,12 @@ pub(crate) enum AuditAction {
         /// `owner/name` (default: the cwd checkout's github.com origin).
         #[arg(long)]
         repo: Option<String>,
+        /// The ticket the PR delivers. Required on a hosted org, which
+        /// binds the read to the PR's live head through `delivery
+        /// requirements` first (CAD-1946); the local store read does not
+        /// use it.
+        #[arg(long)]
+        issue: Option<String>,
     },
     /// Read-only (CAD-1106): the ticket scope pre-approvals recorded for
     /// `--issue` (id, body digest, how recorded, revoked or not). Prints one
@@ -155,7 +161,7 @@ pub(super) fn run(
             print_json(&v);
             Ok(code)
         }
-        Some(AuditAction::Approval { pr, head, repo }) => {
+        Some(AuditAction::Approval { pr, head, repo, .. }) => {
             let head = full_head(&head)?;
             let repo = match repo {
                 Some(r) => r,

@@ -57,6 +57,9 @@ use crate::issue::{board, history, model, write as issue_write, Pm};
 /// refetches, so per-fixture issuers in tests stay honest.
 static CLI_JWKS: Mutex<board_identity::JwksCache> = Mutex::new(board_identity::JwksCache::new());
 
+#[path = "cli_delivery_reads.rs"]
+mod delivery_reads;
+
 #[cfg(all(test, feature = "cli-runtime-test"))]
 pub(crate) fn prime_jwks_for_test(issuer: &str, kid: &str, now: i64) -> crate::Result<()> {
     CLI_JWKS
@@ -330,7 +333,14 @@ fn arg_strs(args: &Value, key: &str) -> Result<Vec<String>, HttpResp> {
 fn rpc(state_dir: &Path, method: &str, params: Value) -> HttpResp {
     match client::rpc(state_dir, method, params) {
         Ok(v) => json_ok(v),
-        Err(e @ crate::error::Error::Structured(_)) => {
+        Err(e) => rpc_error(e),
+    }
+}
+
+/// [`rpc`]'s refusal mapping, for a caller that needs the answer first.
+fn rpc_error(e: crate::error::Error) -> HttpResp {
+    match e {
+        e @ crate::error::Error::Structured(_) => {
             let code = e.code().unwrap_or("invalid_request").to_string();
             let status = match code.as_str() {
                 "capability_unavailable" => 503,
@@ -341,7 +351,7 @@ fn rpc(state_dir: &Path, method: &str, params: Value) -> HttpResp {
             };
             cli_fail(status, &code, &e.to_string())
         }
-        Err(e) => match e.kind() {
+        e => match e.kind() {
             "rejected" => cli_fail(400, "invalid_request", &e.to_string()),
             _ => cli_fail(503, "capability_unavailable", &e.to_string()),
         },
@@ -664,6 +674,10 @@ fn dispatch(
                     "payload": Value::Object(op_payload),
                 }),
             )
+        }
+        // CAD-1946: the merge gate's reads — human Owner only.
+        Verb::DeliveryRequirements | Verb::AuditApproval | Verb::AuditVerdicts => {
+            delivery_reads::serve(verb, args, actor, state_dir, pm_dir)
         }
         // ---- cli.write ----
         Verb::IssueNew => match pm_at(pm_dir) {

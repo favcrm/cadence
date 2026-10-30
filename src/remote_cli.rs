@@ -124,6 +124,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
     "master_status",
+    // CAD-1946: the merge gate's reads — cli.read, human Owner only.
+    "delivery_requirements",
+    "audit_approval",
+    "audit_verdicts",
 ];
 
 /// Scope a cli authorize request asks for. Existing container verbs keep
@@ -132,6 +136,7 @@ pub const REMOTE_VERBS: &[&str] = &[
 fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
     match verb {
         "team_list" | "team_invites" => &["cli.read"],
+        "delivery_requirements" | "audit_approval" | "audit_verdicts" => &["cli.read"],
         "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => &["cli.write"],
         _ => &["cli.read", "cli.write"],
     }
