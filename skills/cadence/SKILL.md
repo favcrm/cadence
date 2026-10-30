@@ -14,8 +14,8 @@ your pane environment has `CADENCE_ALIAS` and `CADENCE_STATE_DIR` set.
 `cadence --help` lists the core verbs only, in groups:
 
 - Me: `self`, `inbox`
-- Work: `issue`, `plan`
-- Agents: `send`, `dispatch`, `join`, `agent`
+- Work: `issue` (`issue epic propose|approve|reject` is the plan write; `plan ls` and `plan show` remain)
+- Agents: `agent` (`agent join` adds a worker). `send` and `dispatch` still parse; `message send` is the canonical enqueue
 - Build: `build-slot`, `secret`
 - Fleet: `status`, `doctor`
 - Knowledge: `memory`, `wiki`
