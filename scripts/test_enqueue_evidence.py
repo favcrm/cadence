@@ -399,6 +399,20 @@ class EvidencePosting(unittest.TestCase):
                 self.assert_refused_clean(rc, err)
                 self.assertIn("operator approval", err)
 
+    def test_hosted_owner_approval_counts_and_no_other_recorded_via_does(self):
+        # CAD-1946: exactly operator-connection and hosted-owner-login.
+        self.c.approval_via = "hosted-owner-login"
+        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}\nGreen CI run: {CI_URL}\nOperator approval id: {APPROVAL_ID}"}]
+        rc, out, err = self.run_main("--dry-run")
+        self.assertEqual(rc, 0, (out, err))
+        for via in ("hosted-member-login", "hosted-owner-login ", "Hosted-Owner-Login", ""):
+            with self.subTest(via=via):
+                self.fresh()
+                self.c.approval_via = via
+                rc, out, err = self.run_main()
+                self.assert_refused_clean(rc, err)
+                self.assertIn("operator approval", err)
+
     def test_comment_write_failure_refuses_before_enqueue(self):
         self.c.comment_rc = 1
         rc, out, err = self.run_main()

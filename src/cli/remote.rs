@@ -1192,7 +1192,7 @@ fn unavailable(command: &Commands) -> Error {
          wiki put (text), wiki cp, settings agents <verb>, master status, \
          team list, team invites, team invite, team revoke-invite, \
          team set-role, team remove, delivery requirements, audit approval, \
-         audit scope, audit approve (merge). \
+         audit scope, audit approve (merge), issue project delivery. \
          Use `--org local` or `cadence org switch` to run locally.",
         name(command)
     ))
@@ -1610,18 +1610,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                 }),
             ..
         } => {
-            // The stored login is the human's; a managed caller spending
-            // it would approve as the operator (the CAD-1586 rule above).
-            if target.identity.is_some()
-                || std::env::var_os("CADENCE_ALIAS").is_some()
-                || std::env::var_os("CADENCE_GRANT_TOKEN").is_some()
-            {
-                return Err(Error::rejected(
-                    "remote `audit approve` refused for a managed caller: an approval is \
-                     the operator's own act and the stored login is not an agent's to spend. \
-                     Nothing was sent.",
-                ));
-            }
+            refuse_managed(target, "audit approve")?;
             if issue.is_some() || *delegated || scope.is_some() || id.is_some() || action != "merge"
             {
                 return Err(Error::usage(
@@ -1636,8 +1625,48 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             let receipt = hosted_gate::approve(target, wake_timeout, &repo, pr, &head, source)?;
             printed((receipt, 0))
         }
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Project {
+                    action:
+                        cadence_agent::issue::cli::ProjectAction::Delivery {
+                            key,
+                            repos,
+                            delivery_file,
+                        },
+                },
+        } => {
+            refuse_managed(target, "issue project delivery")?;
+            let delivery = delivery_file
+                .as_ref()
+                .map(|path| {
+                    std::fs::read_to_string(path).map_err(|e| {
+                        Error::rejected(format!("--delivery-file {}: {e}", path.display()))
+                    })
+                })
+                .transpose()?;
+            let receipt =
+                hosted_gate::set_delivery(target, wake_timeout, key, repos, delivery.as_deref())?;
+            printed((receipt, 0))
+        }
         _ => None,
     })
+}
+
+/// The stored login is the human owner's; a managed caller spending it
+/// would act as the owner (the CAD-1586 rule in [`run`]).
+fn refuse_managed(target: &RemoteTarget, command: &str) -> Result<()> {
+    if target.identity.is_some()
+        || std::env::var_os("CADENCE_ALIAS").is_some()
+        || std::env::var_os("CADENCE_GRANT_TOKEN").is_some()
+    {
+        return Err(Error::rejected(format!(
+            "remote `{command}` refused for a managed caller: it is the workspace \
+             owner's own act and the stored login is not an agent's to spend. \
+             Nothing was sent."
+        )));
+    }
+    Ok(())
 }
 
 /// CAD-1593: `restore` against a remote org. Only `--portable` forms exist

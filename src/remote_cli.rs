@@ -128,6 +128,7 @@ pub const REMOTE_VERBS: &[&str] = &[
     // approval (`audit.approve`, which only `cadence login --audit-approve`
     // requests; the hosted org admits it for the human owner only).
     "delivery_policy",
+    "delivery_policy_set",
     "audit_approval",
     "audit_scope",
     "audit_approve",
@@ -141,7 +142,9 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         "team_list" | "team_invites" | "delivery_policy" | "audit_approval" | "audit_scope" => {
             &["cli.read"]
         }
-        "audit_approve" => &["audit.approve"],
+        // The owner's merge approval and the delivery inputs it binds both
+        // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
+        "audit_approve" | "delivery_policy_set" => &["cli.write", "audit.approve"],
         "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => &["cli.write"],
         _ => &["cli.read", "cli.write"],
     }

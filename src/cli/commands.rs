@@ -92,8 +92,8 @@ pub(crate) enum Commands {
         #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
         cloud_agent: bool,
         /// CAD-1946: also request `audit.approve`, which a hosted org needs
-        /// before the operator's `audit approve` can record a merge
-        /// approval. Never part of a default login.
+        /// before the owner's `audit approve` (a merge approval) or
+        /// `issue project delivery` can run. Never part of a default login.
         #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
         audit_approve: bool,
     },

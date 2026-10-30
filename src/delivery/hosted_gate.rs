@@ -8,7 +8,9 @@
 //! the hosted `delivery_policy`, and the PR from the caller's `gh` exactly
 //! as the daemon read it. `audit approve|approval|scope` are hosted verbs;
 //! their answers are checked here against the exact request and printed in
-//! the local command's shape, so `scripts/enqueue-reviewed` is unchanged.
+//! the local command's shape, so `scripts/enqueue-reviewed` reads them as
+//! before. `issue project delivery` records the project's repos and
+//! `delivery:` section through `delivery_policy_set`.
 //!
 //! Every answer is checked strictly. A missing, malformed or foreign
 //! answer is a refusal, never an approval, a pass or a default.
@@ -68,37 +70,76 @@ fn text<'a>(body: &'a Value, key: &str, verb: &str) -> Result<&'a str> {
 
 // ---- delivery requirements ------------------------------------------------
 
-/// What `delivery_policy` answered for one project: the PROJECT.md text
-/// (`None` = no file), the recorded `project_work_approve` delivery half
-/// (`approved_from`'s payload) and the declared `repos[].remote` values.
+/// What `delivery_policy` answered for one project: the stored
+/// `delivery:` section text (`None` = absent, the native "no section"),
+/// the approval of it in `approved_from`'s payload shape (or `None`) and
+/// the declared repos as `github.com/<owner>/<name>` remotes.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ProjectPolicy {
-    pub project_md: Option<String>,
+    pub delivery: Option<String>,
     pub approval: Option<Value>,
     pub remotes: Vec<String>,
 }
 
-/// Exactly `{project, project_md, approval, remotes}`, echoing `project`,
-/// with at least one remote. Any other document — the hosted org's absent
-/// marker, the visibility/grants answer of `project_policy`, an extra or
-/// missing key — refuses: without the project's declared remotes nothing
-/// proves the PR's repository belongs to it, so nothing is defaulted.
+/// A declared repo: `owner/name`, each part 1-100 of `[A-Za-z0-9._-]`.
+pub fn valid_repo(repo: &str) -> bool {
+    let part = |p: &str| {
+        (1..=100).contains(&p.len())
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    repo.split_once('/')
+        .is_some_and(|(owner, name)| part(owner) && part(name))
+}
+
+/// A PROJECT.md text whose frontmatter carries exactly the stored
+/// `delivery:` section, so the native [`delivery_policy::parse`] reads it.
+/// The text is the section's YAML value, or the section with its
+/// `delivery:` key.
+pub fn delivery_front(section: &str) -> String {
+    let section = section.trim_end();
+    if section.trim_start().starts_with("delivery:") {
+        format!("---\n{section}\n---\n")
+    } else {
+        let body: String = section.lines().map(|l| format!("  {l}\n")).collect();
+        format!("---\ndelivery:\n{body}---\n")
+    }
+}
+
+/// The tenant's `{state: …}` marker, if `value` is one.
+fn marker_state(value: Option<&Value>) -> Option<&str> {
+    value?.get("state")?.as_str()
+}
+
+/// `{project, revision, repos, delivery, delivery_approval}`, echoing
+/// `project`:
+/// - `repos` `{state:"set", repos:[owner/name…]}` (non-empty); `not_stored`
+///   refuses, because nothing then proves the PR's repository belongs to
+///   the project.
+/// - `delivery` `{state:"set", text}` is the section; `{state:"absent"}` is
+///   the native "no section" (the default lean policy); anything else
+///   refuses.
+/// - `delivery_approval` `{state:"approved", digest, recorded_via:
+///   "hosted-owner-login"}` is offered to the native `approved_from` as the
+///   approval of the parsed section, so it counts only when `digest` is the
+///   native policy digest; any other state is no approval (strict, as an
+///   unapproved custom section is natively).
+///
+/// Any other key or shape refuses, so no policy input is ever ignored.
 pub(crate) fn delivery_policy_answer(body: &Value, project: &str) -> Result<ProjectPolicy> {
     let fields = body
         .as_object()
         .ok_or_else(|| refuse("`delivery_policy` answer is not an object"))?;
-    if fields.contains_key("absent")
-        || fields.get("state").and_then(Value::as_str) == Some("absent")
-    {
-        return Err(refuse(format!(
-            "the hosted org has no delivery policy or repo remotes for project {project}; \
-             nothing proves the PR's repository belongs to it"
-        )));
-    }
-    const KEYS: [&str; 4] = ["project", "project_md", "approval", "remotes"];
+    const KEYS: [&str; 5] = [
+        "project",
+        "revision",
+        "repos",
+        "delivery",
+        "delivery_approval",
+    ];
     if fields.len() != KEYS.len() || !KEYS.iter().all(|k| fields.contains_key(*k)) {
         return Err(refuse(
-            "`delivery_policy` answer must be exactly {project, project_md, approval, remotes}",
+            "`delivery_policy` answer must be exactly {project, revision, repos, delivery, delivery_approval}",
         ));
     }
     if fields["project"].as_str() != Some(project) {
@@ -106,38 +147,81 @@ pub(crate) fn delivery_policy_answer(body: &Value, project: &str) -> Result<Proj
             "`delivery_policy` answered for another project than {project}"
         )));
     }
-    let project_md = match &fields["project_md"] {
-        Value::Null => None,
-        Value::String(s) => Some(s.clone()),
-        _ => return Err(refuse("`delivery_policy` project_md is not text or null")),
-    };
-    let approval = match &fields["approval"] {
-        Value::Null => None,
-        v @ Value::Object(_) => Some(v.clone()),
-        _ => {
-            return Err(refuse(
-                "`delivery_policy` approval is not an object or null",
-            ))
+    if !(fields["revision"].is_null() || fields["revision"].is_u64()) {
+        return Err(refuse("`delivery_policy` revision is malformed"));
+    }
+    let repos = match marker_state(fields.get("repos")) {
+        Some("set") => fields["repos"]["repos"]
+            .as_array()
+            .ok_or_else(|| refuse("`delivery_policy` repos has no list"))?,
+        Some("not_stored") => {
+            return Err(refuse(format!(
+                "the hosted org stores no repos for project {project}; nothing proves the \
+                 PR's repository belongs to it — the owner records them with \
+                 `cadence issue project delivery {project} --repo owner/name`"
+            )))
         }
+        _ => return Err(refuse("`delivery_policy` repos is malformed")),
     };
-    let remotes = fields["remotes"]
-        .as_array()
-        .ok_or_else(|| refuse("`delivery_policy` remotes is not a list"))?
+    let remotes = repos
         .iter()
         .map(|r| {
             r.as_str()
-                .filter(|s| !s.trim().is_empty())
-                .map(str::to_string)
-                .ok_or_else(|| refuse("`delivery_policy` remotes holds a non-text entry"))
+                .filter(|r| valid_repo(r))
+                .map(|r| format!("github.com/{r}"))
+                .ok_or_else(|| {
+                    refuse("`delivery_policy` repos holds an entry that is not owner/name")
+                })
         })
         .collect::<Result<Vec<_>>>()?;
     if remotes.is_empty() {
         return Err(refuse(format!(
-            "`delivery_policy` declares no repo remotes for project {project}"
+            "`delivery_policy` declares no repos for project {project}"
         )));
     }
+    let delivery = match marker_state(fields.get("delivery")) {
+        Some("set") => Some(
+            fields["delivery"]["text"]
+                .as_str()
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| refuse("`delivery_policy` delivery has no text"))?
+                .to_string(),
+        ),
+        Some("absent") => None,
+        _ => {
+            return Err(refuse(format!(
+                "`delivery_policy` delivery for project {project} is not stored or malformed"
+            )))
+        }
+    };
+    let approval = match marker_state(fields.get("delivery_approval")) {
+        Some("approved") => {
+            let record = &fields["delivery_approval"];
+            if record["recorded_via"].as_str() != Some("hosted-owner-login") {
+                return Err(refuse(
+                    "`delivery_policy` approval was not recorded by the hosted owner",
+                ));
+            }
+            let digest = record["digest"]
+                .as_str()
+                .ok_or_else(|| refuse("`delivery_policy` approval has no digest"))?;
+            // The native approval payload: the recorded digest plus the
+            // policy it approves. `approved_from` keeps it only when the
+            // digest is the native digest of exactly that policy.
+            let policy = delivery
+                .as_deref()
+                .map(|text| delivery_policy::parse(&delivery_front(text)))
+                .transpose()
+                .ok()
+                .flatten()
+                .flatten();
+            policy.map(|p| json!({"delivery_digest": digest, "delivery": p}))
+        }
+        Some(_) => None,
+        None => return Err(refuse("`delivery_policy` delivery_approval is malformed")),
+    };
     Ok(ProjectPolicy {
-        project_md,
+        delivery,
         approval,
         remotes,
     })
@@ -206,7 +290,10 @@ fn resolve(
         .and_then(delivery_policy::approved_from);
     let resolved = delivery_policy::effective(
         project,
-        delivery_policy::parse_project(project, answer.project_md.as_deref()),
+        delivery_policy::parse_project(
+            project,
+            answer.delivery.as_deref().map(delivery_front).as_deref(),
+        ),
         approved.as_ref(),
     );
     (resolved, approved)
@@ -238,6 +325,78 @@ pub fn requirements(
     let (mut answer, _) = classify_from(&inputs, &json!({"issue": issue, "pr": pr, "head": head}))?;
     answer["readiness"] = Value::Null;
     Ok(answer)
+}
+
+/// `cadence issue project delivery` for a hosted org: record the project's
+/// repos and optional `delivery:` section through `delivery_policy_set`.
+/// Each repo must be `owner/name` and the section must parse with the
+/// native parser before anything is sent; the receipt must echo exactly
+/// the project and repos recorded.
+pub fn set_delivery(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    project: &str,
+    repos: &[String],
+    delivery: Option<&str>,
+) -> Result<Value> {
+    let repos = set_delivery_repos(repos)?;
+    if let Some(section) = delivery {
+        if delivery_policy::parse(&delivery_front(section))?.is_none() {
+            return Err(refuse("the delivery file holds no delivery section"));
+        }
+    }
+    let mut call_args = args(&[("project", json!(project)), ("repos", json!(repos))]);
+    if let Some(section) = delivery {
+        call_args.insert("delivery".into(), json!(section));
+    }
+    let body = call(target, wake_timeout, "delivery_policy_set", call_args)?;
+    set_delivery_answer(&body, project, &repos, delivery)
+}
+
+fn set_delivery_repos(repos: &[String]) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for repo in repos {
+        let repo = repo.trim();
+        if !valid_repo(repo) {
+            return Err(refuse(format!("--repo {repo:?} is not owner/name")));
+        }
+        if !out.iter().any(|r| r.eq_ignore_ascii_case(repo)) {
+            out.push(repo.to_string());
+        }
+    }
+    if out.is_empty() {
+        return Err(refuse("at least one --repo is required"));
+    }
+    Ok(out)
+}
+
+/// The receipt `{state:"recorded", project, repos, delivery, revision}`
+/// must echo exactly what was sent.
+pub(crate) fn set_delivery_answer(
+    body: &Value,
+    project: &str,
+    repos: &[String],
+    delivery: Option<&str>,
+) -> Result<Value> {
+    let echoed = body["repos"].as_array().map(|list| {
+        list.iter()
+            .map(|r| r.as_str().unwrap_or_default().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    });
+    let asked: Vec<String> = repos.iter().map(|r| r.to_ascii_lowercase()).collect();
+    if body["state"].as_str() != Some("recorded")
+        || body["project"].as_str() != Some(project)
+        || echoed.as_ref() != Some(&asked)
+        || body["delivery"].as_str() != delivery
+        || (delivery.is_none() && !body["delivery"].is_null())
+        || !body["revision"].is_u64()
+    {
+        return Err(refuse(format!(
+            "`delivery_policy_set` receipt does not name exactly project {project} and its repos: {}",
+            short(body)
+        )));
+    }
+    Ok(body.clone())
 }
 
 // ---- audit approval / scope / approve ---------------------------------------
@@ -548,49 +707,166 @@ mod tests {
         assert!(approve_answer(&refused, "favcrm/cadence", 7, HEAD, "chris").is_err());
     }
 
-    #[test]
-    fn delivery_policy_answer_is_exact_and_refuses_the_visibility_shape() {
-        let ok = json!({"project": "cadence", "project_md": null, "approval": null,
-                        "remotes": ["github.com/favcrm/cadence"]});
-        for absent in [
-            json!({"project": "cadence", "absent": true}),
-            json!({"project": "cadence", "state": "absent"}),
-        ] {
-            let err = delivery_policy_answer(&absent, "cadence").unwrap_err();
-            assert!(err.to_string().contains("nothing proves"), "{err}");
-        }
-        let mut no_remotes = ok.clone();
-        no_remotes["remotes"] = json!([]);
-        assert!(delivery_policy_answer(&no_remotes, "cadence").is_err());
-        let read = delivery_policy_answer(&ok, "cadence").unwrap();
-        assert_eq!(read.remotes, vec!["github.com/favcrm/cadence".to_string()]);
-        assert!(delivery_policy_answer(&ok, "pm").is_err());
-        let visibility = json!({"project": "cadence", "visibility": "private", "grants": []});
-        assert!(delivery_policy_answer(&visibility, "cadence").is_err());
-        let mut extra = ok.clone();
-        extra["policy"] = json!("routine");
-        assert!(delivery_policy_answer(&extra, "cadence").is_err());
-        let mut bad_remote = ok.clone();
-        bad_remote["remotes"] = json!([7]);
-        assert!(delivery_policy_answer(&bad_remote, "cadence").is_err());
+    fn answer(repos: Value, delivery: Value, approval: Value) -> Value {
+        json!({"project": "cadence", "revision": 3, "repos": repos,
+               "delivery": delivery, "delivery_approval": approval})
+    }
+
+    fn not_stored() -> Value {
+        json!({"state": "not_stored", "reason": "x"})
     }
 
     #[test]
-    fn hosted_policy_resolves_through_the_daemon_functions() {
-        // No PROJECT.md, no approval: the daemon's defaults (not an active
-        // profile); an inconsistent approval reads as none, as locally.
+    fn delivery_policy_answer_needs_stored_repos_and_known_keys() {
+        let set = json!({"state": "set", "repos": ["favcrm/cadence"]});
+        let ok = answer(set.clone(), json!({"state": "absent"}), not_stored());
+        let read = delivery_policy_answer(&ok, "cadence").unwrap();
+        assert_eq!(read.remotes, vec!["github.com/favcrm/cadence".to_string()]);
+        assert_eq!((read.delivery, read.approval), (None, None));
+        let unset = answer(not_stored(), not_stored(), not_stored());
+        let err = delivery_policy_answer(&unset, "cadence").unwrap_err();
+        assert!(err.to_string().contains("nothing proves"), "{err}");
+        let mut extra = ok.clone();
+        extra["policy"] = json!("routine");
+        let mut other_project = ok.clone();
+        other_project["project"] = json!("pm");
+        for body in [
+            answer(
+                json!({"state": "set", "repos": []}),
+                json!({"state": "absent"}),
+                not_stored(),
+            ),
+            answer(
+                json!({"state": "set", "repos": ["github.com/favcrm/cadence"]}),
+                json!({"state": "absent"}),
+                not_stored(),
+            ),
+            answer(
+                json!(["favcrm/cadence"]),
+                json!({"state": "absent"}),
+                not_stored(),
+            ),
+            answer(set.clone(), not_stored(), not_stored()),
+            answer(set.clone(), json!(null), not_stored()),
+            answer(set.clone(), json!({"state": "set"}), not_stored()),
+            answer(set.clone(), json!({"state": "absent"}), json!(null)),
+            answer(
+                set.clone(),
+                json!({"state": "absent"}),
+                json!({"state": "approved", "digest": "d", "recorded_via": "operator-connection"}),
+            ),
+            extra,
+            other_project,
+            json!({"project": "cadence", "visibility": "private", "grants": []}),
+        ] {
+            assert!(delivery_policy_answer(&body, "cadence").is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn hosted_policy_resolves_through_the_native_functions() {
+        // Absent delivery and no approval: exactly the native "no section".
         let none = ProjectPolicy {
-            project_md: None,
+            delivery: None,
             approval: None,
             remotes: vec![],
         };
         let local = delivery_policy::effective("cadence", Ok(None), None);
         assert_eq!(resolve("cadence", &none).0, local);
+        // An inconsistent approval reads as none, as natively.
         let forged = ProjectPolicy {
             approval: Some(json!({"delivery_digest": "sha256:00", "delivery": null})),
             ..none
         };
         assert_eq!(resolve("cadence", &forged), (local, None));
+        // A stored section is parsed by the native parser, with or without
+        // its `delivery:` key, and is unapproved until an approval matches.
+        let section =
+            "reviews: {r: {kind: agent, focus: general}}\nrisk: [{require: [r]}]\nmax_revise: 4\n";
+        let text = "---\ndelivery:\n  reviews: {r: {kind: agent, focus: general}}\n  risk: [{require: [r]}]\n  max_revise: 4\n---\n";
+        let native = delivery_policy::effective(
+            "cadence",
+            delivery_policy::parse_project("cadence", Some(text)),
+            None,
+        );
+        for stored in [
+            section.to_string(),
+            format!("delivery:\n  {}", section.replace('\n', "\n  ")),
+        ] {
+            let custom = ProjectPolicy {
+                delivery: Some(stored),
+                approval: None,
+                remotes: vec![],
+            };
+            let (resolved, _) = resolve("cadence", &custom);
+            assert_eq!(resolved, native);
+            assert!(resolved
+                .note
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("delivery_unapproved"));
+        }
+    }
+
+    #[test]
+    fn a_hosted_approval_counts_only_with_the_native_policy_digest() {
+        let text =
+            "reviews: {r: {kind: agent, focus: general}}\nrisk: [{require: [r]}]\nmax_revise: 4\n";
+        let policy = delivery_policy::parse(&delivery_front(text))
+            .unwrap()
+            .unwrap();
+        let repos = json!({"state": "set", "repos": ["favcrm/cadence"]});
+        let delivery = json!({"state": "set", "text": text});
+        let approved = |digest: &str| {
+            let body = answer(
+                repos.clone(),
+                delivery.clone(),
+                json!({"state": "approved", "digest": digest,
+                       "recorded_via": "hosted-owner-login"}),
+            );
+            resolve(
+                "cadence",
+                &delivery_policy_answer(&body, "cadence").unwrap(),
+            )
+        };
+        let (native, approval) = approved(&delivery_policy::digest(&policy));
+        assert_eq!((native.source, native.note.as_deref()), ("approved", None));
+        assert!(approval.is_some());
+        // A digest of the raw text is not the native digest: unapproved.
+        use sha2::{Digest, Sha256};
+        let raw: String = Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        for digest in [raw.clone(), format!("sha256:{raw}")] {
+            let (resolved, approval) = approved(&digest);
+            assert_eq!(approval, None);
+            assert!(resolved
+                .note
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("delivery_unapproved"));
+        }
+    }
+
+    #[test]
+    fn delivery_set_validates_repos_and_its_receipt() {
+        assert!(set_delivery_repos(&["favcrm/cadence".into(), "evil".into()]).is_err());
+        assert!(set_delivery_repos(&[]).is_err());
+        let repos =
+            set_delivery_repos(&["favcrm/cadence".into(), "FavCRM/Cadence".into()]).unwrap();
+        assert_eq!(repos, vec!["favcrm/cadence".to_string()]);
+        let ok = json!({"state": "recorded", "project": "cadence", "repos": ["favcrm/cadence"],
+                        "delivery": null, "revision": 2});
+        assert!(set_delivery_answer(&ok, "cadence", &repos, None).is_ok());
+        assert!(set_delivery_answer(&ok, "pm", &repos, None).is_err());
+        assert!(set_delivery_answer(&ok, "cadence", &repos, Some("max_revise: 4")).is_err());
+        let mut other = ok.clone();
+        other["repos"] = json!(["favcrm/pm"]);
+        assert!(set_delivery_answer(&other, "cadence", &repos, None).is_err());
+        let mut refused = ok.clone();
+        refused["state"] = json!("refused");
+        assert!(set_delivery_answer(&refused, "cadence", &repos, None).is_err());
     }
 
     /// The classifier refuses a PR outside the ticket project's declared
