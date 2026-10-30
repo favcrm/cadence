@@ -1,22 +1,19 @@
 # Hosted workspace: local agents, shared work and apps
 
-**Keep the installed Cadence daemon.** It opens one outbound authenticated WSS
-connection for each explicitly connected workspace, multiplexing the agents you
-register. Hosted metadata tells it what changed; typed HTTPS commands still
-read, claim and report work. No inbound port, second messaging daemon, peer mesh
-or automatic scan of private conversations is needed. Standalone local operation
-with no hosted binding keeps its existing storage, terminal and app commands.
+Use the hosted workspace as the shared source of truth. A connected local
+agent uses an installed native daemon and an outbound authenticated WSS
+connection; hosted board and conversation access do not require a local daemon.
+An assignment is not proof that a worker ran or reported a result.
 
-This guide describes the matching native and hosted implementation, not an
-announcement of production deployment. See [verification and rollout](#verification-and-rollout)
-for the exact revision/evidence boundary. Authentication details remain in
-[REMOTE-AUTH](../REMOTE-AUTH.md); local package rules remain in
-[Workspace app catalog](app-catalog.md).
+The company-container fleet was retired by AgenticOS AOS-374. The tenant
+Worker serves the hosted board and supported CLI operations; older references
+below to waking a company container describe historical integration evidence,
+not a current execution path. Unsupported operations must report unavailable;
+do not fall back to a local tracker or claim they ran.
 
-The event bridge, the selected-hosted app journey and a two-state native
-assignment/wiki/ticket collaboration check have separate observed integration
-checkpoints. Their exercised scope and fixture/rollout limitations are recorded
-below; none of them covers every capacity, rotation or abrupt-loss case.
+See [verification and rollout](#verification-and-rollout) for the scope of
+earlier checkpoints, [REMOTE-AUTH](../REMOTE-AUTH.md) for authentication,
+and [Workspace app catalog](app-catalog.md) for local package rules.
 
 ## What runs where
 
@@ -25,16 +22,14 @@ below; none of them covers every capacity, rotation or abrupt-loss case.
 | Human membership, CLI credentials and shared agent directory | Hosted authority; IDs and labels are not credentials. Presence is observed from an authenticated runner connection, not a promise that an agent can execute. |
 | Assignment state, notification receipts and event outbox | Hosted durable metadata. Events are minimal invalidations; HTTPS rechecks current authority and generation before claims or reports. |
 | Local terminals, worktrees, agent adapters and execution | Installed native daemon. Explicit assignments may invoke the existing agent delivery path; an FYI never does. |
-| Wiki/ticket domain operations and app install/approval/run/business records | Existing native domain owners. The hosted HTTP relay can still wake the company runtime for these operations. The directory/outbox do not replace those owners. |
+| Hosted tickets and wiki | The tenant Worker owns supported hosted reads and writes. Availability is per operation; native-only operations do not become available merely because the board is reachable. |
 | Published immutable package bytes | Hosted package storage; an exact listing/version/digest is provenance, not authority. |
 | Pure app `needs.requires` compatibility rules | Canonical Rust `crates/cadence-core`, called natively and compiled to WASM for the hosted adapter. Transport, authentication, storage and app execution are not moved into this kernel. |
 
-Directory registration/read, event/presence transport and storing an FYI operate
-on hosted metadata without invoking a model or waking the company container.
-Receiving/displaying an FYI also does not start local inference. A real assignment
-can wake its explicitly selected native agent. Wiki/ticket calls and app
-check/apply/reconcile paths that consult the native domain still need the native
-runtime; waking or unavailable is not a reason to fall back to local state.
+Directory and FYI metadata do not invoke a model. A connected local agent can
+receive an explicit assignment; an FYI is not an assignment. Hosted ticket and
+wiki operations use the selected workspace and current authorization. A missing
+or unavailable hosted operation is not a reason to fall back to local state.
 
 Shared hosted work stays in its selected workspace; it is not a mirror of the
 teammate's standalone local tracker. Sharing currently extracts only the pure
@@ -42,12 +37,10 @@ requirements kernel, not the whole daemon or CRM backend into WASM. Each adapter
 must supply its actual host version and supported contracts; a shared rule result
 does not confer platform capabilities or native execution authority.
 
-**Storage limit:** the D1 app-operation journal records metadata, exact consent
-and recovery state; it is not a replicated backup of every native SQLite database,
-Git tracker, business record or container filesystem. Reconcile can observe the
-native catalog, not reconstruct lost authoritative business data. This release
-neither retires the daemon nor claims zero-loss recovery of multiple native stores.
-Host-compiled CRM handlers and durable domain storage remain native-owned.
+**Storage limit:** hosted ticket and wiki data are not a backup of every native
+SQLite database, Git tracker or local file. A stored reference, metadata record
+or historical checkpoint does not establish that the referenced content or a
+native execution runtime is available.
 
 Sources: native [`local_assignment/events.rs`](../../src/local_assignment/events.rs),
 [`local_assignment/http.rs`](../../src/local_assignment/http.rs),
@@ -321,6 +314,10 @@ local upgrade/approval/run behavior is unchanged. The reachable local daemon and
 operator requirement remain. See [app-catalog](app-catalog.md) and
 [workspace app upgrade](workspace-app-upgrade.md) for the local details.
 
+The selected-remote steps below describe the earlier native-hosted app
+journey. Check the selected tenant's actual supported operations before using
+them; the retired company container cannot be woken to satisfy a refusal.
+
 For a **selected hosted workspace**, use a plain human owner's saved renewable
 login, never a managed agent spending the owner's credentials. Local paths/Git
 sources are refused remotely: nothing is uploaded and there is no local fallback.
@@ -374,13 +371,11 @@ not a benchmark or a claim of a dependency on Reason's code.
 
 ## Startup and cost: bounded architectural inference
 
-**[INFERENCE]** Metadata-only events avoid starting a company container/model
-just to discover presence, register an agent or store an FYI. Reusing the installed
-daemon avoids another local service/peer mesh. The pure WASM requirements kernel
-can answer its bounded rule question without booting the full native domain.
-These can reduce unnecessary wakeups and control-plane startup work compared with
-routing every metadata event through a container; they do not remove native work
-for wiki/tickets, app admission/approval/run or business records.
+**[INFERENCE]** Metadata-only events avoid invoking a model just to discover
+presence, register an agent or store an FYI. Reusing the installed native
+daemon for explicitly connected local agents avoids a second local service.
+The pure WASM requirements kernel answers its bounded rule question; it does
+not establish availability of a hosted native domain or execution path.
 
 No startup latency, monthly saving, infrastructure bill, commercial price or trial
 allowance was measured/established by this implementation. Active WSS traffic,
