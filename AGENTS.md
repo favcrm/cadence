@@ -22,9 +22,10 @@ prose and an authoritative source disagree, the source wins.
   `cadence delivery requirements --issue <ID> --pr <url> --head <sha>`.
   The evaluator reads the path lists at the PR's base, so a PR can never
   classify itself under rules it edited.
-- The merge gate is mechanical: `scripts/enqueue-reviewed <pr> --head <sha>`
-  (`--dry-run` enqueues nothing) refuses with one reason per line for
-  everything still missing. Trust it over any prose, this file included.
+- The local merge gate is `scripts/enqueue-reviewed <pr> --head <sha>`
+  (`--dry-run` enqueues nothing). It cannot supply a missing hosted evaluator
+  or approval store. If it is unavailable, report the refusal; do not infer
+  a pass or authorize a bypass. Hosted delivery is tracked by CAD-1946.
 - Risk classes, triggers, who approves what: `docs/roles/risk-classes.md`.
 - Path lists: `docs/roles/one-review-paths.toml` (review count),
   `docs/roles/risk-paths.toml` (triggers; the daemon compiles it in).
@@ -191,6 +192,23 @@ the code you just wrote.
 
 ## Working in this repo
 
+### Hosted workspace
+
+- Use the selected hosted workspace for shared issues and wiki; do not fall
+  back to a local tracker when a hosted operation is unavailable. See
+  `docs/guides/hosted-workspace.md` for supported paths and identity boundaries.
+- `issue start` on a hosted org can return a waiting assignment rather than a
+  worktree or running agent. Inspect the assignment and actual result; a queue
+  receipt, a selected alias, or a status change is not proof of execution.
+- A local connected agent has its own native daemon; hosted board access does
+  not require that daemon. Do not connect a runner blindly when it might claim
+  unrelated waiting work. Agent identity is established by the supported
+  authenticated path, not by supplying an alias or borrowing a human login.
+- Hosted project work and local software delivery are distinct. Until the
+  hosted gate is available, its refusal is a delivery limitation, not a pass;
+  any exception remains operator-controlled and does not grant an agent merge
+  or approval authority.
+
 ### Before you start, and before every push
 
 - `git fetch origin`, then `gh pr list -R favcrm/cadence --state all
@@ -198,7 +216,9 @@ the code you just wrote.
   covers the issue, stop and report it. Search by topic too, because
   duplicates often carry a different id.
 - Work in the lane worktree `cadence issue start <ID>` creates, never on
-  main.
+  main. On a hosted org use `--repo <local-checkout>` and confirm that the
+  assignment actually created the lane; a waiting assignment has not created
+  one.
 - One PR per feature, behind a flag if it must land incomplete, not a chain
   of small slices. Sub-tickets of one feature ship in that PR under the
   parent ticket's id; the body lists them. Don't stack a PR on an unmerged
@@ -214,6 +234,10 @@ the code you just wrote.
   together; there is no separate pre-code round.
 
 ### Approvals
+
+These commands describe the native approval store. A hosted org that cannot
+reach it has not recorded an approval merely because an operator signed in.
+Do not substitute a comment or another identity for the required proof.
 
 - The operator records a `human` approval from an operator connection (not
   an agent pane or endpoint): `cadence audit approve --pr <n> --head
@@ -234,6 +258,10 @@ the code you just wrote.
   --help`); where it does not, the operator approves.
 
 ### Merging
+
+The following is the native reviewed-enqueue path, not a claim that a selected
+hosted workspace can run it. If the gate cannot run, stop and report the
+limitation; only an authorized operator can decide an exception.
 
 - Enqueue with `scripts/enqueue-reviewed <n> --head <full-reviewed-sha>`. It
   refuses unless the PR is open at that head, every required check is
