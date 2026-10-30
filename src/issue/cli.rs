@@ -842,6 +842,24 @@ pub enum ProjectAction {
         #[arg(long = "grant")]
         grants: Vec<String>,
     },
+    /// Record a hosted org's delivery inputs for a project (CAD-1946): its
+    /// GitHub repos and, optionally, its `delivery:` policy section. A
+    /// hosted org stores no project.yaml or PROJECT.md, and the merge gate
+    /// refuses a project with no recorded repos. Replaces what was
+    /// recorded. The workspace owner only; locally, `project add --repo`
+    /// and PROJECT.md hold the same inputs.
+    Delivery {
+        /// Project key.
+        key: String,
+        /// A GitHub repo of the project, `owner/name` (repeatable).
+        #[arg(long = "repo", required = true)]
+        repos: Vec<String>,
+        /// A file holding the project's `delivery:` section (its YAML
+        /// value, or the section with its `delivery:` key). Omitted: no
+        /// section, so the default policy applies.
+        #[arg(long)]
+        delivery_file: Option<std::path::PathBuf>,
+    },
 }
 
 /// `--visibility` for `project policy`: the recorded vocabulary, before it

@@ -60,6 +60,7 @@ pub use self::approval::{approval_check, scope_check, verdicts_check};
 pub(crate) use self::approval::{reviewer_identity, verdicts_in};
 pub use self::delegated::digest;
 pub use self::github::origin_slug;
+pub(crate) use self::store::APPROVAL_UNVERIFIED;
 
 use self::approval::*;
 use self::delegated::*;

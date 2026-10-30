@@ -2664,13 +2664,16 @@ pub fn login_portal(
     dir: &Path,
     show_code: impl FnOnce(&str, &str) -> Result<()>,
 ) -> Result<LoginGrant> {
-    login_portal_scoped(issuer, hint, dir, show_code, false, false, false)
+    login_portal_scoped(issuer, hint, dir, show_code, false, false, false, false)
 }
 
 /// The portal login. `web` adds the Publish Web scopes (`cadence login
 /// --web`), `settings` adds the Settings scopes (`cadence login
 /// --settings`), and `cloud_agent` adds the cloud-agent scopes (`cadence
-/// login --cloud-agent`). The flags combine. None of them is a second login.
+/// login --cloud-agent`), and `audit_approve` adds `audit.approve`
+/// (`cadence login --audit-approve`, CAD-1946). The flags combine. None of
+/// them is a second login.
+#[allow(clippy::too_many_arguments)]
 pub fn login_portal_scoped(
     issuer: &str,
     hint: Option<&str>,
@@ -2679,9 +2682,10 @@ pub fn login_portal_scoped(
     web: bool,
     settings: bool,
     cloud_agent: bool,
+    audit_approve: bool,
 ) -> Result<LoginGrant> {
     let issuer = origin(issuer, cfg!(test))?;
-    login_device_flow(
+    login_device_flow_with(
         &issuer,
         None,
         hint,
@@ -2695,6 +2699,7 @@ pub fn login_portal_scoped(
             (false, false) => LoginScope::Wiki,
         },
         cloud_agent,
+        audit_approve,
     )
 }
 
@@ -2841,6 +2846,31 @@ fn login_device_flow(
     scope: LoginScope,
     cloud_agent: bool,
 ) -> Result<LoginGrant> {
+    login_device_flow_with(
+        issuer,
+        org,
+        hint,
+        dir,
+        show_code,
+        runtime,
+        scope,
+        cloud_agent,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn login_device_flow_with(
+    issuer: &str,
+    org: Option<&str>,
+    hint: Option<&str>,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+    runtime: &mut dyn LoginRuntime,
+    scope: LoginScope,
+    cloud_agent: bool,
+    audit_approve: bool,
+) -> Result<LoginGrant> {
     if org.is_some_and(|value| !id(value)) || hint.is_some_and(|value| !slug(value)) {
         return Err(reject("Invalid hosted login request"));
     }
@@ -2860,6 +2890,9 @@ fn login_device_flow(
     let mut requested = scope.requested();
     if cloud_agent {
         requested.extend_from_slice(&CLOUD_AGENT_LOGIN_SCOPES);
+    }
+    if audit_approve {
+        requested.push("audit.approve");
     }
     let mut request = json!({"version":DEVICE_VERSION,
         "client_label":"cadence-cli","requested_capabilities":requested,

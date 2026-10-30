@@ -66,6 +66,10 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                 print_json(&out);
                 Ok(0)
             }
+            ProjectAction::Delivery { .. } => Err(Error::usage(
+                "`issue project delivery` records a hosted org's delivery inputs; \
+                 locally, `issue project add --repo` and the project's PROJECT.md hold them",
+            )),
             ProjectAction::ApproveWork { key } => {
                 model::check_key(key)?;
                 print_json(&crate::client::rpc(

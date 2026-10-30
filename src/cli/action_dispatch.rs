@@ -283,6 +283,30 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             }
             return Ok(0);
         }
+        Commands::Connect { action } => {
+            let commands::ConnectAction::Github {
+                issuer,
+                no_open,
+                wait,
+            } = action;
+            let issuer = issuer
+                .as_deref()
+                .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
+            let poll = cadence_agent::github_connect::connect(
+                issuer,
+                std::time::Duration::from_secs(*wait),
+                |url, code| {
+                    let _ = show_login_code(url, code, *no_open);
+                },
+            )?;
+            let line = cadence_agent::github_connect::outcome_line(&poll)
+                .unwrap_or_else(|| "The connection did not settle in time.".to_string());
+            eprintln!("{line}");
+            return Ok(match poll {
+                cadence_agent::github_connect::Poll::Connected(_) => 0,
+                _ => 1,
+            });
+        }
         Commands::Login {
             hint,
             issuer,
@@ -295,6 +319,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             web,
             settings,
             cloud_agent,
+            audit_approve,
         } => {
             // `--token-stdin` is the legacy AgenticOS token path, not org login.
             let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
@@ -310,7 +335,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             let issuer = issuer
                 .as_deref()
                 .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
-            let grant = if *web || *settings || *cloud_agent {
+            let grant = if *web || *settings || *cloud_agent || *audit_approve {
                 cadence_agent::remote_enrollment::login_portal_scoped(
                     issuer,
                     hint.as_deref().or(slug.as_deref()),
@@ -319,6 +344,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                     *web,
                     *settings,
                     *cloud_agent,
+                    *audit_approve,
                 )?
             } else if let Some(org) = org.as_deref() {
                 let slug = slug.as_deref().ok_or_else(|| {
@@ -382,6 +408,22 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             }
         }
         _ => {}
+    }
+    // CAD-1946: `audit verdicts` only parses the notes directory, so it
+    // runs locally whatever org is selected — before org resolution, the
+    // client-only router and any daemon or state dir.
+    if let Commands::Audit {
+        action:
+            Some(audit::AuditAction::Verdicts {
+                issue,
+                pr,
+                head,
+                notes_dir,
+            }),
+        ..
+    } = &cli.command
+    {
+        return audit::verdicts(issue, *pr, head, notes_dir.as_deref());
     }
     // Hosted metadata never needs local sandbox adoption, permission replay,
     // daemon startup, or the generic native/container verb map. Refuse an
@@ -606,6 +648,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
     match command {
         Commands::Remote { .. }
         | Commands::Register { .. }
+        | Commands::Connect { .. }
         | Commands::Login { .. }
         | Commands::Auth { .. }
         | Commands::Web { .. } => {

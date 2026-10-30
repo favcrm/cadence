@@ -54,6 +54,7 @@ pub mod doctor;
 pub mod error;
 pub mod filter;
 pub mod gh_guard;
+pub mod github_connect;
 pub mod home;
 mod ident;
 pub mod inbox;

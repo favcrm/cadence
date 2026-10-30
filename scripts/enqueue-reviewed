@@ -92,6 +92,10 @@ NEVER_SCOPE_TRIGGERS = {1, 3}
 # work has started and the ticket is not closed. backlog, done, dropped: no.
 SCOPE_STATUSES = ("ready", "doing", "review")
 SCOPE_RECORDED_VIA = "operator-connection"  # the proof check_approval relies on
+# CAD-1946: a merge approval is the operator's when recorded over the local
+# operator connection or by a hosted org's owner login holding audit.approve.
+# Exactly these two; any other recorded_via refuses.
+APPROVAL_RECORDED_VIA = (SCOPE_RECORDED_VIA, "hosted-owner-login")
 # Rust's char::is_whitespace set: the daemon's scope_digest is sha256 of
 # body.trim(), and Python's str.strip() trims a different set.
 RUST_WS = "\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
@@ -663,7 +667,7 @@ def check_approval(repo, pr, head, report, evidence=None):
     except ValueError:
         return [f"cannot read the operator approval via `cadence audit approval` (rc {rc}): {(err or out).strip()[:200]}"]
     if (rc == 0 and state.get("state") == "in-force"
-            and state.get("recorded_via") == SCOPE_RECORDED_VIA
+            and state.get("recorded_via") in APPROVAL_RECORDED_VIA
             and isinstance(state.get("approval_id"), str) and state["approval_id"]):
         if evidence is not None:
             evidence["approval"] = state["approval_id"]

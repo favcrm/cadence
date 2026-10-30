@@ -140,16 +140,7 @@ pub(super) fn run(
             pr,
             head,
             notes_dir,
-        }) => {
-            let head = full_head(&head)?;
-            print_json(&cadence_agent::audit::verdicts_check(
-                notes_dir.as_deref(),
-                issue.trim(),
-                pr,
-                &head,
-            )?);
-            Ok(0)
-        }
+        }) => verdicts(&issue, pr, &head, notes_dir.as_deref()),
         Some(AuditAction::Scope { issue }) => {
             let (v, code) = cadence_agent::audit::scope_check(&state_dir, issue.trim());
             print_json(&v);
@@ -187,9 +178,27 @@ pub(super) fn run(
     }
 }
 
+/// `cadence audit verdicts`: a pure parse of the notes directory. It
+/// needs no daemon, state dir or org, so every org runs it here (CAD-1946).
+pub(super) fn verdicts(
+    issue: &str,
+    pr: u64,
+    head: &str,
+    notes_dir: Option<&std::path::Path>,
+) -> Result<i32> {
+    let head = full_head(head)?;
+    print_json(&cadence_agent::audit::verdicts_check(
+        notes_dir,
+        issue.trim(),
+        pr,
+        &head,
+    )?);
+    Ok(0)
+}
+
 /// A pinned head is the full 40-hex SHA, lower-cased; anything shorter
 /// would let a read bind to another revision.
-fn full_head(head: &str) -> Result<String> {
+pub(super) fn full_head(head: &str) -> Result<String> {
     let h = head.trim().to_ascii_lowercase();
     if h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit()) {
         Ok(h)
