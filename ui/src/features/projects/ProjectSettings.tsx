@@ -165,15 +165,21 @@ export default function ProjectSettings({
                       {t(option === "private" ? "Private" : "Workspace-visible")}
                     </span>
                     <span className="mt-1 block text-label text-ink-400">
-                      {option === "private" && !privateOffered
-                        ? t(
-                            "Private is not available yet — the isolation gate has not passed. Workspace-visible is the only visibility this build records.",
-                          )
-                        : t(
-                            option === "private"
-                              ? "Only the people granted below can see it. An owner can still open it without a grant."
-                              : "Every current and future member of this workspace can see it. Grants are stored but admit no one.",
+                      {t(
+                        option === "private"
+                          ? "Only the people granted below can see it. An owner can still open it without a grant."
+                          : "Every current and future member of this workspace can see it. Grants are stored but admit no one.",
+                      )}
+                      {option === "private" && !privateOffered && (
+                        <>
+                          {" "}
+                          {t(
+                            "This build cannot record private — the isolation gate has not passed.",
                           )}
+                          {base?.visibility === "private" &&
+                            ` ${t("This project already carries a private policy recorded earlier.")}`}
+                        </>
+                      )}
                     </span>
                   </button>
                 );
@@ -269,7 +275,7 @@ export default function ProjectSettings({
           </section>
           <section className="card mt-4 max-w-2xl p-5" aria-label={t("Same change from the CLI")}>
             <div className="slabel">{t("Same change from the CLI")}</div>
-            <pre className="mt-2 overflow-x-auto break-all whitespace-pre-wrap rounded border border-ink-700 bg-ink-900 p-3 font-mono text-label text-ink-200">
+            <pre className="mt-2 overflow-x-auto break-words whitespace-pre-wrap rounded border border-ink-700 bg-ink-900 p-3 font-mono text-label text-ink-200">
               {cliCommand(project, draft)}
             </pre>
             <p className="mt-2 text-label text-ink-500">
