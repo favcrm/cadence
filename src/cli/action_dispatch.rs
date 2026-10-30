@@ -303,7 +303,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 .unwrap_or_else(|| "The connection did not settle in time.".to_string());
             eprintln!("{line}");
             return Ok(match poll {
-                cadence_agent::github_connect::Poll::Connected(_) => 0,
+                cadence_agent::github_connect::Poll::Connected { .. } => 0,
                 _ => 1,
             });
         }

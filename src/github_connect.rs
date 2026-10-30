@@ -106,13 +106,35 @@ pub fn start(issuer: &str) -> Result<Issued> {
     })
 }
 
+/// The workspace a connection grant was bound to.
+#[derive(Debug, PartialEq)]
+pub struct Workspace {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Poll {
     Pending,
     Approved,
-    Connected(u64),
+    /// The grant settled: repositories the installation exposes, and the
+    /// workspace it bound. The workspace is absent only when the org no longer
+    /// exists, so a missing name is reported rather than guessed.
+    Connected {
+        repositories: u64,
+        workspace: Option<Workspace>,
+    },
     Expired,
     Denied,
+}
+
+/// The workspace a settled grant bound, when the issuer names one.
+fn workspace_of(data: &serde_json::Value) -> Option<Workspace> {
+    let workspace = data.get("workspace")?.as_object()?;
+    Some(Workspace {
+        id: workspace.get("id")?.as_str()?.to_string(),
+        name: workspace.get("name")?.as_str()?.to_string(),
+    })
 }
 
 pub fn poll_once(issuer: &str, device_code: &str) -> Result<Poll> {
@@ -121,7 +143,10 @@ pub fn poll_once(issuer: &str, device_code: &str) -> Result<Poll> {
     match text(&data, "status")? {
         "pending" => Ok(Poll::Pending),
         "approved" => Ok(Poll::Approved),
-        "connected" => Ok(Poll::Connected(number(&data, "repositories"))),
+        "connected" => Ok(Poll::Connected {
+            repositories: number(&data, "repositories"),
+            workspace: workspace_of(&data),
+        }),
         "expired" => Ok(Poll::Expired),
         "denied" => Ok(Poll::Denied),
         other => Err(refuse(format!(
@@ -152,14 +177,82 @@ pub fn connect(issuer: &str, wait: Duration, mut on_code: impl FnMut(&str, &str)
 /// The line a settled grant prints. `None` for anything still in flight.
 pub fn outcome_line(poll: &Poll) -> Option<String> {
     match poll {
-        Poll::Connected(count) => Some(format!(
-            "Connected. {count} repositor{} available to Cadence.",
-            if *count == 1 { "y" } else { "ies" }
-        )),
+        Poll::Connected {
+            repositories: count,
+            workspace,
+        } => Some(match workspace {
+            Some(workspace) => format!(
+                "Connected. {count} repositor{} available to Cadence,\n\
+                 authorized for {} ({}). Compare that with `cadence org ls`: a grant\n\
+                 bound to another workspace leaves this one's repositories empty.",
+                if *count == 1 { "y" } else { "ies" },
+                workspace.name,
+                workspace.id
+            ),
+            None => format!(
+                "Connected. {count} repositor{} available to Cadence, but the issuer\n\
+                 named no workspace — check `cadence org ls` before recording a delivery input.",
+                if *count == 1 { "y" } else { "ies" }
+            ),
+        }),
         Poll::Expired => {
             Some("The code expired before it was approved. Run `connect` again.".into())
         }
         Poll::Denied => Some("The owner declined the connection.".into()),
         Poll::Pending | Poll::Approved => None,
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[test]
+    fn a_settled_grant_names_the_workspace_it_bound() {
+        let data = serde_json::json!({
+            "status": "connected",
+            "repositories": 18,
+            "workspace": {"id": "ws_26e7601c-d62f-4fc3-8b19-df2980d098d8", "name": "Fav Limited"},
+        });
+        let poll = Poll::Connected {
+            repositories: number(&data, "repositories"),
+            workspace: workspace_of(&data),
+        };
+        assert_eq!(
+            poll,
+            Poll::Connected {
+                repositories: 18,
+                workspace: Some(Workspace {
+                    id: "ws_26e7601c-d62f-4fc3-8b19-df2980d098d8".into(),
+                    name: "Fav Limited".into(),
+                }),
+            }
+        );
+        let line = outcome_line(&poll).unwrap();
+        assert!(line.contains("18 repositories"), "{line}");
+        assert!(line.contains("Fav Limited"), "{line}");
+        assert!(
+            line.contains("ws_26e7601c-d62f-4fc3-8b19-df2980d098d8"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_grant_without_a_named_workspace_is_said_so_rather_than_guessed() {
+        let data = serde_json::json!({"status": "connected", "repositories": 1});
+        let poll = Poll::Connected {
+            repositories: number(&data, "repositories"),
+            workspace: workspace_of(&data),
+        };
+        assert_eq!(
+            poll,
+            Poll::Connected {
+                repositories: 1,
+                workspace: None
+            }
+        );
+        let line = outcome_line(&poll).unwrap();
+        assert!(line.contains("named no workspace"), "{line}");
+        assert!(line.contains("1 repository "), "{line}");
     }
 }
