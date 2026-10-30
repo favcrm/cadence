@@ -1,5 +1,7 @@
-//! CAD-1290: "Use for publishing" creates or replaces the install's
-//! publication binding from the company's own destination list. A real
+//! CAD-1290: "Use for publishing" creates the install's publication binding
+//! from the company's own destination list. CAD-1939: Facebook Pages list
+//! too, and choosing another destination adds its own binding instead of
+//! replacing the first. A real
 //! in-process daemon over the `test-seam` caller-identity harness and a stub
 //! destinations door. These are the implementer's own checks of the ticket
 //! outcome; the reviewer writes the acceptance check.
@@ -17,6 +19,8 @@ use std::time::Duration;
 const MINE: &str = "17841400008460056";
 const SECOND: &str = "17841400009999999";
 const OTHER_FB: &str = "275491372109884";
+/// A Facebook Page id the company's list does not carry.
+const UNLISTED_FB: &str = "275491372100000";
 
 struct Fx {
     root: tempfile::TempDir,
@@ -154,19 +158,22 @@ impl Drop for Fx {
 }
 
 #[test]
-fn the_destination_list_is_only_active_instagram_accounts_of_the_company() {
+fn the_destination_list_is_only_active_publishable_accounts_of_the_company() {
     let fx = Fx::start();
     let listed = fx.op("social_destinations", json!({}));
     assert_eq!(listed["unavailable"], false, "{listed}");
     let all = listed["destinations"].as_array().unwrap();
-    assert_eq!(all.len(), 2, "{listed}");
+    assert_eq!(all.len(), 3, "{listed}");
     assert_eq!(all[0]["destination_id"], MINE);
     assert_eq!(all[0]["label"], "@harbour");
+    assert_eq!(all[0]["toolkit"], "instagram");
     assert_eq!(all[1]["destination_id"], SECOND);
+    assert_eq!(all[2]["destination_id"], OTHER_FB);
+    assert_eq!(all[2]["toolkit"], "facebook");
 }
 
 #[test]
-fn use_for_publishing_creates_then_replaces_with_a_revision_check() {
+fn use_for_publishing_creates_updates_with_a_revision_check_and_adds_another_destination() {
     let fx = Fx::start();
     let install = fx.install();
     let created = fx.op(
@@ -182,42 +189,71 @@ fn use_for_publishing_creates_then_replaces_with_a_revision_check() {
         "no standing grant: {created}"
     );
     let revision = created["binding"]["revision"].as_i64().unwrap();
-    // Replacing needs the revision the caller saw.
+    // Updating the same destination needs the revision the caller saw.
     let no_revision = fx.rpc(
         Asserted::Operator,
         "app_binding_use_destination",
         fx.use_params(&install, MINE, json!({})),
     );
-    assert!(no_revision.is_err(), "replaced without a revision");
+    assert!(no_revision.is_err(), "updated without a revision");
     let stale = fx.rpc(
         Asserted::Operator,
         "app_binding_use_destination",
         fx.use_params(&install, MINE, json!({"expected_revision": revision + 7})),
     );
-    assert!(stale.is_err(), "replaced on a stale revision");
-    let replaced = fx.op(
+    assert!(stale.is_err(), "updated on a stale revision");
+    let updated = fx.op(
         "app_binding_use_destination",
-        fx.use_params(&install, SECOND, json!({"expected_revision": revision})),
+        fx.use_params(
+            &install,
+            MINE,
+            json!({"expected_revision": revision, "timezone": "Asia/Tokyo"}),
+        ),
     );
     assert_eq!(
-        replaced["binding"]["revision"].as_i64().unwrap(),
+        updated["binding"]["revision"].as_i64().unwrap(),
         revision + 1
     );
     assert_eq!(
-        replaced["binding"]["config"]["publish"]["destination_id"],
+        updated["binding"]["config"]["publish"]["timezone"],
+        "Asia/Tokyo"
+    );
+    // CAD-1939: another destination adds its own binding (a new request id,
+    // no revision); the first is left as it is.
+    let added = fx.op(
+        "app_binding_use_destination",
+        fx.use_params(&install, SECOND, json!({"request_id": "use-2"})),
+    );
+    assert_ne!(added["binding"]["id"], updated["binding"]["id"]);
+    assert_eq!(
+        added["binding"]["config"]["publish"]["destination_id"],
         SECOND
     );
-    assert!(replaced["binding"]["config"]["publish"]
+    assert!(added["binding"]["config"]["publish"]
         .get("grant_id")
         .is_none());
-    assert_eq!(fx.bindings(&install).len(), 1);
+    let page = fx.op(
+        "app_binding_use_destination",
+        fx.use_params(&install, OTHER_FB, json!({"request_id": "use-3"})),
+    );
+    assert_eq!(page["binding"]["config"]["publish"]["toolkit"], "facebook");
+    assert_eq!(fx.bindings(&install).len(), 3);
+    let first = fx.op(
+        "app_binding_show",
+        json!({"install_id": install, "binding_id": updated["binding"]["id"]}),
+    );
+    assert_eq!(
+        first["binding"]["config"]["publish"]["destination_id"],
+        MINE
+    );
+    assert_eq!(first["binding"]["revision"], updated["binding"]["revision"]);
 }
 
 #[test]
 fn a_destination_outside_the_company_list_is_refused_and_nothing_is_written() {
     let fx = Fx::start();
     let install = fx.install();
-    for destination in ["forged-1", OTHER_FB, "999", "888"] {
+    for destination in ["forged-1", UNLISTED_FB, "999", "888"] {
         let result = fx.rpc(
             Asserted::Operator,
             "app_binding_use_destination",

@@ -2,9 +2,9 @@ import { ApiError } from "../../../lib/api";
 import { withPrivateOperation } from "../../../lib/privateSession";
 import { navigate } from "../../../lib/useLocation";
 import { rememberContext } from "../contextSelection";
-import { workspaceApps, type AppContext, type CapabilityQuote, type Installation, type WorkspaceRun } from "../workspaceApps";
+import { workspaceApps, type AppContext, type CapabilityQuote, type Installation, type PublishDestination, type WorkspaceRun } from "../workspaceApps";
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
-import { accountLabel, connectReturnTo, publicationBinding, sendSlot } from "../socialConnect";
+import { accountLabel, connectReturnTo, destinationBindings, isPublishToolkit, sendSlot, bindingToUse } from "../socialConnect";
 import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE, parseScreenDrawerCall, mediaChatAttachArgs, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
 import type { ScreenActions } from "./screenLifecycle";
 import type { Planner, SlotPlan } from "./screenSlot";
@@ -234,7 +234,8 @@ async function socialDraftCall(verb: CallVerb,args:Record<string,unknown>,ui:{ac
     case "social.drafts.create": operation="create"; if(!exact(args,["alias","request_id","caption","source"])&&!exact(args,["alias","request_id","caption","source","asset_id"])) return refuse("bad_args","That request is not valid."); fields={request_id:args.request_id,caption:args.caption,source:args.source,...("asset_id" in args?{asset_id:args.asset_id}:{})}; break;
     case "social.drafts.update": operation="update"; if(!exact(args,["alias","request_id","draft_id","expected_revision","caption"])&&!exact(args,["alias","request_id","draft_id","expected_revision","caption","asset_id"])) return refuse("bad_args","That request is not valid."); fields={request_id:args.request_id,draft_id:args.draft_id,expected_revision:args.expected_revision,caption:args.caption,...("asset_id" in args?{asset_id:args.asset_id}:{})}; break;
     case "social.drafts.discard": operation="discard"; if(!exact(args,["draft_id","revision"])||typeof args.draft_id!=="string"||!Number.isSafeInteger(args.revision)) return refuse("bad_args","That request is not valid."); fields={draft_id:args.draft_id,revision:args.revision}; break;
-    case "social.drafts.publish.stage": operation="effect-stage"; if(!exact(args,["alias","draft_id","revision","request_id"])||typeof args.draft_id!=="string"||!Number.isSafeInteger(args.revision)||typeof args.request_id!=="string") return refuse("bad_args","That request is not valid."); fields={proof:{kind:"social_draft",draft_id:args.draft_id,revision:args.revision},request_id:args.request_id}; break;
+    // CAD-1939: `destination_id` optionally names which of the context's destinations this effect posts to.
+    case "social.drafts.publish.stage": operation="effect-stage"; if((!exact(args,["alias","draft_id","revision","request_id"])&&!exact(args,["alias","draft_id","revision","request_id","destination_id"]))||typeof args.draft_id!=="string"||!Number.isSafeInteger(args.revision)||typeof args.request_id!=="string"||("destination_id" in args&&(typeof args.destination_id!=="string"||args.destination_id.length===0))) return refuse("bad_args","That request is not valid."); fields={proof:{kind:"social_draft",draft_id:args.draft_id,revision:args.revision},request_id:args.request_id,...("destination_id" in args?{destination_id:args.destination_id}:{})}; break;
     case "social.sources.show": operation="sources/show"; if(!exact(args,["alias"])) return refuse("bad_args","That request is not valid."); fields={}; break;
     case "social.sources.save": operation="sources/save"; if(!exact(args,["alias","request_id","expected_revision","handles"])) return refuse("bad_args","That request is not valid."); fields={request_id:args.request_id,expected_revision:args.expected_revision,handles:args.handles}; break;
     default: return refuse("bad_args","That request is not valid.");
@@ -274,49 +275,77 @@ export const linkTarget = (href: string): string => { const url = new URL(href);
  *  Pause, reset, and frame close abort the continuation for good. A later response cannot assign,
  *  navigate, or show a link, and re-admission does not revive it. */
 async function connectOrOpen(ctx: ActionContext, args: Record<string, unknown>, ui: { showLink(url: string): void; navigate?: (path: string) => void; assign?: (url: string) => void; signal?: AbortSignal }): Promise<ActionResult> {
+  // CAD-1939: the connections link may name which toolkit to connect (default Instagram); nothing else takes one.
+  if ("toolkit" in args && (args.url !== "/settings/connections" || !exact(args, ["url", "toolkit"]) || !isPublishToolkit(args.toolkit)))
+    return refuse("bad_args", "That link is not valid.");
+  const toolkit = isPublishToolkit(args.toolkit) ? args.toolkit : undefined;
   return withPrivateOperation(async (operation) => {
     if (args.url === "/settings/connections") {
       try {
         // CAD-1438: the screen only runs under `/apps/<key>` (uniqueness proven
         // at route level), so the installation's own key is its return path.
-        const reply = await workspaceApps.connectLink(ctx.installId, connectReturnTo(window.location.origin, ctx.installation.name, ctx.installId), operation.signal);
+        const reply = await workspaceApps.connectLink(ctx.installId, connectReturnTo(window.location.origin, ctx.installation.name, ctx.installId), operation.signal, toolkit);
         operation.assertCurrent();
         if (reply.hosted && reply.url) { (ui.assign ?? (url => window.location.assign(url)))(reply.url); return { ok: true, data: {} }; }
         // Hosted but no public AgenticOS address: say so, never send the owner to the local page.
-        if (reply.hosted) return refuse("unavailable", "Instagram connect isn't available for this workspace yet.");
+        if (reply.hosted) return refuse("unavailable", "Connecting accounts isn't available for this workspace yet.");
       } catch {
         operation.assertCurrent();
       }
     }
     operation.assertCurrent();
-    return openLink(args, ui);
+    return openLink({ url: args.url }, ui);
   }, ui.signal);
 }
 
-/** `social.destinations.list`: the company's connected Instagram accounts. Read only. */
+/** `social.destinations.list`: the company's connected Instagram accounts and Facebook Pages (any
+ *  number of each), with their toolkit and whether this context publishes to it now (`used`: it has
+ *  a live publication binding here). Read only. */
 async function listDestinations(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
   if (!exact(args, [])) return refuse("bad_args", "That request is not valid.");
   const reply = await workspaceApps.destinations(ctx.installId);
-  return { ok: true, data: { unavailable: reply.unavailable, destinations: reply.destinations.map(value => ({ destination_id: value.destination_id, label: accountLabel(value.label || value.destination_id) })) } };
+  const slot = sendSlot(ctx.installation);
+  const live = slot ? destinationBindings(await workspaceApps.bindings(ctx.installId, ctx.contextId || undefined), slot,
+    ctx.contextId || null, ctx.installation.digest) : [];
+  return { ok: true, data: { unavailable: reply.unavailable, destinations: reply.destinations.filter(value => isPublishToolkit(value.toolkit))
+    .map(value => ({ destination_id: value.destination_id, label: accountLabel(value.label || value.destination_id), toolkit: value.toolkit,
+      used: live.some(binding => binding.config.publish?.destination_id === value.destination_id && binding.config.publish?.toolkit === value.toolkit) })) } };
 }
 
-/** `publish.destination.use`: the install's own publication binding points at one of the
- *  company's accounts. The account comes from the company's list, never from the frame. */
+/** The `destination_id` (and optional `toolkit`) a destination verb names, or null when malformed. */
+function namedDestination(args: Record<string, unknown>): { id: string; toolkit?: string } | null {
+  if (exact(args, ["destination_id"]) && typeof args.destination_id === "string") return { id: args.destination_id };
+  if (exact(args, ["destination_id", "toolkit"]) && typeof args.destination_id === "string" && isPublishToolkit(args.toolkit))
+    return { id: args.destination_id, toolkit: args.toolkit };
+  return null;
+}
+
+/** One listed account for a named destination: exactly one row must match. */
+function listedDestination(rows: PublishDestination[], named: { id: string; toolkit?: string }): PublishDestination | null {
+  const found = rows.filter(value => value.destination_id === named.id && (named.toolkit === undefined || value.toolkit === named.toolkit));
+  return found.length === 1 ? found[0] : null;
+}
+
+/** `publish.destination.use`: add (or update) the install's publication binding for one of the
+ *  company's accounts; another destination's binding is left as it is (CAD-1939). The account
+ *  comes from the company's list, never from the frame. */
 async function planUseDestination(ctx: ActionContext, args: Record<string, unknown>): Promise<SlotPlan | ActionRefusal> {
-  if (!exact(args, ["destination_id"]) || typeof args.destination_id !== "string") return { code: "bad_args", text: "That request is not valid." };
+  const named = namedDestination(args);
+  if (!named) return { code: "bad_args", text: "That request is not valid." };
   const slot = sendSlot(ctx.installation);
   if (!slot) return { code: "unknown_slot", text: "That isn't available." };
-  const destination = args.destination_id;
+  const destination = named.id;
   try {
     const listed = await workspaceApps.destinations(ctx.installId);
-    const chosen = listed.destinations.find(value => value.destination_id === destination);
-    if (!chosen) return { code: "unknown_destination", text: "That Instagram account isn't connected." };
+    const chosen = listedDestination(listed.destinations, named);
+    if (!chosen) return { code: "unknown_destination", text: "That account isn't connected." };
     const contextId = ctx.contextId;
-    const binding = publicationBinding(await workspaceApps.bindings(ctx.installId, contextId || undefined), slot, contextId || null, ctx.installation.digest);
+    const binding = bindingToUse(await workspaceApps.bindings(ctx.installId, contextId || undefined), slot, contextId || null,
+      ctx.installation.digest, destination, chosen.toolkit);
     const request = randomRequest();
     return { label: `Use ${accountLabel(chosen.label || destination)} for publishing`, run: async (): Promise<ActionResult> => {
       try {
-        await workspaceApps.useDestination(ctx.installId, { destination_id: destination,
+        await workspaceApps.useDestination(ctx.installId, { destination_id: destination, toolkit: chosen.toolkit,
           ...(contextId ? { context_id: contextId } : {}),
           ...(binding ? { expected_revision: binding.revision } : { request_id: request }) });
         ctx.onChanged();
@@ -336,16 +365,42 @@ async function planSavePublishSettings(ctx: ActionContext, args: Record<string, 
   if (!slot) return { code: "unknown_slot", text: "That isn't available." };
   try {
     const listed = await workspaceApps.destinations(ctx.installId);
-    const chosen = listed.destinations.find(value => value.destination_id === args.destination_id);
+    const chosen = listedDestination(listed.destinations, { id: args.destination_id });
     if (!chosen || listed.unavailable) return { code: "unknown_destination", text: "That publishing account isn't available." };
-    const binding = publicationBinding(await workspaceApps.bindings(ctx.installId, ctx.contextId || undefined), slot,
-      ctx.contextId || null, ctx.installation.digest);
-    const body = { destination_id: chosen.destination_id, timezone: args.timezone,
+    const binding = bindingToUse(await workspaceApps.bindings(ctx.installId, ctx.contextId || undefined), slot,
+      ctx.contextId || null, ctx.installation.digest, chosen.destination_id, chosen.toolkit);
+    const body = { destination_id: chosen.destination_id, toolkit: chosen.toolkit, timezone: args.timezone,
       ...(ctx.contextId ? { context_id: ctx.contextId } : {}),
       ...(binding ? { expected_revision: binding.revision } : { request_id: randomRequest() }) };
     return { label: `Save time zone · ${accountLabel(chosen.label || chosen.destination_id)} · ${args.timezone}`, run: async (): Promise<ActionResult> => {
       try {
         await workspaceApps.useDestination(ctx.installId, body);
+        await ctx.onChanged();
+        return { ok: true, data: {} };
+      } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+    } };
+  } catch (error) { return plainRefusal(error); }
+}
+
+/** `publish.destination.remove` (CAD-1939): retire one destination's binding for the active context
+ *  at the revision the host read. The last destination is never removed here, so this cannot put the
+ *  app back into preview mode (the same rule as the Settings panel). */
+async function planRemoveDestination(ctx: ActionContext, args: Record<string, unknown>): Promise<SlotPlan | ActionRefusal> {
+  const named = namedDestination(args);
+  if (!named) return { code: "bad_args", text: "That request is not valid." };
+  const slot = sendSlot(ctx.installation);
+  if (!slot) return { code: "unknown_slot", text: "That isn't available." };
+  try {
+    const bindings = await workspaceApps.bindings(ctx.installId, ctx.contextId || undefined);
+    const live = destinationBindings(bindings, slot, ctx.contextId || null, ctx.installation.digest);
+    const found = live.filter(value => value.config.publish?.destination_id === named.id && (named.toolkit === undefined || value.config.publish?.toolkit === named.toolkit));
+    if (found.length !== 1) return { code: "unknown_destination", text: "This app doesn't publish to that account here." };
+    if (live.length < 2) return { code: "last_destination", text: "Choose another account first — publishing needs at least one." };
+    const binding = found[0];
+    const label = accountLabel(binding.config.publish?.destination_label || named.id);
+    return { label: `Stop publishing to ${label}`, run: async (): Promise<ActionResult> => {
+      try {
+        await workspaceApps.revokeBinding(ctx.installId, binding.id, binding.revision);
         await ctx.onChanged();
         return { ok: true, data: {} };
       } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
@@ -368,7 +423,7 @@ async function planConfirmPublish(ctx: ActionContext, args: Record<string, unkno
       const effect = (sent as { effect?: { state?: unknown } }).effect;
       const state = typeof effect?.state === "string" ? effect.state : "";
       if (state === "posted") return { ok: true, data: sent };
-      if (state === "failed") return { ok: false, refusal: { code: "refused", text: "Instagram didn't take that post." } };
+      if (state === "failed") return { ok: false, refusal: { code: "refused", text: "The account didn't take that post." } };
       return { ok: false, refusal: { code: "unconfirmed", text: "That isn't confirmed yet. Check before trying again." } };
     } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
   } };
@@ -411,6 +466,7 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "social.sources.show": () => socialDraftCall(verb,args,ui),
     "social.sources.save": () => socialDraftCall(verb,args,ui),
     "publish.destination.use": async () => runPlan(await planUseDestination(ctx, args)),
+    "publish.destination.remove": async () => runPlan(await planRemoveDestination(ctx, args)),
     "publish.settings.save": async () => runPlan(await planSavePublishSettings(ctx, args)),
     "publish.draft.confirm": async () => runPlan(await planConfirmPublish(ctx, args, ui.actionToken)),
     "publish.draft.schedule": async () => runPlan(await planDraftEffectChange(ctx, verb, args, ui.actionToken)),

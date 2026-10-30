@@ -420,8 +420,13 @@ fn bind_agenticos(
                 let revision = existing["bindings"]
                     .as_array()
                     .and_then(|rows| {
-                        rows.iter()
-                            .find(|row| row["slot"].as_str() == Some("publication"))
+                        // CAD-1939: that destination's own binding.
+                        rows.iter().find(|row| {
+                            row["slot"].as_str() == Some("publication")
+                                && row["state"] == "configured"
+                                && row["config"]["publish"]["destination_id"].as_str()
+                                    == Some(destination_id.as_str())
+                        })
                     })
                     .and_then(|row| row["revision"].as_u64());
                 let mut params = json!({

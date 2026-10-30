@@ -35,6 +35,39 @@ fn scope_key(context: Option<&str>) -> String {
     context.map_or_else(|| "installation".into(), |id| format!("context:{id}"))
 }
 
+/// CAD-1939: a second publish destination under the same slot and scope. The
+/// first destination keeps the plain scope key, so every slot lookup (runs,
+/// tools, upgrades, an older binary) still sees exactly that one row; each
+/// further destination's row is unique under the same live-slot index by its
+/// own qualified key. `context_id` stays the context, so re-pins, listings
+/// and invalidation treat it as one of that context's bindings.
+fn destination_scope_key(context: Option<&str>, toolkit: &str, destination: &str) -> String {
+    format!("{}/publish:{toolkit}:{destination}", scope_key(context))
+}
+
+/// The `(toolkit, destination_id)` a binding receipt publishes to, if any.
+fn publish_destination(config: &Value) -> Option<(&str, &str)> {
+    Some((
+        config["publish"]["toolkit"].as_str()?,
+        config["publish"]["destination_id"].as_str()?,
+    ))
+}
+
+fn proof_of(conn: &impl super::StoreConn, install: &str, id: &str) -> Result<BindingProof> {
+    let row = binding_in(conn, install, id)?;
+    Ok(BindingProof {
+        id: id.to_owned(),
+        revision: row["revision"]
+            .as_i64()
+            .ok_or_else(|| Error::internal("invalid binding revision"))?,
+        digest: row["digest"]
+            .as_str()
+            .ok_or_else(|| Error::internal("invalid binding digest"))?
+            .into(),
+        config: row["config"].clone(),
+    })
+}
+
 fn validate_config(install: &str, context: Option<&str>, config: &Value) -> Result<()> {
     crate::proto::identifier(install, "installation id")?;
     if let Some(id) = context {
@@ -516,7 +549,72 @@ impl Store {
         config: &Value,
         request: &str,
     ) -> Result<Value> {
+        self.app_binding_create_in_scope(install, context, slot, config, request, false)
+    }
+
+    /// CAD-1939: create the binding for one publish destination of a slot.
+    /// The receipt must name its destination (`config.publish`), no live row
+    /// of this scope, slot and bundle may already publish to it, and the row
+    /// takes the plain scope key when the slot is free there (exactly as
+    /// `app_binding_create`), else its destination-qualified key.
+    pub fn app_binding_create_destination(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        slot: &str,
+        config: &Value,
+        request: &str,
+    ) -> Result<Value> {
+        self.app_binding_create_in_scope(install, context, slot, config, request, true)
+    }
+
+    /// CAD-1939: every live binding of one context (or the installation
+    /// scope) for a slot at a bundle — the plain-scope row and any further
+    /// destination rows. Bounded by the active-bundle binding capacity.
+    pub fn app_bindings_for_slot_destinations(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        slot: &str,
+        bundle_digest: &str,
+    ) -> Result<Vec<BindingProof>> {
+        self.read_tx(|conn| {
+            let ids: Vec<String> = conn.query_vec(
+                "SELECT id FROM app_bindings WHERE install_id=? AND context_id IS ? AND slot=?
+                 AND json_extract(config,'$.bundle_digest')=? AND state='configured'
+                 AND (scope_key=? OR substr(scope_key,1,length(?))=?) ORDER BY created,id",
+                params![
+                    install,
+                    context,
+                    slot,
+                    bundle_digest,
+                    scope_key(context),
+                    format!("{}/publish:", scope_key(context)),
+                    format!("{}/publish:", scope_key(context))
+                ],
+                |r| r.get::<_, String>(0),
+            )?;
+            ids.iter().map(|id| proof_of(&*conn, install, id)).collect()
+        })
+    }
+
+    fn app_binding_create_in_scope(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        slot: &str,
+        config: &Value,
+        request: &str,
+        per_destination: bool,
+    ) -> Result<Value> {
         validate_config(install, context, config)?;
+        let destination = if per_destination {
+            Some(publish_destination(config).ok_or_else(|| {
+                Error::rejected("a destination binding must name its publish destination")
+            })?)
+        } else {
+            None
+        };
         crate::proto::identifier(slot, "publication slot")?;
         crate::proto::identifier(request, "binding request id")?;
         self.write_tx(|conn| {
@@ -561,8 +659,26 @@ impl Store {
                             "this package version has reached its configured binding capacity",
                         ));
                     }
-                    let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=? AND coalesce(json_extract(config,'$.bundle_digest'),'')=coalesce(?,'') AND state='configured')",params![install,scope_key(context),slot,config["bundle_digest"].as_str()],|r| r.get(0))?;
-                    if occupied {
+                    let occupied = |key: &str| -> Result<bool> { Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=? AND coalesce(json_extract(config,'$.bundle_digest'),'')=coalesce(?,'') AND state='configured')",params![install,key,slot,config["bundle_digest"].as_str()],|r| r.get(0))?) };
+                    let mut key = scope_key(context);
+                    if let Some((toolkit, destination_id)) = destination {
+                        let taken: bool = tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND context_id IS ? AND slot=?
+                             AND coalesce(json_extract(config,'$.bundle_digest'),'')=coalesce(?,'') AND state='configured'
+                             AND json_extract(config,'$.publish.toolkit')=? AND json_extract(config,'$.publish.destination_id')=?)",
+                            params![install, context, slot, config["bundle_digest"].as_str(), toolkit, destination_id],
+                            |r| r.get(0),
+                        )?;
+                        if taken {
+                            return Err(Error::rejected(
+                                "this destination already has a configured binding in this scope",
+                            ));
+                        }
+                        if occupied(&key)? {
+                            key = destination_scope_key(context, toolkit, destination_id);
+                        }
+                    }
+                    if occupied(&key)? {
                         return Err(Error::rejected(
                             "this scope already has a configured binding for this slot",
                         ));
@@ -575,7 +691,7 @@ impl Store {
                             id,
                             install,
                             context,
-                            scope_key(context),
+                            key,
                             slot,
                             config.to_string(),
                             digest,

@@ -147,6 +147,12 @@ struct Create {
 #[serde(deny_unknown_fields)]
 struct ConnectLink {
     return_to: String,
+    #[serde(
+        default,
+        deserialize_with = "nonnull_context",
+        skip_serializing_if = "Option::is_none"
+    )]
+    toolkit: Option<String>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -168,6 +174,12 @@ struct UseDestination {
         skip_serializing_if = "Option::is_none"
     )]
     timezone: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "nonnull_context",
+        skip_serializing_if = "Option::is_none"
+    )]
+    toolkit: Option<String>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -512,11 +524,17 @@ mod tests {
         .is_err());
         let ok = r#"{"destination_id":"d","request_id":"r"}"#;
         assert!(serde_json::from_str::<UseDestination>(ok).is_ok());
+        // CAD-1939: `toolkit` is a request field now; the daemon allowlists its
+        // value (tests/cad1939_refusal_acceptance.rs refuses `tiktok` over RPC
+        // and HTTP), so the schema admits it.
+        assert!(serde_json::from_str::<UseDestination>(
+            r#"{"destination_id":"d","request_id":"r","toolkit":"instagram"}"#
+        )
+        .is_ok());
         for field in [
             "install_id",
             "destination_label",
             "label",
-            "toolkit",
             "connection_id",
             "grant_id",
             "operator",
