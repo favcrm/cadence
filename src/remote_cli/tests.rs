@@ -1766,6 +1766,46 @@ fn default_cli_renewal_refuses_cloud_or_missing_cli_consent_before_any_post() {
 }
 
 #[test]
+fn a_missing_audit_scope_is_refused_locally_with_the_login_that_grants_it() {
+    // A default login carries cli.* only. The owner's merge approval and the
+    // delivery record both need `audit.approve`, so the client refuses before a
+    // request is built and names the opt-in login instead of leaving the caller
+    // with a gateway 401 they cannot act on.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    store_credential(&dir, &target.endpoint);
+    let path = dir.join(format!("cli-{ORG}.json"));
+    let mut stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    stored["capabilities"] = json!(["cli.read", "cli.write", "wiki.read", "wiki.write"]);
+    fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+    for (verb, args) in [
+        (
+            "audit_approve",
+            json!({"pr": 1445, "head": "e".repeat(40), "source": "probe"}),
+        ),
+        (
+            "delivery_policy_set",
+            json!({"project": "cadence", "repos": ["favcrm/cadence"]}),
+        ),
+    ] {
+        let args = args.as_object().cloned().unwrap_or_default();
+        let out = call_verb_in(&target, verb, args, 10, &dir, |_| {}, |_| {});
+        let err = out.unwrap_err();
+        let shown = err.to_string();
+        assert_eq!(err.kind(), "rejected", "{verb}: {shown}");
+        assert!(shown.contains("audit.approve"), "{verb}: {shown}");
+        assert!(shown.contains("--audit-approve"), "{verb}: {shown}");
+        assert!(shown.contains("nothing was sent"), "{verb}: {shown}");
+    }
+}
+
+#[test]
 fn a_review_refusal_is_definite_and_an_unserved_verb_is_not_retryable() {
     // The three codes a hosted review uses to say "fix the request" are
     // rejections, not unknown answers: nothing was written.

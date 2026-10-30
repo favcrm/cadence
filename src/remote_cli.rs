@@ -154,6 +154,24 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
     }
 }
 
+/// The login that grants a scope the client refuses without. Only a flag
+/// whose meaning is exact is named; anything else says what to request.
+fn login_hint(scope: &str, org: &str) -> String {
+    match scope {
+        "audit.approve" => format!(
+            " Run `cadence login {org} --audit-approve`: a default login never \
+             requests it, and the owner's merge approval and delivery record need it."
+        ),
+        "settings.read" | "settings.write" => {
+            format!(" Run `cadence login {org} --settings` to request settings access.")
+        }
+        "web.read" | "web.prepare" => {
+            format!(" Run `cadence login {org} --web` to request publish access.")
+        }
+        other => format!(" Log in again with a grant that carries {other}."),
+    }
+}
+
 /// The four team mutations: the Worker commits them in the same D1 batch
 /// that records the receipt, so a lost or ambiguous answer follows a
 /// possible commit exactly as a lost send answer does. The two read-only
@@ -2875,6 +2893,24 @@ fn call_verb_until_retry(
                      lacks — nothing was sent. CLI commands are unaffected. `cadence login` \
                      does not request wiki access by default; wiki access needs a login the \
                      workspace owner grants with {scope}"
+                )));
+            }
+        }
+        // A CLI verb asks for the scopes its action needs. Refusing here, before
+        // a request is built, turns a gateway 401 into the one command that
+        // fixes it: a plain `cadence login` never carries `audit.approve`, so
+        // the owner's merge approval and the delivery record both need the
+        // opt-in login. A legacy login with no recorded capabilities is left to
+        // the server's own check.
+        if matches!(surface, Surface::Cli) && !cred.capabilities.is_empty() {
+            if let Some(missing) = cli_requested_scopes(verb)
+                .iter()
+                .find(|scope| !cred.capabilities.iter().any(|c| c == *scope))
+            {
+                return Err(reject(format!(
+                    "`{verb}` needs the {missing} scope, which this remote login lacks — \
+                     nothing was sent.{}",
+                    login_hint(missing, &target.org)
                 )));
             }
         }
