@@ -249,6 +249,13 @@ export default function ProjectSettings({
               </p>
             )}
 
+            {pendingPrivate && dirty && !locked && (
+              <p className="mt-4 text-label text-warn">
+                {t(
+                  "These changes would record private, which this build refuses — the isolation gate has not passed. Save stays off rather than sending a write the tracker would reject.",
+                )}
+              </p>
+            )}
             {block && <p className="mt-4 text-label text-ink-400">{block}</p>}
             {error && (
               <p className="mt-3 text-secondary text-fail" role="alert">
