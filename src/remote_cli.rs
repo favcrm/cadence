@@ -79,7 +79,8 @@ const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 /// consumed. Anything else stays unresolved.
 ///
 /// The cli.write half (`issue_new`/`issue_comment`/`issue_set`/
-/// `project_policy`/`message_send`/`team_*`) rides the same envelope — the
+/// `issue_attach`/`issue_review`/`project_policy`/`message_send`/`team_*`)
+/// rides the same envelope — the
 /// caller's authority never travels as a request field, only inside the
 /// verified, single-use envelope. A failed or ambiguous call is never retried
 /// by the client: the wake retry is the only loop, and it fires only on a
@@ -107,6 +108,7 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_ls",
     "issue_show",
     "issue_history",
+    "issue_artifact",
     "message_read",
     "message_inbox",
     "team_list",
@@ -114,6 +116,8 @@ pub const REMOTE_VERBS: &[&str] = &[
     // cli.write
     "issue_new",
     "issue_comment",
+    "issue_attach",
+    "issue_review",
     "issue_set",
     "team_invite",
     "team_revoke_invite",
@@ -169,7 +173,7 @@ fn team_mutation_verb(verb: &str) -> bool {
 /// `message_send` is the historical member of this set; the team mutations
 /// join it for the reason above.
 fn mutating_cli_verb(verb: &str) -> bool {
-    verb == "message_send" || team_mutation_verb(verb)
+    matches!(verb, "message_send" | "issue_attach" | "issue_review") || team_mutation_verb(verb)
 }
 
 /// The read a caller must run before repeating a mutating verb whose answer
@@ -180,6 +184,10 @@ fn mutating_cli_verb(verb: &str) -> bool {
 fn lost_mutation_note(verb: &str) -> &'static str {
     if verb == "message_send" {
         "the send may or may not have been recorded"
+    } else if verb == "issue_attach" {
+        "the attachment may or may not have been recorded — inspect the same issue and artifact before repeating it"
+    } else if verb == "issue_review" {
+        "the verdict may or may not have been recorded — read the same issue before repeating it; a reviewer holds one verdict per revision"
     } else {
         "the team change may or may not have been applied — inspect `team list` or \
          `team invites` with the same explicit --org before repeating it"
@@ -2894,6 +2902,62 @@ fn call_verb_until_retry(
                 "remote send returned no usable correlated receipt — enqueue outcome is unknown",
             ));
         }
+        if verb == "issue_attach" && (200..300).contains(&status) {
+            let expected_id = arguments.get("id").and_then(Value::as_str);
+            let expected_name = arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| format!("hosted:{name}"));
+            let encoded = arguments.get("data").and_then(Value::as_str);
+            let expected_size = encoded.filter(|data| data.len() % 4 == 0).and_then(|data| {
+                (data.len() / 4 * 3)
+                    .checked_sub(data.bytes().rev().take_while(|byte| *byte == b'=').count())
+            });
+            let correlated = body.as_ref().is_some_and(|reply| {
+                reply
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .zip(expected_id)
+                    .is_some_and(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+                    && reply.get("artifact").and_then(Value::as_str) == expected_name.as_deref()
+                    && reply.get("size").and_then(Value::as_u64)
+                        == expected_size.map(|size| size as u64)
+                    && expected_id.is_some()
+                    && expected_name.is_some()
+                    && expected_size.is_some()
+            });
+            if !correlated {
+                return Err(Error::unknown(
+                    "remote attachment returned no correlated receipt — outcome is unknown",
+                ));
+            }
+        }
+        if verb == "issue_review" && (200..300).contains(&status) {
+            // The committed verdict must be the one this call asked for: same
+            // artifact, and the digest the tenant verified from storage. A
+            // reply that names anything else is not evidence this verdict
+            // landed, so the outcome stays unknown rather than becoming a
+            // refusal.
+            let correlated = arguments
+                .get("artifact")
+                .and_then(Value::as_str)
+                .zip(arguments.get("digest").and_then(Value::as_str))
+                .zip(arguments.get("decision").and_then(Value::as_str))
+                .is_some_and(|((artifact, digest), decision)| {
+                    body.as_ref()
+                        .and_then(|reply| reply.get("review"))
+                        .is_some_and(|review| {
+                            review.get("artifact").and_then(Value::as_str) == Some(artifact)
+                                && review.get("digest").and_then(Value::as_str) == Some(digest)
+                                && review.get("decision").and_then(Value::as_str) == Some(decision)
+                        })
+                });
+            if !correlated {
+                return Err(Error::unknown(
+                    "remote review returned no correlated receipt — outcome is unknown",
+                ));
+            }
+        }
         let refusal_code = refusal_fields(body.as_ref()).0.map(str::to_owned);
         // CAD-1568: a 5xx carrying a worker `state` is a pre-forward
         // verdict (waking handled below, wake_failed/unavailable = nothing
@@ -2919,10 +2983,20 @@ fn call_verb_until_retry(
                 refusal_code.as_deref(),
                 Some("mutation_outcome_uncertain" | "invite_email_uncertain")
             );
+        let artifact_outcome_unknown = matches!(verb, "issue_attach" | "issue_review")
+            && status >= 500
+            && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
+            && !board_gate_refused(body.as_ref());
         let unknown_correlation = refusal_correlation(body.as_ref());
         match classify(status, retry_after, body) {
             Verdict::Done(Err(_e)) if team_mutation_unknown => {
                 return Err(ambiguous_mutation_error(status, unknown_correlation));
+            }
+            Verdict::Done(Err(e)) if artifact_outcome_unknown => {
+                return Err(Error::unknown(format!(
+                    "{e} — {}",
+                    lost_mutation_note(verb)
+                )));
             }
             Verdict::Done(Err(e)) if send_outcome_unknown => {
                 return Err(Error::unknown(format!(
