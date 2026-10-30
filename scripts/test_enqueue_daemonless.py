@@ -252,6 +252,16 @@ class DaemonlessMerge(unittest.TestCase):
         self.assertTrue(any(r.startswith("class: human") for r in report), report)
         self.assertTrue(any("reviews required: two" in r for r in report), report)
 
+    def test_every_diff_takes_the_operator_check_without_a_daemon(self):
+        """No grading means no path can slip past the operator floor."""
+        self.c.approval_comments = []
+        self.c.paths = ["docs/guide.md"]  # a path native might grade non-human
+        reasons, _ = self.c.evaluate()
+        self.assertTrue(any("no operator approval" in r for r in reasons), reasons)
+        self.approval()
+        reasons, report = self.c.evaluate()
+        self.assertEqual(reasons, [], report)
+
     def test_an_unreadable_one_review_manifest_keeps_the_operator_floor(self):
         """Native needs both manifests; unreadable either one demands approval."""
         self.c.one_review_rc = 1

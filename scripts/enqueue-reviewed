@@ -1215,12 +1215,18 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     # Human class: paths, size, or any head-pinned note whose Risk is not exactly `auto`.
     why = [] if risk is not None else [f"cannot read {RISK_PATHS_FILE} at the base (fail closed)"]
     why += [p for p in paths if is_human_path(p, risk or ())][:5]
-    if daemonless and one_text is None:
-        # The native classifier needs BOTH manifests: an unreadable pair made
-        # the list set absent and demanded the operator approval. Without the
-        # authoritative answer that condition must still be reproduced, or a
-        # readable risk list alone would quietly drop the operator floor.
-        why.append(f"cannot read {ONE_REVIEW_FILE} at the base (fail closed)")
+    if daemonless:
+        # The native classifier grades the risk class from the diff, the size
+        # and the trusted lists. Without it, every attempt to reproduce that
+        # grading was found to be looser somewhere (a partial manifest, a
+        # control-character path, a readable risk list beside an unreadable
+        # one-review list). So daemonless mode does not grade at all: the
+        # operator check applies to every diff, which is the native floor's
+        # strictest case and cannot be looser than it.
+        why.append("daemonless mode cannot grade the risk class, so every diff "
+                   "takes the operator check")
+        if one_text is None:
+            why.append(f"cannot read {ONE_REVIEW_FILE} at the base (fail closed)")
     if lines > HUMAN_LINES:
         why.append(f"{lines} changed lines")
     not_auto = [v for v in verdicts if v["risk"] != "auto"]

@@ -54,10 +54,11 @@ and the record it leaves is:
   reproduced here (its parser rejects a partial manifest and a
   control-character path that the script's reader accepts), and a waiver
   that is subtly wider than native is exactly the failure to avoid. Plus the
-  operator check on a human-class diff, the full check floor, and the
-  repository default branch as the only admitted target. Either trusted
-  manifest being unreadable also keeps the operator requirement — native
-  needed both, so a readable risk list alone must not drop it. The refusal the
+  operator check on **every** diff — daemonless mode does not attempt to
+  grade the risk class at all, because every attempt to reproduce the native
+  grading was found to be looser somewhere; the full check floor; and the
+  repository default branch as the only admitted target. An unreadable
+  trusted manifest keeps the operator requirement, exactly as native does. The refusal the
   daemon gave is repeated in the report, never dropped. No approved `PROJECT.md` policy can be read
   without the daemon, so a leaner class is never claimed, and the
   project-to-repository binding the daemon also checked is reported as
