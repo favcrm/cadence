@@ -316,6 +316,128 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             "issue_new"
         }
         Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::Attach { id, file },
+        } => {
+            use base64::Engine;
+            use std::io::Read;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            const LIMIT: u64 = 1_048_576;
+            let name = file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| cadence_agent::issue::model::valid_artifact_name(name))
+                .filter(|name| !cadence_agent::issue::model::reserved_artifact_name(name))
+                .ok_or_else(|| Error::rejected("invalid artifact name — nothing was sent"))?;
+            let opened = if cadence_agent::master::caller_is_master() {
+                let state = cadence_agent::client::state_dir()?;
+                cadence_agent::master::open_command_file(&state, file)?
+            } else {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(file)?
+            };
+            let meta = opened.metadata()?;
+            if !meta.is_file() || meta.len() > LIMIT {
+                return Err(Error::rejected(
+                    "artifact must be a regular file of at most 1 MiB — nothing was sent",
+                ));
+            }
+            let mut bytes = Vec::with_capacity(meta.len() as usize);
+            opened.take(LIMIT + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > LIMIT {
+                return Err(Error::rejected("artifact exceeds 1 MiB — nothing was sent"));
+            }
+            args.insert("id".into(), json!(id));
+            args.insert("name".into(), json!(name));
+            args.insert(
+                "data".into(),
+                json!(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            );
+            "issue_attach"
+        }
+        Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::Artifact { id, name },
+        } => {
+            if !name
+                .strip_prefix("hosted:")
+                .is_some_and(cadence_agent::issue::model::valid_artifact_name)
+            {
+                return Err(Error::rejected("invalid artifact name — nothing was sent"));
+            }
+            args.insert("id".into(), json!(id));
+            args.insert("name".into(), json!(name));
+            "issue_artifact"
+        }
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Review {
+                    id,
+                    artifact,
+                    digest,
+                    decision,
+                    text,
+                    file,
+                },
+        } => {
+            if !artifact
+                .strip_prefix("hosted:")
+                .is_some_and(cadence_agent::issue::model::valid_artifact_name)
+            {
+                return Err(Error::rejected(
+                    "invalid artifact identifier — nothing was sent",
+                ));
+            }
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return Err(Error::rejected(
+                    "digest must be the lowercase hex sha256 you read — nothing was sent",
+                ));
+            }
+            if !matches!(decision.as_str(), "pass" | "revise" | "blocked") {
+                return Err(Error::rejected(
+                    "decision must be pass, revise or blocked — nothing was sent",
+                ));
+            }
+            let body = match (text, file) {
+                (Some(text), None) => text.clone(),
+                (None, Some(path)) if path.as_os_str() == "-" => {
+                    read_stdin_remote("issue review --file")?
+                }
+                (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
+                    Error::rejected(format!(
+                        "issue review --file {}: cannot read it locally: {e}",
+                        path.display()
+                    ))
+                })?,
+                _ => {
+                    return Err(Error::rejected(
+                        "one of -m or --file is required — nothing was sent",
+                    ))
+                }
+            };
+            if body.trim().is_empty() {
+                return Err(Error::rejected(
+                    "a verdict needs its findings — nothing was sent",
+                ));
+            }
+            if body.len() > 16 * 1024 {
+                return Err(Error::rejected(
+                    "verdict text exceeds the 16 KB cap — trim it; nothing was sent",
+                ));
+            }
+            args.insert("id".into(), json!(id));
+            args.insert("artifact".into(), json!(artifact));
+            args.insert("digest".into(), json!(digest));
+            args.insert("decision".into(), json!(decision));
+            args.insert("text".into(), json!(body));
+            "issue_review"
+        }
+        Commands::Issue {
             action:
                 cadence_agent::issue::cli::IssueAction::Comment {
                     id,
@@ -1248,6 +1370,51 @@ fn placement_of(command: &Commands) -> Option<registry::Placement> {
     }
 }
 
+fn print_issue_artifact(command: &Commands, body: &Value) -> Result<bool> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    let Commands::Issue {
+        action: cadence_agent::issue::cli::IssueAction::Artifact { id, name },
+    } = command
+    else {
+        return Ok(false);
+    };
+    let bad = || Error::rejected("hosted artifact response does not match the requested bytes");
+    let artifact = body
+        .get("artifact")
+        .and_then(Value::as_object)
+        .ok_or_else(bad)?;
+    if !artifact
+        .get("ticketId")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case(id))
+        || artifact.get("name").and_then(Value::as_str) != Some(name.as_str())
+    {
+        return Err(bad());
+    }
+    let data = artifact
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(bad)?;
+    if data.len() > 1_398_104 {
+        return Err(bad());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| bad())?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    if bytes.len() > 1_048_576
+        || artifact.get("size").and_then(Value::as_u64) != Some(bytes.len() as u64)
+        || artifact.get("sha256").and_then(Value::as_str) != Some(digest.as_str())
+    {
+        return Err(bad());
+    }
+    std::io::stdout().write_all(&bytes)?;
+    Ok(true)
+}
+
 /// Entry point for a `Remote` resolution (called by `action_dispatch`
 /// instead of the local `dispatch`). `Org` stays local — it edits the
 /// registry, not a daemon — so `org switch local` still gets you home.
@@ -1521,6 +1688,9 @@ pub(super) fn run(
             // printing and recomputes the capacity count it projects.
             if let Some(want) = placement_of(&command) {
                 retain_by_placement(&mut body, want);
+            }
+            if print_issue_artifact(&command, &body)? {
+                return Ok(0);
             }
             match remote_blob_cat(&target, &command, &body, deadline, wake_timeout) {
                 Ok(true) => return Ok(0),
@@ -2224,6 +2394,73 @@ mod read_contract_tests {
         })
         .unwrap();
         assert_eq!(args, json!({"id": "CAD-1", "limit": 10}));
+    }
+
+    #[test]
+    fn issue_review_sends_the_digest_it_was_given_and_refuses_a_bad_one() {
+        let digest = "7743ce348d9284d677a185f33295b92266cc435a5b5f775029b300066d26693a";
+        let (verb, args) = outcome(&Commands::Issue {
+            action: IssueAction::Review {
+                id: "CAD-1".into(),
+                artifact: "hosted:drafts.md".into(),
+                digest: digest.into(),
+                decision: "pass".into(),
+                text: Some("Uses only the supplied facts.".into()),
+                file: None,
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "issue_review");
+        assert_eq!(
+            args,
+            json!({
+                "id": "CAD-1",
+                "artifact": "hosted:drafts.md",
+                "digest": digest,
+                "decision": "pass",
+                "text": "Uses only the supplied facts.",
+            })
+        );
+
+        let bad = |action: IssueAction| outcome(&Commands::Issue { action }).unwrap_err();
+        let review = |artifact: &str, digest: &str, decision: &str, text: Option<&str>| {
+            IssueAction::Review {
+                id: "CAD-1".into(),
+                artifact: artifact.into(),
+                digest: digest.into(),
+                decision: decision.into(),
+                text: text.map(str::to_string),
+                file: None,
+            }
+        };
+        // A native basename, an uppercase or short digest, an unknown decision
+        // and a missing body are refused before any request is built.
+        assert!(bad(review("drafts.md", digest, "pass", Some("Supported.")))
+            .contains("invalid artifact identifier"));
+        assert!(bad(review(
+            "hosted:drafts.md",
+            &digest.to_uppercase(),
+            "pass",
+            Some("Supported.")
+        ))
+        .contains("lowercase hex sha256"));
+        assert!(bad(review(
+            "hosted:drafts.md",
+            "abc",
+            "pass",
+            Some("Supported.")
+        ))
+        .contains("lowercase hex sha256"));
+        assert!(bad(review(
+            "hosted:drafts.md",
+            digest,
+            "approve",
+            Some("Supported.")
+        ))
+        .contains("pass, revise or blocked"));
+        assert!(
+            bad(review("hosted:drafts.md", digest, "pass", None)).contains("one of -m or --file")
+        );
     }
 
     #[test]

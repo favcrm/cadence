@@ -557,6 +557,29 @@ pub enum IssueAction {
     /// Attach a file into `artifacts/` (basename only, size cap,
     /// create-only).
     Attach { id: String, file: PathBuf },
+    /// Read one named task artifact.
+    Artifact { id: String, name: String },
+    /// File one reviewer verdict on an exact artifact revision. Hosted only:
+    /// the digest must be the `sha256` this reviewer read back, so a verdict
+    /// cannot be written for a revision nobody read.
+    Review {
+        id: String,
+        /// The qualified artifact identifier from `issue show`.
+        #[arg(long)]
+        artifact: String,
+        /// Lowercase hex SHA-256 of the bytes this reviewer read.
+        #[arg(long)]
+        digest: String,
+        /// `pass`, `revise` or `blocked`.
+        #[arg(long)]
+        decision: String,
+        /// The findings.
+        #[arg(short = 'm', long, conflicts_with = "file")]
+        text: Option<String>,
+        /// Read the findings from a file.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
     /// Several updates to one issue as ONE tracker commit: set, tag,
     /// link, ref, attach, acceptance and a comment. Every part is
     /// validated first — one bad part refuses the whole edit and writes
@@ -916,7 +939,9 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         | IssueAction::Ref { .. }
         | IssueAction::Comment { .. }
         | IssueAction::Edit { .. }
-        | IssueAction::Attach { .. } => links::run(action, state_dir),
+        | IssueAction::Attach { .. }
+        | IssueAction::Artifact { .. }
+        | IssueAction::Review { .. } => links::run(action, state_dir),
         IssueAction::Lint { .. }
         | IssueAction::Reconcile { .. }
         | IssueAction::Sync { .. }
