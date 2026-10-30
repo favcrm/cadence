@@ -1749,11 +1749,17 @@ impl Refusal {
 /// unknown reason is never trusted as policy.
 const POLICY_REASONS: &[&str] = &["scope_not_granted", "grant_narrowed", "binding_mismatch"];
 
-/// A hosted review refuses with one of these and has written nothing: the
-/// digest is not the stored revision's, the caller authored the artifact, or
-/// this reviewer already holds a verdict on it. Each is a fixable request, not
-/// an unknown answer and not a retry-later condition.
-const REVIEW_REFUSAL_CODES: &[&str] = &["digest_mismatch", "self_review", "review_exists"];
+/// A refusal that names exactly what to fix and has written nothing: a review
+/// whose digest is not the stored revision's, a reviewer who authored the
+/// artifact, a second verdict from the same reviewer, or a delivery record
+/// naming a repository this organization has not authorized. Each is a
+/// fixable request, not an unknown answer and not a retry-later condition.
+const DEFINITE_REFUSAL_CODES: &[&str] = &[
+    "digest_mismatch",
+    "self_review",
+    "review_exists",
+    "not_authorized",
+];
 
 /// The Cadence container's own envelope gate (`src/ui/wiki_envelope.rs`) answers
 /// a 403 `insufficient_scope` when the signed grant does not cover the action or
@@ -1785,6 +1791,11 @@ fn refusal_fields(body: Option<&Value>) -> (Option<&str>, Option<&str>) {
     let code = error
         .and_then(|e| e.get("code"))
         .or_else(|| body.and_then(|b| b.get("code")))
+        // The tenant board names a structured refusal with `state` rather than
+        // `error.code` (a delivery record naming an unauthorized repo says
+        // `state: "not_authorized"`). A bounded token is safe to show; the
+        // free-text `reason` beside it is not.
+        .or_else(|| body.and_then(|b| b.get("state")))
         .and_then(Value::as_str);
     let reason = error.and_then(|e| e.get("reason")).and_then(Value::as_str);
     (safe(code), safe(reason))
@@ -1829,7 +1840,7 @@ fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>
         // or a legacy `too_large`) so the caller sees what was refused. It is not
         // a login or availability claim.
         // A review refusal names exactly what to fix and wrote nothing.
-        400 | 409 if code.is_some_and(|c| REVIEW_REFUSAL_CODES.contains(&c)) => Refusal::Rejected,
+        400 | 409 if code.is_some_and(|c| DEFINITE_REFUSAL_CODES.contains(&c)) => Refusal::Rejected,
         400 | 409 | 413 | 422 => Refusal::Unknown,
         401 | 403 => match (code, known_reason) {
             // A policy outcome proven at a gate is authorization, whatever the code.

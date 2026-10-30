@@ -1825,6 +1825,21 @@ fn a_review_refusal_is_definite_and_an_unserved_verb_is_not_retryable() {
     let text = refusal_message(refusal, shown.as_deref(), 501);
     assert!(text.contains("does not serve"), "{text}");
     assert!(!text.contains("retry later"), "{text}");
+    // The tenant board names a structured refusal with `state`, not
+    // `error.code`: a delivery record naming an unauthorized repo.
+    let (refusal, shown) = decode_refusal(
+        409,
+        Some(&json!({"state": "not_authorized", "repos": ["a/b"],
+                     "reason": "these repositories are not authorized"})),
+    );
+    assert_eq!(refusal, Refusal::Rejected);
+    assert_eq!(shown.as_deref(), Some("not_authorized"));
+    let text = refusal_message(refusal, shown.as_deref(), 409);
+    assert!(text.contains("not_authorized"), "{text}");
+    assert!(
+        !text.contains("these repositories"),
+        "free text leaked: {text}"
+    );
     // An unlisted 409 code keeps the conservative generic refusal.
     let (refusal, _) = decode_refusal(409, Some(&json!({"error": {"code": "midway_collision"}})));
     assert_eq!(refusal, Refusal::Unknown);
