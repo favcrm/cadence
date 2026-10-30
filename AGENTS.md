@@ -264,11 +264,12 @@ the code you just wrote.
 - It runs on a host with no daemon (CAD-1946 v0) when invoked with
   `--daemonless`: it reads the hosted ticket and posts the evidence comment
   through the remote CLI, reads the verdict notes and the operator approval
-  without a local store, and applies the legacy strict floor — one review off
-  the one-review list read at the base, else two; the operator check on a
-  human-class diff; the full CI floor; the default branch as the only target;
-  two reviews whenever the risk manifest cannot be read — because no approved
-  project policy can be read without the daemon. **Never pass `--daemonless`
+  without a local store, and applies the legacy strict floor — **two reviews,
+  always** (it never claims the one-review waiver: the native list validation
+  cannot be reproduced faithfully, and a partial or control-character-bearing
+  diff would otherwise slip through); the operator check on a human-class
+  diff; the full CI floor; the default branch as the only target — because no
+  approved project policy can be read without the daemon. **Never pass `--daemonless`
   where a daemon runs:** without it, an unanswerable `delivery requirements`
   is a refusal, so a working daemon's own refusal is never downgraded. It
   never treats an unavailable answer as a pass. The daemon also bound the

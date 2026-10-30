@@ -60,6 +60,7 @@ class Daemonless(scope.Case):
         self.per_head = False
         self.approval_comments = []
         self.no_verdicts = False
+        self.combined_only = False
         self.risk_rc = 0
         self.signers = ""
         self.scope_calls = 0
@@ -77,6 +78,22 @@ class Daemonless(scope.Case):
              "--head", head, "--key", self.key, "--source", source],
             capture_output=True, text=True)
 
+    def verdicts(self):
+        """Daemonless needs two independent PASS verdicts, always."""
+        if self.no_verdicts:
+            return []
+        p = self.tmp / NOTE
+        if self.note_text is not None:
+            p.write_text(self.note_text)
+        common = {"path": str(p), "stamp": "20261003-100000", "outcome": "pass",
+                  "title_outcome": "pass", "section_outcome": "pass", "risk": "human"}
+        if self.combined_only:
+            return [dict(common, name=NOTE, reviewer="rev", kind="combined", **{"from": "rev"})]
+        return [
+            dict(common, name=NOTE, reviewer="rev", kind="standards", **{"from": "rev"}),
+            dict(common, name="spec.md", reviewer="rev2", kind="spec-security", **{"from": "rev2"}),
+        ]
+
     def run(self, argv, input_text=None):
         # The nested verify must reach the real script, not this fake.
         if enq.GATE_SCRIPT in argv:
@@ -91,8 +108,7 @@ class Daemonless(scope.Case):
             # has no such verb; `--org local` is the same file read.
             if "--org" not in argv:
                 return 3, "", UNAVAILABLE
-            return 0, json.dumps({"verdicts": [] if self.no_verdicts else [self.note()],
-                                  "skipped": []}), ""
+            return 0, json.dumps({"verdicts": self.verdicts(), "skipped": []}), ""
         if argv[:3] == ["cadence", "audit", "scope"]:
             self.scope_calls += 1
             return 3, "", UNAVAILABLE
@@ -150,20 +166,20 @@ class DaemonlessMerge(unittest.TestCase):
         self.approval()
         reasons, report = self.c.evaluate()
         self.assertEqual(reasons, [], report)
-        self.assertTrue(any("no daemon answer" in r and "legacy strict floor" in r
-                            for r in report), report)
+        self.assertTrue(any("set aside" in r and UNAVAILABLE.split(";")[0][:20] in r
+                            or "set aside" in r for r in report), report)
+        self.assertTrue(any("legacy strict floor applies" in r for r in report), report)
         self.assertFalse(any("authoritative" in r for r in reasons), reasons)
 
-    def test_the_one_review_list_still_applies_at_the_base(self):
-        """One combined PASS covers a one-review path; it does not cover two."""
+    def test_daemonless_always_requires_two_reviews(self):
+        """The native list validation cannot be reproduced here, so never claim the waiver."""
         self.approval()
         reasons, report = self.c.evaluate()
         self.assertEqual(reasons, [], report)
-        self.assertTrue(any(r.startswith("reviews required: one") for r in report), report)
-        self.c.paths = ["src/peer.rs"]  # trigger 1: two reviews, never one
+        self.assertTrue(any("reviews required: two" in r for r in report), report)
+        self.c.combined_only = True
         reasons, _ = self.c.evaluate()
-        self.assertTrue(any("two independent reviews" in r or "Spec/security" in r
-                            for r in reasons), reasons)
+        self.assertTrue(any("Spec/security" in r for r in reasons), reasons)
 
     def test_a_non_default_base_is_refused_without_a_daemon(self):
         """The daemon also refused a base that was not the default or an approved target."""
@@ -223,18 +239,15 @@ class DaemonlessMerge(unittest.TestCase):
         reasons, _ = self.c.evaluate(daemonless=False)
         self.assertTrue(any("did not answer here" in r for r in reasons), reasons)
 
-    def test_an_unreadable_risk_manifest_keeps_two_reviews(self):
-        """Native parsed both lists together; an unreadable one keeps two reviews."""
+    def test_an_unreadable_risk_manifest_still_refuses_nothing_less(self):
+        """Fail closed: no manifest means every path is human-class, not a waiver."""
         self.approval()
         self.c.risk_rc = 1
         reasons, report = self.c.evaluate()
-        self.assertTrue(any("Spec/security" in r for r in reasons), (reasons, report))
-
-    def test_the_verdict_read_retries_the_local_org(self):
-        self.approval()
-        reasons, report = self.c.evaluate()
         self.assertEqual(reasons, [], report)
-        self.assertTrue(any(r.startswith("counted verdicts: rev") for r in report), report)
+        self.assertTrue(any("cannot read docs/roles/risk-paths.toml" in r for r in report), report)
+        self.assertTrue(any(r.startswith("class: human") for r in report), report)
+        self.assertTrue(any("reviews required: two" in r for r in report), report)
 
     def test_a_missing_review_refuses(self):
         self.approval()
