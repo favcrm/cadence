@@ -41,6 +41,11 @@ export const RESOURCE_NAMES = [
   "outbox",
   "threads",
   "master",
+  // CAD-1950: a project's recorded policy is its own read, named by the
+  // server's `issues` event. A name missing here is silently dropped by
+  // `invalidatedBy`, so the Settings page would keep a stale policy and could
+  // save over a newer record.
+  "projectPolicy",
 ] as const;
 export type ResourceName = (typeof RESOURCE_NAMES)[number];
 

@@ -4,28 +4,11 @@ import { ApiError } from "../../lib/apiError";
 import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
 import { useLocale } from "../../lib/locale";
-import type { ProjectPolicy } from "../../lib/types";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
+import { cliCommand, policyDirty, type PolicyDraft, type Visibility } from "./policyView";
 
-/** The recorded spelling, which is also the CLI flag's spelling. */
-type Visibility = ProjectPolicy["visibility"];
+type Draft = PolicyDraft;
 
-interface Draft {
-  visibility: Visibility;
-  members: string[];
-}
-
-
-/** The CLI command for exactly this state.
- *
- *  `--grant` is the full list and omitting it clears, so grants are always
- *  spelled out — including on a workspace-visible project, where they are
- *  stored but inert. Printing them is what keeps this line and the save
- *  button describing one state instead of two. */
-function cliCommand(project: string, draft: Draft): string {
-  const grants = draft.members.map((member) => ` --grant ${member}`).join("");
-  return `cadence issue project policy ${project} --visibility ${draft.visibility.replace("_", "-")}${grants}`;
-}
 
 /**
  * A project's access policy (CAD-1950). The values are the tracker's own:
@@ -71,12 +54,7 @@ export default function ProjectSettings({
       }
     : null;
   const draft = edits ?? base;
-  const dirty =
-    draft !== null && base !== null
-      ? draft.visibility !== base.visibility ||
-        draft.members.length !== base.members.length ||
-        draft.members.some((member, index) => member !== base.members[index])
-      : false;
+  const dirty = policyDirty(saved?.recorded === true, base, draft);
   const locked = block !== null;
   const privateOffered = saved?.private_available !== false;
   const pendingPrivate = draft?.visibility === "private" && !privateOffered;
