@@ -53,6 +53,9 @@ from urllib.parse import quote
 ME = "enqueue-reviewed"
 DEFAULT_NOTES_DIR = "/var/www/agent-notes"
 GATE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "delivery-gate")
+# CAD-1925's trust anchor, read at the PR base: the queue's own verifier reads
+# it from the merge-group base. The operator approval reuses it (CAD-1946 v0).
+SIGNERS_FILE = "docs/roles/delivery-gate.allowed_signers"
 DEFAULT_GATE_KEY = "~/.config/cadence/delivery-gate/signing_key"  # CAD-1925
 ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
 
@@ -491,9 +494,18 @@ def required_check_reasons(repo, head, base_oid, required, rollup, runs):
 # ---- verdict notes (parsed by `cadence audit verdicts`) --------------------
 
 def read_verdicts(notes_dir, issue, pr, head):
-    """(verdicts, skipped) from the audit's own note parser. Raises on failure."""
-    rc, out, err = run(["cadence", "audit", "verdicts", "--issue", issue, "--pr", str(pr),
-                        "--head", head, "--notes-dir", notes_dir])
+    """(verdicts, skipped) from the audit's own note parser. Raises on failure.
+
+    The parser reads files, not a daemon, but a saved remote org routes every
+    command to the hosted transport — where `audit verdicts` is not a remote
+    verb. The second attempt pins the local org, which is the same file read
+    (CAD-1946 v0: the notes dir is explicit and nothing is fetched).
+    """
+    argv = ["cadence", "audit", "verdicts", "--issue", issue, "--pr", str(pr),
+            "--head", head, "--notes-dir", notes_dir]
+    rc, out, err = run(argv)
+    if rc != 0:
+        rc, out, err = run(["cadence", "--org", "local", *argv[1:]])
     try:
         doc = json.loads(out)
         verdicts, skipped = doc["verdicts"], doc.get("skipped", [])
@@ -583,10 +595,20 @@ def check_comment(comments, head, counted, base_ref, required=()):
 
 
 def requirements_inspection(issue, repo, pr, head):
-    """Read the daemon's trusted, policy-aware requirements decision."""
+    """Read the daemon's trusted, policy-aware requirements decision.
+
+    Returns `None` when the verb is not available here — a hosted org has no
+    local daemon and refuses `delivery requirements`, and this script must
+    then fall back to the legacy strict floor rather than refuse to run at
+    all (CAD-1946 v0). A verb that answers with a malformed or differently
+    bound document still raises: that is an integrity failure, not an absent
+    answer.
+    """
     pr_url = f"https://github.com/{repo}/pull/{pr}"
     rc, out, err = run(["cadence", "delivery", "requirements", "--issue", issue,
                         "--pr", pr_url, "--head", head, "--json"])
+    if rc != 0 and not out.strip().startswith("{"):
+        return None
     try:
         result = json.loads(out)
         req = result["requirements"]
@@ -656,7 +678,82 @@ def requirements_inspection(issue, repo, pr, head):
         raise RuntimeError(f"cannot use authoritative `cadence delivery requirements` result: {e}; {(err or out).strip()[:200]}")
 
 
-def check_approval(repo, pr, head, report, evidence=None):
+APPROVAL_MARKER = "<!-- cadence-operator-approval v1 -->"
+APPROVAL_SOURCE = re.compile(r"^Source: (.+)$", re.M)
+
+
+def pr_comments(repo, pr):
+    """Every PR comment body, newest page count unbounded by the caller."""
+    rc, out, err = run(["gh", "api",
+                        f"repos/{repo}/issues/{pr}/comments?per_page=100", "--paginate", "--slurp"])
+    if rc != 0:
+        raise RuntimeError(f"cannot list the PR comments: {(err or out).strip()[:200]}")
+    try:
+        pages = json.loads(out)
+        return [c for page in pages for c in page]
+    except (TypeError, ValueError) as e:
+        raise RuntimeError(f"cannot read the PR comments: {e}")
+
+
+def check_signed_approval(repo, pr, head, base_oid, report, evidence=None):
+    """The operator's head-pinned approval, without a daemon.
+
+    The record is a PR comment signed with the delivery-gate key over
+    `(repo, pr, head, source)`, verified against the allowed_signers read at
+    the PR's base — the same key and trust anchor the merge queue already
+    uses (CAD-1925), so this introduces no new trust root. A comment whose
+    Source line was edited, or that names another head, does not verify.
+
+    Known limit, unchanged from CAD-1925 and stated in `scripts/delivery-gate`:
+    the key sits on a host where every session runs as one uid, so a session
+    that can read it can sign. CAD-280 separates the operator uid.
+    """
+    if not base_oid:
+        return ["cannot establish the PR base commit, so no operator approval can be verified (fail closed)"]
+    rc, signers, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                          f"repos/{repo}/contents/{SIGNERS_FILE}?ref={base_oid}"])
+    if rc != 0 or not signers.strip():
+        return [f"cannot read {SIGNERS_FILE} at the base (fail closed): no operator approval can be verified"]
+    try:
+        comments = pr_comments(repo, pr)
+    except RuntimeError as e:
+        return [str(e)]
+    blocks = [c for c in comments
+              if isinstance(c.get("body"), str) and APPROVAL_MARKER in c["body"]]
+    if not blocks:
+        return [f"human-class diff has no operator approval for exactly head {head}; "
+                "the operator records it with `scripts/delivery-gate approve` and posts the "
+                "printed comment on the PR"]
+    with tempfile.TemporaryDirectory(prefix="enqueue-approval.") as tmp:
+        signers_path = os.path.join(tmp, "allowed_signers")
+        with open(signers_path, "w", encoding="utf-8") as f:
+            f.write(signers)
+        comments_path = os.path.join(tmp, "comments.json")
+        with open(comments_path, "w", encoding="utf-8") as f:
+            json.dump(blocks, f)
+        sources = []
+        for block in blocks:
+            m = APPROVAL_SOURCE.search(block["body"].replace("\r\n", "\n"))
+            if m:
+                sources.append(m.group(1).strip())
+        for source in sources:
+            rc, out, err = run([sys.executable, GATE_SCRIPT, "verify-approval",
+                                "--repo", repo, "--pr", str(pr), "--head", head,
+                                "--signers", signers_path, "--comments", comments_path])
+            if rc == 0:
+                if evidence is not None:
+                    evidence["approval"] = f"signed comment (source {source!r})"
+                report.append(f"approval in force: signed operator approval for exactly head "
+                              f"{head}, source {source!r} (verified against {SIGNERS_FILE} at the base)")
+                return []
+    return [f"human-class diff has no operator approval for exactly head {head}: "
+            f"{len(blocks)} approval comment(s) carried no signature that verifies "
+            f"against {SIGNERS_FILE} at the base"]
+
+
+def check_approval(repo, pr, head, report, evidence=None, daemonless=False, base_oid=None):
+    if daemonless:
+        return check_signed_approval(repo, pr, head, base_oid, report, evidence)
     rc, out, err = run(["cadence", "audit", "approval", "--pr", str(pr), "--head", head, "--repo", repo])
     try:
         state = json.loads(out)
@@ -986,22 +1083,38 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         authors.add(str(ticket["claim"]["by"]).lower())
 
     authority = None
+    daemonless = False
     required_comment_evidence = []
     if issue:
         try:
             authority = requirements_inspection(issue, repo, pr, head)
-            if (authority["binding"]["base"] != base_oid
-                    or authority["binding"]["base_ref"] != base
-                    or authority["binding"]["repo"] != repo.lower()
-                    or authority["binding"]["project"] != ticket.get("project")):
-                raise RuntimeError("authoritative requirements binding differs from the ticket project, PR base or repository")
-            req = authority["requirements"]
-            need_qa = need_qa or req["browser_qa"]
-            report.append(f"delivery requirements: {req['class']} ({req['activation']}); policy {authority['binding']['policy_digest']}")
-            report.extend(f"delivery reason: {reason}" for reason in req["reasons"])
-            if req["activation"] == "active":
-                required_comment_evidence.extend((f"Delivery class: {req['class']}",
-                                                  f"Policy digest: {authority['binding']['policy_digest']}"))
+            if authority is None:
+                # CAD-1946 v0: no daemon answered, so no approved policy can be
+                # read. The legacy strict floor below is the requirement set —
+                # one-review list, human paths/size, the operator check and the
+                # full CI floor — never a relaxation.
+                daemonless = True
+                report.append("delivery requirements: no daemon answer — the legacy strict "
+                              "floor applies (one review off the one-review list, else two; "
+                              "operator approval on a human-class diff; full CI)")
+            else:
+                if (authority["binding"]["base"] != base_oid
+                        or authority["binding"]["base_ref"] != base
+                        or authority["binding"]["repo"] != repo.lower()
+                        or authority["binding"]["project"] != ticket.get("project")):
+                    raise RuntimeError("authoritative requirements binding differs from the ticket project, PR base or repository")
+                req = authority["requirements"]
+                need_qa = need_qa or req["browser_qa"]
+                report.append(f"delivery requirements: {req['class']} ({req['activation']}); policy {authority['binding']['policy_digest']}")
+                report.extend(f"delivery reason: {reason}" for reason in req["reasons"])
+                if req["activation"] == "active":
+                    required_comment_evidence.extend((f"Delivery class: {req['class']}",
+                                                      f"Policy digest: {authority['binding']['policy_digest']}"))
+                if authority["readiness"]:
+                    ready = authority["readiness"]
+                    report.append(f"routine outcome: {ready['outcome_report']}; CI run {ready['ci_run_id']} {ready['ci_run_url']}")
+                    required_comment_evidence.extend((f"Outcome report: {ready['outcome_report']}",
+                                                      f"Native CI run: {ready['ci_run_id']} {ready['ci_run_url']}"))
             if ci_url:
                 # Every class binds the evidence comment to the CI run this evaluation
                 # actually read: a comment naming another run is not this evidence.
@@ -1011,11 +1124,6 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                 # comment cannot claim the canonical run proves a gate it never produced.
                 if proofs[name] != ci_url:
                     required_comment_evidence.append(f"Required check run: {name} = {proofs[name]}")
-            if authority["readiness"]:
-                ready = authority["readiness"]
-                report.append(f"routine outcome: {ready['outcome_report']}; CI run {ready['ci_run_id']} {ready['ci_run_url']}")
-                required_comment_evidence.extend((f"Outcome report: {ready['outcome_report']}",
-                                                  f"Native CI run: {ready['ci_run_id']} {ready['ci_run_url']}"))
         except RuntimeError as e:
             reasons.append(str(e))
 
@@ -1035,7 +1143,10 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         counted = []
         if not active or klass == "strict":
             native_one = bool(authority and authority["requirements"]["reviews"] == 1)
-            effective_one = one and native_one
+            # With no authoritative answer, the historical legacy floor decides:
+            # the one-review list read at the base. `native_one` only ever
+            # narrows the answer the evaluator gave.
+            effective_one = one if authority is None else (one and native_one)
             rs, counted = check_reviews(verdicts, effective_one, need_qa, authors, issue)
             reasons += rs
         elif klass == "routine":
@@ -1069,8 +1180,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")
     if why:
         report.append("class: human (" + "; ".join(why) + ")")
-        rs = check_approval(repo, pr, head, report, approval_evidence)
-        if rs:  # legacy CAD-1106 scope fallback only
+        rs = check_approval(repo, pr, head, report, approval_evidence, daemonless, base_oid)
+        if rs and not daemonless:  # legacy CAD-1106 scope fallback: needs the daemon's store
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
                              risk_text, one_text, verdicts, counted, report, approval_evidence)
             if sr:
@@ -1082,8 +1193,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         report.append("class: auto (every head-pinned note says Risk: auto; no path or size trigger)")
     authoritative_operator = bool(authority and authority["requirements"]["operator_approval"])
     if authoritative_operator and not why:
-        rs = check_approval(repo, pr, head, report, approval_evidence)
-        if rs:
+        rs = check_approval(repo, pr, head, report, approval_evidence, daemonless, base_oid)
+        if rs and not daemonless:
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
                              risk_text, one_text, verdicts, counted, report, approval_evidence)
             if sr:

@@ -44,6 +44,32 @@ cadence audit scope --issue CAD-92   # CAD-1106: ticket scope pre-approvals (id,
 counts (digest equals the sha256 of the trimmed current ticket body,
 `recorded_via` `operator-connection`, not revoked).
 
+**With no local daemon (CAD-1946 v0)** — a hosted org, where the local daemon
+is retired — the same script still decides, and the record it leaves is:
+
+- **requirements**: no `delivery requirements` answer, so the legacy strict
+  floor applies (one review off the one-review list read at the base, else
+  two; the operator check on a human-class diff; the full check floor). No
+  approved `PROJECT.md` policy can be read without the daemon, so a leaner
+  class is never claimed.
+- **verdicts**: `cadence --org local audit verdicts` — the same file parser,
+  pinned to the local org because a saved remote org routes `audit` to the
+  hosted transport, which has no such verb.
+- **operator approval**: a PR comment from `scripts/delivery-gate approve`,
+  signed over `(repo, pr, head, source)` with the delivery-gate key, verified
+  against `docs/roles/delivery-gate.allowed_signers` read at the PR's base.
+  It adds no new key or trust root, and a queue signature cannot substitute
+  for it because the signed payloads differ. Scope approvals need the store
+  and are not used, so every PR takes its own per-head approval.
+- **enqueue**: unchanged — `(repo, pr, head)` is signed and auto-merge is
+  enabled pinned to that head, and the merge queue's `delivery-gate` job
+  still verifies the signature from the merge group's base.
+
+Every absent answer still refuses; the fallback above is the strict floor,
+never a relaxation. The same-uid limit on the key (see
+`scripts/delivery-gate`) applies to the approval exactly as it already does
+to the queue signature.
+
 `audit verdicts` uses the same note parser as the audit. A reviewer is the
 first whitespace token of `From:`, lower-cased (the rest is prose). Its kind
 comes from the exact title (`Standards`, `Spec/security`, `Browser QA`,

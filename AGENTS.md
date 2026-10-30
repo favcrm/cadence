@@ -219,6 +219,15 @@ the code you just wrote.
   an agent pane or endpoint): `cadence audit approve --pr <n> --head
   <full-sha> --source "<who decided, where>"`. A note or ticket comment is
   not approval evidence (`docs/AUDIT.md`).
+- **With no local daemon (a hosted org),** the approval is the signed PR
+  comment `scripts/delivery-gate approve --repo <owner/name> --pr <n> --head
+  <full-sha> --source "<who decided, where>"`. It reuses the delivery-gate
+  key and the `docs/roles/delivery-gate.allowed_signers` entry read at the
+  PR's base, so it adds no new trust anchor; the `source` is inside the
+  signed payload and a comment naming another head does not verify. Scope
+  approvals (`audit approve --issue --action scope`) need the daemon's
+  store and are therefore unavailable there: every PR takes its own
+  per-head approval. The key's same-uid limit below applies unchanged.
 - Approve once per ticket: the operator may run `cadence audit approve
   --issue <ID> --action scope` once, and `scripts/enqueue-reviewed` then
   accepts it for every in-scope PR of that ticket. Traps: the ticket body
@@ -244,6 +253,13 @@ the code you just wrote.
   the signature on the PR; the queue's required `delivery-gate` check holds
   any PR without one, so a direct `gh pr merge` never lands (CAD-1925). The
   queue re-tests on the newest main, so you do not have to rebase first.
+- It runs on a host with no daemon (CAD-1946 v0): it reads the hosted ticket
+  and posts the evidence comment through the remote CLI, reads the verdict
+  notes and the operator approval without a local store, and applies the
+  legacy strict floor — one review off the one-review list read at the base,
+  else two; the operator check on a human-class diff; the full CI floor —
+  because no approved project policy can be read without the daemon. It
+  never treats an unavailable answer as a pass.
 - If the queue ejects the PR (`failed_checks`), read the failed run: the
   cause is often a semantic clash with a PR that just landed. Fix it on the
   branch, show a `git range-diff` against the reviewed head, enqueue again.

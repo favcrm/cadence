@@ -5,6 +5,16 @@
     scripts/delivery-gate verify --repo R --pr N --head SHA --signers FILE --comments FILE
     scripts/delivery-gate queue-pr REF
 
+CAD-1946 v0 adds the operator's approval, for a host with no daemon to hold
+the approval store. Same key, same allowed_signers, different payload:
+
+    scripts/delivery-gate approve        --repo R --pr N --head SHA --key PATH --source TEXT
+    scripts/delivery-gate verify-approval --repo R --pr N --head SHA --signers FILE --comments FILE
+
+`verify-approval` takes the `Source:` line from the approval comment itself, so
+it is verified as signed: an edited source, or a comment naming another head,
+does not verify. A queue signature never satisfies it, and vice versa.
+
 The GitHub merge queue only checks CI, and every session holds the operator's
 gh login, so a direct `gh pr merge` skips the delivery gate. enqueue-reviewed
 therefore signs (repo, pr, head) with an SSH key once every rule holds and
@@ -34,14 +44,36 @@ ME = "delivery-gate"
 MARKER = "<!-- cadence-delivery-gate v1 -->"
 NAMESPACE = "cadence-delivery-gate"
 PRINCIPAL = "cadence-delivery-gate"
+# CAD-1946 v0: the operator's head-pinned approval, needed when no daemon
+# holds the approval store. It deliberately reuses the SAME key, principal and
+# namespace as the queue signature so `docs/roles/delivery-gate.allowed_signers`
+# (read at the PR base) stays the one trust anchor and no new key is
+# introduced. The two are told apart by their signed payload's first line, so a
+# queue signature can never stand in for an approval, and vice versa.
+APPROVAL_MARKER = "<!-- cadence-operator-approval v1 -->"
+APPROVAL_NAMESPACE = NAMESPACE
+APPROVAL_PRINCIPAL = PRINCIPAL
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 REPO = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 QUEUE_REF = re.compile(r"^(?:refs/heads/)?gh-readonly-queue/main/pr-([1-9][0-9]*)-[0-9a-f]{40}$")
 ARMOR = re.compile(r"-----BEGIN SSH SIGNATURE-----\n[A-Za-z0-9+/=\n]+?-----END SSH SIGNATURE-----")
+SOURCE_MAX = 200
+SOURCE_LINE = re.compile(r"^Source: (.+)$", re.M)
 
 
 def payload(repo, pr, head):
     return f"cadence-delivery-gate v1\nrepo {repo}\npr {pr}\nhead {head}\n".encode()
+
+
+def approval_payload(repo, pr, head, source):
+    """The operator's approval, bound to the exact PR head and its own words.
+
+    `source` is inside the signed payload: it is the operator's statement of
+    who approved and where, and an unsigned version of it would be free text
+    anybody could edit on the comment.
+    """
+    return (f"cadence-operator-approval v1\nrepo {repo}\npr {pr}\n"
+            f"head {head}\nsource {source}\n").encode()
 
 
 def usage(args):
@@ -69,43 +101,121 @@ def sign(args):
     return 0
 
 
-def verify(args):
-    reasons = []
+def approve(args):
+    """Print the comment body that records the operator's approval."""
+    source = " ".join(args.source.split())
+    if not source or len(source) > SOURCE_MAX:
+        print(f"{ME}: refused: --source must be 1-{SOURCE_MAX} characters", file=sys.stderr)
+        return 2
+    if not (os.path.isfile(args.key) and os.access(args.key, os.R_OK)):
+        print(f"{ME}: refused: no readable signing key at {args.key}", file=sys.stderr)
+        return 1
+    p = subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-n", APPROVAL_NAMESPACE, "-f", args.key],
+                       input=approval_payload(args.repo, args.pr, args.head, source),
+                       capture_output=True)
+    sig = p.stdout.decode(errors="replace").strip()
+    if p.returncode != 0 or not ARMOR.fullmatch(sig):
+        print(f"{ME}: refused: signing failed: {p.stderr.decode(errors='replace').strip()}",
+              file=sys.stderr)
+        return 1
+    print(f"{APPROVAL_MARKER}\nOperator approval: {args.repo}#{args.pr} at {args.head}\n"
+          f"Source: {source}\n\n```\n{sig}\n```")
+    return 0
+
+
+def read_comments(path):
     try:
-        with open(args.signers, encoding="utf-8") as f:
-            if not any(l.strip() and not l.lstrip().startswith("#") for l in f):
-                reasons.append(f"signers file {args.signers} lists no key")
-    except OSError as e:
-        reasons.append(f"cannot read signers file: {e}")
-    try:
-        with open(args.comments, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             comments = json.load(f)
         if not isinstance(comments, list) or not all(
                 isinstance(c, dict) and isinstance(c.get("body"), str) for c in comments):
             raise ValueError("not an array of comments with a string body")
+        return comments, []
     except (OSError, ValueError) as e:
-        reasons.append(f"cannot read comments: {e}")
-        comments = []
+        return [], [f"cannot read comments: {e}"]
+
+
+def read_signers(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            if any(l.strip() and not l.lstrip().startswith("#") for l in f):
+                return []
+    except OSError as e:
+        return [f"cannot read signers file: {e}"]
+    return [f"signers file {path} lists no key"]
+
+
+def verify_signed(args, marker, namespace, principal, data, missing):
+    """Exit 0 only when a comment carrying `marker` signs exactly `data`."""
+    reasons = read_signers(args.signers)
+    comments, why = read_comments(args.comments)
+    reasons += why
     if reasons:
         return refuse(reasons)
-    blocks = [(c.get("id"), m.group(0)) for c in comments if MARKER in c["body"]
+    blocks = [(c.get("id"), m.group(0)) for c in comments if marker in c["body"]
               for m in ARMOR.finditer(c["body"].replace("\r\n", "\n"))]
     if not blocks:
-        return refuse([f"no signed delivery-gate comment on PR #{args.pr}: "
-                       "enqueue with scripts/enqueue-reviewed"])
-    data = payload(args.repo, args.pr, args.head)
+        return refuse([missing])
     with tempfile.TemporaryDirectory(prefix="delivery-gate.") as tmp:
         for cid, block in blocks:
             sig = os.path.join(tmp, "sig")
             with open(sig, "w", encoding="utf-8") as f:
                 f.write(block + "\n")
-            p = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", args.signers, "-I", PRINCIPAL,
-                                "-n", NAMESPACE, "-s", sig], input=data, capture_output=True)
+            p = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", args.signers, "-I", principal,
+                                "-n", namespace, "-s", sig], input=data, capture_output=True)
             if p.returncode == 0:
                 print(f"{ME}: accepted: comment {cid} signs {args.repo}#{args.pr} at {args.head}")
                 return 0
-    return refuse([f"no delivery-gate signature on PR #{args.pr} verifies for head {args.head} "
-                   f"({len(blocks)} tried)"])
+    return refuse([f"no {'approval' if marker == APPROVAL_MARKER else 'delivery-gate'} signature "
+                   f"on PR #{args.pr} verifies for head {args.head} ({len(blocks)} tried)"])
+
+
+def verify(args):
+    return verify_signed(
+        args, MARKER, NAMESPACE, PRINCIPAL, payload(args.repo, args.pr, args.head),
+        f"no signed delivery-gate comment on PR #{args.pr}: "
+        "enqueue with scripts/enqueue-reviewed")
+
+
+def verify_approval(args):
+    """Accept when one approval comment signs (repo, pr, head, its Source line).
+
+    The Source is read from the same comment and is inside the signed payload,
+    so editing it, or naming another head, stops the signature verifying.
+    """
+    reasons = read_signers(args.signers)
+    comments, why = read_comments(args.comments)
+    reasons += why
+    if reasons:
+        return refuse(reasons)
+    blocks = []
+    for c in comments:
+        if APPROVAL_MARKER not in c["body"]:
+            continue
+        body = c["body"].replace("\r\n", "\n")
+        src = SOURCE_LINE.search(body)
+        for m in ARMOR.finditer(body):
+            blocks.append((c.get("id"), m.group(0), src.group(1).strip() if src else ""))
+    if not blocks:
+        return refuse([f"no signed operator approval on PR #{args.pr}: the operator "
+                       f"records it with scripts/delivery-gate approve"])
+    with tempfile.TemporaryDirectory(prefix="delivery-gate.") as tmp:
+        for cid, block, source in blocks:
+            if not source or len(source) > SOURCE_MAX:
+                continue
+            sig = os.path.join(tmp, "sig")
+            with open(sig, "w", encoding="utf-8") as f:
+                f.write(block + "\n")
+            p = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", args.signers,
+                                "-I", APPROVAL_PRINCIPAL, "-n", APPROVAL_NAMESPACE, "-s", sig],
+                               input=approval_payload(args.repo, args.pr, args.head, source),
+                               capture_output=True)
+            if p.returncode == 0:
+                print(f"{ME}: accepted: comment {cid} approves {args.repo}#{args.pr} "
+                      f"at {args.head} (source {source!r})")
+                return 0
+    return refuse([f"no operator approval on PR #{args.pr} verifies for head {args.head} "
+                   f"({len(blocks)} approval comment(s) tried)"])
 
 
 def refuse(reasons):
@@ -117,16 +227,19 @@ def refuse(reasons):
 def main(argv):
     ap = argparse.ArgumentParser(prog=ME)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("sign", "verify"):
+    for name in ("sign", "verify", "approve", "verify-approval"):
         p = sub.add_parser(name)
         p.add_argument("--repo", required=True)
         p.add_argument("--pr", type=int, required=True)
         p.add_argument("--head", required=True)
-        if name == "sign":
+        if name in ("sign", "approve"):
             p.add_argument("--key", required=True)
         else:
             p.add_argument("--signers", required=True)
             p.add_argument("--comments", required=True)
+        if name == "approve":
+            p.add_argument("--source", required=True,
+                           help="who approved and where (signed, single line)")
     q = sub.add_parser("queue-pr")
     q.add_argument("ref")
     args = ap.parse_args(argv)
@@ -140,7 +253,12 @@ def main(argv):
     if bad:
         print(f"{ME}: {bad}", file=sys.stderr)
         return 2
-    return sign(args) if args.cmd == "sign" else verify(args)
+    return {
+        "sign": sign,
+        "verify": verify,
+        "approve": approve,
+        "verify-approval": verify_approval,
+    }[args.cmd](args)
 
 
 if __name__ == "__main__":
