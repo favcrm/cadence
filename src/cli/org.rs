@@ -189,6 +189,68 @@ fn read_registry(path: &Path) -> Result<Registry> {
     Ok(read_registry_raw(path)?.0)
 }
 
+/// Read the registry for a caller that only selects a destination.
+///
+/// Takes a *shared* lock on `orgs.lock` when that file exists, so a read
+/// cannot observe the window `record_remote` documents: the registry
+/// written with the new binding while the credential commit has not run,
+/// or is being restored. A shared lock needs no directory write, so it
+/// still works on a managed sandbox's read-only `HOME` (CAD-1164). When
+/// the lock file is absent no writer has ever run — `RegistryFile::open`
+/// creates it before the first registry write — so the read is lockless.
+/// Startup IO failures name the path and the operation. Without that a
+/// sandbox denial on the registry lock reads as `io: Read-only file
+/// system` with no indication of what was denied, which the ticket calls
+/// out as a defect in its own right (CAD-1164).
+fn startup_io(what: &str, path: &Path, e: std::io::Error) -> Error {
+    Error::internal(format!("{what} {}: {e}", path.display()))
+}
+
+fn read_registry_shared(path: &Path) -> Result<Registry> {
+    read_registry_shared_once(path, true)
+}
+
+fn read_registry_shared_once(path: &Path, retry: bool) -> Result<Registry> {
+    let lock_path = path.parent().expect("registry parent").join("orgs.lock");
+    let lock = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&lock_path)
+    {
+        Ok(file) => Some(file),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(startup_io("open the org registry lock", &lock_path, e)),
+    };
+    if let Some(lock) = &lock {
+        let meta = lock
+            .metadata()
+            .map_err(|e| startup_io("inspect the org registry lock", &lock_path, e))?;
+        if !meta.is_file() {
+            return Err(Error::rejected("org registry lock must be a regular file"));
+        }
+        // SAFETY: flock acts only on the descriptor this guard owns.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH) } != 0 {
+            return Err(startup_io(
+                "lock the org registry",
+                &lock_path,
+                std::io::Error::last_os_error(),
+            ));
+        }
+    }
+    let took_lock = lock.is_some();
+    let registry = read_registry(path)?;
+    drop(lock);
+    // A writer creates the lock file before it touches the registry, so a
+    // lock that appeared while this read was in flight means a login may
+    // have published a binding it has not committed yet. One more pass
+    // takes that lock and reads again; it cannot loop, because the next
+    // pass either locks the file or fails to open it.
+    if retry && !took_lock && lock_path.exists() {
+        return read_registry_shared_once(path, false);
+    }
+    Ok(registry)
+}
+
 /// Read the registry and keep the exact bytes read. The bytes let a failed
 /// credential save restore a compact file that `to_vec_pretty` would refuse
 /// at the write cap.
@@ -202,7 +264,7 @@ fn read_registry_raw(path: &Path) -> Result<(Registry, Option<Vec<u8>>)> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((Registry::default(), None))
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(startup_io("read the org registry", path, e)),
     };
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > 65536 {
@@ -696,14 +758,21 @@ pub(super) fn resolve(
     let org = org.or(org_env.as_deref());
     // No org anywhere and no registry → ambient local; the registry never
     // has to exist for standalone local use.
-    let file = match RegistryFile::path() {
-        Ok(p) if p.exists() => Some(RegistryFile::open()?),
+    //
+    // Resolution only picks a destination, so it takes no write lock and
+    // creates nothing: requiring the exclusive lock here made every
+    // command need a writable config dir, and a managed sandbox has none —
+    // the CLI died with `io: Read-only file system` before the command it
+    // was routing ever ran (CAD-1164). It still excludes the login
+    // transaction through a shared lock, so a read cannot land between the
+    // registry write and the credential commit.
+    let registry = match RegistryFile::path() {
+        Ok(p) if p.exists() => Some(read_registry_shared(&p)?),
         _ => None,
     };
-    let selection = match (&file, org) {
+    let selection = match (&registry, org) {
         (None, Some(name)) if name != LOCAL_ORG => return Err(unknown_org(name, false)),
-        (Some(file), _) => {
-            let registry = file.read()?;
+        (Some(registry), _) => {
             if org == Some(LOCAL_ORG) {
                 registry
                     .connections
@@ -711,7 +780,7 @@ pub(super) fn resolve(
                     .find(|c| c.selection.org == LOCAL_ORG)
                     .cloned()
             } else {
-                select(&registry, org)?
+                select(registry, org)?
             }
         }
         _ => None,
@@ -1082,6 +1151,140 @@ mod tests {
             Resolved::Local(dir) => assert_eq!(dir, PathBuf::from("/org/state")),
             Resolved::Remote(_) => panic!("registered local resolved remote"),
         }
+    }
+
+    /// CAD-1164: a managed sandbox hands the CLI a real `HOME` it cannot
+    /// write, and that `HOME` already holds the registry and its lock file
+    /// from earlier operator logins. Resolution must read through the
+    /// existing lock without creating or rewriting anything.
+    #[test]
+    fn resolution_reads_a_registry_it_cannot_lock() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", true));
+        let dir = env
+            .registry_path()
+            .parent()
+            .expect("registry parent")
+            .to_path_buf();
+        let lock_path = dir.join("orgs.lock");
+        std::fs::write(&lock_path, b"").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let resolved = resolve(None, None, None);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match resolved.expect("resolution must not need a writable config dir") {
+            Resolved::Remote(target) => assert_eq!(target.org, "acme"),
+            Resolved::Local(_) => panic!("the selected remote org resolved local"),
+        }
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().len(),
+            0,
+            "a read must not write to the registry lock"
+        );
+    }
+
+    /// No lock file means no writer has ever run here, so a read-only
+    /// config directory still resolves — and must not create the lock.
+    #[test]
+    fn resolution_reads_a_registry_that_has_no_lock_file() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", true));
+        let dir = env
+            .registry_path()
+            .parent()
+            .expect("registry parent")
+            .to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let resolved = resolve(None, None, None);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match resolved.expect("a missing lock file must not fail resolution") {
+            Resolved::Remote(target) => assert_eq!(target.org, "acme"),
+            Resolved::Local(_) => panic!("the selected remote org resolved local"),
+        }
+        assert!(
+            !dir.join("orgs.lock").exists(),
+            "resolution must not create the registry lock"
+        );
+    }
+
+    /// `record_remote` writes the registry and commits the credential while
+    /// holding the lock, restoring the previous binding if the commit
+    /// fails. A read that skipped the lock could see the new binding with
+    /// the old credential and reject it as a workspace mismatch, so
+    /// resolution has to wait for the transaction to finish.
+    #[test]
+    fn resolution_waits_for_the_login_transaction() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", true));
+        let dir = env
+            .registry_path()
+            .parent()
+            .expect("registry parent")
+            .to_path_buf();
+        let holder = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("orgs.lock"))
+            .unwrap();
+        // SAFETY: flock acts only on the descriptor this test owns.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let resolved = resolve(None, None, None).map(|r| match r {
+                Resolved::Remote(target) => target.org,
+                Resolved::Local(_) => String::new(),
+            });
+            done_tx.send(resolved).unwrap();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the reading thread must start");
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err(),
+            "resolution must wait for the login transaction to commit"
+        );
+        // SAFETY: same descriptor, releasing this test's own lock.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
+        let org = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("resolution must finish once the transaction commits")
+            .expect("resolution must succeed");
+        assert_eq!(org, "acme");
+        reader.join().unwrap();
+    }
+
+    /// The ticket asks that a startup failure identify the denied path
+    /// instead of reading like a test failure, so a refusal must name the
+    /// registry lock it could not open.
+    #[test]
+    fn a_denied_registry_lock_names_the_path() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", true));
+        let dir = env
+            .registry_path()
+            .parent()
+            .expect("registry parent")
+            .to_path_buf();
+        let lock_path = dir.join("orgs.lock");
+        // `O_NOFOLLOW` refuses the final component, which is deterministic
+        // whatever uid the suite runs as — unlike a permission denial.
+        std::os::unix::fs::symlink("/nonexistent/cadence-lock", &lock_path).unwrap();
+        let err = resolve(None, None, None).expect_err("a symlinked lock must be refused");
+        let message = err.to_string();
+        assert!(message.contains("org registry lock"), "{message}");
+        assert!(
+            message.contains(lock_path.to_str().unwrap()),
+            "the refusal must name the path: {message}"
+        );
     }
 
     #[test]
