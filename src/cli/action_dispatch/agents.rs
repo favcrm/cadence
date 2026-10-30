@@ -240,9 +240,6 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             watch,
             placement.map(PlacementArg::placement),
         ),
-        Commands::LocalAgent { .. } => Err(Error::usage(
-            "local-agent coordinates a hosted org with this machine. Select that org, or switch back from `--org local`. Nothing was claimed.",
-        )),
         Commands::Team { .. } => Err(Error::usage(
             "team requires a hosted org: pass --org <org> for a logged-in workspace, or switch back from `--org local`. Nothing was sent",
         )),

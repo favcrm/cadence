@@ -256,8 +256,8 @@ adopted. A managed worker is not instructed to `org switch` or to unset
 Operator-only verbs need the remote operator proof tied to CAD-657's
 source-authority decision — out of scope for v1.
 
-`local-agent connect --alias <alias> --repo <checkout>` configures this
-machine and picks up current assignments once. Run `local-agent watch` for
+`agent connect --alias <alias> --repo <checkout>` configures this
+machine and picks up current assignments once. Run `agent watch` for
 ongoing pickup, with a five-second poll and the org pinned for that process.
 Background pickup leaves blocked work alone; after resolving its blocker,
 explicitly reconnect or start that issue again. State-filtered reads prevent a
