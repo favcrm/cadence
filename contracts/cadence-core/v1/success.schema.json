@@ -74,6 +74,21 @@
         "op",
         "value"
       ]
+    },
+    {
+      "description": "The delivery-requirements document: the class, the reviews it needs and\nthe policy it was decided under (CAD-1946).",
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "delivery.requirements.evaluate"
+        },
+        "value": true
+      },
+      "required": [
+        "op",
+        "value"
+      ]
     }
   ],
   "required": [

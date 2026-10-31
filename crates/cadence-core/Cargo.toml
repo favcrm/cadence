@@ -21,6 +21,8 @@ schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_yaml = "0.9"
+# The trusted-base lists (`risk-paths.toml`, `one-review-paths.toml`) are TOML.
+toml = "0.8"
 # SHA-256 for the one canonical material/ledger digest (already locked by the
 # root crate; the algorithm is extracted from src/store/app_runs.rs).
 sha2 = "0.10"

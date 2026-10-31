@@ -2,44 +2,7 @@
 
 use std::path::Path;
 
-/// `*`/`**`/`?` glob match: `*` stays inside a path component, `**`
-/// crosses directories, `?` is one non-`/` character.
-pub fn glob_match(pattern: &str, path: &str) -> bool {
-    glob_rec(pattern.as_bytes(), path.as_bytes())
-}
-
-fn glob_rec(p: &[u8], s: &[u8]) -> bool {
-    if p.is_empty() {
-        return s.is_empty();
-    }
-    match p[0] {
-        b'*' if p.get(1) == Some(&b'*') => {
-            // `**/`: also try matching zero directories.
-            if p.get(2) == Some(&b'/') && glob_rec(&p[3..], s) {
-                return true;
-            }
-            for i in 0..=s.len() {
-                if glob_rec(&p[2..], &s[i..]) {
-                    return true;
-                }
-            }
-            false
-        }
-        b'*' => {
-            for i in 0..=s.len() {
-                if glob_rec(&p[1..], &s[i..]) {
-                    return true;
-                }
-                if i < s.len() && s[i] == b'/' {
-                    break;
-                }
-            }
-            false
-        }
-        b'?' => !s.is_empty() && s[0] != b'/' && glob_rec(&p[1..], &s[1..]),
-        c => !s.is_empty() && s[0] == c && glob_rec(&p[1..], &s[1..]),
-    }
-}
+pub use cadence_core::delivery_rules::glob_match;
 
 /// A `fn` item added under `test_globs` in the PR diff, with the added
 /// lines that follow it (its body, for the stress-pattern match).

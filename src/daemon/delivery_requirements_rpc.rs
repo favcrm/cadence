@@ -282,7 +282,7 @@ pub(super) fn policy_snapshot(
         .and_then(delivery_policy::approved_from);
     let resolved = delivery_policy::effective(
         project,
-        delivery_policy::load(pm_dir, project),
+        delivery_policy::load(pm_dir, project).map_err(|e| e.to_string()),
         approved.as_ref(),
     );
     Ok((resolved, approved))

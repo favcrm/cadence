@@ -86,6 +86,39 @@ pub enum Operation {
     /// Whether an issue is ready or blocked, given its blockers' statuses.
     #[serde(rename = "issue.readiness")]
     IssueReadiness(ReadinessInput),
+    /// Classify one delivery and answer what it needs to merge (CAD-1946).
+    ///
+    /// The evidence is the caller's own reads: the project's `delivery:`
+    /// section, its recorded approval, the diff rows and the trusted-base list
+    /// texts. Nothing here reads a file or a program, and no input carries a
+    /// class.
+    #[serde(rename = "delivery.requirements.evaluate")]
+    DeliveryRequirementsEvaluate(DeliveryRequirementsInput),
+}
+
+/// Input of `delivery.requirements.evaluate`.
+///
+/// Every field is evidence the caller retrieved itself: the project's
+/// `delivery:` section, its recorded approval, the diff rows and the
+/// trusted-base list texts. No field carries a class, and nothing here reads a
+/// file, a program or a network answer.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryRequirementsInput {
+    /// The exact `delivery:` section text, or absent when the project has none.
+    pub policy: Option<String>,
+    /// The digest the project's work approval recorded for its delivery policy.
+    pub approval_digest: Option<String>,
+    /// The policy that approval recorded (absent = approved "no section").
+    pub approval: Option<Value>,
+    /// `git diff --raw -z --no-renames <merge-base> <head>` rows.
+    pub changes: Vec<Value>,
+    /// `git diff --numstat` total changed lines.
+    pub lines: u64,
+    /// The trusted base's `docs/roles/risk-paths.toml` text.
+    pub risk_paths: Option<String>,
+    /// The trusted base's `docs/roles/one-review-paths.toml` text.
+    pub one_review_paths: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -259,6 +292,10 @@ pub enum OpValue {
     Validate(ValidateValue),
     #[serde(rename = "issue.readiness")]
     Readiness(ReadinessValue),
+    /// The delivery-requirements document: the class, the reviews it needs and
+    /// the policy it was decided under (CAD-1946).
+    #[serde(rename = "delivery.requirements.evaluate")]
+    DeliveryRequirements(Value),
 }
 
 /// Success response.
@@ -402,6 +439,65 @@ fn valid_contract_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// One delivery classification from the evidence the caller gathered.
+///
+/// The policy, its approval, the diff rows and the trusted lists decide; a
+/// malformed anything is a refusal, never a weaker requirement. The answer
+/// names the resolved policy beside the requirements so a reader can see which
+/// policy produced the class.
+fn delivery_requirements_value(input: &DeliveryRequirementsInput) -> Result<Value, Refusal> {
+    use crate::delivery::{effective, parse, Approved, DeliveryPolicy};
+    use crate::delivery_requirements::{classify, Change, TrustedLists};
+
+    let file = match input.policy.as_deref() {
+        None => Ok(None),
+        Some(text) => parse(text).map_err(|error| error.to_string()),
+    };
+    let approved = match input.approval_digest.as_deref() {
+        None => None,
+        Some(digest) => {
+            let policy = match &input.approval {
+                None => None,
+                Some(value) => Some(
+                    serde_json::from_value::<DeliveryPolicy>(value.clone())
+                        .map_err(|error| refuse(Code::InvalidCommand, error.to_string()))?,
+                ),
+            };
+            Some(Approved {
+                digest: digest.to_string(),
+                policy,
+            })
+        }
+    };
+    let resolved = effective("project", file, approved.as_ref());
+    if let Some(note) = &resolved.note {
+        // The policy in force is not the one the file declares. That is a fact
+        // for the caller to surface, and the strict requirements below already
+        // reflect it — never silently the file's weaker reading.
+        let _ = note;
+    }
+    let mut changes = Vec::with_capacity(input.changes.len());
+    for value in &input.changes {
+        changes.push(
+            serde_json::from_value::<Change>(value.clone())
+                .map_err(|error| refuse(Code::InvalidCommand, error.to_string()))?,
+        );
+    }
+    let lists = TrustedLists {
+        risk_paths: input.risk_paths.as_deref(),
+        one_review: input.one_review_paths.as_deref(),
+    };
+    let requirements = classify(&resolved, &changes, input.lines, &lists);
+    serde_json::to_value(serde_json::json!({
+        "policy": resolved.policy,
+        "policy_source": resolved.source,
+        "policy_digest": resolved.digest,
+        "policy_note": resolved.note,
+        "requirements": requirements,
+    }))
+    .map_err(|error| refuse(Code::InvalidCommand, error.to_string()))
+}
+
 fn dispatch(input: &[u8]) -> Result<OpValue, Refusal> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(refuse(
@@ -427,8 +523,8 @@ fn dispatch(input: &[u8]) -> Result<OpValue, Refusal> {
     if object.get("v").and_then(Value::as_u64) != Some(CONTRACT_VERSION.into()) {
         return Err(refuse(Code::InvalidCommand, "unsupported contract version"));
     }
-    let request: Request =
-        serde_json::from_value(value).map_err(|error| refuse(Code::InvalidCommand, error))?;
+    let request: Request = serde_json::from_value(value)
+        .map_err(|error| refuse(Code::InvalidCommand, error.to_string()))?;
     match request.operation {
         Operation::AppManifestPreflight(input) => {
             manifest_preflight(&input.manifest)?;
@@ -453,6 +549,9 @@ fn dispatch(input: &[u8]) -> Result<OpValue, Refusal> {
             // Emitted as produced: `RequirementsValue` publishes the shape.
             Ok(OpValue::Requirements(compat.report(&host)))
         }
+        Operation::DeliveryRequirementsEvaluate(input) => Ok(OpValue::DeliveryRequirements(
+            delivery_requirements_value(&input)?,
+        )),
         Operation::IssueValidate(input) => Ok(OpValue::Validate(issue::validate(&input))),
         Operation::IssueReadiness(input) => Ok(OpValue::Readiness(issue::readiness(&input))),
     }
@@ -527,6 +626,84 @@ mod tests {
 
     const REQUIRES_STORAGE: &str = "---\nname: demo\nneeds:\n  requires:\n    \
         contracts: {app-storage: [1]}\n---\nbody\n";
+
+    /// The delivery op must answer exactly what the native evaluator answers
+    /// for the same evidence — one implementation, two callers.
+    #[test]
+    fn delivery_requirements_op_matches_the_native_evaluator() {
+        use crate::delivery::{default_policy, effective};
+        use crate::delivery_requirements::{classify, TrustedLists};
+
+        let request = |input: Value| {
+            serde_json::to_vec(&serde_json::json!({
+                "v": CONTRACT_VERSION,
+                "op": "delivery.requirements.evaluate",
+                "input": input,
+            }))
+            .unwrap()
+        };
+        let lists = TrustedLists {
+            risk_paths: Some(""),
+            one_review: Some(""),
+        };
+        let native = classify(
+            &effective("project", Ok(None), None),
+            &[],
+            0,
+            &TrustedLists {
+                risk_paths: Some(""),
+                one_review: Some(""),
+            },
+        );
+        let response: Value = serde_json::from_slice(&evaluate(&request(serde_json::json!({
+            "policy": null,
+            "approval_digest": null,
+            "approval": null,
+            "changes": [],
+            "lines": 0,
+            "risk_paths": "",
+            "one_review_paths": "",
+        }))))
+        .unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(
+            response["value"]["requirements"],
+            serde_json::to_value(&native).unwrap(),
+            "the op and the native evaluator disagree"
+        );
+        assert_eq!(
+            response["value"]["policy"],
+            serde_json::to_value(default_policy()).unwrap()
+        );
+        let _ = lists;
+
+        // A malformed section is the default policy plus its note, and the
+        // strict requirements that note implies — never the file's weaker
+        // reading, and never a silent default.
+        let bad: Value = serde_json::from_slice(&evaluate(&request(serde_json::json!({
+            "policy": "---\ndelivery: {bogus: 1}\n---\n",
+            "approval_digest": null,
+            "approval": null,
+            "changes": [],
+            "lines": 0,
+            "risk_paths": null,
+            "one_review_paths": null,
+        }))))
+        .unwrap();
+        assert_eq!(bad["ok"], true, "{bad}");
+        assert_eq!(bad["value"]["policy_source"], "default");
+        assert!(
+            bad["value"]["policy_note"]
+                .as_str()
+                .is_some_and(|note| note.starts_with("delivery_error:")),
+            "{bad}"
+        );
+        assert_eq!(bad["value"]["requirements"]["class"], "strict", "{bad}");
+        assert_eq!(
+            bad["value"]["requirements"]["operator_approval"], true,
+            "{bad}"
+        );
+    }
 
     #[test]
     fn hosted_profile_is_the_only_host_authority() {

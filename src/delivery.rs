@@ -542,13 +542,13 @@ pub enum Risk {
     Oversized,
 }
 
+/// `HEAVY_*` annotates the kickoff so the reviewer slows down.
+pub use cadence_core::delivery::HEAVY_FILES;
+pub use cadence_core::delivery::HEAVY_LINES;
 /// Diff-size thresholds. A review over `OVERSIZED_*` cannot be
 /// diligent — flagged for splitting before a reviewer is asked.
-pub const OVERSIZED_FILES: u64 = 40;
-pub const OVERSIZED_LINES: u64 = 3000;
-/// `HEAVY_*` annotates the kickoff so the reviewer slows down.
-pub const HEAVY_FILES: u64 = 10;
-pub const HEAVY_LINES: u64 = 800;
+pub use cadence_core::delivery::OVERSIZED_FILES;
+pub use cadence_core::delivery::OVERSIZED_LINES;
 
 impl Risk {
     pub fn as_str(self) -> &'static str {
