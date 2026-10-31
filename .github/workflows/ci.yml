@@ -46,19 +46,18 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
-# CAD-1967: the gate stays on GitHub-hosted runners. instabox-medium compiled
-# the test profile in 3:20 against 5:44 on ubuntu-latest, then the suite
-# failed closed: the runner kernel 6.18.54-instabox is outside
-# supported_kernel_abi (src/issue/process_use.rs). Actions cache versions
-# also include the absolute workspace path, so a job moved there cannot
-# restore the cache cache-warm saved from /home/runner/work. Move a cache
-# consumer only together with cache-warm, and only once that kernel is
-# allowlisted. Release, ARM and macOS jobs stay on their current labels.
+# CAD-1967: the Linux gates run on instabox-medium. Its kernel 6.18.54 is
+# listed in supported_kernel_abi and both host acceptances (cad1196, cad1377)
+# pass there; the test profile compiles in 3:20 against 5:44 on ubuntu-latest.
+# `cache-warm` moves with them: Actions cache versions include the cached
+# paths, so a writer on a different runner cannot warm these jobs, and a
+# consumer moved alone compiles cold. Release, ARM and macOS jobs stay on
+# their current labels.
 jobs:
   native-fixture-release-exclusion:
     # C1 is an explicitly dispatched, isolated artifact check, not a fixture run.
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -117,7 +116,7 @@ jobs:
   # run because their `if` tolerates a skipped need.
   queue-evidence:
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 5
     permissions:
       actions: read
@@ -177,7 +176,7 @@ jobs:
   # PR feedback selection runs BASE policy, never a PR-provided classifier.
   # Merge groups, main, tags and any uncertainty retain all real gates.
   change-scope:
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
@@ -230,7 +229,7 @@ jobs:
   fmt:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 10
     steps:
       - name: Not applicable — rust PR feedback gate
@@ -307,7 +306,7 @@ jobs:
   clippy:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 20
     steps:
       - name: Not applicable — rust PR feedback gate
@@ -341,7 +340,7 @@ jobs:
   test-shards:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -441,7 +440,7 @@ jobs:
   test:
     needs: [queue-evidence, change-scope, test-shards]
     if: ${{ always() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 5
     permissions:
       actions: read
@@ -517,7 +516,7 @@ jobs:
   build:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 20
     steps:
       - name: Not applicable — rust PR feedback gate
@@ -601,7 +600,7 @@ jobs:
   ui:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 20
     defaults:
       run:
@@ -689,7 +688,7 @@ jobs:
   # exists (rust-cache would not save) and sccache has nothing to warm.
   cache-warm:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 30
     continue-on-error: true
     environment: sccache-writer
@@ -1763,7 +1762,7 @@ jobs:
     name: cross-build (required)
     needs: [cross-build]
     if: ${{ always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -1780,7 +1779,7 @@ jobs:
   # this phase.
   secrets:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
