@@ -403,7 +403,26 @@ pub fn list_checked(pm_dir: &Path) -> Result<Vec<Project>> {
             ))
         })?;
         let file = entry.path().join("project.yaml");
-        if kind.is_dir() && crate::issue::board::is_real_file(&file) {
+        if !kind.is_dir() {
+            continue;
+        }
+        // `is_real_file` answers false for *any* metadata error, so a project
+        // directory that cannot be searched is silently omitted — the same
+        // fail-open this listing exists to close, one level down. Distinguish
+        // "no project.yaml here" (not a project) from "cannot tell".
+        let meta = match std::fs::symlink_metadata(&file) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(Error::internal(format!(
+                    "cannot inspect {}: {e}",
+                    file.display()
+                )))
+            }
+        };
+        // lstat-style, as `list`: a symlinked or non-regular project.yaml is
+        // not a project.
+        if meta.is_file() && !meta.file_type().is_symlink() {
             projects.push(load(&file)?);
         }
     }

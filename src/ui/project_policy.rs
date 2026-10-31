@@ -301,6 +301,44 @@ mod tests {
         assert!(readable(&pm, "operator").contains("demo"));
     }
 
+    /// CAD-1950: a project directory that exists but cannot be searched hides
+    /// its `project.yaml` behind `PermissionDenied`. `board::is_real_file`
+    /// turns that into `false`, which would omit the project and call the
+    /// listing complete — the same fail-open one level down. The checked
+    /// listing must refuse instead.
+    #[test]
+    fn an_uninspectable_project_refuses_the_whole_listing() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, pm) = pm_with(&[("demo", PRIVATE), ("open", "")]);
+        let hidden = pm.dir.join("demo");
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::symlink_metadata(hidden.join("project.yaml")).is_ok() {
+            // Root (or an ACL) can still inspect it; the mode cannot express
+            // this case here.
+            std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o755)).unwrap();
+            drop(dir);
+            return;
+        }
+
+        // The lenient listing omits it and answers a complete-looking set…
+        let lenient = project::list(&pm.dir).unwrap();
+        assert!(
+            lenient.iter().all(|p| p.key != "demo"),
+            "list still omits an uninspectable project"
+        );
+        // …which the checked listing refuses to do.
+        assert!(
+            project::list_checked(&pm.dir).is_err(),
+            "an uninspectable project must not be silently omitted"
+        );
+        // So a caller that cannot be checked is refused, even the owner.
+        assert!(refused(&pm, "demo", "operator"));
+        assert!(readable(&pm, "operator").is_empty());
+
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!refused(&pm, "demo", "operator"));
+    }
+
     #[test]
     fn an_overview_drops_rows_for_unreadable_projects() {
         let readable: BTreeSet<String> = ["open".to_string()].into_iter().collect();
