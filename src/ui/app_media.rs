@@ -46,6 +46,11 @@ pub(super) fn publish_route(path: &str) -> bool {
     path == "/api/app-media/publish"
 }
 
+/// `POST /api/app-media/import` → `true` for exactly that path.
+pub(super) fn import_route(path: &str) -> bool {
+    path == "/api/app-media/import"
+}
+
 /// `POST /api/app-media/original` → `true` for exactly that path.
 pub(super) fn original_route(path: &str) -> bool {
     path == "/api/app-media/original"
@@ -314,5 +319,59 @@ pub(super) fn media_chat_attach(
     ) {
         Ok(v) => super::json_response(v),
         Err(e) => home::rpc_err(&e, "app_media_chat_attach"),
+    }
+}
+
+/// The media-import relay. Body `{action_token, receipt_id, request_id}`
+/// only — any other key refuses before the daemon sees it. The session
+/// fields are added host-side from the proven request, never the body.
+pub(super) fn media_import(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let body: Value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v) if v.is_object() => v,
+        _ => return err_response(400, "media import body must be a JSON object"),
+    };
+    if body.as_object().is_some_and(|o| {
+        o.keys()
+            .any(|k| !matches!(k.as_str(), "action_token" | "receipt_id" | "request_id"))
+    }) {
+        return err_response(400, "media import body contains unsupported fields");
+    }
+    let action_token = body
+        .get("action_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let receipt_id = body.get("receipt_id").and_then(Value::as_str).unwrap_or("");
+    let request_id = body.get("request_id").and_then(Value::as_str).unwrap_or("");
+    if action_token.is_empty() || receipt_id.is_empty() || request_id.is_empty() {
+        return err_response(
+            400,
+            "media import needs action_token, receipt_id and request_id",
+        );
+    }
+    let Some((token, key, origin)) = app_screens::request_credentials(request, opts) else {
+        return err_response(403, "media import needs a live operator session");
+    };
+    match client::rpc(
+        state_dir,
+        "app_media_import",
+        serde_json::json!({
+            "action_token": action_token,
+            "token": token,
+            "key": key,
+            "origin": origin,
+            "receipt_id": receipt_id,
+            "request_id": request_id,
+        }),
+    ) {
+        Ok(v) => super::json_response(v),
+        Err(e) => home::rpc_err(&e, "app_media_import"),
     }
 }
