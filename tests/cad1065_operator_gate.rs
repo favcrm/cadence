@@ -71,6 +71,10 @@ while True:
                     else:
                         wire.write(b"550 forbidden command\r\n")
                         break
+    except (BrokenPipeError, ConnectionResetError):
+        # The client refused a malformed reply and hung up, which is an
+        # outcome under test rather than a rig failure.
+        pass
     except Exception:
         record("RIG_FAILURE")
 "#;
