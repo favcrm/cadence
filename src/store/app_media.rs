@@ -458,35 +458,12 @@ impl Store {
     /// `next_cursor` (`None` when the page is the last). An empty
     /// catalog is a valid result, never a refusal.
     ///
-    /// This is the STORE-WIDE page: every installation's rows, drafts
-    /// included. A mounting app reads [`Self::app_media_catalog_for`].
+    /// The store is the workspace: permitted collaborators read the same
+    /// rows regardless of which installation produced them, and
+    /// `install_id` is provenance, not a read partition. Draft/published
+    /// is the curation lifecycle, not a visibility boundary.
     pub fn app_media_catalog(
         &self,
-        limit: i64,
-        cursor: Option<&str>,
-    ) -> Result<(Vec<MediaAsset>, Option<String>)> {
-        self.app_media_catalog_page(None, limit, cursor)
-    }
-
-    /// CAD-1962: the page one mounted installation may list — published
-    /// rows from any installation, plus that installation's OWN drafts.
-    /// The workspace library is the curated published subset; another
-    /// app's unpublished draft is its work in progress, not a library
-    /// entry, so it is not listed here. The store stays the workspace:
-    /// a published row is visible regardless of which installation
-    /// produced it, and `install_id` remains provenance.
-    pub fn app_media_catalog_for(
-        &self,
-        install: &str,
-        limit: i64,
-        cursor: Option<&str>,
-    ) -> Result<(Vec<MediaAsset>, Option<String>)> {
-        self.app_media_catalog_page(Some(install), limit, cursor)
-    }
-
-    fn app_media_catalog_page(
-        &self,
-        install: Option<&str>,
         limit: i64,
         cursor: Option<&str>,
     ) -> Result<(Vec<MediaAsset>, Option<String>)> {
@@ -499,18 +476,16 @@ impl Store {
             Some((created, id)) => conn.query_vec(
                 "SELECT a.id,a.install_id,a.title,a.kind,a.lifecycle,a.revision,a.creator,a.created,a.updated,l.source_asset_id
                  FROM app_media_assets a LEFT JOIN app_media_lineage l ON l.asset_id=a.id
-                 WHERE (?4 IS NULL OR a.lifecycle='published' OR a.install_id=?4)
-                   AND (a.created < ?1 OR (a.created = ?1 AND a.id > ?2))
+                 WHERE a.created < ?1 OR (a.created = ?1 AND a.id > ?2)
                  ORDER BY a.created DESC, a.id ASC LIMIT ?3",
-                params![created, id, limit + 1, install],
+                params![created, id, limit + 1],
                 row_media_catalog,
             )?,
             None => conn.query_vec(
                 "SELECT a.id,a.install_id,a.title,a.kind,a.lifecycle,a.revision,a.creator,a.created,a.updated,l.source_asset_id
                  FROM app_media_assets a LEFT JOIN app_media_lineage l ON l.asset_id=a.id
-                 WHERE (?2 IS NULL OR a.lifecycle='published' OR a.install_id=?2)
                  ORDER BY a.created DESC, a.id ASC LIMIT ?1",
-                params![limit + 1, install],
+                params![limit + 1],
                 row_media_catalog,
             )?,
         };
@@ -529,27 +504,12 @@ impl Store {
     }
 
     /// CAD-1962: one catalog row by id, with its lineage pointer — the
-    /// detail read the `asset` input kind returns. Store-wide: the mount
-    /// proved the workspace, so permitted collaborators read any
-    /// workspace asset regardless of which installation produced it;
-    /// `install_id` is provenance, not a read partition. An absent id is
-    /// `None` (the caller refuses it as unknown), and a stored row that
-    /// could not have been written by this module refuses rather than
-    /// projecting. A mounting app uses [`Self::app_media_asset_for`].
+    /// detail read the `asset` input kind returns. Same store-wide
+    /// boundary as the page: `install_id` is provenance, not a read
+    /// partition. An absent id is `None` (the caller refuses it as
+    /// unknown), and a stored row that could not have been written by
+    /// this module refuses rather than projecting.
     pub fn app_media_asset(&self, id: &str) -> Result<Option<MediaAsset>> {
-        self.app_media_asset_page(None, id)
-    }
-
-    /// CAD-1962: the detail read one mounted installation may make —
-    /// the same published-plus-own-drafts rule as
-    /// [`Self::app_media_catalog_for`]. Another installation's draft
-    /// resolves to `None`, exactly as an unknown id does, so the caller
-    /// cannot tell an unpublished asset from a missing one.
-    pub fn app_media_asset_for(&self, install: &str, id: &str) -> Result<Option<MediaAsset>> {
-        self.app_media_asset_page(Some(install), id)
-    }
-
-    fn app_media_asset_page(&self, install: Option<&str>, id: &str) -> Result<Option<MediaAsset>> {
         if !valid_id(id) {
             return Ok(None);
         }
@@ -557,8 +517,8 @@ impl Store {
         let row = conn.query_opt(
             "SELECT a.id,a.install_id,a.title,a.kind,a.lifecycle,a.revision,a.creator,a.created,a.updated,l.source_asset_id
              FROM app_media_assets a LEFT JOIN app_media_lineage l ON l.asset_id=a.id
-             WHERE a.id=?1 AND (?2 IS NULL OR a.lifecycle='published' OR a.install_id=?2)",
-            params![id, install],
+             WHERE a.id=?1",
+            params![id],
             row_media_catalog,
         )?;
         row.map(MediaAsset::checked).transpose()
