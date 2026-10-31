@@ -107,6 +107,27 @@ test("init posts to the exact origin with one transferred port, then ready", asy
   assert.deepEqual(inbox[0], { v: 1, op: "ready", accepts: ["screen.v2"] });
 });
 
+test("surfaces opt-in is advertised and the drawer surface is dispatched", async () => {
+  const seen = [];
+  const { inbox, host } = connect({ accepts: ["screen.v2", "screen-surfaces.v1"], onSurface: (...args) => seen.push(args) });
+  await tick();
+  assert.deepEqual(inbox[0].accepts, ["screen.v2", "screen-surfaces.v1"]);
+  const { receiver } = connect({ accepts: ["screen.v2", "screen-surfaces.v1"] });
+  assert.equal(receiver.surfaceRole(), "primary");
+  assert.equal(receiver.surface(), undefined);
+  host.postMessage({ v: 1, op: "surface", role: "drawer", modal: false, surface: "settings" });
+  await tick();
+  assert.deepEqual(seen.pop(), ["drawer", "settings", false]);
+});
+
+test("a drawer surface opens no further drawer", async () => {
+  const { receiver, host } = connect({ accepts: ["screen.v2", "screen-surfaces.v1"] });
+  host.postMessage({ v: 1, op: "surface", role: "drawer", modal: false, surface: "post" });
+  await tick();
+  assert.equal(receiver.surfaceRole(), "drawer");
+  await assert.rejects(receiver.openDrawer("settings"), /no further drawer/);
+});
+
 test("presentation opt-in is advertised and dispatched; the default is outlet", async () => {
   const modes = [];
   const { receiver, inbox, host } = connect({
