@@ -380,10 +380,19 @@ are now different, so re-measure before reviving that flow.
 
 ## CI throughput benchmark (CAD-840)
 
-The suite width is fixed: six `test-shards` partitions (`hash:k/6`,
-`--jobs 4`). CAD-1073 retired the shard-suite benchmark, and the old
-`workflow_dispatch` input `test_shards` (4 or 8) did not change that
-matrix, so it is gone. A manual `ci.yml` dispatch runs the same suite as
+The suite runs once, on one `instabox-large`, at `--jobs $(nproc)` (capped
+at 16). CAD-1970 replaced the six `test-shards` partitions with this single
+job after measuring both shapes on the same content, both cold: one large
+runner spent 568 runner-seconds and reached the required `test` check at
+568 s; the six shards spent 2696 runner-seconds, reached it at about 735 s,
+and waited 843 s in the queue while the large box was never queued. The
+partition, the shard artifacts, the report selector and the separate
+aggregate went with the matrix; the required check name `test` did not
+change, and `scripts/run-result-tests` still carries the whole guard. The
+partitioned runner remains available to `scripts/run-result-tests
+--partition` for local and pressure work. CAD-1073 retired the shard-suite
+benchmark, and the old `workflow_dispatch` input `test_shards` (4 or 8) did
+not change that matrix, so it is gone. A manual `ci.yml` dispatch runs the same suite as
 a pull request. It does not publish a release or reuse a main push's
 queue evidence. Cross-build runs only on pull_request and merge_group,
 and the secrets scan only on pull_request, so a dispatch skips both.
