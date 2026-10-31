@@ -41,7 +41,7 @@ function mountRefusalCode(body: unknown): string | null {
  *  its host-private action token to that child's mount request. Role is
  *  host-derived: `surfaceRole` is set by the host's own mount, never by the
  *  frame. */
-export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, surfaceRole = "primary", drawerTarget, parentActionToken }: {
+export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, surfaceRole = "primary", drawerSurface, drawerTarget, parentActionToken }: {
   projection: ScreenPush; fallback: ReactNode;
   /** Render the specific pane for a mount failure; absent keeps `fallback`. */
   renderFailure?: ScreenFailurePane;
@@ -64,6 +64,8 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   presentation?: ScreenPresentationMode;
   /** CAD-1777 — the host-derived role of THIS outlet. */
   surfaceRole?: ScreenSurfaceRole;
+  /** CAD-1777 — the closed surface idiom this drawer child draws. */
+  drawerSurface?: string;
   /** CAD-1777 — the shell-owned fixed overlay target a primary portals its
    *  child drawer outlet into; null while the overlay is closed. */
   drawerTarget?: HTMLElement | null;
@@ -147,7 +149,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   // CAD-1777 — the host-owned role/modal state. A primary is modal while
   // its own child overlay is open; a drawer hosts no overlay.
   useEffect(() => {
-    channel.current?.surface(surfaceRole, primary && overlay !== null);
+    channel.current?.surface(surfaceRole, primary && overlay !== null, primary ? undefined : drawerSurface);
   }, [surfaceRole, primary, overlay, state]);
   // The shell closed the overlay (scrim, Escape, route loss): drop the
   // child. Only a target that was really attached and then removed counts,
@@ -348,7 +350,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         // state is stored before the handshake, so `send()` can post it
         // before the first projection.
         owned.surfaceRole = surfaceRole;
-        owned.surface(surfaceRole, primary && overlayRef.current !== null);
+        owned.surface(surfaceRole, primary && overlayRef.current !== null, primary ? undefined : drawerSurface);
         channel.current = owned;
         frame.addEventListener("load", () => owned?.load());
         timer = setTimeout(() => {
@@ -450,6 +452,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         actions={actions}
         onToolInvoked={onToolInvoked}
         surfaceRole="drawer"
+        drawerSurface={overlay ?? undefined}
         parentActionToken={drawerToken}
         onRoute={navigationCallbacks.current.onRoute}
         onCommand={navigationCallbacks.current.onCommand}
