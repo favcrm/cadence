@@ -151,9 +151,22 @@ pub(crate) enum PlatformAction {
     Call {
         /// The tool name as `platform tools` prints it.
         tool: String,
-        /// Inline JSON, `@file`, a file path, or `-` for stdin.
+        /// The tool's input as one JSON object: inline, `@file`, a file path,
+        /// or `-` for stdin. A hosted org forwards this as the call's request
+        /// body; a local adapter takes it as its own input.
+        #[arg(long, required_unless_present = "query")]
+        input: Option<String>,
+        /// Hosted orgs only: the tool's query fields as one JSON object, for a
+        /// catalog tool the platform reads with GET. A local adapter has no
+        /// query half, so this refuses there.
+        #[arg(long, conflicts_with = "input")]
+        query: Option<String>,
+        /// Stable handle for this call. A hosted org replays the recorded
+        /// outcome of the same handle instead of charging twice, so an
+        /// identical resubmission is safe; pass a fresh handle to run the
+        /// same call again. Omitted: derived from the tool and its input.
         #[arg(long)]
-        input: String,
+        request: Option<String>,
         /// Disambiguate when several adapters declare the same tool.
         #[arg(long)]
         platform: Option<String>,
@@ -341,10 +354,22 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
         PlatformAction::Call {
             tool,
             input,
+            query,
+            request,
             platform,
             account,
             project,
         } => {
+            if query.is_some() {
+                return Err(Error::rejected(
+                    "local `platform call` takes one --input object: --query is a \
+                     hosted-org flag, where the platform splits query fields from \
+                     the request body",
+                ));
+            }
+            let input = input.as_deref().ok_or_else(|| {
+                Error::usage("platform call needs --input or, on a hosted org, --query")
+            })?;
             let mut listing = json!({});
             if let Some(project) = project {
                 listing["project"] = json!(project);
@@ -367,6 +392,9 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
             }
             if let Some(project) = project {
                 params["project"] = json!(project);
+            }
+            if let Some(request) = request {
+                params["request"] = json!(request);
             }
             print_json(&rpc("platform_call", params)?);
         }
@@ -468,7 +496,7 @@ fn resolve_platform_tool(
 
 /// Bounded JSON object for one platform call: inline, `@file`, a path, or
 /// `-` for stdin. The daemon enforces its own bound as well.
-fn parse_platform_input(raw: &str) -> Result<Value> {
+pub(super) fn parse_platform_input(raw: &str) -> Result<Value> {
     use std::io::Read;
     const MAX_INPUT_BYTES: usize = 64 * 1024;
     let bytes = if raw == "-" {

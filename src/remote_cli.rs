@@ -135,6 +135,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
     "master_status",
+    // CAD-1678 / AOS-328: the hosted workspace's own tool catalog. `tools`
+    // needs `cli.read`, `call` needs `cli.write`; the Worker decides per
+    // operation, so this client asks for the historical pair.
+    "platform_call",
     // CAD-1946: the merge gate. Reads (cli.read) and the operator's merge
     // approval (`audit.approve`, which only `cadence login --audit-approve`
     // requests; the hosted org admits it for the human owner only).
@@ -187,7 +191,10 @@ fn team_mutation_verb(verb: &str) -> bool {
 /// `message_send` is the historical member of this set; the team mutations
 /// join it for the reason above.
 fn mutating_cli_verb(verb: &str) -> bool {
-    matches!(verb, "message_send" | "issue_attach" | "issue_review") || team_mutation_verb(verb)
+    matches!(
+        verb,
+        "message_send" | "issue_attach" | "issue_review" | "platform_call"
+    ) || team_mutation_verb(verb)
 }
 
 /// The read a caller must run before repeating a mutating verb whose answer
@@ -200,6 +207,10 @@ fn lost_mutation_note(verb: &str) -> &'static str {
         "the send may or may not have been recorded"
     } else if verb == "issue_attach" {
         "the attachment may or may not have been recorded — inspect the same issue and artifact before repeating it"
+    } else if verb == "platform_call" {
+        "the tool call may or may not have run and been charged — replay the same \
+         command; the relayed key returns the door's recorded outcome instead of \
+         running it a second time"
     } else if verb == "issue_review" {
         "the verdict may or may not have been recorded — read the same issue before repeating it; a reviewer holds one verdict per revision"
     } else {
@@ -1431,7 +1442,12 @@ fn call_once(
     // have landed, so the caller must reconcile by idempotency key, never
     // assume nothing landed. `message_send` reconciles on `arguments.message`;
     // the team mutations reconcile with a read (`team list` / `team invites`).
-    let mutating = matches!(surface, Surface::Cli) && mutating_cli_verb(verb);
+    // A platform call is mutating only when it runs a tool: listing the
+    // catalog changes nothing, so a lost answer there is not a possible charge.
+    let mutating = matches!(surface, Surface::Cli)
+        && mutating_cli_verb(verb)
+        && (verb != "platform_call"
+            || arguments.get("operation").and_then(Value::as_str) == Some("call"));
     post(
         &target.endpoint,
         &format!("{relay}/call"),
