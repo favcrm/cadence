@@ -30,10 +30,12 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: RemoteAction,
     },
-    /// Start a GitHub App connection for the saved hosted org (CAD-1946).
+    /// Start a GitHub App connection for the hosted org (CAD-1946).
     /// The CLI asks the issuer for a device code, shows the URL, and polls
     /// until the owner finishes in a browser. It never receives a GitHub
     /// token and cannot authorize on the owner's behalf.
+    /// Hosted only: a local org has no GitHub connection, and this verb never
+    /// falls back to one. `--issuer` names a self-hosted AgenticOS instead.
     Connect {
         #[command(subcommand)]
         action: ConnectAction,

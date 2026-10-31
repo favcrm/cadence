@@ -130,8 +130,9 @@ pub fn poll_once(issuer: &str, device_code: &str) -> Result<Poll> {
     }
 }
 
-/// Start, show the URL, then poll until the grant settles or the code expires.
-/// `on_code` is called once with the URL and the user code.
+/// Start, show the URL, then poll until the grant settles or `wait` runs out.
+/// Running out is `Pending`, never `Expired`: only the issuer knows whether a
+/// code expired. `on_code` is called once with the URL and the user code.
 pub fn connect(issuer: &str, wait: Duration, mut on_code: impl FnMut(&str, &str)) -> Result<Poll> {
     let issued = start(issuer)?;
     on_code(&issued.verification_uri, &issued.user_code);
@@ -143,7 +144,9 @@ pub fn connect(issuer: &str, wait: Duration, mut on_code: impl FnMut(&str, &str)
             settled => return Ok(settled),
         }
         if Instant::now() + step > deadline {
-            return Ok(Poll::Expired);
+            // The wait ended, not the code. Reporting `Expired` here told the
+            // owner their still-valid code had expired.
+            return Ok(Poll::Pending);
         }
         std::thread::sleep(step);
     }
