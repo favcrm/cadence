@@ -1777,6 +1777,50 @@ fn profile_session_can_report_its_own_claim_without_a_kickoff() {
     assert_eq!(again["claim_id"], reported["claim_id"]);
 }
 
+#[test]
+fn a_retired_session_claim_cannot_report_the_next_holders_claim() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let mine = board.seed("start", "waiting", None, ME);
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+    coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect("session start");
+
+    // The board moves the assignment to a different holder.
+    {
+        let mut board = script.0.lock().expect("board");
+        let row = board
+            .rows
+            .iter_mut()
+            .find(|row| row.assignment_id == mine)
+            .expect("row");
+        row.generation += 1;
+        row.claim_id = Some("hlc_00000000000000000000000000000042".to_string());
+        row.client_agent_id = Some("another-worker".to_string());
+        row.state = "running".to_string();
+    }
+    // Observing that row retires the session marker, and the start itself
+    // refuses the claim it no longer holds.
+    let foreign = coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect_err("a foreign claim is not adopted");
+    assert_eq!(foreign.code(), Some("fenced"));
+
+    let refused = coord
+        .report(&mine, "failed", Some("not mine to report"), None)
+        .expect_err("a retired session claim reports nothing");
+
+    assert!(refused.to_string().contains("kickoff"), "{refused}");
+    assert!(
+        script.calls().iter().all(|call| !call.is_suffix("/report")),
+        "no report was sent for a claim this session no longer holds"
+    );
+}
+
 fn bind_file(dir: &Path, message: &str) -> Value {
     let bytes = fs::read(
         dir.join("hosted-assignments")

@@ -233,19 +233,25 @@ unrestricted remote operator verb or a job launcher. Existing kickoff/member,
 claim and generation fences remain. A claim/queued receipt is not proof that
 execution or a result happened; inspect assignment/report state.
 
-An existing terminal or coding session that has no local-agent alias starts the
-named issue itself instead:
+An existing terminal or coding session starts the named issue itself instead:
 
 ```sh
 cadence --org acme issue start <issue-id> --repo /absolute/path/to/checkout --profile ap_<profile-id>
+cadence --org acme local-agent context ap_<profile-id>
 cadence --org acme local-agent report <assignment-id> --state blocked --text "waiting for the owner"
 ```
 
-`--profile` claims under an id derived from that profile, so the board re-checks
-the holder on every report. It needs no daemon, opens the same lane worktree, and
-touches only the named issue: other waiting assignments stay where they are. The
-profile supplies context, never identity or authority — the authenticated login
-still carries both. Without `--profile` the alias path above is unchanged.
+`--profile` claims under `session-<profile-id>`, so the board re-checks the
+holder on every report. It needs no daemon, opens the same lane worktree, and
+touches only the named issue: other waiting assignments stay where they are.
+`--profile` names the profile the session works under; it does not read profile
+content — load that separately with `context`. The profile supplies context,
+never identity or authority — the authenticated login still carries both.
+
+This path needs a member with **no local-agent rows** for that org and audience,
+which is the condition the board's claim route applies to a non-agent client id.
+A member who has connected a local agent must use the default alias on the claim
+route; `--profile` fails with the board's refusal instead of borrowing that alias.
 
 To give the other teammate an informational pointer, obtain their exact `lag_`
 ID from `agent directory`, then send an explicit FYI:

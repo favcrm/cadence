@@ -573,6 +573,9 @@ impl Ledger {
 /// Origins, binding files, old checkouts, and pending reassign operations stay.
 fn retire_current_claim(attempt: &mut Attempt) {
     attempt.claim_id = None;
+    // The session that marked this record no longer holds a claim here, so
+    // its report authority retires with the claim it was given.
+    attempt.session_profile = None;
     attempt.target = None;
     attempt.state = "discovered".to_string();
     attempt.kickoff_message = None;
@@ -619,6 +622,12 @@ fn stamp(attempt: &mut Attempt, assignment: &Assignment) {
         if assignment.generation > generation {
             retire_current_claim(attempt);
         }
+    }
+    if attempt.claim_id != assignment.claim_id {
+        // A record may only be reported through the claim this session took.
+        // Once the observed claim moves, a later holder must never become
+        // reportable through the retired marker.
+        attempt.session_profile = None;
     }
     attempt.assignment_id = Some(assignment.assignment_id.clone());
     attempt.generation = Some(assignment.generation);
