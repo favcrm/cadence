@@ -443,9 +443,6 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         &cli.command,
         Commands::Agent {
             action: AgentAction::Directory { .. } | AgentAction::Notify { .. },
-        } | Commands::LocalAgent {
-            action: local_agent::LocalAgentAction::Directory { .. }
-                | local_agent::LocalAgentAction::Notify { .. },
         }
     ) {
         let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), None)? {
@@ -704,7 +701,6 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         | Commands::Topic { .. }
         | Commands::Monitor { .. }
         | Commands::Status { .. }
-        | Commands::LocalAgent { .. }
         | Commands::Team { .. }
         | Commands::McpPermission { .. }
         | Commands::McpAgent

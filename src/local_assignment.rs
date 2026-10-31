@@ -1740,7 +1740,7 @@ impl<H: CoordHttp> Coordinator<H> {
             value["actor"] = Value::Null;
             value["guidance"] = json!({
                 "code": "connect_local_agent",
-                "text": "This assignment is waiting for your local agent. Run `cadence local-agent connect --alias <alias> --repo <checkout>`. It was not sent to a hosted runner.",
+                "text": "This assignment is waiting for your local agent. Run `cadence agent connect --alias <alias> --repo <checkout>`. It was not sent to a hosted runner.",
             });
             return Ok(value);
         };
