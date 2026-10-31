@@ -152,7 +152,7 @@ class CleanupTests(unittest.TestCase):
     def test_required_gates_still_have_real_checks_and_scope_wiring(self):
         ci = workflow("ci.yml")
         self.assertIn("  merge_group:", ci)
-        for name in ("fmt", "clippy", "test", "build", "ui"):
+        for name in ("fmt", "clippy", "test-shards", "build", "ui"):
             body = job(ci, name)
             self.assertIn("change-scope", body)
             self.assertIn("needs.queue-evidence.outputs.tested", body)
@@ -162,23 +162,22 @@ class CleanupTests(unittest.TestCase):
             for step in commands:
                 category = "ui" if name == "ui" else "rust"
                 self.assertIn(f"needs.change-scope.outputs.{category} != 'false'", step)
-        # CAD-1970: the required `test` check runs the whole suite once on
-        # one runner. It must stay a real execution — not an aggregate of
-        # artifacts — because that is what makes the coverage guard
-        # meaningful: the inventory comes from the binaries this job built.
+        # CAD-1480: the required `test` check is the shard aggregate — it
+        # runs on every shard outcome (never silently skipped), requires
+        # green shards, then re-runs the full zero-target coverage guard
+        # over the merged junit reports.
         agg = job(ci, "test")
-        self.assertIn("needs: [queue-evidence, change-scope]", agg)
-        self.assertIn("runs-on: instabox-large", agg)
-        self.assertIn("scripts/run-result-tests", agg)
-        self.assertIn('--jobs "$jobs"', agg)
-        self.assertIn("--test-selection", agg)
-        # The matrix, its partition and the artifact merge are gone; a
-        # leftover `--partition` would silently run a sixth of the suite.
-        self.assertNotIn("--partition", agg)
-        self.assertNotIn("download-artifact", agg)
-        self.assertNotIn("expected 6 shard", agg)
-        self.assertNotIn("\n  test-shards:\n", ci)
-        shards = agg
+        self.assertIn("needs: [queue-evidence, change-scope, test-shards]", agg)
+        self.assertIn("always()", agg)
+        self.assertIn("needs.test-shards.result", agg)
+        self.assertIn("download-artifact", agg)
+        self.assertIn("check-test-junit.py", agg)
+        self.assertIn("--targets-file", agg)
+        # CAD-1480: a shard that skips its junit OR its inventory fails
+        # here — both artifact counts are pinned to the matrix size.
+        self.assertIn("expected 6 shard junit", agg)
+        self.assertIn("expected 6 shard inventories", agg)
+        shards = job(ci, "test-shards")
         # CAD-1124: retiring the empty doctest invocation must retain BOTH
         # default-feature compilation gates, not just feature-on tests.
         rust_scope = "        if: ${{ needs.change-scope.outputs.rust != 'false' }}"
@@ -212,10 +211,9 @@ class CleanupTests(unittest.TestCase):
                     r"            exit 1\n"
                     r"          fi$")
         # CAD-1090: the shared selection script reports every test target
-        # (CAD-1727: now the one suite binary). CAD-1970: `--partition` stays
-        # available to the local runner and the stress lane, but the gate
-        # itself must never narrow the suite to one shard of it.
+        # (CAD-1727: now the one suite binary).
         self.assertIn("scripts/run-result-tests", shards)
+        self.assertIn("--partition", shards)
         runner = (ROOT / "scripts/run-result-tests").read_text()
         self.assertIn("scripts/result-test-args", runner)
         # CAD-1334: one pinned nextest invocation keeps every selected
@@ -229,8 +227,8 @@ class CleanupTests(unittest.TestCase):
                        'XDG_CONFIG_HOME=', 'CARGO_BUILD_TARGET_DIR',
                        'unset CARGO_TARGET_DIR'):
             self.assertIn(needle, runner)
-        # CAD-1480: the partition argument stays hash-strict — an empty,
-        # repeated or oversized one must refuse before touching nextest.
+        # CAD-1480: shard partitions are hash-strict — an empty, repeated
+        # or oversized argument must refuse before touching nextest.
         for needle in ('partition_seen', 'jobs_seen',
                        '--partition given twice', '--jobs given twice',
                        '[0-9]{1,3})/([0-9]{1,3}', '10#${BASH_REMATCH[1]}',
