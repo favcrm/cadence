@@ -383,17 +383,25 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
       // overlay closes so no blank blocking panel can remain.
       if (primary && overlayRef.current !== null) navigationCallbacks.current.onScreenDrawer?.("outlet", undefined, true);
       setOverlay(null);
-      actionTokenRef.current = null;
-      // Retire the mount's action handle server-side so a torn-down or
-      // remounted screen's token cannot be replayed. Best-effort — the
-      // daemon's own consume/supersede already refuses a stale mount.
-      if (actionToken) {
-        const token = actionToken;
-        actionToken = null;
-        void revokeTool(token);
-      }
+      // The handle is NOT revoked here: this cleanup also runs when the
+      // projection's scope changes (a push while the drawer is open), and the
+      // drawer child was mounted with the token captured before that re-run.
+      // Revoking it turned every second open into "This screen could not be
+      // opened." (SOC-52). The unmount effect below retires it once.
+      actionToken = null;
     };
   }, [scope, attempt]);
+  // Retire this frame's action handle when the outlet really goes away, so a
+  // torn-down screen's token cannot be replayed. Best-effort — the daemon's own
+  // consume/supersede rules already refuse a stale mount.
+  useEffect(
+    () => () => {
+      const token = actionTokenRef.current;
+      actionTokenRef.current = null;
+      if (token) void revokeTool(token);
+    },
+    [],
+  );
   // A pick change while the screen is open: post it to the frame, which
   // applies it without a reload. Re-mounting here would throw away unsaved
   // edits; a host that has no listener simply ignores the message.
