@@ -3,7 +3,17 @@ name: ci
 on:
   # Manual dispatch runs the same six-shard suite as a pull request.
   # CAD-1073 retired the 4/8 width switch; it did not change the matrix.
+  # CAD-1970: the isolated C1 native-fixture proof is a deliberately separate
+  # dispatch input rather than an unconditional manual-dispatch job. Its
+  # constructor source lives in another lane, so a plain dispatch on main used
+  # to report a failure for an artifact main never had. The proof itself is
+  # unchanged and still runs whenever it is asked for.
   workflow_dispatch:
+    inputs:
+      native_fixture:
+        description: Run the isolated C1 native-fixture release-exclusion proof
+        type: boolean
+        default: false
   pull_request:
   # GitHub merge queue (CAD-290): each queued PR is tested on top of main
   # (and of the PRs ahead of it) on a gh-readonly-queue/* ref, so a PR
@@ -56,7 +66,7 @@ env:
 jobs:
   native-fixture-release-exclusion:
     # C1 is an explicitly dispatched, isolated artifact check, not a fixture run.
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.native_fixture
     runs-on: instabox-medium
     timeout-minutes: 25
     steps:
@@ -261,6 +271,10 @@ jobs:
       # real CLI over a raw REST transport substitute (carried aliases
       # included) and feeds the selected reports through check-test-junit.py.
       - run: python3 scripts/test_select_shard_artifacts.py
+      # CAD-1970: the coverage guard must refuse a hole the target-level
+      # guard cannot see — a case dropped from every report, executed
+      # twice, skipped although selected, or ignored without a declaration.
+      - run: python3 scripts/test_check_test_junit.py
       - run: python3 -m unittest scripts/test_enqueue_human_paths.py
       - run: python3 scripts/test_cad1743_bun_guards.py
       - run: python3 -m unittest scripts/test_enqueue_scope_approval.py
@@ -436,13 +450,14 @@ jobs:
       # step already failed when it is missing. CAD-1745: the name carries
       # the producing attempt, so a rerun's report can never be confused
       # with — or overwrite — the immutable report of an earlier attempt.
-      - name: Upload shard junit and expected inventory
+      - name: Upload shard junit, inventory and expected targets
         if: always() && needs.change-scope.outputs.rust != 'false'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: |
             target/nextest/cadence/junit.xml
+            target/nextest/cadence/inventory.json
             target/nextest/cadence/expected-targets.txt
           if-no-files-found: warn
           retention-days: 1
@@ -527,8 +542,25 @@ jobs:
             fi
           done
           package=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["name"])')
+          # CAD-1970: each shard's junit is checked against the inventory its
+          # own binaries reported, and the six inventories must together own
+          # every discovered test exactly once. Agreement among the reports
+          # is not coverage, so a test missing from all six still fails.
+          lists=(junits/*/inventory.json)
+          if [ "${#lists[@]}" -ne 6 ]; then
+            echo "::error::expected 6 shard test inventories, found ${#lists[@]}: ${lists[*]:-none}" >&2
+            exit 1
+          fi
+          inventory_args=()
+          for f in "${lists[@]}"; do
+            inventory_args+=(--inventory "$f")
+          done
           python3 scripts/check-test-junit.py --package "$package" \
-            --targets-file "$first" "${files[@]}"
+            --targets-file "$first" \
+            --complete-partition \
+            "${inventory_args[@]}" \
+            --ignored-manifest .config/nextest-ignored.txt \
+            "${files[@]}"
 
   build:
     needs: [queue-evidence, change-scope]

@@ -84,8 +84,12 @@ jobs:
       - name: Verify inventory parity
         if: steps.scope.outputs.mode != 'docs'
         run: python3 scripts/ci-rust-tests.py --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/plan.json" --phase inventory
-      - run: scripts/cadence-nextest --test test_seam --locked
-        if: steps.scope.outputs.mode != 'docs'
+      # CAD-1970: this step ran `--test test_seam`, a target that no longer
+      # exists — CAD-1727 set `autotests = false` and collapsed tests/*.rs
+      # into the `suite` target, so the step could only fail with "no tests to
+      # run". The seam proof did not disappear with it: `--phase tests` runs
+      # the recorded scope including the suite target, and the authoritative
+      # guard is `scripts/check-release-test-seam` in ci.yml's build job.
       - name: Run recorded scope
         run: python3 scripts/ci-rust-tests.py --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/plan.json" --phase tests
       - run: cargo test --doc --locked

@@ -4,8 +4,14 @@
 # the exact target scope from CI and `scripts/pre-push --tests`.
 #  - --features test-seam: some targets are cfg(feature = "test-seam") and
 #    would otherwise run 0 tests and pass.
-#  - the post-run JUnit guard rejects any selected integration target without
-#    a runnable test, an empty lib suite, or a bins selection with no tests.
+#  - the post-run guard compares the junit against the selection read back
+#    from the built binaries (target/nextest/cadence/inventory.json), so a
+#    test missing from the report, executed twice, skipped although selected,
+#    or added to a shard's scope is a failure rather than a smaller green
+#    run. --ignored-manifest pins every deliberate `#[ignore]` to
+#    .config/nextest-ignored.txt. The older target-level guard is kept too:
+#    no selected integration target, the lib suite or the bins selection may
+#    report zero runnable tests.
 #  - the pinned cadence nextest profile disables fail-fast and retries;
 #    -j runs with bounded concurrency — 2 by default, --jobs N for the
 #    dedicated CI shard runners.
@@ -380,8 +386,25 @@ junit_report=$workspace_dir/target/nextest/cadence/junit.xml
 # sharded CI run can hand both to the aggregate coverage check — the
 # aggregate never re-derives it.
 targets_report=$workspace_dir/target/nextest/cadence/expected-targets.txt
+# CAD-1970: the checker compares this run's junit against what the binaries
+# actually contain, not against the reports themselves. The inventory comes
+# from the same nextest selection the run used, so a case missing from every
+# report is a hole rather than agreement.
+inventory_report=$workspace_dir/target/nextest/cadence/inventory.json
+ignored_manifest=$root/.config/nextest-ignored.txt
+# The declaration file names this repository's own `#[ignore]`d cases by
+# binary id. A foreign workspace — the shim and runner acceptance fixtures
+# pass --manifest-path — can use the same ids for unrelated binaries, so it
+# gets the explicit "no manifest here" form instead of ours. Strict coverage
+# still applies to it; only the declaration check is scoped to its owner.
+guard_args=(--inventory "$inventory_report")
+if [ "$(realpath -m -- "$manifest_for_coverage")" = "$(realpath -m -- "$root/Cargo.toml")" ]; then
+  guard_args+=(--ignored-manifest "$ignored_manifest")
+else
+  guard_args+=(--no-ignored-manifest)
+fi
 mkdir -p "$(dirname "$junit_report")"
-rm -f "$junit_report"
+rm -f "$junit_report" "$inventory_report"
 printf '%s\n' "${integration_targets[@]}" > "$targets_report"
 
 # One pinned nextest invocation replaces 56 serial cargo test invocations.
@@ -413,14 +436,31 @@ fi
 if [ ! -f "$junit_report" ]; then
   echo "::error::nextest did not produce its required JUnit report: $junit_report" >&2
   status=1
-elif [ -n "$partition" ]; then
+fi
+# Read the same selection back out of the built binaries. A failure here is
+# fatal: without an inventory the junit cannot be checked, and an unchecked
+# junit is what let a case disappear unnoticed.
+if [ -f "$junit_report" ] && ! env "${cargo_env[@]}" "$root/scripts/cadence-nextest" list \
+    --locked --features test-seam \
+    "${target_args[@]}" --lib --bins "${manifest_args[@]}" \
+    "${partition_args[@]}" \
+    --message-format json > "$inventory_report"; then
+  echo "::error::nextest did not produce the inventory its JUnit is checked against" >&2
+  status=1
+fi
+if [ -f "$junit_report" ] && [ -n "$partition" ]; then
+  # A partition checks its own share strictly here; the aggregate re-checks
+  # the union, so a gap or overlap between shards cannot pass either.
   if ! python3 "$root/scripts/check-test-junit.py" --package "$package_name" \
+      "${guard_args[@]}" \
       "$junit_report"; then
     status=1
   fi
-else
+elif [ -f "$junit_report" ]; then
   if ! python3 "$root/scripts/check-test-junit.py" --package "$package_name" \
-      --targets-file "$targets_report" "$junit_report"; then
+      --targets-file "$targets_report" \
+      "${guard_args[@]}" \
+      "$junit_report"; then
     status=1
   fi
 fi
