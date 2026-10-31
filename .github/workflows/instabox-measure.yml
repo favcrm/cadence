@@ -249,3 +249,41 @@ jobs:
             grep -c ' - proc ' /proc/self/mountinfo 2>/dev/null || echo 0
             grep ' /proc' /proc/self/mountinfo 2>/dev/null | head -8 || true
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # CAD-1967: the end-to-end proof that the deletion/reconcile enumeration
+  # works on the InstaBox kernel once 6.18 is listed. These two acceptance
+  # tests are the ones that refused 6.18.54-instabox; here they run for
+  # real rather than against a version string.
+  host-proof:
+    runs-on: instabox-medium
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - run: scripts/ci-rust-toolchain --profile minimal
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gate-test-ld2
+          save-if: false
+
+      - name: Run the host enumeration acceptances
+        run: |
+          set -u
+          sudo prlimit --pid $$ --nofile=1048576:1048576 || true
+          ulimit -n 1048576 || true
+          rc=0
+          for target in cad1196_finish_host_acceptance cad1377_reconcile_acceptance; do
+            echo "### $target" | tee -a "$GITHUB_STEP_SUMMARY"
+            if cargo test --locked --features test-seam --test "$target" -- --test-threads 1 \
+                > "$RUNNER_TEMP/$target.log" 2>&1; then
+              echo "PASS $target" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "FAIL $target" | tee -a "$GITHUB_STEP_SUMMARY"
+              tail -40 "$RUNNER_TEMP/$target.log" | tee -a "$GITHUB_STEP_SUMMARY"
+              rc=1
+            fi
+          done
+          exit "$rc"

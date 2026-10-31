@@ -825,3 +825,34 @@ mod cad1845_acceptance {
         refused(&me, "EACCES on a foreign self/ns/pid", &[expect]);
     }
 }
+
+/// CAD-1967: the frozen-ABI list is an allowlist, so an unlisted kernel
+/// must keep failing closed. `6.18` is listed because the InstaBox CI
+/// kernel presents the same proof inputs as the supported `7.0` runner
+/// (kthreadd PID 2 with PF_KTHREAD and PPid 0, one full procfs root, the
+/// same ns links), and its only extra submount is under `/proc/sys`,
+/// which `sensitive_proc_submount` deliberately does not treat as
+/// sensitive. The neighbouring versions stay refused.
+#[cfg(target_os = "linux")]
+#[test]
+fn frozen_kernel_abi_accepts_the_listed_kernels_and_refuses_the_rest() {
+    for release in [
+        "5.15.0-91-generic",
+        "6.17.0-1008-azure",
+        "6.18.54-instabox",
+        "7.0.0-1017-azure",
+    ] {
+        assert!(supported_kernel_abi(release), "{release}");
+    }
+    for release in [
+        "5.4.0-150-generic",
+        "6.16.0-1008-azure",
+        "6.19.0-1008-azure",
+        "garbage",
+        "",
+        "6",
+        "6.x.1",
+    ] {
+        assert!(!supported_kernel_abi(release), "{release}");
+    }
+}
