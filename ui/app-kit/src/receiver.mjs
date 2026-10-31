@@ -168,6 +168,7 @@ export function createScreenReceiver(options = {}) {
     onPush,
     onError,
     onPresentation,
+    onSurface,
     accepts = ["screen.v2"],
     timeoutMs = DEFAULT_TIMEOUT_MS,
     onSlotState,
@@ -177,14 +178,14 @@ export function createScreenReceiver(options = {}) {
     MessageChannel: Channel = globalThis.MessageChannel,
   } = options;
   if (typeof onPush !== "function") throw new TypeError("onPush is required");
-  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1", "screen-presentation.v1"]);
+  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1", "screen-presentation.v1", "screen-surfaces.v1"]);
   if (
     !Array.isArray(accepts) ||
     accepts.length === 0 ||
     accepts.some((value) => !ACCEPTED.has(value)) ||
     !accepts.some((value) => value === "screen.v1" || value === "screen.v2")
   ) {
-    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1 or screen-presentation.v1");
+    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1, screen-presentation.v1 or screen-surfaces.v1");
   }
   const actionsAccepted = accepts.includes("screen-actions.v1");
   if (actionsAccepted && !accepts.includes("screen.v2")) {
@@ -194,10 +195,17 @@ export function createScreenReceiver(options = {}) {
   if (presentationAccepted && !accepts.includes("screen.v2")) {
     throw new TypeError("screen-presentation.v1 needs screen.v2");
   }
+  // CAD-1777 — the host mounts this frame as its own overlay surface: a
+  // `primary` stays in its layout box, a `drawer` lives in the shell's fixed
+  // panel. The role is host-derived; a frame never claims one.
+  const surfacesAccepted = accepts.includes("screen-surfaces.v1");
+  if (surfacesAccepted && !accepts.includes("screen.v2")) {
+    throw new TypeError("screen-surfaces.v1 needs screen.v2");
+  }
   // `screen.v1` is a local PUSH filter. The host's ready envelope admits only
   // v2 contract names, and a v1-only mount sends the bare ready.
   const ready = accepts.includes("screen.v2")
-    ? { v: 1, op: "ready", accepts: ["screen.v2", ...(actionsAccepted ? ["screen-actions.v1"] : []), ...(presentationAccepted ? ["screen-presentation.v1"] : [])] }
+    ? { v: 1, op: "ready", accepts: ["screen.v2", ...(actionsAccepted ? ["screen-actions.v1"] : []), ...(presentationAccepted ? ["screen-presentation.v1"] : []), ...(surfacesAccepted ? ["screen-surfaces.v1"] : [])] }
     : { v: 1, op: "ready" };
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new TypeError("timeoutMs must be positive");
   if (!parent || typeof parent.postMessage !== "function") throw new TypeError("a parent window is required");
@@ -236,6 +244,9 @@ export function createScreenReceiver(options = {}) {
   // actually is. The drawer helpers wait for that proof so an opted-in app on
   // a non-presenting host keeps its own drawer (CAD-1785 fallback).
   let presented = false;
+  /** CAD-1777 — the host-derived role of this mount and the surface it names. */
+  let surfaceRole = "primary";
+  let surfaceName = undefined;
   let seq = 0;
   // The host closes a mount that starts a second tool while one is running.
   // A local timeout does not cancel the host invocation, so busy survives it
@@ -397,6 +408,23 @@ export function createScreenReceiver(options = {}) {
         if (!settle(message)) fail(`reply for an id this mount never sent: ${message.id}`);
         return;
       }
+      if (message.op === "surface") {
+        // CAD-1777 (host): the role this mount plays and, for a drawer, the
+        // closed surface idiom the primary asked for. Closed shape only.
+        if (!surfacesAccepted) fail("surface without the opt-in");
+        const keys = Object.keys(message).sort().join();
+        if (message.v !== 1 || (keys !== "op,role,v" && keys !== "modal,op,role,surface,v") ||
+            (message.role !== "primary" && message.role !== "drawer") ||
+            (keys === "modal,op,role,surface,v" &&
+              (typeof message.modal !== "boolean" || typeof message.surface !== "string" ||
+               !/^[a-z0-9_-]{1,64}$/.test(message.surface)))) {
+          fail("invalid surface message");
+        }
+        surfaceRole = message.role;
+        surfaceName = message.role === "drawer" ? message.surface : undefined;
+        onSurface?.(surfaceRole, surfaceName, message.modal === true);
+        return;
+      }
       if (message.op === "presentation") {
         // CAD-1615 (host): the surface this frame is presented in. Only a host
         // that saw the opt-in may send it; the mode is validated like any
@@ -454,14 +482,21 @@ export function createScreenReceiver(options = {}) {
     },
     /** The surface the host currently presents this frame in. */
     presentation: () => presentation,
+    /** CAD-1777 — the host-derived role of this mount ("primary" | "drawer"). */
+    surfaceRole: () => surfaceRole,
+    /** The closed surface idiom this drawer mounts, when the host named one. */
+    surface: () => surfaceName,
     /** Ask the host to present the app's surface in the board-wide drawer.
      *  `options.size` (CAD-1932) is `"narrow"` (the default) or `"wide"`. */
     openDrawer(surface, options = {}) {
-      if (!presentationAccepted) {
-        return Promise.reject(new ScreenClosedError("the host did not opt into screen-presentation.v1"));
+      if (!presentationAccepted && !surfacesAccepted) {
+        return Promise.reject(new ScreenClosedError("the host did not opt into a drawer"));
       }
-      if (!presented) {
+      if (presentationAccepted && !presented) {
         return Promise.reject(new ScreenClosedError("the host has not presented this screen"));
+      }
+      if (surfaceRole !== "primary") {
+        return Promise.reject(new ScreenClosedError("a drawer surface opens no further drawer"));
       }
       if (typeof surface !== "string" || !/^[a-z0-9_-]{1,64}$/.test(surface)) {
         return Promise.reject(new TypeError("surface must be 1-64 of a-z, 0-9, _ or -"));
@@ -474,10 +509,10 @@ export function createScreenReceiver(options = {}) {
     },
     /** Ask the host to close the board-wide drawer it opened. */
     closeDrawer() {
-      if (!presentationAccepted) {
-        return Promise.reject(new ScreenClosedError("the host did not opt into screen-presentation.v1"));
+      if (!presentationAccepted && !surfacesAccepted) {
+        return Promise.reject(new ScreenClosedError("the host did not opt into a drawer"));
       }
-      if (!presented) {
+      if (presentationAccepted && !presented) {
         return Promise.reject(new ScreenClosedError("the host has not presented this screen"));
       }
       return request("call", { verb: "screen.drawer.close", args: {} });
