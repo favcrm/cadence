@@ -1074,6 +1074,25 @@ pub fn pr_refusal_for_remotes(
     remotes: impl FnOnce() -> Result<Vec<String>>,
 ) -> Result<Option<String>> {
     let Some(key) = pr_ref(pr) else {
+        // A bare PR number is what `cadence delivery requirements --pr`
+        // documents and what `scripts/enqueue-reviewed` passes. It can only be
+        // checked against a project with one remote: with several, the number
+        // does not say which repo the PR belongs to, and guessing is how a gate
+        // ends up checking the wrong repository.
+        let bare = pr.trim().trim_start_matches('#');
+        if !bare.is_empty() && bare.bytes().all(|b| b.is_ascii_digit()) {
+            let remotes: Vec<String> = remotes()?;
+            return Ok(match remotes.len() {
+                1 => None,
+                0 => Some(format!(
+                    "names `pr: {pr}`, and the project lists no repo remote to match it against"
+                )),
+                _ => Some(format!(
+                    "names `pr: {pr}` without a repo, and project {project} has several \
+                     remotes — pass the full pull request URL"
+                )),
+            });
+        }
         return Ok(Some(format!(
             "names `pr: {pr}`, which is not a pull request URL"
         )));
@@ -1243,6 +1262,54 @@ mod cad1751_pause_refusal_acceptance;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--pr` accepts a number, but only where the project has one remote: the
+    /// number alone cannot name a repository.
+    #[test]
+    fn a_bare_pr_number_is_checked_against_the_project_remote() {
+        let one = || Ok(vec!["github.com/favcrm/cadence".to_string()]);
+        assert_eq!(
+            pr_refusal_for_remotes("cadence", "1462", one).unwrap(),
+            None
+        );
+        assert_eq!(
+            pr_refusal_for_remotes("cadence", "#1462", one).unwrap(),
+            None
+        );
+
+        let none = || Ok(Vec::new());
+        let refused = pr_refusal_for_remotes("cadence", "1462", none)
+            .unwrap()
+            .expect("no remote is a refusal");
+        assert!(refused.contains("no repo remote"), "{refused}");
+
+        let several = || {
+            Ok(vec![
+                "github.com/favcrm/cadence".to_string(),
+                "github.com/favcrm/pm".to_string(),
+            ])
+        };
+        let refused = pr_refusal_for_remotes("cadence", "1462", several)
+            .unwrap()
+            .expect("several remotes is a refusal");
+        assert!(refused.contains("several"), "{refused}");
+
+        // A URL keeps its old path: it names its own repo.
+        let url = "https://github.com/favcrm/cadence/pull/1462";
+        assert_eq!(
+            pr_refusal_for_remotes("cadence", url, || Ok(vec![
+                "github.com/favcrm/cadence".to_string()
+            ]))
+            .unwrap(),
+            None
+        );
+        let refused = pr_refusal_for_remotes("cadence", url, || {
+            Ok(vec!["github.com/favcrm/pm".to_string()])
+        })
+        .unwrap()
+        .expect("another repo's PR is a refusal");
+        assert!(refused.contains("not a repo of project"), "{refused}");
+    }
 
     #[test]
     fn resolve_gh_is_absolute_or_fails_closed() {
