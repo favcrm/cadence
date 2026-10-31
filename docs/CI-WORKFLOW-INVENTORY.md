@@ -77,20 +77,19 @@ manifests as retired rather than deleted.
 
 ## CAD-1970: the coverage contract, and what is deliberately not asserted
 
-The matrix is gone and the guard got stricter. Both in one cutover because
-the guard is what makes a smaller shape safe.
+The shard matrix is unchanged. What changed is what a green shard *means*.
 
-- **Coverage is judged against the binaries, not against the reports.** The
-  run writes `target/nextest/cadence/inventory.json` — its own nextest
+- **Coverage is judged against the binaries, not against the reports.** Each
+  shard writes `target/nextest/cadence/inventory.json` — its own nextest
   `list --message-format json` for the same selection and features — and
   `scripts/check-test-junit.py --inventory` requires every selected
-  `(binary id, test name)` to appear exactly once, green and unskipped. That
-  is what let a single job replace six: a case dropped from the report fails,
-  where the old target-level guard passed as long as each target still had
-  one runnable case. The guard can still judge a full partition set
-  (`--complete-partition`, gap and overlap included) because
-  `run-result-tests --partition` remains available outside the gate; the gate
-  simply no longer partitions.
+  `(binary id, test name)` to appear exactly once, green and unskipped. The
+  required `test` aggregate passes `--complete-partition` over all six
+  inventories and refuses a test no shard owns (a partition gap) or one two
+  shards own (an overlap). A case dropped from all six reports therefore
+  fails; before CAD-1970 it passed, because the guard only asked whether each
+  target still had one runnable case. Agreement among shards was never
+  coverage.
 - **An `#[ignore]` is a reviewed line, not a silent exclusion.**
   `.config/nextest-ignored.txt` declares the fourteen ignored cases. The guard
   refuses an ignored case that is not declared, and a declaration whose case
@@ -114,35 +113,31 @@ the guard is what makes a smaller shape safe.
   unpartitioned `scripts/run-result-tests` on `instabox-large`. It is
   measurement, not policy: it changes no required check and no runner label.
 
-## One `test` job, and the measurement behind it
+Deliberately not asserted: that one runner is faster. The six shards exist
+because CAD-1480 measured the suite past a single runner's wall-time budget on
+the runner available then. The first same-content comparison is now in:
 
-Six `test-shards` at `hash:k/6` and `--jobs 4` became one `test` job on
-`instabox-large` at `--jobs $(nproc)` (capped at 16). Same content, both cold,
-measured 2026-10-31:
-
-| `f7915b475` (PR #1469) | six shards | one `instabox-large` |
+| `f7915b475` (PR #1469), both cold | six shards | one `instabox-large` |
 | --- | --- | --- |
 | workers | 6 × `--jobs 4` | 1 × `--jobs 8` (8 vCPU, 16 GB) |
 | summed runner-seconds | 2696 | 568 |
 | created → last shard | 717 s | — |
 | created → required `test` green | ≈735 s | 568 s |
-| summed queue delay | 843 s (shard 4: 288 s, shard 5: 258 s) | ≈7 s |
-| compile | once per shard (6×) | once |
+| summed queue delay | 843 s | ≈7 s |
 
-One run each, so no distribution, and both legs were cold. The queue column is
-the part that settles the throughput objection the earlier note raised: the
-medium pool never had six slots free — the shards waited 843 s between them —
-while the large box was never queued, and two `instabox-large` jobs ran
-concurrently in that same run, so its capacity is not 1. The gate therefore
-gained concurrency headroom rather than losing it.
+One run each, so no distribution. The single runner was 149 s faster on the
+critical path and 4.75× cheaper in runner-seconds, and the shards spent 843 s
+queued. That is still not the whole decision: both legs were cold, and the
+unmeasured dimension is **throughput**, not latency — six shard jobs let six
+runs share a pool, one large job per run shares a pool observed at ≥2
+concurrent slots. Changing the matrix is its own PR with a warm-cache run and
+a two-PR overlap measurement. Until then the matrix stays as it is.
 
-Rollback is one job restored from git history: the required check name `test`
-never changed, so branch protection, the merge queue and every consumer are
-unaffected by either direction.
-
-Still not measured, and not claimed: the warm-cache path. Both legs were cold,
-and `cache-warm` only writes on main. A warm comparison needs a main run
-followed by a PR run on the same tree.
+Also deliberately unchanged: `test-shards` still compiles the workspace once
+per shard. Reusing one archive across shards was measured only as cold
+compilation (`instabox-measure` on `a9951a20`), which is not the end-to-end
+question, and a `--archive-file` consumer needs the same absolute
+workspace/target layout the producer used. That is a separate measured change.
 
 ## Deliberately not changed
 
