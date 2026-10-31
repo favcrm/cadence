@@ -25,16 +25,23 @@ fn refuse(why: impl std::fmt::Display) -> Error {
 
 /// One JSON POST to the issuer. Status is data here: a refusal body is the
 /// answer we report, not a transport failure.
-fn post(issuer: &str, path: &str, body: &Value) -> Result<(u16, Value)> {
+fn post(issuer: &str, path: &str, body: &Value, token: Option<&str>) -> Result<(u16, Value)> {
     let url = format!("{issuer}{path}");
     let builder = ureq::Agent::config_builder()
         .timeout_global(Some(REQUEST_TIMEOUT))
         .http_status_as_error(false)
         .max_redirects(0)
         .proxy(None);
-    let response = crate::issuer_transport::agent(builder)
+    let mut request = crate::issuer_transport::agent(builder)
         .post(&url)
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+    // The saved login is what lets the issuer bind the code to the workspace
+    // the CLI already belongs to; without it the code stays untargeted and the
+    // owner must choose explicitly.
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let response = request
         .send_json(body)
         .map_err(|_| refuse("the issuer did not answer"))?;
     let status = response.status().as_u16();
@@ -89,8 +96,8 @@ pub struct Issued {
 }
 
 /// Ask the issuer for a code. Nothing is approved by this call.
-pub fn start(issuer: &str) -> Result<Issued> {
-    let (status, body) = post(issuer, CODE_PATH, &json!({}))?;
+pub fn start(issuer: &str, token: Option<&str>) -> Result<Issued> {
+    let (status, body) = post(issuer, CODE_PATH, &json!({}), token)?;
     let data = data_of(status, &body)?;
     let verification_uri = text(&data, "verification_uri")?;
     if !verification_uri.starts_with("https://") {
@@ -116,7 +123,12 @@ pub enum Poll {
 }
 
 pub fn poll_once(issuer: &str, device_code: &str) -> Result<Poll> {
-    let (status, body) = post(issuer, TOKEN_PATH, &json!({ "device_code": device_code }))?;
+    let (status, body) = post(
+        issuer,
+        TOKEN_PATH,
+        &json!({ "device_code": device_code }),
+        None,
+    )?;
     let data = data_of(status, &body)?;
     match text(&data, "status")? {
         "pending" => Ok(Poll::Pending),
@@ -133,8 +145,13 @@ pub fn poll_once(issuer: &str, device_code: &str) -> Result<Poll> {
 /// Start, show the URL, then poll until the grant settles or `wait` runs out.
 /// Running out is `Pending`, never `Expired`: only the issuer knows whether a
 /// code expired. `on_code` is called once with the URL and the user code.
-pub fn connect(issuer: &str, wait: Duration, mut on_code: impl FnMut(&str, &str)) -> Result<Poll> {
-    let issued = start(issuer)?;
+pub fn connect(
+    issuer: &str,
+    token: Option<&str>,
+    wait: Duration,
+    mut on_code: impl FnMut(&str, &str),
+) -> Result<Poll> {
+    let issued = start(issuer, token)?;
     on_code(&issued.verification_uri, &issued.user_code);
     let deadline = Instant::now() + wait;
     let step = Duration::from_secs(issued.interval);
@@ -164,5 +181,65 @@ pub fn outcome_line(poll: &Poll) -> Option<String> {
         }
         Poll::Denied => Some("The owner declined the connection.".into()),
         Poll::Pending | Poll::Approved => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    use super::*;
+
+    const ISSUED: &str = r#"{"ok":true,"data":{"device_code":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","user_code":"ABCD-EFGH","verification_uri":"https://app.example.test/settings/connections?code=ABCD-EFGH","interval":5,"expires_in":600}}"#;
+
+    /// One real request against a local socket: the only way to see the headers
+    /// this module actually sends.
+    fn serve_once() -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut seen = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).expect("read") == 0 || line == "\r\n" {
+                    break;
+                }
+                seen.push_str(&line);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{ISSUED}",
+                ISSUED.len()
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+            stream.flush().expect("flush");
+            seen
+        });
+        (format!("http://127.0.0.1:{port}"), server)
+    }
+
+    #[test]
+    fn a_saved_login_travels_as_the_bearer() {
+        let (issuer, server) = serve_once();
+        let issued = start(&issuer, Some("hct_synthetic")).expect("a code is issued");
+        assert_eq!(issued.user_code, "ABCD-EFGH");
+        let request = server.join().expect("server").to_lowercase();
+        assert!(
+            request.contains("authorization: bearer hct_synthetic"),
+            "the saved login was not sent: {request}"
+        );
+    }
+
+    #[test]
+    fn no_login_sends_no_authorization_header() {
+        let (issuer, server) = serve_once();
+        start(&issuer, None).expect("a code is issued");
+        let request = server.join().expect("server").to_lowercase();
+        assert!(
+            !request.contains("authorization:"),
+            "an anonymous request carried authority: {request}"
+        );
     }
 }

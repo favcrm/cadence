@@ -663,6 +663,42 @@ fn resolve_managed(
 /// Never resolves the tracker for a managed, pinned or ambient caller —
 /// those never needed it (the CAD-313 `ui login` residual runs with no
 /// `HOME`).
+/// The saved login's bearer for the selected remote org, or `None` when this
+/// machine is on a local org or holds no usable credential.
+///
+/// `None` keeps the GitHub device flow anonymous — the owner then chooses the
+/// workspace explicitly — so a missing or unrenewable login never blocks the
+/// flow and never invents a workspace.
+pub(super) fn saved_login_token(auth_dir: Option<&Path>) -> Result<Option<String>> {
+    let Some(org) = selected_org_readonly()? else {
+        return Ok(None);
+    };
+    if org == LOCAL_ORG {
+        return Ok(None);
+    }
+    let file = match RegistryFile::path() {
+        Ok(path) if path.exists() => RegistryFile::open()?,
+        _ => return Ok(None),
+    };
+    let registry = file.read()?;
+    let Some(conn) = select(&registry, Some(org.as_str()))? else {
+        return Ok(None);
+    };
+    let Destination::Remote { endpoint, org_id } = conn.destination else {
+        return Ok(None);
+    };
+    let target = cadence_agent::remote_cli::RemoteTarget {
+        identity: None,
+        org: conn.selection.org,
+        endpoint,
+        org_id,
+    };
+    let dir = cadence_agent::remote_auth::auth_dir(auth_dir)?;
+    Ok(cadence_agent::remote_cli::cli_material(&dir, &target)
+        .ok()
+        .map(|material| material.access_token))
+}
+
 pub(super) fn resolve(
     org: Option<&str>,
     state: Option<PathBuf>,

@@ -292,8 +292,13 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             let issuer = issuer
                 .as_deref()
                 .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
+            // The saved login is what binds the code to the workspace this CLI
+            // already belongs to. Without one the flow stays anonymous and the
+            // owner chooses explicitly in the browser.
+            let token = org::saved_login_token(auth_dir.as_deref())?;
             let poll = cadence_agent::github_connect::connect(
                 issuer,
+                token.as_deref(),
                 std::time::Duration::from_secs(*wait),
                 |url, code| {
                     let _ = show_login_code(url, code, *no_open);
