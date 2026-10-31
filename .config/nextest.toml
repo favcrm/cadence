@@ -58,8 +58,14 @@ threads-required = 'num-test-threads'
 # CAD-347: this HTTP acceptance reuses a probe-then-bind board fixture.
 # Reserve the worker pool like the existing CAD-1489 fixtures so it cannot
 # take the safety floor's port between that test's probe and actual bind.
+# CAD-1970: the whole module reserves, not only cad347. The gate now runs one
+# job at `--jobs $(nproc)` instead of six shards at `--jobs 4`, so every
+# probe-then-bind fixture in this module runs beside more neighbours than it
+# did; `public_workspace_wiki_reads_require_its_real_host_bound_session` hit
+# `AddrInUse` on the first single-runner PR. Reserving the pool costs this
+# module's parallelism, not the suite's.
 [[profile.cadence.overrides]]
-filter = 'test(/^wiki_board_http_guard_acceptance::cad347_/)'
+filter = 'test(/^wiki_board_http_guard_acceptance::/)'
 threads-required = 'num-test-threads'
 
 # CAD-348: the memory-detail acceptance reuses the probe-then-bind board
