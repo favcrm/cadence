@@ -48,13 +48,11 @@ pub(super) fn check_layout(_scan: &Scan) -> Check {
         Ok(d) => format!("{name} {}", d.display()),
         Err(e) => format!("{name} unresolved ({e})"),
     }))
-    .chain(
-        (layout.source == crate::home::Source::Fresh).then(|| {
-            "first run on this account's own home — no existing tracker, state \
+    .chain((layout.source == crate::home::Source::Fresh).then(|| {
+        "first run on this account's own home — no existing tracker, state \
              dir or hosted config was found"
-                .to_string()
-        }),
-    )
+            .to_string()
+    }))
     .chain(
         (layout.marker_present && layout.source == crate::home::Source::Legacy).then(|| {
             format!(

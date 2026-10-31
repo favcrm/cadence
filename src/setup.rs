@@ -1204,7 +1204,11 @@ pub fn cli(
     };
     // The daemon and the board are local services: a run that did not
     // choose this machine reports them without starting either.
-    let detect_only: &[&str] = if start_services { &[] } else { &["daemon", "ui"] };
+    let detect_only: &[&str] = if start_services {
+        &[]
+    } else {
+        &["daemon", "ui"]
+    };
     let outcomes = run_checks_selective(&ctx, &checks(), detect_only, |o| {
         if json {
             println!("{}", serde_json::to_string(o).unwrap_or_default());
@@ -1613,7 +1617,10 @@ pub fn billing_offer(target: &crate::remote_cli::RemoteTarget) -> OfferRead {
         return if body["ok"] == true {
             OfferRead::Offer(body["data"].clone())
         } else {
-            OfferRead::unavailable("invalid", "the billing offer response was not an ok envelope")
+            OfferRead::unavailable(
+                "invalid",
+                "the billing offer response was not an ok envelope",
+            )
         };
     }
     let code = body["code"].as_str().unwrap_or("unknown").to_string();
@@ -1793,7 +1800,11 @@ fn published_plan_line(body: &OfferBody) -> String {
             plan.currency,
             plan.period,
             money(&plan.included_credit),
-            if plan.grants_enabled { "enabled" } else { "disabled" },
+            if plan.grants_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
             body.as_of
         ),
         None => format!(

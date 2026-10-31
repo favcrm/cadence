@@ -173,8 +173,8 @@ fn decide(choice: ScopeChoice, json: bool, state_dir: &Path, sign_in: &SignInFac
                 .ok()
                 .flatten()
                 .is_some_and(|name| !name.is_empty());
-            let tracker_present = cadence_agent::issue::default_dir()
-                .map_or(true, |dir| dir.exists());
+            let tracker_present =
+                cadence_agent::issue::default_dir().map_or(true, |dir| dir.exists());
             let first_run = sign_in.is_signed_out()
                 && !saved_org
                 && !state_dir.exists()

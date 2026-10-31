@@ -187,9 +187,13 @@ fn installation(root: &Path) -> Result<Installation> {
     ]
     .iter()
     .any(|path| legacy_present(path));
-    let consolidated = [root.join("state"), root.join("tracker"), root.join("config")]
-        .iter()
-        .any(|path| legacy_present(path));
+    let consolidated = [
+        root.join("state"),
+        root.join("tracker"),
+        root.join("config"),
+    ]
+    .iter()
+    .any(|path| legacy_present(path));
     Ok(match (legacy, consolidated) {
         (false, false) => Installation::FirstRun,
         (false, true) => Installation::Consolidated,
