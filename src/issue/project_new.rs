@@ -302,10 +302,19 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
         // one verb for that (`issue project policy`) with its own version
         // bump — so it is refused here rather than quietly rewritten.
         let recorded_matches = match &p.policy {
-            Some(recorded) => recorded.visibility == req.visibility && recorded.members == grants,
+            // A grant list the caller did not name is not a request to change
+            // it: `project new` is idempotent, and a project that already
+            // carries grants (stored while visible, or recorded private) must
+            // still be a no-op for a plain re-run. Only a named list is
+            // compared, and naming one is already refused unless the request
+            // is private.
+            Some(recorded) => {
+                recorded.visibility == req.visibility
+                    && (grants.is_empty() || recorded.members == grants)
+            }
             // No recorded policy keeps everyone's access (REQ-007), which is
             // what a workspace-visible request asks for and nothing else is.
-            None => req.visibility == project::Visibility::WorkspaceVisible && grants.is_empty(),
+            None => req.visibility == project::Visibility::WorkspaceVisible,
         };
         if !recorded_matches {
             return Err(Error::rejected(format!(
@@ -815,6 +824,32 @@ mod tests {
         .to_string();
         assert!(err.contains("--grant needs --visibility private"), "{err}");
         assert!(!pm.dir.join("pay").exists());
+    }
+
+    /// A project that already carries grants is still a no-op for a plain
+    /// re-run: an unmentioned grant list is not a request to change it, and
+    /// `project new` is used idempotently by the daemon's own callers.
+    #[test]
+    fn a_rerun_leaves_a_stored_grant_list_alone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm = pm(tmp.path());
+        let a = repo(tmp.path(), "a");
+        run(&pm, &req("legal", &a), "operator", &[]).unwrap();
+
+        // Record a grant list the way `issue project policy` would, then
+        // re-run creation with no grant named.
+        let path = pm.dir.join("legal/project.yaml");
+        let mut project = project::load(&path).unwrap();
+        let mut policy = project.policy.clone().unwrap();
+        policy.members = vec![project::Grant::parse("users/alex").unwrap()];
+        project.policy = Some(policy);
+        std::fs::write(&path, serde_yaml::to_string(&project).unwrap()).unwrap();
+
+        let out = run(&pm, &req("legal", &a), "operator", &[]).unwrap();
+        assert_eq!(out["changed"], false, "{out}");
+        let after = project::load(&path).unwrap().policy.unwrap();
+        assert_eq!(after.members.len(), 1, "a re-run dropped the stored grant");
+        assert_eq!(after.members[0].as_str(), "users/alex");
     }
 
     /// `project new` stays idempotent for the same request. A second run that
