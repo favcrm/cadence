@@ -105,6 +105,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     "my_work",
     "agent_list",
     "agent_show",
+    // CAD-1964: reusable agent profiles. Reads only; the hosted board applies
+    // the caller's own role and wiki access, and returns no agent identity.
+    "agent_profile_list",
+    "agent_profile_context",
     "issue_ls",
     "issue_show",
     "issue_history",
@@ -144,8 +148,15 @@ pub const REMOTE_VERBS: &[&str] = &[
 /// for the scope that verb requires.
 fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
     match verb {
-        "team_list" | "team_invites" | "delivery_policy" | "audit_approval" | "audit_verdicts"
-        | "audit_scope" => &["cli.read"],
+        "team_list"
+        | "team_invites"
+        | "delivery_policy"
+        | "audit_approval"
+        | "audit_verdicts"
+        | "audit_scope"
+        | "agent_profile_list"
+        | "agent_profile_context"
+        | "agent_roles" => &["cli.read"],
         // The owner's merge approval and the delivery inputs it binds both
         // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
         "audit_approve" | "delivery_policy_set" => &["cli.write", "audit.approve"],
