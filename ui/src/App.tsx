@@ -13,7 +13,7 @@ import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell
 import { Loading, Notice } from "./features/app-shell/shared/States";
 import type { Viewer } from "./features/projects/work";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
-import { noteAppScreen, useSidebarPrefs } from "./features/app-shell/sidebarPrefs";
+import { noteAppScreen, updateSidebarPrefs, useSidebarPrefs } from "./features/app-shell/sidebarPrefs";
 import { useInstallations, type InstallationsState } from "./features/workspace-apps/useInstallations";
 import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
 import { appLoadErrorCopy } from "./features/explorer/appErrors";
@@ -81,7 +81,7 @@ import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
 import { runningRelease } from "./lib/fmt";
 import { applyDraft, composerField, sessionStore, stashDraft, takeDraft } from "./lib/draft";
 import Toast, { type ToastMsg } from "./ui/Toast";
-import { IconList } from "./ui/icons";
+import { IconList, IconSidebarCollapse } from "./ui/icons";
 import type { BoardFilters } from "./lib/filters";
 import type { UpdateBanner } from "./lib/types";
 import { RESOURCE_NAMES } from "./lib/cache";
@@ -281,6 +281,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const [menuOpen, setMenuOpen] = useState(false);
   const closeMenu = useCallback(() => setMenuOpen(false), []);
   const { collapsed: sidebarCollapsed } = useSidebarPrefs();
+  const sidebarExpandRef = useRef<HTMLButtonElement>(null);
+  const sidebarCollapseRef = useRef<HTMLButtonElement>(null);
+  const setSidebarCollapsed = (collapsed: boolean) => {
+    updateSidebarPrefs((prefs) => ({ ...prefs, collapsed }));
+    requestAnimationFrame(() => (collapsed ? sidebarExpandRef : sidebarCollapseRef).current?.focus());
+  };
   const [accountOpen, setAccountOpen] = useState(false);
   // The serving build when it differs from this bundle's — drives the
   // reload banner (CAD-573).
@@ -995,6 +1001,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       }`}
     >
       <Sidebar
+        collapsed={sidebarCollapsed}
+        expandRef={sidebarExpandRef}
+        onExpand={() => setSidebarCollapsed(false)}
         noWiki={!wikiAvailable(meta)}
         screen={screen === "workspaceApp" || screen === "workspaceAppKey" ? "apps" : screen}
         navHref={hrefFor}
@@ -1031,6 +1040,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           >
             <IconList size={16} />
           </button>
+          {!sidebarCollapsed && <div className="desktop-collapse-control">
+            <button ref={sidebarCollapseRef} type="button" className="header-icon text-ink-400" aria-label={t("Collapse sidebar")} aria-expanded="true" title={t("Collapse sidebar")} onClick={() => setSidebarCollapsed(true)}>
+              <IconSidebarCollapse size={16} />
+            </button>
+          </div>}
           <nav className="header-breadcrumb min-w-0 flex-1" aria-label={t("Breadcrumb")}>
             {/* The organisation's display name, or the board's neutral
                 label — never a hostname or project mistaken for an org. */}

@@ -206,7 +206,7 @@
   justify-content: space-between;
   margin-bottom: 19px;
 }
-.sidebar-logo-button, .sidebar-collapse, .mobile-navigation-close {
+.sidebar-logo-button, .mobile-navigation-close {
   display: grid;
   place-items: center;
   width: 32px;
@@ -215,12 +215,11 @@
   border-radius: 5px;
   color: var(--color-ink-400);
 }
-.sidebar-collapse:hover, .mobile-navigation-close:hover {
+.mobile-navigation-close:hover {
   background: var(--color-ink-800);
   color: var(--color-ink-100);
 }
-.sidebar-collapse svg { transform: rotate(180deg); }
-.sidebar-logo-button:focus-visible, .sidebar-collapse:focus-visible, .mobile-navigation-close:focus-visible {
+.sidebar-logo-button:focus-visible, .mobile-navigation-close:focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
@@ -2129,6 +2128,8 @@ button.refchip:hover {
 .app-header { height: 2.25rem; flex-shrink: 0; padding-block: 4px; box-sizing: border-box; align-items: center; }
 .header-menu svg { flex-shrink: 0; }
 @media (width >= 1024px) { .app-header .header-menu { display: none; } }
+.desktop-collapse-control { display: none; }
+@media (width >= 1024px) { .desktop-collapse-control { display: inline-flex; flex: none; } }
 .header-breadcrumb { display: flex; align-items: center; gap: .5rem; font-size: var(--text-micro); }
 @media (width < 640px) {
   .app-header { height: auto; min-height: 2.25rem; flex-wrap: wrap; }
