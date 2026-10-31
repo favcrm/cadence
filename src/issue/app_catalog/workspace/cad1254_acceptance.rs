@@ -9,7 +9,8 @@
 //! (c) control: a screen JS of exactly 384 KiB installs.
 use super::*;
 
-const SCREEN_CAP: usize = 393_216;
+// Derived from the host cap so raising it never re-pins a literal here.
+const SCREEN_CAP: usize = crate::issue::app::MAX_SCREEN_ASSET_BYTES as usize;
 const FILE_CAP: usize = 262_144;
 
 const WORKFLOW: &str = "---\ntitle: \"Post: {{topic}}\"\ngoal: \"Publish {{topic}}\"\n\

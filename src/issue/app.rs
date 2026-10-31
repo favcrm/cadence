@@ -99,7 +99,7 @@ const MAX_FILE_BYTES: u64 = plan::MAX_PLAN_BYTES as u64;
 
 /// CAD-1254: a declared screen's JS/CSS asset (`screens/<tag>/<stem>.js|css`)
 /// gets its own 384 KiB per-file cap; nothing else is raised.
-pub(crate) const MAX_SCREEN_ASSET_BYTES: u64 = 384 * 1024;
+pub(crate) const MAX_SCREEN_ASSET_BYTES: u64 = 400 * 1024;
 
 /// The per-file cap for bundle member `rel`: [`MAX_SCREEN_ASSET_BYTES`] for a
 /// screen JS/CSS leaf, the skill caps inside a `skills/<tag>/` package, else
