@@ -10,7 +10,13 @@
 //! the sandbox was started with `CADENCE_SANDBOX_ALLOW_GLOBAL=1`, an
 //! observe-only provider WAL watcher, no Cursor `cli-config.json` merge.
 //! Every verb first refuses a root that overlaps production's state
-//! dir (and so its socket) or tracker.
+//! dir (and so its socket), tracker, home or config dir.
+//!
+//! CAD-1922: the sandbox is its own home. Its children get
+//! `CADENCE_HOME=<root>` and `XDG_CONFIG_HOME=<root>/config` as well as
+//! its state and tracker, so a caller's consolidated home, system
+//! install or hosted credentials cannot leak vault, repos, workspace or
+//! credentials into it.
 //!
 //! CAD-1187: whether a store may change build without the rollout lease
 //! is a property of the STORE, not of the caller's env. `up` writes a
@@ -766,6 +772,11 @@ impl Sandbox {
     fn pm_dir(&self) -> PathBuf {
         self.root.join("pm")
     }
+    /// The sandbox's own `XDG_CONFIG_HOME` — hosted config and
+    /// credentials stay inside the sandbox, never the caller's.
+    fn config_dir(&self) -> PathBuf {
+        self.root.join("config")
+    }
     fn env_file(&self) -> PathBuf {
         self.root.join("sandbox.env")
     }
@@ -862,53 +873,99 @@ pub(crate) fn resolved(path: &Path) -> PathBuf {
     out
 }
 
-/// The live dirs a sandbox must never overlap, labelled for the
-/// refusal: production's defaults (`CADENCE_STATE_DIR` and
-/// `CADENCE_PM_DIR` unset), plus whatever the caller exports now — a
-/// shell pointed at a live cadence — unless that shell is this very
-/// dev instance's (`eval "$(cadence dev env <name>)"`). `exported: false`
-/// keeps the defaults only.
+/// The live dirs a sandbox must never overlap, labelled for the refusal.
+///
+/// The list is evidence about the *host*, not about the candidate: the
+/// marker is a hand-writable file and any caller can export any path, so
+/// neither may exempt a production dir. Production's own roots are
+/// therefore resolved from the host's defaults alone — `$HOME` and
+/// `$XDG_*`, never `$CADENCE_HOME`, which a sandbox pins to itself — and
+/// none is dropped because it happens to sit at or under the candidate
+/// root: a marker planted in the production tracker stays a production
+/// tracker.
+///
+/// Nothing a caller exports is exempt either. `CADENCE_PROFILE`,
+/// `CADENCE_HOME`, `CADENCE_STATE_DIR`, `CADENCE_PM_DIR` and
+/// `XDG_CONFIG_HOME` are same-uid environment, not identity: a genuine
+/// installation may be configured at `<root>/state`, `<root>/pm` or
+/// `<root>/config`, so a forged profile or an export equal to one of
+/// this sandbox's own paths would let a planted marker in `<root>`
+/// authorise deleting that installation. Every export is a production
+/// dir. `exported: false` keeps the defaults only.
 fn production_dirs(sb: &Sandbox, exported: bool) -> Result<Vec<(&'static str, PathBuf)>> {
-    let mut dirs = vec![
-        ("the production state dir", client::default_state_dir()?),
-        ("the production tracker", crate::issue::home_default_dir()?),
-    ];
-    // A daemon started without XDG_STATE_HOME lives here even when this
-    // shell sets it.
-    if std::env::var_os("HOME").is_some_and(|h| !h.is_empty()) {
+    let var = |name: &str| {
+        std::env::var_os(name)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    // CAD-1922: the consolidated home holds `state/`, `tracker/`,
+    // `config/`, `repos/`, `vault/` and `workspace/`, so a sandbox inside
+    // it would share a live install's roots.
+    let mut dirs: Vec<(&'static str, PathBuf)> =
+        vec![("the production home", crate::home::home_default()?)];
+    // The pre-`CADENCE_HOME` roots, from `$HOME`/`$XDG_*` alone: an
+    // existing installation keeps its data here whatever branch the
+    // caller's `$CADENCE_HOME` selects, so an export cannot hide it.
+    // `home.rs` resolves the same spellings, but its public defaults
+    // follow `$CADENCE_HOME`/`$XDG_CONFIG_HOME`; this guard must not.
+    if let Some(home) = var("HOME") {
+        dirs.push(("the production tracker", home.join("pm")));
+        dirs.push(("the production config dir", home.join(".config/cadence")));
+        // A daemon started without XDG_STATE_HOME lives here even when
+        // this shell sets it.
         dirs.push(("the production state dir", crate::home::local_state_dir()?));
     }
-    if exported && profile().as_deref() != Some(sb.name.as_str()) {
-        // CAD-1187: a shell pointed at this very sandbox's own dirs
-        // (`--state-dir <root>/state`, a bare export) is not a live
-        // cadence; the sandbox's dirs are checked against production's
-        // defaults above.
-        let own = |d: &std::ffi::OsString| {
-            let d = resolved(Path::new(d));
-            d == resolved(&sb.state_dir()) || d == resolved(&sb.pm_dir())
-        };
-        if let Some(d) = std::env::var_os("CADENCE_STATE_DIR").filter(|d| !own(d)) {
-            dirs.push(("the exported CADENCE_STATE_DIR", PathBuf::from(d)));
+    if let Some(state_home) = var("XDG_STATE_HOME") {
+        dirs.push(("the production state dir", state_home.join("cadence")));
+    }
+    if let Some(config_home) = var("XDG_CONFIG_HOME") {
+        // The config root's own `cadence/` dir is the config *this
+        // process* would use. A sandbox's children carry
+        // `XDG_CONFIG_HOME=<root>/config`, and `owner_of` (exported:
+        // false) must not read that as production. Nothing is exempted
+        // here: a deleting verb passes exported: true and sees the
+        // export itself, which stays a production dir even at this path.
+        if resolved(&config_home) != resolved(&sb.config_dir()) {
+            dirs.push(("the production config dir", config_home.join("cadence")));
         }
-        if let Some(d) = std::env::var_os("CADENCE_PM_DIR").filter(|d| !own(d)) {
-            dirs.push(("the exported CADENCE_PM_DIR", PathBuf::from(d)));
-        }
-        if let Some(d) = std::env::var_os("CADENCE_HOME") {
-            dirs.push(("the exported CADENCE_HOME", PathBuf::from(d)));
+    }
+    if exported {
+        // CAD-1187: every export is a claim about a live cadence, with
+        // no exemption. `CADENCE_PROFILE` is caller-controlled env, not
+        // identity, so neither it nor a path equal to one of this
+        // sandbox's own dirs may mark a dir disposable — a custom
+        // installation can be configured at `<root>/state` or `<root>/pm`
+        // too, and a planted marker would then delete it.
+        for (name, label) in [
+            ("CADENCE_STATE_DIR", "the exported CADENCE_STATE_DIR"),
+            ("CADENCE_PM_DIR", "the exported CADENCE_PM_DIR"),
+            ("CADENCE_HOME", "the exported CADENCE_HOME"),
+            ("XDG_CONFIG_HOME", "the exported XDG_CONFIG_HOME"),
+        ] {
+            if let Some(dir) = var(name) {
+                dirs.push((label, dir));
+            }
         }
     }
     Ok(dirs)
 }
 
-/// Refuse a sandbox whose root, state dir or tracker overlaps a live
-/// dir in either direction — equal (the socket lives in the state dir),
-/// nested inside it, or containing it (a `reset` would delete it).
+/// Refuse a sandbox whose root, state dir, tracker or config dir
+/// overlaps a live dir in either direction — equal (the socket lives in
+/// the state dir), nested inside it, or containing it (a `reset` would
+/// delete it).
 fn refuse_production(sb: &Sandbox) -> Result<()> {
     refuse_overlap(sb, true)
 }
 
 fn refuse_overlap(sb: &Sandbox, exported: bool) -> Result<()> {
-    let ours = [sb.root.clone(), sb.state_dir(), sb.pm_dir()].map(|p| resolved(&p));
+    let ours = [
+        sb.root.clone(),
+        sb.state_dir(),
+        sb.pm_dir(),
+        sb.config_dir(),
+    ]
+    .map(|p| resolved(&p));
     for (label, dir) in production_dirs(sb, exported)? {
         let live = resolved(&dir);
         if ours
@@ -1141,6 +1198,11 @@ pub fn adopt(state_dir: &Path) -> Result<Option<String>> {
     };
     let root = state_dir.parent().unwrap_or(state_dir);
     std::env::set_var("CADENCE_PROFILE", format!("{PROFILE_PREFIX}{name}"));
+    // CAD-1922: the adopted shell is the sandbox's home too, so a
+    // caller's exported CADENCE_HOME or XDG_CONFIG_HOME cannot point
+    // its vault, repos, workspace or credentials at a live install.
+    std::env::set_var("CADENCE_HOME", root);
+    std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
     std::env::set_var("CADENCE_PM_DIR", root.join("pm"));
     std::env::set_var("CADENCE_STATE_DIR", state_dir);
     Ok(Some(name))
@@ -1392,12 +1454,16 @@ fn env_lines(sb: &Sandbox, port: Option<u16>, allow_global: bool) -> String {
     let mut text = format!(
         "# cadence dev {name} — `eval \"$(cadence dev env {name})\"`\n\
          unset {unset}\n\
+         export CADENCE_HOME={home}\n\
+         export XDG_CONFIG_HOME={config}\n\
          export CADENCE_STATE_DIR={state}\n\
          export CADENCE_PM_DIR={pm}\n\
          export CADENCE_PROFILE={profile}\n\
          export CADENCE_SANDBOX_ROOT={base}\n",
         name = sb.name,
         unset = unset,
+        home = sh_quote(&sb.root.to_string_lossy()),
+        config = sh_quote(&sb.config_dir().to_string_lossy()),
         state = sh_quote(&sb.state_dir().to_string_lossy()),
         pm = sh_quote(&sb.pm_dir().to_string_lossy()),
         profile = sh_quote(&sb.profile()),
@@ -1432,6 +1498,12 @@ fn child(sb: &Sandbox, exe: &Path, args: &[&str], grant: bool) -> Command {
     cmd.arg("--state-dir")
         .arg(sb.state_dir())
         .args(args)
+        // CAD-1922: the sandbox is its own home. An exported
+        // CADENCE_HOME (a consolidated install, a system install) must
+        // not leak its vault, repos or workspace into the sandbox, and
+        // XDG_CONFIG_HOME keeps hosted config and credentials inside it.
+        .env("CADENCE_HOME", &sb.root)
+        .env("XDG_CONFIG_HOME", sb.config_dir())
         .env("CADENCE_STATE_DIR", sb.state_dir())
         .env("CADENCE_PM_DIR", sb.pm_dir())
         .env("CADENCE_PROFILE", sb.profile())
@@ -1624,12 +1696,14 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
     // has bound the board: a cooperating suite can neither take the
     // port we picked nor have its own leased port stolen in the gap.
     let (port, lease) = choose_port(sb, wanted_port, &lock_dir)?;
-    std::fs::create_dir_all(sb.state_dir())?;
+    // CAD-1922: the sandbox root is its own home — create it and the
+    // state/tracker dirs privately (0700) rather than at the umask.
+    crate::home::create_private_tree(&sb.root, &sb.state_dir())?;
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(sb.state_dir(), std::fs::Permissions::from_mode(0o700))?;
     }
-    std::fs::create_dir_all(sb.pm_dir())?;
+    crate::home::create_private_tree(&sb.root, &sb.pm_dir())?;
     let created_at = existing
         .as_ref()
         .and_then(|m| m["created_at"].as_str().map(str::to_string))

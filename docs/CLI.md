@@ -278,6 +278,95 @@ The hosted binding lives under the `agent` noun:
 (the same path as the hidden `message ask`). A remote send is a durable
 enqueue only and refuses `--wait`.
 
+## Cadence home, overrides and isolation (CAD-1922)
+
+One resolver (`src/home.rs`) answers every Cadence path, and `cadence doctor
+host` reports the branch it took under the `layout` check. It only resolves:
+nothing here creates, moves, copies or deletes an installation's data.
+
+**A first run** — no existing tracker, state directory or hosted config is
+present anywhere — uses one consolidated home, `~/.cadence` (or
+`$CADENCE_HOME` when set):
+
+| Path | Contents |
+| --- | --- |
+| `~/.cadence/state/` | runtime state, socket, database (0700) |
+| `~/.cadence/tracker/` | Git tracker |
+| `~/.cadence/vault/` | knowledge vault |
+| `~/.cadence/workspace/` | operational upload workspace |
+| `~/.cadence/repos/` | managed repo checkouts |
+| `~/.cadence/config/` | hosted config and credentials, private (0700; files 0600) |
+
+The executable stays wherever it was installed (`~/.local/bin`). The home root
+itself is created 0700 and kept that way for a first run — whoever creates it
+first — while an existing installation's directories are never re-chmod'ed.
+
+**An existing installation keeps the paths it has**: tracker `~/pm`, runtime
+state `$XDG_STATE_HOME/cadence` or `~/.local/state/cadence`, vault
+`<tracker>/wiki`, hosted config and credentials `$XDG_CONFIG_HOME/cadence`.
+Any one of those present keeps every path on the legacy branch, so resolution
+cannot switch a live install away from its data. The branch is sticky: once
+`~/.cadence` holds `state/`, `tracker/` or `config/`, a legacy path that turns
+up later (a stray `~/pm`, an old saved binding) can neither flip the
+installation nor be preferred silently — **both at once is refused**, naming
+every root, so nothing is guessed. A probe that cannot be answered (a
+permission error, a dangling symlink) counts as present, so an installation the
+resolver could not inspect is never switched. There is **no automatic
+migration, no implicit default switch and no new empty tracker**: moving an
+existing installation is a separate operator-approved, backed-up operation with
+validation and rollback, which this build does not perform. A
+`~/.cadence/LAYOUT` marker, the directory's existence or same-uid ownership are
+reported at most; none of them switches a live install.
+
+The vault follows the tracker it belongs to: a tracker inside the home keeps
+`<home>/vault`, one outside it keeps `<tracker>/wiki`. The tracker's location —
+not the process environment — decides that, so a per-directory override
+(`cadence switch local` exports the pair, a sandbox exports its own) only
+overrides its own directory and never moves the vault or the hosted config.
+
+A CI job, container or test suite with its own `$HOME` is a first run like any
+other and gets `~/.cadence` **inside that isolated home** — never the host's
+installation. Name it explicitly with `CADENCE_HOME` when the environment
+wants a fixed root.
+
+**Documented overrides** (all absolute; a relative value is refused):
+
+- `CADENCE_HOME` — the consolidated home root. Use it for a system install
+  (`CADENCE_HOME=/var/lib/cadence`), for a separate profile, or to return to
+  `~/.cadence` after an installation exists elsewhere. Hosted credentials
+  follow the evidence, not the flag: an existing `$XDG_CONFIG_HOME/cadence`
+  keeps them, and otherwise they live in `<CADENCE_HOME>/config` — including
+  when `CADENCE_PM_DIR`/`CADENCE_STATE_DIR` are also set.
+- `CADENCE_PM_DIR` — tracker, in either layout. Overrides only the tracker.
+- `CADENCE_STATE_DIR` — runtime state, in either layout. Overrides only the
+  state dir.
+- `--state-dir` — the same per command, and what a sandbox passes.
+- `--auth-dir` — hosted credentials, per command.
+
+None of these chooses the layout: a per-directory override (including the pair
+`cadence switch local` exports into its own process) changes its own directory
+and nothing else, so one command cannot flip the vault or the hosted config
+mid-run.
+
+`XDG_CONFIG_HOME` is a config override in its own right: when it is exported,
+hosted config and credentials live in `$XDG_CONFIG_HOME/cadence` whatever the
+layout, which is how a client-only installation keeps the credentials it has.
+Inside a first run's home, a symlinked `~/.cadence` or `~/.cadence/config` is
+refused for credentials rather than followed.
+
+The state directory holds the daemon socket, so `<state>/cadence.sock` must
+fit the 107-byte Unix socket limit; `setup` and `dev up` refuse a longer path
+rather than failing later.
+
+`cadence dev` instances are isolated on every axis: `dev up` exports
+`CADENCE_HOME`, `XDG_CONFIG_HOME`, `CADENCE_STATE_DIR`, `CADENCE_PM_DIR` and
+`CADENCE_PROFILE` for its own root, so a caller's consolidated home, system
+install or hosted credentials never leak in, and every verb refuses a root
+that overlaps production's state dir, tracker, home or config dir. A sandbox
+created before this change keeps its old vault at `<root>/pm/wiki`; its
+vault now resolves to `<root>/vault`, so `cadence dev reset <name>` starts it
+over rather than migrating it.
+
 ## Native cloud-agent connections (CAD-1853)
 
 This unreleased integration connects a **local** Cadence coordinator to the

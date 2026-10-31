@@ -36,6 +36,7 @@ docs/*
 !docs/CLI.md
 !docs/DEV-CYCLE.md
 !docs/EXTERNAL-TEST-RECIPE.md
+!docs/FIRST-RUN.md
 !docs/HOSTED-LEASE.md
 !docs/INSTALL-AGENT.md
 !docs/NATIVE_MESSAGING.md

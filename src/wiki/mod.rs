@@ -335,9 +335,10 @@ pub fn normalize_dir(path: &str) -> Result<String> {
 }
 
 /// The vault this tracker serves — [`crate::home::vault_for`]:
-/// `<home>/vault` under `CADENCE_HOME`, the served tracker's `wiki/`
-/// under the legacy layout (the daemon's tracker is instance-bound,
-/// so the vault follows `pm.dir`, not the process env).
+/// `<home>/vault` under `CADENCE_HOME` or when the served tracker sits
+/// inside the home, the tracker's own `wiki/` otherwise (the daemon's
+/// tracker is instance-bound, so the vault follows `pm.dir`, not the
+/// process env).
 pub fn vault_dir(pm: &Pm) -> Result<PathBuf> {
     crate::home::vault_for(&pm.dir)
 }

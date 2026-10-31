@@ -1,10 +1,10 @@
 //! CAD-584: `cadence doctor host` check `layout` — the CADENCE_HOME
 //! resolution this host sees: which branch the resolver took
-//! (`CADENCE_HOME` or the legacy layout) and every path it yields.
-//! A `LAYOUT` marker at the resolved root is reported but never
-//! activates the new layout — only `CADENCE_HOME` does. The check
-//! fails only when resolution itself is refused — a non-absolute
-//! `CADENCE_HOME` breaks every cadence path lookup.
+//! (`CADENCE_HOME`, a first run, or the legacy layout) and every path it
+//! yields. A `LAYOUT` marker at the resolved root is reported but never
+//! activates the new layout — only `CADENCE_HOME` or a first run does.
+//! The check fails only when resolution itself is refused — a
+//! non-absolute `CADENCE_HOME` breaks every cadence path lookup.
 
 use super::*;
 
@@ -37,6 +37,7 @@ pub(super) fn check_layout(_scan: &Scan) -> Check {
         ("state", crate::home::state_dir()),
         ("vault", crate::home::vault_dir()),
         ("repos", crate::home::repos_dir()),
+        ("config", crate::home::config_dir()),
     ];
     let detail = std::iter::once(format!(
         "{} → {}",
@@ -47,6 +48,13 @@ pub(super) fn check_layout(_scan: &Scan) -> Check {
         Ok(d) => format!("{name} {}", d.display()),
         Err(e) => format!("{name} unresolved ({e})"),
     }))
+    .chain(
+        (layout.source == crate::home::Source::Fresh).then(|| {
+            "first run on this account's own home — no existing tracker, state \
+             dir or hosted config was found"
+                .to_string()
+        }),
+    )
     .chain(
         (layout.marker_present && layout.source == crate::home::Source::Legacy).then(|| {
             format!(
@@ -69,6 +77,7 @@ pub(super) fn check_layout(_scan: &Scan) -> Check {
             "state": dir_value(crate::home::state_dir()),
             "vault": dir_value(crate::home::vault_dir()),
             "repos": dir_value(crate::home::repos_dir()),
+            "config": dir_value(crate::home::config_dir()),
         }),
         Value::Null,
         detail,

@@ -11,13 +11,13 @@ mod agents;
 mod issues;
 mod providers;
 
-fn show_login_code(url: &str, code: &str, no_open: bool) -> Result<()> {
+pub(super) fn show_login_code(url: &str, code: &str, no_open: bool) -> Result<()> {
     eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
     open_login_url(url, no_open);
     Ok(())
 }
 
-fn show_register_code(url: &str, code: &str, no_open: bool) -> Result<()> {
+pub(super) fn show_register_code(url: &str, code: &str, no_open: bool) -> Result<()> {
     eprintln!("Complete registration and approve this CLI at: {url}\nDevice code: {code}");
     open_login_url(url, no_open);
     Ok(())
