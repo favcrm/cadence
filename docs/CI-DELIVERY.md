@@ -380,8 +380,12 @@ are now different, so re-measure before reviving that flow.
 
 ## CI throughput benchmark (CAD-840)
 
-The suite runs once, on one `instabox-large`, at `--jobs $(nproc)` (capped
-at 16). CAD-1970 replaced the six `test-shards` partitions with this single
+The suite runs once, on one `instabox-large`, at `--jobs 4` — the same
+per-process concurrency the six shards ran. `nproc` on that runner is 8, and
+eight-way is not equivalent: these fixtures probe a port, drop the reservation
+and bind it again, so the first single-runner gate at `nproc` failed two
+consecutive main runs on two different probe-then-bind board fixtures. Raising
+this needs those fixtures made race-free first, not a wider reservation list. CAD-1970 replaced the six `test-shards` partitions with this single
 job after measuring both shapes on the same content, both cold: one large
 runner spent 568 runner-seconds and reached the required `test` check at
 568 s; the six shards spent 2696 runner-seconds, reached it at about 735 s,

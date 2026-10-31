@@ -117,7 +117,14 @@ the guard is what makes a smaller shape safe.
 ## One `test` job, and the measurement behind it
 
 Six `test-shards` at `hash:k/6` and `--jobs 4` became one `test` job on
-`instabox-large` at `--jobs $(nproc)` (capped at 16). Same content, both cold,
+`instabox-large`, still at `--jobs 4`.
+
+The first version used `nproc` (8 on that runner) and main went red twice in a
+row on two different probe-then-bind board fixtures — `wiki_board_http_guard_acceptance`
+with `AddrInUse` and `cad1537_acceptance` with "fixture BLOCKED: board could
+not bind". Those fixtures probe a port, drop the reservation and bind again, so
+doubling per-process concurrency doubles the window. The shards' four-way
+width is the concurrency this crate was tuned at, so the single job keeps it. Same content, both cold,
 measured 2026-10-31:
 
 | `f7915b475` (PR #1469) | six shards | one `instabox-large` |
