@@ -161,7 +161,7 @@ await React.act(async () => { finishRecovery!(); });
 const menu = host2.querySelector<HTMLButtonElement>('button[aria-controls="mobile-navigation"]');
 assert(menu, "mobile navigation can be opened");
 await React.act(async () => { menu.click(); });
-const workspaceRetry = Array.from(host2.querySelectorAll<HTMLButtonElement>("#mobile-navigation button")).find((button) => button.textContent?.trim() === "Retry workspace");
+const workspaceRetry = Array.from(document.querySelectorAll<HTMLButtonElement>("#mobile-navigation button")).find((button) => button.textContent?.trim() === "Retry workspace");
 assert(workspaceRetry && !workspaceRetry.disabled, "completed recovery is actionable after opening the mobile menu");
 await React.act(async () => { workspaceRetry.click(); });
 assert(reloads === 1, "mobile workspace retry performs the recovery reload");

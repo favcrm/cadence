@@ -25,6 +25,8 @@ import {
   Menu01Icon,
   Moon02Icon,
   MoreHorizontalIcon,
+  PanelLeftOpenIcon,
+  PanelLeftCloseIcon,
   PinIcon,
   Pulse01Icon,
   RefreshIcon,
@@ -117,6 +119,14 @@ export const IconChevron = ({ size = 10, ...rest }: IconProps = {}) => (
 /** Tree disclosure; the row rotates it when the folder is open. */
 export const IconCaret = ({ size = 10, ...rest }: IconProps = {}) => (
   <Glyph icon={ArrowRight01Icon} size={size} {...rest} />
+);
+/** Collapse the desktop sidebar to its compact rail. */
+export const IconSidebarCollapse = ({ size = 15, ...rest }: IconProps = {}) => (
+  <Glyph icon={PanelLeftOpenIcon} size={size} {...rest} />
+);
+/** Expand the compact desktop rail. */
+export const IconSidebarExpand = ({ size = 15, ...rest }: IconProps = {}) => (
+  <Glyph icon={PanelLeftCloseIcon} size={size} {...rest} />
 );
 /** Pin a row to the top of its list. */
 export const IconPin = ({ size = 12, ...rest }: IconProps = {}) => (

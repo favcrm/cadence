@@ -13,7 +13,7 @@ import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell
 import { Loading, Notice } from "./features/app-shell/shared/States";
 import type { Viewer } from "./features/projects/work";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
-import { noteAppScreen } from "./features/app-shell/sidebarPrefs";
+import { noteAppScreen, updateSidebarPrefs, useSidebarPrefs } from "./features/app-shell/sidebarPrefs";
 import { useInstallations, type InstallationsState } from "./features/workspace-apps/useInstallations";
 import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
 import { appLoadErrorCopy } from "./features/explorer/appErrors";
@@ -37,6 +37,7 @@ import CredentialEntry from "./features/connections/CredentialEntry";
 import CredentialAuthorize from "./features/connections/CredentialAuthorize";
 import EmailSending from "./features/settings/EmailSending";
 import SettingsLayout from "./features/settings/SettingsLayout";
+import Preferences from "./features/settings/Preferences";
 import Templates from "./features/templates/Templates";
 import Update from "./features/settings/Update";
 import Outbox from "./features/outbox/Outbox";
@@ -50,6 +51,7 @@ import Context from "./features/projects/Context";
 import { contextNavigationSearch } from "./features/projects/contextRoute";
 import Workflows from "./features/projects/Workflows";
 import Sidebar from "./ui/Sidebar";
+import MobileNavigation from "./ui/MobileNavigation";
 import { NavList, ProjectsSection } from "./ui/NavList";
 import Wiki from "./features/wiki/Wiki";
 import Link from "./ui/Link";
@@ -79,7 +81,7 @@ import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
 import { runningRelease } from "./lib/fmt";
 import { applyDraft, composerField, sessionStore, stashDraft, takeDraft } from "./lib/draft";
 import Toast, { type ToastMsg } from "./ui/Toast";
-import { IconList } from "./ui/icons";
+import { IconList, IconSidebarCollapse, IconSidebarExpand } from "./ui/icons";
 import type { BoardFilters } from "./lib/filters";
 import type { UpdateBanner } from "./lib/types";
 import { RESOURCE_NAMES } from "./lib/cache";
@@ -277,6 +279,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const restorePersonal = useRef(false);
   const [toast, setToast] = useState<ToastMsg | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const closeMenu = useCallback(() => setMenuOpen(false), []);
+  const { collapsed: sidebarCollapsed } = useSidebarPrefs();
+  const sidebarCollapseRef = useRef<HTMLButtonElement>(null);
+  const setSidebarCollapsed = (collapsed: boolean) => {
+    updateSidebarPrefs((prefs) => ({ ...prefs, collapsed }));
+    requestAnimationFrame(() => sidebarCollapseRef.current?.focus());
+  };
   const [accountOpen, setAccountOpen] = useState(false);
   // The serving build when it differs from this bundle's — drives the
   // reload banner (CAD-573).
@@ -986,11 +995,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       : hireBlock(meta)}>
     <div
       data-app-shell
-      className={`grid lg:grid-cols-[208px_minmax(0,1fr)] bg-ink-900 ${
+      className={`grid ${sidebarCollapsed ? "lg:grid-cols-[64px_minmax(0,1fr)]" : "lg:grid-cols-[208px_minmax(0,1fr)]"} bg-ink-900 ${
         fullHeight ? "app-workspace h-[100dvh] grid-rows-[minmax(0,1fr)] overflow-hidden" : "min-h-screen"
       }`}
     >
       <Sidebar
+        collapsed={sidebarCollapsed}
+        onExpand={() => setSidebarCollapsed(false)}
         noWiki={!wikiAvailable(meta)}
         screen={screen === "workspaceApp" || screen === "workspaceAppKey" ? "apps" : screen}
         navHref={hrefFor}
@@ -1006,12 +1017,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         account={<AccountMenu
           onOpenChange={setAccountOpen}
           meta={meta}
-          actor={actor}
-          mayWrite={!readOnly}
           onChange={refresh}
           trigger="row"
           placement="above-start"
-          settingsHref={hrefFor({ screen: "settings", section: "models" })}
+          settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
           footer={versionLine}
         />}
       />
@@ -1019,7 +1028,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       {/* Workspaces fill the dynamic viewport; their panes own scrolling.
           Other screens retain the natural document flow. */}
       <div data-canvas-main className={`min-w-0 flex flex-col ${fullHeight ? "h-full min-h-0" : ""}`}>
-        <header className="app-header sticky top-0 z-10 flex items-center gap-2 sm:gap-3 px-4 lg:px-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
+        <header className="app-header sticky top-0 z-10 flex items-center gap-2 sm:gap-3 px-4 lg:pr-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
           <button
             onClick={() => setMenuOpen((o) => !o)}
             className="header-menu header-icon -ml-1 shrink-0 gap-1 text-ink-200"
@@ -1029,6 +1038,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           >
             <IconList size={16} />
           </button>
+          <div className="desktop-collapse-control">
+            <button ref={sidebarCollapseRef} type="button" className="header-icon text-ink-400" aria-label={t(sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar")} aria-expanded={!sidebarCollapsed} aria-controls="desktop-sidebar" title={t(sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar")} onClick={() => setSidebarCollapsed(!sidebarCollapsed)}>
+              {sidebarCollapsed ? <IconSidebarExpand size={16} /> : <IconSidebarCollapse size={16} />}
+            </button>
+          </div>
           <nav className="header-breadcrumb min-w-0 flex-1" aria-label={t("Breadcrumb")}>
             {/* The organisation's display name, or the board's neutral
                 label — never a hostname or project mistaken for an org. */}
@@ -1063,12 +1077,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             {/* Desktop identity lives in the sidebar footer row; signed-out viewers keep the one-click theme button. */}
             {meta?.signed_in === true ? <div className="flex lg:hidden"><AccountMenu
               meta={meta}
-              actor={actor}
-              mayWrite={!readOnly}
               onChange={refresh}
               trigger="avatar"
               placement="below-end"
-              settingsHref={hrefFor({ screen: "settings", section: "models" })}
+              settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
               footer={versionLine}
             /></div> : <><LocalLanguage /><ThemeToggle /></>}
           </div>
@@ -1084,7 +1096,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         )}
 
         {menuOpen && (
-          <div id="mobile-navigation" className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
+          <MobileNavigation onClose={closeMenu}>
             <NavList
               noWiki={!wikiAvailable(meta)}
               screen={screen === "workspaceApp" || screen === "workspaceAppKey" ? "apps" : screen}
@@ -1092,7 +1104,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               appMenu={appMenu}
               homeCount={homeCount}
               label={t("Workspace")}
-              onNavigate={() => setMenuOpen(false)}
+              onNavigate={closeMenu}
             />
             <div className="pt-2">
               <ProjectsSection
@@ -1101,7 +1113,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 projects={projects}
                 issues={issuesState}
                 projectsError={projectsState.status === "failed" ? projectsState.error : null}
-                onNavigate={() => setMenuOpen(false)}
+                onNavigate={closeMenu}
               />
             </div>
             {/* The header carries these as icons under lg — here they keep
@@ -1118,7 +1130,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 <SignIn meta={meta} onChange={refresh} access={viewer.access} recheckFinished={recheckFinished} onRetryWorkspace={reload} />
               </StatusChips>
             </div>
-          </div>
+            {meta?.signed_in === true && <div className="mt-3 border-t border-ink-700 pt-2" onClick={(event) => { if ((event.target as Element).closest("a")) closeMenu(); }}><AccountMenu
+              meta={meta}
+              onChange={refresh}
+              trigger="row"
+              placement="above-start"
+              settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
+              footer={versionLine}
+            /></div>}
+          </MobileNavigation>
         )}
 
         {projectScope(route) === "chips" && showProjectChoices(projects.length, project) && (
@@ -1418,6 +1438,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                   { label: "Agents", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
                   { label: "Connections", href: hrefFor({ screen: "settings", section: "connections" }), on: route.section === "connections" },
                   { label: "Email sending", href: hrefFor({ screen: "settings", section: "email" }), on: route.section === "email" },
+                  { label: "Preferences", href: hrefFor({ screen: "settings", section: "preferences" }), on: route.section === "preferences" },
                 ],
               },
               {
@@ -1439,6 +1460,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             )}
             {route.section === "email" && <EmailSending viewer={viewer} />}
             {route.section === "templates" && <Templates />}
+            {route.section === "preferences" && <Preferences />}
             {route.section === "account" && <PlatformAccount />}
             {route.section === "update" && <Update viewer={viewer} health={health} />}
             {route.section === "permissions" && <MasterPermissions viewer={{ ...viewer, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}

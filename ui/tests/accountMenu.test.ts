@@ -1,5 +1,6 @@
 import type { Meta } from "../src/lib/types";
 import type * as SessionKeyModule from "../src/lib/sessionKey";
+import type PreferencesComponent from "../src/features/settings/Preferences";
 
 declare function require(name: string): any;
 const { Window } = require("happy-dom");
@@ -26,6 +27,7 @@ moduleLoader.prototype.require = function (this: unknown, id: string) {
 const { createElement, act } = require("react");
 const { createRoot } = require("react-dom/client");
 const { default: AccountMenu } = require("../src/ui/AccountMenu") as typeof import("../src/ui/AccountMenu");
+const { default: Preferences } = require("../src/features/settings/Preferences") as { default: typeof PreferencesComponent };
 const { default: SignIn } = require("../src/features/auth/SignIn") as typeof import("../src/features/auth/SignIn");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { sessionKey, setSessionKey } = require("../src/lib/sessionKey") as typeof SessionKeyModule;
@@ -46,7 +48,7 @@ function mount(node: unknown) {
   return { host, done: () => { act(() => root.unmount()); host.remove(); } };
 }
 const menu = (meta: Meta | null, extra: object = {}, onChange: () => void = () => undefined) =>
-  createElement(AccountMenu, { meta, actor: "Fable (board)", mayWrite: true, onChange, trigger: "avatar", placement: "below-end", ...extra });
+  createElement(AccountMenu, { meta, onChange, trigger: "avatar", placement: "below-end", ...extra });
 const trigger = (host: any) => host.querySelector("button[aria-haspopup=dialog]") as HTMLButtonElement;
 const panel = (host: any) => host.querySelector("[role=dialog]");
 const pointerDown = (target: any) => act(() => { target.dispatchEvent(new win.Event("pointerdown", { bubbles: true })); });
@@ -124,35 +126,31 @@ const pointerDown = (target: any) => act(() => { target.dispatchEvent(new win.Ev
   done();
 }
 
-// Identity and the writes line.
+// Identity remains visible in the account menu.
 {
   const { host, done } = mount(menu(signedIn));
   act(() => trigger(host).click());
   const text = panel(host).textContent as string;
   assert(text.includes("Fable Chen") && text.includes("fable@example.com") && text.includes("operator"), "identity block");
-  assert(text.includes("Writes commit to the tracker as") && text.includes("Fable (board)"), "writes line when the client may write");
   assert(host.querySelector("[title='session sess-1']"), "session id kept in a title");
   done();
 }
-{
-  const { host, done } = mount(menu(signedIn, { mayWrite: false }));
-  act(() => trigger(host).click());
-  assert(!(panel(host).textContent as string).includes("Writes commit"), "no writes line on a read-only client");
-  done();
-}
 
-// Theme selection calls setThemePref (stored + applied).
+// The settings preferences preserve theme selection and persistence.
 {
-  const { host, done } = mount(menu(signedIn));
-  act(() => trigger(host).click());
-  const buttons = Array.from(panel(host).querySelectorAll("[aria-pressed]")) as HTMLButtonElement[];
-  assert(buttons.length === 3 && buttons[0].getAttribute("aria-pressed") === "true", "System pressed by default");
-  const dark = buttons.find((b) => b.textContent === "Dark")!;
-  act(() => dark.click());
-  assert(dark.getAttribute("aria-pressed") === "true", "Dark pressed");
+  const { host, done } = mount(createElement(Preferences));
+  const theme = host.querySelector('[role="combobox"][aria-label="Theme"]') as HTMLButtonElement;
+  assert(theme?.textContent?.includes("System"), "System is selected by default");
+  const key = (value: string) => act(() => theme.dispatchEvent(new win.KeyboardEvent("keydown", { key: value, bubbles: true })));
+  key("Enter");
+  key("End");
+  key("Enter");
+  assert(theme.textContent?.includes("Dark"), "Dark is selected");
   assert(document.documentElement.getAttribute("data-theme") === "dark", "data-theme applied");
   assert(win.localStorage.getItem("cadence-theme") === "dark", "pick stored");
-  act(() => buttons[0].click());
+  key("Enter");
+  key("Home");
+  key("Enter");
   assert(!document.documentElement.hasAttribute("data-theme"), "System clears data-theme");
   done();
 }
@@ -175,8 +173,8 @@ async function guardCases() {
     const { host, done } = mount(menu(ro));
     act(() => trigger(host).click());
     const text = panel(host).textContent as string;
-    assert(text.includes("Sign out") && !text.includes("Writes commit"), "read-only boards keep session logout without enabling workspace writes");
-    assert(text.includes("Fable Chen") && host.querySelector("[aria-pressed]"), "read-only board keeps identity and theme");
+    assert(text.includes("Sign out"), "read-only boards keep session logout");
+    assert(text.includes("Fable Chen"), "read-only board keeps identity");
     done();
   }
   {

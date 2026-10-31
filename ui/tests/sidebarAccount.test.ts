@@ -100,10 +100,23 @@ const rowTrigger = (host: Element) => host.querySelector("aside button[aria-hasp
   // Phone menu: identity has one home, so no writes chip.
   const open = host.querySelector("button[aria-label='Open navigation']") as HTMLButtonElement;
   await React.act(async () => { open.click(); });
-  const menu = host.querySelector("#mobile-navigation");
+  const menu = document.querySelector("#mobile-navigation");
   assert(menu && menu.textContent?.includes("Refresh board"), "phone menu is open");
   assert(!(menu.textContent ?? "").includes("writes:"), "no writes: chip in the phone menu");
+  await React.act(async () => {
+    document.activeElement?.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  assert(!document.querySelector('[role="dialog"][aria-label="Search issues and knowledge"]'), "global search cannot open behind the modal drawer");
+  const mobileAccount = menu.querySelector<HTMLButtonElement>(".account-row");
+  assert(mobileAccount, "the drawer exposes its account menu");
+  await React.act(async () => { mobileAccount.click(); });
+  const settings = menu.querySelector<HTMLAnchorElement>('[data-account-menu] [role="dialog"] a');
+  assert(settings, "the drawer account menu links to settings");
+  await React.act(async () => { settings.click(); });
+  assert(!document.querySelector("#mobile-navigation") && location.pathname === "/settings/preferences", "account navigation closes the drawer and opens preferences");
+  assert(!host.querySelector<HTMLElement>("[data-app-shell]")?.inert, "the destination is interactive after navigation");
   done();
+  history.replaceState(null, "", "/");
 }
 
 // CAD-1034: both triggers (sidebar row, phone header avatar) carry the version line.

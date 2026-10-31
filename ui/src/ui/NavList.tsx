@@ -58,11 +58,13 @@ interface NavListProps {
   homeCount?: number;
   /** The board does not serve the wiki (see wikiAvailable); do not advertise it there. */
   noWiki?: boolean;
+  /** Desktop rail hides nested rows without changing their stored fold state. */
+  rail?: boolean;
 }
 
 /** The one nav row list: the desktop sidebar and the phone menu both
  *  render it, so there is a single row style. */
-export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate, homeCount = 0, noWiki = false }: NavListProps) {
+export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate, homeCount = 0, noWiki = false, rail = false }: NavListProps) {
   const { t } = useLocale();
   const items = navItems(noWiki);
   const prefs = useSidebarPrefs();
@@ -75,6 +77,9 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
     <nav className="grid gap-[2px]" aria-label={t(label)}>
       {items.map((item) => {
         const here = navMatches(screen, item.screen);
+        const railLabel = item.screen === "home"
+          ? [t(item.label), homeCount > 0 ? `${homeCount} ${t("waiting for you")}` : "", assistantUnread.has("home") ? t("New assistant reply") : ""].filter(Boolean).join(" · ")
+          : t(item.label);
         if (item.screen !== "apps" || apps.length === 0) {
           return (
             <Fragment key={item.screen}>
@@ -82,6 +87,8 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                 href={navHref(item.route)}
                 onClick={onNavigate}
                 className="navlink"
+                data-rail-label={railLabel}
+                aria-label={rail ? railLabel : undefined}
                 aria-current={here ? "page" : undefined}
               >
                 {NAV_ICONS[item.screen]}
@@ -95,14 +102,14 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                   <span className="navdot" role="img" aria-label={t("New assistant reply")} />
                 )}
               </Link>
-              {item.screen === "apps" && appMenu?.notice && <AppNotice notice={appMenu.notice} />}
+              {item.screen === "apps" && appMenu?.notice && <AppNotice notice={appMenu.notice} rail={rail} />}
             </Fragment>
           );
         }
         // With an app open under Apps the most specific row carries the accent;
         // the parent stays current for assistive tech only.
-        const parent = here && currentApp !== null;
         const open = prefs.appsOpen;
+        const parent = here && currentApp !== null && open && !rail;
         return (
           <Fragment key={item.screen}>
             <div className="navrow">
@@ -110,6 +117,8 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                 href={navHref(item.route)}
                 onClick={onNavigate}
                 className="navlink"
+                data-rail-label={currentApp && here ? `${t(item.label)} · ${currentApp.title}` : t(item.label)}
+                aria-label={rail ? (currentApp && here ? `${t(item.label)} · ${currentApp.title}` : t(item.label)) : undefined}
                 aria-current={here ? (parent ? "true" : "page") : undefined}
                 data-parent-current={parent ? "" : undefined}
               >
@@ -123,15 +132,8 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                 onToggle={() => updateSidebarPrefs((p) => ({ ...p, appsOpen: !p.appsOpen }))}
               />
             </div>
-            {appMenu?.notice && <AppNotice notice={appMenu.notice} />}
-            {/* Folded on an app screen: the open app keeps one row, so the sidebar still says where you are. */}
-            {!open && here && currentApp !== null && (
-              <div className="navtree">
-                <Link href={currentApp.href} onClick={onNavigate} className="navlink navlink-sub" title={currentApp.title} aria-current="page">
-                  <span className="truncate">{currentApp.title}</span>
-                </Link>
-              </div>
-            )}
+            {appMenu?.notice && <AppNotice notice={appMenu.notice} rail={rail} />}
+            {/* The Apps parent is current while the tree is folded or the rail is compact. */}
             <Fold id={foldId} open={open}>
               <div className="navtree">
                 {apps.map((app) => {
@@ -202,8 +204,12 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
   );
 }
 
-function AppNotice({ notice }: { notice: NonNullable<AppNav["notice"]> }) {
+function AppNotice({ notice, rail = false }: { notice: NonNullable<AppNav["notice"]>; rail?: boolean }) {
   const { t } = useLocale();
+  if (rail) {
+    const label = `${t(notice.text)}${notice.retrying ? "" : ` · ${t("Retry")}`}`;
+    return <div role="status" className="rail-notice">{notice.retrying ? <span aria-label={label}>!</span> : <button type="button" aria-label={label} data-rail-label={label} onClick={notice.onRetry}>!</button>}</div>;
+  }
   return (
     <div role="status" className="ml-[10px] border-l border-ink-700 pl-[6px] py-[3px] text-label text-ink-400">
       {t(notice.text)}{" "}
