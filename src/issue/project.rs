@@ -344,6 +344,11 @@ pub(crate) fn repo_identity(cwd: &Path) -> Option<(PathBuf, Option<String>)> {
 }
 
 /// Load every `<pm>/<key>/project.yaml`, sorted by key.
+///
+/// An unreadable tracker answers an empty list, and an entry whose type
+/// cannot be read is skipped. That is right for callers that only render what
+/// they could read, and **wrong for access decisions**: an empty list reads as
+/// "nothing is restricted". Authorization uses [`list_checked`].
 pub fn list(pm_dir: &Path) -> Result<Vec<Project>> {
     let mut projects = Vec::new();
     let Ok(entries) = std::fs::read_dir(pm_dir) else {
@@ -355,6 +360,50 @@ pub fn list(pm_dir: &Path) -> Result<Vec<Project>> {
         let dir_ok = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let file = entry.path().join("project.yaml");
         if dir_ok && crate::issue::board::is_real_file(&file) {
+            projects.push(load(&file)?);
+        }
+    }
+    projects.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(projects)
+}
+
+/// [`list`] for an access decision (CAD-1950).
+///
+/// Identical rows, but an answer that cannot be trusted is an error rather
+/// than an empty list: an unreadable tracker directory, or an entry whose type
+/// cannot be read, might be hiding a restricted project. A tracker that does
+/// not exist is `Ok(empty)` — nothing is there to hide — so a fresh checkout
+/// behaves as before. Callers that must fail closed map the error to "no
+/// projects", which refuses every project rather than admitting all of them.
+pub fn list_checked(pm_dir: &Path) -> Result<Vec<Project>> {
+    let entries = match std::fs::read_dir(pm_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(Error::internal(format!(
+                "cannot read the tracker {}: {e}",
+                pm_dir.display()
+            )))
+        }
+    };
+    let mut projects = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            Error::internal(format!(
+                "cannot read an entry of the tracker {}: {e}",
+                pm_dir.display()
+            ))
+        })?;
+        // lstat-style, as `list`: a symlinked project dir or project.yaml is
+        // not a project.
+        let kind = entry.file_type().map_err(|e| {
+            Error::internal(format!(
+                "cannot classify {} in the tracker: {e}",
+                entry.path().display()
+            ))
+        })?;
+        let file = entry.path().join("project.yaml");
+        if kind.is_dir() && crate::issue::board::is_real_file(&file) {
             projects.push(load(&file)?);
         }
     }
@@ -586,6 +635,24 @@ mod tests {
         let file = dir.path().join("project.yaml");
         std::fs::write(&file, format!("key: x\nprefix: X\n{body}")).unwrap();
         file
+    }
+
+    /// CAD-1950: the checked listing agrees with `list` for a real tracker,
+    /// and a tracker that is simply not there is empty rather than an error —
+    /// there is nothing to hide. Only an unreadable *existing* tracker refuses.
+    #[test]
+    fn the_checked_listing_matches_list_and_tolerates_a_missing_tracker() {
+        let tracker = tempfile::TempDir::new().unwrap();
+        let project = tracker.path().join("x");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("project.yaml"), "key: x\nprefix: X\n").unwrap();
+
+        assert_eq!(list_checked(tracker.path()).unwrap().len(), 1);
+        assert_eq!(list(tracker.path()).unwrap().len(), 1);
+        assert_eq!(list_checked(tracker.path()).unwrap()[0].key, "x");
+        assert!(list_checked(&tracker.path().join("absent"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
