@@ -72,6 +72,43 @@ CREATE TABLE IF NOT EXISTS app_media_lineage(
     source_sha256 TEXT NOT NULL);
 ";
 
+/// CAD-1962 v61: workspace custody for an image an installation
+/// imported into the shared library. The bytes live HERE, in the
+/// workspace store — not in the importing installation's record store —
+/// so the asset outlives that installation and any other app in the
+/// workspace can read it. One accepted import intent per request id,
+/// exactly like the publish ledger: a refused attempt reserves nothing.
+pub(super) const SCHEMA_V61: &str = "
+CREATE TABLE IF NOT EXISTS app_media_imports(
+    asset_id TEXT PRIMARY KEY REFERENCES app_media_assets(id),
+    context_id TEXT NOT NULL,
+    media_type TEXT NOT NULL CHECK(media_type IN ('image/png','image/jpeg','image/webp')),
+    sha256 TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
+    bytes BLOB NOT NULL,
+    created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS app_media_import_requests(
+    request_id TEXT PRIMARY KEY,
+    asset_id TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    result TEXT NOT NULL,
+    created REAL NOT NULL);
+";
+
+/// The custody bound for one imported image: the same 2 MiB the
+/// capability and tool custody doors use.
+pub const IMPORT_BYTES: usize = 2 * 1024 * 1024;
+
+/// One imported workspace image: the catalog row plus the verified
+/// custody bytes. Only the store's own readers see this shape; the
+/// frame still receives metadata only.
+pub struct ImportedImage {
+    pub asset: MediaAsset,
+    pub media_type: String,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+}
+
 /// The daemon-minted id grammar — `med-` + 32 lowercase hex. A stored
 /// row carrying anything else is refused rather than projected.
 pub fn valid_id(id: &str) -> bool {
@@ -525,6 +562,159 @@ impl Store {
             row_media_catalog,
         )?;
         row.map(MediaAsset::checked).transpose()
+    }
+
+    /// CAD-1962: import ONE image an approved installation holds into
+    /// workspace custody and the shared catalog, as a draft.
+    ///
+    /// The bytes are copied into this store, so the asset survives the
+    /// importing installation's removal and any other app in the same
+    /// workspace can read it — the library is the workspace, not the
+    /// app. Idempotent by `request_id`: an identical replay returns the
+    /// accepted result, a different digest under the same id refuses,
+    /// and a refused attempt reserves nothing. `creator` is the
+    /// caller-proven attribution, already in the catalog's closed
+    /// tagged form.
+    pub(crate) fn app_media_import(
+        &self,
+        install: &str,
+        context: &str,
+        creator: &str,
+        media_type: &str,
+        bytes: &[u8],
+        request_id: &str,
+    ) -> Result<Value> {
+        Creator::parse(creator)?;
+        if !matches!(media_type, "image/png" | "image/jpeg" | "image/webp") {
+            return Err(Error::rejected(
+                "imported media must be a supported image type",
+            ));
+        }
+        if bytes.is_empty() || bytes.len() > IMPORT_BYTES {
+            return Err(Error::rejected(
+                "imported image is outside the custody size",
+            ));
+        }
+        let digest = super::app_runs::artifact_digest(bytes);
+        self.write_tx(|tx| {
+            if let Some((stored_digest, result)) = tx.query_opt(
+                "SELECT sha256,result FROM app_media_import_requests WHERE request_id=?1",
+                params![request_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )? {
+                if stored_digest != digest {
+                    return Err(Error::rejected(
+                        "media import request id is already used by different bytes",
+                    ));
+                }
+                return serde_json::from_str(&result)
+                    .map_err(|_| Error::rejected("media import receipt is malformed"));
+            }
+            let at = super::now();
+            let asset = MediaAsset {
+                id: format!("med-{}", uuid::Uuid::new_v4().simple()),
+                install_id: install.to_string(),
+                title: "Imported image".to_string(),
+                kind: "image".to_string(),
+                lifecycle: "draft".to_string(),
+                revision: 1,
+                creator: creator.to_string(),
+                created: at,
+                updated: at,
+                source_asset_id: None,
+            }
+            .checked()?;
+            tx.execute(
+                "INSERT INTO app_media_assets(
+                    id,install_id,title,kind,lifecycle,revision,creator,created,updated)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    asset.id,
+                    asset.install_id,
+                    asset.title,
+                    asset.kind,
+                    asset.lifecycle,
+                    asset.revision,
+                    asset.creator,
+                    asset.created,
+                    asset.updated,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO app_media_imports(
+                    asset_id,context_id,media_type,sha256,size_bytes,bytes,created)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    asset.id,
+                    context,
+                    media_type,
+                    digest,
+                    bytes.len() as i64,
+                    bytes,
+                    at
+                ],
+            )?;
+            let result = json!({
+                "receipt": {
+                    "request_id": request_id,
+                    "asset_id": asset.id,
+                    "revision": asset.revision,
+                    "lifecycle": asset.lifecycle,
+                }
+            });
+            tx.execute(
+                "INSERT INTO app_media_import_requests(
+                    request_id,asset_id,sha256,result,created)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![request_id, asset.id, digest, result.to_string(), at],
+            )?;
+            Ok(result)
+        })
+    }
+
+    /// CAD-1962: the verified custody bytes behind one imported asset.
+    /// `None` for a provider-produced asset (its original lives behind
+    /// the provider proof door), and a stored row that fails its digest,
+    /// size or MIME check refuses rather than serving bytes.
+    pub(crate) fn app_media_imported_image(&self, asset_id: &str) -> Result<Option<ImportedImage>> {
+        if !valid_id(asset_id) {
+            return Ok(None);
+        }
+        let conn = self.conn();
+        let row = conn.query_opt(
+            "SELECT a.id,a.install_id,a.title,a.kind,a.lifecycle,a.revision,a.creator,a.created,a.updated,
+                    i.media_type,i.sha256,i.bytes
+             FROM app_media_assets a JOIN app_media_imports i ON i.asset_id=a.id
+             WHERE a.id=?1",
+            params![asset_id],
+            |r| {
+                Ok((
+                    row_media_asset(r)?,
+                    r.get::<_, String>(9)?,
+                    r.get::<_, String>(10)?,
+                    r.get::<_, Vec<u8>>(11)?,
+                ))
+            },
+        )?;
+        let Some((asset, media_type, sha256, bytes)) = row else {
+            return Ok(None);
+        };
+        let asset = asset.checked()?;
+        if !matches!(
+            media_type.as_str(),
+            "image/png" | "image/jpeg" | "image/webp"
+        ) || bytes.is_empty()
+            || bytes.len() > IMPORT_BYTES
+            || super::app_runs::artifact_digest(&bytes) != sha256
+        {
+            return Err(Error::rejected("imported media custody is invalid"));
+        }
+        Ok(Some(ImportedImage {
+            asset,
+            media_type,
+            sha256,
+            bytes,
+        }))
     }
 
     /// CAD-1365 atomic producer association, run inside

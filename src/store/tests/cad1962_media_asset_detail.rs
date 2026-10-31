@@ -171,3 +171,108 @@ fn a_mounting_install_lists_published_rows_and_only_its_own_drafts() {
     // The store-wide maintenance read is unchanged.
     assert_eq!(s.app_media_catalog(20, None).unwrap().0.len(), 4);
 }
+
+const IMPORT_BYTES: &[u8] = b"not-really-a-png-but-the-store-trusts-the-declared-mime";
+
+#[test]
+fn an_import_copies_bytes_into_workspace_custody_and_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+    let first = s
+        .app_media_import(
+            INSTALL_A,
+            "ctx-a",
+            OPERATOR,
+            "image/png",
+            IMPORT_BYTES,
+            "import-1",
+        )
+        .unwrap();
+    let asset_id = first["receipt"]["asset_id"].as_str().unwrap().to_owned();
+    assert_eq!(first["receipt"]["lifecycle"], "draft");
+
+    let imported = s.app_media_imported_image(&asset_id).unwrap().unwrap();
+    assert_eq!(imported.media_type, "image/png");
+    assert_eq!(imported.bytes, IMPORT_BYTES);
+    assert_eq!(imported.asset.install_id, INSTALL_A);
+    assert_eq!(imported.asset.lifecycle, "draft");
+
+    // Identical replay returns the SAME asset, never a second copy.
+    let replay = s
+        .app_media_import(
+            INSTALL_A,
+            "ctx-a",
+            OPERATOR,
+            "image/png",
+            IMPORT_BYTES,
+            "import-1",
+        )
+        .unwrap();
+    assert_eq!(replay["receipt"]["asset_id"], json!(asset_id));
+    assert_eq!(s.app_media_catalog(20, None).unwrap().0.len(), 1);
+
+    // The same request id with different bytes refuses and reserves nothing.
+    assert!(s
+        .app_media_import(
+            INSTALL_A,
+            "ctx-a",
+            OPERATOR,
+            "image/png",
+            b"different-bytes",
+            "import-1"
+        )
+        .is_err());
+    assert_eq!(s.app_media_catalog(20, None).unwrap().0.len(), 1);
+}
+
+#[test]
+fn an_imported_asset_is_a_draft_until_published_and_outlives_its_importer() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+    let created = s
+        .app_media_import(
+            INSTALL_A,
+            "ctx-a",
+            OPERATOR,
+            "image/jpeg",
+            IMPORT_BYTES,
+            "import-2",
+        )
+        .unwrap();
+    let asset_id = created["receipt"]["asset_id"].as_str().unwrap().to_owned();
+
+    // Another installation cannot see the draft, in the page or by id.
+    assert!(s
+        .app_media_asset_for(INSTALL_B, &asset_id)
+        .unwrap()
+        .is_none());
+    let (page, _) = s.app_media_catalog_for(INSTALL_B, 20, None).unwrap();
+    assert!(page.is_empty());
+
+    // Publishing is the existing curation step; the bytes stay in the
+    // workspace store, not the importer's record store.
+    s.app_media_publish(&asset_id, 1, "publish-1", 20.0)
+        .unwrap();
+    assert!(s
+        .app_media_asset_for(INSTALL_B, &asset_id)
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        s.app_media_imported_image(&asset_id)
+            .unwrap()
+            .unwrap()
+            .bytes,
+        IMPORT_BYTES
+    );
+
+    // Tampered custody refuses instead of serving bytes.
+    s.write_tx(|tx| {
+        tx.execute(
+            "UPDATE app_media_imports SET bytes=?1 WHERE asset_id=?2",
+            params![b"tampered".to_vec(), asset_id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(s.app_media_imported_image(&asset_id).is_err());
+}
