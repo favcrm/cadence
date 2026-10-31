@@ -121,57 +121,6 @@ fn detail_refuses_a_row_the_catalog_could_not_have_written() {
     );
 }
 
-#[test]
-fn a_mounting_install_lists_published_rows_and_only_its_own_drafts() {
-    let dir = tempfile::tempdir().unwrap();
-    let s = Store::open(&dir.path().join("t.sqlite3")).unwrap();
-    let a_published = format!("med-{}", "1".repeat(32));
-    let a_draft = format!("med-{}", "2".repeat(32));
-    let b_published = format!("med-{}", "3".repeat(32));
-    let b_draft = format!("med-{}", "4".repeat(32));
-    seed(&s, &a_published, INSTALL_A, "Generated image", "published");
-    seed(&s, &a_draft, INSTALL_A, "Generated image", "draft");
-    seed(&s, &b_published, INSTALL_B, "Generated image", "published");
-    seed(&s, &b_draft, INSTALL_B, "Generated image", "draft");
-
-    let (page, _) = s.app_media_catalog_for(INSTALL_B, 20, None).unwrap();
-    let ids: Vec<&str> = page.iter().map(|a| a.id.as_str()).collect();
-    assert_eq!(
-        ids.len(),
-        3,
-        "published rows from anyone plus this installation's own draft"
-    );
-    assert!(ids.contains(&b_published.as_str()));
-    assert!(ids.contains(&a_published.as_str()));
-    assert!(ids.contains(&b_draft.as_str()));
-    assert!(
-        !ids.contains(&a_draft.as_str()),
-        "another installation's draft is not a library entry"
-    );
-
-    // Its own draft still resolves by id; another installation's does not,
-    // and the two are indistinguishable to the caller.
-    assert!(s
-        .app_media_asset_for(INSTALL_B, &b_draft)
-        .unwrap()
-        .is_some());
-    assert!(s
-        .app_media_asset_for(INSTALL_B, &a_draft)
-        .unwrap()
-        .is_none());
-    assert!(s
-        .app_media_asset_for(INSTALL_B, &format!("med-{}", "5".repeat(32)))
-        .unwrap()
-        .is_none());
-    assert!(s
-        .app_media_asset_for(INSTALL_B, &a_published)
-        .unwrap()
-        .is_some());
-
-    // The store-wide maintenance read is unchanged.
-    assert_eq!(s.app_media_catalog(20, None).unwrap().0.len(), 4);
-}
-
 const IMPORT_BYTES: &[u8] = b"not-really-a-png-but-the-store-trusts-the-declared-mime";
 
 #[test]
@@ -241,22 +190,20 @@ fn an_imported_asset_is_a_draft_until_published_and_outlives_its_importer() {
         .unwrap();
     let asset_id = created["receipt"]["asset_id"].as_str().unwrap().to_owned();
 
-    // Another installation cannot see the draft, in the page or by id.
-    assert!(s
-        .app_media_asset_for(INSTALL_B, &asset_id)
-        .unwrap()
-        .is_none());
-    let (page, _) = s.app_media_catalog_for(INSTALL_B, 20, None).unwrap();
-    assert!(page.is_empty());
+    // The catalog is store-wide: another installation reads the row, as
+    // CAD-1365's cross-install acceptance requires. Draft/published is
+    // curation, not a visibility boundary.
+    assert!(s.app_media_asset(&asset_id).unwrap().is_some());
+    assert_eq!(s.app_media_catalog(20, None).unwrap().0.len(), 1);
 
     // Publishing is the existing curation step; the bytes stay in the
     // workspace store, not the importer's record store.
     s.app_media_publish(&asset_id, 1, "publish-1", 20.0)
         .unwrap();
-    assert!(s
-        .app_media_asset_for(INSTALL_B, &asset_id)
-        .unwrap()
-        .is_some());
+    assert_eq!(
+        s.app_media_asset(&asset_id).unwrap().unwrap().lifecycle,
+        "published"
+    );
     assert_eq!(
         s.app_media_imported_image(&asset_id)
             .unwrap()
