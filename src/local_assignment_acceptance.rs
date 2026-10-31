@@ -1849,6 +1849,90 @@ fn a_claim_that_could_not_open_a_lane_is_still_reportable() {
     assert_eq!(script.row(&mine).0, "failed");
 }
 
+#[test]
+fn a_former_session_cannot_report_a_replacement_sessions_claim() {
+    let former_auth = private_dir();
+    let replacement_auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let assignment = board.seed("start", "waiting", None, ME);
+    let script = Script::new(board);
+    let mut former = open(&script, former_auth.path());
+    let mut replacement = open(&script, replacement_auth.path());
+    let first = former
+        .start_session(ISSUE, repo.path(), Some("former"), PROFILE)
+        .expect("first session claims the assignment");
+
+    // Model an external reassignment to the same member: the board retires
+    // the old claim before a different session acquires the next generation.
+    {
+        let mut board = script.0.lock().expect("board");
+        let row = board
+            .rows
+            .iter_mut()
+            .find(|row| row.assignment_id == assignment)
+            .expect("assignment");
+        row.generation += 1;
+        row.state = "queued".to_string();
+        row.claim_id = None;
+        row.client_agent_id = None;
+    }
+    let next = replacement
+        .start_session(
+            ISSUE,
+            repo.path(),
+            Some("replacement"),
+            "ap_00000000-0000-4000-8000-00000000beef",
+        )
+        .expect("replacement session acquires its own claim");
+    assert_ne!(next["claim_id"], first["claim_id"]);
+    assert_ne!(next["client_agent_id"], first["client_agent_id"]);
+    assert_eq!(
+        next["generation"].as_u64().expect("next generation"),
+        first["generation"].as_u64().expect("first generation") + 1
+    );
+    let held = script.row(&assignment);
+    assert_eq!(held.0, "running");
+    let calls_before_refusal = script.calls().len();
+
+    let refused = former
+        .start_session(ISSUE, repo.path(), Some("former"), PROFILE)
+        .expect_err("observing a replacement claim cannot adopt it");
+    assert_eq!(refused.code(), Some("fenced"));
+    let observed = former.status().expect("current assignment is observable");
+    assert_eq!(observed["assignments"][0]["claim_id"], next["claim_id"]);
+    former
+        .report(&assignment, "failed", Some("former session finished"), None)
+        .expect_err("seeing the new claim is not authority to report it");
+
+    assert_eq!(script.row(&assignment), held);
+    let calls = script.calls();
+    assert!(
+        calls[calls_before_refusal..]
+            .iter()
+            .all(|call| !call.is_suffix("/claim") && !call.is_suffix("/report")),
+        "the former session must neither reclaim nor report the replacement claim"
+    );
+
+    // Positive control: refusal must not disable the actual holder's reports.
+    let reported = replacement
+        .report(&assignment, "blocked", Some("replacement is waiting"), None)
+        .expect("the replacement holder retains report authority");
+    assert_eq!(reported["claim_id"], next["claim_id"]);
+    assert_eq!(reported["generation"], next["generation"]);
+    assert_eq!(reported["state"], "blocked");
+    assert_eq!(script.row(&assignment).0, "blocked");
+    let calls = script.calls();
+    let reports: Vec<_> = calls[calls_before_refusal..]
+        .iter()
+        .filter(|call| call.is_suffix("/report"))
+        .collect();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].body["claim_id"], next["claim_id"]);
+    assert_eq!(reports[0].body["expected_generation"], next["generation"]);
+}
+
 fn bind_file(dir: &Path, message: &str) -> Value {
     let bytes = fs::read(
         dir.join("hosted-assignments")
