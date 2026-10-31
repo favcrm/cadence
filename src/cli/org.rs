@@ -663,6 +663,16 @@ fn resolve_managed(
 /// Never resolves the tracker for a managed, pinned or ambient caller —
 /// those never needed it (the CAD-313 `ui login` residual runs with no
 /// `HOME`).
+/// Whether the selected org is this machine's local state, or no org is
+/// registered at all. A hosted selection is never local — not even when it is
+/// unreachable, because "unreachable" is not "read the notes folder instead".
+pub(super) fn selected_is_local() -> Result<bool> {
+    Ok(match selected_org_readonly()? {
+        None => true,
+        Some(org) => org == LOCAL_ORG,
+    })
+}
+
 /// The saved login's bearer for the selected remote org, or `None` when this
 /// machine is on a local org or holds no usable credential.
 ///
