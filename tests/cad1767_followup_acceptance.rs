@@ -1208,10 +1208,98 @@ fn cad1767_member_master_reads_carry_no_home_entries() {
     assert!(wrong.is_empty(), "member master reads: {wrong:#?}");
 }
 
+struct SweepTiming {
+    label: &'static str,
+    started: Instant,
+    teardown_started: Option<Instant>,
+    setup: Duration,
+    route_expansion: Duration,
+    routes: usize,
+    ids: usize,
+    member: Duration,
+    owner: Duration,
+    stream_while: Duration,
+    assertion: Duration,
+    calls: usize,
+    over_100ms: usize,
+    over_500ms: usize,
+    over_1s: usize,
+    slowest: [(Duration, &'static str, String); 5],
+}
+
+impl SweepTiming {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            started: Instant::now(),
+            teardown_started: None,
+            setup: Duration::ZERO,
+            route_expansion: Duration::ZERO,
+            routes: 0,
+            ids: 0,
+            member: Duration::ZERO,
+            owner: Duration::ZERO,
+            stream_while: Duration::ZERO,
+            assertion: Duration::ZERO,
+            calls: 0,
+            over_100ms: 0,
+            over_500ms: 0,
+            over_1s: 0,
+            slowest: std::array::from_fn(|_| (Duration::ZERO, "", String::new())),
+        }
+    }
+
+    fn record(&mut self, elapsed: Duration, who: &'static str, route: &str) {
+        self.calls += 1;
+        self.over_100ms += usize::from(elapsed > Duration::from_millis(100));
+        self.over_500ms += usize::from(elapsed > Duration::from_millis(500));
+        self.over_1s += usize::from(elapsed > Duration::from_secs(1));
+        if elapsed > self.slowest[4].0 {
+            self.slowest[4] = (elapsed, who, route.to_string());
+            self.slowest.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        }
+    }
+}
+
+impl Drop for SweepTiming {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let _ = writeln!(
+            std::io::stderr(),
+            "CAD-1767 {} timing: setup={}ms route_expansion={}ms routes={} ids={} \
+             member={}ms owner={}ms stream_while={}ms assert={}ms teardown={}ms total={}ms \
+             sweep_get_calls={} over_100ms={} over_500ms={} over_1s={} slowest_ms={:?}",
+            self.label,
+            self.setup.as_millis(),
+            self.route_expansion.as_millis(),
+            self.routes,
+            self.ids,
+            self.member.as_millis(),
+            self.owner.as_millis(),
+            self.stream_while.as_millis(),
+            self.assertion.as_millis(),
+            self.teardown_started
+                .map(|t| t.elapsed().as_millis())
+                .unwrap_or(0),
+            self.started.elapsed().as_millis(),
+            self.calls,
+            self.over_100ms,
+            self.over_500ms,
+            self.over_1s,
+            self.slowest
+                .each_ref()
+                .map(|(d, who, route)| (d.as_millis(), who, route)),
+        );
+    }
+}
+
 /// G2.3. `/stream`: a member's event stream carries no artifact card, no
 /// hire proposal and no master Home entry; the owner's stream does.
 #[test]
 fn cad1767_member_thread_stream_strips_operator_only_entries() {
+    let mut timing = SweepTiming::new("thread-stream");
     let fx = Fx::start(Board::Public);
     fx.seed("helper", None, None);
     fx.seed("master", None, None);
@@ -1228,6 +1316,7 @@ fn cad1767_member_thread_stream_strips_operator_only_entries() {
     let member = fx.platform_cookie("member");
     let window = Duration::from_secs(3);
     let mut wrong = Vec::new();
+    timing.setup = timing.started.elapsed();
     for (alias, path, home_id) in [
         ("helper", "/api/threads/helper/stream".to_string(), None),
         (
@@ -1241,7 +1330,11 @@ fn cad1767_member_thread_stream_strips_operator_only_entries() {
             Some(home.as_str()),
         ),
     ] {
+        timing.routes += 1;
+        let phase_started = Instant::now();
         let (status, events) = fx.sse(&path, &owner, window);
+        timing.owner += phase_started.elapsed();
+        let phase_started = Instant::now();
         let kinds: Vec<Value> = events.iter().map(|e| e["kind"].clone()).collect();
         if status != 200
             || !kinds.contains(&json!("artifact"))
@@ -1249,7 +1342,11 @@ fn cad1767_member_thread_stream_strips_operator_only_entries() {
         {
             wrong.push(format!("control {path}: owner {status} {kinds:?}"));
         }
+        timing.assertion += phase_started.elapsed();
+        let phase_started = Instant::now();
         let (status, events) = fx.sse(&path, &member, window);
+        timing.member += phase_started.elapsed();
+        let phase_started = Instant::now();
         eprintln!(
             "CAD-1767 member stream {path}: {status}, {} events",
             events.len()
@@ -1261,8 +1358,12 @@ fn cad1767_member_thread_stream_strips_operator_only_entries() {
         if alias == "helper" && status == 200 && !events.iter().any(|e| e["text"] == HELPER_CHAT) {
             wrong.push(format!("{path}: member stream lost the ordinary chat"));
         }
+        timing.assertion += phase_started.elapsed();
     }
+    let phase_started = Instant::now();
     assert!(wrong.is_empty(), "member streams: {wrong:#?}");
+    timing.assertion += phase_started.elapsed();
+    timing.teardown_started = Some(Instant::now());
 }
 
 // ------------------------------- G2 round 2: bypasses of the member view
@@ -1986,6 +2087,7 @@ fn needle_hits(body: &str) -> Vec<String> {
 /// Round 5. A member receives no operator text on any board GET route.
 #[test]
 fn cad1767_member_route_sweep_carries_no_operator_text() {
+    let mut timing = SweepTiming::new("sweep");
     let fx = Fx::start(Board::Public);
     let (store, home) = master_with_home(&fx);
     fx.seed("helper", None, None);
@@ -2083,15 +2185,27 @@ fn cad1767_member_route_sweep_carries_no_operator_text() {
     .iter()
     .map(|s| s.to_string())
     .collect();
+    timing.setup = timing.started.elapsed();
+    let phase_started = Instant::now();
     let (routes, skipped) = swept_routes(&ids, &home);
+    timing.route_expansion = phase_started.elapsed();
+    timing.routes = routes.len();
+    timing.ids = ids.len();
+    let phase_started = Instant::now();
     let owner = fx.platform_cookie("owner");
     let member = fx.platform_cookie("member");
+    timing.setup += phase_started.elapsed();
 
     let mut leaks = Vec::new();
     let mut admitted = Vec::new();
     let mut owner_seen = std::collections::BTreeSet::new();
     for route in &routes {
+        let phase_started = Instant::now();
         let (status, body) = fx.sweep_get(route, &member);
+        let elapsed = phase_started.elapsed();
+        timing.member += elapsed;
+        timing.record(elapsed, "member", route);
+        let phase_started = Instant::now();
         if status == 200 {
             admitted.push(route.clone());
             // Operator decision 1: an ordinary (non-master) agent's own
@@ -2119,13 +2233,21 @@ fn cad1767_member_route_sweep_carries_no_operator_text() {
                 leaks.push(format!("{route}: {hits:?}"));
             }
         }
+        timing.assertion += phase_started.elapsed();
+        let phase_started = Instant::now();
         let (ostatus, obody) = fx.sweep_get(route, &owner);
+        let elapsed = phase_started.elapsed();
+        timing.owner += elapsed;
+        timing.record(elapsed, "owner", route);
+        let phase_started = Instant::now();
         if ostatus == 200 {
             for hit in needle_hits(&obody) {
                 owner_seen.insert(hit.split(" @ ").next().unwrap().to_string());
             }
         }
+        timing.assertion += phase_started.elapsed();
     }
+    let phase_started = Instant::now();
     eprintln!(
         "CAD-1767 sweep: {} routes tried, {} answered 200 to the member",
         routes.len(),
@@ -2141,11 +2263,13 @@ fn cad1767_member_route_sweep_carries_no_operator_text() {
         .map(|needle| format!("control: the owner never saw {needle}"))
         .collect();
     wrong.extend(leaks);
+    timing.assertion += phase_started.elapsed();
 
     // The entity stream: agent frames go out only when an agent changes, so
     // read while changing both agents, and require that an `event: agent`
     // frame actually arrived (a quiet stream would prove nothing).
     for (who, cookie) in [("member", &member), ("owner", &owner)] {
+        let phase_started = Instant::now();
         let raw = fx.stream_while("/api/stream?entities=1", cookie, || {
             for (i, alias) in ["helper", "master"].iter().enumerate() {
                 let _ = fx.rpc(
@@ -2156,6 +2280,8 @@ fn cad1767_member_route_sweep_carries_no_operator_text() {
                 );
             }
         });
+        timing.stream_while += phase_started.elapsed();
+        let phase_started = Instant::now();
         let frames: Vec<&str> = raw
             .split("\n\n")
             .filter(|f| f.starts_with("event: agent") || f.contains("\nevent: agent"))
@@ -2179,11 +2305,15 @@ fn cad1767_member_route_sweep_carries_no_operator_text() {
                 n(10)
             ));
         }
+        timing.assertion += phase_started.elapsed();
     }
+    let phase_started = Instant::now();
     assert!(
         wrong.is_empty(),
         "operator text reached a member: {wrong:#?}"
     );
+    timing.assertion += phase_started.elapsed();
+    timing.teardown_started = Some(Instant::now());
 }
 
 impl Fx {
