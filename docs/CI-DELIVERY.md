@@ -378,6 +378,65 @@ plus the 15 explicitly declared targets. The CAD-869 measurement stands
 for the tree it was taken on; an archive producer's size and transfer cost
 are now different, so re-measure before reviving that flow.
 
+## Test execution network contract (CAD-1970)
+
+`scripts/run-result-tests` defaults to **no non-loopback outbound access
+during test execution**. Dependency/tool preparation and compilation remain
+outside the sandbox. The pinned nextest wrapper first builds the complete
+selected binary set with `list --list-type binaries-only`, then reads its
+test inventory from those binaries. Execution reuses both Cargo and binary
+metadata, so it does not invoke a build inside the sandbox. Selection,
+partitioning, zero retries, JUnit/inventory coverage checks, the `CADENCE_*`
+scrub, private HOME/XDG/TMPDIR, production-path refusal and restricted PATH
+remain in force.
+
+The mechanism is a fresh Linux network namespace (`sudo -n unshare -n`)
+with only `lo` brought up. Before any proof or test runs, `setpriv` restores
+the invoking non-root uid/gid and clears supplementary groups; the scrubbed
+environment is restored only after that privilege drop. It neither changes
+the host firewall nor gives the tests host networking. The runner prints
+the mechanism and performs two TCP proofs inside that same namespace:
+`1.1.1.1:443` must fail within a one-second timeout, and a listener it opens
+on `127.0.0.1` must accept a connection. Both results are printed. Missing
+tools, unavailable noninteractive privilege/namespace support, a root caller,
+failed identity restoration or either incorrect proof refuses execution;
+there is no automatic unsandboxed fallback.
+
+**The guarantee is prevention, not attempt detection: an attempted external
+connect is not a distinct suite failure if the test swallows its network
+error.** The proofs establish the network boundary, not syscall auditing.
+Tests that need services must use deterministic loopback fixtures in the
+same namespace, not host-network listeners or real external endpoints.
+
+On GitHub-hosted Ubuntu, the selected route uses the runner's passwordless
+sudo and standard util-linux (`unshare`, `setpriv`) plus iproute2 (`ip`).
+On `instabox-large` the same route requires noninteractive sudo and permission
+to create a network namespace; the runner checks this by actually creating
+the namespace rather than assuming the runner label grants it. Hardened
+containers may deny it and will fail closed. Unprivileged `unshare -rn` is
+not selected: Ubuntu user-namespace/AppArmor policy can deny its uid mapping,
+and mapping the caller to namespace root changes fixture identity semantics.
+A host firewall rule was rejected because privileged global rules interfere
+with concurrent jobs; an LD_PRELOAD shim misses static/direct-syscall callers,
+and ordinary seccomp cannot inspect the destination behind a sockaddr pointer.
+None is claimed as an attempted-connect audit mechanism.
+
+For a prepared checkout, run `scripts/run-result-tests` to see the two proof
+lines before the suite; the suite itself then runs normally. An explicit
+`scripts/run-result-tests --allow-egress` escape hatch disables isolation and
+prints a warning. Its outcome is **not** evidence for the no-egress contract.
+
+Release builds/artifact production, cross-builds and their dependency
+preparation remain separate compilation checks, not sandboxed test execution.
+Release/qualification checks that intentionally exercise real OS behavior
+(for example host namespaces, privileges or confinement) or real external
+platform behavior (provider/GitHub authentication, live APIs, downloads or
+network-dependent end-to-end qualification) must remain separately identified
+checks, with their actual host/network prerequisites and outcomes reported.
+They must not silently replace the isolated suite or be described as
+deterministic loopback-fixture coverage; use the explicit escape hatch only
+when such a separate qualification needs this runner.
+
 ## CI throughput benchmark (CAD-840)
 
 The suite runs once, on one `instabox-large`, at `--jobs $(nproc)` (capped
