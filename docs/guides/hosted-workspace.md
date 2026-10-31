@@ -237,7 +237,7 @@ An existing terminal or coding session starts the named issue itself instead:
 
 ```sh
 cadence --org acme issue start <issue-id> --repo /absolute/path/to/checkout --profile ap_<profile-id>
-cadence --org acme local-agent context ap_<profile-id>
+cadence --org acme agent context ap_<profile-id>
 cadence --org acme local-agent report <assignment-id> --state blocked --text "waiting for the owner"
 ```
 

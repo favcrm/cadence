@@ -1862,6 +1862,18 @@ impl<H: CoordHttp> Coordinator<H> {
             .claim_id
             .clone()
             .ok_or_else(|| Error::rejected("the claim has no id; no worktree was created"))?;
+        // The claim is reportable from the moment it exists: a lane that
+        // cannot be opened still leaves this session holding the work.
+        self.with_ledger(|ledger| {
+            for attempt in ledger.attempts.values_mut() {
+                if attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
+                    && attempt.claim_id.as_deref() == Some(claim_id.as_str())
+                {
+                    attempt.session_profile = Some(profile.to_string());
+                }
+            }
+            Ok(())
+        })?;
         let lane = self.lane_for(&claimed, name)?;
         let dir = ensure_lane(&root, &lane)?;
         let path = dir.display().to_string();
@@ -1870,7 +1882,6 @@ impl<H: CoordHttp> Coordinator<H> {
                 if attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
                     && attempt.claim_id.as_deref() == Some(claim_id.as_str())
                 {
-                    attempt.session_profile = Some(profile.to_string());
                     attempt.worktree = Some(path.clone());
                 }
             }

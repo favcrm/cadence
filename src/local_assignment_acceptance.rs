@@ -1821,6 +1821,34 @@ fn a_retired_session_claim_cannot_report_the_next_holders_claim() {
     );
 }
 
+#[test]
+fn a_claim_that_could_not_open_a_lane_is_still_reportable() {
+    let auth = private_dir();
+    let repo = private_dir();
+    git(repo.path(), &["init", "-b", "main"]);
+    fs::write(repo.path().join("README"), "checkout\n").expect("readme");
+    git(repo.path(), &["add", "README"]);
+    git(repo.path(), &["commit", "-m", "init"]);
+    // `.cadence` as a file makes the lane path unopenable after the claim lands.
+    fs::write(repo.path().join(".cadence"), "not a directory").expect("blocker");
+    let mut board = Board::empty();
+    let mine = board.seed("start", "waiting", None, ME);
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+
+    coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect_err("the lane cannot be opened");
+    assert_eq!(script.row(&mine).0, "running");
+
+    let reported = coord
+        .report(&mine, "failed", Some("lane could not be opened"), None)
+        .expect("a held claim reports even without a lane");
+
+    assert_eq!(reported["state"], "failed");
+    assert_eq!(script.row(&mine).0, "failed");
+}
+
 fn bind_file(dir: &Path, message: &str) -> Value {
     let bytes = fs::read(
         dir.join("hosted-assignments")
