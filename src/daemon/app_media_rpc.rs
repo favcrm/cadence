@@ -1443,9 +1443,29 @@ impl Shared {
                     "current_actor": media_actor(view),
                 }))
             }
-            "asset" => Err(Error::rejected(
-                "media asset detail is not admitted — no asset read exists yet",
-            )),
+            "asset" => {
+                // CAD-1962: one catalog row by id — the same metadata
+                // projection the page emits, never bytes or a locator.
+                // The catalog is store-wide, so an asset another install
+                // produced reads here under the same mount proof.
+                if input
+                    .as_object()
+                    .is_some_and(|o| o.keys().any(|k| !matches!(k.as_str(), "kind" | "asset_id")))
+                {
+                    return Err(Error::rejected("media asset input has unsupported fields"));
+                }
+                let asset_id = input
+                    .get("asset_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::rejected("media asset input needs an asset_id"))?;
+                let asset = self.store.app_media_asset(asset_id)?.ok_or_else(|| {
+                    Error::rejected("media asset is not in the workspace catalog")
+                })?;
+                Ok(json!({
+                    "asset": asset.projection(),
+                    "current_actor": media_actor(view),
+                }))
+            }
             _ => Err(Error::rejected(
                 "media read input kind is not a recognized media read",
             )),

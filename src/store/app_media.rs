@@ -461,6 +461,29 @@ impl Store {
         Ok((page, next))
     }
 
+    /// CAD-1962: one catalog row by id, with its lineage pointer — the
+    /// detail read the `asset` input kind returns. Same store-wide
+    /// boundary as the catalog page: the mount proved the workspace, so
+    /// permitted collaborators read any workspace asset regardless of
+    /// which installation produced it; `install_id` is provenance, not a
+    /// read partition. An absent id is `None` (the caller refuses it as
+    /// unknown), and a stored row that could not have been written by
+    /// this module refuses rather than projecting.
+    pub fn app_media_asset(&self, id: &str) -> Result<Option<MediaAsset>> {
+        if !valid_id(id) {
+            return Ok(None);
+        }
+        let conn = self.conn();
+        let row = conn.query_opt(
+            "SELECT a.id,a.install_id,a.title,a.kind,a.lifecycle,a.revision,a.creator,a.created,a.updated,l.source_asset_id
+             FROM app_media_assets a LEFT JOIN app_media_lineage l ON l.asset_id=a.id
+             WHERE a.id=?1",
+            params![id],
+            row_media_catalog,
+        )?;
+        row.map(MediaAsset::checked).transpose()
+    }
+
     /// CAD-1365 atomic producer association, run inside
     /// `app_capability_record`'s already-open write tx AFTER the new
     /// immutable receipt row exists and BEFORE its event — one commit
