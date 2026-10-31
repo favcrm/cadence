@@ -280,7 +280,11 @@ fn collect_projects(
         let file = dp::load(&pm.dir, &project.key);
         match delivery_approvals {
             Some(ap) => {
-                let eff = dp::effective(&project.key, file, ap.get(&project.key));
+                let eff = dp::effective(
+                    &project.key,
+                    file.map_err(|e| e.to_string()),
+                    ap.get(&project.key),
+                );
                 if let Some(note) = eff.note {
                     lint.warn(note);
                 }

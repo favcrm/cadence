@@ -1,0 +1,1498 @@
+//! The delivery-policy model and the rules that decide what a delivery
+//! needs to merge — the portable half of `src/issue/delivery_policy.rs`.
+//!
+//! Everything here is pure: it parses nothing from disk, reads no file and
+//! calls no program. The native crate keeps the `PROJECT.md` reader and the
+//! approval store, and re-exports these types so there is ONE policy model:
+//! the same digest, the same precedence, the same refusals, whether the call
+//! arrives from the CLI or from the hosted tenant through `core_evaluate`.
+
+use std::collections::{BTreeMap, HashMap};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::error::{Error, Result};
+use crate::issue::valid_tag;
+
+/// REVISE verdicts a ticket takes before the operator decides.
+pub const MAX_REVISE: u32 = 2;
+
+/// Changed lines over which a delivery is "heavy".
+pub const HEAVY_LINES: u64 = 800;
+
+/// Changed files over which a delivery is "heavy".
+pub const HEAVY_FILES: u64 = 10;
+
+/// Changed lines over which a delivery cannot merge through the loop.
+pub const OVERSIZED_LINES: u64 = 3000;
+
+/// Changed files over which a delivery cannot merge through the loop.
+pub const OVERSIZED_FILES: u64 = 40;
+
+pub const FOCI: &[&str] = &["general", "standards", "spec-security", "browser-qa"];
+
+/// A project's delivery policy — `PROJECT.md` `delivery:` or the
+/// defaults. [`parse`] builds it through the strict raw types and
+/// [`DeliveryPolicy::validate`]; `serde` round-trips the validated
+/// form (the approval payload's `delivery` key).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryPolicy {
+    /// How an approved PR merges.
+    pub merge: MergePolicy,
+    /// REVISE verdicts a ticket takes before the operator decides.
+    pub max_revise: u32,
+    /// The named reviews a `risk` rule may require.
+    pub reviews: BTreeMap<String, Review>,
+    /// Risk rules: a delivery must satisfy every review `require`d by
+    /// every rule whose `when` holds. A rule with no `when` always
+    /// applies.
+    pub risk: Vec<RiskRule>,
+    /// Over this a delivery is "heavy".
+    pub heavy: SizeLimit,
+    /// Over this a delivery cannot merge through the loop.
+    pub oversized: SizeLimit,
+    /// Optional legacy CAD-1298 profile, retained for compatible reads.
+    /// CAD-1314 needs no profile for default lean classification. Keeping
+    /// `None` omitted preserves existing canonical digests and approvals;
+    /// requirements always use [`Resolved`], never the raw file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solo_operator: Option<SoloOperatorProfile>,
+    /// CAD-1561: one extra PR target beyond the repository default
+    /// branch. `None` is omitted from the canonical JSON so existing
+    /// digests and approvals are unchanged. A non-default target is
+    /// admitted only while the exact current approved policy names it —
+    /// last-approved fallbacks (`delivery_unapproved` notes) do not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_branch: Option<String>,
+}
+
+/// The legacy solo-operator delivery profile (CAD-1298), still readable
+/// after CAD-1314 made the tiers default for valid default-equivalent policies.
+/// Custom, malformed and unapproved policies retain strict requirements.
+/// `version` is forward-proofing:
+/// `1` is the only accepted value, an unknown one refuses the whole
+/// section, so an older binary never silently accepts a profile shape it
+/// does not understand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoloOperatorProfile {
+    pub version: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergePolicy {
+    pub method: MergeMethod,
+    pub queue: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeMethod {
+    Squash,
+    Merge,
+    Rebase,
+}
+
+/// One named review a rule may require. `kind` picks the variant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Review {
+    /// An independent agent review; `focus` is one of [`FOCI`].
+    Agent { focus: String },
+    /// A GitHub App check (a bot). `mode: advisory` never blocks;
+    /// `required` blocks like an agent review.
+    Check { app: String, mode: CheckMode },
+    /// The operator decides.
+    Operator,
+}
+
+impl Review {
+    /// A review a delivery must wait for — everything except an
+    /// advisory `check` (a bot's verdict is advisory input).
+    pub fn blocking(&self) -> bool {
+        !matches!(
+            self,
+            Self::Check {
+                mode: CheckMode::Advisory,
+                ..
+            }
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckMode {
+    Advisory,
+    Required,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RiskRule {
+    /// The conditions under which the rule applies — ANY of them.
+    /// Absent: the rule always applies.
+    pub when: Option<RiskWhen>,
+    /// Names in `reviews` the delivery must satisfy.
+    pub require: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RiskWhen {
+    /// Repo-relative, file-level globs — the same grammar as the
+    /// `areas:` reader and `paths=` ([`crate::delivery_rules::check_path`]):
+    /// `*` and `?` match inside one segment, a `**` segment any number,
+    /// a trailing `/` everything under it. Slice 3 matches them with
+    /// `areas::matches`, so the two grammars must agree.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub lines_over: Option<u64>,
+    #[serde(default)]
+    pub files_over: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SizeLimit {
+    pub lines_over: u64,
+    pub files_over: u64,
+}
+
+/// The policy today's loop implements — used when there is no
+/// `delivery:` section. Built from the `delivery.rs` constants, never
+/// literals.
+pub fn default_policy() -> DeliveryPolicy {
+    DeliveryPolicy {
+        merge: MergePolicy {
+            method: MergeMethod::Squash,
+            queue: true,
+        },
+        max_revise: crate::delivery::MAX_REVISE,
+        reviews: BTreeMap::from([(
+            "review".to_string(),
+            Review::Agent {
+                focus: "general".to_string(),
+            },
+        )]),
+        risk: vec![RiskRule {
+            when: None,
+            require: vec!["review".to_string()],
+        }],
+        heavy: SizeLimit {
+            lines_over: crate::delivery::HEAVY_LINES,
+            files_over: crate::delivery::HEAVY_FILES,
+        },
+        oversized: SizeLimit {
+            lines_over: crate::delivery::OVERSIZED_LINES,
+            files_over: crate::delivery::OVERSIZED_FILES,
+        },
+        solo_operator: None,
+        integration_branch: None,
+    }
+}
+
+/// `sha256:<hex>` of the policy's canonical JSON — struct fields in
+/// declaration order, `reviews` as a BTreeMap — so reordered keys and
+/// omitted-vs-written defaults share one digest. `risk` rule ORDER is
+/// significant (the rules are hashed as a list, even though slice 3
+/// applies the union of every matching rule), so reordering rules
+/// changes the digest and needs re-approval.
+pub fn digest(p: &DeliveryPolicy) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_vec(p).expect("DeliveryPolicy always serializes");
+    let hash = Sha256::digest(&canonical);
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256:{hex}")
+}
+
+/// The policy a project runs under, and why. `source` is `default`,
+/// `file` or `approved`; `digest` is always the digest of `policy`;
+/// `note` is `Some("delivery_unapproved: …")`/`"delivery_error: …"`
+/// when the file's section is not the one in force.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Resolved {
+    pub policy: DeliveryPolicy,
+    pub source: &'static str,
+    pub digest: String,
+    pub note: Option<String>,
+}
+
+/// The delivery half of a `project_work_approve` payload: the recorded
+/// digest plus the policy it approved (`None` = approved "no
+/// section").
+#[derive(Clone, Debug, PartialEq)]
+pub struct Approved {
+    pub digest: String,
+    pub policy: Option<DeliveryPolicy>,
+}
+
+/// The delivery half of a `project_work_approve` payload, or `None`
+/// when the payload is an old-format approval (no `delivery_digest`
+/// key), its `delivery` no longer deserializes and validates, or the
+/// recorded digest does not match the recorded policy — any
+/// inconsistency reads as no delivery approval, the fail-safe
+/// direction.
+pub fn approved_from(payload: &Value) -> Option<Approved> {
+    let recorded = payload["delivery_digest"].as_str()?.to_string();
+    let policy = match payload.get("delivery") {
+        None | Some(Value::Null) => {
+            if recorded != digest(&default_policy()) {
+                return None;
+            }
+            None
+        }
+        Some(v) => {
+            let p: DeliveryPolicy = serde_json::from_value(v.clone()).ok()?;
+            p.validate().ok()?;
+            if digest(&p) != recorded {
+                return None;
+            }
+            Some(p)
+        }
+    };
+    Some(Approved {
+        digest: recorded,
+        policy,
+    })
+}
+
+/// Project key → its recorded delivery approval.
+pub type DeliveryApprovals = HashMap<String, Approved>;
+
+/// Resolve a project's policy from what was read from its PROJECT.md
+/// (`Err` carries the parse error) and its latest
+/// `project_work_approve` delivery half, if any. Pure.
+pub fn effective(
+    key: &str,
+    file: std::result::Result<Option<DeliveryPolicy>, String>,
+    approved: Option<&Approved>,
+) -> Resolved {
+    let resolved = |policy: DeliveryPolicy, source: &'static str, note: Option<String>| {
+        let digest = digest(&policy);
+        Resolved {
+            policy,
+            source,
+            digest,
+            note,
+        }
+    };
+    let approve_cmd = format!("`cadence issue project approve-work {key}`");
+    match file {
+        Ok(Some(p)) => {
+            let dg = digest(&p);
+            // The approval is checked first: while a custom policy is
+            // approved, ANY different section — including a
+            // default-equivalent one — keeps the approved policy in
+            // force, otherwise an agent could swap it for the weaker
+            // defaults with no note.
+            if let Some(a) = approved {
+                if a.digest == dg && a.policy.is_some() {
+                    return resolved(p, "approved", None);
+                }
+                if let Some(q) = &a.policy {
+                    return resolved(
+                        q.clone(),
+                        "approved",
+                        Some(format!(
+                            "delivery_unapproved: {key}/PROJECT.md delivery changed since \
+                             approval ({dg}) — the approved policy ({}) stays in force \
+                             until {approve_cmd}",
+                            a.digest
+                        )),
+                    );
+                }
+            }
+            if dg == digest(&default_policy()) {
+                return resolved(p, "file", None);
+            }
+            resolved(
+                default_policy(),
+                "default",
+                Some(format!(
+                    "delivery_unapproved: {key}/PROJECT.md delivery differs from the \
+                     default and is not operator-approved ({dg}) — the default applies \
+                     until {approve_cmd}"
+                )),
+            )
+        }
+        Ok(None) => match approved.and_then(|a| a.policy.clone()) {
+            Some(q) => resolved(
+                q,
+                "approved",
+                Some(format!(
+                    "delivery_unapproved: {key}/PROJECT.md delivery was removed since \
+                     approval — the approved policy stays in force until {approve_cmd}"
+                )),
+            ),
+            None => resolved(default_policy(), "default", None),
+        },
+        Err(e) => match approved.and_then(|a| a.policy.clone()) {
+            Some(q) => resolved(
+                q,
+                "approved",
+                Some(format!(
+                    "delivery_unapproved: {key}/PROJECT.md delivery is malformed ({e}) \
+                     — the approved policy stays in force"
+                )),
+            ),
+            None => resolved(
+                default_policy(),
+                "default",
+                Some(format!(
+                    "delivery_error: {key}/PROJECT.md delivery is malformed ({e}) \
+                     — the default applies"
+                )),
+            ),
+        },
+    }
+}
+
+/// A `check` `app`: a GitHub App slug (`^[a-z0-9][a-z0-9-]{0,99}$`) or
+/// an App id (all digits, same 100-char cap).
+fn valid_app(app: &str) -> bool {
+    if !app.is_empty() && app.bytes().all(|b| b.is_ascii_digit()) {
+        return app.len() <= 100;
+    }
+    !app.is_empty()
+        && app.len() <= 100
+        && app.as_bytes()[0] != b'-'
+        && app
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// A canonical GitHub branch name — plain `heads/` content only, no
+/// `refs/` prefix, revision operator, whitespace or control/format
+/// mark, and not `HEAD`/`@`. Mirrors `git check-ref-format --branch`'s
+/// documented rules so an approved target can never smuggle a symbolic
+/// ref, a remote path, or a revision expression.
+fn valid_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "HEAD"
+        && name != "@"
+        && !name.starts_with("refs/")
+        && !name.starts_with('-')
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.contains("@{")
+        && name.bytes().all(|b| {
+            !(b <= 0x20 || b == 0x7f)
+                && !matches!(b, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+        && name
+            .split('/')
+            .all(|seg| !seg.starts_with('.') && !seg.ends_with('.') && !seg.ends_with(".lock"))
+        && crate::delivery_rules::scrub(name) == name
+}
+
+/// A `when.paths` entry: the same repo-relative, file-level glob
+/// grammar `areas:` and `paths=` use — slice 3 matches with
+/// `areas::matches`, so the two must accept exactly the same strings.
+/// On top of that, an entry carrying a control or format mark is
+/// refused outright: its text would be scrubbed on display anyway,
+/// never a valid glob.
+fn check_glob(path: &str) -> Result<()> {
+    crate::delivery_rules::check_path(path).map_err(|e| {
+        Error::rejected(format!(
+            "when.paths {}",
+            crate::delivery_rules::scrub(&e.to_string())
+        ))
+    })?;
+    if crate::delivery_rules::scrub(path) != path {
+        return Err(Error::rejected(format!(
+            "when.paths entry {path:?} carries a control or format mark"
+        )));
+    }
+    Ok(())
+}
+
+impl DeliveryPolicy {
+    /// Every rule fails closed: a malformed section is refused whole,
+    /// never partially applied.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(s) = &self.solo_operator {
+            // Checked here too, not only in RawDelivery: `approved_from`
+            // deserializes an approval's `delivery` directly and calls
+            // this — a recorded profile must satisfy the same rules.
+            if s.version != 1 {
+                return Err(err(format!(
+                    "solo_operator.version {}: the only supported version is 1",
+                    s.version
+                )));
+            }
+            // CAD-1298: the profile never silently discards custom
+            // requirements — it is supported only on an otherwise
+            // default-equivalent policy. A custom reviews/risk/limits
+            // configuration alongside a profile is refused rather than
+            // partially honored.
+            let mut rest = self.clone();
+            rest.solo_operator = None;
+            rest.integration_branch = None;
+            if rest != default_policy() {
+                return Err(err(
+                    "solo_operator is supported only on the default delivery policy — \
+                     a custom merge/reviews/risk/limits configuration beside a \
+                     profile is refused",
+                ));
+            }
+        }
+        if let Some(b) = &self.integration_branch {
+            // Checked here too: `approved_from` deserializes a recorded
+            // `delivery` directly — a malformed approved target must
+            // invalidate the whole approval, not survive it.
+            if !valid_branch_name(b) {
+                return Err(err(format!(
+                    "integration_branch {b:?}: not a canonical GitHub branch name"
+                )));
+            }
+        }
+        if self.reviews.is_empty() {
+            return Err(err("reviews must name at least one review"));
+        }
+        for name in self.reviews.keys() {
+            if !valid_tag(name) {
+                return Err(err(format!("reviews.{name:?}: not a valid name")));
+            }
+        }
+        if self.risk.is_empty() {
+            return Err(err("risk must hold at least one rule"));
+        }
+        let mut floor = false;
+        for (i, rule) in self.risk.iter().enumerate() {
+            if rule.require.is_empty() {
+                return Err(err(format!(
+                    "risk[{i}].require must name at least one review"
+                )));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for req in &rule.require {
+                if !seen.insert(req) {
+                    return Err(err(format!("risk[{i}].require names {req:?} twice")));
+                }
+                match self.reviews.get(req) {
+                    None => {
+                        return Err(err(format!(
+                            "risk[{i}].require names undefined review {req:?}"
+                        )))
+                    }
+                    Some(r) if !r.blocking() => {
+                        return Err(err(format!(
+                            "risk[{i}].require names {req:?}, an advisory check — \
+                             advisory reviews never block: use mode: required or drop \
+                             it from require"
+                        )))
+                    }
+                    _ => {}
+                }
+            }
+            match &rule.when {
+                None => {
+                    // The floor is a human-or-peer gate: only an agent
+                    // or operator review counts — a `check` is a bot
+                    // and never satisfies it, even `mode: required`
+                    // (which still blocks where a rule names it).
+                    if rule
+                        .require
+                        .iter()
+                        .any(|r| matches!(self.reviews[r], Review::Agent { .. } | Review::Operator))
+                    {
+                        floor = true;
+                    }
+                }
+                Some(when) => {
+                    if when.paths.is_empty()
+                        && when.lines_over.is_none()
+                        && when.files_over.is_none()
+                    {
+                        return Err(err(format!("risk[{i}].when has no condition")));
+                    }
+                    for (key, v) in [
+                        ("lines_over", when.lines_over),
+                        ("files_over", when.files_over),
+                    ]
+                    .into_iter()
+                    .filter_map(|(k, v)| v.map(|v| (k, v)))
+                    {
+                        if v < 1 {
+                            return Err(err(format!("risk[{i}].when.{key} must be >= 1")));
+                        }
+                    }
+                    for path in &when.paths {
+                        check_glob(path).map_err(|e| err(format!("risk[{i}].{e}")))?;
+                    }
+                }
+            }
+        }
+        if !floor {
+            return Err(err(
+                "risk must hold one unconditional rule (no `when`) whose require \
+                 includes an agent or operator review — a bot check never \
+                 satisfies the floor",
+            ));
+        }
+        if !(1..=10).contains(&self.max_revise) {
+            return Err(err(format!(
+                "max_revise {} is outside 1..=10",
+                self.max_revise
+            )));
+        }
+        for (name, size) in [("heavy", &self.heavy), ("oversized", &self.oversized)] {
+            if size.lines_over < 1 || size.files_over < 1 {
+                return Err(err(format!("{name} sizes must be >= 1")));
+            }
+        }
+        if self.heavy.lines_over >= self.oversized.lines_over
+            || self.heavy.files_over >= self.oversized.files_over
+        {
+            return Err(err("heavy must be under oversized on both fields"));
+        }
+        Ok(())
+    }
+}
+
+/// `PROJECT.md` frontmatter for this reader — lenient: the file carries keys
+/// other readers own (`agents`, `stages`, `areas`, …).
+#[derive(Deserialize)]
+pub(crate) struct Front {
+    #[serde(default)]
+    pub(crate) delivery: Option<serde_yaml::Value>,
+}
+
+/// The raw `delivery:` section — every level `deny_unknown_fields`,
+/// then each raw node converts to its validated type with an error
+/// that names the offending key. `reviews` and `risk` are required.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDelivery {
+    #[serde(default)]
+    merge: Option<RawMerge>,
+    #[serde(default)]
+    max_revise: Option<u32>,
+    reviews: BTreeMap<String, RawReview>,
+    risk: Vec<RiskRule>,
+    #[serde(default)]
+    heavy: Option<RawSize>,
+    #[serde(default)]
+    oversized: Option<RawSize>,
+    #[serde(default)]
+    solo_operator: Option<SoloOperatorProfile>,
+    #[serde(default)]
+    integration_branch: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMerge {
+    #[serde(default)]
+    method: Option<MergeMethod>,
+    #[serde(default)]
+    queue: Option<bool>,
+}
+
+/// A flat review: `kind` plus every key any variant could take, so
+/// the conversion can refuse the keys a kind does not own with an
+/// exact per-kind message (an internally tagged enum cannot).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReview {
+    kind: String,
+    #[serde(default)]
+    focus: Option<String>,
+    #[serde(default)]
+    app: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSize {
+    #[serde(default)]
+    lines_over: Option<u64>,
+    #[serde(default)]
+    files_over: Option<u64>,
+}
+
+fn err(msg: impl std::fmt::Display) -> Error {
+    // Rejected section text is embedded in these messages; scrub it so
+    // a control character or a bidi/format mark can never reach a lint
+    // warning or a `project ls` note.
+    Error::rejected(format!(
+        "PROJECT.md delivery: {}",
+        crate::delivery_rules::scrub(&format!("{msg}"))
+    ))
+}
+
+impl RawReview {
+    fn into_review(self, name: &str) -> Result<Review> {
+        let refused = |key: &str, has: &Option<String>| -> Result<()> {
+            if has.is_some() {
+                return Err(err(format!(
+                    "reviews.{name:?}: a {:?} review takes no '{key}'",
+                    self.kind
+                )));
+            }
+            Ok(())
+        };
+        match self.kind.as_str() {
+            "agent" => {
+                refused("app", &self.app)?;
+                refused("mode", &self.mode)?;
+                let focus = self.focus.ok_or_else(|| {
+                    err(format!(
+                        "reviews.{name:?}: an 'agent' review needs a 'focus'"
+                    ))
+                })?;
+                if !FOCI.contains(&focus.as_str()) {
+                    return Err(err(format!(
+                        "reviews.{name:?}.focus {focus:?}: not a known focus ({})",
+                        FOCI.join(", ")
+                    )));
+                }
+                Ok(Review::Agent { focus })
+            }
+            "check" => {
+                refused("focus", &self.focus)?;
+                let app = self.app.ok_or_else(|| {
+                    err(format!("reviews.{name:?}: a 'check' review needs an 'app'"))
+                })?;
+                if !valid_app(&app) {
+                    return Err(err(format!(
+                        "reviews.{name:?}.app {app:?}: not a GitHub App slug \
+                         (^[a-z0-9][a-z0-9-]{{0,99}}$) or an App id (all digits)"
+                    )));
+                }
+                let mode = match self.mode.as_deref() {
+                    None => {
+                        return Err(err(format!(
+                            "reviews.{name:?}: a 'check' review needs a 'mode' \
+                             (advisory|required)"
+                        )))
+                    }
+                    Some("advisory") => CheckMode::Advisory,
+                    Some("required") => CheckMode::Required,
+                    Some(m) => {
+                        return Err(err(format!(
+                            "reviews.{name:?}.mode {m:?}: advisory|required"
+                        )))
+                    }
+                };
+                Ok(Review::Check { app, mode })
+            }
+            "operator" => {
+                refused("focus", &self.focus)?;
+                refused("app", &self.app)?;
+                refused("mode", &self.mode)?;
+                Ok(Review::Operator)
+            }
+            other => Err(err(format!(
+                "reviews.{name:?}.kind {other:?}: unknown kind (agent|check|operator)"
+            ))),
+        }
+    }
+}
+
+impl RawDelivery {
+    fn into_policy(self) -> Result<DeliveryPolicy> {
+        let merge = self.merge.unwrap_or(RawMerge {
+            method: None,
+            queue: None,
+        });
+        let size = |raw: Option<RawSize>, lines: u64, files: u64| {
+            let raw = raw.unwrap_or(RawSize {
+                lines_over: None,
+                files_over: None,
+            });
+            SizeLimit {
+                lines_over: raw.lines_over.unwrap_or(lines),
+                files_over: raw.files_over.unwrap_or(files),
+            }
+        };
+        let heavy = size(
+            self.heavy,
+            crate::delivery::HEAVY_LINES,
+            crate::delivery::HEAVY_FILES,
+        );
+        let oversized = size(
+            self.oversized,
+            crate::delivery::OVERSIZED_LINES,
+            crate::delivery::OVERSIZED_FILES,
+        );
+        let mut reviews = BTreeMap::new();
+        for (name, raw) in self.reviews {
+            reviews.insert(name.clone(), raw.into_review(&name)?);
+        }
+        if let Some(s) = &self.solo_operator {
+            if s.version != 1 {
+                return Err(err(format!(
+                    "solo_operator.version {}: the only supported version is 1",
+                    s.version
+                )));
+            }
+        }
+        if let Some(b) = &self.integration_branch {
+            if !valid_branch_name(b) {
+                return Err(err(format!(
+                    "integration_branch {b:?}: not a canonical GitHub branch name"
+                )));
+            }
+        }
+        Ok(DeliveryPolicy {
+            merge: MergePolicy {
+                method: merge.method.unwrap_or(MergeMethod::Squash),
+                queue: merge.queue.unwrap_or(true),
+            },
+            max_revise: self.max_revise.unwrap_or(crate::delivery::MAX_REVISE),
+            reviews,
+            risk: self.risk,
+            heavy,
+            oversized,
+            solo_operator: self.solo_operator,
+            integration_branch: self.integration_branch,
+        })
+    }
+}
+
+/// The policy today's loop implements — used when there is no
+/// `delivery:` section. Built from the `delivery.rs` constants, never
+/// literals.
+pub fn parse(text: &str) -> Result<Option<DeliveryPolicy>> {
+    let trimmed = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if !trimmed.starts_with("---\n") && !trimmed.starts_with("---\r\n") {
+        return Ok(None);
+    }
+    let (yaml, _) = crate::frontmatter::split_front(trimmed)?;
+    let front: Front = serde_yaml::from_str(yaml).map_err(|e| {
+        Error::rejected(format!(
+            "PROJECT.md frontmatter: {}",
+            crate::delivery_rules::scrub(&e.to_string())
+        ))
+    })?;
+    let Some(value) = front.delivery else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw: RawDelivery = serde_yaml::from_value(value).map_err(err)?;
+    let policy = raw.into_policy()?;
+    policy.validate()?;
+    Ok(Some(policy))
+}
+
+/// [`load`] over a PROJECT.md text already read — locally or from a
+/// hosted org (CAD-1946). `None` is "no PROJECT.md".
+pub fn parse_project(key: &str, text: Option<&str>) -> Result<Option<DeliveryPolicy>> {
+    match text {
+        None => Ok(None),
+        Some(text) => parse(text).map_err(|e| Error::rejected(format!("{key}: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse_delivery(yaml: &str) -> Result<Option<DeliveryPolicy>> {
+        parse(&format!("---\n{yaml}\n---\n# P\n"))
+    }
+
+    fn err_of(yaml: &str) -> String {
+        parse_delivery(yaml).unwrap_err().to_string()
+    }
+
+    /// A custom policy (≠ the defaults) that validates.
+    fn custom() -> DeliveryPolicy {
+        parse_delivery(
+            "delivery:\n  reviews:\n    review: {kind: agent, focus: general}\n    \
+             standards: {kind: agent, focus: standards}\n    \
+             devin: {kind: check, app: devin, mode: advisory}\n    \
+             gate: {kind: operator}\n  risk:\n    - require: [review]\n    \
+             - when: {paths: [\"ui/**\"]}\n      require: [review, gate]\n  max_revise: 3\n",
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn approval_for(p: &DeliveryPolicy) -> Approved {
+        Approved {
+            digest: digest(p),
+            policy: Some(p.clone()),
+        }
+    }
+
+    #[test]
+    fn default_policy_is_the_loop_constants() {
+        let d = default_policy();
+        assert_eq!(d.max_revise, crate::delivery::MAX_REVISE);
+        assert_eq!(d.heavy.lines_over, crate::delivery::HEAVY_LINES);
+        assert_eq!(d.heavy.files_over, crate::delivery::HEAVY_FILES);
+        assert_eq!(d.oversized.lines_over, crate::delivery::OVERSIZED_LINES);
+        assert_eq!(d.oversized.files_over, crate::delivery::OVERSIZED_FILES);
+        assert_eq!(
+            d.merge,
+            MergePolicy {
+                method: MergeMethod::Squash,
+                queue: true
+            }
+        );
+        assert_eq!(
+            d.reviews,
+            BTreeMap::from([(
+                "review".to_string(),
+                Review::Agent {
+                    focus: "general".to_string()
+                }
+            )])
+        );
+        assert_eq!(
+            d.risk,
+            vec![RiskRule {
+                when: None,
+                require: vec!["review".to_string()]
+            }]
+        );
+        d.validate().unwrap();
+    }
+
+    #[test]
+    fn parse_none_without_frontmatter_or_key() {
+        assert_eq!(parse("# plain markdown\n").unwrap(), None);
+        assert_eq!(
+            parse("---\nproject: x\nagents: {dev: 1}\n---\n").unwrap(),
+            None
+        );
+        assert_eq!(parse_delivery("delivery: null\n").unwrap(), None);
+    }
+
+    #[test]
+    fn the_full_example_parses_and_reparses() {
+        let p = parse_delivery(
+            "project: x\ndelivery:\n  merge: {method: merge, queue: false}\n  max_revise: 4\n  \
+             reviews:\n    standards: {kind: agent, focus: standards}\n    \
+             spec: {kind: agent, focus: spec-security}\n    browser: {kind: agent, focus: browser-qa}\n    \
+             devin: {kind: check, app: devin-ai-integration, mode: advisory}\n    \
+             operator: {kind: operator}\n  \
+             risk:\n    - require: [standards, spec]\n    \
+             - when: {paths: [\"ui/**\"]}\n      require: [browser]\n    \
+             - when: {paths: [\".github/**\"], lines_over: 1500, files_over: 40}\n      \
+             require: [operator]\n  \
+             heavy: {lines_over: 100, files_over: 3}\n  \
+             oversized: {lines_over: 900, files_over: 20}\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.merge.method, MergeMethod::Merge);
+        assert!(!p.merge.queue);
+        assert_eq!(p.max_revise, 4);
+        assert_eq!(p.reviews.len(), 5);
+        assert_eq!(
+            p.reviews["devin"],
+            Review::Check {
+                app: "devin-ai-integration".into(),
+                mode: CheckMode::Advisory
+            }
+        );
+        assert!(!p.reviews["devin"].blocking());
+        assert!(p.reviews["operator"].blocking());
+        assert_eq!(p.risk.len(), 3);
+        assert_eq!(p.risk[1].when.as_ref().unwrap().paths, vec!["ui/**"]);
+        assert_eq!(p.risk[2].when.as_ref().unwrap().lines_over, Some(1500));
+        assert_eq!(p.heavy.lines_over, 100);
+        assert_eq!(p.oversized.files_over, 20);
+        // The digest is stable across parse → serialize → parse.
+        let reparsed: DeliveryPolicy =
+            serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+        reparsed.validate().unwrap();
+        assert_eq!(digest(&p), digest(&reparsed));
+        assert!(digest(&p).starts_with("sha256:"));
+    }
+
+    #[test]
+    fn unknown_keys_and_variants_are_refused_naming_the_key() {
+        for (yaml, key) in [
+            ("delivery: {bogus: 1}", "bogus"),
+            ("delivery: {merge: {bogus: 1}}", "bogus"),
+            ("delivery: {merge: {method: fold}}", "fold"),
+            ("delivery: {reviews: {r: {kind: agent, focus: general, bogus: 1}}, risk: [{require: [r]}]}", "bogus"),
+            ("delivery: {reviews: {r: {kind: check, app: a, mode: advisory, bogus: 1}}, risk: [{require: [r]}]}", "bogus"),
+            ("delivery: {reviews: {r: {kind: operator, bogus: 1}}, risk: [{require: [r]}]}", "bogus"),
+            ("delivery: {reviews: {r: {kind: robot}}, risk: [{require: [r]}]}", "robot"),
+            ("delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{bogus: 1, require: [r]}]}", "bogus"),
+            ("delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{when: {bogus: 1}, require: [r]}]}", "bogus"),
+            ("delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], heavy: {bogus: 3}}", "bogus"),
+            ("delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], oversized: {bogus: 3}}", "bogus"),
+            // unknown enum variants
+            ("delivery: {reviews: {r: {kind: check, app: a, mode: sometimes}}, risk: [{require: [r]}]}", "sometimes"),
+        ] {
+            let e = err_of(yaml);
+            assert!(e.contains(key), "{yaml} -> {e}");
+            assert!(e.starts_with("PROJECT.md delivery:"), "{yaml} -> {e}");
+        }
+        // …while keys other readers own still pass.
+        let ok = parse_delivery(
+            "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}]}\n\
+             stages: [a, b]\nareas: {}\n",
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+    }
+
+    /// Validation rules 1–11, each a failing case that names WHY the
+    /// rule refused — a case failing for another reason would hide a
+    /// missing guard.
+    #[test]
+    fn validation_rules_each_refuse() {
+        for (yaml, why) in [
+            // 1: reviews non-empty; names are tags.
+            ("delivery: {reviews: {}, risk: [{require: [r]}]}", "at least one review"),
+            (
+                "delivery: {reviews: {Bad: {kind: agent, focus: general}}, risk: [{require: [Bad]}]}",
+                "not a valid name",
+            ),
+            // 2: agent needs focus in FOCI; app/mode refused.
+            (
+                "delivery: {reviews: {r: {kind: agent}}, risk: [{require: [r]}]}",
+                "needs a 'focus'",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: madeup}}, risk: [{require: [r]}]}",
+                "not a known focus",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general, app: x}}, risk: [{require: [r]}]}",
+                "takes no 'app'",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general, mode: advisory}}, risk: [{require: [r]}]}",
+                "takes no 'mode'",
+            ),
+            // 3: check needs a slug-or-id app and a mode; focus refused.
+            (
+                "delivery: {reviews: {r: {kind: check, mode: advisory}}, risk: [{require: [r]}]}",
+                "needs an 'app'",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: check, app: '-x', mode: advisory}}, risk: [{require: [r]}]}",
+                "not a GitHub App slug",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: check, app: 'X', mode: advisory}}, risk: [{require: [r]}]}",
+                "not a GitHub App slug",
+            ),
+            (
+                // 101-char slug is over the cap.
+                "delivery: {reviews: {r: {kind: check, app: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', mode: advisory}}, risk: [{require: [r]}]}",
+                "not a GitHub App slug",
+            ),
+            (
+                // A 101-digit App id is capped the same.
+                "delivery: {reviews: {r: {kind: check, app: '11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111', mode: advisory}}, risk: [{require: [r]}]}",
+                "not a GitHub App slug",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: check, app: a}}, risk: [{require: [r]}]}",
+                "needs a 'mode'",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: check, app: a, mode: advisory, focus: general}}, risk: [{require: [r]}]}",
+                "takes no 'focus'",
+            ),
+            // 4: operator refuses focus/app/mode.
+            (
+                "delivery: {reviews: {r: {kind: operator, focus: general}}, risk: [{require: [r]}]}",
+                "takes no 'focus'",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: operator, mode: advisory}}, risk: [{require: [r]}]}",
+                "takes no 'mode'",
+            ),
+            // 6: risk non-empty; require non-empty, no dups, defined.
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: []}",
+                "at least one rule",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: []}]}",
+                "require must name at least one review",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r, r]}]}",
+                "twice",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [nope]}]}",
+                "undefined review \"nope\"",
+            ),
+            // 7: require may not name an advisory check.
+            (
+                "delivery: {reviews: {r: {kind: check, app: ok, mode: advisory}, \
+                           g: {kind: operator}}, risk: [{require: [r, g]}]}",
+                "advisory check",
+            ),
+            // 8: when needs a condition; sizes >= 1; path syntax.
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+                           risk: [{require: [r]}, {when: {}, require: [r]}]}",
+                "has no condition",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+                           risk: [{require: [r]}, {when: {lines_over: 0}, require: [r]}]}",
+                "when.lines_over must be >= 1",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+                           risk: [{require: [r]}, {when: {files_over: 0}, require: [r]}]}",
+                "when.files_over must be >= 1",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: operator}}, \
+                           risk: [{require: [r]}, {when: {paths: ['']}, require: [r]}]}",
+                "is empty",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: operator}}, \
+                           risk: [{require: [r]}, {when: {paths: ['/abs']}, require: [r]}]}",
+                "relative to the repo root",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: operator}}, \
+                           risk: [{require: [r]}, {when: {paths: ['a/../b']}, require: [r]}]}",
+                "'..' segment",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: operator}}, \
+                           risk: [{require: [r]}, {when: {paths: ['a\\\\b']}, require: [r]}]}",
+                "backslash",
+            ),
+            (
+                // A control character (a tab) in a path entry.
+                "delivery: {reviews: {r: {kind: operator}}, \
+                           risk: [{require: [r]}, {when: {paths: [\"a\\tb\"]}, require: [r]}]}",
+                "a control character",
+            ),
+            // 9: the safety floor — an unconditional rule must require an agent or operator review.
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+                           risk: [{when: {paths: [a]}, require: [r]}]}",
+                "unconditional rule",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: operator}, d: {kind: check, app: a, mode: required}}, \
+                           risk: [{when: {paths: [x]}, require: [d]}]}",
+                "unconditional rule",
+            ),
+            // The floor needs an agent or operator review — a bot
+            // check never satisfies it, even `required`: alone
+            // unconditionally, or beside a conditional agent rule.
+            (
+                "delivery: {reviews: {c: {kind: check, app: '12345', mode: required}}, \
+                           risk: [{require: [c]}]}",
+                "a bot check never satisfies the floor",
+            ),
+            (
+                "delivery: {reviews: {c: {kind: check, app: '12345', mode: required}, \
+                           r: {kind: agent, focus: general}}, \
+                           risk: [{require: [c]}, {when: {lines_over: 1}, require: [r]}]}",
+                "a bot check never satisfies the floor",
+            ),
+            // 10: max_revise in 1..=10.
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], max_revise: 0}",
+                "outside 1..=10",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], max_revise: 11}",
+                "outside 1..=10",
+            ),
+            // 11: sizes >= 1, heavy strictly under oversized.
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
+                           heavy: {lines_over: 0}}",
+                "heavy sizes must be >= 1",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
+                           heavy: {files_over: 0}}",
+                "heavy sizes must be >= 1",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
+                           oversized: {lines_over: 0}}",
+                "oversized sizes must be >= 1",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
+                           oversized: {files_over: 0}}",
+                "oversized sizes must be >= 1",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
+                           oversized: {lines_over: 100}}",
+                "heavy must be under oversized",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
+                           heavy: {files_over: 50}}",
+                "heavy must be under oversized",
+            ),
+        ] {
+            let e = err_of(yaml);
+            assert!(e.contains(why), "{yaml} -> {e}");
+            assert!(e.starts_with("PROJECT.md delivery:"), "{yaml} -> {e}");
+        }
+        // …and the floor accepts an agent or an operator — a required
+        // check may join them, but never stands alone.
+        for yaml in [
+            "delivery: {reviews: {g: {kind: operator}}, risk: [{require: [g]}]}",
+            "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}]}",
+            "delivery: {reviews: {c: {kind: check, app: '12345', mode: required}, \
+                        r: {kind: agent, focus: general}}, risk: [{require: [c, r]}]}",
+            "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+                       risk: [{require: [r]}, {when: {paths: ['**', 'x/**/y']}, require: [r]}]}",
+        ] {
+            assert!(parse_delivery(yaml).unwrap().is_some(), "{yaml}");
+        }
+    }
+
+    /// `when.paths` uses the same file-level glob grammar as `areas:`
+    /// and `paths=` — slice 3 matches with `areas::matches`, so both
+    /// must accept exactly the same strings.
+    #[test]
+    fn paths_use_the_areas_glob_grammar() {
+        let accepted = [
+            "src/**", "**/x.rs", "src/*.rs", "a/**/b", "*", "**", "a?b", "ui/",
+        ];
+        let refused = [
+            ("", "is empty"),
+            ("/abs", "relative to the repo root"),
+            ("~/x", "relative to the repo root"),
+            ("a//b", "empty, '.' or '..' segment"),
+            ("a/./b", "empty, '.' or '..' segment"),
+            ("a/../b", "empty, '.' or '..' segment"),
+            ("a\\b", "backslash"),
+            ("a,b", "comma"),
+            ("a#sym", "names a symbol"),
+        ];
+        let parse_paths = |paths: &str| {
+            parse_delivery(&format!(
+                "delivery: {{reviews: {{r: {{kind: agent, focus: general}}}}, \
+                 risk: [{{require: [r]}}, {{when: {{paths: [{paths}]}}, require: [r]}}]}}"
+            ))
+        };
+        for path in accepted {
+            assert!(
+                parse_paths(&format!("'{path}'")).unwrap().is_some(),
+                "{path}"
+            );
+        }
+        for (path, why) in refused {
+            let e = parse_paths(&format!("'{path}'")).unwrap_err().to_string();
+            assert!(e.contains(why), "{path} -> {e}");
+        }
+        // `check_glob` and `areas::check_path` agree on every entry.
+        for path in accepted
+            .iter()
+            .copied()
+            .chain(refused.iter().map(|(p, _)| *p))
+        {
+            assert_eq!(
+                check_glob(path).is_ok(),
+                crate::delivery_rules::check_path(path).is_ok(),
+                "{path}"
+            );
+        }
+    }
+
+    /// Rejected text never reaches an error raw — control characters
+    /// and bidi/format marks (U+202E & co) are scrubbed from every
+    /// error a section can produce. YAML refuses raw control
+    /// characters at the lexer, so the direct `check_glob`/`validate`
+    /// calls stand in for the file path.
+    #[test]
+    fn rejected_text_is_scrubbed_in_errors() {
+        let e = check_glob("a\u{7}b").unwrap_err().to_string();
+        assert!(e.contains("a control character"), "{e}");
+        assert!(e.chars().all(|c| !c.is_control()), "{e:?}");
+        // A bidi mark in a paths entry is refused, unechoed.
+        let e = check_glob("a\u{202E}b").unwrap_err().to_string();
+        assert!(!e.contains('\u{202E}'), "{e:?}");
+        assert!(e.chars().all(|c| !c.is_control()), "{e:?}");
+        // A review name carrying a control or bidi character scrubs the
+        // same.
+        for name in ["r\u{7}", "r\u{202E}"] {
+            let mut p = default_policy();
+            p.reviews.insert(
+                name.to_string(),
+                Review::Agent {
+                    focus: "general".into(),
+                },
+            );
+            let e = p.validate().unwrap_err().to_string();
+            assert!(e.chars().all(|c| !c.is_control()), "{name:?}: {e:?}");
+            assert!(!e.contains('\u{202E}'), "{name:?}: {e:?}");
+        }
+        // And serde_yaml's own echo of a rejected key is scrubbed.
+        let e = parse_delivery(
+            "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+             risk: [{require: [r]}], bogus\u{7}: 1}",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.chars().all(|c| !c.is_control() || c == '\n' || c == '\t'),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn digest_is_canonical() {
+        let a = parse_delivery(
+            "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+             risk: [{require: [r]}], max_revise: 5}\n",
+        )
+        .unwrap()
+        .unwrap();
+        // Keys reordered, every default written out — one digest.
+        let b = parse_delivery(
+            "delivery:\n  merge: {method: squash, queue: true}\n  max_revise: 5\n  \
+             reviews: {r: {kind: agent, focus: general}}\n  \
+             risk: [{require: [r]}]\n  \
+             heavy: {lines_over: 800, files_over: 10}\n  \
+             oversized: {lines_over: 3000, files_over: 40}\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(digest(&a), digest(&b));
+        let c = parse_delivery(
+            "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+             risk: [{require: [r]}], max_revise: 6}\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(digest(&a), digest(&c));
+        assert_ne!(digest(&default_policy()), digest(&a));
+    }
+
+    // The `effective` resolution table, one test per row.
+    #[test]
+    fn effective_no_section_no_approval_is_default() {
+        let e = effective("demo", Ok(None), None);
+        assert_eq!((e.source, &e.note), ("default", &None));
+        assert_eq!(e.policy, default_policy());
+        assert_eq!(e.digest, digest(&default_policy()));
+    }
+
+    #[test]
+    fn effective_section_equal_to_default_is_file() {
+        // No approval, and an approved "no section" (policy None):
+        // a default-equivalent section is the file's own, in force.
+        for approval in [
+            None,
+            Some(Approved {
+                digest: digest(&default_policy()),
+                policy: None,
+            }),
+        ] {
+            let e = effective("demo", Ok(Some(default_policy())), approval.as_ref());
+            assert_eq!((e.source, &e.note), ("file", &None));
+            assert_eq!(e.policy, default_policy());
+        }
+    }
+
+    /// Regression: while a custom policy is approved, rewriting
+    /// `delivery:` to a default-equivalent section must NOT silently
+    /// drop the stronger approved policy — it resolves as `approved`
+    /// with the "changed since approval" note, exactly like a removal.
+    #[test]
+    fn effective_default_equivalent_edit_keeps_approved_custom() {
+        let q = custom();
+        let a = approval_for(&q);
+        let e = effective("demo", Ok(Some(default_policy())), Some(&a));
+        assert_eq!((e.source, e.policy), ("approved", q.clone()));
+        assert_eq!(e.digest, digest(&q));
+        let n = e.note.unwrap();
+        assert!(
+            n.starts_with("delivery_unapproved: demo/PROJECT.md delivery changed since approval"),
+            "{n}"
+        );
+        assert!(n.contains(&digest(&default_policy())), "{n}");
+    }
+
+    #[test]
+    fn effective_matching_digest_is_approved() {
+        let p = custom();
+        let a = approval_for(&p);
+        let e = effective("demo", Ok(Some(p.clone())), Some(&a));
+        assert_eq!((e.source, &e.note), ("approved", &None));
+        assert_eq!(e.policy, p);
+        assert_eq!(e.digest, digest(&p));
+    }
+
+    #[test]
+    fn effective_custom_unapproved_is_default_plus_note() {
+        let p = custom();
+        for approval in [
+            None,
+            Some(Approved {
+                digest: "sha256:x".into(),
+                policy: None,
+            }),
+        ] {
+            let e = effective("demo", Ok(Some(p.clone())), approval.as_ref());
+            assert_eq!((e.source, e.policy), ("default", default_policy()));
+            let n = e.note.unwrap();
+            assert!(
+                n.starts_with(
+                    "delivery_unapproved: demo/PROJECT.md delivery differs from \
+                 the default and is not operator-approved"
+                ),
+                "{n}"
+            );
+            assert!(
+                n.contains(&digest(&p)) && n.contains("approve-work demo"),
+                "{n}"
+            );
+        }
+        // An old-format approval (approved_from → None at the call
+        // site) resolves the same.
+        let e = effective("demo", Ok(Some(p)), None);
+        assert_eq!(e.source, "default");
+    }
+
+    #[test]
+    fn effective_changed_since_approval_keeps_approved() {
+        let q = custom();
+        let a = approval_for(&q);
+        let mut p = q.clone();
+        p.max_revise = 9;
+        let e = effective("demo", Ok(Some(p.clone())), Some(&a));
+        assert_eq!((e.source, e.policy), ("approved", q.clone()));
+        assert_eq!(e.digest, digest(&q));
+        let n = e.note.unwrap();
+        assert!(
+            n.starts_with("delivery_unapproved: demo/PROJECT.md delivery changed since approval"),
+            "{n}"
+        );
+        assert!(n.contains(&digest(&p)) && n.contains(&digest(&q)), "{n}");
+    }
+
+    #[test]
+    fn effective_removed_since_approval_keeps_approved() {
+        let q = custom();
+        let a = approval_for(&q);
+        let e = effective("demo", Ok(None), Some(&a));
+        assert_eq!((e.source, e.policy), ("approved", q));
+        assert!(e.note.unwrap().starts_with(
+            "delivery_unapproved: demo/PROJECT.md delivery was removed since approval"
+        ));
+    }
+
+    #[test]
+    fn effective_no_section_approved_no_section_is_default() {
+        let a = Approved {
+            digest: digest(&default_policy()),
+            policy: None,
+        };
+        let e = effective("demo", Ok(None), Some(&a));
+        assert_eq!((e.source, &e.note), ("default", &None));
+    }
+
+    #[test]
+    fn effective_malformed_with_approval_keeps_approved() {
+        let q = custom();
+        let a = approval_for(&q);
+        let bad = Error::rejected("delivery: risk is empty");
+        let e = effective("demo", Err(bad.to_string()), Some(&a));
+        assert_eq!((e.source, e.policy), ("approved", q));
+        let n = e.note.unwrap();
+        assert!(
+            n.starts_with("delivery_unapproved: demo/PROJECT.md delivery is malformed"),
+            "{n}"
+        );
+        assert!(n.contains("risk is empty"), "{n}");
+    }
+
+    #[test]
+    fn effective_malformed_without_approval_is_default_error() {
+        for approval in [
+            None,
+            Some(Approved {
+                digest: "sha256:x".into(),
+                policy: None,
+            }),
+        ] {
+            let bad = Error::rejected("delivery: risk is empty");
+            let e = effective("demo", Err(bad.to_string()), approval.as_ref());
+            assert_eq!((e.source, e.policy), ("default", default_policy()));
+            let n = e.note.unwrap();
+            assert!(
+                n.starts_with("delivery_error: demo/PROJECT.md delivery is malformed"),
+                "{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn approved_from_payload() {
+        let p = custom();
+        let payload = json!({
+            "project": "demo",
+            "digest": "sha256:work",
+            "delivery": serde_json::to_value(&p).unwrap(),
+            "delivery_digest": digest(&p),
+        });
+        let a = approved_from(&payload).unwrap();
+        assert_eq!(a.digest, digest(&p));
+        assert_eq!(a.policy, Some(p.clone()));
+
+        // Approved "no section".
+        let a = approved_from(&json!({
+            "delivery": null,
+            "delivery_digest": digest(&default_policy()),
+        }))
+        .unwrap();
+        assert_eq!(a.policy, None);
+
+        // Old-format approval: no `delivery_digest` key.
+        assert_eq!(
+            approved_from(&json!({"project": "demo", "digest": "sha256:w"})),
+            None
+        );
+
+        // A `delivery` that no longer validates is no approval.
+        let mut stale = json!({
+            "delivery": serde_json::to_value(&p).unwrap(),
+            "delivery_digest": digest(&p),
+        });
+        stale["delivery"]["risk"] = json!([]);
+        assert_eq!(approved_from(&stale), None);
+        let mut bad = json!({"delivery": {"bogus": 1}, "delivery_digest": "sha256:x"});
+        assert_eq!(approved_from(&bad), None);
+        bad["delivery"] = json!("text");
+        assert_eq!(approved_from(&bad), None);
+
+        // A digest that does not match the recorded policy is no
+        // approval — in both shapes (a policy, and "no section").
+        let mismatched = json!({
+            "delivery": serde_json::to_value(&p).unwrap(),
+            "delivery_digest": digest(&default_policy()),
+        });
+        assert_eq!(approved_from(&mismatched), None);
+        let mismatched_null = json!({
+            "delivery": null,
+            "delivery_digest": digest(&p),
+        });
+        assert_eq!(approved_from(&mismatched_null), None);
+    }
+}

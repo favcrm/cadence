@@ -293,7 +293,8 @@ fn resolve(
         delivery_policy::parse_project(
             project,
             answer.delivery.as_deref().map(delivery_front).as_deref(),
-        ),
+        )
+        .map_err(|e| e.to_string()),
         approved.as_ref(),
     );
     (resolved, approved)
@@ -887,7 +888,7 @@ mod tests {
         let text = "---\ndelivery:\n  reviews: {r: {kind: agent, focus: general}}\n  risk: [{require: [r]}]\n  max_revise: 4\n---\n";
         let native = delivery_policy::effective(
             "cadence",
-            delivery_policy::parse_project("cadence", Some(text)),
+            delivery_policy::parse_project("cadence", Some(text)).map_err(|e| e.to_string()),
             None,
         );
         for stored in [

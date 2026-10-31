@@ -69,14 +69,8 @@ use crate::issue::board::Issue;
 use crate::issue::model::{self, Front};
 use crate::issue::parse;
 
-/// Longest glob accepted, in bytes.
-pub const PATH_MAX: usize = 256;
 /// Most planned paths one issue may declare.
 pub const PATHS_MAX: usize = 64;
-/// Most wildcard characters (`*`/`?`) one glob may carry — a cap on
-/// top of [`PATH_MAX`], since wildcards are what makes matching cost
-/// anything at all.
-pub const WILD_MAX: usize = 16;
 /// Changed files per lane kept for matching, sorted. A lane past the
 /// cap warns on the prefix only — advisory, not exhaustive.
 const CHANGED_MAX: usize = 8192;
@@ -257,6 +251,10 @@ fn parse_owner(owner: &str) -> std::result::Result<(Option<String>, Option<Strin
     Ok((epic, pm))
 }
 
+pub use cadence_core::delivery_rules::{check_path, PATH_MAX, WILD_MAX};
+
+/*
+
 /// One planned path or area glob: repo-relative, file-level. `*` and
 /// `?` match inside one path segment, a `**` segment any number of
 /// segments, and a trailing `/` (or a plain directory path) everything
@@ -296,36 +294,9 @@ pub fn check_path(p: &str) -> Result<()> {
     }
     Ok(())
 }
+*/
 
-/// Agent-controlled strings (refs, aliases, planted frontmatter,
-/// filenames, a `changed_error`'s git stderr) reach terminals, tracker
-/// comments and the overview JSON through warnings. Strip anything
-/// that moves a cursor or mirrors text: control characters and bidi or
-/// other invisible format marks. Matching fields stay raw — this is
-/// for display only.
-pub(crate) fn scrub(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() && !is_format(*c))
-        .collect()
-}
-
-/// Invisible or direction-overriding marks — the bidi controls,
-/// joiners, soft hyphen, BOM, word joiners, interlinear anchors and
-/// hangul fillers — none of which a path, ref or alias legitimately
-/// carries.
-fn is_format(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}'              // soft hyphen
-        | '\u{061C}'            // arabic letter mark
-        | '\u{115F}' | '\u{1160}' | '\u{FFA0}'  // hangul fillers
-        | '\u{200B}'..='\u{200F}' // ZWSP ZWNJ ZWJ LRM RLM
-        | '\u{202A}'..='\u{202E}' // LRE RLE PDF RLO LRO
-        | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
-        | '\u{2066}'..='\u{2069}' // LRI RLI FSI PDI
-        | '\u{FEFF}'            // BOM / ZWNBSP
-        | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation anchors
-    )
-}
+pub(crate) use cadence_core::delivery_rules::scrub;
 
 /// `issue set <ID> paths=a,b` — validated, sorted, de-duplicated; an
 /// empty value clears.
@@ -1609,7 +1580,10 @@ mod tests {
         evil.worker = Some("w\u{1b}[2J\u{202e}detaruS".into());
         evil.pr = Some("https://x/\u{7}pull/9".into());
         evil.changed = vec!["src/pe\u{1b}er.rs".into()];
-        assert!(!evil.label().chars().any(|c| c.is_control() || is_format(c)));
+        assert!(!evil
+            .label()
+            .chars()
+            .any(|c| c.is_control() || cadence_core::delivery_rules::is_format(c)));
         let ws = warnings(&[], &me("pm-a"), &["src/".into()], &[evil]);
         assert_eq!(kinds(&ws), vec!["overlap"]);
         let w = &ws[0];
@@ -1620,14 +1594,17 @@ mod tests {
             w["paths"].to_string(),
         ] {
             assert!(
-                !v.chars().any(|c| c.is_control() || is_format(c)),
+                !v.chars()
+                    .any(|c| c.is_control() || cadence_core::delivery_rules::is_format(c)),
                 "unscrubbed bytes in {v:?}"
             );
         }
         // The lease comment path is the same lines.
         for line in warning_lines(&json!({"warnings": ws, "config_error": null})) {
             assert!(
-                !line.chars().any(|c| c.is_control() || is_format(c)),
+                !line
+                    .chars()
+                    .any(|c| c.is_control() || cadence_core::delivery_rules::is_format(c)),
                 "{line:?}"
             );
         }
@@ -1640,7 +1617,9 @@ mod tests {
             "config_error": "k/PROJECT.md areas: area 'x\u{7}\u{202e}' bad",
         })) {
             assert!(
-                !line.chars().any(|c| c.is_control() || is_format(c)),
+                !line
+                    .chars()
+                    .any(|c| c.is_control() || cadence_core::delivery_rules::is_format(c)),
                 "{line:?}"
             );
         }

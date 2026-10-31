@@ -79,6 +79,23 @@
         "op",
         "input"
       ]
+    },
+    {
+      "description": "Classify one delivery and answer what it needs to merge (CAD-1946).\n\nThe evidence is the caller's own reads: the project's `delivery:`\nsection, its recorded approval, the diff rows and the trusted-base list\ntexts. Nothing here reads a file or a program, and no input carries a\nclass.",
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/DeliveryRequirementsInput"
+        },
+        "op": {
+          "type": "string",
+          "const": "delivery.requirements.evaluate"
+        }
+      },
+      "required": [
+        "op",
+        "input"
+      ]
     }
   ],
   "required": [
@@ -100,6 +117,59 @@
       "required": [
         "id",
         "status"
+      ]
+    },
+    "DeliveryRequirementsInput": {
+      "description": "Input of `delivery.requirements.evaluate`.\n\nEvery field is evidence the caller retrieved itself: the project's\n`delivery:` section, its recorded approval, the diff rows and the\ntrusted-base list texts. No field carries a class, and nothing here reads a\nfile, a program or a network answer.",
+      "type": "object",
+      "properties": {
+        "approval": {
+          "description": "The policy that approval recorded (absent = approved \"no section\")."
+        },
+        "approval_digest": {
+          "description": "The digest the project's work approval recorded for its delivery policy.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "changes": {
+          "description": "`git diff --raw -z --no-renames <merge-base> <head>` rows.",
+          "type": "array",
+          "items": true
+        },
+        "lines": {
+          "description": "`git diff --numstat` total changed lines.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "one_review_paths": {
+          "description": "The trusted base's `docs/roles/one-review-paths.toml` text.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "policy": {
+          "description": "The exact `delivery:` section text, or absent when the project has none.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "risk_paths": {
+          "description": "The trusted base's `docs/roles/risk-paths.toml` text.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "changes",
+        "lines"
       ]
     },
     "ManifestPreflightInput": {

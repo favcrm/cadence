@@ -97,7 +97,7 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                         let file = crate::issue::delivery_policy::load(&pm.dir, &p.key);
                         let eff = crate::issue::delivery_policy::effective(
                             &p.key,
-                            file,
+                            file.map_err(|e| e.to_string()),
                             approvals.get(&p.key),
                         );
                         json!({
