@@ -398,8 +398,16 @@ jobs:
           # 70000 and fails closed unless the hard RLIMIT_NOFILE exceeds it.
           sudo prlimit --pid $$ --nofile=1048576:1048576
           ulimit -n 1048576
-          jobs=$(nproc)
-          [ "$jobs" -le 16 ] || jobs=16
+          # CAD-1970: four, not nproc. These fixtures probe a port, drop the
+          # reservation and bind it again; the crate was tuned and validated
+          # at the four-way concurrency the six shards ran, and eight-way is
+          # not equivalent. The first single-runner gate at `nproc` failed two
+          # consecutive main runs on two different probe-then-bind fixtures
+          # (`wiki_board_http_guard_acceptance::public_workspace_...`,
+          # `cad1537_acceptance::cad1537_member_screen_...`), the second with
+          # "fixture BLOCKED: board could not bind". Raising this needs those
+          # fixtures made race-free first, not a wider reservation list.
+          jobs=4
           echo "test parallelism: $jobs"
           # CAD-1370: narrowed integration feedback only on pull_request,
           # only from the trusted-base classifier, re-validated one
