@@ -86,11 +86,17 @@ printed on errors.
 
 Credentials use an explicit permission-restricted file fallback, not an OS
 keychain: `$XDG_CONFIG_HOME/cadence/remote-auth/credential.json` (otherwise
-`~/.config/cadence/remote-auth/credential.json`). Directory permissions are 0700
-and file permissions 0600; symlinks and unsafe ownership/permissions are refused.
-Concurrent saves are serialized. Use an absolute `--auth-dir` for isolated
-development or a separate connection. A different issuer/organization cannot
-replace an existing credential; org switching is separate CAD-657 work.
+`~/.config/cadence/remote-auth/credential.json`). A first run — no existing
+tracker, state directory or hosted config — keeps them in its consolidated
+home instead: `<CADENCE_HOME>/config/remote-auth/credential.json`, which is
+`~/.cadence/config/remote-auth/credential.json` by default (CAD-1922). An
+installation that already has credentials never has them relocated, so a
+`CADENCE_HOME` added later does not move an existing one. Directory
+permissions are 0700 and file permissions 0600; symlinks and unsafe
+ownership/permissions are refused. Concurrent saves are serialized. Use an
+absolute `--auth-dir` for isolated development or a separate connection. A
+different issuer/organization cannot replace an existing credential; org
+switching is separate CAD-657 work.
 
 `cadence auth logout` removes the local credential only. Revoke the server
 credential using AgenticOS connected devices. Logout does not clear an environment

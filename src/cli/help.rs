@@ -13,6 +13,14 @@ use clap::{Command, CommandFactory};
 /// The default root help: group title and its core verbs.
 const CORE: &[(&str, &[(&str, &str)])] = &[
     (
+        "Start",
+        &[
+            ("setup", "Set up Cadence on this machine"),
+            ("login", "Sign in to an existing hosted workspace"),
+            ("register", "Create a hosted workspace in the browser"),
+        ],
+    ),
+    (
         "Me",
         &[
             ("self", "Your alias, running message and report token"),
@@ -118,18 +126,15 @@ const ADVANCED: &[&str] = &[
     "intake",
     "interrupt",
     "job",
-    "login",
     "message",
     "milestone",
     "monitor",
     "overview",
     "project",
-    "register",
     "remote",
     "report",
     "resume",
     "schema",
-    "setup",
     "skill",
     "stop",
     "template",

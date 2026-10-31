@@ -158,7 +158,8 @@ of this flow.
   stream-json, Pi rpc via `join <pm> pi`); sessions resume by their
   native ids.
 - **A git-backed tracker** — issues are Markdown files in a private repo
-  (`~/pm`); every write is one commit, `issue log`/`blame` work from git alone.
+  (`~/.cadence/tracker` on a fresh install, `~/pm` on an existing one);
+  every write is one commit, `issue log`/`blame` work from git alone.
 - **Verified delivery** — workers report with `sha:`; reviewers bind a verdict
   to that exact head; `cadence audit` flags merges with no passing verdict.
 - **A board** — read/write SPA + JSON API on loopback; one writer
