@@ -214,7 +214,9 @@ pub fn staging_register(state_dir: &Path, board_port: u16, by: &str) -> Result<V
 /// never touch (CAD-1024, contract I5). Canonicalized, so a symlinked or
 /// `..`-spelled staging dir cannot alias a live one. `~/pm` is the
 /// production PM dir; `client::default_state_dir()`/`home::local_state_dir()`
-/// are the two spellings of the production state dir.
+/// are the two spellings of the production state dir; the consolidated
+/// home (`~/.cadence`) holds the tracker, state, vault, workspace, repos
+/// and hosted config of a first run (CAD-1922).
 pub(super) fn refuse_production_staging(state_dir: &Path) -> Result<()> {
     let ours = crate::sandbox::resolved(state_dir);
     let mut forbidden: Vec<PathBuf> = Vec::new();
@@ -225,6 +227,9 @@ pub(super) fn refuse_production_staging(state_dir: &Path) -> Result<()> {
         forbidden.push(d);
     }
     if let Ok(d) = crate::issue::home_default_dir() {
+        forbidden.push(d);
+    }
+    if let Ok(d) = crate::home::home_default() {
         forbidden.push(d);
     }
     for live in forbidden {

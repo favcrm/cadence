@@ -83,22 +83,17 @@ struct RegistryFile {
 
 impl RegistryFile {
     fn path() -> Result<PathBuf> {
-        let base = match std::env::var_os("XDG_CONFIG_HOME") {
-            Some(path) => PathBuf::from(path),
-            None => PathBuf::from(
-                std::env::var_os("HOME").ok_or_else(|| Error::rejected("HOME is not set"))?,
-            )
-            .join(".config"),
-        };
-        absolute(&base)?;
-        Ok(base.join("cadence").join("orgs.json"))
+        // The same hosted config root as the credentials: `<home>/config`
+        // for a first run, `$XDG_CONFIG_HOME/cadence` (else
+        // `~/.config/cadence`) for an existing installation.
+        Ok(cadence_agent::home::config_dir()?.join("orgs.json"))
     }
     /// Exclusive flock: every read-modify-write is one locked snapshot, so a
     /// `login` racing a `switch` cannot interleave a stale default.
     fn open() -> Result<Self> {
         let path = Self::path()?;
         let dir = path.parent().expect("registry parent");
-        std::fs::create_dir_all(dir)?;
+        cadence_agent::home::create_home_dir(dir)?;
         let lock = OpenOptions::new()
             .write(true)
             .create(true)
@@ -1041,6 +1036,13 @@ mod tests {
             std::env::set_var("HOME", home.path());
             std::env::set_var("XDG_CONFIG_HOME", home.path().join("config"));
             std::env::set_var("XDG_STATE_HOME", home.path().join("xdg-state"));
+            // CAD-1922: a `HOME`/XDG-only environment with nothing in it
+            // is a first run, which resolves `~/.cadence`. This fixture
+            // models an EXISTING installation (ambient local state under
+            // `XDG_STATE_HOME`), so it presents that installation's own
+            // roots before anything resolves.
+            std::fs::create_dir_all(home.path().join("xdg-state").join("cadence")).unwrap();
+            std::fs::create_dir_all(home.path().join("config").join("cadence")).unwrap();
             Self { home, saved }
         }
         fn expected_state(&self) -> PathBuf {

@@ -192,6 +192,11 @@ fn unix_now() -> Result<u64> {
         .map_err(|_| rejected("System clock is invalid"))
 }
 
+/// The credential directory: `--auth-dir` when given, else
+/// [`crate::home::config_dir`]`/remote-auth` — `<home>/config/remote-auth`
+/// for a first run, `$XDG_CONFIG_HOME/cadence/remote-auth` (else
+/// `~/.config/cadence/remote-auth`) for an existing installation, which
+/// keeps the credentials it already has.
 pub fn auth_dir(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(dir) = explicit {
         if !dir.is_absolute() {
@@ -199,20 +204,33 @@ pub fn auth_dir(explicit: Option<&Path>) -> Result<PathBuf> {
         }
         return Ok(dir.to_owned());
     }
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .ok_or_else(|| rejected("Set HOME, XDG_CONFIG_HOME or --auth-dir"))?;
-    if !base.is_absolute() {
-        return Err(rejected("Credential directory must be absolute"));
-    }
-    Ok(base.join("cadence/remote-auth"))
+    Ok(crate::home::config_dir()?.join("remote-auth"))
 }
 
 fn private_dir(dir: &Path, create: bool) -> Result<()> {
+    // CAD-1922: a first run keeps its credentials in `<home>/config`. A
+    // symlinked home root or credential root would redirect them, so
+    // refuse both — the credential file and dir themselves are refused
+    // below, which leaves an out-of-home `--auth-dir` untouched.
+    if let Ok(home) = crate::home::home() {
+        if dir.starts_with(&home) {
+            let levels = [Some(home.as_path()), dir.parent()];
+            for level in levels.into_iter().flatten() {
+                let linked = std::fs::symlink_metadata(level)
+                    .is_ok_and(|meta| meta.file_type().is_symlink());
+                if linked {
+                    return Err(rejected(
+                        "the consolidated home's credential directory is reached through a \
+                         symlink — refusing to read or write credentials",
+                    ));
+                }
+            }
+        }
+    }
     if !dir.exists() && create {
-        fs::create_dir_all(dir)?;
+        // Inside the consolidated home this also creates the home root
+        // above it 0700; the leaf is 0700 either way.
+        crate::home::create_home_dir(dir)?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     let meta = fs::symlink_metadata(dir)?;

@@ -59,10 +59,11 @@
 //! login` lands), and the master agent's files and bootstrap are
 //! CAD-339 (`cadence master start`) — setup only reports them.
 
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::json;
@@ -308,11 +309,7 @@ impl Ctx {
     /// running, `--port`, else the persisted port, else `ui start`'s
     /// default.
     pub fn board_port(&self) -> u16 {
-        let persisted = crate::ui::persisted_opts(&self.state_dir).port;
-        if crate::ui::detached_pid(&self.state_dir).is_some() {
-            return persisted.unwrap_or(DEFAULT_UI_PORT);
-        }
-        self.port.or(persisted).unwrap_or(DEFAULT_UI_PORT)
+        board_port(&self.state_dir, self.port)
     }
 
     fn has_verb(&self, verb: &str) -> bool {
@@ -320,7 +317,7 @@ impl Ctx {
     }
 
     pub fn board_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.board_port())
+        board_url(&self.state_dir, self.port)
     }
 
     /// `$<var>`, else `$HOME/<fallback>`.
@@ -330,6 +327,23 @@ impl Ctx {
             .filter(|p| p.is_absolute())
             .unwrap_or_else(|| self.home.join(fallback))
     }
+}
+
+/// The board port for a state dir: the running board's own (`ui.json`);
+/// with none running, `--port`, else the persisted port, else
+/// `ui start`'s default. Shared by [`Ctx`] and by the first-run handover,
+/// which reports the URL the same run started the board on.
+pub fn board_port(state_dir: &Path, port: Option<u16>) -> u16 {
+    let persisted = crate::ui::persisted_opts(state_dir).port;
+    if crate::ui::detached_pid(state_dir).is_some() {
+        return persisted.unwrap_or(DEFAULT_UI_PORT);
+    }
+    port.or(persisted).unwrap_or(DEFAULT_UI_PORT)
+}
+
+/// The URL that port serves: the board this run started or found.
+pub fn board_url(state_dir: &Path, port: Option<u16>) -> String {
+    format!("http://127.0.0.1:{}", board_port(state_dir, port))
 }
 
 fn sh_quote(s: &str) -> String {
@@ -938,13 +952,31 @@ fn login_check() -> Check {
 // ---------- the CLI ----------
 
 /// Run `checks` in order, handing each outcome to `emit` as it lands.
-pub fn run_checks(ctx: &Ctx, checks: &[Check], mut emit: impl FnMut(&Outcome)) -> Vec<Outcome> {
+pub fn run_checks(ctx: &Ctx, checks: &[Check], emit: impl FnMut(&Outcome)) -> Vec<Outcome> {
+    run_checks_selective(ctx, checks, &[], emit)
+}
+
+/// [`run_checks`] with the named checks detect-only: a hosted run reports
+/// the daemon and board without starting either, so signing in never
+/// starts a local service. Everything else is applied as usual, and a
+/// detect-only check still reports `missing` with its fix.
+fn run_checks_selective(
+    ctx: &Ctx,
+    checks: &[Check],
+    detect_only: &[&str],
+    mut emit: impl FnMut(&Outcome),
+) -> Vec<Outcome> {
     if cfg!(debug_assertions) {
         validate(checks);
     }
     let mut done = Vec::with_capacity(checks.len());
     for check in checks {
-        let outcome = check.run(ctx, &done);
+        let mode = if detect_only.contains(&check.name.as_str()) {
+            Mode::DetectOnly
+        } else {
+            Mode::Apply
+        };
+        let outcome = check.run_as(ctx, &done, mode);
         emit(&outcome);
         done.push(outcome);
     }
@@ -1144,8 +1176,18 @@ pub fn validate(checks: &[Check]) {
 }
 
 /// `cadence setup [--json] [--port <n>]`. Exit 1 when any check
-/// failed; `missing` and `unknown` are facts, not failures.
-pub fn cli(state_dir: &Path, port: Option<u16>, json: bool, verbs: Vec<String>) -> Result<i32> {
+/// failed; `missing` and `unknown` are facts, not failures. The outcomes
+/// are returned so the first-run handover reports what this run actually
+/// found and started, never a re-probe. With `start_services` false the
+/// daemon and board checks are detect-only: a hosted run reports them and
+/// starts neither.
+pub fn cli(
+    state_dir: &Path,
+    port: Option<u16>,
+    json: bool,
+    verbs: Vec<String>,
+    start_services: bool,
+) -> Result<(i32, Vec<Outcome>)> {
     let home = process_env("HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -1160,7 +1202,14 @@ pub fn cli(state_dir: &Path, port: Option<u16>, json: bool, verbs: Vec<String>) 
         probe_timeout: PROBE_TIMEOUT,
         verbs,
     };
-    let outcomes = run_checks(&ctx, &checks(), |o| {
+    // The daemon and the board are local services: a run that did not
+    // choose this machine reports them without starting either.
+    let detect_only: &[&str] = if start_services {
+        &[]
+    } else {
+        &["daemon", "ui"]
+    };
+    let outcomes = run_checks_selective(&ctx, &checks(), detect_only, |o| {
         if json {
             println!("{}", serde_json::to_string(o).unwrap_or_default());
         } else {
@@ -1171,10 +1220,843 @@ pub fn cli(state_dir: &Path, port: Option<u16>, json: bool, verbs: Vec<String>) 
         }
     });
     if !json {
-        println!("\nboard: {}", ctx.board_url());
+        if start_services {
+            println!("\nboard: {}", ctx.board_url());
+        } else {
+            println!(
+                "\nboard: {} (not started — this run is hosted; `cadence ui start` starts it)",
+                ctx.board_url()
+            );
+        }
     }
     let failed = outcomes.iter().any(|o| o.status == Status::Failed);
-    Ok(i32::from(failed))
+    Ok((i32::from(failed), outcomes))
+}
+
+// ---------- the first-run handover (CAD-1922) ----------
+
+/// One bounded read of the owner-only billing offer, never a retry.
+const OFFER_TIMEOUT: Duration = Duration::from_secs(8);
+/// Cap on the offer body, as every other bounded JSON read here.
+const OFFER_BODY_MAX: usize = 1_048_576;
+
+/// Where the person works after this run: this machine only, or a hosted
+/// workspace this machine holds a login for. Reported as a fact, never
+/// inferred from a marker file.
+pub const SCOPE_LOCAL: &str = "local";
+pub const SCOPE_HOSTED: &str = "hosted";
+
+/// The live instruction the handover carries. It is a live line, not a
+/// replacement for the briefing: `cadence self`, `cadence agent list` and
+/// the briefing's own report route stay the durable/live truth.
+pub const LIVE_INSTRUCTION: &str = "\
+Ask for the work you want done — an issue, a repo, a question — not another setup.
+`cadence status` reports work, not billing.
+Do not rerun setup, open a second login or checkout, or type a card, OTP or key here: card details stay on Stripe.
+In a cadence pane report with the route your briefing names (`cadence message result <id> --token <turn_id> --text '...'`; a turn-result reporter's final text is the report).";
+
+/// The sign-in fact: signed out, this run's verified grant, a login saved
+/// earlier, a failed approval, or a store that could not be inspected.
+/// `state` is one of `signed_out`, `verified`, `saved`, `failed`, `unknown`.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SignInFact {
+    pub state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+impl SignInFact {
+    pub fn signed_out(detail: impl Into<String>) -> Self {
+        Self {
+            state: "signed_out",
+            slug: None,
+            endpoint: None,
+            detail: detail.into(),
+            code: None,
+        }
+    }
+
+    /// The issuer's own slug and endpoint from this run's browser-approved
+    /// grant — the only sign-in this build calls verified.
+    pub fn verified(slug: &str, endpoint: &str) -> Self {
+        Self {
+            state: "verified",
+            slug: Some(slug.to_string()),
+            endpoint: Some(endpoint.to_string()),
+            detail: format!("signed in to {slug} ({endpoint}), verified by this run's grant"),
+            code: None,
+        }
+    }
+
+    /// A login this machine already holds. The credential files are named
+    /// only; their contents, endpoint and expiry are never re-read here,
+    /// so this is `saved` and never `verified`.
+    pub fn saved(slugs: &[String]) -> Self {
+        let (slug, detail) = match slugs {
+            [] => (None, "no hosted login on this machine".to_string()),
+            [one] => (
+                Some(one.clone()),
+                format!(
+                    "a saved login for {one} is on this machine — not verified by this run, \
+                     and it may be expired"
+                ),
+            ),
+            many => (
+                None,
+                format!(
+                    "saved hosted logins for {} — none verified by this run and any may be \
+                     expired; `cadence org list` names them",
+                    many.join(", ")
+                ),
+            ),
+        };
+        Self {
+            state: if slug.is_some() || !slugs.is_empty() {
+                "saved"
+            } else {
+                "signed_out"
+            },
+            slug,
+            endpoint: None,
+            detail,
+            code: None,
+        }
+    }
+
+    pub fn failed(error: &Error) -> Self {
+        Self {
+            state: "failed",
+            slug: None,
+            endpoint: None,
+            detail: format!("the browser approval did not complete: {error}"),
+            code: error.code().map(str::to_owned),
+        }
+    }
+
+    pub fn unknown(detail: impl Into<String>) -> Self {
+        Self {
+            state: "unknown",
+            slug: None,
+            endpoint: None,
+            detail: detail.into(),
+            code: None,
+        }
+    }
+
+    pub fn is_signed_out(&self) -> bool {
+        self.state == "signed_out"
+    }
+}
+
+/// One independently reported component of the plan fact: the server's own
+/// trial, paid-subscription or Checkout state. Present only when this run
+/// read the offer; absent — never a default or a guess — when it did not.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct PlanState {
+    pub state: &'static str,
+    pub detail: String,
+}
+
+impl PlanState {
+    fn new(state: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            state,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// The plan fact: what the server's offer says about trial, paid
+/// subscription and Checkout. `state` is one of `none`, `skipped`,
+/// `trial_active`, `trial_eligible`, `trial_used`, `trial_expired`,
+/// `trial_failed`, `trial_unknown`, `checkout_pending`, `checkout_open`,
+/// `checkout_completed`, `checkout_settled`, `checkout_unknown`, `past_due`,
+/// `subscription_unknown`, `unknown` (not read this run) or `unavailable`
+/// (the read was refused). Nothing here is computed by this client.
+///
+/// `trial`, `subscription` and `checkout` are the same read reported as three
+/// independent server facts, so an active trial is never hidden by an open
+/// Checkout and an active subscription never hides a trial. They are absent
+/// when the offer was not read, and `detail` is the combined human line. A
+/// component's own `state` is its server-derived name (`trial_*`,
+/// `subscription_active`/`subscription_past_due`/`subscription_inactive`/
+/// `subscription_none`/`subscription_unknown`, or `checkout_*`).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct PlanFact {
+    pub state: &'static str,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkout_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trial: Option<Box<PlanState>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<Box<PlanState>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<Box<PlanState>>,
+}
+
+impl PlanFact {
+    fn new(state: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            state,
+            detail: detail.into(),
+            checkout_url: None,
+            code: None,
+            trial: None,
+            subscription: None,
+            checkout: None,
+        }
+    }
+
+    /// No hosted workspace on this machine: nothing is billed.
+    pub fn none() -> Self {
+        Self::new(
+            "none",
+            "No hosted workspace — nothing is billed on this machine.",
+        )
+    }
+
+    /// Not read by this run. Never a claim that there is no plan.
+    pub fn unknown(detail: impl Into<String>) -> Self {
+        Self::new("unknown", detail)
+    }
+
+    /// The server refused or could not answer the read.
+    pub fn unavailable(code: &str, detail: impl Into<String>) -> Self {
+        Self {
+            state: "unavailable",
+            detail: detail.into(),
+            checkout_url: None,
+            code: Some(code.to_string()),
+            trial: None,
+            subscription: None,
+            checkout: None,
+        }
+    }
+}
+
+/// The four facts and the one next command the first run hands over.
+#[derive(Serialize, Debug, Clone)]
+pub struct Handover {
+    pub scope: &'static str,
+    pub sign_in: SignInFact,
+    pub plan: PlanFact,
+    /// The board this run started or found, on the resolved port.
+    pub board_url: String,
+    /// Whether that board answered this run's `ui` check.
+    pub board_running: bool,
+    /// The hosted workspace's board, when this run verified one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosted_board_url: Option<String>,
+    /// Exactly one command to run next.
+    pub next_command: String,
+    pub instruction: String,
+}
+
+/// A workspace slug as the issuer mints it (`remote_enrollment::slug`):
+/// lowercase alphanumerics and `-`, bounded. A credential file name that
+/// is not one is ignored rather than echoed into a printed command.
+fn valid_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 63
+        && !slug.starts_with('-')
+        && !slug.ends_with('-')
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The workspace slugs this machine holds a hosted login for: the
+/// credential file names only, never their contents. `None` means the
+/// store could not be inspected — never "signed out".
+pub fn saved_hosted_logins() -> Option<Vec<String>> {
+    let dir = crate::remote_auth::auth_dir(None).ok()?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(_) => return None,
+    };
+    let mut slugs = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(slug) = name
+            .strip_prefix("cli-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if valid_slug(slug) {
+            slugs.push(slug.to_string());
+        }
+    }
+    slugs.sort();
+    Some(slugs)
+}
+
+/// What the billing read produced: the server's offer, or the exact reason
+/// there is none. `code` is the server's own stable code where it answered,
+/// so "this grant was never consented for billing" is never confused with
+/// "the credential is dead".
+#[derive(Debug, Clone)]
+pub enum OfferRead {
+    Offer(serde_json::Value),
+    Unavailable { code: String, detail: String },
+}
+
+impl OfferRead {
+    fn unavailable(code: &str, detail: impl Into<String>) -> Self {
+        Self::Unavailable {
+            code: code.to_string(),
+            detail: detail.into(),
+        }
+    }
+}
+
+/// `GET <endpoint>/__platform/hosted-cadence/<org>/billing/offer` with the
+/// saved human login, on the board origin that is the credential's exact
+/// audience. Read only: no Checkout is started, cancelled or replayed, no
+/// redirect is followed and nothing is written. The offer is the server's
+/// own; every refusal is reported with its code.
+pub fn billing_offer(target: &crate::remote_cli::RemoteTarget) -> OfferRead {
+    // Owner-class money authority is never spent by an agent's process.
+    if std::env::var_os("CADENCE_ALIAS").is_some()
+        || std::env::var_os("CADENCE_GRANT_TOKEN").is_some()
+    {
+        return OfferRead::unavailable(
+            "human_session_required",
+            "a managed agent cannot spend the saved human login for a billing read",
+        );
+    }
+    let endpoint = target.endpoint.trim_end_matches('/');
+    if !endpoint.starts_with("https://") || target.org_id.is_empty() {
+        return OfferRead::unavailable(
+            "invalid_target",
+            "the saved workspace has no https board origin to read billing from",
+        );
+    }
+    let deadline = Instant::now() + OFFER_TIMEOUT;
+    let dir = match crate::remote_auth::auth_dir(None) {
+        Ok(dir) => dir,
+        Err(e) => {
+            return OfferRead::unavailable(
+                "credential",
+                format!("the hosted credential directory is unavailable: {e}"),
+            )
+        }
+    };
+    let material = match crate::remote_cli::cli_material_until(&dir, target, deadline) {
+        Ok(material) => material,
+        Err(e) => return OfferRead::unavailable("credential", e.to_string()),
+    };
+    if material.subject_id.is_none() || material.issuer.is_none() {
+        return OfferRead::unavailable(
+            "credential",
+            "the saved login carries no member and issuer pin",
+        );
+    }
+    let agent = crate::issuer_transport::agent(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(deadline.saturating_duration_since(Instant::now())))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .proxy(None),
+    );
+    let url = format!(
+        "{endpoint}/__platform/hosted-cadence/{}/billing/offer",
+        target.org_id
+    );
+    let authorization = format!("Bearer {}", material.access_token);
+    let response = match agent
+        .get(url.as_str())
+        .header("Authorization", authorization.as_str())
+        .call()
+    {
+        Ok(response) => response,
+        Err(e) => {
+            return OfferRead::unavailable(
+                "transport",
+                format!("the billing offer could not be reached: {e}"),
+            )
+        }
+    };
+    let status = response.status().as_u16();
+    if (300..400).contains(&status) {
+        return OfferRead::unavailable(
+            "redirect",
+            "the billing offer answered with a redirect; none was followed",
+        );
+    }
+    let mut bytes = Vec::new();
+    if response
+        .into_body()
+        .as_reader()
+        .take((OFFER_BODY_MAX + 1) as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return OfferRead::unavailable("transport", "the billing offer body could not be read");
+    }
+    if bytes.len() > OFFER_BODY_MAX {
+        return OfferRead::unavailable("transport", "the billing offer response exceeded 1 MiB");
+    }
+    let body: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(body) => body,
+        Err(_) => {
+            return OfferRead::unavailable("invalid", "the billing offer response was not JSON")
+        }
+    };
+    if status == 200 {
+        return if body["ok"] == true {
+            OfferRead::Offer(body["data"].clone())
+        } else {
+            OfferRead::unavailable(
+                "invalid",
+                "the billing offer response was not an ok envelope",
+            )
+        };
+    }
+    let code = body["code"].as_str().unwrap_or("unknown").to_string();
+    let detail = match code.as_str() {
+        "capability_not_consented" => "this grant does not carry billing.read — the optional scope was declined at consent, the approver's role could not grant it, or the grant predates it. That is not a reason to sign in again; the plan and any Checkout are shown in the workspace dashboard",
+        "owner_required" => "only the workspace owner may read billing",
+        "human_session_required" => {
+            "billing requires the owner's human login, not an agent credential"
+        }
+        "unauthorized" => {
+            "the saved credential was refused for this workspace (dead, revoked, or bound to another audience)"
+        }
+        "capability_unavailable" => "the server cannot read billing right now",
+        _ => "the billing read was refused",
+    };
+    OfferRead::unavailable(&code, format!("{detail} ({code})"))
+}
+
+/// The published offer, as the server sends it. Only the fields the
+/// handover prints are read; an absent or mistyped one makes the whole
+/// offer unavailable rather than a default plan, price or expiry.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OfferBody {
+    as_of: String,
+    plan: Option<PlanBody>,
+    trial: TrialBody,
+    subscription: SubscriptionBody,
+    checkout: CheckoutBody,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanBody {
+    label: String,
+    amount: String,
+    currency: String,
+    period: String,
+    included_credit: String,
+    grants_enabled: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrialBody {
+    state: String,
+    eligibility: String,
+    deadline_at: Option<String>,
+    credit: Option<String>,
+    token_cap: Option<u64>,
+    terms: Option<TrialTerms>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrialTerms {
+    policy_id: String,
+    duration_hours: u64,
+    credit: String,
+    token_cap: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct SubscriptionBody {
+    state: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckoutBody {
+    state: String,
+    url: Option<String>,
+    expires_at: Option<String>,
+    available: bool,
+    blocked: Option<String>,
+}
+
+/// The plan fact for one read. Trial and paid subscription stay separate
+/// states: the cardless trial is a promotional grant with its own deadline
+/// and cap, and a paid plan exists only after an explicit owner Checkout.
+pub fn plan_fact(read: &OfferRead) -> PlanFact {
+    let offer = match read {
+        OfferRead::Offer(offer) => offer,
+        OfferRead::Unavailable { code, detail } => {
+            return PlanFact::unavailable(code, format!("Billing unavailable: {detail}"))
+        }
+    };
+    let body: OfferBody = match serde_json::from_value((*offer).clone()) {
+        Ok(body) => body,
+        Err(_) => {
+            return PlanFact::unavailable(
+                "invalid",
+                "Billing unavailable: the offer did not match the published contract; no plan, price, trial or expiry is assumed",
+            )
+        }
+    };
+    let published_plan = published_plan_line(&body);
+    // Read all three server facts before choosing a summary. A Checkout or a
+    // paid subscription must never hide the trial (and vice versa): each is
+    // reported in its own field below, and the combined line names all three.
+    let trial = match trial_state(&body.trial, &body.as_of) {
+        Ok(trial) => trial,
+        Err(fact) => return fact,
+    };
+    let subscription = match subscription_state(&body.subscription, &body.as_of) {
+        Ok(subscription) => subscription,
+        Err(fact) => return fact,
+    };
+    let checkout = match checkout_state(&body.checkout, &body.as_of) {
+        Ok(checkout) => checkout,
+        Err(fact) => return fact,
+    };
+    // The summary keeps the previous precedence for the one plan fact; the
+    // three component states above are reported independently regardless.
+    let state = match subscription.state {
+        "subscription_active" => "skipped",
+        "subscription_past_due" => "past_due",
+        "subscription_unknown" => "subscription_unknown",
+        _ => match checkout.state {
+            "checkout_pending" | "checkout_open" | "checkout_completed" | "checkout_settled"
+            | "checkout_unknown" => checkout.state,
+            _ => trial.state,
+        },
+    };
+    // `available`/`blocked` describe a *new* Checkout only. A fenced
+    // operation is reported by its own state even when it reports
+    // `available: false`, so availability is consulted only when the server
+    // says no operation is outstanding.
+    let paid = if matches!(
+        subscription.state,
+        "subscription_none" | "subscription_inactive"
+    ) && matches!(
+        checkout.state,
+        "checkout_none" | "checkout_expired" | "checkout_settled"
+    ) {
+        match paid_line(&body) {
+            Ok(paid) => paid,
+            Err(fact) => return fact,
+        }
+    } else {
+        ""
+    };
+    let detail = [
+        trial.detail.as_str(),
+        subscription.detail.as_str(),
+        checkout.detail.as_str(),
+        published_plan.as_str(),
+        paid,
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ");
+    PlanFact {
+        state,
+        detail,
+        checkout_url: if checkout.state == "checkout_open" {
+            body.checkout.url.clone()
+        } else {
+            None
+        },
+        code: None,
+        // Boxed: these three facts make `PlanFact` the error value of the
+        // state helpers below, and clippy refuses a 200-byte `Err`.
+        trial: Some(Box::new(trial)),
+        subscription: Some(Box::new(subscription)),
+        checkout: Some(Box::new(checkout)),
+    }
+}
+
+/// The published plan line. Only the server's own plan fields are printed;
+/// an absent plan is reported as unread, never as a default price.
+fn published_plan_line(body: &OfferBody) -> String {
+    match &body.plan {
+        Some(plan) => format!(
+            "Plan {}: {} {}/{} with {} included credit (grants {}), as published at {}.",
+            plan.label,
+            money(&plan.amount),
+            plan.currency,
+            plan.period,
+            money(&plan.included_credit),
+            if plan.grants_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            body.as_of
+        ),
+        None => format!(
+            "The published plan could not be read at {} — no price is assumed.",
+            body.as_of
+        ),
+    }
+}
+
+/// The server's stored paid-subscription truth, reported on its own. `unknown`
+/// is never described as inactive.
+fn subscription_state(
+    subscription: &SubscriptionBody,
+    as_of: &str,
+) -> std::result::Result<PlanState, PlanFact> {
+    match subscription.state.as_str() {
+        "active" => Ok(PlanState::new(
+            "subscription_active",
+            format!("Subscription active at {as_of}; no new plan is needed."),
+        )),
+        "past_due" => Ok(PlanState::new(
+            "subscription_past_due",
+            format!("Subscription past due at {as_of} — it is not an active subscription."),
+        )),
+        "inactive" => Ok(PlanState::new(
+            "subscription_inactive",
+            format!("Subscription inactive at {as_of} — no paid plan is active."),
+        )),
+        "none" => Ok(PlanState::new(
+            "subscription_none",
+            format!("No paid subscription at {as_of}."),
+        )),
+        "unknown" => Ok(PlanState::new(
+            "subscription_unknown",
+            format!(
+                "Subscription state unknown at {as_of} — it is not an active subscription, \
+                 and no new Checkout starts until it can be read."
+            ),
+        )),
+        other => Err(PlanFact::unavailable(
+            "invalid",
+            format!(
+                "Billing unavailable: the offer reported an unknown subscription state `{other}`; it is not an active subscription and nothing is assumed"
+            ),
+        )),
+    }
+}
+
+/// The durable Checkout operation, reported on its own. Only a state that
+/// fences nothing (`none`, `expired`, `settled`) leaves a new Checkout
+/// possible; `available`/`blocked` are consulted separately for those.
+fn checkout_state(
+    checkout: &CheckoutBody,
+    as_of: &str,
+) -> std::result::Result<PlanState, PlanFact> {
+    match checkout.state.as_str() {
+        "open" => {
+            let until = checkout.expires_at.as_deref().unwrap_or("its expiry");
+            let where_ = checkout
+                .url
+                .as_deref()
+                .map(|url| format!(": {url}"))
+                .unwrap_or_default();
+            Ok(PlanState::new(
+                "checkout_open",
+                format!(
+                    "A Checkout is already open until {until}{where_}. No second Checkout is \
+                     opened here and no card is taken."
+                ),
+            ))
+        }
+        "pending" => Ok(PlanState::new(
+            "checkout_pending",
+            "A Checkout is pending — Stripe has not acknowledged a session yet. No second \
+             Checkout may start; re-read the offer before acting.",
+        )),
+        "completed" => Ok(PlanState::new(
+            "checkout_completed",
+            format!(
+                "Stripe completed a Checkout at {as_of}; the subscription is not reconciled \
+                 yet. No second Checkout may start."
+            ),
+        )),
+        "settled" => Ok(PlanState::new(
+            "checkout_settled",
+            format!(
+                "A Checkout completed and was reconciled at {as_of}; no Checkout is fenced."
+            ),
+        )),
+        "unknown" => Ok(PlanState::new(
+            "checkout_unknown",
+            format!(
+                "The Checkout outcome is unknown at {as_of} — no new Checkout may start until \
+                 the server reconciles it."
+            ),
+        )),
+        "none" => Ok(PlanState::new(
+            "checkout_none",
+            format!("No Checkout is outstanding at {as_of}."),
+        )),
+        "expired" => Ok(PlanState::new(
+            "checkout_expired",
+            format!("The last Checkout expired before {as_of}; none is outstanding."),
+        )),
+        other => Err(PlanFact::unavailable(
+            "invalid",
+            format!(
+                "Billing unavailable: the offer reported an unknown Checkout state `{other}`; no Checkout is started and none is assumed"
+            ),
+        )),
+    }
+}
+
+/// What the offer says about starting a *new* Checkout. Only a state that
+/// fences nothing (`none`, `expired`, `settled`) consults this: for
+/// `pending`/`open`/`completed`/`unknown` the state itself is the answer,
+/// and `blocked` is expected to name that same operation.
+fn paid_line(body: &OfferBody) -> std::result::Result<&'static str, PlanFact> {
+    if body.checkout.available {
+        return Ok(
+            "Starting a paid plan is a separate, explicit action in the workspace dashboard; this terminal never opens a Checkout.",
+        );
+    }
+    match body.checkout.blocked.as_deref() {
+        Some("plan_unavailable") => Ok("A paid plan cannot start right now (plan_unavailable)."),
+        other => Err(PlanFact::unavailable(
+            "invalid",
+            format!(
+                "Billing unavailable: the offer says no Checkout can start ({}) while reporting subscription `{}` and Checkout `{}`; no plan state is assumed",
+                other.unwrap_or("no reason"),
+                body.subscription.state,
+                body.checkout.state
+            ),
+        )),
+    }
+}
+
+/// The trial's own state, server-authored and reported independently of the
+/// subscription and Checkout. `not_started` is not an error and not
+/// ineligibility — eligibility says which; terms exist only when the server
+/// publishes them. `eligible` is a decision this read can make, not a
+/// promise: only the registration door grants the trial.
+fn trial_state(trial: &TrialBody, as_of: &str) -> std::result::Result<PlanState, PlanFact> {
+    match trial.state.as_str() {
+        "active" => {
+            let until = trial.deadline_at.as_deref().unwrap_or("its deadline");
+            let mut bounds = Vec::new();
+            if let Some(credit) = trial.credit.as_deref() {
+                bounds.push(format!("{} credit", money(credit)));
+            }
+            if let Some(cap) = trial.token_cap {
+                bounds.push(format!("{cap} tokens"));
+            }
+            let limits = if bounds.is_empty() {
+                " (credit and token cap not published)".to_string()
+            } else {
+                format!(" ({})", bounds.join(" and "))
+            };
+            Ok(PlanState::new(
+                "trial_active",
+                format!(
+                    "Cardless trial active until {until}{limits}; it never converts to a paid \
+                     plan by itself."
+                ),
+            ))
+        }
+        "not_started" => match trial.eligibility.as_str() {
+            "eligible" => match &trial.terms {
+                Some(terms) => Ok(PlanState::new(
+                    "trial_eligible",
+                    format!(
+                        "The cardless registration trial is eligible under policy {} ({} hours, {} credit, {} tokens); only the registration door grants it and it can still fail at admission. It never opens a Checkout or charges.",
+                        terms.policy_id,
+                        terms.duration_hours,
+                        money(&terms.credit),
+                        terms.token_cap
+                    ),
+                )),
+                None => Ok(PlanState::new(
+                    "trial_unknown",
+                    "The cardless trial is eligible for this workspace, but the server \
+                     published no trial terms — no duration, cap or expiry is assumed.",
+                )),
+            },
+            "used" => Ok(PlanState::new(
+                "trial_used",
+                "The cardless trial was already used for this workspace, its owner or its \
+                 email domain.",
+            )),
+            "unavailable" => Ok(PlanState::new(
+                "trial_unknown",
+                "This deployment cannot grant a trial (unavailable) — do not assume one applies.",
+            )),
+            "unproven" => Ok(PlanState::new(
+                "trial_unknown",
+                format!(
+                    "Trial eligibility is unproven at {as_of}: this read found no prior use, \
+                     but only the registration door can start the trial, so nothing is claimed."
+                ),
+            )),
+            "unknown" => Ok(PlanState::new(
+                "trial_unknown",
+                format!(
+                    "Trial eligibility is unknown at {as_of} — do not assume the trial applies."
+                ),
+            )),
+            other => Err(PlanFact::unavailable(
+                "invalid",
+                format!(
+                    "Billing unavailable: the offer reported an unknown trial eligibility `{other}`; no trial, duration or expiry is assumed"
+                ),
+            )),
+        },
+        "expired" => Ok(PlanState::new(
+            "trial_expired",
+            "The cardless trial expired.",
+        )),
+        "failed" => Ok(PlanState::new(
+            "trial_failed",
+            "The cardless trial did not start (failed).",
+        )),
+        "unavailable" => Ok(PlanState::new(
+            "trial_unknown",
+            "The trial record could not be read (unavailable) — nothing is assumed.",
+        )),
+        other => Err(PlanFact::unavailable(
+            "invalid",
+            format!(
+                "Billing unavailable: the offer reported an unknown trial state `{other}`; no trial, duration or expiry is assumed"
+            ),
+        )),
+    }
+}
+
+/// `20.000000` → `20.00`; anything else is printed exactly as the server
+/// sent it. Display only — no rounding, no invented precision, and no
+/// byte-index slicing of a string that is not already ASCII digits.
+fn money(scaled: &str) -> String {
+    let Some((whole, fraction)) = scaled.split_once('.') else {
+        return scaled.to_string();
+    };
+    let bytes = fraction.as_bytes();
+    if whole.bytes().all(|b| b.is_ascii_digit())
+        && bytes.len() == 6
+        && bytes.iter().all(u8::is_ascii_digit)
+        && bytes[2..].iter().all(|b| *b == b'0')
+    {
+        return format!("{whole}.{}", &fraction[..2]);
+    }
+    scaled.to_string()
 }
 
 #[cfg(test)]
