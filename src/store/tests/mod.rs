@@ -640,6 +640,7 @@ mod app_tools;
 mod app_works;
 mod archive_acceptance;
 mod cad1365_media_producer_acceptance;
+mod cad1962_media_asset_detail;
 mod effect_lifecycle;
 mod human_push_presence_acceptance;
 mod social_generation_receipt_acceptance;

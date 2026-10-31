@@ -2592,7 +2592,8 @@ fn has_tools_only_screen(files: &[(String, String)], manifest: &Manifest) -> boo
             && pkg.may.iter().all(|m| {
                 m == crate::issue::app_screen_decl::MAY_TOOLS_INVOKE
                     || ((m == crate::issue::app_screen_decl::MAY_MEDIA_READ
-                        || m == crate::issue::app_screen_decl::MAY_MEDIA_PUBLISH)
+                        || m == crate::issue::app_screen_decl::MAY_MEDIA_PUBLISH
+                        || m == crate::issue::app_screen_decl::MAY_MEDIA_IMPORT)
                         && pkg.host_contract.as_deref()
                             == Some(crate::issue::app_screen_decl::HOST_CONTRACT_MEDIA))
             })

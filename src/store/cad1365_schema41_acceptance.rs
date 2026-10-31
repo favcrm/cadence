@@ -54,7 +54,9 @@ fn cad1365_s41_v40_fixture(dir: &TempDir) -> (std::path::PathBuf, Store) {
     {
         let raw = Connection::open(&db).unwrap();
         raw.execute_batch(
-            "DROP TABLE app_media_asset_origins;
+            "DROP TABLE app_media_imports;
+             DROP TABLE app_media_import_requests;
+             DROP TABLE app_media_asset_origins;
              DROP TABLE app_media_publish_requests;
              DROP TABLE app_media_assets;
              UPDATE schema_version SET version=40;",
@@ -72,7 +74,9 @@ fn cad1365_s45_v44_fixture(dir: &TempDir) -> (std::path::PathBuf, Store) {
     {
         let raw = Connection::open(&db).unwrap();
         raw.execute_batch(
-            "DROP TABLE app_media_asset_origins;
+            "DROP TABLE app_media_imports;
+             DROP TABLE app_media_import_requests;
+             DROP TABLE app_media_asset_origins;
              DROP TABLE app_media_publish_requests;
              DROP TABLE app_media_assets;
              UPDATE schema_version SET version=44;",
