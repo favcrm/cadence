@@ -240,8 +240,9 @@ class CleanupTests(unittest.TestCase):
         warm = job(ci, "cache-warm")
         self.assertIn("test and release legs", warm)
         junit = (ROOT / "scripts/check-test-junit.py").read_text()
-        for needle in ('no runnable tests', 'findall(".//testsuite")',
-                       'failure', '--targets-file', 'skipped'):
+        for needle in ('no runnable tests', 'iter("testsuite")',
+                       'failure', '--targets-file', 'skipped',
+                       '--inventory', '--ignored-manifest', 'test-count'):
             self.assertIn(needle, junit)
         selected = subprocess.run([str(ROOT / "scripts/result-test-args")],
                                   capture_output=True, text=True, check=True).stdout.split()
