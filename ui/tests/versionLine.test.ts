@@ -91,7 +91,7 @@ assert(runningRelease(null) === null, "no meta -> fallback");
   const user = { name: "Fable Chen", email: "f@example.com", role: "operator", handle: "f", sub: "s" };
   const meta = { read_only: false, signed_in: true, actor: "x", session: { id: "s1", origin: "public", user } };
   const footer = createElement(VersionLine, { release: "1.2.3", build: "abc", href, updatePending: false });
-  const { host, done } = mount(createElement(AccountMenu, { meta, actor: "x", mayWrite: true, onChange: () => undefined, trigger: "avatar", placement: "below-end", footer }));
+  const { host, done } = mount(createElement(AccountMenu, { meta, onChange: () => undefined, trigger: "avatar", placement: "below-end", footer }));
   act(() => (host.querySelector("button[aria-haspopup=dialog]") as HTMLButtonElement).click());
   assert(host.querySelector("[role=dialog] [data-version-line]"), "version line is inside the open dialog");
   act(() => (host.querySelector("[data-version-line]") as HTMLElement).click());

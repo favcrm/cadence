@@ -4,6 +4,8 @@ import { onPrivateSessionReset } from "../../lib/privateSession";
 /** Per-browser sidebar layout (CAD-1692): what is folded and which
  *  projects are pinned. The desktop sidebar and the phone menu share it. */
 export interface SidebarPrefs {
+  /** Desktop icon rail preference; mobile drawer visibility is separate. */
+  collapsed: boolean;
   /** The Apps tree is unfolded. */
   appsOpen: boolean;
   /** Installations whose section list the user folded. */
@@ -19,6 +21,7 @@ export interface SidebarPrefs {
 export const SIDEBAR_PREFS_KEY = "cadence.sidebar";
 
 export const DEFAULT_SIDEBAR_PREFS: SidebarPrefs = Object.freeze({
+  collapsed: false,
   appsOpen: true,
   closedApps: [],
   projectsOpen: true,
@@ -39,6 +42,7 @@ export function readSidebarPrefs(storage: Pick<Storage, "getItem"> | null = safe
     if (v === null || typeof v !== "object") return DEFAULT_SIDEBAR_PREFS;
     const d = DEFAULT_SIDEBAR_PREFS;
     return {
+      collapsed: flag(v.collapsed, d.collapsed),
       appsOpen: flag(v.appsOpen, d.appsOpen),
       closedApps: ids(v.closedApps),
       projectsOpen: flag(v.projectsOpen, d.projectsOpen),

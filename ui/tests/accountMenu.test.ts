@@ -48,7 +48,7 @@ function mount(node: unknown) {
   return { host, done: () => { act(() => root.unmount()); host.remove(); } };
 }
 const menu = (meta: Meta | null, extra: object = {}, onChange: () => void = () => undefined) =>
-  createElement(AccountMenu, { meta, actor: "Fable (board)", mayWrite: true, onChange, trigger: "avatar", placement: "below-end", ...extra });
+  createElement(AccountMenu, { meta, onChange, trigger: "avatar", placement: "below-end", ...extra });
 const trigger = (host: any) => host.querySelector("button[aria-haspopup=dialog]") as HTMLButtonElement;
 const panel = (host: any) => host.querySelector("[role=dialog]");
 const pointerDown = (target: any) => act(() => { target.dispatchEvent(new win.Event("pointerdown", { bubbles: true })); });
@@ -126,20 +126,13 @@ const pointerDown = (target: any) => act(() => { target.dispatchEvent(new win.Ev
   done();
 }
 
-// Identity and the writes line.
+// Identity remains visible in the account menu.
 {
   const { host, done } = mount(menu(signedIn));
   act(() => trigger(host).click());
   const text = panel(host).textContent as string;
   assert(text.includes("Fable Chen") && text.includes("fable@example.com") && text.includes("operator"), "identity block");
-  assert(text.includes("Writes commit to the tracker as") && text.includes("Fable (board)"), "writes line when the client may write");
   assert(host.querySelector("[title='session sess-1']"), "session id kept in a title");
-  done();
-}
-{
-  const { host, done } = mount(menu(signedIn, { mayWrite: false }));
-  act(() => trigger(host).click());
-  assert(!(panel(host).textContent as string).includes("Writes commit"), "no writes line on a read-only client");
   done();
 }
 
@@ -180,7 +173,7 @@ async function guardCases() {
     const { host, done } = mount(menu(ro));
     act(() => trigger(host).click());
     const text = panel(host).textContent as string;
-    assert(text.includes("Sign out") && !text.includes("Writes commit"), "read-only boards keep session logout without enabling workspace writes");
+    assert(text.includes("Sign out"), "read-only boards keep session logout");
     assert(text.includes("Fable Chen"), "read-only board keeps identity");
     done();
   }

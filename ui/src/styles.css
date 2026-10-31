@@ -198,6 +198,97 @@
   background: var(--color-ink-800);
   color: var(--color-ink-100);
 }
+/* CAD-1961: compact desktop rail. Labels remain accessible on the links. */
+.sidebar-brand {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 19px;
+}
+.sidebar-logo-button, .sidebar-collapse, .mobile-navigation-close {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  border-radius: 5px;
+  color: var(--color-ink-400);
+}
+.sidebar-collapse:hover, .mobile-navigation-close:hover {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+.sidebar-collapse svg { transform: rotate(180deg); }
+.sidebar-logo-button:focus-visible, .sidebar-collapse:focus-visible, .mobile-navigation-close:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+[data-sidebar-rail] .sidebar-brand { justify-content: center; }
+[data-sidebar-rail] .navlink {
+  position: relative;
+  justify-content: center;
+  gap: 0;
+  padding: 0;
+  font-size: 0;
+}
+[data-sidebar-rail] .navrow > .navlink { padding: 0; }
+[data-sidebar-rail] .navdisc, [data-sidebar-rail] .navfold { display: none; }
+[data-sidebar-rail] .navbadge, [data-sidebar-rail] .navdot {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 6px;
+  min-width: 0;
+  height: 6px;
+  padding: 0;
+  overflow: hidden;
+  border-radius: 50%;
+  font-size: 0;
+}
+[data-sidebar-rail] .account-row > span:not(:first-child) { display: none; }
+.rail-notice { text-align: center; color: var(--color-warn); font-weight: 700; }
+.rail-notice button { min-width: 28px; min-height: 28px; }
+.sidebar-tooltip {
+  position: fixed;
+  z-index: 100;
+  transform: translateY(-50%);
+  max-width: 240px;
+  padding: 6px 9px;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 5px;
+  background: var(--color-ink-850);
+  color: var(--color-ink-100);
+  box-shadow: 0 4px 16px #0003;
+  font-size: 12px;
+  line-height: 1.3;
+  pointer-events: none;
+}
+.mobile-navigation-layer { position: fixed; inset: 0; z-index: 100; }
+.mobile-navigation-scrim { position: absolute; inset: 0; background: #0009; }
+.mobile-navigation-drawer {
+  position: absolute;
+  inset: 0 auto 0 0;
+  display: flex;
+  flex-direction: column;
+  width: min(320px, calc(100vw - 48px));
+  max-height: 100dvh;
+  background: var(--color-ink-875);
+  box-shadow: 8px 0 28px #0003;
+}
+.mobile-navigation-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: none;
+  padding: max(16px, env(safe-area-inset-top)) 16px 14px;
+}
+.mobile-navigation-content {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 16px max(16px, env(safe-area-inset-bottom));
+}
 /* The phone menu keeps touch-sized rows. */
 #mobile-navigation .navlink {
   min-height: 40px;

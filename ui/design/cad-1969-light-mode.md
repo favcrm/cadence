@@ -22,3 +22,13 @@ After review, the account menu retains identity, settings, sign-out and version
 information; theme and language controls live in Settings → Preferences and
 reuse the board's `Select` control. The logo mark has a transparent background in
 both themes. Public sign-in keeps its language and theme controls available.
+
+## CAD-1961 sidebar
+
+The owner-accepted synthetic sidebar reference is
+`cad-1961-sidebar-reference.html`; its draft header predates acceptance.
+The implementation reuses `NavList`, `ProjectsSection`, `AccountMenu` and the
+existing sidebar preference store. Desktop collapse is per browser and does not
+open the mobile navigation. The mobile drawer is a modal overlay with its own
+scrolling and does not change the desktop rail preference. A folded Apps tree
+marks its parent current rather than inserting an extra app row.

@@ -100,7 +100,7 @@ const rowTrigger = (host: Element) => host.querySelector("aside button[aria-hasp
   // Phone menu: identity has one home, so no writes chip.
   const open = host.querySelector("button[aria-label='Open navigation']") as HTMLButtonElement;
   await React.act(async () => { open.click(); });
-  const menu = host.querySelector("#mobile-navigation");
+  const menu = document.querySelector("#mobile-navigation");
   assert(menu && menu.textContent?.includes("Refresh board"), "phone menu is open");
   assert(!(menu.textContent ?? "").includes("writes:"), "no writes: chip in the phone menu");
   done();

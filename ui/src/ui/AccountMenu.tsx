@@ -8,8 +8,6 @@ import Link from "./Link";
 /** The shared account menu for the desktop sidebar and mobile header. */
 export default function AccountMenu({
   meta,
-  actor,
-  mayWrite,
   onChange,
   trigger,
   placement,
@@ -18,9 +16,6 @@ export default function AccountMenu({
   onOpenChange,
 }: {
   meta: Meta | null;
-  actor: string;
-  /** This client may write — shows the "writes commit as" line. */
-  mayWrite: boolean;
   onChange: () => void;
   trigger: "avatar" | "row";
   placement: "below-end" | "above-start";
@@ -94,8 +89,6 @@ export default function AccountMenu({
         setBusy(false);
       });
   };
-  // Read-only blocks workspace writes, not ending your own session.
-  const canWrite = !meta.read_only;
   const avatar = trigger === "avatar";
   const role = user?.role || "operator";
   const roleLabel = locale !== "zh-TW" ? role : role === "operator" ? t("Operator role") : role === "member" ? t("Member role") : role;
@@ -146,11 +139,6 @@ export default function AccountMenu({
               {user?.role && <span className="chip bg-ink-800 text-ink-400 mt-1">{accessLabel}</span>}
             </div>
           </div>
-          {mayWrite && canWrite && (
-            <p className="px-2 py-1.5 text-micro text-ink-500">
-              {t("Writes commit to the tracker as")} <span className="num text-ink-300 break-all">{actor}</span>
-            </p>
-          )}
           <div className="my-1 border-t border-ink-700" />
           {settingsHref && (
             <Link href={settingsHref} onClick={() => setOpen(false)} className="block rounded-md px-2.5 py-2 text-secondary text-ink-200 hover:bg-ink-800">

@@ -13,7 +13,7 @@ import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell
 import { Loading, Notice } from "./features/app-shell/shared/States";
 import type { Viewer } from "./features/projects/work";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
-import { noteAppScreen } from "./features/app-shell/sidebarPrefs";
+import { noteAppScreen, useSidebarPrefs } from "./features/app-shell/sidebarPrefs";
 import { useInstallations, type InstallationsState } from "./features/workspace-apps/useInstallations";
 import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
 import { appLoadErrorCopy } from "./features/explorer/appErrors";
@@ -51,6 +51,7 @@ import Context from "./features/projects/Context";
 import { contextNavigationSearch } from "./features/projects/contextRoute";
 import Workflows from "./features/projects/Workflows";
 import Sidebar from "./ui/Sidebar";
+import MobileNavigation from "./ui/MobileNavigation";
 import { NavList, ProjectsSection } from "./ui/NavList";
 import Wiki from "./features/wiki/Wiki";
 import Link from "./ui/Link";
@@ -278,6 +279,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const restorePersonal = useRef(false);
   const [toast, setToast] = useState<ToastMsg | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const closeMenu = useCallback(() => setMenuOpen(false), []);
+  const { collapsed: sidebarCollapsed } = useSidebarPrefs();
   const [accountOpen, setAccountOpen] = useState(false);
   // The serving build when it differs from this bundle's — drives the
   // reload banner (CAD-573).
@@ -987,7 +990,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       : hireBlock(meta)}>
     <div
       data-app-shell
-      className={`grid lg:grid-cols-[208px_minmax(0,1fr)] bg-ink-900 ${
+      className={`grid ${sidebarCollapsed ? "lg:grid-cols-[64px_minmax(0,1fr)]" : "lg:grid-cols-[208px_minmax(0,1fr)]"} bg-ink-900 ${
         fullHeight ? "app-workspace h-[100dvh] grid-rows-[minmax(0,1fr)] overflow-hidden" : "min-h-screen"
       }`}
     >
@@ -1007,8 +1010,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         account={<AccountMenu
           onOpenChange={setAccountOpen}
           meta={meta}
-          actor={actor}
-          mayWrite={!readOnly}
           onChange={refresh}
           trigger="row"
           placement="above-start"
@@ -1064,8 +1065,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             {/* Desktop identity lives in the sidebar footer row; signed-out viewers keep the one-click theme button. */}
             {meta?.signed_in === true ? <div className="flex lg:hidden"><AccountMenu
               meta={meta}
-              actor={actor}
-              mayWrite={!readOnly}
               onChange={refresh}
               trigger="avatar"
               placement="below-end"
@@ -1085,7 +1084,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         )}
 
         {menuOpen && (
-          <div id="mobile-navigation" className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
+          <MobileNavigation onClose={closeMenu}>
             <NavList
               noWiki={!wikiAvailable(meta)}
               screen={screen === "workspaceApp" || screen === "workspaceAppKey" ? "apps" : screen}
@@ -1093,7 +1092,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               appMenu={appMenu}
               homeCount={homeCount}
               label={t("Workspace")}
-              onNavigate={() => setMenuOpen(false)}
+              onNavigate={closeMenu}
             />
             <div className="pt-2">
               <ProjectsSection
@@ -1102,7 +1101,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 projects={projects}
                 issues={issuesState}
                 projectsError={projectsState.status === "failed" ? projectsState.error : null}
-                onNavigate={() => setMenuOpen(false)}
+                onNavigate={closeMenu}
               />
             </div>
             {/* The header carries these as icons under lg — here they keep
@@ -1119,7 +1118,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 <SignIn meta={meta} onChange={refresh} access={viewer.access} recheckFinished={recheckFinished} onRetryWorkspace={reload} />
               </StatusChips>
             </div>
-          </div>
+            {meta?.signed_in === true && <div className="mt-3 border-t border-ink-700 pt-2"><AccountMenu
+              meta={meta}
+              onChange={refresh}
+              trigger="row"
+              placement="above-start"
+              settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
+              footer={versionLine}
+            /></div>}
+          </MobileNavigation>
         )}
 
         {projectScope(route) === "chips" && showProjectChoices(projects.length, project) && (
