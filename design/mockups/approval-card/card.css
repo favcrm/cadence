@@ -1,0 +1,142 @@
+/* Only what the board's compiled CSS does not already provide.
+   Everything else uses the board's own classes (navlink, proj, chip, card,
+   rc-sheet*, btn btn-primary/btn-ghost, text-ink-*, text-ok/fail/warn). */
+
+.review-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  align-items: center;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--color-ink-700);
+  background: var(--color-ink-950);
+  font-size: 12px;
+  color: var(--color-ink-400);
+}
+
+.review-bar strong { color: var(--color-ink-200); font-weight: 500; }
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.seg button {
+  border: 0;
+  background: transparent;
+  color: var(--color-ink-400);
+  padding: 4px 9px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.seg button[aria-pressed="true"] {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+
+.kbd {
+  border: 1px solid var(--color-ink-700);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--color-ink-400);
+}
+
+.rc-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.rc-row > summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 10px;
+  border: 1px solid var(--color-ink-800);
+  border-radius: 8px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 12.5px;
+}
+
+.rc-row > summary::-webkit-details-marker { display: none; }
+.rc-row > summary:hover { border-color: var(--color-ink-700); }
+
+.rc-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.rc-row[data-state="ok"] .rc-dot { background: var(--color-ok); }
+.rc-row[data-state="todo"] .rc-dot { background: var(--color-warn); }
+.rc-row[data-state="blocked"] .rc-dot { background: var(--color-fail); }
+.rc-row[data-state="waiting"] .rc-dot { background: var(--color-ink-600); }
+
+.rc-row-text { flex: 1; color: var(--color-ink-200); }
+.rc-row-status { min-width: 4.5rem; text-align: right; font-size: 11px; color: var(--color-ink-400); }
+.rc-row-hint { font-family: var(--font-mono); font-size: 10.5px; color: var(--color-ink-500); }
+.rc-row-body { padding: 8px 10px 2px 27px; font-size: 11.5px; color: var(--color-ink-400); }
+
+.rc-banner {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 9px 11px;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 8px;
+  font-size: 12.5px;
+  color: var(--color-ink-300);
+}
+
+.rc-banner[data-tone="warn"] {
+  border-color: color-mix(in srgb, var(--color-warn) 40%, var(--color-ink-700));
+  background: color-mix(in srgb, var(--color-warn) 8%, transparent);
+}
+
+.rc-banner[data-tone="fail"] {
+  border-color: color-mix(in srgb, var(--color-fail) 40%, var(--color-ink-700));
+  background: color-mix(in srgb, var(--color-fail) 8%, transparent);
+}
+
+.rc-banner a { color: var(--color-accent); }
+
+.rc-stepup {
+  margin-top: 14px;
+  padding: 11px;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 8px;
+  background: var(--color-ink-850);
+  font-size: 12.5px;
+  color: var(--color-ink-300);
+}
+
+.rc-progress {
+  display: flex;
+  gap: 12px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--color-ink-500);
+}
+
+.rc-progress [data-step]::before { content: "○ "; }
+.rc-progress [data-step="done"] { color: var(--color-ink-300); }
+.rc-progress [data-step="done"]::before { content: "● "; color: var(--color-accent); }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}

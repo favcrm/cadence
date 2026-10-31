@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Approve change — CAD-1939 · cadence board mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="index.css">
+<link rel="stylesheet" href="card.css">
+<script>
+(function () {
+  try {
+    var p = localStorage.getItem("cadence-theme");
+    if (p === "light" || p === "dark") document.documentElement.setAttribute("data-theme", p);
+  } catch (e) { /* unstorable: the system preference decides */ }
+})();
+</script>
+</head>
+<body class="bg-ink-900 text-ink-200">
+
+<div class="review-bar" role="region" aria-label="Review controls">
+  <span><strong>Review controls</strong> — not part of the product · resize the window for 390</span>
+  <span class="seg" role="group" aria-label="Theme">
+    <button type="button" data-theme-pick="">System</button>
+    <button type="button" data-theme-pick="dark">Dark</button>
+    <button type="button" data-theme-pick="light">Light</button>
+  </span>
+  <label>State
+    <select id="state" class="field">
+      <option value="ready">Ready to merge</option>
+      <option value="needs-one">One thing missing</option>
+      <option value="head-moved">Head moved</option>
+      <option value="ejected">Queue ejected</option>
+      <option value="down">Board unreachable</option>
+      <option value="step-up">Step-up</option>
+      <option value="merging">Approved — merging</option>
+    </select>
+  </label>
+</div>
+
+<div class="grid lg:grid-cols-[208px_minmax(0,1fr)] bg-ink-900 min-h-screen" id="shell">
+  <aside class="side hidden lg:flex sticky top-0 h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[16px] pb-1">
+    <div class="flex items-center gap-[9px] pb-[14px] text-[15px] font-semibold tracking-tight">
+      cadence&nbsp;<span class="text-ink-400 font-normal">board</span>
+    </div>
+    <nav class="grid gap-[2px]" aria-label="Primary">
+      <a href="#" class="navlink">Home</a>
+      <a href="#" class="navlink">My work</a>
+      <a href="#" class="navlink">Threads</a>
+      <a href="#" class="navlink">Projects</a>
+      <a href="#" class="navlink">Wiki</a>
+      <a href="#" class="navlink">Apps</a>
+      <a href="#" class="navlink" aria-current="page">Agents</a>
+      <a href="#" class="navlink">Settings</a>
+    </nav>
+    <div class="mt-4 grid gap-[2px]">
+      <div class="px-[9px] pb-1 text-[10px] uppercase tracking-[.08em] text-ink-500">Projects</div>
+      <a href="#" class="proj"><span class="truncate">synthetic-app</span><span class="num">12</span></a>
+      <a href="#" class="proj"><span class="truncate">synthetic-site</span><span class="num">3</span></a>
+    </div>
+  </aside>
+
+  <div class="min-w-0 flex flex-col">
+    <header class="app-header sticky top-0 z-10 flex items-center gap-2 sm:gap-3 px-4 lg:px-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
+      <nav class="header-breadcrumb min-w-0 flex-1" aria-label="Breadcrumb">
+        <span class="text-ink-400">Cadence</span>
+        <span class="text-ink-600">/</span>
+        <span>SOC-42</span>
+      </nav>
+      <button class="header-search-trigger hidden lg:inline-flex" type="button">
+        Search issues and knowledge… <span class="kbd">Ctrl K</span>
+      </button>
+      <button class="header-icon" type="button" aria-label="Open notifications">◔</button>
+      <button class="header-icon" type="button" aria-label="Refresh board">⟳</button>
+    </header>
+
+    <main class="px-4 lg:px-8 pt-6 pb-9">
+      <div class="kicker text-ink-500">SOC-42</div>
+      <h1 class="mt-1 text-[22px] font-semibold tracking-[-.02em]">Publish 0.2.0 to the marketplace</h1>
+      <div class="mt-2 flex flex-wrap gap-2">
+        <span class="chip text-ink-300">ready</span>
+        <span class="chip text-ink-300">P1</span>
+        <span class="chip text-ink-300">marketplace</span>
+      </div>
+      <p class="mt-4 max-w-[62ch] text-label text-ink-400">
+        Synthetic issue body. The listing block ships with the version, the manifest points at the
+        signed bundle, and the marketplace reads the release record. This page is only here to show
+        the approval card in the surface it will actually live in.
+      </p>
+      <p class="mt-3 max-w-[62ch] text-label text-ink-500">
+        Two reviewers passed <span class="font-mono">290710c</span>. Required checks are green.
+      </p>
+    </main>
+  </div>
+</div>
+
+<dialog open class="rc-sheet bg-ink-875 border-l border-ink-700 text-ink-200" id="sheet" aria-labelledby="card-title">
+  <div class="rc-sheet-h">
+    <div class="min-w-0">
+      <h2 id="card-title" class="text-[15px] font-semibold leading-tight">Publish 0.2.0 to the marketplace</h2>
+      <p class="rc-sub mt-1 text-label text-ink-400" id="card-sub">Ready to merge</p>
+    </div>
+    <button type="button" class="btn btn-ghost btn-sm x" aria-label="Close">✕</button>
+  </div>
+
+  <div class="rc-sheet-b">
+    <p class="rc-summary mb-3 font-mono text-[11px] text-ink-500" id="card-summary"></p>
+    <ul class="rc-rows" id="rows"></ul>
+    <div id="banner-slot"></div>
+    <details class="rc-details mt-4 text-[11px] text-ink-500">
+      <summary class="cursor-pointer">Details</summary>
+      <dl class="mt-2 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 font-mono">
+        <dt class="text-ink-500">head</dt><dd class="text-ink-300 break-all">290710c4d1e8f0a7c6b5a4938271605f4e3d2c1b</dd>
+        <dt class="text-ink-500">base</dt><dd class="text-ink-300">main @ 3a49b913</dd>
+        <dt class="text-ink-500">class</dt><dd class="text-ink-300">delegated</dd>
+        <dt class="text-ink-500">policy</dt><dd class="text-ink-300">sha256:9f2c…a71d</dd>
+      </dl>
+    </details>
+  </div>
+
+  <div class="rc-sheet-f">
+    <span class="text-label text-ink-500">Nothing merges until you approve.</span>
+    <button type="button" class="btn btn-ghost btn-sm">Cancel</button>
+    <span id="action-slot" class="contents"></span>
+  </div>
+</dialog>
+
+<p class="visually-hidden" role="status" aria-live="polite" id="live"></p>
+
+<script src="card.js"></script>
+</body>
+</html>
