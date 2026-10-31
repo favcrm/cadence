@@ -200,3 +200,52 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
           tail -5 "$RUNNER_TEMP/cargo.log" || true
           exit "$rc"
+
+  # CAD-1967: `supported_kernel_abi` refused 6.18.54-instabox, and adding a
+  # kernel to that list is a product safety decision, not a runner label.
+  # This job gathers the same procfs facts `process_use::validate_completeness`
+  # reads, on the GitHub runner the gate uses today and on the InstaBox
+  # runner, so the comparison is evidence rather than assumption. Read-only.
+  proc-facts:
+    name: proc-facts (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, instabox-medium]
+    steps:
+      - name: Record the procfs facts the deletion proof reads
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: |
+          set -u
+          echo "## proc facts ($RUNNER_LABEL)" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "runner=$RUNNER_LABEL"
+            echo "kernel=$(uname -r)"
+            echo "euid=$(id -u)"
+            echo "proc_fstype=$(findmnt -no FSTYPE /proc 2>/dev/null || echo unknown)"
+            echo
+            echo "-- /proc/2/stat --"
+            head -c 300 /proc/2/stat 2>/dev/null || echo unreadable
+            echo
+            echo "-- /proc/2/status --"
+            grep -E '^(Name|PPid):' /proc/2/status 2>/dev/null || echo unreadable
+            echo
+            echo "-- /proc/2/ns/pid --"
+            if target=$(readlink /proc/2/ns/pid 2>/dev/null); then
+              echo "target=[${target}]"
+            else
+              echo "readlink_failed"
+            fi
+            stat -c 'link uid=%u gid=%g mode=%A' /proc/2/ns/pid 2>/dev/null \
+              || echo "link stat unavailable"
+            echo
+            echo "-- /proc/self/ns/pid --"
+            readlink /proc/self/ns/pid 2>/dev/null || echo unreadable
+            echo
+            echo "-- proc mounts --"
+            grep -c ' - proc ' /proc/self/mountinfo 2>/dev/null || echo 0
+            grep ' /proc' /proc/self/mountinfo 2>/dev/null | head -8 || true
+          } | tee -a "$GITHUB_STEP_SUMMARY"
