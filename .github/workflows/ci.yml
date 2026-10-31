@@ -791,7 +791,7 @@ jobs:
           - target: aarch64-linux
             runner: ubuntu-22.04-arm
           - target: aarch64-macos
-            runner: macos-14
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     continue-on-error: true
@@ -1178,7 +1178,7 @@ jobs:
           - target: aarch64-linux
             runner: ubuntu-22.04-arm
           - target: aarch64-macos
-            runner: macos-14
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
@@ -1278,7 +1278,7 @@ jobs:
           - target: aarch64-linux
             runner: ubuntu-22.04-arm
           - target: aarch64-macos
-            runner: macos-14
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     permissions:
@@ -1732,7 +1732,7 @@ jobs:
           - target: aarch64-linux
             runner: ubuntu-22.04-arm
           - target: aarch64-macos
-            runner: macos-14
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
