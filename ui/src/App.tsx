@@ -37,6 +37,7 @@ import CredentialEntry from "./features/connections/CredentialEntry";
 import CredentialAuthorize from "./features/connections/CredentialAuthorize";
 import EmailSending from "./features/settings/EmailSending";
 import SettingsLayout from "./features/settings/SettingsLayout";
+import Preferences from "./features/settings/Preferences";
 import Templates from "./features/templates/Templates";
 import Update from "./features/settings/Update";
 import Outbox from "./features/outbox/Outbox";
@@ -1011,7 +1012,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           onChange={refresh}
           trigger="row"
           placement="above-start"
-          settingsHref={hrefFor({ screen: "settings", section: "models" })}
+          settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
           footer={versionLine}
         />}
       />
@@ -1068,7 +1069,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               onChange={refresh}
               trigger="avatar"
               placement="below-end"
-              settingsHref={hrefFor({ screen: "settings", section: "models" })}
+              settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
               footer={versionLine}
             /></div> : <><LocalLanguage /><ThemeToggle /></>}
           </div>
@@ -1418,6 +1419,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                   { label: "Agents", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
                   { label: "Connections", href: hrefFor({ screen: "settings", section: "connections" }), on: route.section === "connections" },
                   { label: "Email sending", href: hrefFor({ screen: "settings", section: "email" }), on: route.section === "email" },
+                  { label: "Preferences", href: hrefFor({ screen: "settings", section: "preferences" }), on: route.section === "preferences" },
                 ],
               },
               {
@@ -1439,6 +1441,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             )}
             {route.section === "email" && <EmailSending viewer={viewer} />}
             {route.section === "templates" && <Templates />}
+            {route.section === "preferences" && <Preferences />}
             {route.section === "account" && <PlatformAccount />}
             {route.section === "update" && <Update viewer={viewer} health={health} />}
             {route.section === "permissions" && <MasterPermissions viewer={{ ...viewer, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}

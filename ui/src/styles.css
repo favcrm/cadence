@@ -21,6 +21,10 @@
     --board-reading-width: 48rem;
     --board-project-width: 76rem;
     --board-project-surface: var(--color-ink-850);
+    --cadence-logo-surface: #ffffff;
+    --cadence-logo-border: #d5dddc;
+    --cadence-logo-start: #126b60;
+    --cadence-logo-end: #197987;
   }
 }
 :root[data-theme="light"] {
@@ -30,6 +34,10 @@
   --board-reading-width: 48rem;
   --board-project-width: 76rem;
   --board-project-surface: var(--color-ink-850);
+  --cadence-logo-surface: #ffffff;
+  --cadence-logo-border: #d5dddc;
+  --cadence-logo-start: #126b60;
+  --cadence-logo-end: #197987;
 }
 
 .kicker {

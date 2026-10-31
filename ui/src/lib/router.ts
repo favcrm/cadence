@@ -42,7 +42,7 @@ import { MY_WORK_URL_KEYS, readMyWorkView, writeMyWorkView, type MyWorkView } fr
  */
 
 export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows";
-export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates";
+export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). */
 export type WikiMode = "browse" | "edit" | "history" | "search" | "upload";
 
@@ -285,6 +285,7 @@ export function matchRoute(pathname: string): Route {
       if (a === "memory") return { screen: "settings", section: "memory" };
       if (a === "update") return { screen: "settings", section: "update" };
       if (a === "account") return { screen: "settings", section: "account" };
+      if (a === "preferences") return { screen: "settings", section: "preferences" };
       if (a === "permissions") return { screen: "settings", section: "permissions" };
       if (a === "email") return { screen: "settings", section: "email" };
       if (a === "templates") return { screen: "settings", section: "templates" };
@@ -377,6 +378,7 @@ export function routePath(route: Route): string {
       return "/my-work";
     case "settings":
       if (route.section === "account") return "/settings/account";
+      if (route.section === "preferences") return "/settings/preferences";
       if (route.section === "memory") return "/settings/memory";
       if (route.section === "update") return "/settings/update";
       if (route.section === "permissions") return "/settings/permissions";

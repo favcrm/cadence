@@ -1,30 +1,11 @@
 import { useEffect, useId, useRef, useState, type FocusEvent, type KeyboardEvent, type ReactNode } from "react";
 import { closeSession } from "../features/auth/session";
-import { setThemePref, type ThemePref } from "../lib/theme";
 import type { Meta } from "../lib/types";
 import { useLocale } from "../lib/locale";
-import { IconChevron, IconMoon, IconSun, IconTheme } from "./icons";
+import { IconChevron } from "./icons";
 import Link from "./Link";
 
-const THEMES: { pref: ThemePref; label: string; icon: ReactNode }[] = [
-  { pref: "system", label: "System", icon: <IconTheme size={14} /> },
-  { pref: "light", label: "Light", icon: <IconSun size={14} /> },
-  { pref: "dark", label: "Dark", icon: <IconMoon size={14} /> },
-];
-
-/** The applied theme (initTheme ran before the first render). */
-function appliedTheme(): ThemePref {
-  const applied = document.documentElement.getAttribute("data-theme");
-  return applied === "light" || applied === "dark" ? applied : "system";
-}
-
-/**
- * One account menu: who you are, who writes are attributed to, theme and
- * sign out. The "avatar" trigger is a 24px initial (header, phones); the
- * "row" trigger is the desktop sidebar footer (CAD-1033, CAD-1312): a
- * compact single line — avatar, name, small role and an up-chevron in a
- * `.navlink`-family row.
- */
+/** The shared account menu for the desktop sidebar and mobile header. */
 export default function AccountMenu({
   meta,
   actor,
@@ -53,29 +34,12 @@ export default function AccountMenu({
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const signingOut = useRef(false);
-  const [theme, setTheme] = useState<ThemePref>(appliedTheme);
-  const [languageBusy, setLanguageBusy] = useState(false);
-  const [languageError, setLanguageError] = useState(false);
-  const [languageSaved, setLanguageSaved] = useState(false);
-  const { userLocale, organizationLocale, isHostedUser, canSetOrganizationLocale, locale, t, setPreference } = useLocale();
+  const { locale, t } = useLocale();
   const rootRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const user = meta?.session?.user;
   const name = user?.name || user?.email || user?.handle || user?.sub || "operator";
-  const saveLocale = async (scope: "user" | "organization", value: "en" | "zh-TW" | null) => {
-    setLanguageBusy(true);
-    setLanguageError(false);
-    setLanguageSaved(false);
-    try {
-      await setPreference(scope, value);
-      setLanguageSaved(true);
-    } catch {
-      setLanguageError(true);
-    } finally {
-      setLanguageBusy(false);
-    }
-  };
 
   useEffect(() => {
     if (!open) return;
@@ -172,12 +136,15 @@ export default function AccountMenu({
           aria-label={t("Account")}
           // Any link in the panel (Settings, a footer slot item) navigates away: close.
           onClick={(event) => { if ((event.target as Element).closest("a")) setOpen(false); }}
-          className={`absolute z-50 card p-1.5 shadow-xl ${placement === "below-end" ? "right-0 top-full mt-2 w-64" : "left-0 bottom-full mb-2 w-[max(100%,16rem)]"}`}
+          className={`absolute z-50 card p-2 shadow-xl ${placement === "below-end" ? "right-0 top-full mt-2 w-64" : "left-0 bottom-full mb-2 w-[max(100%,16rem)]"}`}
         >
-          <div className="px-2 py-1.5" title={meta.session ? `${t("session")} ${meta.session.id}` : undefined}>
-            <p className="text-secondary text-ink-100 break-words">{name}</p>
-            {user?.email && user.email !== name && <p className="text-micro text-ink-500 break-all">{user.email}</p>}
-            {user?.role && <span className="chip bg-ink-800 text-ink-400 mt-1">{accessLabel}</span>}
+          <div className="flex items-start gap-3 px-2 py-2" title={meta.session ? `${t("session")} ${meta.session.id}` : undefined}>
+            <span aria-hidden className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent/15 text-secondary font-medium uppercase text-accent">{name.trim().charAt(0)}</span>
+            <div className="min-w-0">
+              <p className="text-secondary font-medium text-ink-100 break-words">{name}</p>
+              {user?.email && user.email !== name && <p className="text-micro text-ink-500 break-all">{user.email}</p>}
+              {user?.role && <span className="chip bg-ink-800 text-ink-400 mt-1">{accessLabel}</span>}
+            </div>
           </div>
           {mayWrite && canWrite && (
             <p className="px-2 py-1.5 text-micro text-ink-500">
@@ -185,64 +152,12 @@ export default function AccountMenu({
             </p>
           )}
           <div className="my-1 border-t border-ink-700" />
-          <div className="flex items-center justify-between gap-2 px-2 py-1.5">
-            <span className="text-label text-ink-400">{t("Theme")}</span>
-            <div role="group" aria-label={t("Theme")} className="flex gap-0.5 rounded-md bg-ink-800 p-0.5">
-              {THEMES.map(({ pref, label, icon }) => (
-                <button
-                  key={pref}
-                  type="button"
-                  aria-pressed={theme === pref}
-                  onClick={() => {
-                    setThemePref(pref);
-                    setTheme(pref);
-                  }}
-                  className={`inline-flex items-center gap-1 rounded px-1.5 py-1 text-micro ${theme === pref ? "bg-ink-700 text-ink-100" : "text-ink-400 hover:text-ink-200"}`}
-                >
-                  {icon}{t(label)}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="px-2 py-2">
-            <label htmlFor={`${panelId}-locale`} className="mb-1 block text-label text-ink-400">{t("Language")}</label>
-            <select
-              id={`${panelId}-locale`}
-              value={userLocale ?? "follow"}
-              disabled={languageBusy}
-              onChange={(event) => void saveLocale("user", event.target.value === "follow" ? null : event.target.value as "en" | "zh-TW")}
-              className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-1.5 text-label text-ink-200"
-            >
-              <option value="follow">{isHostedUser ? `${t("Follow organization")}${organizationLocale ? ` (${organizationLocale === "zh-TW" ? "繁體中文" : "English"})` : ""}` : t("Browser default")}</option>
-              <option value="en">{t("English")}</option>
-              <option value="zh-TW">繁體中文</option>
-            </select>
-            {canSetOrganizationLocale && (
-              <>
-                <label htmlFor={`${panelId}-org-locale`} className="mb-1 mt-2 block text-label text-ink-400">{t("Organization default")}</label>
-                <select
-                  id={`${panelId}-org-locale`}
-                  value={organizationLocale ?? ""}
-                  disabled={languageBusy}
-                  onChange={(event) => void saveLocale("organization", event.target.value as "en" | "zh-TW")}
-                  className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-1.5 text-label text-ink-200"
-                >
-                  <option value="" disabled>{t("Not set")}</option>
-                  <option value="en">{t("English")}</option>
-                  <option value="zh-TW">繁體中文</option>
-                </select>
-              </>
-            )}
-            {languageBusy && <p role="status" className="mt-1 text-micro text-ink-400">{t("Saving…")}</p>}
-            {languageSaved && <p role="status" className="mt-1 text-micro text-ink-400">{t(isHostedUser ? "Language preference saved." : "Language saved in this browser.")}</p>}
-            {languageError && <p role="alert" className="mt-1 text-micro text-red-400">{t("Could not save language preference.")}</p>}
-          </div>
           {settingsHref && (
-            <Link href={settingsHref} onClick={() => setOpen(false)} className="block rounded px-2 py-1.5 text-label text-ink-200 hover:bg-ink-800">
+            <Link href={settingsHref} onClick={() => setOpen(false)} className="block rounded-md px-2.5 py-2 text-secondary text-ink-200 hover:bg-ink-800">
               {t("Settings")}
             </Link>
           )}
-          <button type="button" disabled={busy} onClick={signOut} className="block w-full rounded px-2 py-1.5 text-left text-label text-ink-200 hover:bg-ink-800 disabled:opacity-60">
+          <button type="button" disabled={busy} onClick={signOut} className="block w-full rounded-md px-2.5 py-2 text-left text-secondary text-ink-200 hover:bg-ink-800 disabled:opacity-60">
             {t("Sign out")}
           </button>
           {footer}

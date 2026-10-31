@@ -1,5 +1,6 @@
 import type { Meta } from "../src/lib/types";
 import type * as SessionKeyModule from "../src/lib/sessionKey";
+import type PreferencesComponent from "../src/features/settings/Preferences";
 
 declare function require(name: string): any;
 const { Window } = require("happy-dom");
@@ -26,6 +27,7 @@ moduleLoader.prototype.require = function (this: unknown, id: string) {
 const { createElement, act } = require("react");
 const { createRoot } = require("react-dom/client");
 const { default: AccountMenu } = require("../src/ui/AccountMenu") as typeof import("../src/ui/AccountMenu");
+const { default: Preferences } = require("../src/features/settings/Preferences") as { default: typeof PreferencesComponent };
 const { default: SignIn } = require("../src/features/auth/SignIn") as typeof import("../src/features/auth/SignIn");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { sessionKey, setSessionKey } = require("../src/lib/sessionKey") as typeof SessionKeyModule;
@@ -141,11 +143,10 @@ const pointerDown = (target: any) => act(() => { target.dispatchEvent(new win.Ev
   done();
 }
 
-// Theme selection calls setThemePref (stored + applied).
+// The settings preferences preserve theme selection and persistence.
 {
-  const { host, done } = mount(menu(signedIn));
-  act(() => trigger(host).click());
-  const buttons = Array.from(panel(host).querySelectorAll("[aria-pressed]")) as HTMLButtonElement[];
+  const { host, done } = mount(createElement(Preferences));
+  const buttons = Array.from(host.querySelectorAll("[aria-pressed]")) as HTMLButtonElement[];
   assert(buttons.length === 3 && buttons[0].getAttribute("aria-pressed") === "true", "System pressed by default");
   const dark = buttons.find((b) => b.textContent === "Dark")!;
   act(() => dark.click());
@@ -176,7 +177,7 @@ async function guardCases() {
     act(() => trigger(host).click());
     const text = panel(host).textContent as string;
     assert(text.includes("Sign out") && !text.includes("Writes commit"), "read-only boards keep session logout without enabling workspace writes");
-    assert(text.includes("Fable Chen") && host.querySelector("[aria-pressed]"), "read-only board keeps identity and theme");
+    assert(text.includes("Fable Chen"), "read-only board keeps identity");
     done();
   }
   {

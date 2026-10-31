@@ -6,11 +6,11 @@ export function Logo({ size = 25 }: { size?: number }) {
     <svg width={size} height={size} viewBox="0 0 1024 1024" fill="none" role="img" aria-label="cadence">
       <defs>
         <linearGradient id="cadence-lit" x1="0" y1="0" x2="0.574" y2="0.819">
-          <stop offset="0" stopColor="#2DD4BF" />
-          <stop offset="1" stopColor="#22D3EE" />
+          <stop offset="0" stopColor="var(--cadence-logo-start, #2DD4BF)" />
+          <stop offset="1" stopColor="var(--cadence-logo-end, #22D3EE)" />
         </linearGradient>
       </defs>
-      <rect x="20" y="20" width="984" height="984" rx="214" fill="#0B0B0C" stroke="#2e3136" strokeWidth="40" />
+      <rect x="20" y="20" width="984" height="984" rx="214" fill="var(--cadence-logo-surface, #0B0B0C)" stroke="var(--cadence-logo-border, #2e3136)" strokeWidth="40" />
       <path
         d="M 280 336 L 512 512 L 280 688"
         stroke="url(#cadence-lit)"
@@ -18,7 +18,7 @@ export function Logo({ size = 25 }: { size?: number }) {
         strokeLinecap="round"
         strokeLinejoin="round"
       />
-      <rect x="640" y="656" width="176" height="80" rx="40" fill="#2DD4BF" fillOpacity="0.8" />
+      <rect x="640" y="656" width="176" height="80" rx="40" fill="var(--cadence-logo-start, #2DD4BF)" fillOpacity="0.8" />
     </svg>
   );
 }
