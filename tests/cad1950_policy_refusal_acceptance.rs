@@ -49,8 +49,10 @@ impl Fixture {
         let stop = Arc::new(AtomicBool::new(false));
         let mut threads = Vec::new();
 
-        // The tracker the board serves: one project with a recorded policy.
+        // The tracker the board serves: a real PM skeleton (`Pm::at` refuses a
+        // bare directory) holding one project with a recorded policy.
         let pm_dir = state_dir.join("pm");
+        cadence_agent::issue::Pm::init(&pm_dir).unwrap();
         let project_dir = pm_dir.join(PROJECT);
         std::fs::create_dir_all(&project_dir).unwrap();
         let policy_path = project_dir.join("project.yaml");
