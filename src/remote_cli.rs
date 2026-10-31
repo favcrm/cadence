@@ -1442,7 +1442,12 @@ fn call_once(
     // have landed, so the caller must reconcile by idempotency key, never
     // assume nothing landed. `message_send` reconciles on `arguments.message`;
     // the team mutations reconcile with a read (`team list` / `team invites`).
-    let mutating = matches!(surface, Surface::Cli) && mutating_cli_verb(verb);
+    // A platform call is mutating only when it runs a tool: listing the
+    // catalog changes nothing, so a lost answer there is not a possible charge.
+    let mutating = matches!(surface, Surface::Cli)
+        && mutating_cli_verb(verb)
+        && (verb != "platform_call"
+            || arguments.get("operation").and_then(Value::as_str) == Some("call"));
     post(
         &target.endpoint,
         &format!("{relay}/call"),

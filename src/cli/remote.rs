@@ -787,6 +787,8 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
                 PlatformAction::Call {
                     tool,
                     input,
+                    query,
+                    request,
                     platform,
                     account,
                     project,
@@ -812,11 +814,43 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
                             "a hosted workspace resolves its own project",
                         ));
                     }
-                    let input = super::platform::parse_platform_input(input)?;
+                    let body = match input {
+                        Some(input) => Some(super::platform::parse_platform_input(input)?),
+                        None => None,
+                    };
+                    let query = match query {
+                        Some(query) => Some(super::platform::parse_platform_input(query)?),
+                        None => None,
+                    };
+                    if body.is_none() && query.is_none() {
+                        return Err(Error::usage(
+                            "platform call needs --input or, on a hosted org, --query",
+                        ));
+                    }
+                    // The handle names the retry: an identical call replays the
+                    // door's recorded outcome instead of charging again, so a
+                    // second intentional run needs a fresh --request.
+                    let key = match request {
+                        Some(request) => {
+                            if !valid_platform_handle(request) {
+                                return Err(Error::invalid(
+                                    "platform_call",
+                                    "request must be 1-128 of A-Z a-z 0-9 _ . : -",
+                                ));
+                            }
+                            request.clone()
+                        }
+                        None => platform_replay_key(tool, query.as_ref(), body.as_ref()),
+                    };
                     args.insert("operation".into(), json!("call"));
                     args.insert("tool".into(), json!(tool));
-                    args.insert("key".into(), json!(platform_replay_key(tool, &input)));
-                    args.insert("body".into(), input);
+                    args.insert("key".into(), json!(key));
+                    if let Some(body) = body {
+                        args.insert("body".into(), body);
+                    }
+                    if let Some(query) = query {
+                        args.insert("query".into(), query);
+                    }
                 }
                 _ => return Err(unavailable(command)),
             }
@@ -827,17 +861,35 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
     Ok((verb, args))
 }
 
+/// The hosted reply-token grammar (`[A-Za-z0-9_.:-]{1,128}`), checked here so
+/// a bad `--request` never reaches a paid call.
+fn valid_platform_handle(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+}
+
 /// CAD-1678: the reply key a hosted tool call replays under. The relay body
 /// has no header channel, so the token rides in the arguments; deriving it
 /// from the tool and its input means a resubmitted identical call reads the
 /// door's recorded outcome instead of charging a second time, while a
 /// different input is a different call.
-fn platform_replay_key(tool: &str, input: &Value) -> String {
+fn platform_replay_key(tool: &str, query: Option<&Value>, body: Option<&Value>) -> String {
     use sha2::{Digest, Sha256};
+    // A BTreeMap serializes in key order, so the same call always hashes the
+    // same way however the flags were ordered.
+    let mut canonical = std::collections::BTreeMap::new();
+    canonical.insert("tool", serde_json::json!(tool));
+    canonical.insert("query", query.cloned().unwrap_or(Value::Null));
+    canonical.insert("body", body.cloned().unwrap_or(Value::Null));
     let mut hasher = Sha256::new();
-    hasher.update(tool.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(serde_json::to_string(input).unwrap_or_default().as_bytes());
+    hasher.update(
+        serde_json::to_string(&canonical)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     let digest: String = hasher
         .finalize()
         .iter()
@@ -2192,6 +2244,23 @@ mod read_contract_tests {
         Commands::Platform { action }
     }
 
+    fn call_with(
+        tool: &str,
+        input: Option<&str>,
+        query: Option<&str>,
+        request: Option<&str>,
+    ) -> Commands {
+        platform(PlatformAction::Call {
+            tool: tool.into(),
+            input: input.map(str::to_string),
+            query: query.map(str::to_string),
+            request: request.map(str::to_string),
+            platform: None,
+            account: None,
+            project: None,
+        })
+    }
+
     #[test]
     fn hosted_platform_lists_and_calls_through_one_verb() {
         let (verb, args) = outcome(&platform(PlatformAction::Tools {
@@ -2202,32 +2271,76 @@ mod read_contract_tests {
         assert_eq!(verb, "platform_call");
         assert_eq!(args, json!({"operation": "tools"}));
 
-        let call = || {
-            platform(PlatformAction::Call {
-                tool: "generate_image".into(),
-                input: r#"{"prompt": "synthetic"}"#.into(),
-                platform: None,
-                account: None,
-                project: None,
-            })
-        };
-        let (verb, args) = outcome(&call()).unwrap();
+        let (verb, args) = outcome(&call_with(
+            "generate_image",
+            Some(r#"{"prompt": "synthetic"}"#),
+            None,
+            None,
+        ))
+        .unwrap();
         assert_eq!(verb, "platform_call");
         assert_eq!(args["operation"], json!("call"));
         assert_eq!(args["tool"], json!("generate_image"));
         assert_eq!(args["body"], json!({"prompt": "synthetic"}));
         let key = args["key"].as_str().expect("a call carries a reply key");
         assert!(key.starts_with("pcli_"), "{key}");
+        assert!(valid_platform_handle(key), "{key}");
         // The same command replays the same key; another input is another call.
-        assert_eq!(outcome(&call()).unwrap().1["key"], json!(key));
-        let other = platform(PlatformAction::Call {
-            tool: "generate_image".into(),
-            input: r#"{"prompt": "a different prompt"}"#.into(),
-            platform: None,
-            account: None,
-            project: None,
-        });
-        assert_ne!(outcome(&other).unwrap().1["key"], json!(key));
+        assert_eq!(
+            outcome(&call_with(
+                "generate_image",
+                Some(r#"{"prompt": "synthetic"}"#),
+                None,
+                None
+            ))
+            .unwrap()
+            .1["key"],
+            json!(key)
+        );
+        assert_ne!(
+            outcome(&call_with(
+                "generate_image",
+                Some(r#"{"prompt": "a different prompt"}"#),
+                None,
+                None
+            ))
+            .unwrap()
+            .1["key"],
+            json!(key)
+        );
+    }
+
+    #[test]
+    fn hosted_platform_sends_a_query_half_and_honours_an_explicit_handle() {
+        // A catalog tool the platform reads with GET carries its fields in
+        // `query`, never wrapped into a request body.
+        let (_, args) = outcome(&call_with(
+            "read_posts",
+            None,
+            Some(r#"{"handle": "synthetic"}"#),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(args["query"], json!({"handle": "synthetic"}));
+        assert!(args.get("body").is_none(), "{args}");
+        // A deliberate second run names its own handle; a malformed one never
+        // reaches a paid call.
+        let (_, args) = outcome(&call_with(
+            "generate_image",
+            Some("{}"),
+            None,
+            Some("run-2026"),
+        ))
+        .unwrap();
+        assert_eq!(args["key"], json!("run-2026"));
+        let refused = outcome(&call_with(
+            "generate_image",
+            Some("{}"),
+            None,
+            Some("bad handle"),
+        ))
+        .unwrap_err();
+        assert!(refused.contains("1-128"), "{refused}");
     }
 
     #[test]
@@ -2244,7 +2357,9 @@ mod read_contract_tests {
                 "--platform",
                 PlatformAction::Call {
                     tool: "generate_image".into(),
-                    input: "{}".into(),
+                    input: Some("{}".into()),
+                    query: None,
+                    request: None,
                     platform: Some("agenticos".into()),
                     account: None,
                     project: None,
@@ -2254,7 +2369,9 @@ mod read_contract_tests {
                 "--account",
                 PlatformAction::Call {
                     tool: "generate_image".into(),
-                    input: "{}".into(),
+                    input: Some("{}".into()),
+                    query: None,
+                    request: None,
                     platform: None,
                     account: Some("work".into()),
                     project: None,
