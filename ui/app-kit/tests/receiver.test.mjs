@@ -120,6 +120,27 @@ test("surfaces opt-in is advertised and the drawer surface is dispatched", async
   assert.deepEqual(seen.pop(), ["drawer", "settings", false]);
 });
 
+test("every surface shape the host sends is admitted", async () => {
+  const shapes = [
+    { v: 1, op: "surface", role: "primary", modal: false },
+    { v: 1, op: "surface", role: "drawer", modal: false, surface: "settings" },
+    { v: 1, op: "surface", role: "primary" },
+  ];
+  for (const shape of shapes) {
+    const seen = [];
+    const { host, receiver } = connect({ accepts: ["screen.v2", "screen-surfaces.v1"], onSurface: (...a) => seen.push(a) });
+    host.postMessage(shape);
+    await tick();
+    assert.equal(seen.length, 1, `host shape ${JSON.stringify(shape)} is admitted`);
+    assert.equal(receiver.surfaceRole(), shape.role);
+    assert.equal(receiver.surface(), shape.surface);
+  }
+  const bad = connect({ accepts: ["screen.v2", "screen-surfaces.v1"] });
+  bad.host.postMessage({ v: 1, op: "surface", role: "primary", modal: "no" });
+  await tick();
+  assert.equal(bad.receiver.accepted(), false, "a non-boolean modal still refuses");
+});
+
 test("a drawer surface opens no further drawer", async () => {
   const { receiver, host } = connect({ accepts: ["screen.v2", "screen-surfaces.v1"] });
   host.postMessage({ v: 1, op: "surface", role: "drawer", modal: false, surface: "post" });

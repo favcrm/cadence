@@ -412,12 +412,15 @@ export function createScreenReceiver(options = {}) {
         // CAD-1777 (host): the role this mount plays and, for a drawer, the
         // closed surface idiom the primary asked for. Closed shape only.
         if (!surfacesAccepted) fail("surface without the opt-in");
-        const keys = Object.keys(message).sort().join();
-        if (message.v !== 1 || (keys !== "op,role,v" && keys !== "modal,op,role,surface,v") ||
+        // Field set, not an exact key string: the host sends `modal` on every
+        // surface and `surface` only for a drawer, and a strict key comparison
+        // closed the channel on the first mount (SOC-52).
+        const FIELDS = new Set(["v", "op", "role", "modal", "surface"]);
+        if (message.v !== 1 || Object.keys(message).some((key) => !FIELDS.has(key)) ||
             (message.role !== "primary" && message.role !== "drawer") ||
-            (keys === "modal,op,role,surface,v" &&
-              (typeof message.modal !== "boolean" || typeof message.surface !== "string" ||
-               !/^[a-z0-9_-]{1,64}$/.test(message.surface)))) {
+            (message.modal !== undefined && typeof message.modal !== "boolean") ||
+            (message.surface !== undefined &&
+              (typeof message.surface !== "string" || !/^[a-z0-9_-]{1,64}$/.test(message.surface)))) {
           fail("invalid surface message");
         }
         surfaceRole = message.role;
