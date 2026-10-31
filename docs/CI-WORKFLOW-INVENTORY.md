@@ -115,11 +115,23 @@ The shard matrix is unchanged. What changed is what a green shard *means*.
 
 Deliberately not asserted: that one runner is faster. The six shards exist
 because CAD-1480 measured the suite past a single runner's wall-time budget on
-the runner available then. Choosing between one larger runner and
-compile-once-plus-shards needs the `full-suite` leg's wall time beside a
-`ci.yml` run's job timestamps on the same SHA — wall time and summed runner
-minutes reported separately, never summed test durations presented as wall
-savings. Until that comparison exists, the matrix stays as it is.
+the runner available then. The first same-content comparison is now in:
+
+| `f7915b475` (PR #1469), both cold | six shards | one `instabox-large` |
+| --- | --- | --- |
+| workers | 6 × `--jobs 4` | 1 × `--jobs 8` (8 vCPU, 16 GB) |
+| summed runner-seconds | 2696 | 568 |
+| created → last shard | 717 s | — |
+| created → required `test` green | ≈735 s | 568 s |
+| summed queue delay | 843 s | ≈7 s |
+
+One run each, so no distribution. The single runner was 149 s faster on the
+critical path and 4.75× cheaper in runner-seconds, and the shards spent 843 s
+queued. That is still not the whole decision: both legs were cold, and the
+unmeasured dimension is **throughput**, not latency — six shard jobs let six
+runs share a pool, one large job per run shares a pool observed at ≥2
+concurrent slots. Changing the matrix is its own PR with a warm-cache run and
+a two-PR overlap measurement. Until then the matrix stays as it is.
 
 Also deliberately unchanged: `test-shards` still compiles the workspace once
 per shard. Reusing one archive across shards was measured only as cold
