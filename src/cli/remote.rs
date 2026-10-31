@@ -116,6 +116,12 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
         Commands::Agent {
             action: AgentAction::Profiles,
         } => "agent_profile_list",
+        // `agent roles` is a pure read of a static table, so a hosted org
+        // answers it from its pinned copy instead of refusing. It takes no
+        // arguments at all.
+        Commands::Agent {
+            action: AgentAction::Roles,
+        } => "agent_roles",
         Commands::Agent {
             action: AgentAction::Context { id },
         } => {
@@ -2307,6 +2313,16 @@ mod read_contract_tests {
         })
         .unwrap_err();
         assert!(err.contains("--since"), "{err}");
+    }
+
+    #[test]
+    fn agent_roles_crosses_the_relay_without_arguments() {
+        let (verb, args) = outcome(&Commands::Agent {
+            action: AgentAction::Roles,
+        })
+        .unwrap();
+        assert_eq!(verb, "agent_roles");
+        assert_eq!(args, json!({}));
     }
 
     #[test]

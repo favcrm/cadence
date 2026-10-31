@@ -105,6 +105,9 @@ pub const REMOTE_VERBS: &[&str] = &[
     "my_work",
     "agent_list",
     "agent_show",
+    // CAD-1964: the role catalogue. A hosted org has no daemon, so the board
+    // answers from its pinned copy of this build's own catalogue.
+    "agent_roles",
     // CAD-1964: reusable agent profiles. Reads only; the hosted board applies
     // the caller's own role and wiki access, and returns no agent identity.
     "agent_profile_list",
