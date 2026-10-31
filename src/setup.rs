@@ -1395,11 +1395,11 @@ pub struct PlanFact {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub trial: Option<PlanState>,
+    pub trial: Option<Box<PlanState>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub subscription: Option<PlanState>,
+    pub subscription: Option<Box<PlanState>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub checkout: Option<PlanState>,
+    pub checkout: Option<Box<PlanState>>,
 }
 
 impl PlanFact {
@@ -1783,9 +1783,11 @@ pub fn plan_fact(read: &OfferRead) -> PlanFact {
             None
         },
         code: None,
-        trial: Some(trial),
-        subscription: Some(subscription),
-        checkout: Some(checkout),
+        // Boxed: these three facts make `PlanFact` the error value of the
+        // state helpers below, and clippy refuses a 200-byte `Err`.
+        trial: Some(Box::new(trial)),
+        subscription: Some(Box::new(subscription)),
+        checkout: Some(Box::new(checkout)),
     }
 }
 

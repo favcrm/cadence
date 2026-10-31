@@ -8,7 +8,8 @@ use std::process::{Command, Output};
 use tempfile::Builder;
 
 fn reset(home: &Path, state: &Path, temp: &Path, name: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_cadence"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+    command
         .env_clear()
         .env("HOME", home)
         .env("XDG_STATE_HOME", state)
@@ -17,9 +18,9 @@ fn reset(home: &Path, state: &Path, temp: &Path, name: &str) -> Output {
         .env("CADENCE_TEST_REAL_HOME", home.join("not-the-real-home"))
         .env("TMPDIR", temp)
         .env("PATH", "/usr/bin:/bin")
-        .args(["dev", "reset", name])
-        .output()
-        .expect("run isolated cadence dev reset")
+        .args(["dev", "reset", name]);
+    // CAD-308: every child goes through the subreaper's spawn.
+    cadence_agent::reaper::output(&mut command).expect("run isolated cadence dev reset")
 }
 
 #[test]
@@ -111,7 +112,8 @@ fn assert_custom_tracker_refused(forged_profile: bool) {
     if forged_profile {
         command.env("CADENCE_PROFILE", "sandbox:candidate");
     }
-    let result = command.output().expect("run isolated cadence dev reset");
+    let result =
+        cadence_agent::reaper::output(&mut command).expect("run isolated cadence dev reset");
     let output = format!(
         "{}\n{}",
         String::from_utf8_lossy(&result.stdout),
