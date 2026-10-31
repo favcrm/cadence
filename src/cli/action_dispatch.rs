@@ -295,7 +295,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             // The saved login is what binds the code to the workspace this CLI
             // already belongs to. Without one the flow stays anonymous and the
             // owner chooses explicitly in the browser.
-            let token = org::saved_login_token(auth_dir.as_deref())?;
+            let token = org::saved_login_token(None)?;
             let poll = cadence_agent::github_connect::connect(
                 issuer,
                 token.as_deref(),
