@@ -1,13 +1,7 @@
-import { useId, useState, type ReactNode } from "react";
+import { useId, useState } from "react";
 import { useLocale } from "../../lib/locale";
 import { setThemePref, type ThemePref } from "../../lib/theme";
-import { IconMoon, IconSun, IconTheme } from "../../ui/icons";
-
-const THEMES: { pref: ThemePref; label: string; icon: ReactNode }[] = [
-  { pref: "system", label: "System", icon: <IconTheme size={14} /> },
-  { pref: "light", label: "Light", icon: <IconSun size={14} /> },
-  { pref: "dark", label: "Dark", icon: <IconMoon size={14} /> },
-];
+import Select from "../../ui/Select";
 
 export default function Preferences() {
   const id = useId();
@@ -35,44 +29,54 @@ export default function Preferences() {
   };
 
   return (
-    <main className="px-4 lg:px-8 py-5 min-w-0 max-w-2xl">
-      <h1 className="text-section font-semibold text-ink-100">{t("Preferences")}</h1>
-      <section className="mt-6 border-b border-ink-700 pb-6" aria-labelledby={`${id}-theme`}>
-        <h2 id={`${id}-theme`} className="text-cardtitle font-medium text-ink-100">{t("Theme")}</h2>
-        <div role="group" aria-labelledby={`${id}-theme`} className="mt-3 inline-flex flex-wrap gap-1 rounded-md bg-ink-800 p-1">
-          {THEMES.map(({ pref, label, icon }) => (
-            <button key={pref} type="button" aria-pressed={theme === pref}
-              onClick={() => { setThemePref(pref); setTheme(pref); }}
-              className={`inline-flex items-center gap-2 rounded px-3 py-2 text-secondary ${theme === pref ? "bg-ink-850 text-ink-100 shadow-sm" : "text-ink-400 hover:text-ink-100"}`}>
-              {icon}{t(label)}
-            </button>
-          ))}
+    <main className="px-4 lg:px-8 py-5 min-w-0 max-w-3xl">
+      <header>
+        <h1 className="text-section font-semibold text-ink-100">{t("Preferences")}</h1>
+        <p className="mt-1 text-secondary text-ink-400">{t("Choose how Cadence looks and the language you use.")}</p>
+      </header>
+      <section className="mt-7 border-t border-ink-700" aria-labelledby={`${id}-appearance`}>
+        <div className="grid gap-3 py-5 sm:grid-cols-[minmax(0,1fr)_minmax(12rem,16rem)] sm:items-start sm:gap-8">
+          <div>
+            <h2 id={`${id}-appearance`} className="text-cardtitle font-medium text-ink-100">{t("Theme")}</h2>
+            <p className="mt-1 text-label leading-relaxed text-ink-400">{t("Use your system setting or choose a theme for this browser.")}</p>
+          </div>
+          <Select id={`${id}-theme`} aria-label={t("Theme")} full value={theme}
+            options={[{ value: "system", label: t("System") }, { value: "light", label: t("Light") }, { value: "dark", label: t("Dark") }]}
+            onChange={(value) => { const pref = value as ThemePref; setThemePref(pref); setTheme(pref); }} />
         </div>
       </section>
-      <section className="pt-6" aria-labelledby={`${id}-language-heading`}>
-        <h2 id={`${id}-language-heading`} className="text-cardtitle font-medium text-ink-100">{t("Language")}</h2>
-        <label htmlFor={`${id}-locale`} className="sr-only">{t("Language")}</label>
-        <select id={`${id}-locale`} value={userLocale ?? "follow"} disabled={busy}
-          onChange={(event) => void saveLocale("user", event.target.value === "follow" ? null : event.target.value as "en" | "zh-TW")}
-          className="mt-3 block w-full max-w-xs rounded border border-ink-700 bg-ink-900 px-3 py-2 text-secondary text-ink-200">
-          <option value="follow">{isHostedUser ? `${t("Follow organization")}${organizationLocale ? ` (${organizationLocale === "zh-TW" ? "繁體中文" : "English"})` : ""}` : t("Browser default")}</option>
-          <option value="en">{t("English")}</option>
-          <option value="zh-TW">繁體中文</option>
-        </select>
-        {canSetOrganizationLocale && <>
-          <label htmlFor={`${id}-org-locale`} className="mt-5 block text-label text-ink-400">{t("Organization default")}</label>
-          <select id={`${id}-org-locale`} value={organizationLocale ?? ""} disabled={busy}
-            onChange={(event) => void saveLocale("organization", event.target.value as "en" | "zh-TW")}
-            className="mt-2 block w-full max-w-xs rounded border border-ink-700 bg-ink-900 px-3 py-2 text-secondary text-ink-200">
-            <option value="" disabled>{t("Not set")}</option>
-            <option value="en">{t("English")}</option>
-            <option value="zh-TW">繁體中文</option>
-          </select>
-        </>}
-        {busy && <p role="status" className="mt-2 text-label text-ink-400">{t("Saving…")}</p>}
-        {saved && <p role="status" className="mt-2 text-label text-ink-400">{t(isHostedUser ? "Language preference saved." : "Language saved in this browser.")}</p>}
-        {error && <p role="alert" className="mt-2 text-label text-fail">{t("Could not save language preference.")}</p>}
+      <section className="border-t border-ink-700" aria-labelledby={`${id}-language-heading`}>
+        <div className="grid gap-3 py-5 sm:grid-cols-[minmax(0,1fr)_minmax(12rem,16rem)] sm:items-start sm:gap-8">
+          <div>
+            <h2 id={`${id}-language-heading`} className="text-cardtitle font-medium text-ink-100">{t("Language")}</h2>
+            <p className="mt-1 text-label leading-relaxed text-ink-400">{t(isHostedUser ? "Choose your language or follow the organization default." : "Choose your language or follow your browser setting.")}</p>
+          </div>
+          <div className="min-w-0">
+            <Select id={`${id}-locale`} aria-label={t("Language")} full value={userLocale ?? "follow"} disabled={busy}
+              onChange={(value) => void saveLocale("user", value === "follow" ? null : value as "en" | "zh-TW")}
+              options={[
+                { value: "follow", label: isHostedUser ? `${t("Follow organization")}${organizationLocale ? ` (${organizationLocale === "zh-TW" ? "繁體中文" : "English"})` : ""}` : t("Browser default") },
+                { value: "en", label: t("English") },
+                { value: "zh-TW", label: "繁體中文" },
+              ]} />
+            {busy && <p role="status" className="mt-2 text-label text-ink-400">{t("Saving…")}</p>}
+            {saved && <p role="status" className="mt-2 text-label text-ink-400">{t(isHostedUser ? "Language preference saved." : "Language saved in this browser.")}</p>}
+            {error && <p role="alert" className="mt-2 text-label text-fail">{t("Could not save language preference.")}</p>}
+          </div>
+        </div>
       </section>
+      {canSetOrganizationLocale && <section className="border-t border-ink-700" aria-labelledby={`${id}-org-heading`}>
+        <div className="grid gap-3 py-5 sm:grid-cols-[minmax(0,1fr)_minmax(12rem,16rem)] sm:items-start sm:gap-8">
+          <div>
+            <h2 id={`${id}-org-heading`} className="text-cardtitle font-medium text-ink-100">{t("Organization default")}</h2>
+            <p className="mt-1 text-label leading-relaxed text-ink-400">{t("The default language for members who follow the organization.")}</p>
+          </div>
+          <Select id={`${id}-org-locale`} aria-label={t("Organization default")} full value={organizationLocale ?? ""} disabled={busy}
+            placeholder={t("Not set")}
+            onChange={(value) => void saveLocale("organization", value as "en" | "zh-TW")}
+            options={[{ value: "en", label: t("English") }, { value: "zh-TW", label: "繁體中文" }]} />
+        </div>
+      </section>}
     </main>
   );
 }

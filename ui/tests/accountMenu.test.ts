@@ -146,14 +146,18 @@ const pointerDown = (target: any) => act(() => { target.dispatchEvent(new win.Ev
 // The settings preferences preserve theme selection and persistence.
 {
   const { host, done } = mount(createElement(Preferences));
-  const buttons = Array.from(host.querySelectorAll("[aria-pressed]")) as HTMLButtonElement[];
-  assert(buttons.length === 3 && buttons[0].getAttribute("aria-pressed") === "true", "System pressed by default");
-  const dark = buttons.find((b) => b.textContent === "Dark")!;
-  act(() => dark.click());
-  assert(dark.getAttribute("aria-pressed") === "true", "Dark pressed");
+  const theme = host.querySelector('[role="combobox"][aria-label="Theme"]') as HTMLButtonElement;
+  assert(theme?.textContent?.includes("System"), "System is selected by default");
+  const key = (value: string) => act(() => theme.dispatchEvent(new win.KeyboardEvent("keydown", { key: value, bubbles: true })));
+  key("Enter");
+  key("End");
+  key("Enter");
+  assert(theme.textContent?.includes("Dark"), "Dark is selected");
   assert(document.documentElement.getAttribute("data-theme") === "dark", "data-theme applied");
   assert(win.localStorage.getItem("cadence-theme") === "dark", "pick stored");
-  act(() => buttons[0].click());
+  key("Enter");
+  key("Home");
+  key("Enter");
   assert(!document.documentElement.hasAttribute("data-theme"), "System clears data-theme");
   done();
 }

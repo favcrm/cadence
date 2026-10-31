@@ -120,9 +120,9 @@ export default function AccountMenu({
         </span>
         {!avatar && (
           <>
-            <span className="flex min-w-0 flex-1 items-baseline gap-1.5 text-left" title={`${name} · ${accessLabel}`}>
-              <span className="truncate text-label font-medium text-ink-200">{name}</span>
-              <span className="shrink-0 text-micro text-ink-500">{accessLabel}</span>
+            <span className="flex min-w-0 flex-1 flex-col items-start text-left" title={`${name} · ${accessLabel}`}>
+              <span className="w-full truncate text-secondary font-medium text-ink-100">{name}</span>
+              <span className="w-full truncate text-micro text-ink-500">{accessLabel}</span>
             </span>
             <span aria-hidden className="shrink-0 rotate-180 text-ink-500"><IconChevron /></span>
           </>
@@ -141,7 +141,7 @@ export default function AccountMenu({
           <div className="flex items-start gap-3 px-2 py-2" title={meta.session ? `${t("session")} ${meta.session.id}` : undefined}>
             <span aria-hidden className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent/15 text-secondary font-medium uppercase text-accent">{name.trim().charAt(0)}</span>
             <div className="min-w-0">
-              <p className="text-secondary font-medium text-ink-100 break-words">{name}</p>
+              <p className="text-body font-semibold leading-snug text-ink-100 break-words">{name}</p>
               {user?.email && user.email !== name && <p className="text-micro text-ink-500 break-all">{user.email}</p>}
               {user?.role && <span className="chip bg-ink-800 text-ink-400 mt-1">{accessLabel}</span>}
             </div>

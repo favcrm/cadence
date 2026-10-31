@@ -10,7 +10,6 @@ export function Logo({ size = 25 }: { size?: number }) {
           <stop offset="1" stopColor="var(--cadence-logo-end, #22D3EE)" />
         </linearGradient>
       </defs>
-      <rect x="20" y="20" width="984" height="984" rx="214" fill="var(--cadence-logo-surface, #0B0B0C)" stroke="var(--cadence-logo-border, #2e3136)" strokeWidth="40" />
       <path
         d="M 280 336 L 512 512 L 280 688"
         stroke="url(#cadence-lit)"

@@ -19,6 +19,6 @@ from the illustrative preview. Embedded apps own their own document styles;
 the reference does not authorize redesigning them.
 
 After review, the account menu retains identity, settings, sign-out and version
-information; theme and language controls live in Settings → Preferences.
-The board logo uses a light surface in light mode and retains its dark mark in
-dark mode. Public sign-in keeps its language and theme controls available.
+information; theme and language controls live in Settings → Preferences and
+reuse the board's `Select` control. The logo mark has a transparent background in
+both themes. Public sign-in keeps its language and theme controls available.
