@@ -279,6 +279,21 @@ pub enum RequirementCheck {
     },
 }
 
+/// Success value of `delivery.requirements.evaluate`: the requirements the
+/// evaluator produced, beside the policy they were computed under. The value is
+/// emitted as produced; this type publishes its shape.
+#[derive(Serialize, JsonSchema)]
+pub struct DeliveryRequirementsValue {
+    pub policy: crate::delivery::DeliveryPolicy,
+    /// `default`, `file` or `approved`.
+    pub policy_source: String,
+    pub policy_digest: String,
+    /// `delivery_unapproved:`/`delivery_error:` when the file's section is not
+    /// the one in force.
+    pub policy_note: Option<String>,
+    pub requirements: crate::delivery_requirements::Requirements,
+}
+
 /// Success value of `app.manifest.preflight`.
 #[derive(Serialize, JsonSchema)]
 pub struct ManifestPreflightValue {}
@@ -302,6 +317,7 @@ pub enum OpValue {
     /// The delivery-requirements document: the class, the reviews it needs and
     /// the policy it was decided under (CAD-1946).
     #[serde(rename = "delivery.requirements.evaluate")]
+    #[schemars(with = "DeliveryRequirementsValue")]
     DeliveryRequirements(Value),
 }
 

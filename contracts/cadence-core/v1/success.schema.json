@@ -83,7 +83,9 @@
           "type": "string",
           "const": "delivery.requirements.evaluate"
         },
-        "value": true
+        "value": {
+          "$ref": "#/$defs/DeliveryRequirementsValue"
+        }
       },
       "required": [
         "op",
@@ -95,6 +97,160 @@
     "ok"
   ],
   "$defs": {
+    "Activation": {
+      "description": "Whether default lean classification applies, and if not, why strict\nrequirements are retained.",
+      "oneOf": [
+        {
+          "description": "A valid default-equivalent policy is in force.",
+          "type": "string",
+          "const": "active"
+        },
+        {
+          "description": "The policy is custom or its provenance is unknown. The serialized\nname is retained for compatibility with existing requirements readers.",
+          "type": "string",
+          "const": "no_profile"
+        },
+        {
+          "description": "A `delivery:` section exists but is not the approved one\n(`delivery_unapproved`) — the legacy requirements stay.",
+          "type": "string",
+          "const": "not_approved"
+        },
+        {
+          "description": "The section is malformed with no approved policy\n(`delivery_error`) — the defaults apply, legacy requirements.",
+          "type": "string",
+          "const": "malformed"
+        }
+      ]
+    },
+    "CheckMode": {
+      "type": "string",
+      "enum": [
+        "advisory",
+        "required"
+      ]
+    },
+    "DeliveryClass": {
+      "description": "What class the evidence places the delivery in.",
+      "oneOf": [
+        {
+          "description": "Activated profile, allowlisted ordinary documentation only.",
+          "type": "string",
+          "const": "routine"
+        },
+        {
+          "description": "Activated profile, ordinary listed paths.",
+          "type": "string",
+          "const": "consequential"
+        },
+        {
+          "description": "Reserved: `classify` resolves sensitive conditions to `Strict` and\ndoes not currently return this variant.",
+          "type": "string",
+          "const": "sensitive"
+        },
+        {
+          "description": "No relaxation applies: the profile is not in force, the trusted\nlists are unavailable, or the diff evidence is incomplete. The\nrequirements are exactly the legacy ones.",
+          "type": "string",
+          "const": "strict"
+        }
+      ]
+    },
+    "DeliveryPolicy": {
+      "description": "A project's delivery policy — `PROJECT.md` `delivery:` or the\ndefaults. [`parse`] builds it through the strict raw types and\n[`DeliveryPolicy::validate`]; `serde` round-trips the validated\nform (the approval payload's `delivery` key).",
+      "type": "object",
+      "properties": {
+        "heavy": {
+          "description": "Over this a delivery is \"heavy\".",
+          "$ref": "#/$defs/SizeLimit"
+        },
+        "integration_branch": {
+          "description": "CAD-1561: one extra PR target beyond the repository default\nbranch. `None` is omitted from the canonical JSON so existing\ndigests and approvals are unchanged. A non-default target is\nadmitted only while the exact current approved policy names it —\nlast-approved fallbacks (`delivery_unapproved` notes) do not.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_revise": {
+          "description": "REVISE verdicts a ticket takes before the operator decides.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "merge": {
+          "description": "How an approved PR merges.",
+          "$ref": "#/$defs/MergePolicy"
+        },
+        "oversized": {
+          "description": "Over this a delivery cannot merge through the loop.",
+          "$ref": "#/$defs/SizeLimit"
+        },
+        "reviews": {
+          "description": "The named reviews a `risk` rule may require.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Review"
+          }
+        },
+        "risk": {
+          "description": "Risk rules: a delivery must satisfy every review `require`d by\nevery rule whose `when` holds. A rule with no `when` always\napplies.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RiskRule"
+          }
+        },
+        "solo_operator": {
+          "description": "Optional legacy CAD-1298 profile, retained for compatible reads.\nCAD-1314 needs no profile for default lean classification. Keeping\n`None` omitted preserves existing canonical digests and approvals;\nrequirements always use [`Resolved`], never the raw file.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SoloOperatorProfile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "merge",
+        "max_revise",
+        "reviews",
+        "risk",
+        "heavy",
+        "oversized"
+      ]
+    },
+    "DeliveryRequirementsValue": {
+      "description": "Success value of `delivery.requirements.evaluate`: the requirements the\nevaluator produced, beside the policy they were computed under. The value is\nemitted as produced; this type publishes its shape.",
+      "type": "object",
+      "properties": {
+        "policy": {
+          "$ref": "#/$defs/DeliveryPolicy"
+        },
+        "policy_digest": {
+          "type": "string"
+        },
+        "policy_note": {
+          "description": "`delivery_unapproved:`/`delivery_error:` when the file's section is not\nthe one in force.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "policy_source": {
+          "description": "`default`, `file` or `approved`.",
+          "type": "string"
+        },
+        "requirements": {
+          "$ref": "#/$defs/Requirements"
+        }
+      },
+      "required": [
+        "policy",
+        "policy_source",
+        "policy_digest",
+        "requirements"
+      ]
+    },
     "FieldRefusal": {
       "description": "One refused field.",
       "type": "object",
@@ -114,6 +270,30 @@
     "ManifestPreflightValue": {
       "description": "Success value of `app.manifest.preflight`.",
       "type": "object"
+    },
+    "MergeMethod": {
+      "type": "string",
+      "enum": [
+        "squash",
+        "merge",
+        "rebase"
+      ]
+    },
+    "MergePolicy": {
+      "type": "object",
+      "properties": {
+        "method": {
+          "$ref": "#/$defs/MergeMethod"
+        },
+        "queue": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "queue"
+      ]
     },
     "ReadinessValue": {
       "description": "Success value of `issue.readiness`.",
@@ -229,6 +409,66 @@
         }
       ]
     },
+    "Requirements": {
+      "description": "What a delivery needs to merge, derived from the class.",
+      "type": "object",
+      "properties": {
+        "activation": {
+          "$ref": "#/$defs/Activation"
+        },
+        "browser_qa": {
+          "description": "A `ui/` change additionally needs a Browser QA pass.",
+          "type": "boolean"
+        },
+        "class": {
+          "$ref": "#/$defs/DeliveryClass"
+        },
+        "full_checks": {
+          "description": "The full PR check floor applies. `false` only for routine —\nwhere the required base-branch checks are still all required.",
+          "type": "boolean"
+        },
+        "operator_approval": {
+          "description": "An exact-head operator-connection approval is required.",
+          "type": "boolean"
+        },
+        "policy_digest": {
+          "description": "Digest of the policy the requirements were computed under —\nevidence binds to it and a policy change invalidates them.",
+          "type": "string"
+        },
+        "reasons": {
+          "description": "Machine-readable reasons: why this class, what evidence decided.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "review_kind": {
+          "$ref": "#/$defs/ReviewKind"
+        },
+        "reviews": {
+          "description": "Independent verdict count on the exact head: `0` only for\nroutine under a valid default-equivalent policy.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "security_capable": {
+          "description": "The combined review must be filed by a security-capable\nreviewer (sensitive class).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "class",
+        "reviews",
+        "review_kind",
+        "security_capable",
+        "browser_qa",
+        "operator_approval",
+        "full_checks",
+        "reasons",
+        "policy_digest",
+        "activation"
+      ]
+    },
     "RequirementsHost": {
       "description": "The version and contracts of the target that produced a receipt.",
       "type": "object",
@@ -326,6 +566,176 @@
         "contracts",
         "host",
         "checks"
+      ]
+    },
+    "Review": {
+      "description": "One named review a rule may require. `kind` picks the variant.",
+      "oneOf": [
+        {
+          "description": "An independent agent review; `focus` is one of [`FOCI`].",
+          "type": "object",
+          "properties": {
+            "focus": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "agent"
+            }
+          },
+          "required": [
+            "kind",
+            "focus"
+          ]
+        },
+        {
+          "description": "A GitHub App check (a bot). `mode: advisory` never blocks;\n`required` blocks like an agent review.",
+          "type": "object",
+          "properties": {
+            "app": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "check"
+            },
+            "mode": {
+              "$ref": "#/$defs/CheckMode"
+            }
+          },
+          "required": [
+            "kind",
+            "app",
+            "mode"
+          ]
+        },
+        {
+          "description": "The operator decides.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "operator"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "ReviewKind": {
+      "description": "The kind of independent review `reviews` counts toward.",
+      "oneOf": [
+        {
+          "description": "No review required (routine under a valid default-equivalent policy).",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "One combined `Review (standards+spec)` verdict.",
+          "type": "string",
+          "const": "combined"
+        },
+        {
+          "description": "Two verdicts — Standards and Spec/security — by distinct\nreviewers.",
+          "type": "string",
+          "const": "standards_and_spec"
+        }
+      ]
+    },
+    "RiskRule": {
+      "type": "object",
+      "properties": {
+        "require": {
+          "description": "Names in `reviews` the delivery must satisfy.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "when": {
+          "description": "The conditions under which the rule applies — ANY of them.\nAbsent: the rule always applies.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RiskWhen"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "require"
+      ]
+    },
+    "RiskWhen": {
+      "type": "object",
+      "properties": {
+        "files_over": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "lines_over": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "paths": {
+          "description": "Repo-relative, file-level globs — the same grammar as the\n`areas:` reader and `paths=` ([`crate::delivery_rules::check_path`]):\n`*` and `?` match inside one segment, a `**` segment any number,\na trailing `/` everything under it. Slice 3 matches them with\n`areas::matches`, so the two grammars must agree.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SizeLimit": {
+      "type": "object",
+      "properties": {
+        "files_over": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "lines_over": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "lines_over",
+        "files_over"
+      ]
+    },
+    "SoloOperatorProfile": {
+      "description": "The legacy solo-operator delivery profile (CAD-1298), still readable\nafter CAD-1314 made the tiers default for valid default-equivalent policies.\nCustom, malformed and unapproved policies retain strict requirements.\n`version` is forward-proofing:\n`1` is the only accepted value, an unknown one refuses the whole\nsection, so an older binary never silently accepts a profile shape it\ndoes not understand.",
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version"
       ]
     },
     "TargetStage": {
