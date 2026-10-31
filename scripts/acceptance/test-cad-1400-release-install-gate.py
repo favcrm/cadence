@@ -68,7 +68,7 @@ class Cad1400ReleaseInstallGate(unittest.TestCase):
         for target, runner in (
             ("x86_64-linux", "ubuntu-22.04"),
             ("aarch64-linux", "ubuntu-22.04-arm"),
-            ("aarch64-macos", "macos-14"),
+            ("aarch64-macos", "macos-15"),
         ):
             self.assertIn(f"target: {target}", install)
             self.assertIn(f"runner: {runner}", install)
