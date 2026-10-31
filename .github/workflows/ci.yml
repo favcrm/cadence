@@ -45,6 +45,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # CAD-1967: these runners are per-job and thrown away, so `ci-fast-linker`
+  # may apt-install mold on them. That matters twice: it links the 223 MB
+  # suite faster, and the linker flag is part of the rustc invocation, so it
+  # also matches the sccache objects the warm leg wrote on the hosted runner.
+  # Never set this on a shared self-hosted machine.
+  CADENCE_CI_LINKER_INSTALL: "1"
 
 # CAD-1967: the Linux gates run on instabox-medium. Its kernel 6.18.54 is
 # listed in supported_kernel_abi and both host acceptances (cad1196, cad1377)

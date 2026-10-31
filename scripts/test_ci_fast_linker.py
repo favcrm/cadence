@@ -42,6 +42,28 @@ class FastLinkerTests(unittest.TestCase):
                 self.assertEqual(sudo_calls, "", "sudo must not be called")
                 self.assertEqual(env, "")
 
+    def test_disposable_runner_opt_in_refreshes_apt_then_installs(self):
+        # CAD-1967: a workflow that declares its runner disposable may install
+        # mold; a per-job InstaBox machine ships without apt lists, so the
+        # install is preceded by an update. Still fails open.
+        result, sudo_calls, env = run({
+            "GITHUB_ACTIONS": "true",
+            "RUNNER_ENVIRONMENT": "self-hosted",
+            "CADENCE_CI_LINKER_INSTALL": "1",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = sudo_calls.splitlines()
+        self.assertEqual(len(calls), 2, sudo_calls)
+        self.assertTrue(calls[0].startswith("-n apt-get update"), sudo_calls)
+        self.assertTrue(calls[1].startswith("-n apt-get install"), sudo_calls)
+        self.assertEqual(env, "")
+
+    def test_opt_in_without_actions_still_refuses(self):
+        result, sudo_calls, env = run({"CADENCE_CI_LINKER_INSTALL": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sudo_calls, "", "sudo must not be called")
+        self.assertEqual(env, "")
+
     def test_hosted_runner_installs_with_noninteractive_sudo_and_fails_open(self):
         result, sudo_calls, env = run({"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted"})
         self.assertEqual(result.returncode, 0)
