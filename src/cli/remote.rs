@@ -114,6 +114,23 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             "agent_list"
         }
         Commands::Agent {
+            action: AgentAction::Profiles,
+        } => "agent_profile_list",
+        // `agent roles` is a pure read of a static table, so a hosted org
+        // answers it from its pinned copy instead of refusing. It takes no
+        // arguments at all.
+        Commands::Agent {
+            action: AgentAction::Roles,
+        } => "agent_roles",
+        Commands::Agent {
+            action: AgentAction::Context { id },
+        } => {
+            // The id is the board's own `ap_…`; a caller cannot name a path,
+            // a verb or an authority field through it.
+            args.insert("id".into(), json!(id));
+            "agent_profile_context"
+        }
+        Commands::Agent {
             action:
                 AgentAction::Show {
                     alias,
@@ -2296,6 +2313,38 @@ mod read_contract_tests {
         })
         .unwrap_err();
         assert!(err.contains("--since"), "{err}");
+    }
+
+    #[test]
+    fn agent_roles_crosses_the_relay_without_arguments() {
+        let (verb, args) = outcome(&Commands::Agent {
+            action: AgentAction::Roles,
+        })
+        .unwrap();
+        assert_eq!(verb, "agent_roles");
+        assert_eq!(args, json!({}));
+    }
+
+    #[test]
+    fn agent_profile_reads_send_only_the_profile_id() {
+        let (verb, args) = outcome(&Commands::Agent {
+            action: AgentAction::Profiles,
+        })
+        .unwrap();
+        assert_eq!(verb, "agent_profile_list");
+        assert_eq!(args, json!({}));
+
+        let (verb, args) = outcome(&Commands::Agent {
+            action: AgentAction::Context {
+                id: "ap_11111111-2222-4333-8444-555555555555".into(),
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "agent_profile_context");
+        assert_eq!(
+            args,
+            json!({"id": "ap_11111111-2222-4333-8444-555555555555"})
+        );
     }
 
     #[test]

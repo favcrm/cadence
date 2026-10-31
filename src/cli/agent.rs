@@ -309,6 +309,16 @@ pub(crate) enum AgentAction {
     },
     /// List the catalogue roles (id, title, job) a hire can use. Read-only.
     Roles,
+    /// List this workspace's reusable agent profiles (hosted orgs). Read-only:
+    /// a profile is a description a session may load, never a credential.
+    Profiles,
+    /// Print one reusable agent profile's portable context (hosted orgs): the
+    /// profile plus the wiki pages under `agents/<id>/{profile,knowledge,memory}`
+    /// the caller's own access allows. Read-only; it authenticates nobody.
+    Context {
+        /// The profile id the board prints (`ap_…`).
+        id: String,
+    },
     /// Propose hiring a catalogue role (the master, on its live turn): the
     /// operator reviews a card and hires from it. Registers nothing.
     ProposeHire {
@@ -968,6 +978,13 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
                 .collect();
             print_json(&json!({"roles": roles}));
             return Ok(0);
+        }
+        // A reusable agent profile is workspace data the hosted board owns; a
+        // local org has no such store, so this refuses instead of inventing one.
+        AgentAction::Profiles | AgentAction::Context { .. } => {
+            return Err(Error::rejected(
+                "agent profiles are a hosted-org read; select the hosted org with `--org <org>`",
+            ));
         }
         AgentAction::ProposeHire { role, name, job_file } => {
             // The job is read through the master's command-file rules, never
