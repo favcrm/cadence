@@ -51,7 +51,11 @@ impl<'a> Access<'a> {
     fn of(pm: &Pm, actor: &'a str) -> Self {
         Self {
             caller: caller_of(actor),
-            projects: project::list(&pm.dir).ok(),
+            // CAD-1950: `list` answers an empty vector for an unreadable
+            // tracker, and an empty vector reads as "nothing is restricted".
+            // The checked listing errors instead, and `None` is the fail-closed
+            // answer every question below already handles.
+            projects: project::list_checked(&pm.dir).ok(),
         }
     }
 
@@ -249,6 +253,52 @@ mod tests {
         // stream is unrestricted exactly as before.
         let (_dir, pm) = pm_with(&[("demo", "")]);
         assert!(reads_every_project(&pm, "users/anyone"));
+    }
+
+    /// CAD-1950: an unreadable tracker is not an empty one.
+    ///
+    /// `project::list` answers `Ok(empty)` when `read_dir` fails, and an empty
+    /// list reads as "nothing is restricted" — so every access question would
+    /// fail open. The access layer uses the checked listing, and this test
+    /// pins both halves: the plain listing still answers empty (its other
+    /// callers render what they could read), and the policy layer refuses.
+    #[test]
+    fn an_unreadable_tracker_refuses_every_project() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, pm) = pm_with(&[("demo", PRIVATE), ("open", "")]);
+        let tracker = pm.dir.clone();
+        std::fs::set_permissions(&tracker, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&tracker).is_ok() {
+            // Root (or an ACL) can read it anyway, so the mode cannot express
+            // this case here; leave the tracker usable and skip.
+            std::fs::set_permissions(&tracker, std::fs::Permissions::from_mode(0o755)).unwrap();
+            drop(dir);
+            return;
+        }
+
+        // The plain listing is unchanged for its rendering callers…
+        assert!(
+            project::list(&tracker).unwrap().is_empty(),
+            "list still answers empty for an unreadable tracker"
+        );
+        // …and the checked one refuses to describe it as complete.
+        assert!(
+            project::list_checked(&tracker).is_err(),
+            "the checked listing must not answer empty for an unreadable tracker"
+        );
+
+        // Every access question fails closed, including for the owner.
+        assert!(readable(&pm, "operator").is_empty());
+        assert!(
+            refused(&pm, "demo", "operator"),
+            "a project that cannot be checked must be refused, not admitted"
+        );
+        assert!(!reads_every_project(&pm, "operator"));
+
+        std::fs::set_permissions(&tracker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // And the answers return once it can be read again.
+        assert!(!refused(&pm, "demo", "operator"));
+        assert!(readable(&pm, "operator").contains("demo"));
     }
 
     #[test]
