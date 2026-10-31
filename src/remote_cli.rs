@@ -134,6 +134,7 @@ pub const REMOTE_VERBS: &[&str] = &[
     "delivery_policy",
     "delivery_policy_set",
     "audit_approval",
+    "audit_verdicts",
     "audit_scope",
     "audit_approve",
 ];
@@ -143,9 +144,8 @@ pub const REMOTE_VERBS: &[&str] = &[
 /// for the scope that verb requires.
 fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
     match verb {
-        "team_list" | "team_invites" | "delivery_policy" | "audit_approval" | "audit_scope" => {
-            &["cli.read"]
-        }
+        "team_list" | "team_invites" | "delivery_policy" | "audit_approval" | "audit_verdicts"
+        | "audit_scope" => &["cli.read"],
         // The owner's merge approval and the delivery inputs it binds both
         // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
         "audit_approve" | "delivery_policy_set" => &["cli.write", "audit.approve"],

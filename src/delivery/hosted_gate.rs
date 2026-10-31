@@ -506,6 +506,80 @@ pub fn scope(target: &RemoteTarget, wake_timeout: u64, issue: &str) -> Result<(V
     scope_answer(&body, issue)
 }
 
+/// `cadence audit verdicts` (CAD-1946) for a hosted org: the org's own read
+/// of the verdicts naming this issue, PR and full head. A refused or
+/// unreadable answer is exit 1 — never the notes folder on this machine, which
+/// would answer an empty list and read as "nothing was filed".
+pub fn verdicts(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    issue: &str,
+    pr: u64,
+    head: &str,
+) -> Result<(Value, i32)> {
+    let body = call(
+        target,
+        wake_timeout,
+        "audit_verdicts",
+        args(&[
+            ("issue", json!(issue)),
+            ("pr", json!(pr)),
+            ("head", json!(head)),
+        ]),
+    )?;
+    verdicts_answer(&body, issue, pr, head)
+}
+
+pub(crate) fn verdicts_answer(
+    body: &Value,
+    issue: &str,
+    pr: u64,
+    head: &str,
+) -> Result<(Value, i32)> {
+    let verb = "audit_verdicts";
+    let state = text(body, "state", verb)?;
+    if state != "ok" {
+        let reason = body["reason"].as_str().unwrap_or(state);
+        return Ok((json!({"state": state, "reason": reason}), 1));
+    }
+    if !body["issue"]
+        .as_str()
+        .is_some_and(|i| i.eq_ignore_ascii_case(issue))
+    {
+        return Err(refuse(format!(
+            "`{verb}` answered for another issue than {issue}"
+        )));
+    }
+    if body["pr"].as_u64() != Some(pr) {
+        return Err(refuse(format!(
+            "`{verb}` answered for another PR than {pr}"
+        )));
+    }
+    if !body["head"]
+        .as_str()
+        .is_some_and(|h| h.eq_ignore_ascii_case(head))
+    {
+        return Err(refuse(format!(
+            "`{verb}` answered for another head than {head}"
+        )));
+    }
+    let verdicts = body["verdicts"]
+        .as_array()
+        .ok_or_else(|| refuse(format!("`{verb}` answer has no verdicts list")))?
+        .clone();
+    let mut doc = json!({
+        "state": "ok",
+        "issue": issue,
+        "pr": pr,
+        "head": head,
+        "verdicts": verdicts,
+    });
+    if let Some(note) = body["note"].as_str() {
+        doc["note"] = json!(note);
+    }
+    Ok((doc, 0))
+}
+
 pub(crate) fn scope_answer(body: &Value, issue: &str) -> Result<(Value, i32)> {
     let verb = "audit_scope";
     let state = text(body, "state", verb)?;
@@ -687,6 +761,33 @@ mod tests {
         let unknown = json!({"state": "unknown", "reason": "store unreadable"});
         assert_eq!(scope_answer(&unknown, "CAD-1").unwrap().1, 1);
         assert!(scope_answer(&json!({}), "CAD-1").is_err());
+    }
+
+    #[test]
+    fn verdicts_answer_binds_the_issue_pr_and_head() {
+        let ok = json!({"state": "ok", "issue": "CAD-1", "pr": 7, "head": HEAD,
+                        "verdicts": [], "note": "none recorded"});
+        let (doc, code) = verdicts_answer(&ok, "CAD-1", 7, HEAD).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(doc["verdicts"], json!([]));
+        assert_eq!(doc["note"], json!("none recorded"));
+        // Another issue, PR or head is a refusal, never a silent empty answer.
+        assert!(verdicts_answer(&ok, "CAD-2", 7, HEAD).is_err());
+        assert!(verdicts_answer(&ok, "CAD-1", 8, HEAD).is_err());
+        assert!(verdicts_answer(&ok, "CAD-1", 7, OTHER).is_err());
+        // A refused read exits 1 with its reason; it does not become "empty".
+        let unknown = json!({"state": "unknown", "reason": "store unreadable"});
+        let (_, code) = verdicts_answer(&unknown, "CAD-1", 7, HEAD).unwrap();
+        assert_eq!(code, 1);
+        // An answer without a list is malformed, not empty.
+        assert!(verdicts_answer(
+            &json!({"state": "ok", "issue": "CAD-1", "pr": 7, "head": HEAD}),
+            "CAD-1",
+            7,
+            HEAD
+        )
+        .is_err());
+        assert!(verdicts_answer(&json!({}), "CAD-1", 7, HEAD).is_err());
     }
 
     #[test]

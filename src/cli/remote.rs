@@ -1762,6 +1762,21 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             )?)
         }
         Commands::Audit {
+            action: Some(AuditAction::Verdicts {
+                issue, pr, head, ..
+            }),
+            ..
+        } => {
+            let head = super::audit::full_head(head)?;
+            printed(hosted_gate::verdicts(
+                target,
+                wake_timeout,
+                issue.trim(),
+                *pr,
+                &head,
+            )?)
+        }
+        Commands::Audit {
             action: Some(AuditAction::Scope { issue }),
             ..
         } => printed(hosted_gate::scope(target, wake_timeout, issue.trim())?),

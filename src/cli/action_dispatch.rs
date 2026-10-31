@@ -414,9 +414,12 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         }
         _ => {}
     }
-    // CAD-1946: `audit verdicts` only parses the notes directory, so it
-    // runs locally whatever org is selected — before org resolution, the
-    // client-only router and any daemon or state dir.
+    // CAD-1946: `audit verdicts` parses the notes directory only for a local
+    // selection, and does so before org resolution reaches a daemon or state
+    // dir. A hosted selection answers through the org's own read: a hosted org
+    // that cannot answer must refuse, never fall back to whatever notes happen
+    // to be on this machine — that fallback answers an empty list and reads as
+    // "no verdicts were filed".
     if let Commands::Audit {
         action:
             Some(audit::AuditAction::Verdicts {
@@ -428,7 +431,9 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         ..
     } = &cli.command
     {
-        return audit::verdicts(issue, *pr, head, notes_dir.as_deref());
+        if org::selected_is_local()? {
+            return audit::verdicts(issue, *pr, head, notes_dir.as_deref());
+        }
     }
     // Hosted metadata never needs local sandbox adoption, permission replay,
     // daemon startup, or the generic native/container verb map. Refuse an
