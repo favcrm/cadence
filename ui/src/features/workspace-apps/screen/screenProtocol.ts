@@ -71,7 +71,7 @@ export type ScreenPresentation = { v: 1; op: "presentation"; mode: ScreenPresent
  *  the frame's own overlay state — a primary is modal while its child
  *  drawer is open; a drawer hosts no further overlay. */
 export type ScreenSurfaceRole = "primary" | "drawer";
-export type ScreenSurface = { v: 1; op: "surface"; role: ScreenSurfaceRole; modal: boolean };
+export type ScreenSurface = { v: 1; op: "surface"; role: ScreenSurfaceRole; modal: boolean; surface?: string };
 
 /** CAD-1777 — the two host-local presentation verbs. They are UI
  *  in), never records operations or authority grants: a screen.v2 frame

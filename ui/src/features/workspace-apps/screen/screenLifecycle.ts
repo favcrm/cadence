@@ -289,18 +289,22 @@ export class ScreenChannel extends FrameChannel {
    *  child. `send()` posts it before the first projection, so a primary
    *  never flashes list content when it is meant to draw a drawer; every
    *  later change is posted once. */
-  surface(role: ScreenSurfaceRole, modal: boolean): void {
-    if (this.surfaceState?.role === role && this.surfaceState.modal === modal) return;
+  surface(role: ScreenSurfaceRole, modal: boolean, drawerSurface?: string): void {
+    if (this.surfaceState?.role === role && this.surfaceState.modal === modal && this.drawerSurface === drawerSurface) return;
     this.surfaceState = { role, modal };
+    this.drawerSurface = drawerSurface;
     this.postSurface();
   }
+  /** CAD-1777 — the closed surface idiom a mounted drawer child draws. */
+  private drawerSurface: string | undefined;
   private postSurface(): void {
     if (this.closed || !this.ready || !this.port || !this.wantsSurfaces) return;
     this.surfaceState ??= { role: this.surfaceRole, modal: false };
-    const key = `${this.surfaceState.role}:${this.surfaceState.modal ? 1 : 0}`;
+    const named = this.surfaceState.role === "drawer" && this.drawerSurface ? this.drawerSurface : undefined;
+    const key = `${this.surfaceState.role}:${this.surfaceState.modal ? 1 : 0}:${named ?? ""}`;
     if (this.surfaceSent === key) return;
     this.surfaceSent = key;
-    const message: ScreenSurface = { v: 1, op: "surface", role: this.surfaceState.role, modal: this.surfaceState.modal };
+    const message: ScreenSurface = { v: 1, op: "surface", role: this.surfaceState.role, modal: this.surfaceState.modal, ...(named ? { surface: named } : {}) };
     this.port.postMessage(message);
   }
   protected state(data: string): void {
