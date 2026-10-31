@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -36,7 +37,7 @@ pub const FOCI: &[&str] = &["general", "standards", "spec-security", "browser-qa
 /// defaults. [`parse`] builds it through the strict raw types and
 /// [`DeliveryPolicy::validate`]; `serde` round-trips the validated
 /// form (the approval payload's `delivery` key).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeliveryPolicy {
     /// How an approved PR merges.
@@ -75,20 +76,20 @@ pub struct DeliveryPolicy {
 /// `1` is the only accepted value, an unknown one refuses the whole
 /// section, so an older binary never silently accepts a profile shape it
 /// does not understand.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SoloOperatorProfile {
     pub version: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MergePolicy {
     pub method: MergeMethod,
     pub queue: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeMethod {
     Squash,
@@ -97,7 +98,7 @@ pub enum MergeMethod {
 }
 
 /// One named review a rule may require. `kind` picks the variant.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Review {
     /// An independent agent review; `focus` is one of [`FOCI`].
@@ -123,14 +124,14 @@ impl Review {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckMode {
     Advisory,
     Required,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RiskRule {
     /// The conditions under which the rule applies — ANY of them.
@@ -140,7 +141,7 @@ pub struct RiskRule {
     pub require: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RiskWhen {
     /// Repo-relative, file-level globs — the same grammar as the
@@ -156,7 +157,7 @@ pub struct RiskWhen {
     pub files_over: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SizeLimit {
     pub lines_over: u64,

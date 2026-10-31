@@ -107,18 +107,25 @@ pub enum Operation {
 pub struct DeliveryRequirementsInput {
     /// The exact `delivery:` section text, or absent when the project has none.
     pub policy: Option<String>,
-    /// The digest the project's work approval recorded for its delivery policy.
-    pub approval_digest: Option<String>,
-    /// The policy that approval recorded (absent = approved "no section").
-    pub approval: Option<Value>,
+    /// The project's recorded work approval, when one exists.
+    pub approval: Option<DeliveryApprovalInput>,
     /// `git diff --raw -z --no-renames <merge-base> <head>` rows.
-    pub changes: Vec<Value>,
+    pub changes: Vec<crate::delivery_requirements::Change>,
     /// `git diff --numstat` total changed lines.
     pub lines: u64,
     /// The trusted base's `docs/roles/risk-paths.toml` text.
     pub risk_paths: Option<String>,
     /// The trusted base's `docs/roles/one-review-paths.toml` text.
     pub one_review_paths: Option<String>,
+}
+
+/// The delivery half of a project work approval: the digest it recorded and
+/// the policy it approved.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryApprovalInput {
+    pub digest: String,
+    pub policy: Option<crate::delivery::DeliveryPolicy>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -446,48 +453,23 @@ fn valid_contract_name(name: &str) -> bool {
 /// names the resolved policy beside the requirements so a reader can see which
 /// policy produced the class.
 fn delivery_requirements_value(input: &DeliveryRequirementsInput) -> Result<Value, Refusal> {
-    use crate::delivery::{effective, parse, Approved, DeliveryPolicy};
-    use crate::delivery_requirements::{classify, Change, TrustedLists};
+    use crate::delivery::{effective, parse, Approved};
 
     let file = match input.policy.as_deref() {
         None => Ok(None),
         Some(text) => parse(text).map_err(|error| error.to_string()),
     };
-    let approved = match input.approval_digest.as_deref() {
-        None => None,
-        Some(digest) => {
-            let policy = match &input.approval {
-                None => None,
-                Some(value) => Some(
-                    serde_json::from_value::<DeliveryPolicy>(value.clone())
-                        .map_err(|error| refuse(Code::InvalidCommand, error.to_string()))?,
-                ),
-            };
-            Some(Approved {
-                digest: digest.to_string(),
-                policy,
-            })
-        }
-    };
+    let approved = input.approval.as_ref().map(|approval| Approved {
+        digest: approval.digest.clone(),
+        policy: approval.policy.clone(),
+    });
     let resolved = effective("project", file, approved.as_ref());
-    if let Some(note) = &resolved.note {
-        // The policy in force is not the one the file declares. That is a fact
-        // for the caller to surface, and the strict requirements below already
-        // reflect it — never silently the file's weaker reading.
-        let _ = note;
-    }
-    let mut changes = Vec::with_capacity(input.changes.len());
-    for value in &input.changes {
-        changes.push(
-            serde_json::from_value::<Change>(value.clone())
-                .map_err(|error| refuse(Code::InvalidCommand, error.to_string()))?,
-        );
-    }
-    let lists = TrustedLists {
+    let lists = crate::delivery_requirements::TrustedLists {
         risk_paths: input.risk_paths.as_deref(),
         one_review: input.one_review_paths.as_deref(),
     };
-    let requirements = classify(&resolved, &changes, input.lines, &lists);
+    let requirements =
+        crate::delivery_requirements::classify(&resolved, &input.changes, input.lines, &lists);
     serde_json::to_value(serde_json::json!({
         "policy": resolved.policy,
         "policy_source": resolved.source,
@@ -657,7 +639,6 @@ mod tests {
         );
         let response: Value = serde_json::from_slice(&evaluate(&request(serde_json::json!({
             "policy": null,
-            "approval_digest": null,
             "approval": null,
             "changes": [],
             "lines": 0,
@@ -682,7 +663,6 @@ mod tests {
         // reading, and never a silent default.
         let bad: Value = serde_json::from_slice(&evaluate(&request(serde_json::json!({
             "policy": "---\ndelivery: {bogus: 1}\n---\n",
-            "approval_digest": null,
             "approval": null,
             "changes": [],
             "lines": 0,
