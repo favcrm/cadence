@@ -104,6 +104,7 @@ mod cad1772_recruit_page_acceptance;
 mod cad1853_cloud_agent_guard_acceptance;
 mod cad1901_memory_project_access_acceptance;
 mod cad1922_handover_acceptance;
+mod cad1922_home_guards_acceptance;
 mod cad1922_sandbox_isolation_acceptance;
 mod cad1935_pi_worker_dependencies;
 mod cad1939_destinations;
