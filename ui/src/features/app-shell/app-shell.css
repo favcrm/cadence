@@ -153,11 +153,19 @@
 }
 
 /* CAD-1615 / CAD-1777 — the app screen presented in the board-wide drawer:
-   the whole window height on the right, the rest of the board under the one
-   host scrim. The host promotes the OUTLET ITSELF (the same DOM node that
-   already holds the mounted frame), so a geometry change never reloads the
-   frame or discards an in-progress draft; the app draws its own header,
-   footer and body scrolling inside this box. */
+   the whole window height, the rest of the board under the one host scrim.
+   The host promotes the OUTLET ITSELF (the same DOM node that already holds
+   the mounted frame), so a geometry change never reloads the frame or
+   discards an in-progress draft; the app draws its own header, footer and
+   body scrolling inside this box.
+
+   The promoted frame keeps its own WIDTH and takes the viewport.
+   Sizing the outlet to a 30rem column turned the app's own content into the
+   drawer: a screen that draws its own panel then laid its list out inside
+   480px (observed on Social Content 0.12, whose Library shrank into the
+   column). Giving the frame height without changing its width leaves the
+   primary content at full size behind the app's own scrim, and the app's
+   panel sits over it at the full window height. */
 .app-shell[data-screen-drawer="true"] {
   /* The promoted panel is fixed and owns its own scroll; freezing the
      shell's scroller keeps the board (and its scrollbar) still behind the
@@ -171,17 +179,13 @@
   display: flex;
   flex-direction: column;
   position: fixed;
-  top: 0;
-  right: 0;
-  bottom: auto;
-  width: min(30rem, 100dvw);
+  inset: 0;
+  width: auto;
   height: 100vh;
   height: 100dvh;
   max-height: 100dvh;
   z-index: 51;
   background: var(--color-ink-875);
-  border-left: 1px solid var(--color-ink-700);
-  box-shadow: -12px 0 32px rgb(0 0 0 / .35);
   overflow: hidden;
   overscroll-behavior: contain;
 }
@@ -189,17 +193,6 @@
 .app-shell[data-screen-drawer="true"] .app-shell-outlet > [aria-label="Installed app screen"] {
   flex: 1 1 0%;
   min-height: 0;
-}
-/* The board's narrow layout (single pane, no second column) gets the whole
-   viewport rather than a slice of it — the same breakpoint the shell uses to
-   switch from two panes to one. */
-@media (max-width: 1023.98px) {
-  .app-shell[data-screen-drawer="true"] .app-shell-outlet {
-    width: 100dvw;
-    max-width: 100dvw;
-    border-left: 0;
-    box-shadow: none;
-  }
 }
 .app-shell-screen-scrim {
   position: fixed;
