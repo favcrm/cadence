@@ -39,13 +39,14 @@
 //! currently return it: sensitive conditions resolve to `strict`. No class
 //! sets `security_capable` today.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::delivery::{default_policy, Resolved};
 
 /// One changed file of the PR diff — the shape `git diff --raw -z
 /// --no-renames` emits and `scripts/enqueue-reviewed` collects.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Change {
     /// The raw status letter: `A`, `M`, `D`, `R`, `C`, `T`, `U`, `X`, `B`.
     pub status: String,
@@ -68,7 +69,7 @@ pub struct TrustedLists<'a> {
 
 /// Whether default lean classification applies, and if not, why strict
 /// requirements are retained.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Activation {
     /// A valid default-equivalent policy is in force.
@@ -85,7 +86,7 @@ pub enum Activation {
 }
 
 /// What class the evidence places the delivery in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryClass {
     /// Activated profile, allowlisted ordinary documentation only.
@@ -102,7 +103,7 @@ pub enum DeliveryClass {
 }
 
 /// The kind of independent review `reviews` counts toward.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewKind {
     /// No review required (routine under a valid default-equivalent policy).
@@ -115,7 +116,7 @@ pub enum ReviewKind {
 }
 
 /// What a delivery needs to merge, derived from the class.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Requirements {
     pub class: DeliveryClass,
     /// Independent verdict count on the exact head: `0` only for
