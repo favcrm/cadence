@@ -61,7 +61,7 @@ TAG_RE = re.compile(r"v[0-9][0-9A-Za-z.+_-]*")
 TARGETS = {
     "x86_64-linux": "ubuntu-22.04",
     "aarch64-linux": "ubuntu-22.04-arm",
-    "aarch64-macos": "macos-14",
+    "aarch64-macos": "macos-15",
 }
 GATE_JOBS = ["fmt", "clippy", "test", "build", "ui"]
 TAR_MEMBERS = {"cadence", "cadence.sha256", "manifest.json"}
