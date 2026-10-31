@@ -1,15 +1,9 @@
 name: ci
 
 on:
-  # CAD-840: observational full-suite benchmark; automatic events stay 8-way.
+  # Manual dispatch runs the same six-shard suite as a pull request.
+  # CAD-1073 retired the 4/8 width switch; it did not change the matrix.
   workflow_dispatch:
-    inputs:
-      test_shards:
-        description: Legacy benchmark input (inactive since CAD-1073 retired the shard suite)
-        type: choice
-        options: ["4", "8"]
-        default: "8"
-        required: true
   pull_request:
   # GitHub merge queue (CAD-290): each queued PR is tested on top of main
   # (and of the PRs ahead of it) on a gh-readonly-queue/* ref, so a PR
@@ -51,14 +45,19 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  # Never let a manual input change PR, merge-group, push or tag coverage.
-  CADENCE_CI_SHARDS: ${{ github.event_name == 'workflow_dispatch' && inputs.test_shards == '4' && '4' || '8' }}
 
+# CAD-1967: the Linux gates run on instabox-medium. Its kernel 6.18.54 is
+# listed in supported_kernel_abi and both host acceptances (cad1196, cad1377)
+# pass there; the test profile compiles in 3:20 against 5:44 on ubuntu-latest.
+# `cache-warm` moves with them: Actions cache versions include the cached
+# paths, so a writer on a different runner cannot warm these jobs, and a
+# consumer moved alone compiles cold. Release, ARM and macOS jobs stay on
+# their current labels.
 jobs:
   native-fixture-release-exclusion:
     # C1 is an explicitly dispatched, isolated artifact check, not a fixture run.
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -117,7 +116,7 @@ jobs:
   # run because their `if` tolerates a skipped need.
   queue-evidence:
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 5
     permissions:
       actions: read
@@ -177,7 +176,7 @@ jobs:
   # PR feedback selection runs BASE policy, never a PR-provided classifier.
   # Merge groups, main, tags and any uncertainty retain all real gates.
   change-scope:
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
@@ -230,7 +229,7 @@ jobs:
   fmt:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 10
     steps:
       - name: Not applicable — rust PR feedback gate
@@ -241,16 +240,6 @@ jobs:
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
       - run: cargo fmt --all -- --check
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
-      - name: Validate manual benchmark width
-        env:
-          BENCHMARK_SHARDS: ${{ inputs.test_shards }}
-        run: |
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
-            case "$BENCHMARK_SHARDS" in
-              4|8) ;;
-              *) echo 'manual benchmark width must be 4 or 8' >&2; exit 1 ;;
-            esac
-          fi
       # CAD-1073 clean-slate transition: the legacy tests/scripts contract
       # suite is retired; only the checks that validate this PR's own shape
       # remain. The nextest inventory/test-plan/shard contracts are gone with
@@ -317,7 +306,7 @@ jobs:
   clippy:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 20
     steps:
       - name: Not applicable — rust PR feedback gate
@@ -341,8 +330,8 @@ jobs:
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
 
   # CAD-1480: the suite (~1400 cpu-s) cannot fit the wall-time budget on
-  # one runner, so N shards each run a deterministic nextest
-  # `hash:k/N` partition at the proven `-j 2`. Every shard still runs
+  # one runner, so six shards each run a deterministic nextest
+  # `hash:k/6` partition at `--jobs 4`. Every shard still runs
   # scripts/run-result-tests with the same isolation, toolchain and
   # rust-cache, and uploads its junit plus expected inventory. The
   # aggregate `test` job below keeps the required check name and re-runs
@@ -351,7 +340,7 @@ jobs:
   test-shards:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -382,6 +371,19 @@ jobs:
       - name: Enable fast linker (mold/lld; falls back to the default linker)
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
+      # CAD-1967: every shard compiles the same workspace crates, so six
+      # machines each pay that codegen. Read-only sccache lets them reuse
+      # what cache-warm's test leg wrote with the identical command and
+      # flags (RUSTC_WRAPPER is exported after rust-cache, as in `build`).
+      # Test binaries link, so the final link stays per shard; the library
+      # crates are the part that gets reused.
+      - name: Enable shared sccache (read-only; no-op without credentials)
+        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        env:
+          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
+          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
       # CAD-1124: no doctests exist; mandatory default-feature clippy and
       # build retain compilation coverage without a zero-test rebuild.
       # CAD-1090: every cargo test target (scripts/result-test-args), with
@@ -425,6 +427,10 @@ jobs:
           else
             scripts/run-result-tests --partition "${{ matrix.shard }}/6" --jobs 4
           fi
+      - name: sccache statistics
+        if: ${{ !cancelled() && needs.change-scope.outputs.rust != 'false' }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
+
       # Artifacts always land (even on a red shard) so the aggregate can
       # prove where coverage stopped. junit.xml is required; the shard
       # step already failed when it is missing. CAD-1745: the name carries
@@ -451,7 +457,7 @@ jobs:
   test:
     needs: [queue-evidence, change-scope, test-shards]
     if: ${{ always() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 5
     permissions:
       actions: read
@@ -527,7 +533,7 @@ jobs:
   build:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 20
     steps:
       - name: Not applicable — rust PR feedback gate
@@ -611,7 +617,7 @@ jobs:
   ui:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 20
     defaults:
       run:
@@ -699,7 +705,7 @@ jobs:
   # exists (rust-cache would not save) and sccache has nothing to warm.
   cache-warm:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 30
     continue-on-error: true
     environment: sccache-writer
@@ -722,7 +728,7 @@ jobs:
       # and no gate reads clippy objects from it.
       # CAD-1103: the gates' linker flag is part of the cargo fingerprint, so
       # the release leg warms the cache with the same flag the gates use.
-      # CAD-1487: test-shards enable the fast linker too (83-binary link is
+      # CAD-1487: test-shards enable the fast linker too (the suite link is
       # the shard bottleneck), so the test leg must warm with it as well.
       - name: Enable fast linker (test and release legs; same flags as the gates)
         if: matrix.profile == 'test' || matrix.profile == 'release'
@@ -1773,7 +1779,7 @@ jobs:
     name: cross-build (required)
     needs: [cross-build]
     if: ${{ always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -1790,7 +1796,7 @@ jobs:
   # this phase.
   secrets:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
