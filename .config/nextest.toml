@@ -74,6 +74,14 @@ threads-required = 'num-test-threads'
 filter = 'test(/^cad348_memory_detail_identity_acceptance::/)'
 threads-required = 'num-test-threads'
 
+# CAD-1970 diagnostic: nextest discards a passing test's output, so a timing
+# summary printed by these two tests would never reach CI. Print it for exactly
+# those two names while the 66 s of
+# `cad1767_member_route_sweep_carries_no_operator_text` is being chased.
+[[profile.cadence.overrides]]
+filter = 'test(/^cad1767_followup_acceptance::cad1767_member_(route_sweep|thread_stream)/)'
+success-output = "immediate"
+
 [profile.cadence.junit]
 path = "junit.xml"
 report-skipped = "all"
