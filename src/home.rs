@@ -300,10 +300,35 @@ pub fn vault_for(tracker: &Path) -> Result<PathBuf> {
     // not that tracker, and its wiki must stay beside it: reading the
     // branch would move an existing installation's knowledge root without
     // the migration that CAD-392 still owns.
-    if tracker == layout.root.join("tracker") {
+    if same_place(tracker, &layout.root.join("tracker")) {
         return Ok(layout.root.join("vault"));
     }
     Ok(tracker.join("wiki"))
+}
+
+/// Whether two paths name the same place. The comparison canonicalises
+/// first — so `~/.cadence/alias/../tracker` with `alias` present is the
+/// branch's own tracker, exactly as the OS resolves it — and falls back
+/// to folding `.`/`..` for a path that does not exist yet.
+fn same_place(a: &Path, b: &Path) -> bool {
+    comparable(a) == comparable(b)
+}
+
+fn comparable(p: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(p) {
+        return real;
+    }
+    let mut out = PathBuf::new();
+    for component in p.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Operational upload workspace: `<resolved-home>/workspace`. This is
@@ -394,11 +419,23 @@ fn config_root(layout: &Layout) -> Result<PathBuf> {
 /// credential reads and writes somewhere else. Same-uid planting is the
 /// threat the ticket names, and a leaf-only check misses every ancestor.
 fn refuse_symlinked_under(root: &Path, path: &Path) -> Result<()> {
-    let mut current = if path.starts_with(root) {
-        root.to_path_buf()
-    } else {
+    let Ok(relative) = path.strip_prefix(root) else {
         return Ok(());
     };
+    // A `..` is resolved by the OS *after* it follows symlinks, so a walk
+    // that folds it lexically could check a path the write never takes.
+    // Generated paths never contain one; refuse instead of guessing.
+    if relative
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(Error::rejected(format!(
+            "{} contains a `..` component — refusing to resolve a consolidated path \
+             through it; name the installation with an absolute CADENCE_HOME instead",
+            path.display()
+        )));
+    }
+    let mut current = root.to_path_buf();
     loop {
         if std::fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
             return Err(Error::rejected(format!(
