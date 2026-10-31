@@ -20,6 +20,12 @@ export default function MobileNavigation({ children, onClose }: { children: Reac
     closeButton.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "k") {
+        // The background search shortcut must not open a portal behind this modal.
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
       if (event.key === "Escape") {
         event.preventDefault();
         onClose();

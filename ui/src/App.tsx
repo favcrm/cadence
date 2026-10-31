@@ -1130,7 +1130,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 <SignIn meta={meta} onChange={refresh} access={viewer.access} recheckFinished={recheckFinished} onRetryWorkspace={reload} />
               </StatusChips>
             </div>
-            {meta?.signed_in === true && <div className="mt-3 border-t border-ink-700 pt-2"><AccountMenu
+            {meta?.signed_in === true && <div className="mt-3 border-t border-ink-700 pt-2" onClick={(event) => { if ((event.target as Element).closest("a")) closeMenu(); }}><AccountMenu
               meta={meta}
               onChange={refresh}
               trigger="row"
