@@ -53,6 +53,8 @@ import type {
   Overview,
   Project,
   ProjectContext,
+  ProjectPolicy,
+  ProjectPolicyPayload,
   ContextRole,
   ThreadRef,
   WorkflowPreview,
@@ -535,6 +537,21 @@ export const api = {
   myWork: (query: string, signal?: AbortSignal) => get<MyWorkPayload>(`/api/my-work?${query}`, signal),
   myWorkIssue: (id: string) => get<MyWorkMembership>(`/api/my-work/issues/${encodeURIComponent(id)}`),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
+  /** `GET /api/projects/<key>/policy` (CAD-1950) — the recorded access
+   *  policy, whether there is one, and whether this build may record
+   *  `private`. */
+  projectPolicy: (project: string) =>
+    get<ProjectPolicyPayload>(`/api/projects/${encodeURIComponent(project)}/policy`),
+  /** `POST /api/projects/<key>/policy` (CAD-1950) — the same writer the CLI
+   *  calls. `members` is the full grant list and replaces what was there. */
+  setProjectPolicy: (
+    project: string,
+    req: { visibility: "workspace-visible" | "private"; members: string[] },
+  ) =>
+    post<{ project: string; policy: ProjectPolicy; committed: boolean }>(
+      `/api/projects/${encodeURIComponent(project)}/policy`,
+      req,
+    ),
   projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {
     const query = new URLSearchParams({ role });
     if (expectedRevision) query.set("expected_revision", expectedRevision);

@@ -22,6 +22,7 @@ import Board from "./features/projects/Board";
 import WorkItemDetail from "./features/work-items/WorkItemDetail";
 import { restoreDetailFocus } from "./features/work-items/focus";
 import { applyDecisionDone, homeNeedIssueId, type HomeDecisionOpen, type MyWorkDraft, type WorkItemOrigin } from "./lib/workItems";
+import ProjectSettings from "./features/projects/ProjectSettings";
 import ProjectsOverview from "./features/projects/ProjectsOverview";
 import IssuePage from "./features/issues/IssuePage";
 import { issuePath, laneFollowsStream, refreshIssueIds } from "./features/issues/model";
@@ -73,7 +74,12 @@ import SetupNudge from "./features/setup/SetupNudge";
 import AuthBoundary from "./features/auth/AuthBoundary";
 import SignIn from "./features/auth/SignIn";
 import { metaAccess, wakingBanner } from "./features/auth/access";
-import { hireBlock, kickoffBlock as operatorKickoffBlock, writeBlock } from "./features/auth/gate";
+import {
+  hireBlock,
+  kickoffBlock as operatorKickoffBlock,
+  policyBlock,
+  writeBlock,
+} from "./features/auth/gate";
 import { HireBlock, WriteGate } from "./features/auth/WriteGate";
 import { sessionHeaders } from "./lib/sessionKey";
 import { onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration, withPrivateOperation } from "./lib/privateSession";
@@ -1241,11 +1247,29 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 }),
                 on: route.screen === "projects" && route.section === "context",
               }]),
+              // CAD-1950: access is a property of the project, so its
+              // control lives on the project page rather than in a list.
+              {
+                label: "Settings",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "settings",
+                }),
+                on: route.screen === "projects" && route.section === "settings",
+              },
             ]}
           />
         )}
         {route.screen === "projects" && route.section === "overview" && (
           <ProjectsOverview project={project} projects={projects} issues={issuesState} onOpenIssue={openIssue} onRetry={() => void resources.issues.refresh()} />
+        )}
+        {route.screen === "projects" && route.slug && route.section === "settings" && (
+          <ProjectSettings
+            project={route.slug}
+            block={policyBlock(meta)}
+            onToast={(text) => say("ok", text)}
+          />
         )}
         {route.screen === "issue" && (
           <IssuePage

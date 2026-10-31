@@ -2713,6 +2713,9 @@ mod tests {
                     "app_runs",
                     "outbox",
                     "app_outputs",
+                    // CAD-1950: a project's recorded policy is its own read,
+                    // not a collection the entity frame patches.
+                    "projectPolicy",
                 ][..],
             ),
             (

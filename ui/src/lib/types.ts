@@ -227,6 +227,31 @@ export interface Project {
 
 export type ContextRole = "pm" | "dev" | "qa" | "devops";
 
+/**
+ * A project's recorded access policy (CAD-1950, AOS-274). The values are the
+ * tracker's own spelling — `workspace_visible` / `private` and grants such as
+ * `users/<handle>` — so the board cannot invent a second vocabulary.
+ */
+export interface ProjectPolicy {
+  version: number;
+  visibility: "workspace_visible" | "private";
+  /** Grants for a private project; absent when the list is empty. Ignored
+   *  while `workspace_visible` — stored, but it does not admit anyone. */
+  members?: string[];
+}
+
+/** `GET /api/projects/<key>/policy` — the policy, and whether one exists. */
+export interface ProjectPolicyPayload {
+  project: string;
+  /** False for a project that predates the policy contract: with no policy
+   *  recorded every caller keeps access (REQ-007). That is a different state
+   *  from workspace-visible and must not be shown as it. */
+  recorded: boolean;
+  policy: ProjectPolicy | null;
+  /** Whether this build may record `private` (the isolation gate). */
+  private_available: boolean;
+}
+
 export interface ProjectContextDocument {
   id: string;
   kind: string;
