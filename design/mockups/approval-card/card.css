@@ -1,0 +1,269 @@
+/* Approval card mockup (CAD-1946). Reuses ../tokens.css and ../kit.css;
+   these rules only cover the review harness and card-specific layout. */
+
+.review-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  align-items: center;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--color-ink-800);
+  background: var(--color-ink-875);
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+}
+
+.review-bar strong {
+  color: var(--color-ink-200);
+  font-weight: 500;
+}
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.seg button {
+  border: 0;
+  background: transparent;
+  color: var(--color-ink-400);
+  padding: 5px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.seg button[aria-pressed="true"] {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+
+.stage {
+  display: grid;
+  place-items: start center;
+  padding: 28px 16px 48px;
+  min-height: 70vh;
+}
+
+.stage[data-width="narrow"] {
+  justify-items: center;
+}
+
+.frame {
+  width: 100%;
+  max-width: 1280px;
+}
+
+.stage[data-width="narrow"] .frame {
+  max-width: 390px;
+}
+
+.card-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.card-title {
+  margin: 0;
+  font-size: 1.0625rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.card-sub {
+  margin: 4px 0 0;
+  color: var(--color-ink-400);
+  font-size: var(--text-secondary);
+}
+
+.rows {
+  list-style: none;
+  margin: 18px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.row > summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--color-ink-800);
+  border-radius: 9px;
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--text-secondary);
+}
+
+.row > summary::-webkit-details-marker {
+  display: none;
+}
+
+.row > summary:hover {
+  border-color: var(--color-ink-700);
+}
+
+.row[data-state="ok"] .dot {
+  background: var(--color-ok);
+}
+
+.row[data-state="todo"] .dot {
+  background: var(--color-warn);
+}
+
+.row[data-state="blocked"] .dot {
+  background: var(--color-fail);
+}
+
+.row[data-state="waiting"] .dot {
+  background: var(--color-ink-600);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.row-text {
+  flex: 1;
+  color: var(--color-ink-200);
+}
+
+.row-hint {
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+  font-family: var(--font-mono);
+}
+
+.row-body {
+  padding: 8px 10px 4px 28px;
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+}
+
+.row-body a {
+  color: var(--color-accent);
+}
+
+.banner {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  margin-top: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 9px;
+  font-size: var(--text-secondary);
+  color: var(--color-ink-300);
+}
+
+.banner[data-tone="warn"] {
+  border-color: color-mix(in srgb, var(--color-warn) 40%, var(--color-ink-700));
+  background: color-mix(in srgb, var(--color-warn) 8%, transparent);
+}
+
+.banner[data-tone="fail"] {
+  border-color: color-mix(in srgb, var(--color-fail) 40%, var(--color-ink-700));
+  background: color-mix(in srgb, var(--color-fail) 8%, transparent);
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 20px;
+  flex-wrap: wrap;
+}
+
+.actions .grow {
+  flex: 1;
+}
+
+.stage[data-width="narrow"] .actions {
+  flex-direction: column-reverse;
+  align-items: stretch;
+}
+
+.stepup {
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 9px;
+  background: var(--color-ink-850);
+}
+
+.stepup p {
+  margin: 0 0 10px;
+  font-size: var(--text-secondary);
+  color: var(--color-ink-300);
+}
+
+.details {
+  margin-top: 18px;
+  font-size: var(--text-label);
+  color: var(--color-ink-500);
+}
+
+.details dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 14px;
+  margin: 10px 0 0;
+  font-family: var(--font-mono);
+}
+
+.details dt {
+  color: var(--color-ink-500);
+}
+
+.details dd {
+  margin: 0;
+  color: var(--color-ink-300);
+  overflow-wrap: anywhere;
+}
+
+.progress {
+  display: flex;
+  gap: 14px;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-micro);
+  font-family: var(--font-mono);
+  color: var(--color-ink-500);
+}
+
+.progress [data-step]::before {
+  content: \"○ \";
+}
+
+.progress [data-step=\"done\"] {
+  color: var(--color-ink-300);
+}
+
+.progress [data-step=\"done\"]::before {
+  content: \"● \";
+  color: var(--color-accent);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}

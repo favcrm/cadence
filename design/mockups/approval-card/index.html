@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Approve change — approval card · CAD-1946 mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../../kit.css">
+<link rel="stylesheet" href="card.css">
+<script>
+(function () {
+  try {
+    var p = localStorage.getItem("cadence-theme");
+    if (p === "light" || p === "dark") document.documentElement.setAttribute("data-theme", p);
+  } catch (e) { /* unstorable: the system preference decides */ }
+})();
+</script>
+</head>
+<body>
+
+<div class="review-bar" role="region" aria-label="Review controls">
+  <span><strong>Review controls</strong> — not part of the product</span>
+  <span class="seg" role="group" aria-label="Theme">
+    <button type="button" data-theme-pick="">System</button>
+    <button type="button" data-theme-pick="dark">Dark</button>
+    <button type="button" data-theme-pick="light">Light</button>
+  </span>
+  <span class="seg" role="group" aria-label="Width">
+    <button type="button" data-width-pick="wide">1280</button>
+    <button type="button" data-width-pick="narrow">390</button>
+  </span>
+  <label>
+    State
+    <select id="state" class="field">
+      <option value="ready">Ready to merge</option>
+      <option value="needs-one">Needs 1 more thing</option>
+      <option value="head-moved">Head moved</option>
+      <option value="ejected">Queue ejected</option>
+      <option value="down">Hosted board unreachable</option>
+      <option value="step-up">Step-up</option>
+      <option value="merging">Approved — merging</option>
+    </select>
+  </label>
+</div>
+
+<main class="stage" id="stage" data-width="wide">
+  <div class="frame">
+    <p class="crumb" style="margin:0 0 12px">Agents / Approve change</p>
+    <section class="card" id="card" aria-labelledby="card-title" style="padding:22px">
+      <div class="card-head">
+        <div>
+          <h1 class="card-title" id="card-title">Social app: publish 0.2.0 to the marketplace</h1>
+          <p class="card-sub" id="card-sub">Ready to merge</p>
+        </div>
+        <span class="badge b-ok" id="card-badge">Ready</span>
+      </div>
+
+      <ul class="rows" id="rows"></ul>
+
+      <div id="banner-slot"></div>
+
+      <div class="actions" id="actions-slot"></div>
+
+      <details class="details">
+        <summary>Details</summary>
+        <dl>
+          <dt>head</dt><dd>290710c4d1e8f0a7c6b5a4938271605f4e3d2c1b</dd>
+          <dt>base</dt><dd>main @ 3a49b913</dd>
+          <dt>class</dt><dd>delegated</dd>
+          <dt>policy</dt><dd>sha256:9f2c…a71d</dd>
+          <dt>evidence</dt><dd>CI run 41186770970 · 2 verdicts</dd>
+        </dl>
+      </details>
+
+      <p class="visually-hidden" role="status" aria-live="polite" id="live"></p>
+    </section>
+  </div>
+</main>
+
+<script src="card.js"></script>
+</body>
+</html>
