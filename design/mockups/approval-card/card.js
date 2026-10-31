@@ -1,5 +1,4 @@
-/* Approval card states (CAD-1946). Synthetic data only; nothing here calls a
-   real endpoint. */
+/* Approval card states (CAD-1946). Synthetic data; no endpoint is called. */
 
 const ROWS = [
   { id: "reviews", text: "Two independent reviews" },
@@ -8,61 +7,78 @@ const ROWS = [
   { id: "approval", text: "Your approval" },
 ];
 
+const BODY = {
+  reviews: "Two reviewers read this exact version and both passed it. Neither wrote the change.",
+  browser: "Someone opened the changed screens and used them, rather than only running tests.",
+  checks: "The required checks ran on this version and passed.",
+  approval: "Yours only. Members and agents cannot approve, and an approval is for one version.",
+};
+
+const WORDS = { ok: "pass", todo: "missing", blocked: "failed", waiting: "unknown" };
+
+const SUMMARY = "4 files · +412 −37 · touches the release workflow";
+
 const STATES = {
   ready: {
     sub: "Ready to merge",
-    badge: ["b-ok", "Ready"],
-    rows: { reviews: "ok", browser: "ok", checks: "ok", approval: "ok" },
-    hint: { reviews: "2 pass · 290710c", browser: "Safari, Chrome", checks: "run 41186770970" },
+    summary: SUMMARY,
+    rows: { reviews: "ok", browser: "ok", checks: "ok", approval: "waiting" },
+    hint: { reviews: "290710c", browser: "Safari, Chrome", checks: "run 41186770970" },
     banner: null,
     action: "approve",
   },
   "needs-one": {
-    sub: "Needs 1 more thing",
-    badge: ["b-warn", "Not yet"],
-    rows: { reviews: "ok", browser: "todo", checks: "ok", approval: "ok" },
-    hint: { reviews: "2 pass · 290710c", browser: "missing", checks: "run 41186770970" },
-    banner: ["warn", "One thing is still missing: this change touches the UI and has not been tested in a browser."],
+    sub: "Missing: tested in the browser",
+    summary: SUMMARY,
+    rows: { reviews: "ok", browser: "todo", checks: "ok", approval: "waiting" },
+    hint: { reviews: "290710c", browser: "", checks: "run 41186770970" },
+    banner: ["warn", "This change touches the UI and has not been tested in a browser yet."],
     action: null,
   },
   "head-moved": {
     sub: "Needs a fresh review",
-    badge: ["b-warn", "Stale"],
+    summary: "290710c → 41b7e02 · the version changed after review",
     rows: { reviews: "blocked", browser: "blocked", checks: "waiting", approval: "blocked" },
-    hint: { reviews: "voided", browser: "voided", checks: "—" },
-    banner: ["warn", "A newer version came in — it needs a fresh review. The reviews and the approval you gave were for the previous version."],
+    hint: { reviews: "voided", browser: "voided", checks: "" },
+    banner: [
+      "warn",
+      "A newer version came in. The reviews and the approval you gave were for the previous version.",
+    ],
     action: "send-back",
   },
   ejected: {
     sub: "Didn't merge",
-    badge: ["b-fail", "Ejected"],
+    summary: SUMMARY,
     rows: { reviews: "ok", browser: "ok", checks: "blocked", approval: "ok" },
-    hint: { reviews: "2 pass", browser: "Safari, Chrome", checks: "failed" },
+    hint: { reviews: "290710c", browser: "Safari, Chrome", checks: "failed" },
     banner: ["fail", "Didn't merge — a check failed. Nothing was merged."],
     link: ["Open the failed run", "https://example.invalid/run/41186770970"],
     action: "retry",
   },
   down: {
     sub: "Can't check right now",
-    badge: ["b-info", "Unknown"],
+    summary: "4 files · nothing could be checked",
     rows: { reviews: "waiting", browser: "waiting", checks: "waiting", approval: "waiting" },
     hint: {},
-    banner: ["warn", "Can't check right now — nothing was approved. The board could not reach the workspace, so every item is unknown rather than green."],
+    banner: [
+      "warn",
+      "The board could not reach the workspace, so every item is unknown rather than green. Nothing was approved.",
+    ],
     action: "retry",
   },
   "step-up": {
     sub: "Ready to merge",
-    badge: ["b-ok", "Ready"],
-    rows: { reviews: "ok", browser: "ok", checks: "ok", approval: "ok" },
-    hint: { reviews: "2 pass", browser: "Safari, Chrome", checks: "run 41186770970" },
+    summary: SUMMARY,
+    rows: { reviews: "ok", browser: "ok", checks: "ok", approval: "waiting" },
+    hint: { reviews: "290710c", browser: "Safari, Chrome", checks: "run 41186770970" },
     banner: null,
     action: "stepup",
   },
   merging: {
     sub: "Approved — merging",
-    badge: ["b-info", "Merging"],
+    summary: "approved by you for 290710c",
     rows: { reviews: "ok", browser: "ok", checks: "ok", approval: "ok" },
-    hint: { reviews: "2 pass", browser: "Safari, Chrome", checks: "queued" },
+    hint: { reviews: "290710c", browser: "Safari, Chrome", checks: "queued" },
     banner: null,
     action: "revoke",
     progress: ["approved", "queued", "checks", "merged"],
@@ -70,12 +86,12 @@ const STATES = {
   },
 };
 
-const stage = document.getElementById("stage");
+const sheet = document.getElementById("sheet");
 const rowsEl = document.getElementById("rows");
 const subEl = document.getElementById("card-sub");
-const badgeEl = document.getElementById("card-badge");
+const summaryEl = document.getElementById("card-summary");
 const bannerSlot = document.getElementById("banner-slot");
-const actionsSlot = document.getElementById("actions-slot");
+const actionSlot = document.getElementById("action-slot");
 const live = document.getElementById("live");
 const picker = document.getElementById("state");
 
@@ -86,72 +102,67 @@ function el(tag, className, text) {
   return node;
 }
 
-function renderDetails() {
-  const rows = ROWS.map((row) => {
-    const details = el("details", "row");
-    details.dataset.state = "waiting";
-    details.dataset.id = row.id;
-    const summary = el("summary");
-    summary.append(el("span", "dot"), el("span", "row-text", row.text));
-    const hint = el("span", "row-hint");
-    hint.dataset.hint = row.id;
-    summary.append(hint);
-    details.append(summary);
-    const body = el("div", "row-body");
-    body.dataset.body = row.id;
-    details.append(body);
-    return details;
-  });
-  rowsEl.replaceChildren(...rows);
+function wordFor(rowId, status) {
+  if (rowId === "approval") {
+    if (status === "ok") return "given";
+    if (status === "blocked") return "voided";
+    return "not given";
+  }
+  return WORDS[status] ?? "unknown";
 }
 
-const BODY = {
-  reviews: "Two reviewers read this exact version and both passed it. Neither wrote the change.",
-  browser: "Someone opened the changed screens and used them, rather than only running tests.",
-  checks: "The required checks ran on this version and passed.",
-  approval: "Yours only. Members and agents cannot approve, and an approval is for one version.",
-};
+function renderRows() {
+  rowsEl.replaceChildren(
+    ...ROWS.map((row) => {
+      const details = el("details", "rc-row");
+      details.dataset.id = row.id;
+      const summary = el("summary");
+      const dot = el("span", "rc-dot");
+      const text = el("span", "rc-row-text", row.text);
+      const word = el("span", "rc-row-status");
+      word.dataset.word = row.id;
+      const hint = el("span", "rc-row-hint");
+      hint.dataset.hint = row.id;
+      summary.append(dot, text, word, hint);
+      const body = el("div", "rc-row-body", BODY[row.id]);
+      details.append(summary, body);
+      return details;
+    }),
+  );
+}
 
-function render(stateKey) {
-  const state = STATES[stateKey];
+function clear(node) {
+  while (node.firstChild) node.removeChild(node.firstChild);
+}
+
+function render(key) {
+  const state = STATES[key];
   subEl.textContent = state.sub;
-  badgeEl.className = `badge ${state.badge[0]}`;
-  badgeEl.textContent = state.badge[1];
+  summaryEl.textContent = state.summary ?? "";
 
   for (const row of ROWS) {
     const details = rowsEl.querySelector(`[data-id="${row.id}"]`);
     const status = state.rows[row.id] ?? "waiting";
     details.dataset.state = status;
-    const hint = details.querySelector(`[data-hint="${row.id}"]`);
-    hint.textContent = state.hint[row.id] ?? "";
-    const body = details.querySelector(`[data-body="${row.id}"]`);
-    body.textContent = BODY[row.id];
+    details.querySelector(`[data-hint="${row.id}"]`).textContent = state.hint[row.id] ?? "";
+    details.querySelector(`[data-word="${row.id}"]`).textContent = wordFor(row.id, status);
   }
 
-  bannerSlot.replaceChildren();
+  clear(bannerSlot);
   if (state.banner) {
     const [tone, text] = state.banner;
-    const banner = el("div", "banner", text);
+    const banner = el("div", "rc-banner", text);
     banner.dataset.tone = tone;
     if (state.link) {
       const a = el("a", null, state.link[0]);
       a.href = state.link[1];
       a.rel = "noreferrer";
-      banner.append(" ");
-      banner.append(a);
+      banner.append(" ", a);
     }
     bannerSlot.append(banner);
   }
-
-  actionsSlot.replaceChildren();
-  const grow = el("span", "grow");
-  actionsSlot.append(grow);
-  const cancel = el("button", "btn btn-ghost", "Close");
-  cancel.type = "button";
-  actionsSlot.append(cancel);
-
   if (state.progress) {
-    const list = el("ol", "progress");
+    const list = el("ol", "rc-progress");
     state.progress.forEach((step, index) => {
       const item = el("li", null, step);
       item.dataset.step = index < state.progressAt ? "done" : "todo";
@@ -160,52 +171,41 @@ function render(stateKey) {
     bannerSlot.append(list);
   }
 
-  if (state.action === "approve") {
-    const approve = el("button", "btn btn-primary", "Approve and merge");
-    approve.type = "button";
-    approve.addEventListener("click", () => setState("step-up"));
-    actionsSlot.append(approve);
-  }
+  clear(actionSlot);
+  const make = (label, className, onClick) => {
+    const button = el("button", className, label);
+    button.type = "button";
+    if (onClick) button.addEventListener("click", onClick);
+    return button;
+  };
+
   if (state.action === "stepup") {
-    const panel = el("div", "stepup");
+    const panel = el("div", "rc-stepup");
     panel.append(el("p", null, "Confirm it's you. The board will not take an approval from an older sign-in."));
-    const confirm = el("button", "btn btn-primary", "Confirm with passkey");
-    confirm.type = "button";
-    confirm.addEventListener("click", () => setState("merging"));
-    panel.append(confirm);
-    actionsSlot.before(panel);
+    panel.append(make("Confirm with passkey", "btn btn-primary btn-sm mt-2", () => render("merging")));
+    bannerSlot.append(panel);
+  }
+
+  if (state.action === "approve") {
+    actionSlot.append(make("Approve and merge", "btn btn-primary", () => render("step-up")));
   }
   if (state.action === "revoke") {
-    const revoke = el("button", "btn btn-ghost", "Take my approval back");
-    revoke.type = "button";
-    revoke.addEventListener("click", () => setState("ready"));
-    actionsSlot.append(revoke);
+    actionSlot.append(make("Take my approval back", "btn btn-ghost btn-sm", () => render("ready")));
   }
   if (state.action === "retry") {
-    const retry = el("button", "btn btn-sm", "Check again");
-    retry.type = "button";
-    retry.addEventListener("click", () => setState("ready"));
-    actionsSlot.append(retry);
+    actionSlot.append(make("Check again", "btn btn-ghost btn-sm", () => render("ready")));
   }
   if (state.action === "send-back") {
-    const send = el("button", "btn btn-ghost", "Send back with a reason");
-    send.type = "button";
-    actionsSlot.append(send);
+    actionSlot.append(make("Send back with a reason", "btn btn-ghost btn-sm"));
   }
 
   live.textContent = `${state.sub}. ${state.banner ? state.banner[1] : ""}`;
-  picker.value = stateKey;
+  picker.value = key;
   try {
-    // Keep whatever else is in the query — the preview token lives there, and
-    // dropping it would lock the reviewer out of the page they are reading.
     const params = new URLSearchParams(location.search);
-    params.set("state", stateKey);
+    params.set("state", key);
     history.replaceState(null, "", `${location.pathname}?${params}`);
-  } catch (e) { /* file:// without history is fine */ }
-}
-
-function setState(key) {
-  render(key);
+  } catch (e) { /* file:// is fine */ }
 }
 
 document.querySelectorAll("[data-theme-pick]").forEach((button) => {
@@ -213,37 +213,23 @@ document.querySelectorAll("[data-theme-pick]").forEach((button) => {
     const pick = button.dataset.themePick;
     if (pick) document.documentElement.setAttribute("data-theme", pick);
     else document.documentElement.removeAttribute("data-theme");
-    try {
-      localStorage.setItem("cadence-theme", pick || "");
-    } catch (e) { /* ignore */ }
-    syncThemeButtons();
+    try { localStorage.setItem("cadence-theme", pick || ""); } catch (e) { /* ignore */ }
+    syncTheme();
   });
 });
 
-function syncThemeButtons() {
+function syncTheme() {
   const current = document.documentElement.getAttribute("data-theme") || "";
-  document.querySelectorAll("[data-theme-pick]").forEach((button) => {
-    button.setAttribute("aria-pressed", String(button.dataset.themePick === current));
+  document.querySelectorAll("[data-theme-pick]").forEach((b) => {
+    b.setAttribute("aria-pressed", String(b.dataset.themePick === current));
   });
 }
 
-document.querySelectorAll("[data-width-pick]").forEach((button) => {
-  button.addEventListener("click", () => {
-    stage.dataset.width = button.dataset.widthPick;
-    syncWidthButtons();
-  });
-});
 
-function syncWidthButtons() {
-  document.querySelectorAll("[data-width-pick]").forEach((button) => {
-    button.setAttribute("aria-pressed", String(button.dataset.widthPick === stage.dataset.width));
-  });
-}
+picker.addEventListener("change", () => render(picker.value));
+sheet.querySelector("button.x").addEventListener("click", () => live.focus?.());
 
-picker.addEventListener("change", () => setState(picker.value));
-
-renderDetails();
-syncThemeButtons();
-syncWidthButtons();
+renderRows();
+syncTheme();
 const initial = new URLSearchParams(location.search).get("state");
-setState(STATES[initial] ? initial : "ready");
+render(STATES[initial] ? initial : "ready");

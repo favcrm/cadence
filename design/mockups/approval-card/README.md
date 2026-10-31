@@ -1,36 +1,50 @@
-# Approve change — approval card (review draft)
+# Approve change — approval card (review draft, real UI)
 
-Static mockup for CAD-1946's operator surface, produced to settle the card's
-states and words before any product UI work.
+Static mockup of CAD-1946's operator surface, built on the board's **own compiled
+CSS** rather than the design kit: the shell, sidebar, header, chips, drawer and
+buttons are the classes the live board uses.
 
 - **Source:** `design/mockups/approval-card/{index.html,card.css,card.js}`
-- **Design owners reused:** `design/tokens.css` + `design/kit.css` (copied beside
-  the page so the published copy has no path outside its folder). No second
-  palette, no new type scale.
-- **Preview:** `https://preview.simplebuild.site/20261031-164011/approval-card/`
-  (signed link; the `?t=` token is required and is preserved when the state
-  changes, so a reviewer can switch states without losing access).
-- **Status:** review draft. Nothing here is accepted, and none of it is
-  implemented.
+- **Preview:** `https://preview.simplebuild.site/20261031-173736/approval-card-real/`
+  (signed; the `?t=` token survives state changes)
+- **Status:** review draft. Nothing accepted, nothing implemented.
 
-## What it demonstrates
+## How it is built
 
-| Control | States |
+| Piece | Owner |
 |---|---|
-| State picker | ready · needs 1 more thing · head moved · queue ejected · hosted board unreachable · step-up · approved → merging |
-| Width | 1280 and 390 |
-| Theme | system, dark, light (tokens' own `data-theme`) |
+| Shell, `aside`, `header` | the live board's classes (`grid lg:grid-cols-[208px_minmax(0,1fr)]`, `navlink`, `proj`, `app-header`, `header-breadcrumb`) |
+| Drawer | `rc-sheet bg-ink-875 border-l border-ink-700` — the hire sheet's own pattern, including its bottom-sheet rule under 640px |
+| Buttons | `btn btn-primary`, `btn btn-ghost btn-sm` — read off the live hire sheet |
+| Colours, type | `--color-*` and `--font-*` from the board's compiled stylesheet |
+| `card.css` | only what the board lacks: the status dot, row layout, progress steps |
 
-Each row expands to say what the item means. "Approve and merge" appears only
-when everything else holds; the header SHA, delivery class and policy digest sit
-behind **Details**.
+`index.css` is **not** committed. It is the board's compiled stylesheet, copied
+at publish time:
 
-## Approximations, stated
+```bash
+curl -o index.css https://<board-host>/assets/index.css
+```
 
-- The card is shown in a bare shell, not the real board chrome. The real surface
-  is the issue page's Approve change drawer.
-- Checklist values are synthetic. No endpoint is called; nothing is approved,
-  merged or revoked.
-- Step-up is a button, not a real passkey ceremony.
-- The real card must reuse the board's compiled components; this file is a
-  static approximation of layout and words.
+so the mockup cannot drift from a committed stale copy of the product's CSS.
+
+## States
+
+ready · one thing missing · head moved · queue ejected · board unreachable ·
+step-up · approved → merging.
+
+Rows expand to say what each item means. **Approve and merge** only when
+everything else holds. Head, base, class and policy digest behind **Details**.
+Nothing merges until you approve; while merging, **Take my approval back**
+stays until it lands.
+
+Width follows the window: the drawer is `min(460px,100%)` and becomes the
+bottom sheet the board already uses below its breakpoint. Set the viewport to
+390 to see that, rather than a fake phone frame.
+
+## Approximations
+
+- The page behind the drawer is synthetic; the drawer is the real component
+  class, not the real React component.
+- Step-up is a button, not a passkey ceremony.
+- No endpoint is called; nothing is approved, merged or revoked.
