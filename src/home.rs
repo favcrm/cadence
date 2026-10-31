@@ -287,7 +287,16 @@ pub fn vault_dir() -> Result<PathBuf> {
 /// served.
 pub fn vault_for(tracker: &Path) -> Result<PathBuf> {
     let layout = layout()?;
-    if layout.source == Source::Env || tracker.starts_with(&layout.root) {
+    if layout.source == Source::Env {
+        return Ok(layout.root.join("vault"));
+    }
+    // Only the consolidated branch's *own* tracker (`<home>/tracker`) uses
+    // the home vault. A `CADENCE_PM_DIR` that merely happens to sit under
+    // the home — a legacy install pointed at `~/.cadence/old-pm`, say — is
+    // not that tracker, and its wiki must stay beside it: reading the
+    // branch would move an existing installation's knowledge root without
+    // the migration that CAD-392 still owns.
+    if tracker == layout.root.join("tracker") {
         return Ok(layout.root.join("vault"));
     }
     Ok(tracker.join("wiki"))
@@ -300,20 +309,20 @@ pub fn workspace_dir() -> Result<PathBuf> {
     Ok(layout()?.root.join("workspace"))
 }
 
-/// Hosted config and credentials root: `<home>/config` for a first run,
-/// `$XDG_CONFIG_HOME/cadence` (else `~/.config/cadence`) for an
-/// installation that already has one or for a caller that names
-/// `XDG_CONFIG_HOME` itself.
+/// Hosted config and credentials root. A first run — and an installation
+/// already living in the consolidated home — keeps them in `<home>/config`.
+/// A legacy installation keeps `$XDG_CONFIG_HOME/cadence` (else
+/// `~/.config/cadence`), where its credentials already are; so does an
+/// installation given an explicit `CADENCE_HOME` whose `XDG_CONFIG_HOME` is
+/// exported, or whose legacy root already holds something.
 ///
-/// The decision is evidence, not branch: an exported `XDG_CONFIG_HOME`
-/// and an existing legacy config root both keep the credentials already
-/// there — a client-only installation that has only credentials keeps
-/// them, and so does an existing installation given a `CADENCE_HOME`. A
-/// genuinely fresh installation with no explicit config root puts them
-/// under `<home>/config`, including when
-/// `$CADENCE_PM_DIR`/`$CADENCE_STATE_DIR` are set. A probe that cannot be
-/// answered counts as present, so credentials the resolver could not
-/// inspect are never abandoned.
+/// The decision follows the branch, not the environment: exporting
+/// `XDG_CONFIG_HOME` does not move a fresh installation's credentials into
+/// the legacy root, because the next run would then see both layouts and
+/// refuse the installation as ambiguous. A probe that cannot be answered
+/// counts as present, so credentials the resolver could not inspect are
+/// never abandoned. Under the consolidated home the path is refused when
+/// any level is a symlink, so a planted link cannot redirect credentials.
 ///
 /// The directory is private: [`create_home_dir`] makes it and the home
 /// root above it 0700 on first use, and the credential files inside stay
@@ -330,21 +339,83 @@ pub fn config_default() -> Result<PathBuf> {
     config_root(&layout)
 }
 
-/// The config root for a resolved layout: an explicit `XDG_CONFIG_HOME`
-/// wins (it names only this directory), then the legacy root when one is
-/// present, then the consolidated home's own `config/`.
+/// The config root for a resolved layout. One branch, one store:
+///
+/// - a first run — and an installation already living in the consolidated
+///   home — keeps everything, credentials included, under that home.
+///   Honouring an exported `XDG_CONFIG_HOME` here would write the first
+///   credential into the legacy root, and the next run would then find
+///   legacy *and* consolidated evidence and refuse the installation as
+///   ambiguous;
+/// - a legacy installation keeps `$XDG_CONFIG_HOME/cadence`
+///   (`~/.config/cadence`), where its credentials already are;
+/// - an explicit `CADENCE_HOME` keeps an exported `XDG_CONFIG_HOME` and an
+///   existing legacy root, which name where credentials already live, and
+///   otherwise uses `<home>/config`.
+///
+/// A config root under the consolidated home is then checked for
+/// symlinks: a planted link would redirect credential reads and writes,
+/// so it is refused rather than followed.
 fn config_root(layout: &Layout) -> Result<PathBuf> {
-    if std::env::var_os("XDG_CONFIG_HOME").is_some_and(|value| !value.is_empty()) {
-        return legacy_config_dir();
-    }
-    if layout.source == Source::Legacy {
-        return legacy_config_dir();
-    }
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").is_some_and(|value| !value.is_empty());
     let legacy = legacy_config_dir()?;
-    if legacy_present(&legacy) {
-        return Ok(legacy);
+    let chosen = match layout.source {
+        // No `CADENCE_HOME` and no legacy evidence: a first run or an
+        // installation already living in the consolidated home. Both keep
+        // their config inside it; a legacy config root present at the same
+        // time would have made the layout `Ambiguous` and been refused
+        // before this point.
+        Source::Fresh => layout.root.join("config"),
+        Source::Legacy => legacy,
+        Source::Env => {
+            if xdg || legacy_present(&legacy) {
+                legacy
+            } else {
+                layout.root.join("config")
+            }
+        }
+    };
+    if chosen.starts_with(&layout.root) {
+        refuse_symlinked_under(&layout.root, &chosen)?;
     }
-    Ok(layout.root.join("config"))
+    Ok(chosen)
+}
+
+/// Refuse a path under the consolidated home that is reached through a
+/// symlink, at any level from the home root down to the leaf.
+///
+/// The home is created by this installation, so nothing legitimate in it
+/// predates it: a symlinked `~/.cadence`, `~/.cadence/config` or
+/// `~/.cadence/config/remote-auth` is planted evidence that would send
+/// credential reads and writes somewhere else. Same-uid planting is the
+/// threat the ticket names, and a leaf-only check misses every ancestor.
+fn refuse_symlinked_under(root: &Path, path: &Path) -> Result<()> {
+    let mut current = if path.starts_with(root) {
+        root.to_path_buf()
+    } else {
+        return Ok(());
+    };
+    loop {
+        if std::fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(Error::rejected(format!(
+                "{} is reached through a symlink — refusing to read or write the \
+                 consolidated home through it; remove the link or set CADENCE_HOME to the \
+                 installation to use",
+                current.display()
+            )));
+        }
+        if current == path {
+            return Ok(());
+        }
+        match path.strip_prefix(&current).ok().and_then(|rest| {
+            rest.components()
+                .next()
+                .map(|c| current.join(c.as_os_str()))
+        }) {
+            Some(next) if next != current => current = next,
+            _ => return Ok(()),
+        }
+    }
 }
 
 /// Create a directory that belongs to the consolidated home — the config

@@ -126,7 +126,7 @@ pub(super) fn run(
     let handover = Handover {
         scope,
         hosted_board_url: sign_in.endpoint.clone(),
-        next_command: next_command(scope, &sign_in),
+        next_command: next_command(scope, &sign_in, &state_dir),
         board_running: outcomes
             .iter()
             .find(|outcome| outcome.check == "ui")
@@ -308,16 +308,20 @@ fn plan_fact(target: Option<&RemoteTarget>, json: bool, saved: Option<&[String]>
         (Some(_), true) => PlanFact::unknown(
             "not read: `setup --json` keeps its existing records and never calls the billing API",
         ),
-        (None, _) => {
-            if saved.is_some_and(|slugs| !slugs.is_empty()) {
-                PlanFact::unknown(
-                    "not read: this run verified no hosted sign-in, and a saved login is not \
-                     re-read here; the offer stays in the workspace dashboard",
-                )
-            } else {
-                PlanFact::none()
-            }
-        }
+        (None, _) => match saved {
+            // The inventory could not be inspected. "none" would be a claim
+            // this run cannot make: a workspace may well be billed.
+            None => PlanFact::unknown(
+                "not read: the hosted credential store could not be inspected, so this run \
+                 cannot say whether this machine is billed; the offer stays in the workspace \
+                 dashboard",
+            ),
+            Some(slugs) if !slugs.is_empty() => PlanFact::unknown(
+                "not read: this run verified no hosted sign-in, and a saved login is not \
+                 re-read here; the offer stays in the workspace dashboard",
+            ),
+            Some(_) => PlanFact::none(),
+        },
     }
 }
 
@@ -327,13 +331,28 @@ fn plan_fact(target: Option<&RemoteTarget>, json: bool, saved: Option<&[String]>
 /// transport failure, a grant that did not match — an approved credential
 /// may already exist server-side. The safe next step is always a truthful
 /// read of this machine, and only a hosted scope names a workspace.
-fn next_command(scope: &str, sign_in: &SignInFact) -> String {
-    match (scope, &sign_in.slug) {
+fn next_command(scope: &str, sign_in: &SignInFact, state_dir: &Path) -> String {
+    let mut command = match (scope, &sign_in.slug) {
         (cadence_agent::setup::SCOPE_HOSTED, Some(slug)) => {
             format!("cadence status --org {slug}")
         }
         _ => "cadence status".into(),
+    };
+    // A run that named its own state dir must hand over a command that
+    // reads the same one; the default would report a different machine.
+    if cadence_agent::home::state_dir().ok().as_deref() != Some(state_dir) {
+        command.push_str(&format!(
+            " --state-dir {}",
+            shell_quote(&state_dir.display().to_string())
+        ));
     }
+    command
+}
+
+/// Single-quote a value for a command the CLI only ever *prints*. `'`
+/// becomes `'\''`, so a path with a quote cannot break out of the quotes.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn print_handover(handover: &Handover) {

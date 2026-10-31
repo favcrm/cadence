@@ -185,8 +185,10 @@ carries `handover` (`scope`, `sign_in`, `plan`, `board_url`,
 existing field or line changes. `plan` keeps its `state`, `detail`,
 `checkout_url` and `code`, and adds `trial`, `subscription` and `checkout`
 as independent `{state, detail}` facts when the offer was read (absent when
-it was not, never a default). A pipe never prompts, never signs in and
-never calls the billing API.
+it was not, never a default). `--json` never prompts, never signs in and
+never calls the billing API. A pipe is asked the one question on stderr —
+an empty line signs in, `1` stays local, `2` registers, and EOF with no line
+stays local — so the run's own output is never mixed with it.
 
 Exit 1 when a check failed, and when a requested browser approval did not
 complete. `missing`, `unknown`, `unavailable` and a plan that was not read
