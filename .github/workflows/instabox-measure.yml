@@ -154,3 +154,49 @@ jobs:
           path: ${{ runner.temp }}/measure-report.txt
           if-no-files-found: warn
           retention-days: 14
+
+  # CAD-1967: the gate jobs restore caches `cache-warm` saves from
+  # ubuntu-latest, and every InstaBox job reported "No cache found". This
+  # job answers the narrow question that evidence left open: can
+  # instabox-medium save an entry under the gate's own key and restore it
+  # on a later run? The first run misses and saves; a re-run of the same
+  # pull request restores it. Pull-request caches are scoped to the merge
+  # ref, so this cannot seed or poison `main`'s entries.
+  cache-roundtrip:
+    runs-on: instabox-medium
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - run: scripts/ci-rust-toolchain --profile minimal
+
+      - name: Restore the gate test cache, saving it on a miss
+        id: cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gate-test-ld2
+          save-if: true
+
+      - name: Compile against whatever was restored
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          set -u
+          start=$(date +%s)
+          cargo test --no-run --locked --all-targets --features test-seam \
+            > "$RUNNER_TEMP/cargo.log" 2>&1
+          rc=$?
+          end=$(date +%s)
+          {
+            echo "## cache round trip"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "cache_hit=${CACHE_HIT:-}"
+            echo "wall_s=$((end - start))"
+            echo "cargo_rc=$rc"
+            echo "compiling_units=$(grep -c '^ *Compiling ' "$RUNNER_TEMP/cargo.log" || true)"
+            df -h / /data "$RUNNER_TEMP" || true
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          tail -5 "$RUNNER_TEMP/cargo.log" || true
+          exit "$rc"
