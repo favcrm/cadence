@@ -405,7 +405,10 @@ fn managed_pi_worker_confinement_acceptance() {
     // target may become readable, never the surrounding runtime directory.
     let resolver = std::fs::canonicalize("/etc/resolv.conf").unwrap();
     assert_worker_read(&valid, Path::new("/etc/resolv.conf"), Some("nameserver"));
-    assert_worker_read(&valid, Path::new("/run"), None);
+    // `/run` itself is deliberately not probed with `cat`: opening a directory
+    // succeeds and `cat` fails with "Is a directory" before any policy is
+    // consulted, so the answer says nothing about the guard. The resolver files
+    // below assert the same intent against a path whose read is observable.
     for sibling in [
         "/run/systemd/resolve/stub-resolv.conf",
         "/run/systemd/resolve/resolv.conf",
