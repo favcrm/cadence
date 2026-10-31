@@ -1,4 +1,4 @@
-import { useState, type FocusEvent, type MouseEvent, type ReactNode, type RefObject } from "react";
+import { useState, type FocusEvent, type MouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type { ResourceState } from "../lib/cache";
 import type { AppNav } from "../features/app-shell/appNav";
@@ -10,7 +10,6 @@ import { useLocale } from "../lib/locale";
 
 interface Props {
   collapsed: boolean;
-  expandRef: RefObject<HTMLButtonElement | null>;
   onExpand: () => void;
   screen: Screen;
   /** The href of a main-nav route (scope and drawer carried along). */
@@ -41,7 +40,7 @@ interface Props {
   noWiki?: boolean;
 }
 
-export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, accountOpen = false, appMenu = null, homeCount = 0, noWiki = false, collapsed, expandRef, onExpand }: Props) {
+export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, accountOpen = false, appMenu = null, homeCount = 0, noWiki = false, collapsed, onExpand }: Props) {
   const { t } = useLocale();
   const [tip, setTip] = useState<{ text: string; top: number; left: number } | null>(null);
   const showTip = (target: EventTarget | null) => {
@@ -55,14 +54,14 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
     if (!(event.relatedTarget instanceof Element) || !event.relatedTarget.closest("[data-rail-label]")) setTip(null);
   };
   return (
-    <aside data-account-open={accountOpen || undefined} data-sidebar-rail={collapsed || undefined}
+    <aside id="desktop-sidebar" data-account-open={accountOpen || undefined} data-sidebar-rail={collapsed || undefined}
       className={`hidden lg:flex sticky top-0 ${accountOpen ? "z-[35]" : ""} h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[16px] pb-1`}
       onMouseOver={(event) => showTip(event.target)} onMouseOut={hideTip}
       onFocus={(event) => showTip(event.target)} onBlur={hideTip}>
       <div className="min-h-0 flex-1 overflow-y-auto" onScroll={() => setTip(null)}>
         <div className="sidebar-brand">
           {collapsed ? (
-            <button ref={expandRef} type="button" className="sidebar-logo-button" aria-label={t("Expand sidebar")} aria-expanded="false" onClick={onExpand}>
+            <button type="button" className="sidebar-logo-button" aria-label={t("Expand sidebar")} aria-expanded="false" aria-controls="desktop-sidebar" onClick={onExpand}>
               <Logo size={25} />
             </button>
           ) : (

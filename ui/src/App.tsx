@@ -81,7 +81,7 @@ import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
 import { runningRelease } from "./lib/fmt";
 import { applyDraft, composerField, sessionStore, stashDraft, takeDraft } from "./lib/draft";
 import Toast, { type ToastMsg } from "./ui/Toast";
-import { IconList, IconSidebarCollapse } from "./ui/icons";
+import { IconList, IconSidebarCollapse, IconSidebarExpand } from "./ui/icons";
 import type { BoardFilters } from "./lib/filters";
 import type { UpdateBanner } from "./lib/types";
 import { RESOURCE_NAMES } from "./lib/cache";
@@ -281,11 +281,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const [menuOpen, setMenuOpen] = useState(false);
   const closeMenu = useCallback(() => setMenuOpen(false), []);
   const { collapsed: sidebarCollapsed } = useSidebarPrefs();
-  const sidebarExpandRef = useRef<HTMLButtonElement>(null);
   const sidebarCollapseRef = useRef<HTMLButtonElement>(null);
   const setSidebarCollapsed = (collapsed: boolean) => {
     updateSidebarPrefs((prefs) => ({ ...prefs, collapsed }));
-    requestAnimationFrame(() => (collapsed ? sidebarExpandRef : sidebarCollapseRef).current?.focus());
+    requestAnimationFrame(() => sidebarCollapseRef.current?.focus());
   };
   const [accountOpen, setAccountOpen] = useState(false);
   // The serving build when it differs from this bundle's — drives the
@@ -1002,7 +1001,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     >
       <Sidebar
         collapsed={sidebarCollapsed}
-        expandRef={sidebarExpandRef}
         onExpand={() => setSidebarCollapsed(false)}
         noWiki={!wikiAvailable(meta)}
         screen={screen === "workspaceApp" || screen === "workspaceAppKey" ? "apps" : screen}
@@ -1040,11 +1038,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           >
             <IconList size={16} />
           </button>
-          {!sidebarCollapsed && <div className="desktop-collapse-control">
-            <button ref={sidebarCollapseRef} type="button" className="header-icon text-ink-400" aria-label={t("Collapse sidebar")} aria-expanded="true" title={t("Collapse sidebar")} onClick={() => setSidebarCollapsed(true)}>
-              <IconSidebarCollapse size={16} />
+          <div className="desktop-collapse-control">
+            <button ref={sidebarCollapseRef} type="button" className="header-icon text-ink-400" aria-label={t(sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar")} aria-expanded={!sidebarCollapsed} aria-controls="desktop-sidebar" title={t(sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar")} onClick={() => setSidebarCollapsed(!sidebarCollapsed)}>
+              {sidebarCollapsed ? <IconSidebarExpand size={16} /> : <IconSidebarCollapse size={16} />}
             </button>
-          </div>}
+          </div>
           <nav className="header-breadcrumb min-w-0 flex-1" aria-label={t("Breadcrumb")}>
             {/* The organisation's display name, or the board's neutral
                 label — never a hostname or project mistaken for an org. */}
