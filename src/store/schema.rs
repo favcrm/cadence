@@ -1575,6 +1575,16 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=60", [])?;
                 tx.commit()?;
             }
+            if version < 61 {
+                // CAD-1962: workspace custody for an image an installation
+                // imported into the shared library, plus its accepted-intent
+                // ledger. New tables only; no existing row is read or
+                // rewritten, and the catalog itself is unchanged.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::app_media::SCHEMA_V61)?;
+                tx.execute("UPDATE schema_version SET version=61", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

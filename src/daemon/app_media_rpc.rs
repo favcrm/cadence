@@ -122,19 +122,37 @@ impl Shared {
             .as_i64()
             .filter(|revision| *revision > 0)
             .ok_or_else(|| Error::rejected("media preview needs a positive revision"))?;
-        let image = self.store.app_media_context_image(asset_id)?;
         // CAD-1962: the same visibility rule the catalog page applies —
         // another installation's draft is not a library entry, so its
         // display material is not served to this mount either.
         let caller = self.media_caller_install(params)?;
-        if image.asset.lifecycle != "published" && image.asset.install_id != caller {
-            return Err(Error::rejected(
-                "media asset is not in the workspace catalog",
-            ));
-        }
-        if image.asset.revision != revision || image.asset.kind != "image" {
+        let asset = self
+            .store
+            .app_media_asset_for(&caller, asset_id)?
+            .ok_or_else(|| Error::rejected("media asset is not in the workspace catalog"))?;
+        if asset.revision != revision || asset.kind != "image" {
             return Err(Error::rejected("media preview reference is stale"));
         }
+        if let Some(imported) = self.store.app_media_imported_image(asset_id)? {
+            // Workspace custody: the bytes are this store's own, so the
+            // only authority is the live mount proved above. The digest
+            // and size were re-verified on read.
+            let preview = crate::platform::agenticos_external::image::preview_jpeg(
+                &imported.bytes,
+                &imported.media_type,
+            )
+            .map_err(|(_, reason)| Error::rejected(reason))?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(preview);
+            // Re-prove the mount after preparing the bytes and before the
+            // reply, so an expiry or revoke that landed meanwhile refuses.
+            self.media_caller_install(params)?;
+            return Ok(json!({
+                "asset_id": asset_id, "revision": revision,
+                "sha256": imported.sha256,
+                "media_type": "image/jpeg", "base64": encoded,
+            }));
+        }
+        let image = self.store.app_media_context_image(asset_id)?;
         let preview = crate::platform::agenticos_external::image::preview_jpeg(
             &image.bytes,
             image.media_type,
@@ -601,6 +619,94 @@ impl Shared {
                     expected_revision,
                     &request_id,
                     crate::store::now(),
+                )
+            },
+        )
+    }
+
+    /// `app_media_import {action_token, token, key, origin, receipt_id,
+    /// request_id}` — copy ONE retained image this installation holds
+    /// into workspace custody and the shared catalog, as a draft.
+    /// Identical fresh authority chain to `app_media_publish` — operator
+    /// connection, closed fields, real session + public-operator floor,
+    /// the SAME session's consumed mount, live install digest, approved
+    /// status, re-extracted package, active owned context — then the
+    /// declared permission is `media.import`, never implied by
+    /// `media.read` or `media.publish`.
+    ///
+    /// The bytes come from THIS installation's own tool custody: the
+    /// receipt is looked up under the mount's install, never a request
+    /// field, and the stored MIME is re-sniffed against the bytes before
+    /// anything is written. The store copies them into workspace
+    /// custody, so the asset outlives this installation and another app
+    /// in the same workspace can read it.
+    pub(super) fn rpc_app_media_import(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.media_request_proven(
+            "media import",
+            params,
+            peer_pid,
+            (
+                &[
+                    "action_token",
+                    "token",
+                    "key",
+                    "origin",
+                    "receipt_id",
+                    "request_id",
+                ],
+                app_screen_decl::MAY_MEDIA_IMPORT,
+            ),
+            |params| {
+                let receipt_id = required_str(params, "receipt_id")?;
+                if receipt_id.is_empty()
+                    || receipt_id.len() > 128
+                    || !receipt_id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                {
+                    return Err(Error::rejected(
+                        "media import receipt_id must be nonempty ASCII \
+                         letters/digits/hyphen/underscore within 128 bytes",
+                    ));
+                }
+                let request_id = required_str(params, "request_id")?;
+                if request_id.is_empty()
+                    || request_id.len() > 128
+                    || !request_id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                {
+                    return Err(Error::rejected(
+                        "media import request_id must be nonempty ASCII \
+                         letters/digits/hyphen/underscore within 128 bytes",
+                    ));
+                }
+                Ok((receipt_id.to_string(), request_id.to_string()))
+            },
+            |view, (receipt_id, request_id), ctx| {
+                let context = ctx.context_id.as_deref().ok_or_else(|| {
+                    Error::rejected("media import needs a mounted active context")
+                })?;
+                let (declared_mime, _digest, bytes) = self
+                    .store
+                    .app_tool_asset_bytes(&ctx.install_id, &receipt_id)
+                    .map_err(|_| {
+                        Error::rejected(
+                            "media import needs a retained image this installation owns",
+                        )
+                    })?;
+                let media_type = crate::platform::agenticos_external::image::uploaded_image_mime(
+                    &bytes,
+                    &declared_mime,
+                )
+                .map_err(|(_, reason)| Error::rejected(reason))?;
+                self.store.app_media_import(
+                    &ctx.install_id,
+                    context,
+                    &media_actor(view).to_string(),
+                    media_type,
+                    &bytes,
+                    &request_id,
                 )
             },
         )

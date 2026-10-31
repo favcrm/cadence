@@ -3955,6 +3955,7 @@ impl Shared {
             "app_media_read" => self.rpc_app_media_read(params, peer_pid),
             "app_media_chat_attach" => self.rpc_app_media_chat_attach(params, peer_pid),
             "app_media_publish" => self.rpc_app_media_publish(params, peer_pid),
+            "app_media_import" => self.rpc_app_media_import(params, peer_pid),
             "app_tool_revoke" => self.rpc_app_tool_revoke(params, peer_pid),
             "app_tool_result" | "app_tool_results" => self.rpc_app_tool_result(params, peer_pid),
             "app_run_capability_call" => self.rpc_app_capability(method, params, peer_pid),

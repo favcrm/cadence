@@ -1725,6 +1725,18 @@ pub(crate) fn write_route(
     // action token to `app_media_original` and streams the verified
     // bytes back. Closed body `{action_token, asset_id}`; a body
     // credential/ref/scope field is 400 before dispatch.
+    // CAD-1962: copy one retained image into the shared workspace
+    // library. Closed body `{action_token, receipt_id, request_id}`; a
+    // body credential/scope field is 400 before dispatch.
+    if app_media::import_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = app_media::media_import(&mut request, state_dir, opts);
+        send(request, response);
+        return;
+    }
     if app_media::original_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
