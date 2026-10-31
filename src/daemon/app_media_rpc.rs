@@ -101,12 +101,13 @@ impl Shared {
                 }
                 Ok(input)
             },
-            |view, input, _ctx| {
+            |view, input, ctx| {
                 // The workspace is this daemon's own store — the mount
-                // proved it; no request field selects one. The catalog
-                // is store-wide: same-workspace collaborators read the
-                // same rows regardless of which install produced them.
-                self.media_read_input(view, &input)
+                // proved it; no request field selects one. CAD-1962: the
+                // library a mount lists is the curated published subset
+                // plus its OWN drafts, so another installation's work in
+                // progress never appears here.
+                self.media_read_input(view, &ctx.install_id, &input)
             },
         )
     }
@@ -121,6 +122,15 @@ impl Shared {
             .filter(|revision| *revision > 0)
             .ok_or_else(|| Error::rejected("media preview needs a positive revision"))?;
         let image = self.store.app_media_context_image(asset_id)?;
+        // CAD-1962: the same visibility rule the catalog page applies —
+        // another installation's draft is not a library entry, so its
+        // display material is not served to this mount either.
+        let caller = self.media_caller_install(params)?;
+        if image.asset.lifecycle != "published" && image.asset.install_id != caller {
+            return Err(Error::rejected(
+                "media asset is not in the workspace catalog",
+            ));
+        }
         if image.asset.revision != revision || image.asset.kind != "image" {
             return Err(Error::rejected("media preview reference is stale"));
         }
@@ -142,6 +152,39 @@ impl Shared {
                 "media_type": "image/jpeg", "base64": encoded,
             }))
         })
+    }
+
+    /// The installation this media request's mount proved. Used only for
+    /// the visibility rule; every authority proof is the caller's own.
+    fn media_caller_install(&self, params: &Value) -> Result<String> {
+        let token = required_str(params, "token")?;
+        let action_token = required_str(params, "action_token")?;
+        let key = match params.get("key") {
+            None => "",
+            Some(Value::String(key)) => key.as_str(),
+            Some(_) => {
+                return Err(Error::rejected(
+                    "media image key must be a session key string",
+                ))
+            }
+        };
+        let origin = match params["origin"].as_str() {
+            Some("loopback") => Origin::Loopback,
+            Some("tailnet") => Origin::Tailnet,
+            Some("public") => Origin::Public,
+            _ => {
+                return Err(Error::rejected(
+                    "media image needs a classified session origin",
+                ))
+            }
+        };
+        let (session, _) = self
+            .tool_session(token, key, origin)
+            .ok_or_else(|| Error::rejected("media image needs a live operator session"))?;
+        let ctx = self.tool_context_proven(action_token, &session)?;
+        ctx.context_id
+            .ok_or_else(|| Error::rejected("media image needs a mounted active context"))?;
+        Ok(ctx.install_id)
     }
 
     fn with_media_mount_current<T>(
@@ -644,6 +687,19 @@ impl Shared {
         if ctx.context_id.is_none() {
             return Err(Error::rejected(format!(
                 "{verb} needs a mounted active context"
+            )));
+        }
+        // CAD-1962: the asset must be in THIS mount's library —
+        // published, or this installation's own draft. Another
+        // installation's draft refuses here, before any provider work,
+        // exactly as an unknown id does.
+        if self
+            .store
+            .app_media_asset_for(&ctx.install_id, asset_id)?
+            .is_none()
+        {
+            return Err(Error::rejected(format!(
+                "{verb} asset is not in the workspace catalog",
             )));
         }
         // The asset's private provenance — a pure store read, resolved
@@ -1391,12 +1447,15 @@ impl Shared {
         }
     }
 
-    /// The closed media-read input union and the bounded catalog page.
-    /// `kind:"asset"` is a recognized contract member but NOT admitted —
-    /// detail needs its own custody check and refuses explicitly here.
+    /// The closed media-read input union: the bounded catalog page and
+    /// one asset's metadata projection. Both list what this installation
+    /// may see — published rows from any installation plus its OWN
+    /// drafts (CAD-1962). Neither returns bytes or a locator; the
+    /// original transfer is its own door.
     fn media_read_input(
         &self,
         view: &crate::operator_auth::SessionView,
+        install: &str,
         input: &Value,
     ) -> Result<Value> {
         let kind = input
@@ -1435,7 +1494,8 @@ impl Shared {
                         ))
                     }
                 };
-                let (page, next_cursor) = self.store.app_media_catalog(limit, cursor)?;
+                let (page, next_cursor) =
+                    self.store.app_media_catalog_for(install, limit, cursor)?;
                 let assets: Vec<Value> = page.iter().map(|asset| asset.projection()).collect();
                 Ok(json!({
                     "assets": assets,
@@ -1446,8 +1506,9 @@ impl Shared {
             "asset" => {
                 // CAD-1962: one catalog row by id — the same metadata
                 // projection the page emits, never bytes or a locator.
-                // The catalog is store-wide, so an asset another install
-                // produced reads here under the same mount proof.
+                // Another installation's draft resolves to nothing, so
+                // an unpublished asset is indistinguishable from an
+                // unknown one.
                 if input
                     .as_object()
                     .is_some_and(|o| o.keys().any(|k| !matches!(k.as_str(), "kind" | "asset_id")))
@@ -1458,9 +1519,12 @@ impl Shared {
                     .get("asset_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| Error::rejected("media asset input needs an asset_id"))?;
-                let asset = self.store.app_media_asset(asset_id)?.ok_or_else(|| {
-                    Error::rejected("media asset is not in the workspace catalog")
-                })?;
+                let asset = self
+                    .store
+                    .app_media_asset_for(install, asset_id)?
+                    .ok_or_else(|| {
+                        Error::rejected("media asset is not in the workspace catalog")
+                    })?;
                 Ok(json!({
                     "asset": asset.projection(),
                     "current_actor": media_actor(view),
