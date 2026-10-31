@@ -380,39 +380,30 @@ are now different, so re-measure before reviving that flow.
 
 ## CI throughput benchmark (CAD-840)
 
-Automatic PR, merge-group, main and tag CI stays eight-way. A manual
-`ci.yml` dispatch can run the **same full suite** four-way or eight-way:
+The suite width is fixed: six `test-shards` partitions (`hash:k/6`,
+`--jobs 4`). CAD-1073 retired the shard-suite benchmark, and the old
+`workflow_dispatch` input `test_shards` (4 or 8) did not change that
+matrix, so it is gone. A manual `ci.yml` dispatch runs the same suite as
+a pull request. It does not publish a release or reuse a main push's
+queue evidence. Cross-build runs only on pull_request and merge_group,
+and the secrets scan only on pull_request, so a dispatch skips both.
+Dispatch concurrency is its own group, so it does not cancel a pull
+request or a main push. Dispatching still consumes a full CI run.
 
 ```sh
-# Use one reviewed, frozen branch/ref for both dispatches.
-gh workflow run ci.yml -R favcrm/cadence --ref <frozen-ref> -f test_shards=4
-gh workflow run ci.yml -R favcrm/cadence --ref <frozen-ref> -f test_shards=8
+gh workflow run ci.yml -R favcrm/cadence --ref <frozen-ref>
 ```
 
-The matrix, partition denominator and assignment aggregate use the same
-width. Each width must prove its complete inventory union, with no missing,
-duplicate or out-of-range shard. Default-feature refusal proofs, doctests,
-fmt, both clippy shapes, build and UI checks remain. Cross-build runs only
-on pull_request and merge_group events, and the secrets scan only on
-pull_request, so manual runs at either width skip both equally. Manual
-runs do not publish a release or reuse a main push's queue evidence.
-Benchmark dispatches have their own concurrency groups, so they cannot
-hold up an unrelated run sharing the main ref.
-
-Do not dispatch both trials simultaneously merely to compare them: they
-would compete with each other. Alternate widths across multiple trials,
-with similar background PR load and cache/toolchain state. Dispatching a
-benchmark consumes a full CI run; no scheduled extra runs are added here.
-The workflow must be available on the default branch before GitHub accepts
-manual dispatches. Freeze the ref, then verify the returned runs have the
-same `head_sha`; a moving main is not a controlled comparison.
+The workflow must be on the default branch before GitHub accepts a
+manual dispatch. Freeze the ref, then verify the returned run's
+`head_sha`. A moving main is not a controlled comparison.
 
 Read timing evidence (requires read-only Actions access via `gh`):
 
 ```sh
 python3 scripts/ci-throughput.py --run-id <run-id>
-python3 scripts/ci-throughput.py --run-id <four-run-id> \
-  --compare-run-id <eight-run-id> --json > throughput-comparison.json
+python3 scripts/ci-throughput.py --run-id <run-id> \
+  --compare-run-id <other-run-id> --json > throughput-comparison.json
 ```
 
 The report separates **dispatch-to-start delay** from job execution.
@@ -440,11 +431,9 @@ carry the run's `run_id`, `head_sha` and `run_attempt`, and a run cannot be
 compared with itself. Offline reports are labelled `source:
 offline-unverified`: the files are only as trustworthy as their provenance.
 
-Choose a default only after repeated same-SHA trials show better gate
-latency **and** acceptable runner-minutes under realistic load. Do not
-claim a saving from one noisy run. Build-once nextest distribution and a
-separate merge-queue runner pool remain follow-ups; neither is deployed
-by this benchmark increment.
+Do not claim a saving from one noisy run. There is no width switch left
+to choose: the gate is six shards. Build-once nextest distribution and a
+separate merge-queue runner pool remain follow-ups; neither is deployed.
 
 ## Remaining delivery work
 
