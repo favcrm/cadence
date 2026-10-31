@@ -22,6 +22,7 @@ const ME: &str = "user_me";
 const THEM: &str = "user_them";
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 const KICKOFF: &str = "hosted local assignment";
+const PROFILE: &str = "ap_00000000-0000-4000-8000-00000000cafe";
 const ENDPOINT: &str = "https://board.test";
 
 #[derive(Clone)]
@@ -1688,6 +1689,92 @@ fn failed_resume_blocks_the_resumed_claim_again() {
     let (state_now, _, claim) = script.row(&assignment);
     assert_eq!(state_now, "blocked");
     assert_eq!(claim.as_deref(), Some(original_claim.as_str()));
+}
+
+#[test]
+fn profile_session_start_claims_only_its_own_issue() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let mine = board.seed("start", "waiting", None, ME);
+    let untouched = board.seed("start", "waiting", None, ME);
+    board.rows.last_mut().expect("row").issue_id = "SYN-OTHER".to_string();
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+
+    let started = coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect("session start");
+
+    assert_eq!(started["state"], "running");
+    assert_eq!(
+        started["client_agent_id"],
+        json!(format!("session-{PROFILE}"))
+    );
+    assert_eq!(started["profile"], json!(PROFILE));
+    assert!(Path::new(started["worktree"].as_str().expect("worktree")).is_dir());
+    assert_eq!(script.row(&mine).0, "running");
+    // A waiting assignment for another issue is neither claimed nor moved.
+    assert_eq!(script.row(&untouched).0, "waiting");
+    assert_eq!(script.row(&untouched).2, None);
+    // The caller is the actor: nothing was messaged to a daemon.
+    assert_eq!(ledger_file(auth.path())["origins"], json!({}));
+}
+
+#[test]
+fn profile_session_start_refuses_a_claim_another_worker_holds() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let held = board.seed("start", "running", Some(ME), ME);
+    let row = board.rows.last_mut().expect("row");
+    row.claim_id = Some("hlc_00000000000000000000000000000009".to_string());
+    row.client_agent_id = Some("someone-else".to_string());
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+
+    let refused = coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect_err("a foreign claim is not replaced");
+
+    assert_eq!(refused.code(), Some("fenced"));
+    assert_eq!(script.row(&held).0, "running");
+    assert_eq!(
+        script.row(&held).2.as_deref(),
+        Some("hlc_00000000000000000000000000000009")
+    );
+    assert!(
+        script.calls().iter().all(|call| !call.is_suffix("/claim")),
+        "no second claim was sent"
+    );
+}
+
+#[test]
+fn profile_session_can_report_its_own_claim_without_a_kickoff() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let mine = board.seed("start", "waiting", None, ME);
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+    coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect("session start");
+
+    let reported = coord
+        .report(&mine, "blocked", Some("waiting for the owner"), None)
+        .expect("a session claim reports itself");
+
+    assert_eq!(reported["state"], "blocked");
+    assert_eq!(script.row(&mine).0, "blocked");
+    // A retry replays the same claim rather than opening another one.
+    let again = coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect("retry");
+    assert_eq!(again["claim_id"], reported["claim_id"]);
 }
 
 fn bind_file(dir: &Path, message: &str) -> Value {
