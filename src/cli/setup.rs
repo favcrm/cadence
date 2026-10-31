@@ -332,14 +332,21 @@ fn plan_fact(target: Option<&RemoteTarget>, json: bool, saved: Option<&[String]>
 /// may already exist server-side. The safe next step is always a truthful
 /// read of this machine, and only a hosted scope names a workspace.
 fn next_command(scope: &str, sign_in: &SignInFact, state_dir: &Path) -> String {
-    let mut command = match (scope, &sign_in.slug) {
+    let hosted = match (scope, &sign_in.slug) {
         (cadence_agent::setup::SCOPE_HOSTED, Some(slug)) => {
-            format!("cadence status --org {slug}")
+            Some(format!("cadence status --org {slug}"))
         }
-        _ => "cadence status".into(),
+        _ => None,
     };
-    // A run that named its own state dir must hand over a command that
-    // reads the same one; the default would report a different machine.
+    if let Some(command) = hosted {
+        // A hosted read goes to the workspace through the saved login;
+        // `--org` refuses an explicit `--state-dir` (`org::pin_conflict`),
+        // so the state pin must not be appended here.
+        return command;
+    }
+    let mut command = "cadence status".to_string();
+    // A local run that named its own state dir must hand over a command
+    // that reads the same one; the default would report a different machine.
     if cadence_agent::home::state_dir().ok().as_deref() != Some(state_dir) {
         command.push_str(&format!(
             " --state-dir {}",
