@@ -204,7 +204,7 @@ pub fn run_cli(state_dir: &Path, action: &DevAction) -> Result<i32> {
         DevAction::Reload { name, build } => reload(state_dir, name.as_deref(), build.as_deref())?,
         DevAction::Env { name } => {
             let sb = target(state_dir, name.as_deref())?;
-            refuse_production(&sb)?;
+            refuse_production_readonly(&sb)?;
             let marker = require_marker(&sb)?;
             let allow = marker["allow_global"].as_bool() == Some(true);
             print!("{}", env_lines(&sb, persisted_port(&sb.state_dir()), allow));
@@ -218,7 +218,7 @@ pub fn run_cli(state_dir: &Path, action: &DevAction) -> Result<i32> {
         }
         DevAction::Status { name } => {
             let sb = target(state_dir, name.as_deref())?;
-            refuse_production(&sb)?;
+            refuse_production_readonly(&sb)?;
             require_marker(&sb)?;
             status(&sb)
         }
@@ -900,15 +900,18 @@ fn production_dirs(sb: &Sandbox, exported: bool) -> Result<Vec<(&'static str, Pa
     };
     // CAD-1922: the consolidated home holds `state/`, `tracker/`,
     // `config/`, `repos/`, `vault/` and `workspace/`, so a sandbox inside
-    // it would share a live install's roots.
-    let mut dirs: Vec<(&'static str, PathBuf)> =
-        vec![("the production home", crate::home::home_default()?)];
+    // it would share a live install's roots. It is spelled from `$HOME`
+    // like the legacy roots below, not through `home_default()`: that
+    // resolver is test-guarded (CAD-1210) and would refuse to name the
+    // real `~/.cadence` in a test process that only needs the path.
+    let mut dirs: Vec<(&'static str, PathBuf)> = Vec::new();
     // The pre-`CADENCE_HOME` roots, from `$HOME`/`$XDG_*` alone: an
     // existing installation keeps its data here whatever branch the
     // caller's `$CADENCE_HOME` selects, so an export cannot hide it.
     // `home.rs` resolves the same spellings, but its public defaults
     // follow `$CADENCE_HOME`/`$XDG_CONFIG_HOME`; this guard must not.
     if let Some(home) = var("HOME") {
+        dirs.push(("the production home", home.join(".cadence")));
         dirs.push(("the production tracker", home.join("pm")));
         dirs.push(("the production config dir", home.join(".config/cadence")));
         // A daemon started without XDG_STATE_HOME lives here even when
@@ -955,10 +958,22 @@ fn production_dirs(sb: &Sandbox, exported: bool) -> Result<Vec<(&'static str, Pa
 /// the state dir), nested inside it, or containing it (a `reset` would
 /// delete it).
 fn refuse_production(sb: &Sandbox) -> Result<()> {
-    refuse_overlap(sb, true)
+    refuse_overlap(sb, true, false)
 }
 
-fn refuse_overlap(sb: &Sandbox, exported: bool) -> Result<()> {
+/// The same overlap guard for a verb that only *reports*: `status` and
+/// `env` in a shell exported by `cadence dev env` name the sandbox's own
+/// dirs on both sides, and refusing that made the sandbox unusable in its
+/// own environment. Exact equality is skipped there because nothing is
+/// deleted or stopped. Every deforming verb — `reset`, `down`, `reload`,
+/// the global gate — keeps the strict check: a marker planted at the
+/// production tracker makes that dir the sandbox's own, and only the
+/// strict form refuses to delete it.
+fn refuse_production_readonly(sb: &Sandbox) -> Result<()> {
+    refuse_overlap(sb, true, true)
+}
+
+fn refuse_overlap(sb: &Sandbox, exported: bool, own_dirs_readonly: bool) -> Result<()> {
     let ours = [
         sb.root.clone(),
         sb.state_dir(),
@@ -968,6 +983,13 @@ fn refuse_overlap(sb: &Sandbox, exported: bool) -> Result<()> {
     .map(|p| resolved(&p));
     for (label, dir) in production_dirs(sb, exported)? {
         let live = resolved(&dir);
+        // Only a read-only verb may treat an exported dir that is exactly
+        // one of the sandbox's own paths as its own: deleting verbs must
+        // still refuse a planted marker in the production tracker, which
+        // is indistinguishable from an export at that path.
+        if own_dirs_readonly && ours.iter().any(|own| own == &live) {
+            continue;
+        }
         if ours
             .iter()
             .any(|p| p.starts_with(&live) || live.starts_with(p))
@@ -1106,7 +1128,7 @@ pub fn owner_of(state_dir: &Path) -> Result<Option<String>> {
                     state_dir.display()
                 )));
             }
-            refuse_overlap(&sb, false)
+            refuse_overlap(&sb, false, false)
         });
     owned.map(|()| Some(sb.name.clone())).map_err(|e| {
         Error::rejected(format!(
