@@ -238,7 +238,7 @@ named issue itself instead:
 
 ```sh
 cadence --org acme issue start <issue-id> --repo /absolute/path/to/checkout --profile ap_<profile-id>
-cadence --org acme agent report <assignment-id> --state blocked --text "waiting for the owner"
+cadence --org acme local-agent report <assignment-id> --state blocked --text "waiting for the owner"
 ```
 
 `--profile` claims under an id derived from that profile, so the board re-checks

@@ -1882,7 +1882,7 @@ impl<H: CoordHttp> Coordinator<H> {
             "actor": "external_session",
             "guidance": {
                 "code": "report_from_this_session",
-                "text": "This session holds the claim. Report with `cadence agent report <assignment> --state running|blocked|failed|result`; no local agent was connected.",
+                "text": "This session holds the claim. Report with `cadence local-agent report <assignment> --state running|blocked|failed|result`; no local agent was connected.",
             },
         }))
     }
