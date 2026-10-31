@@ -309,6 +309,35 @@ pub(crate) fn issue_project_answer(body: &Value, issue: &str) -> Result<String> 
     Ok(text(body, "project", "issue_show")?.to_string())
 }
 
+/// A PR reference as the classifier expects it: a URL when the project's one
+/// remote can name it, unchanged when the caller already passed one.
+///
+/// `--pr 1462` is the documented form, and the classifier parses a URL later
+/// (to read the PR through `gh`), so the number has to become a URL here —
+/// before anything downstream sees it. Several remotes cannot name it: the
+/// caller is asked for the URL rather than a repo being guessed.
+pub fn pr_url_from(remotes: &[String], pr: &str) -> Result<String> {
+    let bare = pr.trim().trim_start_matches('#');
+    if bare.is_empty() || !bare.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(pr.to_string());
+    }
+    match remotes {
+        [only] => {
+            let slug = only
+                .trim()
+                .trim_start_matches("github.com/")
+                .trim_end_matches('/');
+            Ok(format!("https://github.com/{slug}/pull/{bare}"))
+        }
+        [] => Err(refuse(format!(
+            "`pr: {pr}` names no repo, and the project lists no remote to match it against"
+        ))),
+        _ => Err(refuse(format!(
+            "`pr: {pr}` names no repo, and the project has several remotes — pass the full pull request URL"
+        ))),
+    }
+}
+
 /// `cadence delivery requirements` for a hosted org: the daemon's answer
 /// shape, with `readiness` null — routine readiness reads the local
 /// delivery record, which a hosted org does not have here.
@@ -322,6 +351,19 @@ pub fn requirements(
     let inputs = HostedInputs {
         target,
         wake_timeout,
+    };
+    // The classifier parses the PR as a URL, so a bare number is resolved
+    // against the project's remote first — never guessed past that.
+    let pr = if pr
+        .trim()
+        .trim_start_matches('#')
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+    {
+        let project = inputs.issue_project(issue)?;
+        pr_url_from(&inputs.delivery_policy(&project)?.remotes, pr)?
+    } else {
+        pr.to_string()
     };
     let (mut answer, _) = classify_from(&inputs, &json!({"issue": issue, "pr": pr, "head": head}))?;
     answer["readiness"] = Value::Null;
@@ -762,6 +804,32 @@ mod tests {
         let unknown = json!({"state": "unknown", "reason": "store unreadable"});
         assert_eq!(scope_answer(&unknown, "CAD-1").unwrap().1, 1);
         assert!(scope_answer(&json!({}), "CAD-1").is_err());
+    }
+
+    #[test]
+    fn a_bare_pr_number_becomes_the_project_remote_url() {
+        let one = vec!["github.com/favcrm/cadence".to_string()];
+        assert_eq!(
+            pr_url_from(&one, "1462").unwrap(),
+            "https://github.com/favcrm/cadence/pull/1462"
+        );
+        assert_eq!(
+            pr_url_from(&one, "#1462").unwrap(),
+            "https://github.com/favcrm/cadence/pull/1462"
+        );
+        // A URL is already what the classifier wants.
+        let url = "https://github.com/other/repo/pull/7";
+        assert_eq!(pr_url_from(&one, url).unwrap(), url);
+        // Nothing to match, or more than one candidate: refuse rather than guess.
+        assert!(pr_url_from(&[], "1462").is_err());
+        assert!(pr_url_from(
+            &[
+                "github.com/favcrm/cadence".to_string(),
+                "github.com/favcrm/pm".to_string()
+            ],
+            "1462"
+        )
+        .is_err());
     }
 
     #[test]
