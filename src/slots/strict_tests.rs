@@ -75,6 +75,19 @@ fn clk(now: f64) -> SlotClock {
     SlotClock::at(now, 1_000_000.0 + now)
 }
 
+/// A probe that reports a comfortably provisioned host.
+///
+/// The fixtures below persist to a temp directory and then acquire, so an
+/// unset probe would read the *host's* free disk and memory. A CI runner
+/// sitting under the 15 GiB `slot_disk_min_free_bytes` floor then answers
+/// `wait_reason: "disk"` instead of exercising the admission path under
+/// test (CAD-1967: InstaBox keeps the worktree on a 20 GiB `/data`). These
+/// tests prove strict admission, not the host floors — those are covered
+/// by `slots::tests`.
+fn generous_host() -> (Option<u64>, Option<u64>) {
+    (Some(64 * (1 << 30)), Some(500 * (1 << 30)))
+}
+
 fn strict_slots(proc: &FakeProc, build: usize) -> Slots {
     let mut s = Slots::new(SlotConfig {
         build_slots: build,
@@ -85,6 +98,7 @@ fn strict_slots(proc: &FakeProc, build: usize) -> Slots {
         ..Default::default()
     });
     s.use_proc(proc.root(), UID);
+    s.use_resources(Some(generous_host));
     s
 }
 
