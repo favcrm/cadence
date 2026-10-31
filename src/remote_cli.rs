@@ -135,6 +135,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
     "master_status",
+    // CAD-1678 / AOS-328: the hosted workspace's own tool catalog. `tools`
+    // needs `cli.read`, `call` needs `cli.write`; the Worker decides per
+    // operation, so this client asks for the historical pair.
+    "platform_call",
     // CAD-1946: the merge gate. Reads (cli.read) and the operator's merge
     // approval (`audit.approve`, which only `cadence login --audit-approve`
     // requests; the hosted org admits it for the human owner only).
@@ -191,7 +195,7 @@ fn team_mutation_verb(verb: &str) -> bool {
 fn mutating_cli_verb(verb: &str) -> bool {
     matches!(
         verb,
-        "message_send" | "issue_attach" | "issue_review" | "audit_verdict"
+        "message_send" | "issue_attach" | "issue_review" | "audit_verdict" | "platform_call"
     ) || team_mutation_verb(verb)
 }
 
@@ -207,6 +211,10 @@ fn lost_mutation_note(verb: &str) -> &'static str {
         "the attachment may or may not have been recorded — inspect the same issue and artifact before repeating it"
     } else if verb == "audit_verdict" {
         "the verdict may or may not have been recorded — read `audit verdicts` for the same head before repeating it"
+    } else if verb == "platform_call" {
+        "the tool call may or may not have run and been charged — replay the same \
+         command; the relayed key returns the door's recorded outcome instead of \
+         running it a second time"
     } else if verb == "issue_review" {
         "the verdict may or may not have been recorded — read the same issue before repeating it; a reviewer holds one verdict per revision"
     } else {

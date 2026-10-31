@@ -767,9 +767,83 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             args.insert("payload".into(), Value::Object(payload));
             "settings_agents"
         }
+        Commands::Platform { action } => {
+            // CAD-1678: a hosted workspace owns its catalog, its accounts and
+            // its per-project default, so a flag naming any of them cannot
+            // cross faithfully — it refuses here rather than being silently
+            // ignored by the door. The tool and its input are the only caller
+            // facts that travel.
+            match action {
+                PlatformAction::Tools { project, .. } => {
+                    if project.is_some() {
+                        return Err(unsupported(
+                            "platform tools",
+                            "--project",
+                            "a hosted workspace resolves its own default account",
+                        ));
+                    }
+                    args.insert("operation".into(), json!("tools"));
+                }
+                PlatformAction::Call {
+                    tool,
+                    input,
+                    platform,
+                    account,
+                    project,
+                } => {
+                    if platform.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--platform",
+                            "a hosted workspace runs its own registered platforms",
+                        ));
+                    }
+                    if account.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--account",
+                            "a hosted workspace funds and resolves its own account",
+                        ));
+                    }
+                    if project.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--project",
+                            "a hosted workspace resolves its own project",
+                        ));
+                    }
+                    let input = super::platform::parse_platform_input(input)?;
+                    args.insert("operation".into(), json!("call"));
+                    args.insert("tool".into(), json!(tool));
+                    args.insert("key".into(), json!(platform_replay_key(tool, &input)));
+                    args.insert("body".into(), input);
+                }
+                _ => return Err(unavailable(command)),
+            }
+            "platform_call"
+        }
         _ => return Err(unavailable(command)),
     };
     Ok((verb, args))
+}
+
+/// CAD-1678: the reply key a hosted tool call replays under. The relay body
+/// has no header channel, so the token rides in the arguments; deriving it
+/// from the tool and its input means a resubmitted identical call reads the
+/// door's recorded outcome instead of charging a second time, while a
+/// different input is a different call.
+fn platform_replay_key(tool: &str, input: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(tool.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(serde_json::to_string(input).unwrap_or_default().as_bytes());
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("pcli_{digest}")
 }
 
 /// CAD-1568: `send`/`message send` → `message_send` arguments. Exactly
@@ -2193,6 +2267,84 @@ mod read_contract_tests {
         match verb_for(command) {
             Ok((verb, args)) => Ok((verb, Value::Object(args))),
             Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn platform(action: PlatformAction) -> Commands {
+        Commands::Platform { action }
+    }
+
+    #[test]
+    fn hosted_platform_lists_and_calls_through_one_verb() {
+        let (verb, args) = outcome(&platform(PlatformAction::Tools {
+            json: false,
+            project: None,
+        }))
+        .unwrap();
+        assert_eq!(verb, "platform_call");
+        assert_eq!(args, json!({"operation": "tools"}));
+
+        let call = || {
+            platform(PlatformAction::Call {
+                tool: "generate_image".into(),
+                input: r#"{"prompt": "synthetic"}"#.into(),
+                platform: None,
+                account: None,
+                project: None,
+            })
+        };
+        let (verb, args) = outcome(&call()).unwrap();
+        assert_eq!(verb, "platform_call");
+        assert_eq!(args["operation"], json!("call"));
+        assert_eq!(args["tool"], json!("generate_image"));
+        assert_eq!(args["body"], json!({"prompt": "synthetic"}));
+        let key = args["key"].as_str().expect("a call carries a reply key");
+        assert!(key.starts_with("pcli_"), "{key}");
+        // The same command replays the same key; another input is another call.
+        assert_eq!(outcome(&call()).unwrap().1["key"], json!(key));
+        let other = platform(PlatformAction::Call {
+            tool: "generate_image".into(),
+            input: r#"{"prompt": "a different prompt"}"#.into(),
+            platform: None,
+            account: None,
+            project: None,
+        });
+        assert_ne!(outcome(&other).unwrap().1["key"], json!(key));
+    }
+
+    #[test]
+    fn hosted_platform_refuses_flags_the_workspace_owns() {
+        for (label, action) in [
+            (
+                "--project",
+                PlatformAction::Tools {
+                    json: true,
+                    project: Some("cadence".into()),
+                },
+            ),
+            (
+                "--platform",
+                PlatformAction::Call {
+                    tool: "generate_image".into(),
+                    input: "{}".into(),
+                    platform: Some("agenticos".into()),
+                    account: None,
+                    project: None,
+                },
+            ),
+            (
+                "--account",
+                PlatformAction::Call {
+                    tool: "generate_image".into(),
+                    input: "{}".into(),
+                    platform: None,
+                    account: Some("work".into()),
+                    project: None,
+                },
+            ),
+        ] {
+            let refused = outcome(&platform(action)).unwrap_err();
+            assert!(refused.contains(label), "{label}: {refused}");
         }
     }
 

@@ -468,7 +468,7 @@ fn resolve_platform_tool(
 
 /// Bounded JSON object for one platform call: inline, `@file`, a path, or
 /// `-` for stdin. The daemon enforces its own bound as well.
-fn parse_platform_input(raw: &str) -> Result<Value> {
+pub(super) fn parse_platform_input(raw: &str) -> Result<Value> {
     use std::io::Read;
     const MAX_INPUT_BYTES: usize = 64 * 1024;
     let bytes = if raw == "-" {
