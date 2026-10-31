@@ -684,7 +684,7 @@ pub fn refuse_global_unless_allowed(what: &str) -> Result<()> {
     if allowed {
         if let Some(name) = profile.as_deref() {
             let sb = Sandbox::open(name)?;
-            refuse_production(&sb)?;
+            refuse_production_readonly(&sb)?;
             let marker = require_marker(&sb)?;
             allowed = marker["allow_global"].as_bool() == Some(true);
         }
@@ -961,19 +961,24 @@ fn refuse_production(sb: &Sandbox) -> Result<()> {
     refuse_overlap(sb, true, false)
 }
 
-/// The same overlap guard for a verb that only *reports*: `status` and
-/// `env` in a shell exported by `cadence dev env` name the sandbox's own
-/// dirs on both sides, and refusing that made the sandbox unusable in its
-/// own environment. Exact equality is skipped there because nothing is
-/// deleted or stopped. Every deforming verb — `reset`, `down`, `reload`,
-/// the global gate — keeps the strict check: a marker planted at the
-/// production tracker makes that dir the sandbox's own, and only the
+/// The same overlap guard for a verb that does not delete: `status`,
+/// `env` and the global gate in a shell exported by `cadence dev env`
+/// name the sandbox's own dirs on both sides, and refusing that made the
+/// sandbox unusable in its own environment (the CAD-832 acceptance
+/// covers the gate).
+///
+/// Only an *exported* dir that is exactly one of the sandbox's own is
+/// exempt; production's host-derived defaults keep their equality check,
+/// so a sandbox rooted at the production tracker, home or config is still
+/// refused. Every deleting verb — `reset`, `down`, `reload` — keeps the
+/// strict inventory with no exemption at all: there, a marker planted at
+/// a production path makes that path the sandbox's own, and only the
 /// strict form refuses to delete it.
 fn refuse_production_readonly(sb: &Sandbox) -> Result<()> {
     refuse_overlap(sb, true, true)
 }
 
-fn refuse_overlap(sb: &Sandbox, exported: bool, own_dirs_readonly: bool) -> Result<()> {
+fn refuse_overlap(sb: &Sandbox, exported: bool, own_exports_are_ours: bool) -> Result<()> {
     let ours = [
         sb.root.clone(),
         sb.state_dir(),
@@ -983,11 +988,13 @@ fn refuse_overlap(sb: &Sandbox, exported: bool, own_dirs_readonly: bool) -> Resu
     .map(|p| resolved(&p));
     for (label, dir) in production_dirs(sb, exported)? {
         let live = resolved(&dir);
-        // Only a read-only verb may treat an exported dir that is exactly
-        // one of the sandbox's own paths as its own: deleting verbs must
-        // still refuse a planted marker in the production tracker, which
-        // is indistinguishable from an export at that path.
-        if own_dirs_readonly && ours.iter().any(|own| own == &live) {
+        // An exported dir that is exactly one of the sandbox's own paths
+        // is the sandbox, not a live cadence; a host-derived default at
+        // the same path is still production and still refuses.
+        if own_exports_are_ours
+            && label.starts_with("the exported ")
+            && ours.iter().any(|own| own == &live)
+        {
             continue;
         }
         if ours

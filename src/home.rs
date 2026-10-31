@@ -126,15 +126,11 @@ fn layout_without_env() -> Result<Layout> {
             marker_present,
             root,
         }),
-        Installation::Consolidated | Installation::FirstRun => {
-            // CAD-1227: a test process must not take the invoking user's
-            // real `~/.cadence` as its home either.
-            Ok(Layout {
-                source: Source::Fresh,
-                marker_present,
-                root: guard_home(root)?,
-            })
-        }
+        Installation::Consolidated | Installation::FirstRun => Ok(Layout {
+            source: Source::Fresh,
+            marker_present,
+            root,
+        }),
         Installation::Ambiguous => Err(Error::rejected(format!(
             "two Cadence installations exist: {} holds state/, tracker/ or config/ \
              and the legacy paths ({} or {} or {}) exist too — refusing to pick \
@@ -483,6 +479,12 @@ pub fn create_home_dir(dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         return Ok(());
     }
+    // CAD-1227: a test process must never create in the invoking user's
+    // real `~/.cadence`. The guard sits on creation, not on resolution:
+    // resolving the branch is a read-only question (a daemon fixture
+    // asks it for its vault), while creating the home is the effect the
+    // guard exists to refuse.
+    guard_home(layout.root.clone())?;
     create_private_tree(&layout.root, dir)?;
     if layout.source == Source::Fresh {
         tighten_private(&layout.root)?;
