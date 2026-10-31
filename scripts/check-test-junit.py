@@ -22,6 +22,9 @@ declaration whose binary the inventory lists must still be ignored, so
 adding or removing an ignore is a diff in that file instead of a silent
 way to stop running a test. A binary absent from the inventory — a
 narrowed pull-request selection — does not make its declarations stale.
+``--no-ignored-manifest`` says this workspace has no such file, so strict
+mode still refuses an accidental omission. Ignored cases stay unexecutable
+either way; the manifest only pins *which* cases are ignored.
 
 Target mode (``--targets-file``) stays as the independent, cheaper guard
 on the target selection itself: every integration target named in FILE,
@@ -318,6 +321,11 @@ def main():
     parser.add_argument("--targets-file")
     parser.add_argument("--inventory", action="append", default=[])
     parser.add_argument("--ignored-manifest")
+    parser.add_argument(
+        "--no-ignored-manifest",
+        action="store_true",
+        help="this workspace declares no ignored-test manifest of its own",
+    )
     parser.add_argument("--complete-partition", action="store_true")
     parser.add_argument("junit", nargs="+")
     args = parser.parse_args()
@@ -327,14 +335,21 @@ def main():
         refuse("the junit reports carry no testcase")
 
     if args.inventory:
-        if not args.ignored_manifest:
-            refuse("--inventory requires --ignored-manifest")
+        if args.ignored_manifest and args.no_ignored_manifest:
+            refuse(
+                "--ignored-manifest and --no-ignored-manifest are mutually "
+                "exclusive"
+            )
+        if not args.ignored_manifest and not args.no_ignored_manifest:
+            refuse(
+                "--inventory requires --ignored-manifest, or an explicit "
+                "--no-ignored-manifest for a workspace that declares none"
+            )
         merged, ignored, selected = check_strict(
             args.inventory, executed, skipped, args.complete_partition
         )
-        check_manifest(
-            load_manifest(args.ignored_manifest), merged, ignored
-        )
+        if args.ignored_manifest:
+            check_manifest(load_manifest(args.ignored_manifest), merged, ignored)
         print(
             f"strict coverage: {len(selected)} selected tests executed once, "
             f"{len(ignored)} ignored and declared, "

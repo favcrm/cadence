@@ -140,14 +140,18 @@ class Scenario:
     def write_inventory(self, shard, states):
         self.inventories[shard - 1].write_text(json.dumps(inventory_doc(states)))
 
-    def run(self, complete=True, shards=None):
+    def run(self, complete=True, shards=None, manifest=True, extra=()):
         shards = shards or list(range(1, SHARDS + 1))
         argv = [sys.executable, str(CHECKER), "--package", PACKAGE]
         if complete:
             argv.append("--complete-partition")
         for shard in shards:
             argv += ["--inventory", str(self.inventories[shard - 1])]
-        argv += ["--ignored-manifest", str(self.manifest)]
+        if manifest:
+            argv += ["--ignored-manifest", str(self.manifest)]
+        else:
+            argv.append("--no-ignored-manifest")
+        argv += list(extra)
         argv += [str(self.reports[shard - 1]) for shard in shards]
         return subprocess.run(argv, capture_output=True, text=True)
 
@@ -313,6 +317,25 @@ class CoverageGuard(unittest.TestCase):
         argv += [str(report) for report in self.scenario.reports]
         result = subprocess.run(argv, capture_output=True, text=True)
         self.assertRefused(result, "requires --ignored-manifest")
+
+    def test_workspace_without_a_manifest_declares_that_explicitly(self):
+        """A foreign workspace still gets strict coverage, not a free pass."""
+        result = self.scenario.run(manifest=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 ignored and declared", result.stdout)
+
+    def test_both_manifest_flags_are_refused(self):
+        result = self.scenario.run(
+            manifest=False, extra=["--ignored-manifest", str(self.scenario.manifest)]
+        )
+        self.assertRefused(result, "mutually exclusive")
+
+    def test_foreign_workspace_still_refuses_a_lost_test(self):
+        for shard in (1, 2):
+            self.scenario.mutate(shard, lambda root: drop(root, "cad0001_acceptance::runs"))
+        self.assertRefused(
+            self.scenario.run(manifest=False), "did not execute"
+        )
 
     def test_unexplained_exclusion_is_refused(self):
         document = json.loads(self.scenario.inventories[0].read_text())

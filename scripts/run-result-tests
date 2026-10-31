@@ -392,6 +392,17 @@ targets_report=$workspace_dir/target/nextest/cadence/expected-targets.txt
 # report is a hole rather than agreement.
 inventory_report=$workspace_dir/target/nextest/cadence/inventory.json
 ignored_manifest=$root/.config/nextest-ignored.txt
+# The declaration file names this repository's own `#[ignore]`d cases by
+# binary id. A foreign workspace — the shim and runner acceptance fixtures
+# pass --manifest-path — can use the same ids for unrelated binaries, so it
+# gets the explicit "no manifest here" form instead of ours. Strict coverage
+# still applies to it; only the declaration check is scoped to its owner.
+guard_args=(--inventory "$inventory_report")
+if [ "$(realpath -m -- "$manifest_for_coverage")" = "$(realpath -m -- "$root/Cargo.toml")" ]; then
+  guard_args+=(--ignored-manifest "$ignored_manifest")
+else
+  guard_args+=(--no-ignored-manifest)
+fi
 mkdir -p "$(dirname "$junit_report")"
 rm -f "$junit_report" "$inventory_report"
 printf '%s\n' "${integration_targets[@]}" > "$targets_report"
@@ -441,14 +452,14 @@ if [ -f "$junit_report" ] && [ -n "$partition" ]; then
   # A partition checks its own share strictly here; the aggregate re-checks
   # the union, so a gap or overlap between shards cannot pass either.
   if ! python3 "$root/scripts/check-test-junit.py" --package "$package_name" \
-      --inventory "$inventory_report" --ignored-manifest "$ignored_manifest" \
+      "${guard_args[@]}" \
       "$junit_report"; then
     status=1
   fi
 elif [ -f "$junit_report" ]; then
   if ! python3 "$root/scripts/check-test-junit.py" --package "$package_name" \
       --targets-file "$targets_report" \
-      --inventory "$inventory_report" --ignored-manifest "$ignored_manifest" \
+      "${guard_args[@]}" \
       "$junit_report"; then
     status=1
   fi
