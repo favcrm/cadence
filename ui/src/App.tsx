@@ -1030,7 +1030,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       {/* Workspaces fill the dynamic viewport; their panes own scrolling.
           Other screens retain the natural document flow. */}
       <div data-canvas-main className={`min-w-0 flex flex-col ${fullHeight ? "h-full min-h-0" : ""}`}>
-        <header className="app-header sticky top-0 z-10 flex items-center gap-2 sm:gap-3 px-4 lg:px-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
+        <header className="app-header sticky top-0 z-10 flex items-center gap-2 sm:gap-3 px-4 lg:pr-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
           <button
             onClick={() => setMenuOpen((o) => !o)}
             className="header-menu header-icon -ml-1 shrink-0 gap-1 text-ink-200"
