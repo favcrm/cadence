@@ -18,7 +18,13 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
             force,
             by,
             take_over,
+            profile,
         } => {
+            if profile.is_some() {
+                return Err(Error::rejected(
+                    "--profile is a hosted-org session start; a local org claims through the daemon instead",
+                ));
+            }
             let pm_dir = open_pm()?;
             let args = start::StartArgs {
                 by: by.clone(),
