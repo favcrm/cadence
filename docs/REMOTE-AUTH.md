@@ -91,14 +91,19 @@ tracker, state directory or hosted config — keeps them in its consolidated
 home instead: `<CADENCE_HOME>/config/remote-auth/credential.json`, which is
 `~/.cadence/config/remote-auth/credential.json` by default (CAD-1922), even
 when `XDG_CONFIG_HOME` is exported (writing them there would make the next run
-see two layouts). An installation that already has credentials never has them
-relocated, so a `CADENCE_HOME` added later does not move an existing one.
-Directory permissions are 0700 and file permissions 0600; symlinks — the home
-root, the config root, the credential directory and the file — are refused,
-not followed. Concurrent saves are serialized. Use an absolute `--auth-dir`
-for isolated development or a separate connection. A different
-issuer/organization cannot replace an existing credential; org switching is
-separate CAD-657 work.
+see two layouts). A run given an explicit `CADENCE_HOME` with
+`XDG_CONFIG_HOME` exported uses `$XDG_CONFIG_HOME/cadence` instead; one given
+`CADENCE_HOME` without it reads a legacy root that already holds something and
+otherwise uses `<CADENCE_HOME>/config`. An installation that already has
+credentials never has them relocated by simply adding a `CADENCE_HOME`: the
+resolver reads the default roots and the named home, not a previous
+consolidated home. Directory permissions are 0700 and file permissions 0600;
+inside the consolidated home a symlinked home root, config root, credential
+directory or credential file is refused rather than followed — legacy config
+roots outside that home are not inspected that way. Concurrent saves are
+serialized. Use an absolute `--auth-dir` for isolated development or a
+separate connection. A different issuer/organization cannot replace an
+existing credential; org switching is separate CAD-657 work.
 
 `cadence auth logout` removes the local credential only. Revoke the server
 credential using AgenticOS connected devices. Logout does not clear an environment

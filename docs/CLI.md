@@ -321,10 +321,12 @@ reported at most; none of them switches a live install.
 The vault follows the tracker the consolidated branch owns: `<home>/tracker`
 keeps `<home>/vault`, and every other tracker — the legacy `~/pm`, or any
 `CADENCE_PM_DIR` that is not that one, including one that merely sits under the
-home — keeps `<tracker>/wiki`. The branch's own tracker, not the string prefix
-of a path, decides this, so a per-directory override (`cadence switch local`
-exports the pair, a sandbox exports its own) only overrides its own directory
-and never moves the vault or the hosted config.
+home — keeps `<tracker>/wiki`. An explicit `CADENCE_HOME` is the exception it
+always was: it keeps `<home>/vault` for every tracker. The branch's own
+tracker, not the string prefix of a path, decides the rest, so a
+per-directory override (`cadence switch local` exports the pair, a sandbox
+exports its own) only overrides its own directory and never moves the vault or
+the hosted config.
 
 A CI job, container or test suite with its own `$HOME` is a first run like any
 other and gets `~/.cadence` **inside that isolated home** — never the host's
@@ -339,9 +341,11 @@ were.
 - `CADENCE_HOME` — the consolidated home root. Use it for a system install
   (`CADENCE_HOME=/var/lib/cadence`), for a separate profile, or to return to
   `~/.cadence` after an installation exists elsewhere. Hosted credentials
-  follow the evidence, not the flag: an existing `$XDG_CONFIG_HOME/cadence`
-  keeps them, and otherwise they live in `<CADENCE_HOME>/config` — including
-  when `CADENCE_PM_DIR`/`CADENCE_STATE_DIR` are also set.
+  follow the evidence, not the flag: an exported `XDG_CONFIG_HOME` names
+  their root (`$XDG_CONFIG_HOME/cadence`, whether or not it exists yet), a
+  legacy root that already holds something keeps them, and otherwise they
+  live in `<CADENCE_HOME>/config` — including when
+  `CADENCE_PM_DIR`/`CADENCE_STATE_DIR` are also set.
 - `CADENCE_PM_DIR` — tracker, in either layout. Overrides only the tracker.
 - `CADENCE_STATE_DIR` — runtime state, in either layout. Overrides only the
   state dir.
@@ -354,12 +358,14 @@ and nothing else, so one command cannot flip the vault or the hosted config
 mid-run.
 
 `XDG_CONFIG_HOME` names the config root of an installation that already
-exists: a legacy install, or a consolidated one that already holds a config
-there. A genuine first run keeps its config under its own home even when the
-variable is exported — writing the first credential into the legacy root would
-make the next run see both layouts and refuse the installation as ambiguous.
-Inside the consolidated home a symlinked `~/.cadence`, `~/.cadence/config` or
-credential directory is refused rather than followed.
+exists — a legacy install, or a consolidated one that already holds a config
+there — and of any run given an explicit `CADENCE_HOME`, where it names the
+credential root whether or not it exists yet. A genuine first run keeps its
+config under its own home even when the variable is exported: writing the
+first credential into the legacy root would make the next run see both layouts
+and refuse the installation as ambiguous. Inside the consolidated home a
+symlinked `~/.cadence`, `~/.cadence/config` or credential directory is refused
+rather than followed.
 
 The state directory holds the daemon socket, so `<state>/cadence.sock` must
 fit the 107-byte Unix socket limit; `setup` and `dev up` refuse a longer path
