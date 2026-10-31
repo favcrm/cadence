@@ -1924,12 +1924,6 @@ impl Fx {
         if stream.write_all(request.as_bytes()).is_err() {
             return (0, String::new());
         }
-        // The window is a cap, not the completion boundary. A response that
-        // declares its length is finished once that many body bytes have
-        // arrived, so the sweep stops there instead of waiting the cap out:
-        // several swept routes never close the connection, and each one used
-        // to cost the whole window. A streamed response keeps the window,
-        // because only the connection closing proves it is finished.
         let window = if path.contains("stream") {
             Duration::from_millis(1500)
         } else {
@@ -1938,19 +1932,10 @@ impl Fx {
         let until = Instant::now() + window;
         let mut raw = Vec::new();
         let mut buf = [0u8; 16384];
-        let mut complete_at: Option<usize> = None;
         while Instant::now() < until {
             match stream.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => {
-                    raw.extend_from_slice(&buf[..n]);
-                    if complete_at.is_none() {
-                        complete_at = declared_len(&raw);
-                    }
-                    if complete_at.is_some_and(|end| raw.len() >= end) {
-                        break;
-                    }
-                }
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -1971,25 +1956,6 @@ impl Fx {
             .unwrap_or_default();
         (status, body)
     }
-}
-
-/// Byte offset at which a `Content-Length` response is provably complete.
-///
-/// `None` until the header block has arrived and declared a length, so a
-/// streamed or chunked response keeps the caller's window: only the
-/// connection closing proves those are finished. Stopping at the declared
-/// offset can never truncate a body, which is what makes it safe to end the
-/// read early for a route that would otherwise hold the connection open.
-fn declared_len(raw: &[u8]) -> Option<usize> {
-    let split = raw.windows(4).position(|w| w == &b"\r\n\r\n"[..])?;
-    let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
-    let len = head
-        .lines()
-        .find_map(|line| line.strip_prefix("content-length:"))?
-        .trim()
-        .parse::<usize>()
-        .ok()?;
-    Some(split + 4 + len)
 }
 
 /// Where each needle sits in a body: JSON paths when it parses, else the
