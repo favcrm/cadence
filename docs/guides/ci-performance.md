@@ -72,22 +72,25 @@ hit and took 2m10s. This is the baseline, not a claimed improvement.
 The introducing PR uses a cold epoch; assess the benefit only after main
 has saved both profiles and a later native consumer restores that entry.
 
-## 3. sccache scope — build/ui only, not shards
+## 3. sccache scope — build/ui and test-shards
 
 `cache-workspace-crates: false` on rust-cache, because workspace-source
 hashes change every merge (restoring them always misses). Workspace objects
 go through sccache instead — **but only where the job enables it**:
 
 - `cache-warm` legs run `READ_WRITE` under `sccache-writer` on main pushes.
-- `build` and `ui` gate jobs run `READ_ONLY` via `ci-sccache enable`.
-- **`test-shards` do not enable sccache** — they restore rust-cache, enable
-  the linker, and invoke the test runner directly. Their ~2m19s
-  `cadence-agent` compile is the raw workspace-crate codegen+link floor.
+- `build`, `ui` and `test-shards` run `READ_ONLY` via `ci-sccache enable`.
 
-So the shard diagnostic is: if `cadence-agent` compiles once and takes
-~2min on a warm dep cache, that is expected — sccache never entered the
-shard path. Adding sccache to shards would help only for merges that don't
-touch the crate (rare); not worth the credential surface.
+`test-shards` joined that list in CAD-1967. Six shards compile the same
+workspace crates, so the codegen was paid six times per run; with the cache
+enabled the library crates come from R2 and only the changed crate plus the
+final link are per-shard. Test binaries link, and sccache does not cache
+linking crates, so the link stays on every shard.
+
+The gate never writes: only `cache-warm` holds the read-write key, and the
+shards' key cannot poison the bucket. Read the `sccache statistics` step on
+a shard for the real Rust hit rate rather than assuming one; the warm leg
+must have written the same command and flags for a hit to be possible.
 
 Prefix is `v1/rustc-<toolchain>/` — a rustc bump re-zeros sccache too.
 
