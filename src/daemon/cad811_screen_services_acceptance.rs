@@ -186,23 +186,40 @@ impl Fixture {
         path: &str,
         body: &Value,
     ) -> ureq::http::Response<ureq::Body> {
-        let mut request = self
-            .agent
-            .post(format!("{}{path}", self.base))
-            .header("Host", &self.host)
-            .header("Origin", format!("http://{}", self.host))
-            .header("X-Cadence-Board", "1")
-            .header(crate::test_seam::AS_HEADER, who)
-            .header(crate::test_seam::TOKEN_HEADER, &self.seam)
-            .header("Content-Type", "application/json");
-        if let Some(session) = session {
-            request = request
-                .header("Cookie", &session.cookie)
-                .header("X-Cadence-Session", &session.key);
+        // CAD-1970: an `EINTR` here is a signal arriving during the syscall,
+        // not a transport failure — this fixture spawns competing listeners,
+        // so `SIGCHLD` during a send is ordinary. Rust's own `read`/`write`
+        // retry it; `ureq` surfaces it, and `.expect` turned three gate runs
+        // red on it (two different tests, same line). The retry rebuilds the
+        // whole request, so nothing partial is resent; only a genuinely
+        // interrupted syscall is repeated, and only twice.
+        let url = format!("{}{path}", self.base);
+        let mut attempts = 0u32;
+        loop {
+            let mut request = self
+                .agent
+                .post(&url)
+                .header("Host", &self.host)
+                .header("Origin", format!("http://{}", self.host))
+                .header("X-Cadence-Board", "1")
+                .header(crate::test_seam::AS_HEADER, who)
+                .header(crate::test_seam::TOKEN_HEADER, &self.seam)
+                .header("Content-Type", "application/json");
+            if let Some(session) = session {
+                request = request
+                    .header("Cookie", &session.cookie)
+                    .header("X-Cadence-Session", &session.key);
+            }
+            match request.send(body.to_string()) {
+                Ok(response) => return response,
+                Err(ureq::Error::Io(error))
+                    if error.kind() == std::io::ErrorKind::Interrupted && attempts < 2 =>
+                {
+                    attempts += 1;
+                }
+                Err(error) => panic!("owned HTTP transport failed: {error:?}"),
+            }
         }
-        request
-            .send(body.to_string())
-            .expect("owned HTTP transport failed")
     }
 
     fn session(&self) -> Session {
