@@ -120,6 +120,11 @@ struct Attempt {
     origin_claim_id: Option<String>,
     #[serde(default)]
     origin_generation: Option<u64>,
+    /// CAD-1964: the hosted profile this session claimed under. There is no
+    /// local actor and therefore no kickoff; the claim itself is the only
+    /// authority a report may name.
+    #[serde(default)]
+    session_profile: Option<String>,
 }
 
 /// The claim a kickoff message was allowed to report. Keyed by message id
@@ -202,6 +207,13 @@ fn operation_id() -> String {
 
 fn message_id() -> String {
     Uuid::new_v4().simple().to_string()
+}
+
+/// The client id a profile-scoped session claims under (CAD-1964). Derived
+/// from the profile rather than random, so retrying the same start replays
+/// the same claim instead of opening a second one.
+fn session_client_agent_id(profile: &str) -> String {
+    format!("session-{profile}")
 }
 
 fn valid_hct(token: &str) -> bool {
@@ -561,6 +573,9 @@ impl Ledger {
 /// Origins, binding files, old checkouts, and pending reassign operations stay.
 fn retire_current_claim(attempt: &mut Attempt) {
     attempt.claim_id = None;
+    // The session that marked this record no longer holds a claim here, so
+    // its report authority retires with the claim it was given.
+    attempt.session_profile = None;
     attempt.target = None;
     attempt.state = "discovered".to_string();
     attempt.kickoff_message = None;
@@ -607,6 +622,12 @@ fn stamp(attempt: &mut Attempt, assignment: &Assignment) {
         if assignment.generation > generation {
             retire_current_claim(attempt);
         }
+    }
+    if attempt.claim_id != assignment.claim_id {
+        // A record may only be reported through the claim this session took.
+        // Once the observed claim moves, a later holder must never become
+        // reportable through the retired marker.
+        attempt.session_profile = None;
     }
     attempt.assignment_id = Some(assignment.assignment_id.clone());
     attempt.generation = Some(assignment.generation);
@@ -805,6 +826,7 @@ impl<H: CoordHttp> Coordinator<H> {
                 kickoff_reserved: None,
                 origin_claim_id: None,
                 origin_generation: None,
+                session_profile: None,
             });
             let mut body = json!({
                 "version": VERSION,
@@ -935,8 +957,16 @@ impl<H: CoordHttp> Coordinator<H> {
     }
 
     fn claim(&mut self, assignment: &Assignment) -> Result<Assignment> {
-        self.remember_discovered(assignment)?;
         let client_agent_id = self.client_agent_id()?;
+        self.claim_as(assignment, &client_agent_id)
+    }
+
+    /// Claim as an explicit client. A bound local alias uses its own stored
+    /// id; a profile-scoped session (CAD-1964) uses one derived from the
+    /// profile, so the board can tell the two apart and refuse a report from
+    /// the wrong holder.
+    fn claim_as(&mut self, assignment: &Assignment, client_agent_id: &str) -> Result<Assignment> {
+        self.remember_discovered(assignment)?;
         let body = json!({
             "version": VERSION,
             "organization_id": self.org_id,
@@ -952,7 +982,7 @@ impl<H: CoordHttp> Coordinator<H> {
         if claimed.assignment_id != assignment.assignment_id
             || claimed.generation != assignment.generation
             || claimed.issue_id != assignment.issue_id
-            || claimed.client_agent_id.as_deref() != Some(client_agent_id.as_str())
+            || claimed.client_agent_id.as_deref() != Some(client_agent_id)
             || claimed.state != "running"
         {
             return Err(Error::rejected(
@@ -993,6 +1023,7 @@ impl<H: CoordHttp> Coordinator<H> {
                     kickoff_reserved: None,
                     origin_claim_id: None,
                     origin_generation: None,
+                    session_profile: None,
                 };
                 stamp(&mut attempt, &claimed);
                 ledger
@@ -1040,6 +1071,7 @@ impl<H: CoordHttp> Coordinator<H> {
                 kickoff_reserved: None,
                 origin_claim_id: None,
                 origin_generation: None,
+                session_profile: None,
             };
             stamp(&mut attempt, assignment);
             ledger
@@ -1225,27 +1257,40 @@ impl<H: CoordHttp> Coordinator<H> {
     /// The mutable ledger claim is not authority.
     fn origin_for_assignment(&self, assignment: &str) -> Result<(String, u64)> {
         self.with_ledger(|ledger| {
-            let message = {
-                let attempt = ledger
-                    .attempts
-                    .values()
-                    .find(|attempt| {
-                        attempt.assignment_id.as_deref() == Some(assignment) && !attempt.fenced
-                    })
-                    .ok_or_else(|| {
-                        Error::rejected(
-                            "no local claim for that assignment; connect again to recover it rather than inventing a report",
-                        )
-                    })?;
-                attempt
-                    .kickoff_message
-                    .clone()
-                    .or_else(|| attempt.kickoff_reserved.clone())
-                    .ok_or_else(|| {
-                        Error::rejected(
-                            "that assignment has no kickoff identity; a later claim is not authority to report it",
-                        )
-                    })?
+            let attempt = ledger
+                .attempts
+                .values()
+                .find(|attempt| {
+                    attempt.assignment_id.as_deref() == Some(assignment) && !attempt.fenced
+                })
+                .ok_or_else(|| {
+                    Error::rejected(
+                        "no local claim for that assignment; connect again to recover it rather than inventing a report",
+                    )
+                })?;
+            let message = match attempt
+                .kickoff_message
+                .clone()
+                .or_else(|| attempt.kickoff_reserved.clone())
+            {
+                Some(message) => message,
+                // CAD-1964: a profile-scoped session has no local actor to
+                // message, so the claim it made in this ledger is its only
+                // authority. The board still re-checks the claim, its
+                // generation and the client id on every report.
+                None if attempt.session_profile.is_some() => {
+                    return match (attempt.claim_id.clone(), attempt.generation) {
+                        (Some(claim), Some(generation)) => Ok((claim, generation)),
+                        _ => Err(Error::rejected(
+                            "that assignment has no claim this session made; a report needs one",
+                        )),
+                    };
+                }
+                None => {
+                    return Err(Error::rejected(
+                        "that assignment has no kickoff identity; a later claim is not authority to report it",
+                    ));
+                }
             };
             let origin = ledger.origins.get(&message).ok_or_else(|| {
                 Error::rejected(
@@ -1757,6 +1802,109 @@ impl<H: CoordHttp> Coordinator<H> {
         let queued = self.queue(issue, "start", Some(&subject))?;
         let ready = self.prepare_owned(queued, &subject)?;
         self.activate(&ready, &root, name, &alias, deliver)
+    }
+
+    /// Start one named issue for the calling session under a reusable
+    /// hosted profile (CAD-1964).
+    ///
+    /// The caller is the actor, so no local alias is needed: nothing is
+    /// messaged to a daemon and no other waiting assignment is touched. The
+    /// claim is bound to a client id derived from the profile, which the
+    /// board re-checks on every report. A profile is configuration, not a
+    /// credential — the authenticated login still carries the authority.
+    pub fn start_session(
+        &mut self,
+        issue: &str,
+        repo: &Path,
+        name: Option<&str>,
+        profile: &str,
+    ) -> Result<Value> {
+        self.ensure_active()?;
+        if !prefixed_id(profile, "ap_") {
+            return Err(Error::rejected(
+                "--profile must be a hosted profile id (ap_…)",
+            ));
+        }
+        let root = worktree::main_root(repo)?;
+        slug(name)?;
+        let subject = self.subject_id.clone().ok_or_else(|| {
+            Error::invalid(
+                "config_required",
+                "this workspace login has no directory subject; nothing was started",
+            )
+        })?;
+        let client = session_client_agent_id(profile);
+        let ready = match self.live_for_issue(issue)? {
+            Some(row) => self.prepare_owned(row, &subject)?,
+            None => {
+                let queued = self.queue(issue, "start", Some(&subject))?;
+                self.prepare_owned(queued, &subject)?
+            }
+        };
+        let claimed = if matches!(ready.state.as_str(), "running" | "blocked") {
+            if ready.client_agent_id.as_deref() != Some(client.as_str()) {
+                return Err(Error::invalid(
+                    "fenced",
+                    "another worker of this member already holds the claim; this session did not start a second one",
+                ));
+            }
+            ready.clone()
+        } else {
+            self.claim_as(&ready, &client)?
+        };
+        if self.claim_already_ended(&claimed)? {
+            return Err(Error::invalid(
+                "terminal",
+                "that assignment already ended; it was not reopened",
+            ));
+        }
+        let claim_id = claimed
+            .claim_id
+            .clone()
+            .ok_or_else(|| Error::rejected("the claim has no id; no worktree was created"))?;
+        // The claim is reportable from the moment it exists: a lane that
+        // cannot be opened still leaves this session holding the work.
+        self.with_ledger(|ledger| {
+            for attempt in ledger.attempts.values_mut() {
+                if attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
+                    && attempt.claim_id.as_deref() == Some(claim_id.as_str())
+                {
+                    attempt.session_profile = Some(profile.to_string());
+                }
+            }
+            Ok(())
+        })?;
+        let lane = self.lane_for(&claimed, name)?;
+        let dir = ensure_lane(&root, &lane)?;
+        let path = dir.display().to_string();
+        self.with_ledger(|ledger| {
+            for attempt in ledger.attempts.values_mut() {
+                if attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
+                    && attempt.claim_id.as_deref() == Some(claim_id.as_str())
+                {
+                    attempt.worktree = Some(path.clone());
+                }
+            }
+            Ok(())
+        })?;
+        Ok(json!({
+            "version": VERSION,
+            "assignment_id": claimed.assignment_id,
+            "issue_id": claimed.issue_id,
+            "organization_id": claimed.organization_id,
+            "state": claimed.state,
+            "claim_id": claim_id,
+            "generation": claimed.generation,
+            "client_agent_id": client,
+            "profile": profile,
+            "lane": lane,
+            "worktree": path,
+            "actor": "external_session",
+            "guidance": {
+                "code": "report_from_this_session",
+                "text": "This session holds the claim. Report with `cadence local-agent report <assignment> --state running|blocked|failed|result`; no local agent was connected.",
+            },
+        }))
     }
 
     pub fn connect<F>(

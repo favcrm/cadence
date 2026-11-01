@@ -258,6 +258,7 @@ pub(super) fn start(
     id: &str,
     repo: Option<&Path>,
     name: Option<&str>,
+    profile: Option<&str>,
     wake_timeout: u64,
     local_state: Option<PathBuf>,
 ) -> Result<i32> {
@@ -266,6 +267,12 @@ pub(super) fn start(
             "hosted issue start requires --repo <local git checkout>; nothing was sent",
         ));
     };
+    if let Some(profile) = profile {
+        // CAD-1964: the caller is the actor, so this claims under the
+        // profile's session id and opens the lane without a local alias,
+        // a daemon handoff or any other waiting assignment.
+        return finish(&coordinator(target)?.start_session(id, repo, name, profile)?);
+    }
     let mut deliver =
         |kickoff: &Kickoff| deliver_kickoff(target, local_state.clone(), kickoff, wake_timeout);
     let value = coordinator(target)?.start_here(id, repo, name, &mut deliver)?;

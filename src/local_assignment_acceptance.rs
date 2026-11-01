@@ -22,6 +22,7 @@ const ME: &str = "user_me";
 const THEM: &str = "user_them";
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 const KICKOFF: &str = "hosted local assignment";
+const PROFILE: &str = "ap_00000000-0000-4000-8000-00000000cafe";
 const ENDPOINT: &str = "https://board.test";
 
 #[derive(Clone)]
@@ -1688,6 +1689,248 @@ fn failed_resume_blocks_the_resumed_claim_again() {
     let (state_now, _, claim) = script.row(&assignment);
     assert_eq!(state_now, "blocked");
     assert_eq!(claim.as_deref(), Some(original_claim.as_str()));
+}
+
+#[test]
+fn profile_session_start_claims_only_its_own_issue() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let mine = board.seed("start", "waiting", None, ME);
+    let untouched = board.seed("start", "waiting", None, ME);
+    board.rows.last_mut().expect("row").issue_id = "SYN-OTHER".to_string();
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+
+    let started = coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect("session start");
+
+    assert_eq!(started["state"], "running");
+    assert_eq!(
+        started["client_agent_id"],
+        json!(format!("session-{PROFILE}"))
+    );
+    assert_eq!(started["profile"], json!(PROFILE));
+    assert!(Path::new(started["worktree"].as_str().expect("worktree")).is_dir());
+    assert_eq!(script.row(&mine).0, "running");
+    // A waiting assignment for another issue is neither claimed nor moved.
+    assert_eq!(script.row(&untouched).0, "waiting");
+    assert_eq!(script.row(&untouched).2, None);
+    // The caller is the actor: nothing was messaged to a daemon.
+    assert_eq!(ledger_file(auth.path())["origins"], json!({}));
+}
+
+#[test]
+fn profile_session_start_refuses_a_claim_another_worker_holds() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let held = board.seed("start", "running", Some(ME), ME);
+    let row = board.rows.last_mut().expect("row");
+    row.claim_id = Some("hlc_00000000000000000000000000000009".to_string());
+    row.client_agent_id = Some("someone-else".to_string());
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+
+    let refused = coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect_err("a foreign claim is not replaced");
+
+    assert_eq!(refused.code(), Some("fenced"));
+    assert_eq!(script.row(&held).0, "running");
+    assert_eq!(
+        script.row(&held).2.as_deref(),
+        Some("hlc_00000000000000000000000000000009")
+    );
+    assert!(
+        script.calls().iter().all(|call| !call.is_suffix("/claim")),
+        "no second claim was sent"
+    );
+}
+
+#[test]
+fn profile_session_can_report_its_own_claim_without_a_kickoff() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let mine = board.seed("start", "waiting", None, ME);
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+    coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect("session start");
+
+    let reported = coord
+        .report(&mine, "blocked", Some("waiting for the owner"), None)
+        .expect("a session claim reports itself");
+
+    assert_eq!(reported["state"], "blocked");
+    assert_eq!(script.row(&mine).0, "blocked");
+    // A retry replays the same claim rather than opening another one.
+    let again = coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect("retry");
+    assert_eq!(again["claim_id"], reported["claim_id"]);
+}
+
+#[test]
+fn a_retired_session_claim_cannot_report_the_next_holders_claim() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let mine = board.seed("start", "waiting", None, ME);
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+    coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect("session start");
+
+    // The board moves the assignment to a different holder.
+    {
+        let mut board = script.0.lock().expect("board");
+        let row = board
+            .rows
+            .iter_mut()
+            .find(|row| row.assignment_id == mine)
+            .expect("row");
+        row.generation += 1;
+        row.claim_id = Some("hlc_00000000000000000000000000000042".to_string());
+        row.client_agent_id = Some("another-worker".to_string());
+        row.state = "running".to_string();
+    }
+    // Observing that row retires the session marker, and the start itself
+    // refuses the claim it no longer holds.
+    let foreign = coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect_err("a foreign claim is not adopted");
+    assert_eq!(foreign.code(), Some("fenced"));
+
+    let refused = coord
+        .report(&mine, "failed", Some("not mine to report"), None)
+        .expect_err("a retired session claim reports nothing");
+
+    assert!(refused.to_string().contains("kickoff"), "{refused}");
+    assert!(
+        script.calls().iter().all(|call| !call.is_suffix("/report")),
+        "no report was sent for a claim this session no longer holds"
+    );
+}
+
+#[test]
+fn a_claim_that_could_not_open_a_lane_is_still_reportable() {
+    let auth = private_dir();
+    let repo = private_dir();
+    git(repo.path(), &["init", "-b", "main"]);
+    fs::write(repo.path().join("README"), "checkout\n").expect("readme");
+    git(repo.path(), &["add", "README"]);
+    git(repo.path(), &["commit", "-m", "init"]);
+    // `.cadence` as a file makes the lane path unopenable after the claim lands.
+    fs::write(repo.path().join(".cadence"), "not a directory").expect("blocker");
+    let mut board = Board::empty();
+    let mine = board.seed("start", "waiting", None, ME);
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+
+    coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect_err("the lane cannot be opened");
+    assert_eq!(script.row(&mine).0, "running");
+
+    let reported = coord
+        .report(&mine, "failed", Some("lane could not be opened"), None)
+        .expect("a held claim reports even without a lane");
+
+    assert_eq!(reported["state"], "failed");
+    assert_eq!(script.row(&mine).0, "failed");
+}
+
+#[test]
+fn a_former_session_cannot_report_a_replacement_sessions_claim() {
+    let former_auth = private_dir();
+    let replacement_auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let assignment = board.seed("start", "waiting", None, ME);
+    let script = Script::new(board);
+    let mut former = open(&script, former_auth.path());
+    let mut replacement = open(&script, replacement_auth.path());
+    let first = former
+        .start_session(ISSUE, repo.path(), Some("former"), PROFILE)
+        .expect("first session claims the assignment");
+
+    // Model an external reassignment to the same member: the board retires
+    // the old claim before a different session acquires the next generation.
+    {
+        let mut board = script.0.lock().expect("board");
+        let row = board
+            .rows
+            .iter_mut()
+            .find(|row| row.assignment_id == assignment)
+            .expect("assignment");
+        row.generation += 1;
+        row.state = "queued".to_string();
+        row.claim_id = None;
+        row.client_agent_id = None;
+    }
+    let next = replacement
+        .start_session(
+            ISSUE,
+            repo.path(),
+            Some("replacement"),
+            "ap_00000000-0000-4000-8000-00000000beef",
+        )
+        .expect("replacement session acquires its own claim");
+    assert_ne!(next["claim_id"], first["claim_id"]);
+    assert_ne!(next["client_agent_id"], first["client_agent_id"]);
+    assert_eq!(
+        next["generation"].as_u64().expect("next generation"),
+        first["generation"].as_u64().expect("first generation") + 1
+    );
+    let held = script.row(&assignment);
+    assert_eq!(held.0, "running");
+    let calls_before_refusal = script.calls().len();
+
+    let refused = former
+        .start_session(ISSUE, repo.path(), Some("former"), PROFILE)
+        .expect_err("observing a replacement claim cannot adopt it");
+    assert_eq!(refused.code(), Some("fenced"));
+    let observed = former.status().expect("current assignment is observable");
+    assert_eq!(observed["assignments"][0]["claim_id"], next["claim_id"]);
+    former
+        .report(&assignment, "failed", Some("former session finished"), None)
+        .expect_err("seeing the new claim is not authority to report it");
+
+    assert_eq!(script.row(&assignment), held);
+    let calls = script.calls();
+    assert!(
+        calls[calls_before_refusal..]
+            .iter()
+            .all(|call| !call.is_suffix("/claim") && !call.is_suffix("/report")),
+        "the former session must neither reclaim nor report the replacement claim"
+    );
+
+    // Positive control: refusal must not disable the actual holder's reports.
+    let reported = replacement
+        .report(&assignment, "blocked", Some("replacement is waiting"), None)
+        .expect("the replacement holder retains report authority");
+    assert_eq!(reported["claim_id"], next["claim_id"]);
+    assert_eq!(reported["generation"], next["generation"]);
+    assert_eq!(reported["state"], "blocked");
+    assert_eq!(script.row(&assignment).0, "blocked");
+    let calls = script.calls();
+    let reports: Vec<_> = calls[calls_before_refusal..]
+        .iter()
+        .filter(|call| call.is_suffix("/report"))
+        .collect();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].body["claim_id"], next["claim_id"]);
+    assert_eq!(reports[0].body["expected_generation"], next["generation"]);
 }
 
 fn bind_file(dir: &Path, message: &str) -> Value {

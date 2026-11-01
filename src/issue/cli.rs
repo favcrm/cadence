@@ -339,6 +339,12 @@ pub enum IssueAction {
         /// owner and is recorded as a comment in its own commit.
         #[arg(long, value_name = "REASON")]
         take_over: Option<String>,
+        /// Hosted orgs only: claim this issue for the calling session under
+        /// a reusable profile id (`ap_…`). The caller is the actor, so no
+        /// local-agent alias is required and nothing is messaged to a
+        /// daemon. The profile supplies context, never authority.
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
     },
     /// Record a claim on an issue (CAD-383) — for a PM whose lanes run
     /// outside cadence (Claude subagents, Codex, humans), so `dispatch`
