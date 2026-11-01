@@ -105,6 +105,7 @@ pub fn layout() -> Result<Layout> {
                 root.display()
             )));
         }
+        refuse_symlinked_ancestry(&root)?;
         let root = guard_home(root)?;
         return Ok(Layout {
             source: Source::Env,
@@ -175,14 +176,23 @@ pub fn home_default() -> Result<PathBuf> {
 /// dangling symlink) counts as present. Release and test-seam builds
 /// resolve identically.
 fn installation(root: &Path) -> Result<Installation> {
-    let legacy = [
+    let legacy_paths = [
         legacy_tracker_dir()?,
         legacy_state_dir()?,
         local_state_dir()?,
         legacy_config_dir()?,
-    ]
-    .iter()
-    .any(|path| legacy_present(path));
+    ];
+    // A per-directory override that names one of the legacy roots is the
+    // user's explicit choice of that root. Creating it must not then make
+    // the installation ambiguous on the next run, so naming it counts as
+    // legacy evidence here — the one case where an export decides the
+    // branch, because the effect would otherwise decide it silently.
+    let exported_legacy = ["CADENCE_STATE_DIR", "CADENCE_PM_DIR"].iter().any(|name| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .is_some_and(|path| legacy_paths.iter().any(|legacy| same_place(&path, legacy)))
+    });
+    let legacy = exported_legacy || legacy_paths.iter().any(|path| legacy_present(path));
     let consolidated = [
         root.join("state"),
         root.join("tracker"),
@@ -406,6 +416,44 @@ fn config_root(layout: &Layout) -> Result<PathBuf> {
     Ok(chosen)
 }
 
+/// Refuse a root whose existing ancestry contains a symlink or a `..`.
+/// An explicit `CADENCE_HOME` is authoritative for credentials, so a
+/// planted link anywhere above it would redirect every write even when the
+/// leaf itself is not a link. Nothing below the first missing component is
+/// checked; the caller then creates it under the refusal rules above.
+fn refuse_symlinked_ancestry(root: &Path) -> Result<()> {
+    use std::path::Component;
+    let mut prefix = PathBuf::new();
+    for component in root.components() {
+        match component {
+            Component::RootDir => prefix.push("/"),
+            Component::Normal(part) => prefix.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(Error::rejected(format!(
+                    "{} is not a plain absolute home — refusing a CADENCE_HOME with `..` or a \
+                     path prefix; name the installation's own absolute path",
+                    root.display()
+                )))
+            }
+        }
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(Error::rejected(format!(
+                    "{} is reached through the symlink {} — refusing to use it as CADENCE_HOME; \
+                     name the real installation directory",
+                    root.display(),
+                    prefix.display()
+                )))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a path under the consolidated home that is reached through a
 /// symlink, at any level from the home root down to the leaf.
 ///
@@ -453,6 +501,21 @@ fn refuse_symlinked_under(root: &Path, path: &Path) -> Result<()> {
             _ => return Ok(()),
         }
     }
+}
+
+/// Refuse an effect on the invoking user's real consolidated home in a
+/// test process. [`create_home_dir`] already answers this for its own
+/// callers; a writer that creates with `create_dir_all` directly (setup's
+/// state and tracker initialization) calls this before its first effect.
+#[cfg(not(any(test, feature = "test-seam")))]
+pub fn refuse_real_home(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// [`refuse_real_home`] for builds that can run tests.
+#[cfg(any(test, feature = "test-seam"))]
+pub fn refuse_real_home(dir: &Path) -> Result<()> {
+    guard_home(dir.to_path_buf()).map(|_| ())
 }
 
 /// Create a directory that belongs to the consolidated home — the config

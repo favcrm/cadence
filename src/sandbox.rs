@@ -918,6 +918,13 @@ fn production_dirs(sb: &Sandbox, exported: bool) -> Result<Vec<(&'static str, Pa
         // this shell sets it.
         dirs.push(("the production state dir", crate::home::local_state_dir()?));
     }
+    // `CADENCE_HOME` is deliberately NOT inventory here. A sandbox's own
+    // children export it as their home, so taking it as production
+    // evidence would have `owner_of` refuse the sandbox's own store; and
+    // as an attacker's claim it is not evidence at all. That leaves a
+    // custom install named only by `CADENCE_HOME` unprotected by this
+    // guard unless it also carries one of the roots above — the open
+    // tradeoff tracked on CAD-1922.
     if let Some(state_home) = var("XDG_STATE_HOME") {
         dirs.push(("the production state dir", state_home.join("cadence")));
     }
@@ -988,8 +995,9 @@ fn refuse_overlap(sb: &Sandbox, exported: bool, own_exports_are_ours: bool) -> R
     .map(|p| resolved(&p));
     for (label, dir) in production_dirs(sb, exported)? {
         let live = resolved(&dir);
-        // An exported dir that is exactly one of the sandbox's own paths
-        // is the sandbox, not a live cadence; a host-derived default at
+        // An exported dir that is one of the sandbox's own paths — or
+        // inside its own root, as every `CADENCE_HOME=<root>` path is —
+        // is the sandbox, not a live cadence. A host-derived default at
         // the same path is still production and still refuses.
         if own_exports_are_ours
             && label.starts_with("the exported ")

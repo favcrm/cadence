@@ -297,9 +297,11 @@ present anywhere — uses one consolidated home, `~/.cadence` (or
 | `~/.cadence/repos/` | managed repo checkouts |
 | `~/.cadence/config/` | hosted config and credentials, private (0700; files 0600) |
 
-The executable stays wherever it was installed (`~/.local/bin`). The home root
-itself is created 0700 and kept that way for a first run — whoever creates it
-first — while an existing installation's directories are never re-chmod'ed.
+The executable stays wherever it was installed (`~/.local/bin`). A directory
+the consolidated home creates is made 0700 (the home root and every missing
+ancestor below it, on the first credential write) and the home root of a first
+run is kept 0700; a directory that already exists keeps its mode, and an
+existing installation's directories are never re-chmod'ed.
 
 **An existing installation keeps the paths it has**: tracker `~/pm`, runtime
 state `$XDG_STATE_HOME/cadence` or `~/.local/state/cadence`, vault
@@ -352,10 +354,18 @@ were.
 - `--state-dir` — the same per command, and what a sandbox passes.
 - `--auth-dir` — hosted credentials, per command.
 
-None of these chooses the layout: a per-directory override (including the pair
-`cadence switch local` exports into its own process) changes its own directory
-and nothing else, so one command cannot flip the vault or the hosted config
-mid-run.
+None of these chooses the layout, with one exception: exporting
+`CADENCE_STATE_DIR` or `CADENCE_PM_DIR` *at a legacy root* (`$XDG_STATE_HOME/
+cadence`, `~/.local/state/cadence`, `~/pm`) is an explicit choice of that
+installation, and it resolves to the legacy branch — creating that directory
+would otherwise make the installation ambiguous on the next run. Every other
+override (including the pair `cadence switch local` exports into its own
+process) changes its own directory and nothing else, so one command cannot
+flip the vault or the hosted config mid-run.
+
+`CADENCE_HOME` is refused when it contains `..` or when any existing ancestor
+is a symlink: that root is authoritative for credentials, so a planted link
+above it would redirect them.
 
 `XDG_CONFIG_HOME` names the config root of an installation that already
 exists — a legacy install, or a consolidated one that already holds a config
@@ -375,7 +385,11 @@ rather than failing later.
 `CADENCE_HOME`, `XDG_CONFIG_HOME`, `CADENCE_STATE_DIR`, `CADENCE_PM_DIR` and
 `CADENCE_PROFILE` for its own root, so a caller's consolidated home, system
 install or hosted credentials never leak in, and every verb refuses a root
-that overlaps production's state dir, tracker, home or config dir. A sandbox
+that overlaps production's state dir, tracker, home or config dir — including
+one named by an exported `CADENCE_HOME`. `status`, `env` and the global opt-in
+gate exempt an exported dir that is exactly the sandbox's own, so a shell
+exported by `dev env` can inspect itself; `reset`, `down` and `reload` keep
+the strict inventory with no exemption. A sandbox
 created before this change keeps its old vault at `<root>/pm/wiki`; its
 vault now resolves to `<root>/vault`, so `cadence dev reset <name>` starts it
 over rather than migrating it.

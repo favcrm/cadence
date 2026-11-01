@@ -219,18 +219,33 @@ pub fn staging_register(state_dir: &Path, board_port: u16, by: &str) -> Result<V
 /// and hosted config of a first run (CAD-1922).
 pub(super) fn refuse_production_staging(state_dir: &Path) -> Result<()> {
     let ours = crate::sandbox::resolved(state_dir);
+    // The inventory is spelled from `$HOME`/`$XDG_*` alone, never through
+    // a resolver that can fail: an `Ambiguous` installation made the
+    // branch selectors error, and silently dropping their roots registered
+    // a live instance as staging. Naming the roots directly keeps them in
+    // the list whatever the layout says.
+    let var = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
     let mut forbidden: Vec<PathBuf> = Vec::new();
-    if let Ok(d) = crate::client::default_state_dir() {
-        forbidden.push(d);
+    if let Some(home) = var("HOME") {
+        forbidden.push(home.join("pm"));
+        forbidden.push(home.join(".cadence"));
+        forbidden.push(home.join(".local/state/cadence"));
+        forbidden.push(home.join(".config/cadence"));
     }
-    if let Ok(d) = crate::home::local_state_dir() {
-        forbidden.push(d);
+    for (name, leaf) in [
+        ("XDG_STATE_HOME", "cadence"),
+        ("XDG_CONFIG_HOME", "cadence"),
+    ] {
+        if let Some(base) = var(name) {
+            forbidden.push(base.join(leaf));
+        }
     }
-    if let Ok(d) = crate::issue::home_default_dir() {
-        forbidden.push(d);
-    }
-    if let Ok(d) = crate::home::home_default() {
-        forbidden.push(d);
+    if let Some(root) = var("CADENCE_HOME").filter(|path| path.is_absolute()) {
+        forbidden.push(root);
     }
     for live in forbidden {
         let live = crate::sandbox::resolved(&live);

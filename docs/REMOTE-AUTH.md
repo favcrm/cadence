@@ -105,6 +105,9 @@ serialized. Use an absolute `--auth-dir` for isolated development or a
 separate connection. A different issuer/organization cannot replace an
 existing credential; org switching is separate CAD-657 work.
 
+For a fresh installation the same file lives under the consolidated home:
+`<CADENCE_HOME>/config/remote-auth/cli-<workspace>.json`.
+
 `cadence auth logout` removes the local credential only. Revoke the server
 credential using AgenticOS connected devices. Logout does not clear an environment
 token or terminate remote sessions. Device credentials currently expire after
