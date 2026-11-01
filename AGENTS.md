@@ -181,6 +181,29 @@ the code you just wrote.
   relays, so run the same operator proof on the HTTP peer.
 - Restrict actors with allowlists, not denylists.
 
+### CI tooling is proved by running it, not by testing it
+
+`scripts/` and `.github/workflows/` are the machinery that runs the checks, not
+product code. Do not add unit or contract tests for them. The next real run is
+the test: a workflow that cannot load, a required check that never reports, a
+scope that narrows to nothing, or a gate that passes on `cancelled` all show up
+there, and a test that re-implements the gate's logic proves only the
+re-implementation.
+
+Two things this does not excuse:
+
+- **A rule the daemon or a route enforces still ships with its acceptance
+  check** — see "Gates and security work". One check that drives the real
+  script and shows the bad case refused is not a CI-script unit test; it is the
+  gate's own evidence, and it is written by someone other than the implementer.
+- **A gate that silently checks nothing is the failure to guard against.** If
+  deleting a gate's wiring would leave a green run, that is worth a check; the
+  cost of a wrong gate is not the gate's own code, it is every green run after
+  it stopped looking.
+
+Prefer making the machinery cheaper — fewer steps, fewer jobs, less duplicated
+compile — over covering it with tests.
+
 ### Paid platform calls: no spending limit
 
 - A paid platform call (tool, model, media) runs and is charged as long as
