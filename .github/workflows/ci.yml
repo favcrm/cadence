@@ -256,56 +256,46 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: scripts/ci-rust-toolchain --profile minimal --component rustfmt
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
+      # CAD-1970: 27 contract checks, each an interpreter start plus a few
+      # seconds of work. As separate steps they cost 44.6 s of a 56 s job,
+      # almost all of it process startup in series. One step runs them 8 at a
+      # time: measured 13.8 s for the same 27, same results. A failure still
+      # names the check and fails the step.
+      - name: Contract checks for this repo's own CI
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          xargs -P 8 -I@ sh -c '@ || { echo "::error::contract check failed: @" >&2; exit 1; }' <<'CHECKS'
+            python3 scripts/check-review-recipe
+            python3 scripts/test-review-recipe
+            python3 -m unittest scripts/test_reduced_gate_release.py
+            python3 scripts/test_pre_push_plan.py
+            python3 scripts/test_workflow_cleanup.py
+            python3 scripts/test_ci_change_scope.py
+            python3 scripts/acceptance/test-cad-1370-feedback-contract.py
+            python3 scripts/acceptance/test-cad-1400-release-install-gate.py
+            python3 scripts/test_ci_fast_linker.py
+            python3 scripts/test_release_reuse.py
+            python3 scripts/test_core_wasm_release_latest.py
+            python3 scripts/test_select_shard_artifacts.py
+            python3 scripts/test_check_test_junit.py
+            python3 -m unittest scripts/test_enqueue_human_paths.py
+            python3 scripts/test_cad1743_bun_guards.py
+            python3 -m unittest scripts/test_enqueue_scope_approval.py
+            python3 scripts/test_enqueue_requirements.py
+            python3 scripts/test_enqueue_current_ci.py
+            python3 scripts/test_operator_preflight.py
+            python3 tests/cad1475_publicity_acceptance.py
+            python3 tests/cad1479_r2_publish_gate_acceptance.py
+            python3 tests/cad1540_cross_build_gate_acceptance.py
+            python3 tests/cad1910_boat_cleanup_refusal.py
+            python3 tests/boat_build_session.py
+            python3 tests/cad1919_previous_command_refusal.py
+            scripts/design-kit --check
+            python3 tests/cad1285_migration_ddl_acceptance.py
+          CHECKS
       - run: cargo fmt --all -- --check
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
-      # CAD-1073 clean-slate transition: the legacy tests/scripts contract
-      # suite is retired; only the checks that validate this PR's own shape
-      # remain. The nextest inventory/test-plan/shard contracts are gone with
-      # the deleted suite and are rebuilt as behavior checks under the new
-      # policy.
-      - run: python3 scripts/check-review-recipe
-      - run: python3 scripts/test-review-recipe
-      - run: python3 -m unittest scripts/test_reduced_gate_release.py
-      - run: python3 scripts/test_pre_push_plan.py
-      - run: python3 scripts/test_workflow_cleanup.py
-      - run: python3 scripts/test_ci_change_scope.py
-      - run: python3 scripts/acceptance/test-cad-1370-feedback-contract.py
-      - run: python3 scripts/acceptance/test-cad-1400-release-install-gate.py
-      - run: python3 scripts/test_ci_fast_linker.py
-      - run: python3 scripts/test_release_reuse.py
-      # CAD-1800: a core-v* release must never become GitHub's Latest (install.sh).
-      - run: python3 scripts/test_core_wasm_release_latest.py
-      # CAD-1745: the independent shard-report selector acceptance drives the
-      # real CLI over a raw REST transport substitute (carried aliases
-      # included) and feeds the selected reports through check-test-junit.py.
-      - run: python3 scripts/test_select_shard_artifacts.py
-      # CAD-1970: the coverage guard must refuse a hole the target-level
-      # guard cannot see — a case dropped from every report, executed
-      # twice, skipped although selected, or ignored without a declaration.
-      - run: python3 scripts/test_check_test_junit.py
-      - run: python3 -m unittest scripts/test_enqueue_human_paths.py
-      - run: python3 scripts/test_cad1743_bun_guards.py
-      - run: python3 -m unittest scripts/test_enqueue_scope_approval.py
-      - run: python3 scripts/test_enqueue_requirements.py
-      - run: python3 scripts/test_enqueue_current_ci.py
-      - run: python3 scripts/test_operator_preflight.py
-      # CAD-1475: the operator-owned publicity lifecycle guard — the real
-      # helper driven through a stateful s3api boundary (conditional write,
-      # fixed-endpoint/bucket and bad-case refusals).
-      - run: python3 tests/cad1475_publicity_acceptance.py
-      - run: python3 tests/cad1479_r2_publish_gate_acceptance.py
-      # CAD-1540: the cross-build required-check gate — the real gate script is
-      # driven through all four matrix outcomes and must refuse failure/cancelled.
-      - run: python3 tests/cad1540_cross_build_gate_acceptance.py
-      # CAD-1910: never operate on a sandbox other than the one just created.
-      - run: python3 tests/cad1910_boat_cleanup_refusal.py
-      # Warm Boat session: reuse one sandbox, shallow snapshot, keep target/.
-      - run: python3 tests/boat_build_session.py
-      # CAD-1919: do not reset a warm checkout while its previous command is alive.
-      - run: python3 tests/cad1919_previous_command_refusal.py
-      - run: scripts/design-kit --check
-      # CAD-1285: a shipped `version < N` store migration block, and the
-      # SCHEMA constant it applies, must not change; new DDL gets a new version.
       - name: Refuse DDL edits to shipped migration blocks
         if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
         env:
@@ -313,7 +303,6 @@ jobs:
         run: |
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           python3 scripts/check-migration-ddl --base "$BASE_SHA"
-      - run: python3 tests/cad1285_migration_ddl_acceptance.py
       - name: Check contributor documentation paths
         run: python3 scripts/check-doc-links.py
       - name: Test contributor documentation checker
@@ -650,6 +639,19 @@ jobs:
       - name: Assert the test seam refuses a release build
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         run: sh scripts/check-release-test-seam
+      # CAD-1970: the `ui` gate's compile, run here so the release cache and
+      # the Node/Bun toolchain are paid once. It runs AFTER the two seam
+      # assertions above on purpose: `cargo build --features ui` overwrites
+      # `target/ci/cadence`, and those assertions must judge the default-feature
+      # binary, not the ui one.
+      - run: bun install --frozen-lockfile
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && needs.change-scope.outputs.ui != 'false' }}
+        working-directory: ui
+      - run: bun run build
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && needs.change-scope.outputs.ui != 'false' }}
+        working-directory: ui
+      - run: cargo build --profile ci --locked --features ui
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && needs.change-scope.outputs.ui != 'false' }}
       - name: sccache statistics
         if: ${{ !cancelled() && needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
@@ -705,26 +707,13 @@ jobs:
           git diff --exit-code -- dist
       # This job had no install step and built on the runner's preinstalled
       # (floating) Rust; the default working directory here is ui/.
-      - run: $GITHUB_WORKSPACE/scripts/ci-rust-toolchain --profile minimal
-        if: ${{ needs.change-scope.outputs.ui != 'false' }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: ${{ needs.change-scope.outputs.ui != 'false' }}
-        with:
-          shared-key: gate-release
-          save-if: false
-      - name: Enable fast linker (mold/lld; falls back to the default linker)
-        if: ${{ needs.change-scope.outputs.ui != 'false' }}
-        run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
-      - name: Enable shared sccache (no-op without credentials)
-        if: ${{ needs.change-scope.outputs.ui != 'false' }}
-        env:
-          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
-          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
-          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
-        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
-      - run: cargo build --profile ci --locked --features ui
-        if: ${{ needs.change-scope.outputs.ui != 'false' }}
-        working-directory: ${{ github.workspace }}
+      # CAD-1970: the `--features ui` compile moved into `build`, which already
+      # has the release cache and the Node/Bun toolchain. Two jobs each
+      # restoring `gate-release` and compiling the same profile was ~110 s of
+      # duplicated work for one job's worth of signal. This job keeps every
+      # check that can only be made here (typecheck, lint, url-state, app-kit,
+      # HMR, the bundle, the hosted runtime package); the compile that proves
+      # the binary still builds with the ui feature runs there.
       - name: sccache statistics
         if: ${{ !cancelled() && needs.change-scope.outputs.ui != 'false' }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
