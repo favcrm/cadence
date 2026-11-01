@@ -1,3 +1,19 @@
-# CAD-1970: the integration and acceptance suites were retired; the lib and
-# bins unit suites declare no `#[ignore]`d case, so this file is empty on
-# purpose. A new ignored case must be declared here by binary id.
+# Ignored testcases, declared on purpose.
+#
+# A `#[ignore]` is the one way a test can stop running without its module
+# changing, and the gate cannot tell a deliberate exclusion from a typo.
+# scripts/check-test-junit.py therefore refuses an ignored case that is not
+# listed here, and refuses a line here whose case now runs.
+#
+# CAD-1970: the numbers below are what the single shard actually skipped
+# (junit of run 41279404913), not a count carried over from the retired
+# six-shard reports. The fourteen entries that named the deleted acceptance
+# suites are gone with them.
+cadence-agent daemon::cad811_installed_crm_qa_fixture::cad811_installed_crm_qa_fixture	# interactive installed CRM browser fixture; needs an admitted isolated runtime
+cadence-agent daemon::team_assistants_refusal::member_verbs_refuse_unbound_envelope_child	# re-exec child of the parent test that drives it
+cadence-agent issue::app::bundle_grammar_tests::regenerate_bundle_grammar	# rewrites the checked-in grammar artifact
+cadence-agent protected_runtime::measure_mounts::measure_mount_metadata_acceptance_20261027::cad1085_metadata_mounts_actual_kernel	# needs root/CAP_SYS_ADMIN, an approved Docker, and the pinned policy
+cadence-agent reaper::tests::reaper_proof_isolated	# runs in its own process from reaper_keeps_owned_statuses_and_reaps_adopted_orphans
+cadence-agent rollout::tests::rollout_operator_shell_probe	# re-exec helper for the operator force-release proof
+cadence-agent ui::team_assistants_http_refusal::assist_http_authority_refuses_with_flag_unset_child	# re-exec child of the parent refusal test
+cadence-agent wiki::tests::cad911_partial_copy_child	# re-exec child of failed_partial_copy_cleans_only_its_private_stage
