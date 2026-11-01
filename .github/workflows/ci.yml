@@ -318,23 +318,17 @@ jobs:
       - run: cargo clippy --all-targets --locked --features test-seam -- -D warnings
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
 
-  # CAD-1480: the suite (~1400 cpu-s) cannot fit the wall-time budget on
-  # one runner, so six shards each run a deterministic nextest
-  # `hash:k/6` partition at `--jobs 4`. Every shard still runs
-  # scripts/run-result-tests with the same isolation, toolchain and
-  # rust-cache, and uploads its junit plus expected inventory. The
-  # aggregate `test` job below keeps the required check name and re-runs
-  # the full zero-target coverage guard over the merged shard reports —
-  # coverage can never shrink inside a partition.
-  test-shards:
+  # CAD-1970: one job named `test`. Sharding existed to fit a wall-time
+  # budget on a suite that no longer exists; the artifact upload, selection,
+  # download and merge that came with it are what kept failing. The suite runs
+  # here, and the same checker that used to merge six reports now reads this
+  # one — a case missing from the report, skipped without a declaration, or
+  # absent from the binaries is still a failure.
+  test:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: instabox-medium
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1]
+    timeout-minutes: 30
     steps:
       - name: Not applicable — rust PR feedback gate
         if: ${{ needs.change-scope.outputs.rust == 'false' }}
@@ -345,27 +339,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         with:
-          # CAD-1493: key version carries the linker/fingerprint epoch —
-          # bump -ldN when a flag flips so the warm leg writes fresh
-          # artifacts instead of skipping an existing stale key.
           shared-key: gate-test-ld2
           save-if: false
-      # CAD-1487: linking dominated a shard while every tests/*.rs file was
-      # its own executable; CAD-1727 collapsed them into the one `suite`
-      # binary. mold/lld stays: it links that 223 MB suite and the product
-      # binaries materially faster than the default linker. cache-warm's
-      # test leg enables the same flag so main keeps the gate-test cache
-      # hot for it — the one cold run is this PR's own gate until the merge
-      # push re-warms.
       - name: Enable fast linker (mold/lld; falls back to the default linker)
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
-      # CAD-1967: every shard compiles the same workspace crates, so six
-      # machines each pay that codegen. Read-only sccache lets them reuse
-      # what cache-warm's test leg wrote with the identical command and
-      # flags (RUSTC_WRAPPER is exported after rust-cache, as in `build`).
-      # Test binaries link, so the final link stays per shard; the library
-      # crates are the part that gets reused.
       - name: Enable shared sccache (read-only; no-op without credentials)
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         env:
@@ -373,13 +351,7 @@ jobs:
           SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
           SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
-      # CAD-1124: no doctests exist; mandatory default-feature clippy and
-      # build retain compilation coverage without a zero-test rebuild.
-      # CAD-1090: every cargo test target (scripts/result-test-args), with
-      # the test seam on and a 0-test target treated as a failure.
-      # CAD-1105: then the lib unit tests, with PATH cut to the toolchain.
-      # CAD-1214: then the unit tests inside the binary targets.
-      - name: Run this shard's partition of the integration targets, lib and bins
+      - name: Run the suite
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         env:
           CARGO_BUILD_JOBS: 4
@@ -387,160 +359,33 @@ jobs:
           SCOPE: ${{ needs.change-scope.outputs.scope }}
           TARGETS: ${{ needs.change-scope.outputs.targets }}
         run: |
-          # cadence-agent-exec protected_mechanics high-fd custody seats fd
-          # 70000 and fails closed unless the hard RLIMIT_NOFILE exceeds it.
-          # The hosted runner's hard limit is lower, so raise hard and soft for
-          # this shell (limits do not persist across steps) before the suite.
-          sudo prlimit --pid $$ --nofile=1048576:1048576
-          ulimit -n 1048576
-          echo "RLIMIT_NOFILE hard=$(ulimit -Hn) soft=$(ulimit -n)"
-          # CAD-1370: narrowed integration feedback only on pull_request,
-          # only when the trusted-base classifier emitted a valid tests
-          # scope, and only as a re-validated one-identifier-per-line file
-          # handed to the same run-result-tests runner — never an ambient
-          # env, a shell-joined string, or a PR-provided path. The lib and
-          # bins suites and every zero-target guard are unchanged. The
-          # partition index comes from the matrix, not the environment.
-          selection=
+          set -euo pipefail
+          # CAD-1370: a pull_request may narrow the integration targets from
+          # the trusted-base classifier. The lib and bins suites always run.
+          selection=""
           if [ "${GITHUB_EVENT_NAME:-}" = pull_request ] && [ "$SCOPE" = tests ]; then
             selection="$RUNNER_TEMP/ci-test-selection"
             printf '%s' "$TARGETS" | jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and test("^[A-Za-z0-9_]+$"))' > /dev/null
             printf '%s' "$TARGETS" | jq -r '.[]' > "$selection"
             test -s "$selection"
-            if grep -qvE '^[A-Za-z0-9_]+$' "$selection"; then
-              echo "::error::test selection carries a non-identifier line" >&2
-              exit 1
-            fi
-            echo "Running narrowed integration selection: $(tr '\n' ' ' < "$selection")"
-            scripts/run-result-tests --test-selection "$selection" --partition "${{ matrix.shard }}/1" --jobs 4
+            scripts/run-result-tests --test-selection "$selection" --jobs 4
           else
-            scripts/run-result-tests --partition "${{ matrix.shard }}/1" --jobs 4
+            scripts/run-result-tests --jobs 4
           fi
+      - name: Check the report against the binaries
+        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        run: |
+          set -euo pipefail
+          python3 scripts/check-test-junit.py \
+            --package "$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["name"])')" \
+            --targets-file target/nextest/cadence/expected-targets.txt \
+            --complete-partition \
+            --inventory target/nextest/cadence/inventory.json \
+            --ignored-manifest .config/nextest-ignored.txt \
+            target/nextest/cadence/junit.xml
       - name: sccache statistics
         if: ${{ !cancelled() && needs.change-scope.outputs.rust != 'false' }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
-
-      # Artifacts always land (even on a red shard) so the aggregate can
-      # prove where coverage stopped. junit.xml is required; the shard
-      # step already failed when it is missing. CAD-1745: the name carries
-      # the producing attempt, so a rerun's report can never be confused
-      # with — or overwrite — the immutable report of an earlier attempt.
-      - name: Upload shard junit, inventory and expected targets
-        if: always() && needs.change-scope.outputs.rust != 'false'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: test-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
-          path: |
-            target/nextest/cadence/junit.xml
-            target/nextest/cadence/inventory.json
-            target/nextest/cadence/expected-targets.txt
-          if-no-files-found: warn
-          retention-days: 1
-
-  # The required `test` check: merges every shard's junit and re-runs
-  # the zero-target coverage guard the single job used to run. A skipped
-  # shard set (docs-only PR scope) still resolves to a green no-op gate;
-  # a red shard or a hole in the merged report fails here. CAD-1745: it
-  # merges exactly the reports of each partition's latest actual
-  # execution, so a rerun keeps untouched partitions without reusing an
-  # older failure or success.
-  test:
-    needs: [queue-evidence, change-scope, test-shards]
-    if: ${{ always() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: instabox-medium
-    timeout-minutes: 5
-    permissions:
-      actions: read
-      contents: read
-    steps:
-      - name: Not applicable — rust PR feedback gate
-        if: ${{ needs.change-scope.outputs.rust == 'false' }}
-        run: echo 'rust commands not run for this PR scope; full integration gates still run in the merge queue.' >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Require green shards before trusting their reports
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        run: |
-          if [ "${{ needs.test-shards.result }}" != "success" ]; then
-            echo "::error::test-shards finished as '${{ needs.test-shards.result }}'" >&2
-            exit 1
-          fi
-      # CAD-1745: a failed-job-only rerun copies an untouched green shard's
-      # row into the new attempt without re-running or re-uploading it.
-      # Resolve each partition to the attempt that actually executed it
-      # (the copied row aliases the earlier execution), then fetch exactly
-      # those six artifacts by ID. Older reports stay on the run as
-      # evidence; a non-green or ambiguous current execution fails this
-      # step instead of falling back to an older success.
-      - name: Select each partition's authoritative shard report
-        id: select
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          # A PR run's head is the PR head; queue and push runs checkout
-          # github.sha. The jobs and artifacts APIs report that same head.
-          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          set -euo pipefail
-          python3 scripts/select-shard-artifacts.py \
-            --repo "$GITHUB_REPOSITORY" \
-            --run-id "$GITHUB_RUN_ID" \
-            --sha "$SOURCE_SHA" \
-            --attempt "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        with:
-          artifact-ids: ${{ steps.select.outputs.artifact_ids }}
-          path: junits
-          # The REST artifact list is the same read-only source the
-          # selector checked, and it retains every earlier attempt's
-          # artifacts; each selected artifact lands in junits/<name>/.
-          github-token: ${{ github.token }}
-      - name: Validate merged shard coverage and results
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        run: |
-          set -euo pipefail
-          files=(junits/*/junit.xml)
-          if [ "${#files[@]}" -ne 1 ]; then
-            echo "::error::expected 1 shard junit report, found ${#files[@]}: ${files[*]:-none}" >&2
-            exit 1
-          fi
-          invs=(junits/*/expected-targets.txt)
-          if [ "${#invs[@]}" -ne 1 ]; then
-            echo "::error::expected 1 shard inventory, found ${#invs[@]}: ${invs[*]:-none}" >&2
-            exit 1
-          fi
-          first=${invs[0]}
-          # CAD-1970: one shard means one inventory; comparing it with itself
-          # proves nothing, and a second copy only means an older attempt was
-          # downloaded alongside it.
-          if [ "${#invs[@]}" -gt 1 ]; then
-            for f in "${invs[@]}"; do
-              if ! cmp -s "$first" "$f"; then
-                echo "::error::shard inventories disagree: $first vs $f" >&2
-                exit 1
-              fi
-            done
-          fi
-          package=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["name"])')
-          # CAD-1970: each shard's junit is checked against the inventory its
-          # own binaries reported, and the six inventories must together own
-          # every discovered test exactly once. Agreement among the reports
-          # is not coverage, so a test missing from all six still fails.
-          lists=(junits/*/inventory.json)
-          if [ "${#lists[@]}" -ne 1 ]; then
-            echo "::error::expected 1 shard test inventory, found ${#lists[@]}: ${lists[*]:-none}" >&2
-            exit 1
-          fi
-          inventory_args=()
-          for f in "${lists[@]}"; do
-            inventory_args+=(--inventory "$f")
-          done
-          python3 scripts/check-test-junit.py --package "$package" \
-            --targets-file "$first" \
-            --complete-partition \
-            "${inventory_args[@]}" \
-            --ignored-manifest .config/nextest-ignored.txt \
-            "${files[@]}"
 
   build:
     needs: [queue-evidence, change-scope]
