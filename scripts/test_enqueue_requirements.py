@@ -177,6 +177,33 @@ class RequirementsConsumer(evidence.EvidencePosting):
         self.assert_refused_clean(rc, err)
         self.assertIn("Standards", err)
 
+    def test_the_selected_cadence_build_is_the_one_this_gate_runs(self):
+        """CAD-1964 follow-up: a stale PATH client must not look like a gate failure."""
+        import os
+        import subprocess
+
+        captured = {}
+        real = evidence.enq.subprocess.run
+
+        def fake(argv, **kwargs):
+            captured["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        evidence.enq.subprocess.run = fake
+        try:
+            os.environ["CADENCE_BIN"] = "/opt/current/cadence"
+            evidence.enq.run(["cadence", "audit", "verdicts"])
+        finally:
+            evidence.enq.subprocess.run = real
+            os.environ.pop("CADENCE_BIN", None)
+        self.assertEqual(captured["argv"][0], "/opt/current/cadence")
+
+    def test_a_stale_client_names_its_own_cause(self):
+        hint = evidence.enq.stale_cli_hint(
+            "`cadence <command>` is not available on a remote org in this build")
+        self.assertIn("CADENCE_BIN", hint)
+        self.assertEqual(evidence.enq.stale_cli_hint("some other refusal"), "")
+
     def test_protected_auth_uses_legacy_two_reviews_and_operator_approval(self):
         self.c.paths = ["src/daemon/caller_rule.rs"]
         self.c.verdict_list = [
