@@ -1,10 +1,19 @@
 import { DurableObject } from "cloudflare:workers";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { createRegistry, Harness } from "@earendil-works/pi-durable";
+import {
+  createRegistry,
+  Harness,
+  InboxDoc,
+  LiveDoc,
+  ROOT_CONVERSATION_ID,
+  type JsonObject,
+} from "@earendil-works/pi-durable";
 import { PiHarness, skills } from "agents/harness/pi";
 import { Lifecycle } from "agents/lifecycle";
 import { createAI } from "agents/models/pi-ai";
 import type {
+  AppScope,
   AskResult,
   GenerationIdentity,
   HostedSessionOptions,
@@ -14,8 +23,19 @@ import type {
   ThreadEntry,
 } from "./contract.ts";
 import { assistantIdentityText } from "./assistant-identity.ts";
-import { authorizeExtension, intentGuard, runtimeExtension } from "./engine.ts";
-import { readGenerationIdentity, type TaskSql } from "./identity.ts";
+import {
+  authorizeExtension,
+  intentGuard,
+  runtimeExtension,
+  type AppScopeResolver,
+} from "./engine.ts";
+import {
+  readGenerationIdentity,
+  readHeldSubmission,
+  readSubmissionEntry,
+  type HeldSubmission,
+  type TaskSql,
+} from "./identity.ts";
 import {
   guardModelRequests,
   identityContextExtension,
@@ -27,13 +47,24 @@ import {
 import { masterState } from "./master.ts";
 import { defaultModel, meteredBinding, withDefaultModel } from "./model.ts";
 import {
+  guardOperationRequests,
+  operationContextExtension,
+  runAppScope,
+} from "./operation-context.ts";
+import {
+  OperationScopes,
+  parseEntryAppScope,
+  type EngineEvidence,
+  type OperationEnvelope,
+  type OperationScopeSql,
+} from "./operation-scope.ts";
+import {
   operationalSkills,
   runtimeHealthSkills,
   runtimeProfile,
 } from "./profile.ts";
 import { sessionEventResponse } from "./session-stream.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
-import { authorizeTools } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
 import { threadEntries } from "./transcript.ts";
 
@@ -65,6 +96,19 @@ export class HostedSession<
   private readonly models = createModels();
   private readonly registry = createRegistry();
   private readonly options: HostedSessionOptions;
+  /**
+   * The session's insert-once operation envelopes. The engine deduplicates by
+   * request id alone, so this guard is what refuses a repeated id whose text
+   * or app scope changed.
+   */
+  private readonly operationScopes: OperationScopes;
+  /** The app scope of the operation that owns one tool call, read from the engine. */
+  private readonly toolAppScope: AppScopeResolver = async (api, context) => {
+    const live = await api.snapshot(LiveDoc, api.conversationId, context);
+    const run = live?.run;
+    if (run === undefined || run.inputs.length === 0) return null;
+    return runAppScope(run.inputs, (root) => this.operationAppScope(root));
+  };
 
   private readonly harness: PiHarness;
   /** The last model the gateway reported in this object's lifetime. */
@@ -79,6 +123,9 @@ export class HostedSession<
     this.options = options;
     if (!ctx.id.name)
       throw new Error("HostedSession requires a named conversation");
+    this.operationScopes = new OperationScopes(
+      ctx.storage.sql as unknown as OperationScopeSql,
+    );
     const model = defaultModel(options.modelAlias);
     const authority: ToolAuthority = {
       toolRefusal: (name) => options.toolRefusal(name),
@@ -112,8 +159,24 @@ export class HostedSession<
       );
       guardModelRequests(this.models, identityMessages);
     }
+    // The operation's admitted app scope reaches every model request and every
+    // tool call of that operation. A Home operation resolves to `null`, so a
+    // host that never sends a scope keeps its current context. The attestation
+    // set is shared: the hook authors one message object per attempt, and the
+    // boundary installed here refuses any request that carries none — so a
+    // skipped or failing hook can never reach the provider unscoped.
+    const operationMessages = new WeakSet<object>();
+    this.registry.install(
+      operationContextExtension(
+        (root) => this.operationAppScope(root),
+        operationMessages,
+      ),
+    );
+    guardOperationRequests(this.models, operationMessages);
     for (const group of options.tools) {
-      this.registry.install(runtimeExtension(authorizeTools(group, authority)));
+      this.registry.install(
+        runtimeExtension(group, authority, this.toolAppScope),
+      );
     }
     this.harness = new PiHarness({
       harness: async ({ storage, context, onWake }) => {
@@ -237,13 +300,24 @@ export class HostedSession<
     });
   }
 
-  /** Ask the session and wait for the answer. */
-  async ask(prompt: string, operationId?: string): Promise<AskResult> {
+  /**
+   * Ask the session and wait for the answer.
+   *
+   * `app` is the host-verified scope of this turn; omit it for Home. The
+   * operation id is bound to the text and scope it was first admitted with, so
+   * a retry with the same id replays that operation and a retry that changes
+   * either is refused before the engine runs.
+   */
+  async ask(
+    prompt: string,
+    operationId?: string,
+    app?: AppScope,
+  ): Promise<AskResult> {
     await this.requireIdentity();
-    const id = operationId ?? crypto.randomUUID();
-    const result = await this.harness.prompt(prompt, {
-      operationId: id,
-      entry: { kind: BOARD_MESSAGE_KIND, data: { messageId: id } },
+    const envelope = await this.admitOperation(prompt, operationId, app);
+    const result = await this.harness.prompt(envelope.text, {
+      operationId: envelope.operationId,
+      entry: this.inputEntry(envelope),
     });
     return {
       status: result.status,
@@ -281,14 +355,176 @@ export class HostedSession<
     await this.harness.session().reset();
   }
 
-  /** Submit without waiting: the board's send is queued, not a blocking turn. */
-  async submit(text: string, operationId: string): Promise<boolean> {
+  /**
+   * Submit without waiting: the board's send is queued, not a blocking turn.
+   *
+   * `app` is the host-verified scope of this turn; omit it for Home. The
+   * operation id is bound to the text and scope it was first admitted with, so
+   * a retried send with the same id replays that operation and one that changes
+   * either is refused before the engine is asked.
+   */
+  async submit(
+    text: string,
+    operationId: string,
+    app?: AppScope,
+  ): Promise<boolean> {
     await this.requireIdentity();
-    const receipt = await this.harness.submit(text, {
-      operationId,
-      entry: { kind: BOARD_MESSAGE_KIND, data: { messageId: operationId } },
+    const envelope = await this.admitOperation(text, operationId, app);
+    const receipt = await this.harness.submit(envelope.text, {
+      operationId: envelope.operationId,
+      entry: this.inputEntry(envelope),
     });
     return receipt.accepted;
+  }
+
+  /**
+   * Bind one operation to the exact text and app scope it was admitted with,
+   * and return the stored envelope. A changed text or scope throws here, before
+   * the engine sees the id, so a repeated id can never reuse another turn.
+   *
+   * An id this session never admitted may still be the engine's, from a build
+   * that predates the guard, so the engine's own records are read first and
+   * passed with the envelope: the guard adopts a legacy operation only as the
+   * Home envelope those records prove, and refuses anything else.
+   */
+  private async admitOperation(
+    text: string,
+    operationId: string | undefined,
+    app: AppScope | undefined,
+  ): Promise<OperationEnvelope> {
+    const id = operationId ?? crypto.randomUUID();
+    return this.operationScopes.admit(
+      app === undefined
+        ? { operationId: id, text }
+        : { operationId: id, text, app },
+      await this.engineEvidence(id),
+    );
+  }
+
+  /**
+   * What the engine's own records prove about an operation id this guard has no
+   * envelope for: `null` when it holds nothing for it, otherwise the submission
+   * type, the exact text and the entry metadata the guard needs to recognise a
+   * legacy Home operation it may adopt.
+   *
+   * A placed input keeps its text and metadata in the entry it was placed as. A
+   * queued one has no entry yet, so its draft is read from the engine's own
+   * inbox document. That read awaits, and the engine may place the input and
+   * drop the draft while it does — one commit, so the draft is gone exactly
+   * when the submission has become placed. An absent draft is therefore re-read
+   * once from the submission itself, never in a loop, and recovered from the
+   * entry it now names; only a record that proves neither is left proving
+   * nothing, and the guard refuses it. A submission that is not an input, and a
+   * record the engine cannot produce, also yield evidence that proves nothing.
+   * Reading a record the engine cannot parse throws, so an unreadable id is
+   * refused rather than assumed free.
+   */
+  private async engineEvidence(
+    operationId: string,
+  ): Promise<EngineEvidence | null> {
+    const sql = this.ctx.storage.sql as unknown as TaskSql;
+    const held = readHeldSubmission(sql, ROOT_CONVERSATION_ID, operationId);
+    if (held === null) return null;
+    if (
+      held.entry !== null ||
+      held.type !== "input" ||
+      held.status !== "queued"
+    )
+      return this.placedEvidence(held);
+    const draft = await this.queuedInput(held.id);
+    if (draft !== null)
+      return { type: held.type, text: draft.text, entry: draft.entry };
+    // Placing the input and removing its draft happen in one engine commit, so
+    // the submission now says where the text went. Re-read it once.
+    const placed = readHeldSubmission(sql, ROOT_CONVERSATION_ID, operationId);
+    return this.placedEvidence(placed ?? held);
+  }
+
+  /**
+   * The evidence one stored submission proves: its type, the exact text and the
+   * entry metadata, when the engine placed an entry for it. A submission with
+   * no entry proves no text here, which its caller refuses.
+   */
+  private placedEvidence(held: HeldSubmission): EngineEvidence {
+    const entry = held.entry;
+    return entry === null
+      ? { type: held.type, text: held.text, entry: null }
+      : {
+          type: held.type,
+          text: held.text,
+          entry: { kind: entry.kind, data: entry.data },
+        };
+  }
+
+  /**
+   * The draft one queued input waits in the engine's inbox with, or `null` when
+   * the inbox does not hold it. `content` is the exact text it was submitted
+   * with and `entry` the metadata it will be placed as, so both are the
+   * engine's own record of the operation rather than anything a caller sent.
+   */
+  private async queuedInput(
+    submissionId: number,
+  ): Promise<{
+    text: unknown;
+    entry: { kind: unknown; data: unknown } | null;
+  } | null> {
+    const pi = await this.harness.pi();
+    const inbox = await pi.snapshot(
+      InboxDoc,
+      ROOT_CONVERSATION_ID,
+      BACKGROUND_CONTEXT,
+    );
+    if (inbox === undefined) return null;
+    for (const item of inbox.items) {
+      if (item.mode === "write" || item.id !== submissionId) continue;
+      const entry = item.entry;
+      return {
+        text: item.content,
+        entry:
+          entry === undefined
+            ? null
+            : {
+                kind: entry.kind,
+                data: "data" in entry ? entry.data : undefined,
+              },
+      };
+    }
+    return null;
+  }
+
+  /**
+   * The durable input entry an operation is placed as. The recorded message id
+   * and the admitted app scope travel with the entry, so the transcript, a
+   * rebuilt object and a replayed retry all read the same envelope.
+   */
+  private inputEntry(envelope: OperationEnvelope): {
+    kind: string;
+    data: JsonObject;
+  } {
+    const data: JsonObject = { messageId: envelope.operationId };
+    if (envelope.app !== undefined)
+      data.app =
+        envelope.app.contextId === undefined
+          ? { installId: envelope.app.installId }
+          : {
+              installId: envelope.app.installId,
+              contextId: envelope.app.contextId,
+            };
+    return { kind: BOARD_MESSAGE_KIND, data };
+  }
+
+  /**
+   * The app scope of the operation whose input root is this engine submission,
+   * read from the placed entry the engine stored. `null` is Home: the operation
+   * was admitted without a scope, or the input is not an operation at all.
+   */
+  private operationAppScope(root: string): AppScope | null {
+    const entry = readSubmissionEntry(
+      this.ctx.storage.sql as unknown as TaskSql,
+      root,
+    );
+    if (entry === null) return null;
+    return parseEntryAppScope(entry.kind, entry.data);
   }
 
   /** What the runtime has not settled yet, so the board can show queued/running/parked. */

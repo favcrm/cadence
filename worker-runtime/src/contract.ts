@@ -23,6 +23,25 @@ export interface GenerationIdentity {
   readonly cutoff: string;
 }
 
+/**
+ * The host-verified app scope of one operation.
+ *
+ * `installId` names the installed app and `contextId` one of its contexts;
+ * `contextId` is absent (or `null`) for an installation-only binding. The host
+ * proves both against its own canonical store before it submits, so the runtime
+ * only validates the shape and never accepts a scope from model output or from
+ * a browser field. Home is the absence of a scope, not a scope with empty
+ * parts.
+ *
+ * Both parts follow the board's binding grammar (1–128 characters of
+ * `[A-Za-z0-9_-]`), so the binding the transcript projects is exactly the
+ * `{install_id, context_id?}` object a retry can send back.
+ */
+export type AppScope = {
+  readonly installId: string;
+  readonly contextId?: string;
+};
+
 /** One stored transcript entry, as the board renders it. */
 export interface ThreadEntry {
   seq: number;
@@ -38,6 +57,12 @@ export interface ThreadEntry {
     /** Safe terminal failure projection; never raw provider diagnostics. */
     status?: "failed";
     error?: string;
+    /**
+     * The verified app binding of an operator input, in the board's own stored
+     * shape (`{install_id, context_id?}`), so a retry can send the original
+     * binding back unchanged.
+     */
+    app?: { install_id: string; context_id?: string };
   };
 }
 
@@ -51,6 +76,13 @@ export interface ToolInvocation {
   readonly taskId: number;
   /** Epoch milliseconds, from the engine's run clock. */
   now(): number;
+  /**
+   * The app scope of the turn this call belongs to: the common scope of every
+   * input of the run, as those operations were admitted. Absent for a Home
+   * operation and for a call that runs outside one (for example a tool of
+   * another conversation's run).
+   */
+  readonly app?: AppScope;
 }
 
 /** Per-call cancellation surface. */
