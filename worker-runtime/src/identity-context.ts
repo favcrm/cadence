@@ -7,6 +7,7 @@ import {
   type Extension,
 } from "@earendil-works/pi-durable";
 import type { IdentitySnapshotStore } from "./identity-snapshots.ts";
+import { guardModelStream } from "./model-guard.ts";
 
 /**
  * The committed identity the model sees, injected per request.
@@ -27,20 +28,20 @@ import type { IdentitySnapshotStore } from "./identity-snapshots.ts";
 
 /**
  * One system message after the leading prompts; the leading prompt stays
- * intact. The exact object is recorded in the session's WeakSet so the model
- * boundary can prove this request received it.
+ * intact. When `authored` is supplied, the exact object is recorded in that
+ * set so the model boundary can prove this request received it.
  */
-function withSystemContext(
+export function withSystemContext(
   messages: readonly Message[],
   text: string,
-  authored: WeakSet<object>,
+  authored?: WeakSet<object>,
 ): Message[] {
   const system: Message = {
     role: "system",
     content: text,
     timestamp: Date.now(),
   };
-  authored.add(system);
+  authored?.add(system);
   let index = 0;
   while (index < messages.length && messages[index]!.role === "system")
     index += 1;
@@ -74,25 +75,18 @@ export function requireAuthoredIdentity(
  * `context.messages` here proves this request received the operation
  * snapshot's identity before the SDK normalizes/serializes it.
  *
- * Compaction's summarizer is the only `completeSimple` caller in the SDK; its
- * final request builds its own inline system/user messages, so marking
- * `beforeCompact` messages cannot reach this boundary. Reuse the captured
- * original `streamSimple` for `completeSimple`: identical normalization, auth
- * and transport, no identity guard, no text marker, prompt copy, model or route
- * change. A deferred poll uses `fetchDeferred`, which only continues an
- * already-admitted call.
+ * `guardModelStream` owns the boundary: several guards may share one `Models`
+ * instance (the operation-scope boundary does), each check runs in order, and
+ * `completeSimple` keeps the original path because compaction's summarizer is
+ * an internal summarization, not a turn.
  */
 export function guardModelRequests(
   models: Models,
   authored: WeakSet<object>,
 ): void {
-  const unguardedStreamSimple = models.streamSimple.bind(models);
-  models.streamSimple = (model, context, options) => {
-    requireAuthoredIdentity(context.messages, authored);
-    return unguardedStreamSimple(model, context, options);
-  };
-  models.completeSimple = (model, context, options) =>
-    unguardedStreamSimple(model, context, options).result();
+  guardModelStream(models, (messages) =>
+    requireAuthoredIdentity(messages, authored),
+  );
 }
 
 /**
