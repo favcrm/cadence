@@ -382,9 +382,12 @@ fit the 107-byte Unix socket limit; `setup` and `dev up` refuse a longer path
 rather than failing later.
 
 `cadence dev` instances are isolated on every axis: `dev up` exports
-`CADENCE_HOME`, `XDG_CONFIG_HOME`, `CADENCE_STATE_DIR`, `CADENCE_PM_DIR` and
-`CADENCE_PROFILE` for its own root, so a caller's consolidated home, system
-install or hosted credentials never leak in, and every verb refuses a root
+`CADENCE_PROFILE`, `CADENCE_STATE_DIR`, `CADENCE_PM_DIR` and
+`XDG_CONFIG_HOME` for its own root, and the resolver maps that profile to the
+sandbox root as the home — `CADENCE_HOME` is deliberately *not* exported, so
+the overlap guard can read it as evidence of a real installation. A caller's
+consolidated home, system install or hosted credentials therefore never leak
+in, and every verb refuses a root
 that overlaps production's state dir, tracker, home or config dir — including
 one named by an exported `CADENCE_HOME`. `status`, `env` and the global opt-in
 gate exempt an exported dir that is exactly the sandbox's own, so a shell
