@@ -2208,7 +2208,7 @@ impl Fx {
             let mut opened = false;
             let raw = self.read_until(path, cookie, "first ping (no thread yet)", |text| {
                 let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
-                opened = body.split("\n\n").any(|frame| *frame == ": ping");
+                opened = body.split("\n\n").any(|frame| frame == ": ping");
                 opened
             });
             if raw.starts_with("HTTP/1.1 200") {
