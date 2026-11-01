@@ -601,7 +601,7 @@ jobs:
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         run: scripts/app-toolchain-acceptance.sh "$GITHUB_WORKSPACE/target/ci/cadence"
       - name: Rehearse offline hosted migration with the built CLI
-        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && needs.change-scope.outputs.binary != 'false' }}
         env:
           CADENCE_REHEARSAL_BINARY: ${{ github.workspace }}/target/ci/cadence
         run: python3 scripts/test-hosted-migration.py -v
@@ -637,7 +637,7 @@ jobs:
       # seam's own compile_error message (any other failure — a missing
       # dep, a syntax error — must not count, so grep the message).
       - name: Assert the test seam refuses a release build
-        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && needs.change-scope.outputs.binary != 'false' }}
         run: sh scripts/check-release-test-seam
       # CAD-1970: the `ui` gate's compile, run here so the release cache and
       # the Node/Bun toolchain are paid once. It runs AFTER the two seam
