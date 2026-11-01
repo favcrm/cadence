@@ -510,12 +510,17 @@ jobs:
             exit 1
           fi
           first=${invs[0]}
-          for f in "${invs[@]}"; do
-            if ! cmp -s "$first" "$f"; then
-              echo "::error::shard inventories disagree: $first vs $f" >&2
-              exit 1
-            fi
-          done
+          # CAD-1970: one shard means one inventory; comparing it with itself
+          # proves nothing, and a second copy only means an older attempt was
+          # downloaded alongside it.
+          if [ "${#invs[@]}" -gt 1 ]; then
+            for f in "${invs[@]}"; do
+              if ! cmp -s "$first" "$f"; then
+                echo "::error::shard inventories disagree: $first vs $f" >&2
+                exit 1
+              fi
+            done
+          fi
           package=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["name"])')
           # CAD-1970: each shard's junit is checked against the inventory its
           # own binaries reported, and the six inventories must together own
@@ -573,13 +578,19 @@ jobs:
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         with:
           node-version: 22
+      # CAD-1970: a PR push proves the shipping profile *checks*; the queue and
+      # main prove it *links*. Linking, packaging and the seam assertions need
+      # the built artifact, so they stay where a broken merge is caught before
+      # it lands rather than weeks later at release.
+      - run: cargo check --profile ci --locked
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name == 'pull_request' }}
       - run: cargo build --profile ci --locked
-        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
       - name: Package and clean-consumer check for the app toolchain
-        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
         run: scripts/app-toolchain-acceptance.sh "$GITHUB_WORKSPACE/target/ci/cadence"
       - name: Rehearse offline hosted migration with the built CLI
-        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
         env:
           CADENCE_REHEARSAL_BINARY: ${{ github.workspace }}/target/ci/cadence
         run: python3 scripts/test-hosted-migration.py -v
@@ -597,7 +608,7 @@ jobs:
       # the seam. The step below is the guard's own tripwire: it builds
       # the forbidden combination and asserts the compile_error fires.
       - name: Assert the ci-profile gate binary carries no test seam
-        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
         run: |
           if grep -aq 'cadence-test-seam-v1' target/ci/cadence; then
             echo "release binary contains the CAD-482 test seam" >&2
@@ -615,7 +626,7 @@ jobs:
       # seam's own compile_error message (any other failure — a missing
       # dep, a syntax error — must not count, so grep the message).
       - name: Assert the test seam refuses a release build
-        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
         run: sh scripts/check-release-test-seam
       # CAD-1970: the `ui` gate's compile, run here so the release cache and
       # the Node/Bun toolchain are paid once. It runs AFTER the two seam
@@ -1738,8 +1749,10 @@ jobs:
         include:
           - target: aarch64-linux
             runner: ubuntu-22.04-arm
+            rust_target: aarch64-unknown-linux-gnu
           - target: aarch64-macos
             runner: macos-15
+            rust_target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
@@ -1759,7 +1772,8 @@ jobs:
         if: ${{ matrix.target == 'aarch64-macos' && needs.change-scope.outputs.cross != 'false' }}
         working-directory: ui
       - run: scripts/ci-rust-toolchain --profile minimal
-        if: ${{ needs.change-scope.outputs.cross != 'false' }}
+      - run: rustup target add ${{ matrix.rust_target }}
+        if: ${{ needs.change-scope.outputs.cross != 'false' && github.event_name == 'pull_request' }}
       # Restore-only cache with both test-seam/test and default/dev dependencies.
       # Keep the epoch aligned with cache-warm-cross; only main saves it.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -1772,10 +1786,12 @@ jobs:
       # production feature shape afterward.
       # CAD-1425: the client-update refusal acceptance runs on each native
       # leg; the cfg(macos) test is the real Apple Silicon outcome.
+      - run: cargo check --locked --target ${{ matrix.rust_target }}
+        if: ${{ needs.change-scope.outputs.cross != 'false' && github.event_name == 'pull_request' }}
       - run: cargo build --locked
-        if: ${{ needs.change-scope.outputs.cross != 'false' }}
+        if: ${{ needs.change-scope.outputs.cross != 'false' && github.event_name != 'pull_request' }}
       - run: target/debug/cadence --version
-        if: ${{ needs.change-scope.outputs.cross != 'false' }}
+        if: ${{ needs.change-scope.outputs.cross != 'false' && github.event_name != 'pull_request' }}
 
   # CAD-1540: `cross-build` cannot be a required check itself — `change-scope`
   # skips it on docs-only changes, and a skipped or absent context blocks merges
