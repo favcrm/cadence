@@ -1836,6 +1836,15 @@ fn a_session_start_cuts_the_lane_from_the_named_base() {
     let lane = started["worktree"].as_str().expect("worktree");
     assert_eq!(git_out(Path::new(lane), &["rev-parse", "HEAD"]), release);
     assert_eq!(started["base"], json!("release"));
+    // The receipt says what was created, not only what was asked for.
+    assert_eq!(started["head"], json!(release));
+    assert_eq!(
+        started["branch"],
+        json!(format!(
+            "cadence/{}",
+            started["lane"].as_str().expect("lane")
+        ))
+    );
 }
 
 #[test]
