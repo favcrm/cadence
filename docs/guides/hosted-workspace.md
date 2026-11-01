@@ -70,8 +70,9 @@ model registry or nested-execution API.
 
 **Tool images.** A tool may return base64 PNG, JPEG or WebP parts alongside
 text. The runtime accepts at most four image parts and 192 KiB of encoded image
-data per result. Malformed or oversized images produce an explicit tool error;
-image bytes are retained in the conversation's private engine records for
+data per result. Invalid base64, unsupported media types or oversized parts
+produce an explicit tool error; the runtime does not decode image contents.
+Image bytes are retained in the conversation's private engine records for
 recovery, but are excluded from the board thread projection. The owner-only raw
 event stream retains the image's media type and a redacted marker, not its bytes.
 
