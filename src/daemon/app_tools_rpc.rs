@@ -1422,13 +1422,18 @@ impl Shared {
                 self.store.app_context_proof(install, context)?;
                 let records =
                     crate::store::app_records::RecordStore::open(&self.state_dir, install)?;
-                let visible = records.app_social_freshness_receipts(context)?;
+                // SOC-54: the screen's library is every retained source read of
+                // this context, not the newest per handle — a reload must show
+                // the posts an owner already fetched. Other receipt kinds stay
+                // host-side: only `social.source.posts` is a library read.
+                let visible = records.app_social_tool_receipt_ids(context)?;
                 let mut results = self.store.app_tool_results(install)?;
                 if let Some(rows) = results["results"].as_array_mut() {
                     rows.retain(|row| {
-                        row["id"]
-                            .as_str()
-                            .is_some_and(|id| visible.iter().any(|allowed| allowed == id))
+                        row["result"]["kind"].as_str() == Some("social.source.posts")
+                            && row["id"]
+                                .as_str()
+                                .is_some_and(|id| visible.iter().any(|allowed| allowed == id))
                     });
                 }
                 Ok(results)

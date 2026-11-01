@@ -1,7 +1,7 @@
 import type { Installation, AppContext, WorkspaceRun, AppEffect, AppBinding, SourceReceipt, ToolReceipt } from "../workspaceApps";
 import { PUBLISH_LIST_CAP, type PublishIntent } from "../socialPublish";
 import { ACTION_VERBS, shapeFor, type ScreenDefaults, type ScreenPublishSettings, type ScreenIntent, type ScreenIntents, type ScreenPush,
-  type ScreenRefusal, type ScreenRunV2, type ScreenSourcePost, type ScreenSources } from "./screenProtocol";
+  type ScreenRefusal, type ScreenRunV2, type ScreenSourceCollection, type ScreenSourcePost, type ScreenSources } from "./screenProtocol";
 
 /** The verified `socialPublish.list` read, tagged with the scope it was
  *  issued for. A read for any other install/context is never pushed. */
@@ -116,6 +116,8 @@ export interface ScreenExtras {
 const EXCERPT_MAX = 600;
 const RATIONALE_MAX = 280;
 const POSTS_MAX = 24;
+/** SOC-54: how many handles `sources.collections` may name (the app saves 20). */
+const LIBRARY_HANDLES_MAX = 20;
 const STEPS_MAX = 16;
 const KEYS_MAX = 16;
 /** The wire grammars the package adapter (screen-v2.mjs) checks. */
@@ -232,14 +234,16 @@ export function latestSourceRun(installation: Installation, runs: WorkspaceRun[]
     installation.capabilities?.[slot]?.effect === "read"));
   return reads.reduce<WorkspaceRun | null>((newest, run) => !newest || (run.updated ?? 0) >= (newest.updated ?? 0) ? run : newest, null);
 }
-/** One normalized source post, honestly shown (link + time) or withheld. */
-function sourcePost(post: SourceReceipt["result"]["posts"] extends (infer P)[] ? P : never, seen: Set<string>): ScreenSourcePost | null {
+/** One normalized source post, honestly shown (link + time) or withheld.
+ *  `receiptId` is the retained read that returned it (SOC-54). */
+function sourcePost(post: SourceReceipt["result"]["posts"] extends (infer P)[] ? P : never, seen: Set<string>, receiptId?: string): ScreenSourcePost | null {
   const permalink = instagramLink(post.permalink);
   const published = epoch(post.published_at_unix ?? undefined);
   if (typeof post.id !== "string" || !isId(post.id) || seen.has(post.id) || !permalink || published === null) return null;
   seen.add(post.id);
   return present({ id: post.id, caption: text(post.caption ?? "", EXCERPT_MAX), published_at: published,
-    permalink, media_kind: text(post.media_kind ?? "", 32), thumb_url: instagramThumb(post.preview_url) }) as ScreenSourcePost;
+    permalink, media_kind: text(post.media_kind ?? "", 32), thumb_url: instagramThumb(post.preview_url),
+    receipt_id: receiptId }) as ScreenSourcePost;
 }
 /** The library, or `null` (omitted: the frame shows it as unavailable)
  *  while no verified read is held. One authoritative latest source
@@ -254,16 +258,48 @@ function sourcePost(post: SourceReceipt["result"]["posts"] extends (infer P)[] ?
  *  reload — the frame always shows the posts the user last fetched,
  *  never a stale source that merely ran a workflow earlier. */
 function sourcesOf(installation: Installation, scopedRuns: WorkspaceRun[], extras: ScreenExtras | undefined): ScreenSources | null {
-  const postsFrom = (posts: SourceReceipt["result"]["posts"] | undefined) => {
+  const postsFrom = (posts: SourceReceipt["result"]["posts"] | undefined, receiptId?: string) => {
     const seen = new Set<string>();
     const out: ScreenSourcePost[] = [];
     for (const post of list(posts)) {
       if (out.length >= POSTS_MAX) break;
-      const row = sourcePost(post, seen);
+      const row = sourcePost(post, seen, receiptId);
       if (row) out.push(row);
     }
     return out;
   };
+  // Every retained standalone read this install owns, newest first. Only a
+  // read-effect slot qualifies: a send/publish receipt never feeds the
+  // library.
+  const retainedReads = () => extras?.tools
+    ? extras.tools
+      .filter(r => r.install_id === installation.install_id && installation.capabilities?.[r.slot]?.effect === "read" &&
+        r.result?.kind === "social.source.posts" && typeof r.result.handle === "string" && HANDLE.test(r.result.handle))
+      .sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0))
+    : [];
+  /** SOC-54: the library as every retained read built it, grouped by handle.
+   *  A newer page wins for a post it repeats; an older read still contributes
+   *  the posts it proved and the rest of the page list, so a reload shows more
+   *  than the last fetch. Bounded per handle and in handle count. Run-bound
+   *  reads stay out: a draft from one is a `run` source, which `sources` names. */
+  const reads = retainedReads();
+  const collections = (): ScreenSourceCollection[] => {
+    const byHandle = new Map<string, ScreenSourceCollection>();
+    for (const read of reads) {
+      const handle = (read.result.handle as string).replace(/^@/, "").toLowerCase();
+      const entry = byHandle.get(handle) ?? { handle, fetched_at: epoch(read.created_at) ?? undefined, tool_receipt_id: read.id, posts: [] };
+      const seen = new Set(entry.posts.map(post => post.id));
+      for (const row of postsFrom(read.result.posts, read.id)) {
+        if (entry.posts.length >= POSTS_MAX) break;
+        if (seen.has(row.id)) continue;
+        seen.add(row.id);
+        entry.posts.push(row);
+      }
+      byHandle.set(handle, entry);
+    }
+    return [...byHandle.values()].slice(0, LIBRARY_HANDLES_MAX);
+  };
+  const library = collections();
   // The run-bound read candidate (keys on the run's finished time).
   const latest = latestSourceRun(installation, scopedRuns);
   const runReceipt = latest && extras?.source && extras.source.runId === latest.id
@@ -273,21 +309,17 @@ function sourcesOf(installation: Installation, scopedRuns: WorkspaceRun[], extra
     ? { handle: runReceipt.result.handle, run: latest, when: epoch(latest.updated), posts: postsFrom(runReceipt.result.posts) }
     : null;
   // The standalone retained-read candidate (keys on receipt created_at).
-  const toolRead = extras?.tools
-    ? extras.tools
-      .filter(r => r.install_id === installation.install_id && installation.capabilities?.[r.slot]?.effect === "read" &&
-        r.result?.kind === "social.source.posts" && typeof r.result.handle === "string" && HANDLE.test(r.result.handle))
-      .sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0))[0] ?? null
-    : null;
+  const toolRead = reads[0] ?? null;
   // Authoritative latest across both: the read that finished most
   // recently. Tie goes to the run read (durable, review-anchored).
   const useTool = toolRead && (!runRead || (toolRead.created_at ?? 0) > (runRead.when ?? 0));
+  const spelled = library.length ? { collections: library } : {};
   if (useTool && toolRead) {
     return present({ handle: toolRead.result.handle as string, tool_receipt_id: toolRead.id,
-      fetched_at: epoch(toolRead.created_at), posts: postsFrom(toolRead.result.posts) }) as ScreenSources;
+      fetched_at: epoch(toolRead.created_at), posts: postsFrom(toolRead.result.posts, toolRead.id), ...spelled }) as ScreenSources;
   }
   if (runRead) {
-    return present({ handle: runRead.handle, run_id: runRead.run.id, fetched_at: runRead.when, posts: runRead.posts }) as ScreenSources;
+    return present({ handle: runRead.handle, run_id: runRead.run.id, fetched_at: runRead.when, posts: runRead.posts, ...spelled }) as ScreenSources;
   }
   return null;
 }
