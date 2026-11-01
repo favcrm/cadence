@@ -423,9 +423,9 @@ fn parse_assignment(value: &Value) -> Result<Assignment> {
         .as_object()
         .filter(|object| {
             required.iter().all(|key| object.contains_key(*key))
-                && object
-                    .keys()
-                    .all(|key| required.contains(&key.as_str()) || key == "references")
+                && object.keys().all(|key| {
+                    required.contains(&key.as_str()) || key == "references" || key == "profile_id"
+                })
         })
         .ok_or_else(|| Error::rejected("coordination response is not the assignment contract"))?;
     if object.get("version").and_then(Value::as_str) != Some(VERSION) {
@@ -460,6 +460,16 @@ fn parse_assignment(value: &Value) -> Result<Assignment> {
         return Err(Error::rejected(
             "coordination response has an invalid assignment",
         ));
+    }
+    if let Some(profile) = object.get("profile_id") {
+        let valid = profile
+            .as_str()
+            .is_some_and(|value| prefixed_id(value, "ap_"));
+        if !valid {
+            return Err(Error::rejected(
+                "coordination response has an invalid profile id",
+            ));
+        }
     }
     if object["execution"].as_str() != Some("local") {
         return Err(Error::invalid(
@@ -966,19 +976,42 @@ impl<H: CoordHttp> Coordinator<H> {
     /// profile, so the board can tell the two apart and refuse a report from
     /// the wrong holder.
     fn claim_as(&mut self, assignment: &Assignment, client_agent_id: &str) -> Result<Assignment> {
+        self.claim_with_profile(assignment, client_agent_id, None)
+    }
+
+    /// Claim naming the profile the session runs under. The profile is
+    /// descriptive: the board still authorizes the human subject, the target
+    /// and this generation, and a claim made without one keeps the existing
+    /// registered-agent rule.
+    fn claim_with_profile(
+        &mut self,
+        assignment: &Assignment,
+        client_agent_id: &str,
+        profile: Option<&str>,
+    ) -> Result<Assignment> {
         self.remember_discovered(assignment)?;
-        let body = json!({
+        let mut body = json!({
             "version": VERSION,
             "organization_id": self.org_id,
             "expected_generation": assignment.generation,
             "client_agent_id": client_agent_id,
         });
+        if let Some(profile) = profile {
+            body["profile_id"] = json!(profile);
+        }
         let value = self.exchange(
             "POST",
             &format!("{}/{}/claim", self.base(), assignment.assignment_id),
             Some(&body),
         )?;
         let claimed = self.parse_owned(&value)?;
+        if profile
+            .is_some_and(|profile| value.get("profile_id").and_then(Value::as_str) != Some(profile))
+        {
+            return Err(Error::rejected(
+                "claim response did not record the profile this claim named",
+            ));
+        }
         if claimed.assignment_id != assignment.assignment_id
             || claimed.generation != assignment.generation
             || claimed.issue_id != assignment.issue_id
@@ -1850,7 +1883,7 @@ impl<H: CoordHttp> Coordinator<H> {
             }
             ready.clone()
         } else {
-            self.claim_as(&ready, &client)?
+            self.claim_with_profile(&ready, &client, Some(profile))?
         };
         if self.claim_already_ended(&claimed)? {
             return Err(Error::invalid(
