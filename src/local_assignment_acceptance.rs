@@ -468,6 +468,16 @@ fn private_dir() -> TempDir {
     dir
 }
 
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("git");
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let output = std::process::Command::new("git")
         .current_dir(dir)
@@ -1737,7 +1747,7 @@ fn a_session_claim_names_the_profile_it_runs_under() {
     let mut coord = open(&script, auth.path());
 
     coord
-        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None)
         .expect("session start");
 
     let claim = script
@@ -1753,6 +1763,37 @@ fn a_session_claim_names_the_profile_it_runs_under() {
     assert_eq!(script.row(&mine).0, "running");
 }
 
+/// CAD-1976: the lane must come from the base the caller names, not from
+/// whatever the checkout happens to point at.
+#[test]
+fn a_session_start_cuts_the_lane_from_the_named_base() {
+    let auth = private_dir();
+    let repo = private_dir();
+    git(repo.path(), &["init", "-b", "main"]);
+    fs::write(repo.path().join("README"), "main\n").expect("readme");
+    git(repo.path(), &["add", "README"]);
+    git(repo.path(), &["commit", "-m", "main base"]);
+    git(repo.path(), &["checkout", "-b", "release"]);
+    fs::write(repo.path().join("release"), "release\n").expect("release");
+    git(repo.path(), &["add", "release"]);
+    git(repo.path(), &["commit", "-m", "release work"]);
+    let release = git_out(repo.path(), &["rev-parse", "HEAD"]);
+    git(repo.path(), &["checkout", "main"]);
+
+    let mut board = Board::empty();
+    board.seed("start", "waiting", None, ME);
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+
+    let started = coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE, Some("release"))
+        .expect("session start from a named base");
+
+    let lane = started["worktree"].as_str().expect("worktree");
+    assert_eq!(git_out(Path::new(lane), &["rev-parse", "HEAD"]), release);
+    assert_eq!(started["base"], json!("release"));
+}
+
 #[test]
 fn profile_session_start_claims_only_its_own_issue() {
     let auth = private_dir();
@@ -1766,7 +1807,7 @@ fn profile_session_start_claims_only_its_own_issue() {
     let mut coord = open(&script, auth.path());
 
     let started = coord
-        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None)
         .expect("session start");
 
     assert_eq!(started["state"], "running");
@@ -1798,7 +1839,7 @@ fn profile_session_start_refuses_a_claim_another_worker_holds() {
     let mut coord = open(&script, auth.path());
 
     let refused = coord
-        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None)
         .expect_err("a foreign claim is not replaced");
 
     assert_eq!(refused.code(), Some("fenced"));
@@ -1823,7 +1864,7 @@ fn profile_session_can_report_its_own_claim_without_a_kickoff() {
     let script = Script::new(board);
     let mut coord = open(&script, auth.path());
     coord
-        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None)
         .expect("session start");
 
     let reported = coord
@@ -1834,7 +1875,7 @@ fn profile_session_can_report_its_own_claim_without_a_kickoff() {
     assert_eq!(script.row(&mine).0, "blocked");
     // A retry replays the same claim rather than opening another one.
     let again = coord
-        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None)
         .expect("retry");
     assert_eq!(again["claim_id"], reported["claim_id"]);
 }
@@ -1849,7 +1890,7 @@ fn a_retired_session_claim_cannot_report_the_next_holders_claim() {
     let script = Script::new(board);
     let mut coord = open(&script, auth.path());
     coord
-        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None)
         .expect("session start");
 
     // The board moves the assignment to a different holder.
@@ -1868,7 +1909,7 @@ fn a_retired_session_claim_cannot_report_the_next_holders_claim() {
     // Observing that row retires the session marker, and the start itself
     // refuses the claim it no longer holds.
     let foreign = coord
-        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None)
         .expect_err("a foreign claim is not adopted");
     assert_eq!(foreign.code(), Some("fenced"));
 
@@ -1899,7 +1940,7 @@ fn a_claim_that_could_not_open_a_lane_is_still_reportable() {
     let mut coord = open(&script, auth.path());
 
     coord
-        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None)
         .expect_err("the lane cannot be opened");
     assert_eq!(script.row(&mine).0, "running");
 
@@ -1923,7 +1964,7 @@ fn a_former_session_cannot_report_a_replacement_sessions_claim() {
     let mut former = open(&script, former_auth.path());
     let mut replacement = open(&script, replacement_auth.path());
     let first = former
-        .start_session(ISSUE, repo.path(), Some("former"), PROFILE)
+        .start_session(ISSUE, repo.path(), Some("former"), PROFILE, None)
         .expect("first session claims the assignment");
 
     // Model an external reassignment to the same member: the board retires
@@ -1946,6 +1987,7 @@ fn a_former_session_cannot_report_a_replacement_sessions_claim() {
             repo.path(),
             Some("replacement"),
             "ap_00000000-0000-4000-8000-00000000beef",
+            None,
         )
         .expect("replacement session acquires its own claim");
     assert_ne!(next["claim_id"], first["claim_id"]);
@@ -1959,7 +2001,7 @@ fn a_former_session_cannot_report_a_replacement_sessions_claim() {
     let calls_before_refusal = script.calls().len();
 
     let refused = former
-        .start_session(ISSUE, repo.path(), Some("former"), PROFILE)
+        .start_session(ISSUE, repo.path(), Some("former"), PROFILE, None)
         .expect_err("observing a replacement claim cannot adopt it");
     assert_eq!(refused.code(), Some("fenced"));
     let observed = former.status().expect("current assignment is observable");

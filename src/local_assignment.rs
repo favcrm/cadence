@@ -1536,8 +1536,8 @@ impl<H: CoordHttp> Coordinator<H> {
         })?;
         let opened = match pinned {
             Some(path) => worktree::main_root(Path::new(&path))
-                .and_then(|original_root| ensure_lane(&original_root, &lane)),
-            None => ensure_lane(root, &lane),
+                .and_then(|original_root| ensure_lane(&original_root, &lane, None)),
+            None => ensure_lane(root, &lane, None),
         };
         let dir = match opened {
             Ok(dir) => dir,
@@ -1855,6 +1855,7 @@ impl<H: CoordHttp> Coordinator<H> {
         repo: &Path,
         name: Option<&str>,
         profile: &str,
+        base_ref: Option<&str>,
     ) -> Result<Value> {
         self.ensure_active()?;
         if !prefixed_id(profile, "ap_") {
@@ -1912,7 +1913,7 @@ impl<H: CoordHttp> Coordinator<H> {
             Ok(())
         })?;
         let lane = self.lane_for(&claimed, name)?;
-        let dir = ensure_lane(&root, &lane)?;
+        let dir = ensure_lane(&root, &lane, base_ref)?;
         let path = dir.display().to_string();
         self.with_ledger(|ledger| {
             for attempt in ledger.attempts.values_mut() {
@@ -1924,7 +1925,7 @@ impl<H: CoordHttp> Coordinator<H> {
             }
             Ok(())
         })?;
-        Ok(json!({
+        let mut receipt = json!({
             "version": VERSION,
             "assignment_id": claimed.assignment_id,
             "issue_id": claimed.issue_id,
@@ -1941,7 +1942,11 @@ impl<H: CoordHttp> Coordinator<H> {
                 "code": "report_from_this_session",
                 "text": "This session holds the claim. Report with `cadence local-agent report <assignment> --state running|blocked|failed|result`; no local agent was connected.",
             },
-        }))
+        });
+        if let Some(base) = base_ref {
+            receipt["base"] = json!(base);
+        }
+        Ok(receipt)
     }
 
     pub fn connect<F>(
@@ -2359,7 +2364,7 @@ fn explain_409(body: &Value) -> Error {
     }
 }
 
-fn ensure_lane(root: &Path, lane: &str) -> Result<PathBuf> {
+fn ensure_lane(root: &Path, lane: &str, base_ref: Option<&str>) -> Result<PathBuf> {
     let dir = layout::worktree_dir(root, lane);
     if fs::symlink_metadata(&dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err(Error::rejected(
@@ -2382,7 +2387,7 @@ fn ensure_lane(root: &Path, lane: &str) -> Result<PathBuf> {
             "a local lane directory exists on a different branch; no second checkout was created",
         ));
     }
-    match worktree::create_worktree(root, lane) {
+    match worktree::create_worktree_on(root, lane, base_ref) {
         Ok(dir) => Ok(dir),
         Err(error) => {
             if dir.is_dir() {

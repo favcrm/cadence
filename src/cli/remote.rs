@@ -1606,9 +1606,10 @@ pub(super) fn run(
             || *force
             || by.is_some()
             || take_over.is_some()
+            || (base.is_some() && profile.is_none())
         {
             return Err(Error::usage(
-                "hosted issue start accepts --repo, --name and --profile only. It claims this issue for this session and does not open a job. Nothing was sent.",
+                "hosted issue start accepts --repo, --name, --profile and --base (with --profile). It claims this issue for this session and does not open a job. Nothing was sent.",
             ));
         }
         return local_agent::start(
@@ -1617,6 +1618,7 @@ pub(super) fn run(
             repo.as_deref(),
             name.as_deref(),
             profile.as_deref(),
+            base.as_deref(),
             wake_timeout,
             local_state,
         );

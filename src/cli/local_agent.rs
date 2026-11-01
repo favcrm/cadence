@@ -253,12 +253,14 @@ pub(super) fn dispatch(target: &RemoteTarget, issue: &str, to: &str) -> Result<i
     finish(&coordinator(target)?.dispatch(issue, Some(to))?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn start(
     target: &RemoteTarget,
     id: &str,
     repo: Option<&Path>,
     name: Option<&str>,
     profile: Option<&str>,
+    base: Option<&str>,
     wake_timeout: u64,
     local_state: Option<PathBuf>,
 ) -> Result<i32> {
@@ -271,7 +273,12 @@ pub(super) fn start(
         // CAD-1964: the caller is the actor, so this claims under the
         // profile's session id and opens the lane without a local alias,
         // a daemon handoff or any other waiting assignment.
-        return finish(&coordinator(target)?.start_session(id, repo, name, profile)?);
+        return finish(&coordinator(target)?.start_session(id, repo, name, profile, base)?);
+    }
+    if base.is_some() {
+        return Err(Error::usage(
+            "hosted issue start accepts --base only with --profile; the alias path uses the              project's own base. Nothing was sent",
+        ));
     }
     let mut deliver =
         |kickoff: &Kickoff| deliver_kickoff(target, local_state.clone(), kickoff, wake_timeout);
