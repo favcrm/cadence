@@ -825,12 +825,12 @@ impl RecordStore {
     pub fn app_social_tool_receipt_contains(&self, context: &str, receipt: &str) -> Result<bool> {
         Ok(self.conn().query_row("SELECT EXISTS(SELECT 1 FROM app_social_tool_receipts WHERE install_id=? AND context_id=? AND receipt_id=?)",params![self.install(),context,receipt],|r|r.get(0))?)
     }
-    pub fn app_social_freshness_contains(&self, context: &str, receipt: &str) -> Result<bool> {
-        Ok(self.conn().query_row("SELECT EXISTS(SELECT 1 FROM app_social_freshness WHERE install_id=? AND context_id=? AND receipt_id=?)",params![self.install(),context,receipt],|r|r.get(0))?)
-    }
-    pub fn app_social_freshness_receipts(&self, context: &str) -> Result<Vec<String>> {
+    /// SOC-54: every tool receipt retained by this context, newest first.
+    /// The screen's library needs the whole retained history — one newest
+    /// receipt per handle cannot rebuild the posts an owner already fetched.
+    pub fn app_social_tool_receipt_ids(&self, context: &str) -> Result<Vec<String>> {
         let conn = self.conn();
-        let rows=conn.prepare("SELECT receipt_id FROM app_social_freshness WHERE install_id=? AND context_id=? ORDER BY completed_at DESC,handle LIMIT 20")?
+        let rows=conn.prepare("SELECT receipt_id FROM app_social_tool_receipts WHERE install_id=? AND context_id=? ORDER BY completed_at DESC,receipt_id DESC LIMIT 100")?
             .query_map(params![self.install(), context], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)

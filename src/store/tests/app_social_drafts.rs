@@ -130,14 +130,25 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
     store
         .app_social_freshness_save("ctx-one", "kiva.wood", "receipt-stale", 12.0)
         .unwrap();
+    store
+        .app_social_tool_receipt_attach("ctx-one", "receipt-new", 20.0)
+        .unwrap();
+    store
+        .app_social_tool_receipt_attach("ctx-one", "receipt-old", 10.0)
+        .unwrap();
+    store
+        .app_social_tool_receipt_attach("ctx-two", "receipt-other", 15.0)
+        .unwrap();
+    // SOC-54: the library reads the context's whole retained history, newest
+    // first, and never another context's receipts.
     assert_eq!(
-        store.app_social_freshness_receipts("ctx-one").unwrap(),
-        vec!["receipt-new", "receipt-other"]
+        store.app_social_tool_receipt_ids("ctx-one").unwrap(),
+        vec!["receipt-new", "receipt-old"]
     );
-    assert!(store
-        .app_social_freshness_receipts("ctx-two")
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        store.app_social_tool_receipt_ids("ctx-two").unwrap(),
+        vec!["receipt-other"]
+    );
 }
 
 #[test]

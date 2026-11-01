@@ -407,6 +407,20 @@ export interface ScreenSourcePost {
   /** https URL on the Instagram CDN. Only a screen whose declaration opts
    *  into `remote_images: ["instagram-cdn"]` may load it (frame CSP). */
   thumb_url?: string;
+  /** SOC-54: the retained read receipt that returned this post. A library
+   *  keeps posts from earlier reads, so provenance is a per-post fact; the
+   *  collection's `tool_receipt_id` only names the read behind `sources`
+   *  itself. Omitted when the host cannot state it. */
+  receipt_id?: string;
+}
+/** SOC-54: one retained read, grouped by the handle it read. `sources`
+ *  stays the single newest read (what an older app renders); `collections`
+ *  carries every retained standalone read, so a reload shows the library the
+ *  owner built instead of only the last page. Run-bound reads are not listed
+ *  here: a draft from them is a `run` source, which `sources` already names. */
+export interface ScreenSourceCollection {
+  handle: string; fetched_at?: number; tool_receipt_id?: string;
+  posts: ScreenSourcePost[];
 }
 export interface ScreenSources {
   handle: string; fetched_at?: number;
@@ -417,6 +431,9 @@ export interface ScreenSources {
    *  invocation (CAD-1177) — the retained app_tool receipt id, distinct
    *  from any run id. A screen keys refresh/edit to this, never a run. */
   tool_receipt_id?: string;
+  /** SOC-54: every retained standalone read of this install, newest first,
+   *  bounded by the host. Absent when the host cannot enumerate them. */
+  collections?: ScreenSourceCollection[];
 }
 export interface ScreenPublishSettings {
   revision: number;
