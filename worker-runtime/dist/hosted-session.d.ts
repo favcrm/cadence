@@ -73,8 +73,45 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
      * Bind one operation to the exact text and app scope it was admitted with,
      * and return the stored envelope. A changed text or scope throws here, before
      * the engine sees the id, so a repeated id can never reuse another turn.
+     *
+     * An id this session never admitted may still be the engine's, from a build
+     * that predates the guard, so the engine's own records are read first and
+     * passed with the envelope: the guard adopts a legacy operation only as the
+     * Home envelope those records prove, and refuses anything else.
      */
     private admitOperation;
+    /**
+     * What the engine's own records prove about an operation id this guard has no
+     * envelope for: `null` when it holds nothing for it, otherwise the submission
+     * type, the exact text and the entry metadata the guard needs to recognise a
+     * legacy Home operation it may adopt.
+     *
+     * A placed input keeps its text and metadata in the entry it was placed as. A
+     * queued one has no entry yet, so its draft is read from the engine's own
+     * inbox document. That read awaits, and the engine may place the input and
+     * drop the draft while it does — one commit, so the draft is gone exactly
+     * when the submission has become placed. An absent draft is therefore re-read
+     * once from the submission itself, never in a loop, and recovered from the
+     * entry it now names; only a record that proves neither is left proving
+     * nothing, and the guard refuses it. A submission that is not an input, and a
+     * record the engine cannot produce, also yield evidence that proves nothing.
+     * Reading a record the engine cannot parse throws, so an unreadable id is
+     * refused rather than assumed free.
+     */
+    private engineEvidence;
+    /**
+     * The evidence one stored submission proves: its type, the exact text and the
+     * entry metadata, when the engine placed an entry for it. A submission with
+     * no entry proves no text here, which its caller refuses.
+     */
+    private placedEvidence;
+    /**
+     * The draft one queued input waits in the engine's inbox with, or `null` when
+     * the inbox does not hold it. `content` is the exact text it was submitted
+     * with and `entry` the metadata it will be placed as, so both are the
+     * engine's own record of the operation rather than anything a caller sent.
+     */
+    private queuedInput;
     /**
      * The durable input entry an operation is placed as. The recorded message id
      * and the admitted app scope travel with the entry, so the transcript, a

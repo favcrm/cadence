@@ -21,8 +21,11 @@ import type {
 import {
   createRegistry,
   Harness,
+  InboxDoc,
   LiveDoc,
   MemoryStorage,
+  ROOT_CONVERSATION_ID,
+  type JsonObject,
 } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import {
@@ -47,7 +50,8 @@ import {
 /**
  * CAD-1953: one operation id keeps the full envelope it was admitted with —
  * the text and the host-verified app scope — and the runtime never adopts
- * engine work it did not admit itself.
+ * engine work as a caller's envelope. A legacy operation is adopted only as the
+ * Home envelope the engine's own records prove.
  *
  * The engine deduplicates by request id alone: a repeated id returns its
  * existing submission after comparing the submission *type*, never its text or
@@ -59,16 +63,19 @@ import {
  *
  * Two upgrade edges are part of the contract:
  * - A submission made before the guard existed has engine state but no guard
- *   row. A later turn with the same operation id must not be accepted as a new
- *   scoped replay of that legacy work, queued or settled.
+ *   row. The engine's own records are the only authority for what it was, so an
+ *   identical Home retry is adopted as exactly the text and metadata those
+ *   records prove and replays, queued or settled; a changed text, any app
+ *   scope, another submission type or a record that proves nothing is refused
+ *   before the engine is asked.
  * - A stored record that can no longer be read as the envelope it was admitted
  *   with fails closed instead of being matched.
  *
  * What this file proves: the real `HostedSession.submit`/`ask` call the guard
- * before the engine and refuse these cases; the guard's durable semantics on
- * real SQLite; and the real engine's queue/replay behaviour, both on
- * `MemoryStorage` and on the session's own SQLite where the guard reads the
- * engine's `pi_` tables.
+ * before the engine, admit a proven legacy Home replay and refuse every other
+ * upgrade case; the guard's durable semantics on real SQLite; and the real
+ * engine's queue/replay behaviour, both on `MemoryStorage` and on the session's
+ * own SQLite where the guard reads the engine's `pi_` tables.
  *
  * What this file does NOT prove: the Durable Object construction and lifecycle
  * around `HostedSession`. This repository has no Workers runtime rig — no
@@ -186,15 +193,16 @@ function systemTextOf(messages: readonly Message[]): string {
  * generation task calls through `Models.streamSimple`. By default the first
  * request opens a gate, so a test can submit another turn while the first one
  * is running and observe pi's queue instead of racing it; `gate: false` replies
- * at once. Every request's system context and user turn are recorded, so a test
- * reads the context the runtime actually injected.
+ * at once, and `hold()` opens a fresh gate for the next request after earlier
+ * ones were released. Every request's system context and user turn are
+ * recorded, so a test reads the context the runtime actually injected.
  */
 function scriptedModels(
   reply: string | ((observation: ScopeObservation) => AssistantMessage),
   options: { gate?: boolean } = {},
 ) {
-  const started = Promise.withResolvers<void>();
-  const blocked = Promise.withResolvers<void>();
+  let started = Promise.withResolvers<void>();
+  let blocked = Promise.withResolvers<void>();
   const observations: ScopeObservation[] = [];
   const requests: string[] = [];
   const respond = (context: { messages: readonly Message[] }) => {
@@ -235,8 +243,20 @@ function scriptedModels(
     models,
     observations,
     requests,
-    started: started.promise,
+    /** Resolves when the current gate's request has been observed. */
+    get started() {
+      return started.promise;
+    },
     release: () => blocked.resolve(),
+    /**
+     * Replace the resolved gate with a fresh one for the next request, and
+     * return the promise that resolves when that request is observed.
+     */
+    hold: () => {
+      blocked = Promise.withResolvers<void>();
+      started = Promise.withResolvers<void>();
+      return started.promise;
+    },
   };
 }
 
@@ -388,21 +408,32 @@ function corruptStoredRecord(database: Database): void {
 }
 
 /**
- * The real `HostedSession` prototype over a stubbed engine. The platform base
+ * The real `HostedSession` prototype over an engine adapter. The platform base
  * is stubbed above because `bun test` cannot load `cloudflare:workers`; the
- * methods under test are the runtime's own, and `operationScopes` is the guard
- * the session holds.
+ * methods under test are the runtime's own, `operationScopes` is the guard the
+ * session holds, and `ctx.storage.sql` is where the session reads the engine's
+ * records. One case supplies an adapter over the real engine.
  */
 async function sessionOver(
   engine: {
     submit(
       text: string,
-      options: { operationId: string },
+      options: {
+        operationId: string;
+        entry?: { kind: string; data: JsonObject };
+      },
     ): Promise<{ accepted: boolean; operationId: string }>;
     prompt(
       text: string,
-      options: { operationId: string },
-    ): Promise<{ status: "done"; text: string; operationId: string }>;
+      options: {
+        operationId: string;
+        entry?: { kind: string; data: JsonObject };
+      },
+    ): Promise<{
+      status: "done" | "unanswered";
+      text: string | undefined;
+      operationId: string;
+    }>;
     pending?(): Promise<
       readonly {
         operationId: string;
@@ -410,8 +441,11 @@ async function sessionOver(
         status: "queued" | "running" | "parked";
       }[]
     >;
+    /** The engine's document API, used only to read a queued draft. */
+    pi?(): Promise<unknown>;
   },
   operationScopes: OperationScopes,
+  sql: OperationScopeSql,
 ) {
   // Static import would be hoisted above the `cloudflare:workers` mock and
   // fail to resolve; the platform module does not exist under `bun test`.
@@ -419,10 +453,13 @@ async function sessionOver(
   return Object.assign(Object.create(HostedSession.prototype), {
     options: {},
     operationScopes,
+    // The session reads the engine's own records for an id it never admitted,
+    // exactly as it does through a Durable Object's SQL storage.
+    ctx: { storage: { sql } },
     // The engine stub always answers `pending`; a case that models pre-upgrade
     // queued work supplies its own.
     harness: { pending: async () => [], ...engine },
-  }) as InstanceType<typeof HostedSession>;
+  }) as unknown as InstanceType<typeof HostedSession>;
 }
 
 describe("HostedSession admission", () => {
@@ -444,6 +481,7 @@ describe("HostedSession admission", () => {
         },
       },
       scopes,
+      sqlStore(database),
     );
     try {
       expect(
@@ -498,6 +536,7 @@ describe("HostedSession admission", () => {
         },
       },
       scopes,
+      sqlStore(database),
     );
     try {
       expect(
@@ -515,97 +554,517 @@ describe("HostedSession admission", () => {
     }
   });
 
-  it("refuses engine work the guard never admitted, queued or settled", async () => {
-    const { database } = sessionDatabase();
-    const scripted = scriptedModels("acknowledged");
-    const storage = await SqliteStorage.open(sqliteFacade(database), {
-      prefix: "pi_",
-    });
-    const harness = await Harness.open(
-      storage,
-      { models: scripted.models, registry: createRegistry() },
-      BACKGROUND_CONTEXT,
-    );
-    try {
-      // Pre-upgrade state: the engine stores these submissions in the session
-      // SQLite, and the guard table does not exist yet.
-      const conversation = await harness.root(BACKGROUND_CONTEXT, {
-        agent: { model: { provider: "scripted", modelId: "scripted" } },
+  it(
+    "adopts a proven pre-upgrade Home operation, queued or settled, and refuses anything else",
+    async () => {
+      const { database } = sessionDatabase();
+      const scripted = scriptedModels("acknowledged");
+      const storage = await SqliteStorage.open(sqliteFacade(database), {
+        prefix: "pi_",
       });
-      const running = await conversation.submit(
-        { type: "input", requestId: "op-running", content: "reconcile invoices" },
+      const harness = await Harness.open(
+        storage,
+        { models: scripted.models, registry: createRegistry() },
         BACKGROUND_CONTEXT,
       );
-      await scripted.started;
-      const queued = await conversation.submit(
-        {
-          type: "input",
-          requestId: "op-legacy-queued",
-          content: "reconcile invoices",
-        },
-        BACKGROUND_CONTEXT,
-      );
-      scripted.release();
-      expect((await running.wait(BACKGROUND_CONTEXT)).status).toBe("done");
-      expect((await queued.wait(BACKGROUND_CONTEXT)).status).toBe("done");
-      const settled = await conversation.submit(
-        {
-          type: "input",
-          requestId: "op-legacy-settled",
-          content: "reconcile invoices",
-        },
-        BACKGROUND_CONTEXT,
-      );
-      expect((await settled.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      try {
+        // Pre-upgrade state: the guard table does not exist yet, and these
+        // inputs reach the engine with the board's Home entry. The settled
+        // operations run at once; the queued one arrives while another turn is
+        // held, so the engine still stores it only as an inbox draft.
+        const conversation = await harness.root(BACKGROUND_CONTEXT, {
+          agent: { model: { provider: "scripted", modelId: "scripted" } },
+        });
 
-      // Only now does the guard exist, over the same SQLite the engine wrote.
-      const scopes = new OperationScopes(sqlStore(database));
-      const calls: string[] = [];
-      const session = await sessionOver(
-        {
-          submit: async (text, options) => {
-            calls.push(options.operationId);
-            return { accepted: true, operationId: options.operationId };
+        const settled = await conversation.submit(
+          {
+            type: "input",
+            requestId: "op-legacy-settled",
+            content: "reconcile invoices",
+            entry: operationEntry("op-legacy-settled"),
           },
-          prompt: async () => {
-            throw new Error("ask is not part of this case");
+          BACKGROUND_CONTEXT,
+        );
+        await scripted.started;
+        scripted.release();
+        expect((await settled.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+
+        // Records a correct pre-upgrade build could not have written, and
+        // records that prove nothing: an app-scoped entry, a mismatched
+        // message id, an unknown field, and a passive write under an input id.
+        const legacyApp = await conversation.submit(
+          {
+            type: "input",
+            requestId: "op-legacy-app",
+            content: "ledger question",
+            entry: operationEntry("op-legacy-app", LEDGER),
           },
-        },
-        scopes,
+          BACKGROUND_CONTEXT,
+        );
+        await legacyApp.wait(BACKGROUND_CONTEXT);
+        const mismatch = await conversation.submit(
+          {
+            type: "input",
+            requestId: "op-legacy-mismatch",
+            content: "reconcile invoices",
+            entry: {
+              kind: BOARD_MESSAGE_KIND,
+              data: { messageId: "op-legacy-other" },
+            },
+          },
+          BACKGROUND_CONTEXT,
+        );
+        await mismatch.wait(BACKGROUND_CONTEXT);
+        const extraField = await conversation.submit(
+          {
+            type: "input",
+            requestId: "op-legacy-extra",
+            content: "reconcile invoices",
+            entry: {
+              kind: BOARD_MESSAGE_KIND,
+              data: { messageId: "op-legacy-extra", authority: "owner" },
+            },
+          },
+          BACKGROUND_CONTEXT,
+        );
+        await extraField.wait(BACKGROUND_CONTEXT);
+        const legacyWrite = await conversation.submit(
+          {
+            type: "write",
+            requestId: "op-legacy-write",
+            entry: { kind: "board.note", data: { note: "legacy" } },
+          },
+          BACKGROUND_CONTEXT,
+        );
+        await legacyWrite.wait(BACKGROUND_CONTEXT);
+
+        // Hold the next turn, so the queued legacy input stays a draft while
+        // the guard is created and the replay is attempted.
+        const runningStarted = scripted.hold();
+        const running = await conversation.submit(
+          {
+            type: "input",
+            requestId: "op-running",
+            content: "hold the run",
+            entry: operationEntry("op-running"),
+          },
+          BACKGROUND_CONTEXT,
+        );
+        await runningStarted;
+        const queued = await conversation.submit(
+          {
+            type: "input",
+            requestId: "op-legacy-queued",
+            content: "reconcile invoices",
+            entry: operationEntry("op-legacy-queued"),
+          },
+          BACKGROUND_CONTEXT,
+        );
+        expect((await queued.status(BACKGROUND_CONTEXT)).status).toBe("queued");
+
+        // Only now does the guard exist, over the same SQLite the engine wrote.
+        // The engine adapter is the real one: it deduplicates by request id and
+        // waits on the real submission, exactly as the production harness does.
+        const scopes = new OperationScopes(sqlStore(database));
+        const calls: string[] = [];
+        const session = await sessionOver(
+          {
+            submit: async (text, options) => {
+              calls.push(options.operationId);
+              const existing = await storage.submissionByRequest(
+                conversation.id,
+                options.operationId,
+                BACKGROUND_CONTEXT,
+              );
+              await conversation.submit(
+                {
+                  type: "input",
+                  content: text,
+                  requestId: options.operationId,
+                  ...(options.entry === undefined
+                    ? {}
+                    : { entry: options.entry }),
+                },
+                BACKGROUND_CONTEXT,
+              );
+              return {
+                accepted: existing === undefined,
+                operationId: options.operationId,
+              };
+            },
+            prompt: async (text, options) => {
+              calls.push(options.operationId);
+              const submission = await conversation.submit(
+                {
+                  type: "input",
+                  content: text,
+                  requestId: options.operationId,
+                  ...(options.entry === undefined
+                    ? {}
+                    : { entry: options.entry }),
+                },
+                BACKGROUND_CONTEXT,
+              );
+              const settled = await submission.wait(BACKGROUND_CONTEXT);
+              if (settled.status !== "done")
+                return {
+                  status: "unanswered",
+                  text: undefined,
+                  operationId: options.operationId,
+                };
+              if (settled.type !== "input")
+                return {
+                  status: "done",
+                  text: undefined,
+                  operationId: options.operationId,
+                };
+              const answer = (
+                await conversation.entries(
+                  { minEntryId: settled.answer, maxEntryId: settled.answer },
+                  1,
+                  undefined,
+                  BACKGROUND_CONTEXT,
+                )
+              ).items[0];
+              const message = answer?.model?.[0];
+              let replyText: string | undefined;
+              if (message !== undefined && message.role === "assistant")
+                replyText = message.content
+                  .flatMap((part) => (part.type === "text" ? [part.text] : []))
+                  .join("");
+              return {
+                status: "done",
+                text: replyText,
+                operationId: options.operationId,
+              };
+            },
+            // The session reads a queued draft from the engine's own inbox.
+            pi: async () => harness,
+          },
+          scopes,
+          sqlStore(database),
+        );
+
+        // A changed text or any app scope on the queued draft is refused before
+        // the engine, and reserves nothing.
+        const refusedAt = calls.length;
+        await expect(
+          session.submit("pay the invoices", "op-legacy-queued"),
+        ).rejects.toThrow();
+        await expect(
+          session.submit("reconcile invoices", "op-legacy-queued", LEDGER),
+        ).rejects.toThrow();
+        expect(calls.length).toBe(refusedAt);
+        expect(guardRows(database)).toEqual([]);
+
+        // The exact Home retry is the engine's own operation: the queued draft
+        // proves its text, the guard records that Home envelope, and the engine
+        // replays the existing submission instead of admitting a second one.
+        const requestsBeforeQueuedReplay = scripted.requests.length;
+        const beforeReplay = (await harness.inspect(BACKGROUND_CONTEXT))
+          .submissions.length;
+        expect(
+          await session.submit("reconcile invoices", "op-legacy-queued"),
+        ).toBe(false);
+        expect(
+          (await harness.inspect(BACKGROUND_CONTEXT)).submissions.length,
+        ).toBe(beforeReplay);
+        // The queued turn has not run: the replay admitted no work.
+        expect(scripted.requests.length).toBe(requestsBeforeQueuedReplay);
+        const adoptedQueued = guardRows(database).find(
+          ({ row }) => row.operation_id === "op-legacy-queued",
+        )?.row;
+        expect(adoptedQueued?.install_id).toBeNull();
+        expect(adoptedQueued?.context_id).toBeNull();
+
+        // From now on the recorded Home envelope is the binding: a changed
+        // text, a promotion to an app scope and another installation all fail
+        // before the engine.
+        const afterReplay = calls.length;
+        await expect(
+          session.submit("pay the invoices", "op-legacy-queued"),
+        ).rejects.toThrow();
+        await expect(
+          session.submit("reconcile invoices", "op-legacy-queued", SOCIAL),
+        ).rejects.toThrow();
+        expect(calls.length).toBe(afterReplay);
+
+        // Release the run: the queued turn is placed and runs exactly once.
+        scripted.release();
+        expect((await running.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+        expect((await queued.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+        expect(scripted.requests.length).toBe(
+          requestsBeforeQueuedReplay + 1,
+        );
+        expect(scripted.requests.at(-1)).toBe("reconcile invoices");
+
+        // Every legacy record above already exists; the replays and refusals
+        // below must neither add engine work nor run the model again.
+        const settledRequests = scripted.requests.length;
+        const settledSubmissions = (
+          await harness.inspect(BACKGROUND_CONTEXT)
+        ).submissions.length;
+        const refusalsAt = calls.length;
+
+        // The engine holds these ids, but its records do not prove the caller's
+        // Home envelope, so every one is refused before the engine is asked.
+        await expect(
+          session.submit("pay the invoices", "op-legacy-settled"),
+        ).rejects.toThrow();
+        await expect(
+          session.submit("reconcile invoices", "op-legacy-settled", LEDGER),
+        ).rejects.toThrow();
+        await expect(
+          session.submit("ledger question", "op-legacy-app"),
+        ).rejects.toThrow();
+        await expect(
+          session.submit("ledger question", "op-legacy-app", LEDGER),
+        ).rejects.toThrow();
+        await expect(
+          session.submit("reconcile invoices", "op-legacy-mismatch"),
+        ).rejects.toThrow();
+        await expect(
+          session.submit("reconcile invoices", "op-legacy-extra"),
+        ).rejects.toThrow();
+        await expect(
+          session.submit("reconcile invoices", "op-legacy-write"),
+        ).rejects.toThrow();
+        await expect(
+          session.ask("reconcile invoices", "op-legacy-settled", SOCIAL),
+        ).rejects.toThrow();
+
+        expect(calls.length).toBe(refusalsAt);
+        expect(scripted.requests.length).toBe(settledRequests);
+        expect(
+          (await harness.inspect(BACKGROUND_CONTEXT)).submissions.length,
+        ).toBe(settledSubmissions);
+        // No refused id was bound: only the adopted queued operation has a row.
+        expect(
+          guardRows(database).map(({ row }) => row.operation_id),
+        ).toEqual(["op-legacy-queued"]);
+
+        // The exact settled Home retry returns the prior receipt and result,
+        // and neither adds engine work nor runs the model again.
+        expect(
+          await session.submit("reconcile invoices", "op-legacy-settled"),
+        ).toBe(false);
+        const answer = await session.ask(
+          "reconcile invoices",
+          "op-legacy-settled",
+        );
+        expect(answer.status).toBe("done");
+        expect(answer.text).toBe("acknowledged");
+        expect(answer.operationId).toBe("op-legacy-settled");
+        expect(scripted.requests.length).toBe(settledRequests);
+        expect(
+          (await harness.inspect(BACKGROUND_CONTEXT)).submissions.length,
+        ).toBe(settledSubmissions);
+        expect(
+          guardRows(database)
+            .map(({ row }) => row.operation_id)
+            .sort(),
+        ).toEqual(["op-legacy-queued", "op-legacy-settled"]);
+
+        // A new operation is unaffected: accepted once, then the engine's own
+        // replay, not a refusal.
+        expect(await session.submit("reconcile invoices", "op-fresh")).toBe(
+          true,
+        );
+        expect(await session.submit("reconcile invoices", "op-fresh")).toBe(
+          false,
+        );
+        // Admission is durable and returns before the engine runs the turn, so
+        // wait for the run to finish before counting provider requests.
+        await harness.waitForIdle(BACKGROUND_CONTEXT);
+        expect(scripted.requests.length).toBe(settledRequests + 1);
+
+        // Records the engine cannot prove as Home are refused even when the
+        // submission exists: a queued input whose inbox draft is gone, and an
+        // ambiguous request id. Nothing is adopted from the caller's text.
+        const insertHeld = (id: number, operationId: string): void => {
+          database
+            .prepare(
+              `INSERT INTO pi_submissions (id,conversation_id,request_id,status,record)
+               VALUES (?,?,?,?,?)`,
+            )
+            .run(
+              id,
+              conversation.id,
+              JSON.stringify(operationId),
+              "queued",
+              JSON.stringify({
+                conversationId: conversation.id,
+                requestId: operationId,
+                type: "input",
+                status: "queued",
+                id,
+              }),
+            );
+        };
+        const beforeUnprovable = calls.length;
+        insertHeld(9001, "op-legacy-lost");
+        await expect(
+          session.submit("reconcile invoices", "op-legacy-lost"),
+        ).rejects.toThrow();
+        database.prepare("DELETE FROM pi_submissions WHERE id=?").run(9001);
+
+        insertHeld(9002, "op-legacy-ambiguous");
+        insertHeld(9003, "op-legacy-ambiguous");
+        await expect(
+          session.submit("reconcile invoices", "op-legacy-ambiguous"),
+        ).rejects.toThrow();
+        database
+          .prepare("DELETE FROM pi_submissions WHERE id IN (?,?)")
+          .run(9002, 9003);
+
+        expect(calls.length).toBe(beforeUnprovable);
+        expect(
+          guardRows(database)
+            .map(({ row }) => row.operation_id)
+            .sort(),
+        ).toEqual(["op-fresh", "op-legacy-queued", "op-legacy-settled"]);
+      } finally {
+        scripted.release();
+        await harness.close(BACKGROUND_CONTEXT);
+        database.close();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "adopts a queued legacy Home operation placed while the inbox is read",
+    async () => {
+      const { database } = sessionDatabase();
+      const scripted = scriptedModels("acknowledged");
+      const storage = await SqliteStorage.open(sqliteFacade(database), {
+        prefix: "pi_",
+      });
+      const harness = await Harness.open(
+        storage,
+        { models: scripted.models, registry: createRegistry() },
+        BACKGROUND_CONTEXT,
       );
+      try {
+        // Pre-upgrade state: the Home input is still a queued inbox draft
+        // behind a held turn.
+        const conversation = await harness.root(BACKGROUND_CONTEXT, {
+          agent: { model: { provider: "scripted", modelId: "scripted" } },
+        });
+        await conversation.submit(
+          {
+            type: "input",
+            requestId: "op-running",
+            content: "hold the run",
+            entry: operationEntry("op-running"),
+          },
+          BACKGROUND_CONTEXT,
+        );
+        await scripted.started;
+        const queued = await conversation.submit(
+          {
+            type: "input",
+            requestId: "op-legacy-race",
+            content: "reconcile invoices",
+            entry: operationEntry("op-legacy-race"),
+          },
+          BACKGROUND_CONTEXT,
+        );
+        expect((await queued.status(BACKGROUND_CONTEXT)).status).toBe("queued");
 
-      // The engine holds both ids; adopting either would replay a turn this
-      // guard never admitted for this caller's scope.
-      await expect(
-        session.submit("reconcile invoices", "op-legacy-queued", LEDGER),
-      ).rejects.toThrow();
-      await expect(
-        session.submit("reconcile invoices", "op-legacy-settled", LEDGER),
-      ).rejects.toThrow();
-      // A retry is refused again, so no binding was recorded for either.
-      await expect(
-        session.submit("reconcile invoices", "op-legacy-queued", LEDGER),
-      ).rejects.toThrow();
-      // Nor can another scope claim them.
-      await expect(
-        session.submit("reconcile invoices", "op-legacy-queued", SOCIAL),
-      ).rejects.toThrow();
-      // None of the refusals reached the engine, and none recorded a binding.
-      expect(calls).toEqual([]);
-      expect(guardRows(database)).toEqual([]);
+        const scopes = new OperationScopes(sqlStore(database));
+        let calls = 0;
+        let inboxReads = 0;
+        const session = await sessionOver(
+          {
+            submit: async (text, options) => {
+              calls += 1;
+              const existing = await storage.submissionByRequest(
+                conversation.id,
+                options.operationId,
+                BACKGROUND_CONTEXT,
+              );
+              await conversation.submit(
+                {
+                  type: "input",
+                  content: text,
+                  requestId: options.operationId,
+                  ...(options.entry === undefined
+                    ? {}
+                    : { entry: options.entry }),
+                },
+                BACKGROUND_CONTEXT,
+              );
+              return {
+                accepted: existing === undefined,
+                operationId: options.operationId,
+              };
+            },
+            prompt: async () => {
+              throw new Error("ask is not part of this case");
+            },
+            // The exact transition the runtime must survive: the first read
+            // saw the queued draft, and while the session awaits the inbox
+            // read the engine places the input and clears that draft.
+            pi: async () => ({
+              async snapshot() {
+                inboxReads += 1;
+                scripted.release();
+                await harness.waitForIdle(BACKGROUND_CONTEXT);
+                return harness.snapshot(
+                  InboxDoc,
+                  ROOT_CONVERSATION_ID,
+                  BACKGROUND_CONTEXT,
+                );
+              },
+            }),
+          },
+          scopes,
+          sqlStore(database),
+        );
 
-      // Positive safe control: a new operation is accepted, and its own
-      // identical replay is the engine's replay, not a refusal.
-      expect(
-        await session.submit("reconcile invoices", "op-fresh", LEDGER),
-      ).toBe(true);
-      expect(calls).toEqual(["op-fresh"]);
-    } finally {
-      scripted.release();
-      await harness.close(BACKGROUND_CONTEXT);
-      database.close();
-    }
-  });
+        // The stale inbox observation must not refuse the replay: the engine's
+        // now-placed entry proves the same Home envelope.
+        expect(
+          await session.submit("reconcile invoices", "op-legacy-race"),
+        ).toBe(false);
+        expect(inboxReads).toBe(1);
+        // The queued turn ran exactly once and the replay admitted no second
+        // submission for the operation.
+        expect(scripted.requests).toEqual([
+          "hold the run",
+          "reconcile invoices",
+        ]);
+        const held = database
+          .prepare(
+            "SELECT COUNT(*) AS held FROM pi_submissions WHERE request_id=?",
+          )
+          .get(JSON.stringify("op-legacy-race")) as { held: number };
+        expect(held.held).toBe(1);
+        const adopted = guardRows(database).find(
+          ({ row }) => row.operation_id === "op-legacy-race",
+        )?.row;
+        expect(adopted?.install_id).toBeNull();
+        expect(adopted?.context_id).toBeNull();
+
+        // The recovered Home binding still refuses a changed text or scope.
+        const after = calls;
+        await expect(
+          session.submit("pay the invoices", "op-legacy-race"),
+        ).rejects.toThrow();
+        await expect(
+          session.submit("reconcile invoices", "op-legacy-race", LEDGER),
+        ).rejects.toThrow();
+        expect(calls).toBe(after);
+        expect(guardRows(database)).toHaveLength(1);
+      } finally {
+        scripted.release();
+        await harness.close(BACKGROUND_CONTEXT);
+        database.close();
+      }
+    },
+    30_000,
+  );
 });
 
 /**

@@ -22,10 +22,15 @@ import { submissionHeld, type TaskSql } from "./identity.ts";
  *
  * Before its first reservation the guard also asks the engine whether it
  * already holds that operation id (queued, placed or settled). An id the engine
- * knows but this guard never admitted — an operation from a runtime build that
- * predates the table, or one written around the guard — cannot be re-bound to a
- * caller's envelope, because the engine would replay its own stored turn while
- * the guard recorded a different one. That id is refused.
+ * knows but this guard never admitted was submitted by a build that predates
+ * this table, so the engine — not the caller — is the only authority for what
+ * that operation was. The guard therefore adopts it only as the Home envelope
+ * the engine's own records prove: the exact text it stored, placed as the
+ * board's message entry with no app scope. That envelope replays an identical
+ * retry across the upgrade; a different text, any app scope, another kind or a
+ * record that cannot be read is refused rather than re-bound, because the
+ * engine would replay its own stored turn while the guard recorded another.
+ * Nothing is ever adopted from the request being admitted.
  *
  * The table is created with `IF NOT EXISTS` under this runtime's ownership: an
  * existing table, its rows and any applied migration are left as they are.
@@ -177,6 +182,63 @@ export function sameAppScope(
   );
 }
 
+/**
+ * What the engine's own records prove about an operation id this guard never
+ * admitted, as the session read them: the submission's type, the exact text it
+ * was submitted with, and the entry metadata it was — or, for a queued input,
+ * still would be — placed as.
+ *
+ * The session only reads. Whether that evidence proves an envelope is decided
+ * here, so a caller cannot hand this store a verdict of its own, and the text
+ * and metadata it carries come from the engine rather than from the request
+ * being admitted.
+ */
+export interface EngineEvidence {
+  /** The submission type the engine stored. */
+  readonly type: unknown;
+  /** The exact original text, or `null` when the engine no longer stores it. */
+  readonly text: unknown;
+  /** The stored entry's `kind`/`data`, or `null` when the engine stores none. */
+  readonly entry: {
+    readonly kind: unknown;
+    readonly data: unknown;
+  } | null;
+}
+
+/**
+ * The Home envelope one legacy engine record proves, or `null` when it proves
+ * nothing this guard may adopt.
+ *
+ * A build that predates this table admitted operations without one, so the
+ * engine can hold a submission whose envelope was never recorded. What that
+ * operation *was* is still in the engine's own records, and adopting it is safe
+ * only for exactly that envelope: an input, placed as the board's own message
+ * entry carrying this operation's id and no app scope, with the exact text the
+ * engine stored. Every other shape — another submission type, another kind, an
+ * entry that carries an app or any other field, a text the engine no longer
+ * stores — proves nothing, and the caller refuses instead of adopting it.
+ */
+export function recoveredHomeEnvelope(
+  operationId: string,
+  evidence: EngineEvidence,
+): OperationEnvelope | null {
+  if (evidence.type !== "input") return null;
+  const text = evidence.text;
+  if (typeof text !== "string" || text.length > OPERATION_TEXT_MAX) return null;
+  const entry = evidence.entry;
+  if (entry === null || entry.kind !== BOARD_MESSAGE_KIND) return null;
+  const data = entry.data;
+  if (typeof data !== "object" || data === null || Array.isArray(data))
+    return null;
+  // Canonical no-app metadata is exactly one field, this operation's id. A
+  // stored `app` is another binding, and an unknown field is a record this
+  // guard cannot read, so neither is adopted as Home.
+  const keys = Object.keys(data);
+  if (keys.length !== 1 || keys[0] !== "messageId") return null;
+  if (!("messageId" in data) || data.messageId !== operationId) return null;
+  return { operationId, text };
+}
+
 /** The session's insert-once operation envelope store. */
 export class OperationScopes {
   constructor(private readonly sql: OperationScopeSql) {
@@ -191,14 +253,19 @@ export class OperationScopes {
    * stored binding untouched. Validation happens before the write, so a refused
    * admission reserves nothing, and the text itself is never stored.
    *
-   * A first reservation also asks the engine whether it already holds this
-   * operation id. It can, for example, have been admitted by a runtime build
-   * that predates this table; the engine would then replay that stored turn
-   * while this guard recorded a different envelope, so the id is refused rather
-   * than re-bound. The read, the check and the insert are synchronous, so no
-   * other work of this object can interleave between them.
+   * An id this table has no row for may still be held by the engine, submitted
+   * by a runtime build that predates this table. `evidence` is what the engine's
+   * own records prove about it, read by the caller; `null` means it holds
+   * nothing, and an omitted argument means the caller read nothing, in which
+   * case the engine is asked here and any id it holds is refused rather than
+   * re-bound. A proven legacy Home operation is adopted as the envelope the
+   * engine stored, never as the caller's: a different text or any app scope is
+   * refused, so an identical retry replays while a changed one cannot.
    */
-  admit(envelope: OperationEnvelope): OperationEnvelope {
+  admit(
+    envelope: OperationEnvelope,
+    evidence?: EngineEvidence | null,
+  ): OperationEnvelope {
     if (typeof envelope !== "object" || envelope === null)
       throw new Error("The operation's envelope is malformed.");
     const operationId = requireOperationId(envelope.operationId);
@@ -210,12 +277,65 @@ export class OperationScopes {
     const admitted = this.row(operationId);
     if (admitted !== null)
       return this.replay(operationId, admitted, text, digest, app);
-    if (submissionHeld(this.sql, operationId))
+    if (evidence === undefined) {
+      // The caller read nothing, so ask the engine here: an id it holds but
+      // this guard never admitted has no envelope to compare with.
+      if (submissionHeld(this.sql, operationId))
+        throw new Error(
+          `Operation "${operationId}" is already held by the engine without an admitted envelope.`,
+        );
+    } else if (evidence !== null) {
+      return this.adopt(operationId, evidence, text, digest, app);
+    }
+    this.reserve(operationId, app, digest);
+    return this.bind(operationId, text, digest, app);
+  }
+
+  /**
+   * Adopt the envelope the engine's own records prove for an operation id this
+   * guard never admitted, and bind it exactly as a first admission would.
+   *
+   * The recovered envelope is the authority in both directions: the caller's
+   * text must be the stored text, and a caller that sends an app scope is
+   * refused, because the engine's entry carries none and the turn would replay
+   * as Home while the caller believed it scoped. The row written is the
+   * recovered envelope, never the caller's, so from then on this guard and the
+   * engine's replay agree. A refusal writes nothing.
+   */
+  private adopt(
+    operationId: string,
+    evidence: EngineEvidence,
+    text: string,
+    digest: string,
+    app: AppScope | null,
+  ): OperationEnvelope {
+    const recovered = recoveredHomeEnvelope(operationId, evidence);
+    if (recovered === null)
       throw new Error(
-        `Operation "${operationId}" is already held by the engine without an admitted envelope.`,
+        `Operation "${operationId}" is already held by the engine without a provable Home envelope.`,
       );
-    // Insert-once: a row that already exists is never rewritten, so the
-    // comparison below always reads the admitted envelope.
+    const recoveredDigest = textDigest(recovered.text);
+    if (recoveredDigest !== digest)
+      throw new Error(
+        `Operation "${operationId}" is already held by the engine with a different text.`,
+      );
+    if (app !== null)
+      throw new Error(
+        `Operation "${operationId}" is already held by the engine as a Home operation and cannot be bound to an app scope.`,
+      );
+    this.reserve(operationId, null, recoveredDigest);
+    return this.bind(operationId, text, digest, app);
+  }
+
+  /**
+   * Record one envelope's digest and scope, insert-once: a row that already
+   * exists is never rewritten, so every comparison reads the admitted envelope.
+   */
+  private reserve(
+    operationId: string,
+    app: AppScope | null,
+    digest: string,
+  ): void {
     this.sql.exec(
       `INSERT OR IGNORE INTO tenant_operation_scopes (operation_id,install_id,context_id,text_digest,created_at)
        VALUES (?,?,?,?,?)`,
@@ -225,6 +345,15 @@ export class OperationScopes {
       digest,
       Date.now(),
     );
+  }
+
+  /** The row just reserved, compared with the envelope being admitted. */
+  private bind(
+    operationId: string,
+    text: string,
+    digest: string,
+    app: AppScope | null,
+  ): OperationEnvelope {
     const stored = this.row(operationId);
     if (stored === null)
       throw new Error("The operation's envelope is unavailable.");

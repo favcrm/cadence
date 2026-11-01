@@ -63,6 +63,76 @@ var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require
   throw Error('Dynamic require of "' + x + '" is not supported');
 });
 
+// node_modules/@earendil-works/pi-telemetry/dist/metrics.js
+function createTypedMetrics(metrics, schemas) {
+  const definitions = new Map;
+  for (const schema of schemas) {
+    for (const [name, definition] of Object.entries(schema.metrics ?? {}))
+      definitions.set(name, definition);
+  }
+  return {
+    counter: (name) => metrics.counter(name, definitions.get(name)),
+    upDownCounter: (name) => metrics.upDownCounter(name, definitions.get(name)),
+    histogram: (name) => metrics.histogram(name, definitions.get(name))
+  };
+}
+
+// node_modules/@earendil-works/pi-telemetry/dist/noop.js
+async function startNoopSpan(_options, callback) {
+  return callback(noopTelemetrySpan);
+}
+var noopCounter, noopUpDownCounter, noopHistogram, NOOP_TELEMETRY_METRICS, NOOP_TELEMETRY_PROPAGATION, noopTelemetrySpan, NOOP_TELEMETRY_CONTEXT;
+var init_noop = __esm(() => {
+  noopCounter = Object.freeze({ add: () => {} });
+  noopUpDownCounter = Object.freeze({ add: () => {} });
+  noopHistogram = Object.freeze({ record: () => {} });
+  NOOP_TELEMETRY_METRICS = Object.freeze({
+    counter: () => noopCounter,
+    upDownCounter: () => noopUpDownCounter,
+    histogram: () => noopHistogram
+  });
+  NOOP_TELEMETRY_PROPAGATION = Object.freeze({
+    inject: () => {
+      return;
+    },
+    extract: () => NOOP_TELEMETRY_CONTEXT
+  });
+  noopTelemetrySpan = {
+    metrics: NOOP_TELEMETRY_METRICS,
+    propagation: NOOP_TELEMETRY_PROPAGATION,
+    startSpan: startNoopSpan,
+    addLink: () => {},
+    addEvent: () => {},
+    setAttributes: () => {},
+    setStatus: () => {}
+  };
+  Object.freeze(noopTelemetrySpan);
+  NOOP_TELEMETRY_CONTEXT = noopTelemetrySpan;
+});
+
+// node_modules/@earendil-works/pi-telemetry/dist/memory.js
+var contextCarriers;
+var init_memory = __esm(() => {
+  init_noop();
+  contextCarriers = new WeakMap;
+});
+
+// node_modules/@earendil-works/pi-telemetry/dist/index.js
+function defineTelemetrySchema(schema) {
+  return schema;
+}
+function bindTypedSpanStarter(telemetryContext) {
+  const startSpan = (name, attributes, callback) => telemetryContext.startSpan({ name, attributes }, (span) => callback(span, bindTypedSpanStarter(span)));
+  return startSpan;
+}
+function createTypedSpanStarter(telemetryContext, _schemas) {
+  return bindTypedSpanStarter(telemetryContext);
+}
+var init_dist = __esm(() => {
+  init_noop();
+  init_memory();
+});
+
 // node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js
 class FifoQueue {
   incoming = [];
@@ -545,76 +615,6 @@ class InMemoryModelsStore {
     this.entries.delete(providerId);
   }
 }
-
-// node_modules/@earendil-works/pi-telemetry/dist/metrics.js
-function createTypedMetrics(metrics, schemas) {
-  const definitions = new Map;
-  for (const schema of schemas) {
-    for (const [name, definition] of Object.entries(schema.metrics ?? {}))
-      definitions.set(name, definition);
-  }
-  return {
-    counter: (name) => metrics.counter(name, definitions.get(name)),
-    upDownCounter: (name) => metrics.upDownCounter(name, definitions.get(name)),
-    histogram: (name) => metrics.histogram(name, definitions.get(name))
-  };
-}
-
-// node_modules/@earendil-works/pi-telemetry/dist/noop.js
-async function startNoopSpan(_options, callback) {
-  return callback(noopTelemetrySpan);
-}
-var noopCounter, noopUpDownCounter, noopHistogram, NOOP_TELEMETRY_METRICS, NOOP_TELEMETRY_PROPAGATION, noopTelemetrySpan, NOOP_TELEMETRY_CONTEXT;
-var init_noop = __esm(() => {
-  noopCounter = Object.freeze({ add: () => {} });
-  noopUpDownCounter = Object.freeze({ add: () => {} });
-  noopHistogram = Object.freeze({ record: () => {} });
-  NOOP_TELEMETRY_METRICS = Object.freeze({
-    counter: () => noopCounter,
-    upDownCounter: () => noopUpDownCounter,
-    histogram: () => noopHistogram
-  });
-  NOOP_TELEMETRY_PROPAGATION = Object.freeze({
-    inject: () => {
-      return;
-    },
-    extract: () => NOOP_TELEMETRY_CONTEXT
-  });
-  noopTelemetrySpan = {
-    metrics: NOOP_TELEMETRY_METRICS,
-    propagation: NOOP_TELEMETRY_PROPAGATION,
-    startSpan: startNoopSpan,
-    addLink: () => {},
-    addEvent: () => {},
-    setAttributes: () => {},
-    setStatus: () => {}
-  };
-  Object.freeze(noopTelemetrySpan);
-  NOOP_TELEMETRY_CONTEXT = noopTelemetrySpan;
-});
-
-// node_modules/@earendil-works/pi-telemetry/dist/memory.js
-var contextCarriers;
-var init_memory = __esm(() => {
-  init_noop();
-  contextCarriers = new WeakMap;
-});
-
-// node_modules/@earendil-works/pi-telemetry/dist/index.js
-function defineTelemetrySchema(schema) {
-  return schema;
-}
-function bindTypedSpanStarter(telemetryContext) {
-  const startSpan = (name, attributes, callback) => telemetryContext.startSpan({ name, attributes }, (span) => callback(span, bindTypedSpanStarter(span)));
-  return startSpan;
-}
-function createTypedSpanStarter(telemetryContext, _schemas) {
-  return bindTypedSpanStarter(telemetryContext);
-}
-var init_dist = __esm(() => {
-  init_noop();
-  init_memory();
-});
 
 // node_modules/@earendil-works/pi-ai/dist/telemetry.js
 function createInstruments(adapter) {
@@ -14969,12 +14969,8 @@ __export(exports_x509_transport_state_browser, {
 });
 
 // src/hosted-session.ts
-init_models();
 import { DurableObject } from "cloudflare:workers";
-// node_modules/@earendil-works/pi-durable/dist/harness/define.js
-function hook(task, handlers) {
-  return { task: task.definition.name, handlers };
-}
+
 // node_modules/@earendil-works/chord/dist/context/index.js
 init_dist();
 var ABORT_SIGNAL_CONTEXT_KEY = Object.freeze({
@@ -15065,6 +15061,12 @@ function abortError(signal) {
   return reason instanceof Error ? reason : new DOMException("The operation was aborted", "AbortError");
 }
 
+// src/hosted-session.ts
+init_models();
+// node_modules/@earendil-works/pi-durable/dist/harness/define.js
+function hook(task, handlers) {
+  return { task: task.definition.name, handlers };
+}
 // node_modules/@earendil-works/pi-durable/dist/errors.js
 function errorMessage(error) {
   if (error instanceof Error)
@@ -55971,31 +55973,74 @@ function readSubmissionEntry(sql, submissionId) {
   const entryId = submission.entry;
   if (typeof entryId !== "number" || !Number.isSafeInteger(entryId) || entryId <= 0)
     return null;
+  return entryData(sql, entryId);
+}
+function submissionHeld(sql, operationId) {
+  if (!hasSubmissions(sql))
+    return false;
+  const held = sql.exec("SELECT 1 AS held FROM pi_submissions WHERE json_extract(record,'$.requestId')=? LIMIT 1", operationId).toArray()[0];
+  return held !== undefined;
+}
+function readHeldSubmission(sql, conversationId, operationId) {
+  if (!hasSubmissions(sql))
+    return null;
+  const rows = sql.exec(`SELECT id, record FROM pi_submissions
+        WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`, conversationId, JSON.stringify(operationId)).toArray();
+  if (rows.length === 0)
+    return null;
+  if (rows.length > 1)
+    throw new Error(`Operation "${operationId}" names more than one engine submission.`);
+  const row = rows[0];
+  if (row === undefined)
+    return null;
+  const id = Number(row.id);
+  if (!Number.isSafeInteger(id) || id <= 0)
+    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
+  const submission = parseRecord(row.record);
+  if (submission === null)
+    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
+  const { type, status } = submission;
+  if (type !== "input" && type !== "write")
+    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
+  if (status !== "queued" && status !== "placed" && status !== "done" && status !== "unanswered")
+    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
+  const entryId = submission.entry;
+  if (entryId === undefined || entryId === null)
+    return { id, type, status, text: null, entry: null };
+  if (typeof entryId !== "number" || !Number.isSafeInteger(entryId) || entryId <= 0)
+    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
+  const entry = entryData(sql, entryId);
+  if (entry === null)
+    throw new Error(`Operation "${operationId}" has an engine submission whose entry is unavailable.`);
+  return { id, type, status, text: entryText(entry.model), entry };
+}
+function hasSubmissions(sql) {
+  const table = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='pi_submissions'").toArray()[0];
+  return table !== undefined;
+}
+function entryData(sql, entryId) {
   const entry = record4(sql, "pi_entries", entryId);
   if (entry === null || !("kind" in entry))
     return null;
   return {
     kind: entry.kind,
-    data: "data" in entry ? entry.data : undefined
+    data: "data" in entry ? entry.data : undefined,
+    model: "model" in entry ? entry.model : undefined
   };
 }
-function submissionHeld(sql, operationId) {
-  const table = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='pi_submissions'").toArray()[0];
-  if (table === undefined)
-    return false;
-  const held = sql.exec("SELECT 1 AS held FROM pi_submissions WHERE json_extract(record,'$.requestId')=? LIMIT 1", operationId).toArray()[0];
-  return held !== undefined;
+function entryText(model) {
+  if (!Array.isArray(model) || model.length !== 1)
+    return null;
+  const message = model[0];
+  if (typeof message !== "object" || message === null || Array.isArray(message))
+    return null;
+  if (!("role" in message) || !("content" in message))
+    return null;
+  if (message.role !== "user" || typeof message.content !== "string")
+    return null;
+  return message.content;
 }
-function record4(sql, table, id) {
-  let row;
-  try {
-    row = sql.exec(`SELECT record FROM ${table} WHERE id=?`, id).toArray()[0];
-  } catch {
-    return null;
-  }
-  if (row === undefined)
-    return null;
-  const stored = row.record;
+function parseRecord(stored) {
   if (typeof stored !== "string")
     return null;
   try {
@@ -56006,6 +56051,17 @@ function record4(sql, table, id) {
   } catch {
     return null;
   }
+}
+function record4(sql, table, id) {
+  let row;
+  try {
+    row = sql.exec(`SELECT record FROM ${table} WHERE id=?`, id).toArray()[0];
+  } catch {
+    return null;
+  }
+  if (row === undefined)
+    return null;
+  return parseRecord(row.record);
 }
 
 // src/model-guard.ts
@@ -56328,6 +56384,25 @@ function parseEntryAppScope(kind, data) {
 function sameAppScope(left, right) {
   return (left?.installId ?? null) === (right?.installId ?? null) && (left?.contextId ?? null) === (right?.contextId ?? null);
 }
+function recoveredHomeEnvelope(operationId, evidence) {
+  if (evidence.type !== "input")
+    return null;
+  const text = evidence.text;
+  if (typeof text !== "string" || text.length > OPERATION_TEXT_MAX)
+    return null;
+  const entry = evidence.entry;
+  if (entry === null || entry.kind !== BOARD_MESSAGE_KIND)
+    return null;
+  const data = entry.data;
+  if (typeof data !== "object" || data === null || Array.isArray(data))
+    return null;
+  const keys = Object.keys(data);
+  if (keys.length !== 1 || keys[0] !== "messageId")
+    return null;
+  if (!("messageId" in data) || data.messageId !== operationId)
+    return null;
+  return { operationId, text };
+}
 
 class OperationScopes {
   sql;
@@ -56335,7 +56410,7 @@ class OperationScopes {
     this.sql = sql;
     this.sql.exec(CREATE_TABLE2);
   }
-  admit(envelope) {
+  admit(envelope, evidence) {
     if (typeof envelope !== "object" || envelope === null)
       throw new Error("The operation's envelope is malformed.");
     const operationId = requireOperationId(envelope.operationId);
@@ -56347,10 +56422,32 @@ class OperationScopes {
     const admitted = this.row(operationId);
     if (admitted !== null)
       return this.replay(operationId, admitted, text, digest, app);
-    if (submissionHeld(this.sql, operationId))
-      throw new Error(`Operation "${operationId}" is already held by the engine without an admitted envelope.`);
+    if (evidence === undefined) {
+      if (submissionHeld(this.sql, operationId))
+        throw new Error(`Operation "${operationId}" is already held by the engine without an admitted envelope.`);
+    } else if (evidence !== null) {
+      return this.adopt(operationId, evidence, text, digest, app);
+    }
+    this.reserve(operationId, app, digest);
+    return this.bind(operationId, text, digest, app);
+  }
+  adopt(operationId, evidence, text, digest, app) {
+    const recovered = recoveredHomeEnvelope(operationId, evidence);
+    if (recovered === null)
+      throw new Error(`Operation "${operationId}" is already held by the engine without a provable Home envelope.`);
+    const recoveredDigest = textDigest(recovered.text);
+    if (recoveredDigest !== digest)
+      throw new Error(`Operation "${operationId}" is already held by the engine with a different text.`);
+    if (app !== null)
+      throw new Error(`Operation "${operationId}" is already held by the engine as a Home operation and cannot be bound to an app scope.`);
+    this.reserve(operationId, null, recoveredDigest);
+    return this.bind(operationId, text, digest, app);
+  }
+  reserve(operationId, app, digest) {
     this.sql.exec(`INSERT OR IGNORE INTO tenant_operation_scopes (operation_id,install_id,context_id,text_digest,created_at)
        VALUES (?,?,?,?,?)`, operationId, app === null ? null : app.installId, app === null || app.contextId === undefined ? null : app.contextId, digest, Date.now());
+  }
+  bind(operationId, text, digest, app) {
     const stored = this.row(operationId);
     if (stored === null)
       throw new Error("The operation's envelope is unavailable.");
@@ -56860,7 +56957,7 @@ data: ${JSON.stringify(masterState(model, { running: false, queued: 0 }, master?
   }
   async ask(prompt, operationId, app) {
     await this.requireIdentity();
-    const envelope = this.admitOperation(prompt, operationId, app);
+    const envelope = await this.admitOperation(prompt, operationId, app);
     const result = await this.harness.prompt(envelope.text, {
       operationId: envelope.operationId,
       entry: this.inputEntry(envelope)
@@ -56886,16 +56983,56 @@ data: ${JSON.stringify(masterState(model, { running: false, queued: 0 }, master?
   }
   async submit(text, operationId, app) {
     await this.requireIdentity();
-    const envelope = this.admitOperation(text, operationId, app);
+    const envelope = await this.admitOperation(text, operationId, app);
     const receipt = await this.harness.submit(envelope.text, {
       operationId: envelope.operationId,
       entry: this.inputEntry(envelope)
     });
     return receipt.accepted;
   }
-  admitOperation(text, operationId, app) {
+  async admitOperation(text, operationId, app) {
     const id = operationId ?? crypto.randomUUID();
-    return this.operationScopes.admit(app === undefined ? { operationId: id, text } : { operationId: id, text, app });
+    return this.operationScopes.admit(app === undefined ? { operationId: id, text } : { operationId: id, text, app }, await this.engineEvidence(id));
+  }
+  async engineEvidence(operationId) {
+    const sql = this.ctx.storage.sql;
+    const held = readHeldSubmission(sql, ROOT_CONVERSATION_ID, operationId);
+    if (held === null)
+      return null;
+    if (held.entry !== null || held.type !== "input" || held.status !== "queued")
+      return this.placedEvidence(held);
+    const draft = await this.queuedInput(held.id);
+    if (draft !== null)
+      return { type: held.type, text: draft.text, entry: draft.entry };
+    const placed = readHeldSubmission(sql, ROOT_CONVERSATION_ID, operationId);
+    return this.placedEvidence(placed ?? held);
+  }
+  placedEvidence(held) {
+    const entry = held.entry;
+    return entry === null ? { type: held.type, text: held.text, entry: null } : {
+      type: held.type,
+      text: held.text,
+      entry: { kind: entry.kind, data: entry.data }
+    };
+  }
+  async queuedInput(submissionId) {
+    const pi = await this.harness.pi();
+    const inbox = await pi.snapshot(InboxDoc, ROOT_CONVERSATION_ID, BACKGROUND_CONTEXT);
+    if (inbox === undefined)
+      return null;
+    for (const item of inbox.items) {
+      if (item.mode === "write" || item.id !== submissionId)
+        continue;
+      const entry = item.entry;
+      return {
+        text: item.content,
+        entry: entry === undefined ? null : {
+          kind: entry.kind,
+          data: "data" in entry ? entry.data : undefined
+        }
+      };
+    }
+    return null;
   }
   inputEntry(envelope) {
     const data = { messageId: envelope.operationId };

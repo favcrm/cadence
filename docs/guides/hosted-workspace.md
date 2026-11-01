@@ -113,9 +113,25 @@ admission writes nothing, and the binding is the session's SQLite, not one
 instance's memory, so queueing, retries and crash recovery keep the envelope.
 Before its first reservation the guard also asks the engine whether it already
 holds that operation id in any state — queued, placed or settled. An id the
-engine knows but this guard never admitted cannot be re-bound: the engine would
-replay its own stored turn while the guard recorded a different envelope, so
-that id is refused and the caller must use a new one.
+engine knows but this guard never admitted was submitted by a build that
+predates the table, so the engine, not the caller, is the only authority for
+what that operation was. The guard therefore adopts it only as the Home envelope
+the engine's own records prove: the exact text the engine stored, placed as the
+board's own message entry carrying that operation id and no app scope. A placed
+input's text and metadata are read from the entry it was placed as; a queued
+input has no entry yet, so its draft is read from the engine's own inbox
+document. Placing an input and dropping its draft is one engine commit, so a
+draft the inbox no longer holds is re-read once from the submission itself and
+recovered from the entry it now names — never re-read in a loop — and only a
+record that proves neither is refused. An identical retry of such an operation
+replays across the deployment, and the adopted row is the recovered envelope,
+never the caller's, so a later retry that changes the text or sends an app scope
+is refused like any other. Everything else refuses rather than re-binds — a
+different text, any app scope, another submission type, an entry of another kind
+or with any field beyond `messageId`, a text the engine no longer stores, and a
+record that cannot be read — because the engine would replay its own stored turn
+while the guard recorded another. Nothing is ever adopted from the request being
+admitted.
 
 The admitted envelope is also placed with the input entry (`messageId` and
 `app`), so the transcript, a rebuilt object and a replayed retry all read the
