@@ -21,7 +21,7 @@ and [Workspace app catalog](app-catalog.md) for local package rules.
 | --- | --- |
 | Human membership, CLI credentials and shared agent directory | Hosted authority; IDs and labels are not credentials. Presence is observed from an authenticated runner connection, not a promise that an agent can execute. |
 | Assignment state, notification receipts and event outbox | Hosted durable metadata. Events are minimal invalidations; HTTPS rechecks current authority and generation before claims or reports. |
-| Local terminals, worktrees, agent adapters and execution | Installed native daemon. Explicit assignments may invoke the existing agent delivery path; an FYI never does. |
+| Local execution and worktrees | A connected agent uses the native daemon; an existing session may claim a named issue with a profile without one. An FYI never starts work. |
 | Hosted tickets and wiki | The tenant Worker owns supported hosted reads and writes. Availability is per operation; native-only operations do not become available merely because the board is reachable. |
 | Published immutable package bytes | Hosted package storage; an exact listing/version/digest is provenance, not authority. |
 | Pure app `needs.requires` compatibility rules | Canonical Rust `crates/cadence-core`, called natively and compiled to WASM for the hosted adapter. Transport, authentication, storage and app execution are not moved into this kernel. |
@@ -233,25 +233,28 @@ unrestricted remote operator verb or a job launcher. Existing kickoff/member,
 claim and generation fences remain. A claim/queued receipt is not proof that
 execution or a result happened; inspect assignment/report state.
 
-An existing terminal or coding session starts the named issue itself instead:
+An existing terminal or coding session can work on the named issue instead.
+Check the owning repository's worktree and integration-branch rules first;
+if the supported placement cannot meet them, report the conflict before
+starting. Load the profile, then use the project's actual integration ref:
 
 ```sh
-cadence --org acme issue start <issue-id> --repo /absolute/path/to/checkout --profile ap_<profile-id>
 cadence --org acme agent context ap_<profile-id>
+cadence --org acme issue start <issue-id> --repo /absolute/path/to/checkout --profile ap_<profile-id> --base <integration-ref>
 cadence --org acme local-agent report <assignment-id> --state blocked --text "waiting for the owner"
 ```
 
-`--profile` claims under `session-<profile-id>`, so the board re-checks the
-holder on every report. It needs no daemon, opens the same lane worktree, and
-touches only the named issue: other waiting assignments stay where they are.
-`--profile` names the profile the session works under; it does not read profile
-content — load that separately with `context`. The profile supplies context,
-never identity or authority — the authenticated login still carries both.
+`--profile` claims under `session-<profile-id>` without a daemon and targets
+only the named issue. Inspect the receipt for the claim, lane and reporting
+instructions. The board checks claim and generation on reports, but the
+profile-derived client ID is not proof of a distinct session identity.
+`--profile` does not read profile content; load it with `context`. The
+authenticated caller, not the profile, carries authority.
 
-This path needs a member with **no local-agent rows** for that org and audience,
-which is the condition the board's claim route applies to a non-agent client id.
-A member who has connected a local agent must use the default alias on the claim
-route; `--profile` fails with the board's refusal instead of borrowing that alias.
+Profile claims depend on the deployed board and client versions. An older
+board may still require the member's registered default alias; report that
+refusal rather than borrowing an alias or assuming another board has the
+same behavior.
 
 `--base <ref>` cuts the lane from that ref and echoes it in the receipt; without
 it the lane follows the checkout's own resolution. The alias path refuses
@@ -259,30 +262,30 @@ it the lane follows the checkout's own resolution. The alias path refuses
 the field: the claim then proceeds without it, under the same client id and
 fences, and the client says on stderr that the profile was not recorded.
 
-A `--state result` report ends the assignment but moves nothing else. Close the
-ticket yourself once the work is accepted:
+A `--state result` report ends the assignment but moves nothing else. Once
+the work meets the project's acceptance and completion rules, use the
+selected workspace's supported ticket update, for example:
 
 ```sh
-cadence --org acme issue set <issue-id> status=done
+cadence --org acme issue set <issue-id> status=done --if-rev <issue-rev>
 ```
 
-### Recording a review verdict
+### Reviewing software changes
 
-A reviewer files one verdict per exact head; the merge gate counts them, and an
-author's own verdict never does:
+The owning repository's delivery policy determines the required reviews,
+checks and approvals. An independent OMP session can produce genuine review
+findings; record the actual reviewer/session, repository, full head, outcome,
+checks and limitations. A profile or separate session alone does not prove a
+distinct authenticated principal, and in-chat findings are not automatically
+a gate-counted verdict.
 
-```sh
-cadence --org acme audit verdict --issue <issue-id> --pr <number> --head <full-sha> \
-  --kind standards --outcome pass --risk auto --file findings.md
-```
-
-`--kind` is `standards` or `spec`; `--outcome` is `pass` or `revise`, and
-`--title-outcome` / `--section-outcome` default to it. The reviewer is the
-authenticated caller, never an argument, and a second verdict of the same kind
-for the same head returns the first. Read them back with `audit verdicts`. The
-merge gate also runs whichever `cadence` you point it at: set `CADENCE_BIN` when
-more than one build is on the host, or a stale client's missing hosted verb will
-read like a gate refusal.
+Hosted `audit verdict` and `audit verdicts` exist in some versions, but their
+current identity and native-verdict semantics are not proven equivalent
+(CAD-1542, AOS-473); CAD-1981 also tracks a verdict read that can select the
+wrong organization. Preserve the findings and report the blocker rather than
+counting those records as native gate evidence or impersonating a reviewer.
+The repository's approved merge path and any required operator decision remain
+in force; a missing hosted gate is not a pass.
 
 To give the other teammate an informational pointer, obtain their exact `lag_`
 ID from `agent directory`, then send an explicit FYI:
