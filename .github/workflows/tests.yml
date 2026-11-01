@@ -1,0 +1,62 @@
+# CAD-1970: the suite is off the pull-request path.
+#
+# Every PR push used to compile and run ~3,500 in-source unit tests, which put
+# a serializing job in front of every merge for a suite whose failures were
+# almost never the thing the PR changed. Type-correctness, lints, the release
+# seam and both targets are still proved on the PR by `ci.yml`; behaviour is
+# proved here, on a schedule and on demand, so a red test finds its owner the
+# next morning instead of blocking an unrelated push.
+#
+# This workflow is not a required check. Removing `test` from the required
+# status contexts in the branch ruleset is an operator action.
+name: tests
+
+on:
+  schedule:
+    - cron: "0 18 * * *" # 02:00 HKT
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    runs-on: instabox-medium
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: scripts/ci-rust-toolchain --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gate-test-ld2
+          save-if: false
+      - name: Enable fast linker (mold/lld; falls back to the default linker)
+        run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
+      - name: Enable shared sccache (read-only; no-op without credentials)
+        env:
+          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
+          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
+      - name: Run the suite
+        env:
+          CARGO_BUILD_JOBS: 4
+          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
+        run: scripts/run-result-tests --jobs 4
+      - name: Check the report against the binaries
+        run: |
+          set -euo pipefail
+          python3 scripts/check-test-junit.py \
+            --package "$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["name"])')" \
+            --targets-file target/nextest/cadence/expected-targets.txt \
+            --complete-partition \
+            --inventory target/nextest/cadence/inventory.json \
+            --ignored-manifest .config/nextest-ignored.txt \
+            target/nextest/cadence/junit.xml
+      - name: sccache statistics
+        if: ${{ !cancelled() }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats

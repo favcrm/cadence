@@ -318,75 +318,6 @@ jobs:
       - run: cargo clippy --all-targets --locked --features test-seam -- -D warnings
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
 
-  # CAD-1970: one job named `test`. Sharding existed to fit a wall-time
-  # budget on a suite that no longer exists; the artifact upload, selection,
-  # download and merge that came with it are what kept failing. The suite runs
-  # here, and the same checker that used to merge six reports now reads this
-  # one — a case missing from the report, skipped without a declaration, or
-  # absent from the binaries is still a failure.
-  test:
-    needs: [queue-evidence, change-scope]
-    if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: instabox-medium
-    timeout-minutes: 30
-    steps:
-      - name: Not applicable — rust PR feedback gate
-        if: ${{ needs.change-scope.outputs.rust == 'false' }}
-        run: echo 'rust commands not run for this PR scope; full integration gates still run in the merge queue.' >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: scripts/ci-rust-toolchain --profile minimal
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        with:
-          shared-key: gate-test-ld2
-          save-if: false
-      - name: Enable fast linker (mold/lld; falls back to the default linker)
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
-      - name: Enable shared sccache (read-only; no-op without credentials)
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        env:
-          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
-          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
-          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
-        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
-      - name: Run the suite
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        env:
-          CARGO_BUILD_JOBS: 4
-          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
-          SCOPE: ${{ needs.change-scope.outputs.scope }}
-          TARGETS: ${{ needs.change-scope.outputs.targets }}
-        run: |
-          set -euo pipefail
-          # CAD-1370: a pull_request may narrow the integration targets from
-          # the trusted-base classifier. The lib and bins suites always run.
-          selection=""
-          if [ "${GITHUB_EVENT_NAME:-}" = pull_request ] && [ "$SCOPE" = tests ]; then
-            selection="$RUNNER_TEMP/ci-test-selection"
-            printf '%s' "$TARGETS" | jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and test("^[A-Za-z0-9_]+$"))' > /dev/null
-            printf '%s' "$TARGETS" | jq -r '.[]' > "$selection"
-            test -s "$selection"
-            scripts/run-result-tests --test-selection "$selection" --jobs 4
-          else
-            scripts/run-result-tests --jobs 4
-          fi
-      - name: Check the report against the binaries
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        run: |
-          set -euo pipefail
-          python3 scripts/check-test-junit.py \
-            --package "$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["name"])')" \
-            --targets-file target/nextest/cadence/expected-targets.txt \
-            --complete-partition \
-            --inventory target/nextest/cadence/inventory.json \
-            --ignored-manifest .config/nextest-ignored.txt \
-            target/nextest/cadence/junit.xml
-      - name: sccache statistics
-        if: ${{ !cancelled() && needs.change-scope.outputs.rust != 'false' }}
-        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
-
   build:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
@@ -810,7 +741,7 @@ jobs:
   # release build matches what was tested; the exact rustc/cargo versions
   # are recorded in manifest.json. Neither job is a required check.
   release-artifact:
-    needs: [queue-evidence, release-reuse, fmt, clippy, test, build, ui]
+    needs: [queue-evidence, release-reuse, fmt, clippy, build, ui]
     if: >-
       ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
       needs.release-reuse.outputs.reused != 'true' &&
@@ -980,7 +911,7 @@ jobs:
   # binary needs glibc 2.35, not 2.39.
   release-gate:
     if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-    needs: [fmt, clippy, test, build, ui]
+    needs: [fmt, clippy, build, ui]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
