@@ -29,9 +29,10 @@
 //!   install. A revoke or upgrade between mount and read fails closed.
 //!
 //! `input` is the closed union `{kind:"catalog", limit?:1..20,
-//! cursor?:opaque}` — `{kind:"asset", asset_id}` is recognized by the
-//! contract but NOT admitted until its custody check lands, and refuses
-//! explicitly. Catalog output is `{assets, next_cursor, current_actor}`.
+//! cursor?:opaque}` plus `{kind:"asset", asset_id}` — one catalog row's
+//! metadata projection, never a byte or a locator (CAD-1962). Catalog
+//! output is `{assets, next_cursor, current_actor}`; detail output is
+//! `{asset, current_actor}`.
 //! `current_actor` and each asset's `creator` carry the tagged app-port
 //! `Creator` union — `{kind:"user", id:<verified native
 //! BoardUser.sub>, label?}`, `{kind:"operator"}` or `{kind:"unknown"}`
@@ -1443,9 +1444,29 @@ impl Shared {
                     "current_actor": media_actor(view),
                 }))
             }
-            "asset" => Err(Error::rejected(
-                "media asset detail is not admitted — no asset read exists yet",
-            )),
+            "asset" => {
+                // CAD-1962: one catalog row by id — the same metadata
+                // projection the page emits, never bytes or a locator.
+                // The catalog is store-wide, so an asset another install
+                // produced reads here under the same mount proof.
+                if input
+                    .as_object()
+                    .is_some_and(|o| o.keys().any(|k| !matches!(k.as_str(), "kind" | "asset_id")))
+                {
+                    return Err(Error::rejected("media asset input has unsupported fields"));
+                }
+                let asset_id = input
+                    .get("asset_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::rejected("media asset input needs an asset_id"))?;
+                let asset = self.store.app_media_asset(asset_id)?.ok_or_else(|| {
+                    Error::rejected("media asset is not in the workspace catalog")
+                })?;
+                Ok(json!({
+                    "asset": asset.projection(),
+                    "current_actor": media_actor(view),
+                }))
+            }
             _ => Err(Error::rejected(
                 "media read input kind is not a recognized media read",
             )),
