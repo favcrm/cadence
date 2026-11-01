@@ -609,19 +609,12 @@ fn agent_join_parses_the_same_group_and_provider() {
     let cli = Cli::try_parse_from(["cadence", "agent", "join", "pm-alias", "devin"]).unwrap();
     match cli.command {
         Commands::Agent {
-            action:
-                AgentAction::Join {
-                    group,
-                    provider,
-                    role,
-                    detach,
-                    ..
-                },
+            action: AgentAction::Join { args },
         } => {
-            assert_eq!(group, "pm-alias");
-            assert_eq!(provider, "devin");
-            assert!(!detach);
-            assert_eq!(role, "worker");
+            assert_eq!(args.group, "pm-alias");
+            assert_eq!(args.provider, "devin");
+            assert!(!args.detach);
+            assert_eq!(args.role, "worker");
         }
         _ => panic!("expected agent join"),
     }
