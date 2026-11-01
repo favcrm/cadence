@@ -25,6 +25,7 @@
 //! - Copied, currently unused helpers: sse observes its caller's window;
 //!   master_frame observes 2s; stream_while waits 1.5s before mutation and reads
 //!   for 8s. LaneFx polls readiness/settlement/restart, and fake Pi polls release.
+//!
 //! The fixed observation/poll windows are retained for the measurement pass,
 //! not relabelled as causal completion. Named wait totals overlap phases (and
 //! some enclosing waits); they are not additive wall-clock phases.

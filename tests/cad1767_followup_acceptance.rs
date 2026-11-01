@@ -2192,6 +2192,30 @@ impl Fx {
             return self.read_until(path, cookie, "HTTP error EOF", |_| false);
         };
         let entries = page["entries"].as_array().expect("fixture entries");
+        let Some(thread) = page["thread"]["id"].as_str().map(str::to_string) else {
+            // The alias resolves but has no thread yet: threads::stream's
+            // `thread_read` preflight still succeeds, so it answers 200 and
+            // then loops emitting `: ping` forever — there is no entry and no
+            // EOF to wait for. Nothing can be disclosed for a thread that does
+            // not exist, and the same native read we just made is the proof of
+            // that. Completing on the first ping is therefore causal: it shows
+            // the stream opened and entered its loop, and the page above shows
+            // the loop has nothing to serve.
+            assert!(
+                entries.is_empty(),
+                "{path}: a page with entries must name its thread"
+            );
+            let mut opened = false;
+            let raw = self.read_until(path, cookie, "first ping (no thread yet)", |text| {
+                let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+                opened = body.split("\n\n").any(|frame| *frame == ": ping");
+                opened
+            });
+            if raw.starts_with("HTTP/1.1 200") {
+                assert!(opened, "{path}: stream closed before its first ping");
+            }
+            return raw;
+        };
         // Contract with threads::stream: its page size is 100, and its
         // second ping follows scanning + filtering that entire first page.
         // Include our sentinel in the strict <100-row fixture invariant.
@@ -2199,10 +2223,9 @@ impl Fx {
             entries.len() + 1 < 100,
             "{path}: fixture must fit one SSE page"
         );
-        let thread = page["thread"]["id"].as_str().expect("fixture thread");
         let seq = self.append(
             store,
-            thread,
+            &thread,
             "agent",
             "assistant_text",
             "causal-stream-boundary",
