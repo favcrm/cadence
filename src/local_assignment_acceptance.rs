@@ -45,6 +45,7 @@ struct Row {
     target: Option<String>,
     created_by: String,
     client_agent_id: Option<String>,
+    profile_id: Option<String>,
     idempotency_key: Option<String>,
     fingerprint: Option<String>,
     text: Option<String>,
@@ -112,7 +113,7 @@ impl Row {
     }
 
     fn json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "version": VERSION,
             "assignment_id": self.assignment_id,
             "organization_id": ORG,
@@ -128,7 +129,11 @@ impl Row {
             "guidance": Value::Null,
             "reported_head_sha": self.head,
             "text": self.text,
-        })
+        });
+        if let Some(profile) = &self.profile_id {
+            value["profile_id"] = json!(profile);
+        }
+        value
     }
 
     fn claimed_json(&self) -> Value {
@@ -170,6 +175,7 @@ impl Board {
             target: target.map(str::to_string),
             created_by: created_by.to_string(),
             client_agent_id: None,
+            profile_id: None,
             idempotency_key: None,
             fingerprint: None,
             text: None,
@@ -285,6 +291,7 @@ impl Board {
             target,
             created_by: ME.to_string(),
             client_agent_id: None,
+            profile_id: None,
             idempotency_key: Some(key.to_string()),
             fingerprint: Some(fingerprint),
             text: None,
@@ -314,6 +321,7 @@ impl Board {
         };
         let generation = body.get("expected_generation").and_then(Value::as_u64);
         let client = body.get("client_agent_id").and_then(Value::as_str);
+        let profile = body.get("profile_id").and_then(Value::as_str);
         if generation != Some(self.rows[index].generation) {
             return http(409, "fenced");
         }
@@ -337,6 +345,7 @@ impl Board {
         row.state = "running".to_string();
         row.claim_id = Some(claim_id);
         row.client_agent_id = Some(client.to_string());
+        row.profile_id = profile.map(str::to_string);
         Reply {
             status: 200,
             body: row.claimed_json(),
@@ -406,6 +415,7 @@ impl Board {
         row.generation += 1;
         row.claim_id = None;
         row.client_agent_id = None;
+        row.profile_id = None;
         row.text = None;
         row.head = None;
         if cancel {
@@ -1689,6 +1699,33 @@ fn failed_resume_blocks_the_resumed_claim_again() {
     let (state_now, _, claim) = script.row(&assignment);
     assert_eq!(state_now, "blocked");
     assert_eq!(claim.as_deref(), Some(original_claim.as_str()));
+}
+
+#[test]
+fn a_session_claim_names_the_profile_it_runs_under() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let mine = board.seed("start", "waiting", None, ME);
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+
+    coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE)
+        .expect("session start");
+
+    let claim = script
+        .calls()
+        .into_iter()
+        .find(|call| call.is_suffix("/claim"))
+        .expect("a claim was sent");
+    assert_eq!(claim.body["profile_id"], json!(PROFILE));
+    assert_eq!(
+        claim.body["client_agent_id"],
+        json!(format!("session-{PROFILE}"))
+    );
+    assert_eq!(script.row(&mine).0, "running");
 }
 
 #[test]
