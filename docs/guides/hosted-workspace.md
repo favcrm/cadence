@@ -240,7 +240,7 @@ starting. Load the profile, then use the project's actual integration ref:
 ```sh
 cadence --org acme agent context ap_<profile-id>
 cadence --org acme issue start <issue-id> --repo /absolute/path/to/checkout --profile ap_<profile-id> --base <integration-ref>
-cadence --org acme local-agent report <assignment-id> --state blocked --text "waiting for the owner"
+cadence --org acme agent report <assignment-id> --state blocked --text "waiting for the owner"
 ```
 
 `--profile` claims under `session-<profile-id>` without a daemon and targets
