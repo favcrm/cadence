@@ -76,6 +76,8 @@ struct Assignment {
     target: Option<String>,
     created_by_subject_id: String,
     client_agent_id: Option<String>,
+    /// The profile the board recorded for this claim, when it recorded one.
+    profile_id: Option<String>,
     guidance: Option<Value>,
     reported_head_sha: Option<String>,
     text: Option<String>,
@@ -350,6 +352,7 @@ impl Assignment {
             "target": self.target,
             "created_by_subject_id": self.created_by_subject_id,
             "client_agent_id": self.client_agent_id,
+            "profile_id": self.profile_id,
             "guidance": self.guidance,
             "reported_head_sha": self.reported_head_sha,
             "text": self.text,
@@ -505,6 +508,15 @@ fn parse_assignment(value: &Value) -> Result<Assignment> {
             "a blocked assignment has no claim to resume",
         ));
     }
+    let profile_id = match value.get("profile_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if prefixed_id(id, "ap_") => Some(id.clone()),
+        _ => {
+            return Err(Error::rejected(
+                "coordination response has an invalid profile id",
+            ))
+        }
+    };
     let reported_head_sha = match value.get("reported_head_sha") {
         Some(Value::Null) => None,
         Some(Value::String(sha)) if head_sha(sha) => Some(sha.clone()),
@@ -526,6 +538,7 @@ fn parse_assignment(value: &Value) -> Result<Assignment> {
         target,
         created_by_subject_id: created_by.to_string(),
         client_agent_id,
+        profile_id,
         guidance: parse_guidance(value)?,
         reported_head_sha,
         text: optional_text(value, "text")?,
@@ -1954,6 +1967,7 @@ impl<H: CoordHttp> Coordinator<H> {
             "generation": claimed.generation,
             "client_agent_id": client,
             "profile": profile,
+            "profile_recorded": claimed.profile_id.is_some(),
             "lane": lane,
             "worktree": path,
             "branch": git_line(Path::new(&path), &["rev-parse", "--abbrev-ref", "HEAD"]),
