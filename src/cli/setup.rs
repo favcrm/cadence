@@ -349,16 +349,13 @@ fn next_command(scope: &str, sign_in: &SignInFact, state_dir: &Path) -> String {
             return format!("cadence status --org {slug}");
         }
     }
-    let mut command = "cadence status".to_string();
-    // A run whose state dir is not the default must hand over a command
-    // that reads the same one; the default would report another machine.
-    if pinned || cadence_agent::home::state_dir().ok().as_deref() != Some(state_dir) {
-        command.push_str(&format!(
-            " --state-dir {}",
-            shell_quote(&state_dir.display().to_string())
-        ));
-    }
-    command
+    // A local handover pins this run's state dir even when it is the
+    // default: a saved remote org, or `CADENCE_ORG`, would otherwise send
+    // a bare `cadence status` to another destination.
+    format!(
+        "cadence status --state-dir {}",
+        shell_quote(&state_dir.display().to_string())
+    )
 }
 
 /// Single-quote a value for a command the CLI only ever *prints*. `'`

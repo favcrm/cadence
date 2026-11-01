@@ -607,7 +607,10 @@ fn private_dir(dir: &Path, create: bool) -> Result<()> {
         return Err(reject("Enrollment directory must be absolute"));
     }
     if create && !dir.exists() {
-        fs::create_dir_all(dir)?;
+        // Inside the consolidated home this creates the home root and the
+        // config root above it 0700; elsewhere it is the plain
+        // `create_dir_all` this writer had.
+        crate::home::create_home_dir(dir)?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     let meta = fs::symlink_metadata(dir)?;

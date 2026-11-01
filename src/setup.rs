@@ -1132,12 +1132,6 @@ pub fn board_detect(state_dir: &Path, pm_dir: &Path, port: u16) -> Result<BoardD
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .ok_or_else(|| Error::rejected("HOME is not set to an absolute path"))?;
-    // CAD-1227: a test process must not create in the invoking user's
-    // real consolidated home. The state and tracker initialization below
-    // use plain `create_dir_all`, so the guard belongs here, before the
-    // first effect.
-    crate::home::refuse_real_home(state_dir)?;
-    crate::home::refuse_real_home(&crate::issue::default_dir()?)?;
     let ctx = Ctx {
         state_dir: state_dir.to_path_buf(),
         pm_dir: pm_dir.to_path_buf(),
@@ -1198,9 +1192,16 @@ pub fn cli(
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .ok_or_else(|| Error::rejected("HOME is not set to an absolute path"))?;
+    // CAD-1227: a test process must not create in the invoking user's
+    // real consolidated home. The state and tracker initialization below
+    // use plain `create_dir_all`, so the guard belongs here, on the
+    // effectful path and before the first effect.
+    let pm_dir = crate::issue::default_dir()?;
+    crate::home::refuse_real_home(state_dir)?;
+    crate::home::refuse_real_home(&pm_dir)?;
     let ctx = Ctx {
         state_dir: state_dir.to_path_buf(),
-        pm_dir: crate::issue::default_dir()?,
+        pm_dir,
         home,
         port,
         sandbox: crate::sandbox::profile(),

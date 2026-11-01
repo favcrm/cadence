@@ -442,19 +442,26 @@ fn config_root(layout: &Layout) -> Result<PathBuf> {
 /// checked; the caller then creates it under the refusal rules above.
 fn refuse_symlinked_ancestry(root: &Path) -> Result<()> {
     use std::path::Component;
+    // The lexical refusal comes first: the walk below stops at the first
+    // missing component, so a `..` after a missing prefix would otherwise
+    // never be seen and the OS would apply it later.
+    if root
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(Error::rejected(format!(
+            "{} is not a plain absolute home — refusing a CADENCE_HOME with `..` or a path \
+             prefix; name the installation's own absolute path",
+            root.display()
+        )));
+    }
     let mut prefix = PathBuf::new();
     for component in root.components() {
         match component {
             Component::RootDir => prefix.push("/"),
             Component::Normal(part) => prefix.push(part),
             Component::CurDir => {}
-            Component::ParentDir | Component::Prefix(_) => {
-                return Err(Error::rejected(format!(
-                    "{} is not a plain absolute home — refusing a CADENCE_HOME with `..` or a \
-                     path prefix; name the installation's own absolute path",
-                    root.display()
-                )))
-            }
+            Component::ParentDir | Component::Prefix(_) => unreachable!("checked above"),
         }
         match std::fs::symlink_metadata(&prefix) {
             Ok(meta) if meta.file_type().is_symlink() => {

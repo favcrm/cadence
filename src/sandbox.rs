@@ -681,7 +681,12 @@ fn parse_profile(raw: Option<&str>) -> Option<String> {
 pub fn active_root() -> Option<PathBuf> {
     let name = profile()?;
     let sb = Sandbox::open(&name).ok()?;
-    read_marker(&sb).ok().flatten()?;
+    // The marker must name this sandbox: a copy of another sandbox's
+    // marker is not a home for this profile.
+    let marker = read_marker(&sb).ok().flatten()?;
+    if marker["name"].as_str() != Some(name.as_str()) {
+        return None;
+    }
     Some(sb.root)
 }
 
@@ -939,6 +944,12 @@ fn production_dirs(sb: &Sandbox, exported: bool) -> Result<Vec<(&'static str, Pa
     // resolver maps their profile to the sandbox root), so naming it here
     // cannot make a sandbox refuse its own store, and `owner_of` refuses a
     // marker planted in that installation.
+    if let Some(root) = var("CADENCE_HOME").filter(|path| path.is_absolute()) {
+        dirs.push(("the CADENCE_HOME installation", root.clone()));
+        dirs.push(("the CADENCE_HOME state dir", root.join("state")));
+        dirs.push(("the CADENCE_HOME tracker", root.join("tracker")));
+        dirs.push(("the CADENCE_HOME config dir", root.join("config")));
+    }
     if let Some(state_home) = var("XDG_STATE_HOME") {
         dirs.push(("the production state dir", state_home.join("cadence")));
     }
@@ -1258,6 +1269,12 @@ pub fn adopt(state_dir: &Path) -> Result<Option<String>> {
     std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
     std::env::set_var("CADENCE_PM_DIR", root.join("pm"));
     std::env::set_var("CADENCE_STATE_DIR", state_dir);
+    // Pin the base this sandbox was found under: the resolver rebuilds the
+    // root from the profile name, and a shell without the base exported
+    // would otherwise look in the default one.
+    if let Ok(base) = base_dir() {
+        std::env::set_var("CADENCE_SANDBOX_ROOT", base);
+    }
     Ok(Some(name))
 }
 
