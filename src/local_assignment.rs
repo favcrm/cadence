@@ -1969,6 +1969,8 @@ impl<H: CoordHttp> Coordinator<H> {
             "profile": profile,
             "lane": lane,
             "worktree": path,
+            "branch": git_line(Path::new(&path), &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "head": git_line(Path::new(&path), &["rev-parse", "HEAD"]),
             "actor": "external_session",
             "guidance": {
                 "code": "report_from_this_session",
@@ -2393,6 +2395,18 @@ fn explain_409(body: &Value) -> Error {
             "conflict",
             "the hosted assignment refused the request; nothing ran locally",
         ),
+    }
+}
+
+/// One line of `git -C <dir> <args>`, or an empty string when git refuses.
+fn git_line(dir: &Path, args: &[&str]) -> String {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(args);
+    match crate::reaper::output(&mut command) {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => String::new(),
     }
 }
 
