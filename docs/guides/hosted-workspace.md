@@ -279,10 +279,24 @@ checks and limitations. A profile or separate session alone does not prove a
 distinct authenticated principal, and in-chat findings are not automatically
 a gate-counted verdict.
 
+```sh
+cadence --org acme audit verdict --issue <issue-id> --pr <number> --head <full-sha> \
+  --kind standards --outcome pass --risk auto --file findings.md
+```
+
+`--kind` is `standards` or `spec`; `--outcome` is `pass` or `revise`, and
+`--title-outcome` / `--section-outcome` default to it. The reviewer is the
+authenticated caller, never an argument, and a second verdict of the same kind
+for the same head returns the first. Read them back under the same org with
+`cadence --org acme audit verdicts --issue <issue-id> --pr <number> --head
+<full-sha>`; a hosted selection answers from the org, never from local notes.
+The merge gate also runs whichever `cadence` you point it at: set `CADENCE_BIN`
+when more than one build is on the host, or a stale client's missing hosted verb
+will read like a gate refusal.
+
 Hosted `audit verdict` and `audit verdicts` exist in some versions, but their
 current identity and native-verdict semantics are not proven equivalent
-(CAD-1542, AOS-473); CAD-1981 also tracks a verdict read that can select the
-wrong organization. Preserve the findings and report the blocker rather than
+(CAD-1542, AOS-473). Preserve the findings and report the blocker rather than
 counting those records as native gate evidence or impersonating a reviewer.
 The repository's approved merge path and any required operator decision remain
 in force; a missing hosted gate is not a pass.

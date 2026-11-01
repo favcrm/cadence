@@ -36,7 +36,7 @@ decides before a merge what the audit reports after it:
 
 ```bash
 cadence audit approval --pr 84 --head <full-sha>   # JSON; exit 0 only when an approval is in force for exactly that head
-cadence audit verdicts --issue CAD-92 --pr 84 --head <full-sha>   # head-pinned verdict notes, plus why others were skipped
+cadence audit verdicts --issue CAD-92 --pr 84 --head <full-sha>   # head-pinned verdicts for the selected org, plus why others were skipped
 cadence audit scope --issue CAD-92   # CAD-1106: ticket scope pre-approvals (id, body digest, recorded_via, revoked); exit 0 when the store answered
 ```
 
@@ -44,11 +44,18 @@ cadence audit scope --issue CAD-92   # CAD-1106: ticket scope pre-approvals (id,
 counts (digest equals the sha256 of the trimmed current ticket body,
 `recorded_via` `operator-connection`, not revoked).
 
-`audit verdicts` uses the same note parser as the audit. A reviewer is the
-first whitespace token of `From:`, lower-cased (the rest is prose). Its kind
-comes from the exact title (`Standards`, `Spec/security`, `Browser QA`,
+`audit verdicts` answers for the org this invocation selects: `--org` and
+`CADENCE_ORG` route it exactly as they route every other verb, so an unknown,
+conflicting or unreadable selection refuses — it never reads the notes folder
+instead — and a hosted org reads its own record (and refuses when it cannot)
+rather than this machine's notes. A local selection parses the notes directory
+offline, with the same note parser as the audit; a reviewer is the first
+whitespace token of `From:`, lower-cased (the rest is prose). Its kind comes
+from the exact title (`Standards`, `Spec/security`, `Browser QA`,
 `Review (standards+spec)`); anything else is `other`. Symlinked notes are
-skipped, never followed. Neither verb writes anything or talks to the daemon.
+skipped, never followed. Neither `approval` nor `verdicts` writes anything —
+the verdict read does not even take the registry lock — and the local read
+needs no daemon, state dir or `HOME`.
 
 Two operator verbs write the approval evidence the report reads (see
 [Operator approval evidence](#operator-approval-evidence-the-human-class-gate)):
