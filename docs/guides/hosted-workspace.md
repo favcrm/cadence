@@ -75,6 +75,9 @@ produce an explicit tool error; the runtime does not decode image contents.
 Image bytes are retained in the conversation's private engine records for
 recovery, but are excluded from the board thread projection. The owner-only raw
 event stream retains the image's media type and a redacted marker, not its bytes.
+For each model request the runtime keeps the newest images that fit the
+four-image, 192 KiB total budget and replaces older omitted parts with an
+explicit notice to the model. The private durable history is not changed.
 
 Image input is off by default. A host may set `acceptsToolImages: true` only
 when its model gateway can receive images and verifies the resolved model and

@@ -1,12 +1,8 @@
-import {
-  hook,
-  ToolTask,
-  type Extension,
-  type ToolRegistration,
-} from "@earendil-works/pi-durable";
+import { hook, ToolTask, type Extension, type ToolRegistration } from "@earendil-works/pi-durable";
 import type { RuntimeTool, RuntimeTools, ToolContent } from "./contract.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { withToolAuthority } from "./tool-policy.ts";
+import { MAX_IMAGE_BASE64_CHARS, MAX_IMAGE_PARTS } from "./image-limits.ts";
 
 /**
  * Private adaptation of the neutral contract onto the engine.
@@ -14,16 +10,10 @@ import { withToolAuthority } from "./tool-policy.ts";
  * Nothing here is exported from the package root: application code never sees
  * a registration, hook, prompt section or engine model.
  */
-// Bounds apply to the total base64 payload of one tool result. The host's
-// model gateway still enforces its own whole-request and image pricing limits.
-const MAX_IMAGE_BASE64_CHARS = 192 * 1024;
-const MAX_IMAGE_PARTS = 4;
+// A single result must fit within the whole-request image budget.
 const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
 
-function imageError(
-  output: readonly ToolContent[],
-  acceptsImages: boolean,
-): string | undefined {
+function imageError(output: readonly ToolContent[], acceptsImages: boolean): string | undefined {
   let count = 0;
   let bytes = 0;
   for (const part of output) {
@@ -47,10 +37,7 @@ function imageError(
   return undefined;
 }
 
-function registration(
-  tool: RuntimeTool,
-  acceptsImages: boolean,
-): ToolRegistration {
+function registration(tool: RuntimeTool, acceptsImages: boolean): ToolRegistration {
   return {
     name: tool.name,
     description: tool.description,
@@ -69,8 +56,7 @@ function registration(
         { abortSignal: context.abortSignal },
       );
       const error = result.output && imageError(result.output, acceptsImages);
-      if (error)
-        return { output: [{ type: "text" as const, text: error }], isError: true };
+      if (error) return { output: [{ type: "text" as const, text: error }], isError: true };
       return {
         ...(result.output
           ? {
@@ -92,30 +78,19 @@ function registration(
 }
 
 /** One application group as an engine extension. */
-export function runtimeExtension(
-  group: RuntimeTools,
-  acceptsImages = false,
-): Extension {
+export function runtimeExtension(group: RuntimeTools, acceptsImages = false): Extension {
   return {
     name: group.name,
-    ...(group.tools
-      ? { tools: group.tools.map((tool) => registration(tool, acceptsImages)) }
-      : {}),
+    ...(group.tools ? { tools: group.tools.map((tool) => registration(tool, acceptsImages)) } : {}),
   };
 }
 
-function authorizeRegistration(
-  tool: ToolRegistration,
-  authority: ToolAuthority,
-): ToolRegistration {
+function authorizeRegistration(tool: ToolRegistration, authority: ToolAuthority): ToolRegistration {
   return {
     ...tool,
     execute(input, api, context) {
-      return withToolAuthority(
-        tool.name,
-        authority,
-        { abortSignal: context.abortSignal },
-        () => tool.execute(input, api, context),
+      return withToolAuthority(tool.name, authority, { abortSignal: context.abortSignal }, () =>
+        tool.execute(input, api, context),
       );
     },
   };
@@ -125,16 +100,11 @@ function authorizeRegistration(
  * Wrap an engine-owned extension's tools (the bundled skills' activation and
  * resource reads) with the same execution order an application tool gets.
  */
-export function authorizeExtension(
-  extension: Extension,
-  authority: ToolAuthority,
-): Extension {
+export function authorizeExtension(extension: Extension, authority: ToolAuthority): Extension {
   if (!extension.tools) return extension;
   return {
     ...extension,
-    tools: extension.tools.map((tool) =>
-      authorizeRegistration(tool, authority),
-    ),
+    tools: extension.tools.map((tool) => authorizeRegistration(tool, authority)),
   };
 }
 
@@ -143,9 +113,7 @@ export function authorizeExtension(
  * invokes through `executeTool()` meets the application's refusal before it
  * runs; executions are reauthorized by their wrappers on recovery.
  */
-export function intentGuard(
-  refusal: (name: string) => string | undefined,
-): Extension {
+export function intentGuard(refusal: (name: string) => string | undefined): Extension {
   return {
     name: "hosted-tool-policy",
     hooks: [

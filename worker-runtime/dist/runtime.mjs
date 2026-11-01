@@ -55866,9 +55866,11 @@ function authorizeTools(group, authority) {
   };
 }
 
-// src/engine.ts
+// src/image-limits.ts
 var MAX_IMAGE_BASE64_CHARS = 192 * 1024;
 var MAX_IMAGE_PARTS = 4;
+
+// src/engine.ts
 var BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
 function imageError(output, acceptsImages) {
   let count = 0;
@@ -56109,10 +56111,7 @@ function masterState(model, status, conversationId, metadata) {
 // src/model.ts
 var MODEL_CONTEXT_WINDOW = 128000;
 var MODEL_MAX_OUTPUT_TOKENS = 8192;
-var LEGACY_MODEL_IDS = [
-  "@cf/zai-org/glm-5.3-flash",
-  "z-ai/glm-5.3-flash"
-];
+var LEGACY_MODEL_IDS = ["@cf/zai-org/glm-5.3-flash", "z-ai/glm-5.3-flash"];
 function defaultModel(alias, acceptsImages = false) {
   return {
     id: alias,
@@ -56139,10 +56138,7 @@ function withDefaultModel(provider, model) {
   return {
     ...provider,
     getModels: () => [...provider.getModels(), ...models],
-    getAllModels: () => [
-      ...provider.getAllModels?.() ?? provider.getModels(),
-      ...models
-    ]
+    getAllModels: () => [...provider.getAllModels?.() ?? provider.getModels(), ...models]
   };
 }
 var MAX_MODEL_SCAN_BYTES = 64 * 1024;
@@ -56191,6 +56187,54 @@ function captureResolvedModel(response, onModelResolved) {
     headers: response.headers
   });
 }
+function boundImageHistory(input) {
+  if (!Array.isArray(input.messages))
+    return input;
+  const omitted = new Map;
+  let count = 0;
+  let bytes = 0;
+  let full = false;
+  for (let i = input.messages.length - 1;i >= 0; i--) {
+    const message = input.messages[i];
+    if (typeof message !== "object" || message === null || !("role" in message) || message.role !== "user" || !("content" in message) || !Array.isArray(message.content))
+      continue;
+    for (let j = message.content.length - 1;j >= 0; j--) {
+      const part = message.content[j];
+      if (typeof part !== "object" || part === null || !("type" in part) || part.type !== "image_url" || !("image_url" in part) || typeof part.image_url !== "object" || part.image_url === null || !("url" in part.image_url))
+        continue;
+      const url = part.image_url.url;
+      if (typeof url !== "string" || !/^data:image\/(?:png|jpeg|webp);base64,/.test(url))
+        continue;
+      const size = url.length - url.indexOf(",") - 1;
+      if (full || count >= MAX_IMAGE_PARTS || bytes + size > MAX_IMAGE_BASE64_CHARS) {
+        full = true;
+        const indexes = omitted.get(i) ?? new Set;
+        indexes.add(j);
+        omitted.set(i, indexes);
+      } else {
+        count++;
+        bytes += size;
+      }
+    }
+  }
+  if (omitted.size === 0)
+    return input;
+  return {
+    ...input,
+    messages: input.messages.map((message, messageIndex) => {
+      const indexes = omitted.get(messageIndex);
+      if (!indexes || typeof message !== "object" || message === null || !("content" in message) || !Array.isArray(message.content))
+        return message;
+      return {
+        ...message,
+        content: message.content.map((part, partIndex) => indexes.has(partIndex) ? {
+          type: "text",
+          text: "[An image was omitted from this request to fit the image limit.]"
+        } : part)
+      };
+    })
+  };
+}
 function meteredBinding(transport, identity, onModelResolved) {
   return {
     async run(_model, input, options) {
@@ -56204,7 +56248,7 @@ function meteredBinding(transport, identity, onModelResolved) {
           }
         }, { status: 409 });
       }
-      const response = await transport.requestModel(input, current, options?.signal);
+      const response = await transport.requestModel(boundImageHistory(input), current, options?.signal);
       const metered = onModelResolved ? captureResolvedModel(response, onModelResolved) : response;
       if (options?.returnRawResponse !== false)
         return metered;

@@ -1,18 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
-import {
-  createRegistry,
-  Harness,
-  MemoryStorage,
-} from "@earendil-works/pi-durable";
+import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
 import { createAI } from "agents/models/pi-ai";
 import { runtimeExtension } from "../src/engine.ts";
-import {
-  defaultModel,
-  meteredBinding,
-  withDefaultModel,
-} from "../src/model.ts";
+import { defaultModel, meteredBinding, withDefaultModel } from "../src/model.ts";
 import { rawSessionFrame } from "../src/session-stream.ts";
 import { threadEntries } from "../src/transcript.ts";
 
@@ -28,24 +20,20 @@ const frame = (delta: Record<string, unknown>, finish: string | null = null) =>
     choices: [{ index: 0, delta, finish_reason: finish }],
   })}\n\n`;
 
-async function observe(
-  acceptImages: boolean,
-  image: string = PNG,
-  legacy = false,
-) {
+async function observe(acceptImages: boolean, image: string = PNG, legacy = false, captures = 1) {
   const requests: Record<string, unknown>[] = [];
   const binding = meteredBinding(
     {
       async requestModel(input) {
         requests.push(input);
         const response =
-          requests.length === 1
+          requests.length <= captures
             ? frame({ role: "assistant", content: "" }) +
               frame({
                 tool_calls: [
                   {
                     index: 0,
-                    id: "capture-1",
+                    id: `capture-${requests.length}`,
                     type: "function",
                     function: { name: "capture", arguments: "{}" },
                   },
@@ -95,11 +83,7 @@ async function observe(
       acceptImages,
     ),
   );
-  const harness = await Harness.open(
-    new MemoryStorage(),
-    { models, registry },
-    BACKGROUND_CONTEXT,
-  );
+  const harness = await Harness.open(new MemoryStorage(), { models, registry }, BACKGROUND_CONTEXT);
   try {
     const conversation = await harness.root(BACKGROUND_CONTEXT, {
       agent: {
@@ -155,6 +139,34 @@ describe("visual tool results through the hosted model path", () => {
     expect(rawSnapshot).toContain('"redacted":true');
   });
 
+  it("keeps the newest observations within the whole-request image budget", async () => {
+    const { requests, messages: persisted } = await observe(true, PNG, false, 6);
+    const finalRequest = requests.at(-1);
+    const messages = finalRequest?.messages as Array<{ role: string; content: unknown }>;
+    const parts = messages.flatMap((message) =>
+      Array.isArray(message.content) ? message.content : [],
+    );
+    const images = parts
+      .filter(
+        (part) =>
+          part.type === "image_url" ||
+          (part.type === "text" && /image.{0,100}omitted/i.test(part.text)),
+      )
+      .map((part) => (part.type === "image_url" ? "image" : "omitted"));
+    expect(images).toEqual(["omitted", "omitted", "image", "image", "image", "image"]);
+    expect(JSON.stringify(persisted).split(PNG)).toHaveLength(7);
+  });
+
+  it("bounds combined screenshot bytes even when the image count fits", async () => {
+    const { requests } = await observe(true, "A".repeat(100 * 1024), false, 2);
+    const messages = requests.at(-1)?.messages as Array<{ content: unknown }>;
+    const parts = messages.flatMap((message) =>
+      Array.isArray(message.content) ? message.content : [],
+    );
+    expect(parts.filter((part) => part.type === "image_url")).toHaveLength(1);
+    expect(JSON.stringify(parts)).toMatch(/image.{0,100}omitted/i);
+  });
+
   it("reports unsupported image input instead of silently sending text that claims an image was attached", async () => {
     const { requests, thread } = await observe(false);
     expect(requests).toHaveLength(2);
@@ -202,9 +214,9 @@ describe("visual tool results through the hosted model path", () => {
     }
     expect((await stream.result()).stopReason).toBe("stop");
     expect(JSON.stringify(requests[0])).not.toContain(PNG);
-    const replayed = (
-      requests[0]?.messages as Array<{ role: string; content: string }>
-    ).find((message) => message.role === "tool");
+    const replayed = (requests[0]?.messages as Array<{ role: string; content: string }>).find(
+      (message) => message.role === "tool",
+    );
     expect(replayed?.content).toMatch(/image.{0,100}(?:omitt|unavailable|not support)/i);
     expect(JSON.stringify(messages)).toContain(PNG);
   });
