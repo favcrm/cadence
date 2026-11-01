@@ -12,11 +12,13 @@
 //! Every verb first refuses a root that overlaps production's state
 //! dir (and so its socket), tracker, home or config dir.
 //!
-//! CAD-1922: the sandbox is its own home. Its children get
-//! `CADENCE_HOME=<root>` and `XDG_CONFIG_HOME=<root>/config` as well as
-//! its state and tracker, so a caller's consolidated home, system
-//! install or hosted credentials cannot leak vault, repos, workspace or
-//! credentials into it.
+//! CAD-1922: the sandbox is its own home. Its children carry
+//! `CADENCE_PROFILE`, `CADENCE_STATE_DIR`, `CADENCE_PM_DIR` and
+//! `XDG_CONFIG_HOME=<root>/config`; the resolver maps the profile to the
+//! sandbox root, so a caller's consolidated home, system install or
+//! hosted credentials cannot leak vault, repos, workspace or credentials
+//! in. `CADENCE_HOME` is deliberately not set for children: the overlap
+//! guard reads it as evidence of a real installation.
 //!
 //! CAD-1187: whether a store may change build without the rollout lease
 //! is a property of the STORE, not of the caller's env. `up` writes a
@@ -669,6 +671,20 @@ fn parse_profile(raw: Option<&str>) -> Option<String> {
     raw?.strip_prefix(PROFILE_PREFIX).map(str::to_string)
 }
 
+/// The root of the sandbox this process is pinned to, when that sandbox
+/// exists and still holds its marker. `home::layout` uses it so a sandbox
+/// is its own home without exporting `CADENCE_HOME`, which the overlap
+/// guard must be free to read as production evidence.
+///
+/// Answers only *which root*, never *may this run*: it runs no overlap
+/// guard, no marker policy beyond existence and no daemon check.
+pub fn active_root() -> Option<PathBuf> {
+    let name = profile()?;
+    let sb = Sandbox::open(&name).ok()?;
+    read_marker(&sb).ok().flatten()?;
+    Some(sb.root)
+}
+
 /// Refuse `what` — a write to state shared by the whole host — under a
 /// sandbox profile.
 pub fn refuse_global(what: &str) -> Result<()> {
@@ -918,13 +934,11 @@ fn production_dirs(sb: &Sandbox, exported: bool) -> Result<Vec<(&'static str, Pa
         // this shell sets it.
         dirs.push(("the production state dir", crate::home::local_state_dir()?));
     }
-    // `CADENCE_HOME` is deliberately NOT inventory here. A sandbox's own
-    // children export it as their home, so taking it as production
-    // evidence would have `owner_of` refuse the sandbox's own store; and
-    // as an attacker's claim it is not evidence at all. That leaves a
-    // custom install named only by `CADENCE_HOME` unprotected by this
-    // guard unless it also carries one of the roots above — the open
-    // tradeoff tracked on CAD-1922.
+    // An explicit `CADENCE_HOME` names a real installation too — a system
+    // install, a second profile. Sandbox children no longer carry it (the
+    // resolver maps their profile to the sandbox root), so naming it here
+    // cannot make a sandbox refuse its own store, and `owner_of` refuses a
+    // marker planted in that installation.
     if let Some(state_home) = var("XDG_STATE_HOME") {
         dirs.push(("the production state dir", state_home.join("cadence")));
     }
@@ -946,10 +960,11 @@ fn production_dirs(sb: &Sandbox, exported: bool) -> Result<Vec<(&'static str, Pa
         // sandbox's own dirs may mark a dir disposable — a custom
         // installation can be configured at `<root>/state` or `<root>/pm`
         // too, and a planted marker would then delete it.
+        // `CADENCE_HOME` is inventoried above, from its own value, so it
+        // is not repeated here as an export.
         for (name, label) in [
             ("CADENCE_STATE_DIR", "the exported CADENCE_STATE_DIR"),
             ("CADENCE_PM_DIR", "the exported CADENCE_PM_DIR"),
-            ("CADENCE_HOME", "the exported CADENCE_HOME"),
             ("XDG_CONFIG_HOME", "the exported XDG_CONFIG_HOME"),
         ] {
             if let Some(dir) = var(name) {
@@ -1000,8 +1015,8 @@ fn refuse_overlap(sb: &Sandbox, exported: bool, own_exports_are_ours: bool) -> R
         // is the sandbox, not a live cadence. A host-derived default at
         // the same path is still production and still refuses.
         if own_exports_are_ours
-            && label.starts_with("the exported ")
-            && ours.iter().any(|own| own == &live)
+            && (label.starts_with("the exported ") || label.starts_with("the CADENCE_HOME "))
+            && (live.starts_with(&ours[0]) || ours.iter().any(|own| own == &live))
         {
             continue;
         }
@@ -1235,10 +1250,11 @@ pub fn adopt(state_dir: &Path) -> Result<Option<String>> {
     };
     let root = state_dir.parent().unwrap_or(state_dir);
     std::env::set_var("CADENCE_PROFILE", format!("{PROFILE_PREFIX}{name}"));
-    // CAD-1922: the adopted shell is the sandbox's home too, so a
-    // caller's exported CADENCE_HOME or XDG_CONFIG_HOME cannot point
-    // its vault, repos, workspace or credentials at a live install.
-    std::env::set_var("CADENCE_HOME", root);
+    // CAD-1922: the adopted shell is the sandbox's home too — the
+    // resolver maps the profile to this root — and XDG_CONFIG_HOME
+    // keeps hosted config and credentials inside it. CADENCE_HOME is
+    // deliberately left unset: the overlap guard must be free to read
+    // it as evidence of a real installation.
     std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
     std::env::set_var("CADENCE_PM_DIR", root.join("pm"));
     std::env::set_var("CADENCE_STATE_DIR", state_dir);
@@ -1491,7 +1507,6 @@ fn env_lines(sb: &Sandbox, port: Option<u16>, allow_global: bool) -> String {
     let mut text = format!(
         "# cadence dev {name} — `eval \"$(cadence dev env {name})\"`\n\
          unset {unset}\n\
-         export CADENCE_HOME={home}\n\
          export XDG_CONFIG_HOME={config}\n\
          export CADENCE_STATE_DIR={state}\n\
          export CADENCE_PM_DIR={pm}\n\
@@ -1499,7 +1514,6 @@ fn env_lines(sb: &Sandbox, port: Option<u16>, allow_global: bool) -> String {
          export CADENCE_SANDBOX_ROOT={base}\n",
         name = sb.name,
         unset = unset,
-        home = sh_quote(&sb.root.to_string_lossy()),
         config = sh_quote(&sb.config_dir().to_string_lossy()),
         state = sh_quote(&sb.state_dir().to_string_lossy()),
         pm = sh_quote(&sb.pm_dir().to_string_lossy()),
@@ -1535,11 +1549,12 @@ fn child(sb: &Sandbox, exe: &Path, args: &[&str], grant: bool) -> Command {
     cmd.arg("--state-dir")
         .arg(sb.state_dir())
         .args(args)
-        // CAD-1922: the sandbox is its own home. An exported
-        // CADENCE_HOME (a consolidated install, a system install) must
-        // not leak its vault, repos or workspace into the sandbox, and
-        // XDG_CONFIG_HOME keeps hosted config and credentials inside it.
-        .env("CADENCE_HOME", &sb.root)
+        // CAD-1922: the sandbox is its own home through the profile the
+        // resolver maps to this root, so the caller's CADENCE_HOME (a
+        // consolidated install, a system install) never leaks its vault,
+        // repos or workspace in. It is removed rather than shadowed: the
+        // overlap guard reads it as production evidence.
+        .env_remove("CADENCE_HOME")
         .env("XDG_CONFIG_HOME", sb.config_dir())
         .env("CADENCE_STATE_DIR", sb.state_dir())
         .env("CADENCE_PM_DIR", sb.pm_dir())

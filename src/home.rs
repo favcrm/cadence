@@ -61,6 +61,11 @@ pub const LAYOUT_VERSION: &str = "1";
 pub enum Source {
     /// `$CADENCE_HOME` — an explicit new-layout root.
     Env,
+    /// A `dev` sandbox this process is pinned to (CAD-1922). Its root is
+    /// the sandbox: the same layout a `CADENCE_HOME` would name, without
+    /// exporting one, so the overlap guard can read `CADENCE_HOME` as
+    /// production evidence.
+    Sandbox,
     /// A first run: no legacy installation exists, so `~/.cadence` is
     /// the default home (CAD-1922).
     Fresh,
@@ -75,6 +80,7 @@ impl Source {
         match self {
             Self::Env => "CADENCE_HOME",
             Self::Fresh => "fresh",
+            Self::Sandbox => "sandbox",
             Self::Legacy => "legacy",
         }
     }
@@ -98,6 +104,19 @@ pub struct Layout {
 /// root. Refuses a non-absolute `$CADENCE_HOME` — a relative root
 /// would follow the cwd.
 pub fn layout() -> Result<Layout> {
+    // A sandbox is its own home. The profile names it and the marker
+    // proves the root exists, so no `CADENCE_HOME` has to be exported for
+    // the sandbox's children to keep the caller's vault, repos, workspace
+    // and credentials out — which leaves that variable free to mean
+    // production evidence in the overlap guard.
+    if let Some(root) = crate::sandbox::active_root() {
+        return Ok(Layout {
+            source: Source::Sandbox,
+            marker_present: layout_marker_declared(&root),
+            root,
+        });
+    }
+
     if let Some(root) = std::env::var_os("CADENCE_HOME").map(PathBuf::from) {
         if !root.is_absolute() {
             return Err(Error::rejected(format!(
@@ -297,7 +316,7 @@ pub fn vault_dir() -> Result<PathBuf> {
 /// served.
 pub fn vault_for(tracker: &Path) -> Result<PathBuf> {
     let layout = layout()?;
-    if layout.source == Source::Env {
+    if matches!(layout.source, Source::Env | Source::Sandbox) {
         return Ok(layout.root.join("vault"));
     }
     // Only the consolidated branch's *own* tracker (`<home>/tracker`) uses
@@ -399,8 +418,8 @@ fn config_root(layout: &Layout) -> Result<PathBuf> {
         // installation already living in the consolidated home. Both keep
         // their config inside it; a legacy config root present at the same
         // time would have made the layout `Ambiguous` and been refused
-        // before this point.
-        Source::Fresh => layout.root.join("config"),
+        // before this point. A sandbox is its own install the same way.
+        Source::Fresh | Source::Sandbox => layout.root.join("config"),
         Source::Legacy => legacy,
         Source::Env => {
             if xdg || legacy_present(&legacy) {

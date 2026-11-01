@@ -53,6 +53,11 @@ pub(super) fn check_layout(_scan: &Scan) -> Check {
              dir or hosted config was found"
             .to_string()
     }))
+    .chain((layout.source == crate::home::Source::Sandbox).then(|| {
+        "this process is a dev sandbox — its root is the home, so no \
+             production path is consulted"
+            .to_string()
+    }))
     .chain(
         (layout.marker_present && layout.source == crate::home::Source::Legacy).then(|| {
             format!(
