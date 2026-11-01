@@ -5,7 +5,7 @@ CSS** rather than the design kit: the shell, sidebar, header, chips, drawer and
 buttons are the classes the live board uses.
 
 - **Source:** `design/mockups/approval-card/{index.html,card.css,card.js}`
-- **Preview:** `https://preview.simplebuild.site/20261031-173736/approval-card-real/`
+- **Preview:** `https://preview.simplebuild.site/20261101-151847/approval-card-rebased/`
   (signed; the `?t=` token survives state changes)
 - **Status:** review draft. Nothing accepted, nothing implemented.
 
@@ -19,14 +19,10 @@ buttons are the classes the live board uses.
 | Colours, type | `--color-*` and `--font-*` from the board's compiled stylesheet |
 | `card.css` | only what the board lacks: the status dot, row layout, progress steps |
 
-`index.css` is **not** committed. It is the board's compiled stylesheet, copied
-at publish time:
-
-```bash
-curl -o index.css https://<board-host>/assets/index.css
-```
-
-so the mockup cannot drift from a committed stale copy of the product's CSS.
+`index.css` is **not** committed. This preview reuses the compiled board
+stylesheet from the previous `approval-card-real` preview (SHA-256
+`b22460d705140f9286121999a807651e15fa0a05181f3650151e26cc3affcccf`);
+it was not refreshed from the live board for this rebase.
 
 ## States
 
