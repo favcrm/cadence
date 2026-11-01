@@ -605,6 +605,56 @@ fn codex_detach_parses() {
 }
 
 #[test]
+fn agent_join_parses_the_same_group_and_provider() {
+    let cli = Cli::try_parse_from(["cadence", "agent", "join", "pm-alias", "devin"]).unwrap();
+    match cli.command {
+        Commands::Agent {
+            action: AgentAction::Join { args },
+        } => {
+            assert_eq!(args.group, "pm-alias");
+            assert_eq!(args.provider, "devin");
+            assert!(!args.detach);
+            assert_eq!(args.role, "worker");
+        }
+        _ => panic!("expected agent join"),
+    }
+}
+
+#[test]
+fn issue_epic_propose_parses_file_and_workflow() {
+    let cli = Cli::try_parse_from([
+        "cadence",
+        "issue",
+        "epic",
+        "propose",
+        "--project",
+        "cadence",
+        "--file",
+        "plan.md",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::Epic {
+                action: cadence_agent::issue::cli::EpicAction::Propose {
+                    ref project,
+                    file: Some(_),
+                    workflow: None,
+                    ..
+                },
+            },
+        } if project == "cadence"
+    ));
+    assert!(Cli::try_parse_from(["cadence", "issue", "epic", "approve", "CAD-1",]).is_ok());
+    assert!(Cli::try_parse_from([
+        "cadence", "issue", "epic", "reject", "CAD-1", "--reason", "no",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from(["cadence", "plan", "propose", "--project", "cadence"]).is_ok());
+}
+
+#[test]
 fn join_parses_group_and_provider() {
     let cli = Cli::try_parse_from(["cadence", "join", "pm-alias", "devin"]).unwrap();
     match cli.command {

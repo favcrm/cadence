@@ -15,7 +15,7 @@ use crate::issue::{
 
 mod epic;
 mod milestone;
-pub use epic::{run_epic, EpicAction};
+pub use epic::{decide_plan, propose_plan, run_epic, EpicAction};
 pub use milestone::{run_milestone, MilestoneAction};
 mod board_actions;
 mod checkout;

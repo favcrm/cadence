@@ -28,8 +28,8 @@ path does not require `provider.draft`. The optional legacy external-adapter
 and publisher setup commands below request separate financial consent:
 
 ```sh
-cadence --org <slug> local-agent tool --lane provider.draft
-cadence --org <slug> local-agent tool --lane publish.send
+cadence --org <slug> agent tool --lane provider.draft
+cadence --org <slug> agent tool --lane publish.send
 ```
 
 These use the existing device consent endpoints, not a new token issuer.
@@ -392,7 +392,7 @@ The selected row's UID is checked inside the enqueue transaction; removing
 or replacing that recipient before enqueue refuses the send rather than
 allowing a later generic lookup to redirect it.
 Personal assistants require separate assistant authority and local workers
-use the `local-agent`/local-assignment plane; neither is a remote-send recipient.
+use the local-assignment plane (`agent connect` and the other hosted `agent` verbs); neither is a remote-send recipient.
 Generic member-to-member `send` and the local-worker follow-up journey remain
 refused on this transport. Explicit directory-addressed FYIs use the separate
 [`agent notify` flow](guides/hosted-workspace.md#a-teammates-own-agent-collaboration-flow);
