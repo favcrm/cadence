@@ -13,8 +13,12 @@ import type { GenerationIdentity } from "./contract.ts";
  *
  * A run's inputs (`pi.live.run.inputs`) are submission ids. `pi_submissions`
  * records the entry each placed input became, and `pi_entries` holds that
- * entry's own `kind` and `data` — where the runtime's admission envelope lives.
- * `readSubmissionEntry` exposes exactly that pair for one submission root.
+ * entry's own `kind`, `data` and user message — where the runtime's admission
+ * envelope lives. `readSubmissionEntry` exposes that for one submission root,
+ * and `readHeldSubmission` reads the same records from the other end: the
+ * submission, and the text and entry it was submitted with, for one operation
+ * id. A queued input has no entry yet; its draft lives in the engine's own
+ * inbox document, which the session reads through the engine's document API.
  *
  * A future engine release that changes these tables or shapes only needs this
  * module updated; session and funding code consume the stable shapes.
@@ -107,10 +111,12 @@ export function readGenerationIdentity(
   return { conversation, task, cutoff: cutoffValue };
 }
 
-/** The engine's stored `kind`/`data` for one placed input entry. */
+/** The engine's stored pieces of one entry: its kind, its data and its messages. */
 export interface StoredEntryData {
   readonly kind: unknown;
   readonly data: unknown;
+  /** The messages the entry contributes to the model context, when it has any. */
+  readonly model: unknown;
 }
 
 /**
@@ -139,12 +145,7 @@ export function readSubmissionEntry(
     entryId <= 0
   )
     return null;
-  const entry = record(sql, "pi_entries", entryId);
-  if (entry === null || !("kind" in entry)) return null;
-  return {
-    kind: entry.kind,
-    data: "data" in entry ? entry.data : undefined,
-  };
+  return entryData(sql, entryId);
 }
 
 /**
@@ -160,12 +161,7 @@ export function readSubmissionEntry(
  * it instead of assuming.
  */
 export function submissionHeld(sql: TaskSql, operationId: string): boolean {
-  const table = sql
-    .exec(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name='pi_submissions'",
-    )
-    .toArray()[0];
-  if (table === undefined) return false;
+  if (!hasSubmissions(sql)) return false;
   const held = sql
     .exec(
       "SELECT 1 AS held FROM pi_submissions WHERE json_extract(record,'$.requestId')=? LIMIT 1",
@@ -175,12 +171,174 @@ export function submissionHeld(sql: TaskSql, operationId: string): boolean {
   return held !== undefined;
 }
 
-/** One stored record's parsed JSON body, or `null` when it is absent or unparsable. */
+/** One submission the engine holds for an operation id, as its own records say. */
+export interface HeldSubmission {
+  /** The engine's own submission id. */
+  readonly id: number;
+  /** The submission type the engine stored. */
+  readonly type: "input" | "write";
+  /** The lifecycle status the engine stored. */
+  readonly status: "queued" | "placed" | "done" | "unanswered";
+  /**
+   * The exact text the input was submitted with, when the engine stored it as
+   * one plain user message: the message a submission appends for its input.
+   * `null` when the engine placed no entry yet, or stored a content shape that
+   * cannot be read back as that text.
+   */
+  readonly text: string | null;
+  /** The entry the input was placed as, when the engine placed one. */
+  readonly entry: StoredEntryData | null;
+}
+
+/**
+ * The submission the engine holds for one operation id, or `null` when its
+ * records prove it holds none.
+ *
+ * A runtime build that predates the admission guard submits without one, so the
+ * engine can hold an operation id this session's SQLite never bound. Recovering
+ * what such a submission actually was is the only way to tell an identical
+ * retry from a different operation reusing the id, and the engine's own records
+ * are the only authority for it: the submission's type, the entry it was placed
+ * as, and the user message that entry carries.
+ *
+ * The lookup is the engine's own deduplication key — the conversation and the
+ * JSON-encoded request id it indexes — so this answers for exactly the
+ * submission the engine would replay, and not one another conversation holds
+ * under the same id.
+ *
+ * Unlike the rest of this adapter, an unreadable or ambiguous record throws.
+ * Its caller acts on "the engine holds nothing", so that answer must be a proof
+ * rather than a failed read: two rows for one request id, a record that is not
+ * a submission, or an entry the record names but the engine cannot produce are
+ * states no correct engine writes, and a caller that cannot tell which row is
+ * the operation refuses instead of guessing.
+ */
+export function readHeldSubmission(
+  sql: TaskSql,
+  conversationId: number,
+  operationId: string,
+): HeldSubmission | null {
+  if (!hasSubmissions(sql)) return null;
+  const rows = sql
+    .exec(
+      `SELECT id, record FROM pi_submissions
+        WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`,
+      conversationId,
+      JSON.stringify(operationId),
+    )
+    .toArray();
+  if (rows.length === 0) return null;
+  if (rows.length > 1)
+    throw new Error(
+      `Operation "${operationId}" names more than one engine submission.`,
+    );
+  const row = rows[0];
+  if (row === undefined) return null;
+  const id = Number(row.id);
+  if (!Number.isSafeInteger(id) || id <= 0)
+    throw new Error(
+      `Operation "${operationId}" has an unreadable engine submission.`,
+    );
+  const submission = parseRecord(row.record);
+  if (submission === null)
+    throw new Error(
+      `Operation "${operationId}" has an unreadable engine submission.`,
+    );
+  const { type, status } = submission;
+  if (type !== "input" && type !== "write")
+    throw new Error(
+      `Operation "${operationId}" has an unreadable engine submission.`,
+    );
+  if (
+    status !== "queued" &&
+    status !== "placed" &&
+    status !== "done" &&
+    status !== "unanswered"
+  )
+    throw new Error(
+      `Operation "${operationId}" has an unreadable engine submission.`,
+    );
+  const entryId = submission.entry;
+  if (entryId === undefined || entryId === null)
+    return { id, type, status, text: null, entry: null };
+  if (
+    typeof entryId !== "number" ||
+    !Number.isSafeInteger(entryId) ||
+    entryId <= 0
+  )
+    throw new Error(
+      `Operation "${operationId}" has an unreadable engine submission.`,
+    );
+  const entry = entryData(sql, entryId);
+  if (entry === null)
+    throw new Error(
+      `Operation "${operationId}" has an engine submission whose entry is unavailable.`,
+    );
+  return { id, type, status, text: entryText(entry.model), entry };
+}
+
+/** Whether the engine's submissions table exists; without it, none is held. */
+function hasSubmissions(sql: TaskSql): boolean {
+  const table = sql
+    .exec(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='pi_submissions'",
+    )
+    .toArray()[0];
+  return table !== undefined;
+}
+
+/** One stored entry's pieces, or `null` when the row is absent or unreadable. */
+function entryData(sql: TaskSql, entryId: number): StoredEntryData | null {
+  const entry = record(sql, "pi_entries", entryId);
+  if (entry === null || !("kind" in entry)) return null;
+  return {
+    kind: entry.kind,
+    data: "data" in entry ? entry.data : undefined,
+    model: "model" in entry ? entry.model : undefined,
+  };
+}
+
+/**
+ * The text one input entry carries, when the engine stored exactly the user
+ * message a submission appends for its input: a single message of role `user`
+ * whose content is a plain string. A content list, no messages, or any other
+ * message shape is not that text, so this answers `null` and its caller refuses
+ * rather than reconstructing one.
+ */
+function entryText(model: unknown): string | null {
+  if (!Array.isArray(model) || model.length !== 1) return null;
+  const message: unknown = model[0];
+  if (typeof message !== "object" || message === null || Array.isArray(message))
+    return null;
+  if (!("role" in message) || !("content" in message)) return null;
+  if (message.role !== "user" || typeof message.content !== "string")
+    return null;
+  return message.content;
+}
+
+/** One stored `record` column's parsed JSON body, or `null` when it is not one. */
+function parseRecord(stored: unknown): Record<string, unknown> | null {
+  if (typeof stored !== "string") return null;
+  try {
+    const parsed: unknown = JSON.parse(stored);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+      return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One row's parsed `record`, or `null` when the row is absent, unreadable or
+ * not a JSON object. The row's id is already known by the caller, so only the
+ * body is read.
+ */
 function record(
   sql: TaskSql,
   table: "pi_submissions" | "pi_entries",
   id: number,
-): object | null {
+): Record<string, unknown> | null {
   let row: Record<string, unknown> | undefined;
   try {
     row = sql.exec(`SELECT record FROM ${table} WHERE id=?`, id).toArray()[0];
@@ -188,14 +346,5 @@ function record(
     return null;
   }
   if (row === undefined) return null;
-  const stored = row.record;
-  if (typeof stored !== "string") return null;
-  try {
-    const parsed: unknown = JSON.parse(stored);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
-      return null;
-    return parsed;
-  } catch {
-    return null;
-  }
+  return parseRecord(row.record);
 }

@@ -5,13 +5,13 @@
     "": {
       "name": "@cadence/hosted-runtime",
       "dependencies": {
+        "@earendil-works/chord": "1.4.0",
         "@earendil-works/pi-ai": "1.4.0",
         "@earendil-works/pi-durable": "1.4.0",
         "agents": "0.30.0",
       },
       "devDependencies": {
         "@cloudflare/workers-types": "5.20260930.2",
-        "@earendil-works/chord": "1.4.0",
         "typescript": "7.0.2",
       },
     },
