@@ -126,6 +126,7 @@ async function observe(
       thread: threadEntries(records.items, true),
       rawSnapshot: rawSessionFrame({ type: "snapshot", snapshot: { entries: records.items } }),
       rawEvents: records.items.map((entry) => rawSessionFrame({ type: "message_end", entry })),
+      messages: records.items.flatMap((record) => record.model ?? []),
     };
   } finally {
     await harness.close(BACKGROUND_CONTEXT);
@@ -162,6 +163,50 @@ describe("visual tool results through the hosted model path", () => {
       text: "Image input is unavailable for this session.",
       payload: { is_error: true },
     });
+  });
+
+  it("does not silently drop a stored screenshot when a resumed session becomes text-only", async () => {
+    const { messages } = await observe(true);
+    const requests: Record<string, unknown>[] = [];
+    const binding = meteredBinding(
+      {
+        async requestModel(input) {
+          requests.push(input);
+          return new Response(
+            frame({ role: "assistant", content: "" }) +
+              frame({ content: "finished" }) +
+              frame({}, "stop") +
+              "data: [DONE]\n\n",
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        },
+      },
+      () => ({ conversation: "1", task: "4", cutoff: "5" }),
+    );
+    const model = defaultModel("default");
+    const ai = createAI({ binding: binding as Ai });
+    const models = createModels();
+    models.setProvider(withDefaultModel(ai.provider, model));
+    const stream = models.streamSimple(
+      model,
+      {
+        messages: [
+          ...messages,
+          { role: "user", content: "What did the page show?", timestamp: 1000 },
+        ],
+      },
+      {},
+    );
+    for await (const _event of stream) {
+      // Drain the real adapter to issue the request.
+    }
+    expect((await stream.result()).stopReason).toBe("stop");
+    expect(JSON.stringify(requests[0])).not.toContain(PNG);
+    const replayed = (
+      requests[0]?.messages as Array<{ role: string; content: string }>
+    ).find((message) => message.role === "tool");
+    expect(replayed?.content).toMatch(/image.{0,100}(?:omitt|unavailable|not support)/i);
+    expect(JSON.stringify(messages)).toContain(PNG);
   });
 
   it("retains image input when resuming a session with a legacy model id", async () => {
