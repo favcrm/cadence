@@ -142,6 +142,7 @@ pub const REMOTE_VERBS: &[&str] = &[
     "delivery_policy_set",
     "audit_approval",
     "audit_verdicts",
+    "audit_verdict",
     "audit_scope",
     "audit_approve",
 ];
@@ -162,6 +163,7 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "agent_roles" => &["cli.read"],
         // The owner's merge approval and the delivery inputs it binds both
         // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
+        "audit_verdict" => &["cli.write"],
         "audit_approve" | "delivery_policy_set" => &["cli.write", "audit.approve"],
         "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => &["cli.write"],
         _ => &["cli.read", "cli.write"],
@@ -187,7 +189,10 @@ fn team_mutation_verb(verb: &str) -> bool {
 /// `message_send` is the historical member of this set; the team mutations
 /// join it for the reason above.
 fn mutating_cli_verb(verb: &str) -> bool {
-    matches!(verb, "message_send" | "issue_attach" | "issue_review") || team_mutation_verb(verb)
+    matches!(
+        verb,
+        "message_send" | "issue_attach" | "issue_review" | "audit_verdict"
+    ) || team_mutation_verb(verb)
 }
 
 /// The read a caller must run before repeating a mutating verb whose answer
@@ -200,6 +205,8 @@ fn lost_mutation_note(verb: &str) -> &'static str {
         "the send may or may not have been recorded"
     } else if verb == "issue_attach" {
         "the attachment may or may not have been recorded — inspect the same issue and artifact before repeating it"
+    } else if verb == "audit_verdict" {
+        "the verdict may or may not have been recorded — read `audit verdicts` for the same head before repeating it"
     } else if verb == "issue_review" {
         "the verdict may or may not have been recorded — read the same issue before repeating it; a reviewer holds one verdict per revision"
     } else {

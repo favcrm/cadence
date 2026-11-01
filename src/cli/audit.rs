@@ -87,6 +87,42 @@ pub(crate) enum AuditAction {
         #[arg(long)]
         notes_dir: Option<PathBuf>,
     },
+    /// Record one reviewer's verdict for exactly this issue, PR and head
+    /// (hosted orgs). The board takes the reviewer from the authenticated
+    /// caller, never from an argument; a second verdict of the same kind for
+    /// the same head returns the first and rewrites nothing.
+    Verdict {
+        /// Tracker issue id the verdict names.
+        #[arg(long)]
+        issue: String,
+        /// PR number the verdict pins.
+        #[arg(long)]
+        pr: u64,
+        /// Full 40-hex head SHA the verdict names — a new head voids it.
+        #[arg(long)]
+        head: String,
+        /// `standards` or `spec`.
+        #[arg(long)]
+        kind: String,
+        /// `pass` or `revise`.
+        #[arg(long)]
+        outcome: String,
+        /// The title's outcome; defaults to `--outcome`.
+        #[arg(long = "title-outcome")]
+        title_outcome: Option<String>,
+        /// The findings section outcome; defaults to `--outcome`.
+        #[arg(long = "section-outcome")]
+        section_outcome: Option<String>,
+        /// The risk line the note states (`auto`, or `human (…)`).
+        #[arg(long, default_value = "auto")]
+        risk: String,
+        /// Findings text; `-` reads stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "text")]
+        file: Option<PathBuf>,
+        /// Findings text inline.
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+    },
     /// Designate an agent to record delegated approvals for a project
     /// (operator only; `--revoke` withdraws the designation).
     Designate {
@@ -135,6 +171,12 @@ pub(super) fn run(
     merge_report: Option<PathBuf>,
 ) -> Result<i32> {
     match action {
+        // A verdict is a hosted record: the board owns the reviewer identity
+        // and the exact-head binding. The native path files note files under
+        // the notes dir instead, which this verb never fabricates.
+        Some(AuditAction::Verdict { .. }) => Err(Error::rejected(
+            "audit verdict records a verdict in the hosted org; select it with `--org <org>`.              Nothing was written",
+        )),
         Some(AuditAction::Verdicts {
             issue,
             pr,

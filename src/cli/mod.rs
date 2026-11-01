@@ -634,10 +634,11 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
         }
         // Handled in `cli::audit::run`: a read, not an RPC.
         // Handled in `cli::audit::run`: reads, not RPCs.
-        AuditAction::Approval { .. } | AuditAction::Verdicts { .. } | AuditAction::Scope { .. } => {
-            unreachable!(
-                "audit approval/verdicts/scope are read-only and handled in cli::audit::run"
-            )
+        AuditAction::Approval { .. }
+        | AuditAction::Verdicts { .. }
+        | AuditAction::Scope { .. }
+        | AuditAction::Verdict { .. } => {
+            unreachable!("audit approval/verdicts/scope/verdict are handled in cli::audit::run")
         }
         AuditAction::Designate {
             alias,
