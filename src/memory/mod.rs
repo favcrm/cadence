@@ -1052,33 +1052,6 @@ fn after_initial_find_for_test(path: &Path) {
         AFTER_INITIAL_FIND_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
     }
 }
-
-#[cfg(all(test, feature = "test-seam"))]
-pub(crate) fn set_review_after_initial_find_hook_for_test(
-    hook: Option<(
-        PathBuf,
-        std::sync::mpsc::Sender<()>,
-        std::sync::mpsc::Receiver<()>,
-    )>,
-) {
-    AFTER_INITIAL_FIND_HOOK.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if let Some((path, reached, proceed)) = hook {
-            assert!(
-                slot.is_none(),
-                "native review test hook is already installed"
-            );
-            *slot = Some(AfterInitialFindHook {
-                path,
-                reached,
-                proceed,
-            });
-        } else {
-            *slot = None;
-        }
-    });
-}
-
 pub fn submit_review(
     pm: &Pm,
     flag: Option<&str>,

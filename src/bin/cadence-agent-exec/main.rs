@@ -28,6 +28,7 @@ mod policy;
 #[path = "../../protected_pi_profile.rs"]
 #[allow(dead_code)] // Same grammar compiled into both artifacts, not a caller policy port.
 mod protected_pi_profile;
+
 #[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString, OsString};
 #[cfg(target_os = "linux")]
@@ -175,9 +176,21 @@ fn dispatch_protected_request(
     refuse_unsupported_protected_request(request)
 }
 
-#[cfg(all(target_os = "linux", test))]
-std::thread_local! { static PROTECTED_EFFECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-#[cfg(all(target_os = "linux", test))]
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+#[cfg(all(target_os = "linux", any(test, not(target_arch = "x86_64"))))]
+fn refuse_unsupported_protected_request(
+    request: policy::Request,
+) -> std::io::Result<std::convert::Infallible> {
+    if let policy::Request::PiGuest(profile) = request {
+        profile
+            .selection()
+            .map_err(|why| std::io::Error::new(std::io::ErrorKind::PermissionDenied, why))?;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "protected Pi launch requires Linux x86_64 constructor custody; unsupported target refused",
+    ))
+}
 #[cfg(target_os = "linux")]
 fn refuse(why: &str) -> i32 {
     eprintln!("cadence-agent-exec: refused: {why}");

@@ -935,26 +935,6 @@ fn cli_session_post_with(
         correlation,
     })
 }
-
-#[cfg(test)]
-pub(crate) fn cli_session_post_for_test(
-    dir: &Path,
-    issuer: &str,
-    path: &str,
-    bearer: &str,
-    body: Value,
-    deadline: Instant,
-    send: impl FnOnce(
-        &str,
-        &str,
-        Option<&AccessIngress>,
-        &Value,
-        Duration,
-    ) -> Result<(u16, Vec<u8>, Option<IssuerCorrelation>)>,
-) -> Result<IssuerAnswer> {
-    cli_session_post_with(dir, issuer, path, bearer, body, deadline, send)
-}
-
 /// The account image door uses the saved canonical board audience, never the
 /// issuer's media origin. Trust remains the normal login trust; no media pin
 /// or ingress credential is added (issuer-only Access secrets stay there).
@@ -2477,19 +2457,6 @@ fn login_grant(
         token: field(credential, "access_token")?.to_string(),
     })
 }
-
-/// Test controller access to the strict human login parser.
-#[cfg(all(test, feature = "test-seam"))]
-pub(crate) fn login_grant_for_test(value: &Value, issuer: &str) -> Result<LoginGrant> {
-    login_grant(
-        value,
-        None,
-        Some("lc"),
-        issuer,
-        &["cli.read", "cli.write", "wiki.read", "wiki.write"],
-    )
-}
-
 impl LoginGrant {
     /// Write the `hct_` to `cli-<slug>.json` at 0600 (temp file, then
     /// rename), separate from `orgs.json`. Never printed.
@@ -3109,5 +3076,6 @@ fn enroll_child_locked(
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
 #[cfg(test)]
 mod portable_migration_gate_tests;

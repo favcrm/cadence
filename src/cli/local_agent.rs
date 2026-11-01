@@ -12,9 +12,7 @@ use std::path::{Path, PathBuf};
 
 use cadence_agent::local_assignment::delivery::deliver_kickoff;
 #[cfg(test)]
-use cadence_agent::local_assignment::delivery::{
-    claimant_target, redact_secrets, require_context, write_note,
-};
+use cadence_agent::local_assignment::delivery::{redact_secrets, write_note};
 use cadence_agent::local_assignment::http::BoardHttp;
 use cadence_agent::local_assignment::{Coordinator, Kickoff};
 use cadence_agent::remote_cli::RemoteTarget;

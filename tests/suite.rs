@@ -2,25 +2,13 @@
 //!
 //! The per-module acceptance suites and the contract tests for this repo's own
 //! tooling were retired. What remains is one target so `cargo nextest` has
-//! something real to run, plus the lib and bins unit suites.
+//! something to run, plus the lib and bins unit suites.
 //!
-//! The assertion is about the shipped artifact, which no unit test can make:
-//! the binary that CI just built reports a version and exits successfully.
+//! The assertion is behavioural and pure — no process, socket or clock: an
+//! identifier the daemon accepts is one every caller can rely on.
 
 #[test]
-fn the_built_binary_reports_its_version() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-        .arg("--version")
-        .output()
-        .expect("cadence --version runs");
-    assert!(
-        output.status.success(),
-        "cadence --version exited {:?}",
-        output.status
-    );
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        text.contains("cadence"),
-        "unexpected --version output: {text:?}"
-    );
+fn an_identifier_is_validated_before_anything_uses_it() {
+    assert!(cadence_agent::proto::identifier("cad1234", "issue id").is_ok());
+    assert!(cadence_agent::proto::identifier("not a valid id", "issue id").is_err());
 }

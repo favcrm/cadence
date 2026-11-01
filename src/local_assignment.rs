@@ -694,19 +694,6 @@ impl<H: CoordHttp> Coordinator<H> {
         })
     }
 
-    #[cfg(test)]
-    pub(super) fn pause_after_delivery_check(
-        &mut self,
-        wait: std::sync::Arc<dyn Fn() + Send + Sync>,
-    ) {
-        self.before_reservation = Some(wait);
-    }
-
-    #[cfg(test)]
-    fn set_subject(&mut self, subject: &str) {
-        self.subject_id = Some(subject.to_string());
-    }
-
     fn with_ledger<T>(&self, body: impl FnOnce(&mut Ledger) -> Result<T>) -> Result<T> {
         let _lock = remote_cli::private_lock(
             &self.ledger,
