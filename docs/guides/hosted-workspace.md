@@ -253,6 +253,37 @@ which is the condition the board's claim route applies to a non-agent client id.
 A member who has connected a local agent must use the default alias on the claim
 route; `--profile` fails with the board's refusal instead of borrowing that alias.
 
+`--base <ref>` cuts the lane from that ref and echoes it in the receipt; without
+it the lane follows the checkout's own resolution. The alias path refuses
+`--base` rather than ignoring it. A board that predates profile claims refuses
+the field: the claim then proceeds without it, under the same client id and
+fences, and the client says on stderr that the profile was not recorded.
+
+A `--state result` report ends the assignment but moves nothing else. Close the
+ticket yourself once the work is accepted:
+
+```sh
+cadence --org acme issue set <issue-id> status=done
+```
+
+### Recording a review verdict
+
+A reviewer files one verdict per exact head; the merge gate counts them, and an
+author's own verdict never does:
+
+```sh
+cadence --org acme audit verdict --issue <issue-id> --pr <number> --head <full-sha> \
+  --kind standards --outcome pass --risk auto --file findings.md
+```
+
+`--kind` is `standards` or `spec`; `--outcome` is `pass` or `revise`, and
+`--title-outcome` / `--section-outcome` default to it. The reviewer is the
+authenticated caller, never an argument, and a second verdict of the same kind
+for the same head returns the first. Read them back with `audit verdicts`. The
+merge gate also runs whichever `cadence` you point it at: set `CADENCE_BIN` when
+more than one build is on the host, or a stale client's missing hosted verb will
+read like a gate refusal.
+
 To give the other teammate an informational pointer, obtain their exact `lag_`
 ID from `agent directory`, then send an explicit FYI:
 
