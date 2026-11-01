@@ -76,8 +76,10 @@ Image bytes are retained in the conversation's private engine records for
 recovery, but are excluded from the board thread projection. The owner-only raw
 event stream retains the image's media type and a redacted marker, not its bytes.
 For each model request the runtime keeps the newest images that fit the
-four-image, 192 KiB total budget and replaces older omitted parts with an
-explicit notice to the model. The private durable history is not changed.
+192 KiB total budget and a configurable image-count limit, replacing omitted
+parts with an explicit notice to the model. The count defaults to one; a host
+may set `maxImagesPerRequest` from one to four only when every model its alias
+may resolve to permits that many. The private durable history is not changed.
 
 Image input is off by default. A host may set `acceptsToolImages: true` only
 when its model gateway can receive images and verifies the resolved model and

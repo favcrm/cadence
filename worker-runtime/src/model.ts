@@ -164,7 +164,10 @@ export interface MeteredBinding {
  * Retain the newest image parts that fit one gateway request. Durable session
  * history is untouched; each omitted image is named in the model input.
  */
-function boundImageHistory(input: Record<string, unknown>): Record<string, unknown> {
+function boundImageHistory(
+  input: Record<string, unknown>,
+  maxImages: number,
+): Record<string, unknown> {
   if (!Array.isArray(input.messages)) return input;
   const omitted = new Map<number, Set<number>>();
   let count = 0;
@@ -196,7 +199,7 @@ function boundImageHistory(input: Record<string, unknown>): Record<string, unkno
       const url = part.image_url.url;
       if (typeof url !== "string" || !/^data:image\/(?:png|jpeg|webp);base64,/.test(url)) continue;
       const size = url.length - url.indexOf(",") - 1;
-      if (count >= MAX_IMAGE_PARTS || bytes + size > MAX_IMAGE_BASE64_CHARS) {
+      if (count >= maxImages || bytes + size > MAX_IMAGE_BASE64_CHARS) {
         const indexes = omitted.get(i) ?? new Set<number>();
         indexes.add(j);
         omitted.set(i, indexes);
@@ -248,7 +251,14 @@ export function meteredBinding(
   transport: MeteredTransport,
   identity: () => GenerationIdentity | null,
   onModelResolved?: (model: string) => void,
+  maxImagesPerRequest = 1,
 ): MeteredBinding {
+  if (
+    !Number.isSafeInteger(maxImagesPerRequest) ||
+    maxImagesPerRequest < 1 ||
+    maxImagesPerRequest > MAX_IMAGE_PARTS
+  )
+    throw new Error("Invalid model image limit.");
   return {
     async run(_model, input, options) {
       const current = identity();
@@ -265,7 +275,7 @@ export function meteredBinding(
         );
       }
       const response = await transport.requestModel(
-        boundImageHistory(input),
+        boundImageHistory(input, maxImagesPerRequest),
         current,
         options?.signal,
       );

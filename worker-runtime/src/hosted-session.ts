@@ -90,6 +90,7 @@ export class HostedSession<
         options,
         () => this.generationIdentity(),
         (served) => this.recordResolvedModel(served),
+        options.maxImagesPerRequest,
       ) as unknown as Ai,
     });
     this.models.setProvider(withDefaultModel(ai.provider, model));

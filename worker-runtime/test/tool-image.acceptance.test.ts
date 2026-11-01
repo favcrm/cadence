@@ -20,7 +20,13 @@ const frame = (delta: Record<string, unknown>, finish: string | null = null) =>
     choices: [{ index: 0, delta, finish_reason: finish }],
   })}\n\n`;
 
-async function observe(acceptImages: boolean, image: string = PNG, legacy = false, captures = 1) {
+async function observe(
+  acceptImages: boolean,
+  image: string = PNG,
+  legacy = false,
+  captures = 1,
+  maxImages = 1,
+) {
   const requests: Record<string, unknown>[] = [];
   const binding = meteredBinding(
     {
@@ -49,6 +55,8 @@ async function observe(acceptImages: boolean, image: string = PNG, legacy = fals
       },
     },
     () => ({ conversation: "1", task: "2", cutoff: "3" }),
+    undefined,
+    maxImages,
   );
   const model = defaultModel("default", acceptImages);
   const ai = createAI({ binding: binding as Ai });
@@ -139,8 +147,59 @@ describe("visual tool results through the hosted model path", () => {
     expect(rawSnapshot).toContain('"redacted":true');
   });
 
+  it("keeps the latest screenshots within the host's model-specific image limit", async () => {
+    const images = ["older", "middle", "newest"].map((value) =>
+      Buffer.from(value).toString("base64"),
+    );
+    const messages = images.map((data) => ({
+      role: "user",
+      content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${data}` } }],
+    }));
+    let forwarded: Record<string, unknown> | undefined;
+    const binding = meteredBinding(
+      {
+        async requestModel(input) {
+          forwarded = input;
+          return Response.json({ ok: true });
+        },
+      },
+      () => ({ conversation: "1", task: "2", cutoff: "3" }),
+      undefined,
+      2,
+    );
+    await binding.run("default", { messages });
+    const sent = JSON.stringify(forwarded);
+    expect(sent).not.toContain(images[0]);
+    expect(sent).toContain(images[1]);
+    expect(sent).toContain(images[2]);
+    expect(sent).toMatch(/image.{0,100}omitted/i);
+    expect(messages[0]?.content[0]?.image_url.url).toContain(images[0]);
+  });
+
+  it("defaults to the latest screenshot when the model limit is unknown", async () => {
+    const { requests, messages: persisted } = await observe(true, PNG, false, 3);
+    const messages = requests.at(-1)?.messages as Array<{ content: unknown }>;
+    const parts = messages.flatMap((message) =>
+      Array.isArray(message.content) ? message.content : [],
+    );
+    expect(parts.filter((part) => part.type === "image_url")).toHaveLength(1);
+    expect(parts.filter((part) => part.type === "text" && /image.{0,100}omitted/i.test(part.text)))
+      .toHaveLength(2);
+    expect(JSON.stringify(persisted).split(PNG)).toHaveLength(4);
+  });
+
+  it("refuses a host image limit outside the gateway's supported range", () => {
+    const transport = { requestModel: async () => Response.json({ ok: true }) };
+    const identity = () => ({ conversation: "1", task: "2", cutoff: "3" });
+    for (const limit of [0, 5, 1.5, Number.NaN]) {
+      expect(() => meteredBinding(transport, identity, undefined, limit)).toThrow(
+        "Invalid model image limit.",
+      );
+    }
+  });
+
   it("keeps the newest observations within the whole-request image budget", async () => {
-    const { requests, messages: persisted } = await observe(true, PNG, false, 6);
+    const { requests, messages: persisted } = await observe(true, PNG, false, 6, 4);
     const finalRequest = requests.at(-1);
     const messages = finalRequest?.messages as Array<{ role: string; content: unknown }>;
     const parts = messages.flatMap((message) =>
@@ -158,7 +217,7 @@ describe("visual tool results through the hosted model path", () => {
   });
 
   it("bounds combined screenshot bytes even when the image count fits", async () => {
-    const { requests } = await observe(true, "A".repeat(100 * 1024), false, 2);
+    const { requests } = await observe(true, "A".repeat(100 * 1024), false, 2, 4);
     const messages = requests.at(-1)?.messages as Array<{ content: unknown }>;
     const parts = messages.flatMap((message) =>
       Array.isArray(message.content) ? message.content : [],
@@ -184,6 +243,8 @@ describe("visual tool results through the hosted model path", () => {
         },
       },
       () => ({ conversation: "1", task: "2", cutoff: "3" }),
+      undefined,
+      4,
     );
     await binding.run("default", { messages });
     const sent = JSON.stringify(forwarded);
