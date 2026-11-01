@@ -13,6 +13,9 @@
 //!   stated reason and writes nothing; `look` with `catalogue` works.
 //!
 //! Run: `cargo test --features test-seam --test suite cad1767_ -- --test-threads 1`
+//!
+//! CAD-1970: stream checks finish at a processed fixture entry/batch or at
+//! post-mutation agent frames, never at the end of a quiet observation window.
 #![cfg(all(feature = "test-seam", target_os = "linux"))]
 #![allow(dead_code)]
 
@@ -1054,37 +1057,10 @@ impl Fx {
             .unwrap();
     }
 
-    /// A bounded read of an SSE route: the `data:` JSON events that arrive
-    /// within `window`.
-    fn sse(&self, path: &str, cookie: &str, window: Duration) -> (u16, Vec<Value>) {
-        let token = Seam::token_at(&self.state()).unwrap();
-        let request = format!(
-            "GET {path} HTTP/1.0\r\nHost: {host}\r\nX-Cadence-Board: 1\r\n\
-             Origin: http://{host}\r\nSec-Fetch-Site: same-origin\r\n\
-             {AS_HEADER}: operator\r\n{TOKEN_HEADER}: {token}\r\nCookie: {cookie}\r\n\r\n",
-            host = self.host,
-        );
-        let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_millis(300)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        let until = Instant::now() + window;
-        let mut raw = Vec::new();
-        let mut buf = [0u8; 8192];
-        while Instant::now() < until {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => raw.extend_from_slice(&buf[..n]),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
-                Err(e) => panic!("sse read: {e}"),
-            }
-        }
-        let text = String::from_utf8_lossy(&raw).to_string();
+    /// Read through the final fixture entry (or the filtered Home batch),
+    /// then decode every `data:` event preceding that causal boundary.
+    fn sse(&self, store: &Store, path: &str, cookie: &str, operator: bool) -> (u16, Vec<Value>) {
+        let text = self.thread_stream(store, path, cookie, operator);
         let status = text
             .split_whitespace()
             .nth(1)
@@ -1226,7 +1202,7 @@ fn cad1767_member_thread_stream_strips_operator_only_entries() {
     fx.proposal(&store, &home);
     let owner = fx.platform_cookie("owner");
     let member = fx.platform_cookie("member");
-    let window = Duration::from_secs(3);
+    // The hard read cap is a failure safeguard, not an observation window.
     let mut wrong = Vec::new();
     for (alias, path, home_id) in [
         ("helper", "/api/threads/helper/stream".to_string(), None),
@@ -1241,7 +1217,7 @@ fn cad1767_member_thread_stream_strips_operator_only_entries() {
             Some(home.as_str()),
         ),
     ] {
-        let (status, events) = fx.sse(&path, &owner, window);
+        let (status, events) = fx.sse(&store, &path, &owner, true);
         let kinds: Vec<Value> = events.iter().map(|e| e["kind"].clone()).collect();
         if status != 200
             || !kinds.contains(&json!("artifact"))
@@ -1249,7 +1225,7 @@ fn cad1767_member_thread_stream_strips_operator_only_entries() {
         {
             wrong.push(format!("control {path}: owner {status} {kinds:?}"));
         }
-        let (status, events) = fx.sse(&path, &member, window);
+        let (status, events) = fx.sse(&store, &path, &member, false);
         eprintln!(
             "CAD-1767 member stream {path}: {status}, {} events",
             events.len()
@@ -1309,7 +1285,7 @@ fn master_with_home(fx: &Fx) -> (Store, String) {
 #[test]
 fn cad1767_member_view_holds_for_every_master_spelling() {
     let fx = Fx::start(Board::Public);
-    let (_store, home) = master_with_home(&fx);
+    let (store, home) = master_with_home(&fx);
     // Which spellings does the daemon resolve to the master?
     let mut spellings = Vec::new();
     for name in [NATIVE_THREAD, NATIVE_SESSION, "MASTER", "Master", "master."] {
@@ -1361,11 +1337,11 @@ fn cad1767_member_view_holds_for_every_master_spelling() {
             }
         }
         let path = format!("/api/threads/{name}/stream");
-        let (status, events) = fx.sse(&path, &owner, Duration::from_secs(2));
+        let (status, events) = fx.sse(&store, &path, &owner, true);
         if status != 200 || !events.iter().any(|e| e.to_string().contains(HOME_CHAT)) {
             wrong.push(format!("control {path}: owner {status}"));
         }
-        let (_, events) = fx.sse(&path, &member, Duration::from_secs(2));
+        let (_, events) = fx.sse(&store, &path, &member, false);
         let leaked = operator_only(&events, Some(&home));
         if !leaked.is_empty() {
             wrong.push(format!("{path}: member stream got {leaked:?}"));
@@ -1379,32 +1355,13 @@ const LIVE_TURN: &str = "live-turn-body-secret-needle";
 impl Fx {
     /// The first `event: master` frame of a stream, as raw text.
     fn master_frame(&self, path: &str, cookie: &str) -> Option<String> {
-        let token = Seam::token_at(&self.state()).unwrap();
-        let request = format!(
-            "GET {path} HTTP/1.0\r\nHost: {host}\r\nX-Cadence-Board: 1\r\n\
-             Origin: http://{host}\r\nSec-Fetch-Site: same-origin\r\n\
-             {AS_HEADER}: operator\r\n{TOKEN_HEADER}: {token}\r\nCookie: {cookie}\r\n\r\n",
-            host = self.host,
-        );
-        let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_millis(300)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        let until = Instant::now() + Duration::from_secs(2);
-        let mut raw = Vec::new();
-        let mut buf = [0u8; 8192];
-        while Instant::now() < until {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => raw.extend_from_slice(&buf[..n]),
-                Err(_) => {}
-            }
-        }
-        let text = String::from_utf8_lossy(&raw).to_string();
+        let text = self.read_until(path, cookie, "complete event: master frame", |text| {
+            text.split("\n\n")
+                .any(|frame| frame.lines().any(|line| line == "event: master"))
+        });
         let start = text.find("event: master")?;
         let rest = &text[start..];
-        Some(rest[..rest.find("\n\n").unwrap_or(rest.len())].to_string())
+        Some(rest[..rest.find("\n\n").expect("complete master frame")].to_string())
     }
 }
 
@@ -1905,46 +1862,18 @@ fn swept_routes(ids: &[String], home: &str) -> (Vec<String>, Vec<String>) {
 }
 
 impl Fx {
-    /// A bounded GET for the sweep: `(status, raw body)`. Streams are read
-    /// for a short window; a timeout is status 0.
-    fn sweep_get(&self, path: &str, cookie: &str) -> (u16, String) {
-        let token = Seam::token_at(&self.state()).unwrap();
-        let request = format!(
-            "GET {path} HTTP/1.0\r\nHost: {host}\r\nX-Cadence-Board: 1\r\n\
-             Origin: http://{host}\r\nSec-Fetch-Site: same-origin\r\n\
-             {AS_HEADER}: operator\r\n{TOKEN_HEADER}: {token}\r\nCookie: {cookie}\r\n\r\n",
-            host = self.host,
-        );
-        let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", self.port)) else {
-            return (0, String::new());
-        };
-        stream
-            .set_read_timeout(Some(Duration::from_millis(250)))
-            .unwrap();
-        if stream.write_all(request.as_bytes()).is_err() {
-            return (0, String::new());
-        }
-        let window = if path.contains("stream") {
-            Duration::from_millis(1500)
+    /// A GET ending at EOF, a processed thread batch, or post-nudge agent
+    /// frames. Stream-shaped invalid routes still have to reach HTTP EOF.
+    fn sweep_get(&self, store: &Store, path: &str, cookie: &str, operator: bool) -> (u16, String) {
+        let route = path.split('?').next().unwrap();
+        let text = if route == "/api/stream" {
+            self.stream_while(path, cookie, || self.nudge_agents())
+        } else if route.starts_with("/api/threads/") && route.ends_with("/stream") {
+            self.thread_stream(store, path, cookie, operator)
         } else {
-            Duration::from_secs(8)
+            self.read_until(path, cookie, "HTTP EOF", |_| false)
         };
-        let until = Instant::now() + window;
-        let mut raw = Vec::new();
-        let mut buf = [0u8; 16384];
-        while Instant::now() < until {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => raw.extend_from_slice(&buf[..n]),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
-                Err(_) => break,
-            }
-        }
-        let text = String::from_utf8_lossy(&raw).to_string();
+        let text = text.as_str();
         let status = text
             .split_whitespace()
             .nth(1)
@@ -2091,7 +2020,7 @@ fn cad1767_member_route_sweep_carries_no_operator_text() {
     let mut admitted = Vec::new();
     let mut owner_seen = std::collections::BTreeSet::new();
     for route in &routes {
-        let (status, body) = fx.sweep_get(route, &member);
+        let (status, body) = fx.sweep_get(&store, route, &member, false);
         if status == 200 {
             admitted.push(route.clone());
             // Operator decision 1: an ordinary (non-master) agent's own
@@ -2119,7 +2048,7 @@ fn cad1767_member_route_sweep_carries_no_operator_text() {
                 leaks.push(format!("{route}: {hits:?}"));
             }
         }
-        let (ostatus, obody) = fx.sweep_get(route, &owner);
+        let (ostatus, obody) = fx.sweep_get(&store, route, &owner, true);
         if ostatus == 200 {
             for hit in needle_hits(&obody) {
                 owner_seen.insert(hit.split(" @ ").next().unwrap().to_string());
@@ -2146,16 +2075,7 @@ fn cad1767_member_route_sweep_carries_no_operator_text() {
     // read while changing both agents, and require that an `event: agent`
     // frame actually arrived (a quiet stream would prove nothing).
     for (who, cookie) in [("member", &member), ("owner", &owner)] {
-        let raw = fx.stream_while("/api/stream?entities=1", cookie, || {
-            for (i, alias) in ["helper", "master"].iter().enumerate() {
-                let _ = fx.rpc(
-                    Asserted::Operator,
-                    "agent_send",
-                    json!({"alias": alias, "text": format!("nudge {i}"),
-                           "message": format!("sweep-nudge-{who}-{alias}")}),
-                );
-            }
-        });
+        let raw = fx.stream_while("/api/stream?entities=1", cookie, || fx.nudge_agents());
         let frames: Vec<&str> = raw
             .split("\n\n")
             .filter(|f| f.starts_with("event: agent") || f.contains("\nevent: agent"))
@@ -2187,8 +2107,16 @@ fn cad1767_member_route_sweep_carries_no_operator_text() {
 }
 
 impl Fx {
-    /// Read a stream for a bounded window while `act` changes state.
-    fn stream_while(&self, path: &str, cookie: &str, act: impl FnOnce()) -> String {
+    /// Read complete frames until `done` proves the requested boundary.
+    /// EOF is the boundary for finite HTTP responses; the 8 s cap only fails
+    /// a stalled response and is never a successful negative assertion.
+    fn read_until(
+        &self,
+        path: &str,
+        cookie: &str,
+        boundary: &str,
+        mut done: impl FnMut(&str) -> bool,
+    ) -> String {
         let token = Seam::token_at(&self.state()).unwrap();
         let request = format!(
             "GET {path} HTTP/1.0\r\nHost: {host}\r\nX-Cadence-Board: 1\r\n\
@@ -2201,21 +2129,194 @@ impl Fx {
             .set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
         stream.write_all(request.as_bytes()).unwrap();
-        let reader = std::thread::spawn(move || {
-            let until = Instant::now() + Duration::from_secs(8);
-            let mut raw = Vec::new();
-            let mut buf = [0u8; 16384];
-            while Instant::now() < until {
-                match stream.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => raw.extend_from_slice(&buf[..n]),
-                    Err(_) => {}
+        let until = Instant::now() + Duration::from_secs(8);
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            assert!(
+                Instant::now() < until,
+                "{path}: timed out waiting for {boundary}"
+            );
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    let text = String::from_utf8_lossy(&raw);
+                    let head = text.split_once("\r\n\r\n").map(|(h, _)| h).unwrap_or("");
+                    assert!(
+                        !head.to_ascii_lowercase().contains("text/event-stream"),
+                        "{path}: stream closed before {boundary}"
+                    );
+                    break;
                 }
+                Ok(n) => {
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw);
+                    if let Some(end) = text.rfind("\n\n") {
+                        if done(&text[..end + 2]) {
+                            break;
+                        }
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("{path}: causal read: {e}"),
             }
-            String::from_utf8_lossy(&raw).to_string()
+        }
+        String::from_utf8(raw).expect("board response is UTF-8")
+    }
+
+    /// The appended sentinel follows all seeded secrets. An owner/ordinary
+    /// reader must receive it; a member's master Home is wholly filtered.
+    /// threads::stream emits its first ping BEFORE reading entries and its
+    /// second only AFTER scanning an empty/filtered page. Keeping the entire
+    /// fixture below one page makes that second ping a completion proof even
+    /// when there can be no visible entry. Neither an HTTP head nor the first
+    /// ping is sufficient.
+    fn thread_stream(&self, store: &Store, path: &str, cookie: &str, operator: bool) -> String {
+        let (route, query) = path.split_once('?').unwrap_or((path, ""));
+        let alias = route
+            .strip_prefix("/api/threads/")
+            .and_then(|p| p.strip_suffix("/stream"))
+            .expect("thread stream route");
+        let mut params = json!({"alias": alias, "after": 0, "limit": 100});
+        for part in query.split('&') {
+            if let Some(("conversation", id)) = part.split_once('=') {
+                params["conversation"] = json!(id);
+            }
+        }
+        let Ok(page) = self.rpc(Asserted::Operator, "thread_read", params) else {
+            // The actual HTTP error must complete too; do not silently skip
+            // invalid native ids, artifact ids, or prefix-expanded routes.
+            return self.read_until(path, cookie, "HTTP error EOF", |_| false);
+        };
+        let entries = page["entries"].as_array().expect("fixture entries");
+        let Some(thread) = page["thread"]["id"].as_str().map(str::to_string) else {
+            // The alias resolves but has no thread yet: threads::stream's
+            // `thread_read` preflight still succeeds, so it answers 200 and
+            // then loops emitting `: ping` forever — there is no entry and no
+            // EOF to wait for. Nothing can be disclosed for a thread that does
+            // not exist, and the same native read we just made is the proof of
+            // that. Completing on the first ping is therefore causal: it shows
+            // the stream opened and entered its loop, and the page above shows
+            // the loop has nothing to serve.
+            assert!(
+                entries.is_empty(),
+                "{path}: a page with entries must name its thread"
+            );
+            let mut opened = false;
+            let raw = self.read_until(path, cookie, "first ping (no thread yet)", |text| {
+                let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+                opened = body.split("\n\n").any(|frame| frame == ": ping");
+                opened
+            });
+            if raw.starts_with("HTTP/1.1 200") {
+                assert!(opened, "{path}: stream closed before its first ping");
+            }
+            return raw;
+        };
+        // Contract with threads::stream: its page size is 100, and its
+        // second ping follows scanning + filtering that entire first page.
+        // Include our sentinel in the strict <100-row fixture invariant.
+        assert!(
+            entries.len() + 1 < 100,
+            "{path}: fixture must fit one SSE page"
+        );
+        let seq = self.append(
+            store,
+            &thread,
+            "agent",
+            "assistant_text",
+            "causal-stream-boundary",
+        );
+        let sentinel = format!("id: {seq}");
+        let hidden_home = !operator && page["alias"] == "master";
+        let mut finished = false;
+        let boundary = if hidden_home {
+            "second ping after the filtered Home batch"
+        } else {
+            &sentinel
+        };
+        let raw = self.read_until(path, cookie, boundary, |text| {
+            let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+            finished = if hidden_home {
+                body.split("\n\n")
+                    .filter(|frame| *frame == ": ping")
+                    .count()
+                    >= 2
+            } else {
+                body.split("\n\n").any(|frame| {
+                    frame.lines().any(|line| line == sentinel)
+                        && frame.lines().any(|line| line == "event: entry")
+                })
+            };
+            finished
         });
-        std::thread::sleep(Duration::from_millis(1500));
-        act();
-        reader.join().unwrap()
+        if raw.starts_with("HTTP/1.1 200") {
+            assert!(finished, "{path}: stream closed before processing fixture");
+        }
+        raw
+    }
+
+    fn queued(&self, alias: &str) -> i64 {
+        self.op("agent_show", json!({"alias": alias, "limit": 0}))["queued"]
+            .as_i64()
+            .expect("fixture queued count")
+    }
+
+    fn nudge_agents(&self) {
+        let generation = self.messages("sweep-nudge-").len();
+        for alias in ["helper", "master"] {
+            self.op(
+                "agent_send",
+                json!({"alias": alias, "text": "causal stream nudge",
+                       "message": format!("sweep-nudge-{generation}-{alias}")}),
+            );
+        }
+    }
+
+    /// `hello` is sent only after subscription/baseline setup. Act after
+    /// that handshake, then require BOTH changed rows with their exact new
+    /// queued counts: an unrelated or pre-action agent frame cannot finish
+    /// this read. The running operator-only kickoff remains in those rows.
+    fn stream_while(&self, path: &str, cookie: &str, act: impl FnOnce()) -> String {
+        let aliases = ["helper", "master"];
+        let before = aliases.map(|alias| self.queued(alias));
+        let mut expected = None;
+        let mut act = Some(act);
+        let mut finished = false;
+        let raw = self.read_until(path, cookie, "both post-nudge event: agent rows", |text| {
+            let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+            if act.is_some() && body.contains("event: hello\n") {
+                act.take().unwrap()();
+                let after = aliases.map(|alias| self.queued(alias));
+                for i in 0..aliases.len() {
+                    assert_eq!(after[i], before[i] + 1, "nudge must queue a new turn");
+                }
+                expected = Some(after);
+            }
+            if let Some(expected) = expected {
+                finished = aliases.iter().enumerate().all(|(i, alias)| {
+                    body.split("\n\n").any(|frame| {
+                        frame.lines().any(|line| line == "event: agent")
+                            && frame
+                                .lines()
+                                .filter_map(|line| line.strip_prefix("data:"))
+                                .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+                                .any(|data| {
+                                    data["agent"]["alias"] == *alias
+                                        && data["agent"]["queued"] == expected[i]
+                                })
+                    })
+                });
+            }
+            finished
+        });
+        assert!(
+            finished,
+            "{path}: closed before both post-nudge agent frames"
+        );
+        raw
     }
 }

@@ -180,7 +180,13 @@ class CleanupTests(unittest.TestCase):
         shards = job(ci, "test-shards")
         # CAD-1124: retiring the empty doctest invocation must retain BOTH
         # default-feature compilation gates, not just feature-on tests.
-        rust_scope = "        if: ${{ needs.change-scope.outputs.rust != 'false' }}"
+        # CAD-1970: a gate step may carry one extra conjunction after the
+        # rust scope (the `build`/`cross` outputs narrow a tests-only PR),
+        # but it must still be gated by the rust scope and nothing may mark
+        # it continue-on-error.
+        rust_scope = re.compile(
+            r"(?m)^        if: \$\{\{ needs\.change-scope\.outputs\.rust != 'false'"
+            r"(?: && [^}]+)? \}\}$")
         for name, command in (
             ("clippy", "cargo clippy --all-targets --locked -- -D warnings"),
             ("build", "cargo build --profile ci --locked"),
@@ -189,7 +195,7 @@ class CleanupTests(unittest.TestCase):
             matching = [step for step in steps if re.search(
                 rf"^      (?:- |  )run: {re.escape(command)}$", step, re.M)]
             self.assertEqual(len(matching), 1, (name, command))
-            self.assertIn(rust_scope, matching[0])
+            self.assertRegex(matching[0], rust_scope)
             self.assertNotIn("continue-on-error:", matching[0])
         build_steps = re.split(r"(?=^      - )", job(ci, "build"), flags=re.M)
         for name in ("Assert the test seam refuses a release build",
@@ -198,7 +204,11 @@ class CleanupTests(unittest.TestCase):
                         if step.startswith(f"      - name: {name}\n")]
             self.assertEqual(len(matching), 1, name)
             step = matching[0]
-            self.assertIn(rust_scope, step)
+            self.assertRegex(step, rust_scope)
+            # CAD-1970: these release-seam assertions cannot be reached by a
+            # tests/** diff, so `tests-only` drops them from PR feedback; the
+            # merge queue, main and every non-PR event still run them.
+            self.assertIn("needs.change-scope.outputs.build != 'false'", step)
             self.assertNotIn("continue-on-error:", step)
             if name == "Assert the test seam refuses a release build":
                 self.assertRegex(step, r"(?m)^        run: sh scripts/check-release-test-seam$")

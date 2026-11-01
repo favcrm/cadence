@@ -13,6 +13,22 @@
 //!    app-scoped master turn is refused as other non-app verbs are.
 //!
 //! Run: `cargo test --features test-seam --test suite cad1772_ -- --test-threads 1`
+//!
+//! CAD-1970 wait inventory (timings are observational; windows are unchanged):
+//! - Fx/LaneFx startup polls health/token readiness; board startup already uses
+//!   its producer's channel. Teardown joins the stopped daemon/board/platform.
+//! - HTTP reads await EOF; RPC/SQLite deadlines bound a stalled producer/lock.
+//! - The platform receive timeout lets its fixture thread check the stop flag.
+//! - sweep_get observes streams for 1.5s (other responses have an 8s cap).
+//!   The Recruit test alone calls it: owner targeted, then member targeted and
+//!   derived routes. CI must measure these separately before replacing a wait.
+//! - Copied, currently unused helpers: sse observes its caller's window;
+//!   master_frame observes 2s; stream_while waits 1.5s before mutation and reads
+//!   for 8s. LaneFx polls readiness/settlement/restart, and fake Pi polls release.
+//!
+//! The fixed observation/poll windows are retained for the measurement pass,
+//! not relabelled as causal completion. Named wait totals overlap phases (and
+//! some enclosing waits); they are not additive wall-clock phases.
 #![cfg(all(feature = "test-seam", target_os = "linux"))]
 #![allow(dead_code)]
 
@@ -28,6 +44,168 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[derive(Clone)]
+struct Timing(Arc<std::sync::Mutex<TimingState>>);
+
+struct TimingState {
+    phase: &'static str,
+    phase_started: Instant,
+    phases: std::collections::BTreeMap<&'static str, Duration>,
+    waits: std::collections::BTreeMap<&'static str, (Duration, usize)>,
+}
+
+thread_local! {
+    static TEST_TIMING: std::cell::RefCell<Option<Timing>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+impl Timing {
+    fn current() -> Self {
+        TEST_TIMING.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .expect("test timing installed")
+                .clone()
+        })
+    }
+
+    fn switch_phase(&self, phase: &'static str) -> &'static str {
+        let now = Instant::now();
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = state.phase;
+        let elapsed = now.duration_since(state.phase_started);
+        *state.phases.entry(previous).or_default() += elapsed;
+        state.phase = phase;
+        state.phase_started = now;
+        previous
+    }
+
+    fn phase(&self, phase: &'static str) -> PhaseTiming {
+        PhaseTiming {
+            timing: self.clone(),
+            previous: self.switch_phase(phase),
+        }
+    }
+
+    fn wait(&self, name: &'static str) -> WaitTiming {
+        WaitTiming {
+            timing: self.clone(),
+            name,
+            started: Instant::now(),
+        }
+    }
+}
+
+struct PhaseTiming {
+    timing: Timing,
+    previous: &'static str,
+}
+
+impl Drop for PhaseTiming {
+    fn drop(&mut self) {
+        self.timing.switch_phase(self.previous);
+    }
+}
+
+struct WaitTiming {
+    timing: Timing,
+    name: &'static str,
+    started: Instant,
+}
+
+impl WaitTiming {
+    fn start(name: &'static str) -> Self {
+        Timing::current().wait(name)
+    }
+}
+
+impl Drop for WaitTiming {
+    fn drop(&mut self) {
+        let mut state = self.timing.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (elapsed, calls) = state.waits.entry(self.name).or_default();
+        *elapsed += self.started.elapsed();
+        *calls += 1;
+    }
+}
+
+struct TestTiming {
+    name: &'static str,
+    timing: Timing,
+    started: Instant,
+}
+
+impl TestTiming {
+    fn start(name: &'static str) -> Self {
+        let started = Instant::now();
+        let timing = Timing(Arc::new(std::sync::Mutex::new(TimingState {
+            phase: "setup",
+            phase_started: started,
+            phases: Default::default(),
+            waits: Default::default(),
+        })));
+        TEST_TIMING.with(|slot| *slot.borrow_mut() = Some(timing.clone()));
+        Self {
+            name,
+            timing,
+            started,
+        }
+    }
+
+    fn assertions(&self) {
+        self.timing.switch_phase("assertion");
+    }
+
+    fn teardown(&self) {
+        self.timing.switch_phase("teardown");
+    }
+
+    fn phase(&self, name: &'static str) -> PhaseTiming {
+        self.timing.phase(name)
+    }
+}
+
+impl Drop for TestTiming {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        self.timing.switch_phase("finished");
+        let state = self.timing.0.lock().unwrap_or_else(|e| e.into_inner());
+        let phase_ms = |name| {
+            state
+                .phases
+                .get(name)
+                .copied()
+                .unwrap_or_default()
+                .as_millis()
+        };
+        let waits = state
+            .waits
+            .iter()
+            .map(|(name, (elapsed, calls))| {
+                format!("{name}={}ms/{calls}calls", elapsed.as_millis())
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = writeln!(
+            std::io::stderr(),
+            "CAD-1970 {} setup={}ms owner={}ms route_expansion={}ms member={}ms \
+             waits=[{}] assertion={}ms teardown={}ms total={}ms",
+            self.name,
+            phase_ms("setup"),
+            phase_ms("owner"),
+            phase_ms("route_expansion"),
+            phase_ms("member"),
+            waits,
+            phase_ms("assertion"),
+            phase_ms("teardown"),
+            self.started.elapsed().as_millis(),
+        );
+        TEST_TIMING.with(|slot| *slot.borrow_mut() = None);
+    }
+}
 
 const COMPANY: &str = "c1752-company";
 const KEY_SEED: [u8; 32] = [175; 32];
@@ -47,12 +225,15 @@ struct Fx {
     port: u16,
     host: String,
     issuer: String,
+    timing: Timing,
 }
 
 impl Drop for Fx {
     fn drop(&mut self) {
+        let _phase = self.timing.phase("teardown");
         self.stop.store(true, SeqCst);
         for thread in self.threads.drain(..).rev() {
+            let _wait = self.timing.wait("fixture_join");
             let _ = thread.join();
         }
     }
@@ -67,6 +248,8 @@ struct Reply {
 
 impl Fx {
     fn start(board: Board) -> Self {
+        let timing = Timing::current();
+        let _phase = timing.phase("setup");
         assert!(
             std::env::var_os("CADENCE_SOCKET").is_none(),
             "fixture BLOCKED: inherited socket override"
@@ -79,6 +262,7 @@ impl Fx {
             port: 0,
             host: String::new(),
             issuer: String::new(),
+            timing: timing.clone(),
         };
         std::fs::create_dir_all(fx.root.path().join("h")).unwrap();
         cadence_agent::issue::Pm::init(&fx.pm()).unwrap();
@@ -106,12 +290,21 @@ impl Fx {
         fx.threads.push(std::thread::spawn(move || {
             daemon::serve_with(&state, opts).unwrap();
         }));
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while client::rpc_timeout(&fx.state(), "health", json!({}), Duration::from_secs(2)).is_err()
-            || Seam::token_at(&fx.state()).is_none()
         {
-            assert!(Instant::now() < deadline, "daemon never started");
-            std::thread::sleep(Duration::from_millis(50));
+            let _wait = timing.wait("daemon_ready");
+            // Failure safeguards: health RPC/overall startup must not hang.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while {
+                let _rpc = timing.wait("daemon_health_rpc");
+                client::rpc_timeout(&fx.state(), "health", json!({}), Duration::from_secs(2))
+                    .is_err()
+                    || Seam::token_at(&fx.state()).is_none()
+            } {
+                assert!(Instant::now() < deadline, "daemon never started");
+                let _poll = timing.wait("daemon_ready_poll");
+                // Baseline polling interval, retained until measured in CI.
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
         if board == Board::Public {
             fx.start_platform();
@@ -132,9 +325,15 @@ impl Fx {
             "x": URL_SAFE_NO_PAD.encode(key.public_key().as_ref())
         }]});
         let stop = self.stop.clone();
+        let timing = self.timing.clone();
         self.threads.push(std::thread::spawn(move || {
             while !stop.load(SeqCst) {
-                let Ok(Some(request)) = platform.recv_timeout(Duration::from_millis(100)) else {
+                // Safeguard: periodically notice fixture shutdown when no JWKS arrives.
+                let request = {
+                    let _wait = timing.wait("platform_recv");
+                    platform.recv_timeout(Duration::from_millis(100))
+                };
+                let Ok(Some(request)) = request else {
                     continue;
                 };
                 let response = tiny_http::Response::from_string(jwks.to_string()).with_header(
@@ -174,7 +373,12 @@ impl Fx {
             let thread = std::thread::spawn(move || {
                 let _ = ui::serve(&state, &pm, &opts);
             });
-            match rx.recv_timeout(Duration::from_secs(20)) {
+            // Safeguard only: the board producer sends its bind result on tx.
+            let bound = {
+                let _wait = self.timing.wait("board_startup");
+                rx.recv_timeout(Duration::from_secs(20))
+            };
+            match bound {
                 Ok(Ok(())) => {
                     self.port = port;
                     self.host = host;
@@ -182,6 +386,7 @@ impl Fx {
                     return;
                 }
                 Ok(Err(std::io::ErrorKind::AddrInUse)) => {
+                    let _wait = self.timing.wait("board_bind_failure_join");
                     let _ = thread.join();
                 }
                 Ok(Err(kind)) => panic!("board startup failed on port {port}: {kind:?}"),
@@ -205,6 +410,7 @@ impl Fx {
     }
 
     fn rpc(&self, who: Asserted, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        let _wait = self.timing.wait("daemon_rpc");
         let state = self.state();
         scoped(who, || client::rpc(&state, method, params))
     }
@@ -248,6 +454,8 @@ impl Fx {
         )
         .unwrap();
         conn.busy_timeout(Duration::from_secs(2)).unwrap();
+        // Safeguard: bound SQLite lock contention; the query normally completes.
+        let _wait = self.timing.wait("sqlite_event_count");
         conn.query_row("SELECT COUNT(*) FROM events WHERE kind=?1", [kind], |r| {
             r.get(0)
         })
@@ -263,6 +471,8 @@ impl Fx {
         )
         .unwrap();
         conn.busy_timeout(Duration::from_secs(2)).unwrap();
+        // Safeguard: bound SQLite lock contention; the query normally completes.
+        let _wait = self.timing.wait("sqlite_messages");
         let mut stmt = conn
             .prepare(
                 "SELECT id, source, state, sender, sender_uid FROM messages \
@@ -307,11 +517,13 @@ impl Fx {
             len = body.len(),
         );
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        // Failure safeguard: normal HTTP/1.0 completion is EOF, not this timeout.
         stream
             .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         stream.write_all(request.as_bytes()).unwrap();
         let mut response = String::new();
+        let _wait = self.timing.wait("http_response");
         stream.read_to_string(&mut response).unwrap();
         let (head, raw) = response.split_once("\r\n\r\n").expect("HTTP response head");
         let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
@@ -464,8 +676,11 @@ struct LaneFx {
 
 impl Drop for LaneFx {
     fn drop(&mut self) {
+        let timing = Timing::current();
+        let _phase = timing.phase("teardown");
         self.stop.store(true, SeqCst);
         for thread in self.threads.drain(..).rev() {
+            let _wait = timing.wait("lane_fixture_join");
             let _ = thread.join();
         }
     }
@@ -490,6 +705,8 @@ fn git(dir: &std::path::Path, args: &[&str]) {
 
 impl LaneFx {
     fn start() -> Self {
+        let timing = Timing::current();
+        let _phase = timing.phase("setup");
         let root = tempfile::Builder::new()
             .prefix("c1752l-")
             .tempdir()
@@ -598,14 +815,19 @@ impl LaneFx {
     }
 
     fn until(&self, what: &str, mut done: impl FnMut() -> bool) {
+        let _wait = WaitTiming::start("lane_until");
+        // Safeguard: fail if the polled daemon/actor state never becomes ready.
         let deadline = Instant::now() + Duration::from_secs(60);
         while !done() {
             assert!(Instant::now() < deadline, "{what}: timed out");
+            let _poll = WaitTiming::start("lane_poll");
+            // Baseline polling interval, retained until measured in CI.
             std::thread::sleep(Duration::from_millis(50));
         }
     }
 
     fn rpc(&self, who: Asserted, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        let _wait = WaitTiming::start("lane_daemon_rpc");
         let state = self.state();
         scoped(who, || client::rpc(&state, method, params))
     }
@@ -655,6 +877,8 @@ impl LaneFx {
     ) {
         let conn = rusqlite::Connection::open(self.state().join("cadence.sqlite3")).unwrap();
         conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        // Safeguard: bound SQLite lock contention, not a normal completion event.
+        let _wait = WaitTiming::start("sqlite_plant");
         conn.execute(
             "INSERT INTO messages(id, alias, body, source, state, created, issue, worktree) \
              VALUES (?1, ?2, 'fixture turn', 'dispatch', 'queued', ?3, ?4, ?5)",
@@ -684,6 +908,8 @@ impl LaneFx {
         )
         .unwrap();
         conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        // Safeguard: bound SQLite lock contention, not a normal completion event.
+        let _wait = WaitTiming::start("sqlite_message");
         conn.query_row("SELECT state, error FROM messages WHERE id=?1", [id], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })
@@ -706,6 +932,8 @@ impl LaneFx {
         )
         .unwrap();
         conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        // Safeguard: bound SQLite lock contention, not a normal completion event.
+        let _wait = WaitTiming::start("sqlite_relaunches");
         let mut stmt = conn
             .prepare("SELECT payload FROM events WHERE alias=?1 AND kind='relaunched_for_lane' ORDER BY seq")
             .unwrap();
@@ -774,6 +1002,8 @@ impl LaneFx {
         )
         .unwrap();
         conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        // Safeguard: bound SQLite lock contention, not a normal completion event.
+        let _wait = WaitTiming::start("sqlite_pointer_reasons");
         let mut stmt = conn
             .prepare("SELECT kind || ' ' || payload FROM events WHERE alias=?1")
             .unwrap();
@@ -881,6 +1111,7 @@ impl Fx {
     /// A bounded read of an SSE route: the `data:` JSON events that arrive
     /// within `window`.
     fn sse(&self, path: &str, cookie: &str, window: Duration) -> (u16, Vec<Value>) {
+        let _wait = self.timing.wait("sse_window");
         let token = Seam::token_at(&self.state()).unwrap();
         let request = format!(
             "GET {path} HTTP/1.0\r\nHost: {host}\r\nX-Cadence-Board: 1\r\n\
@@ -897,6 +1128,7 @@ impl Fx {
         let mut raw = Vec::new();
         let mut buf = [0u8; 8192];
         while Instant::now() < until {
+            let _read = self.timing.wait("sse_read");
             match stream.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => raw.extend_from_slice(&buf[..n]),
@@ -987,6 +1219,7 @@ const LIVE_TURN: &str = "live-turn-body-secret-needle";
 impl Fx {
     /// The first `event: master` frame of a stream, as raw text.
     fn master_frame(&self, path: &str, cookie: &str) -> Option<String> {
+        let _wait = self.timing.wait("master_frame_window");
         let token = Seam::token_at(&self.state()).unwrap();
         let request = format!(
             "GET {path} HTTP/1.0\r\nHost: {host}\r\nX-Cadence-Board: 1\r\n\
@@ -1003,6 +1236,7 @@ impl Fx {
         let mut raw = Vec::new();
         let mut buf = [0u8; 8192];
         while Instant::now() < until {
+            let _read = self.timing.wait("master_frame_read");
             match stream.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => raw.extend_from_slice(&buf[..n]),
@@ -1199,7 +1433,14 @@ fn swept_routes(ids: &[String], home: &str) -> (Vec<String>, Vec<String>) {
 impl Fx {
     /// A bounded GET for the sweep: `(status, raw body)`. Streams are read
     /// for a short window; a timeout is status 0.
-    fn sweep_get(&self, path: &str, cookie: &str) -> (u16, String) {
+    fn sweep_get(&self, path: &str, cookie: &str, owner: bool) -> (u16, String) {
+        let is_stream = path.contains("stream");
+        let _wait = self.timing.wait(match (owner, is_stream) {
+            (true, true) => "owner_stream_get",
+            (true, false) => "owner_response_get",
+            (false, true) => "member_stream_get",
+            (false, false) => "member_response_get",
+        });
         let token = Seam::token_at(&self.state()).unwrap();
         let request = format!(
             "GET {path} HTTP/1.0\r\nHost: {host}\r\nX-Cadence-Board: 1\r\n\
@@ -1210,6 +1451,7 @@ impl Fx {
         let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", self.port)) else {
             return (0, String::new());
         };
+        // Retry interval within the unchanged baseline observation window below.
         stream
             .set_read_timeout(Some(Duration::from_millis(250)))
             .unwrap();
@@ -1225,6 +1467,11 @@ impl Fx {
         let mut raw = Vec::new();
         let mut buf = [0u8; 16384];
         while Instant::now() < until {
+            let _read = self.timing.wait(if is_stream {
+                "sweep_stream_read"
+            } else {
+                "sweep_response_read"
+            });
             match stream.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => raw.extend_from_slice(&buf[..n]),
@@ -1278,6 +1525,7 @@ fn needle_hits(body: &str) -> Vec<String> {
 impl Fx {
     /// Read a stream for a bounded window while `act` changes state.
     fn stream_while(&self, path: &str, cookie: &str, act: impl FnOnce()) -> String {
+        let _wait = self.timing.wait("stream_while");
         let token = Seam::token_at(&self.state()).unwrap();
         let request = format!(
             "GET {path} HTTP/1.0\r\nHost: {host}\r\nX-Cadence-Board: 1\r\n\
@@ -1290,11 +1538,14 @@ impl Fx {
             .set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
         stream.write_all(request.as_bytes()).unwrap();
+        let timing = self.timing.clone();
         let reader = std::thread::spawn(move || {
+            let _wait = timing.wait("stream_while_reader");
             let until = Instant::now() + Duration::from_secs(8);
             let mut raw = Vec::new();
             let mut buf = [0u8; 16384];
             while Instant::now() < until {
+                let _read = timing.wait("stream_while_read");
                 match stream.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => raw.extend_from_slice(&buf[..n]),
@@ -1303,8 +1554,13 @@ impl Fx {
             }
             String::from_utf8_lossy(&raw).to_string()
         });
-        std::thread::sleep(Duration::from_millis(1500));
+        {
+            let _wait = self.timing.wait("stream_while_before_action");
+            // Baseline subscription delay, retained until measured in CI.
+            std::thread::sleep(Duration::from_millis(1500));
+        }
         act();
+        let _join = self.timing.wait("stream_while_join");
         reader.join().unwrap()
     }
 }
@@ -1381,6 +1637,7 @@ fn recruit_conversation(fx: &Fx) -> Result<String, String> {
 
 #[test]
 fn cad1772_recruit_conversation_is_operator_only() {
+    let timing = TestTiming::start("cad1772_recruit_conversation_is_operator_only");
     let fx = Fx::start(Board::Public);
     let (store, home) = master_with_home(&fx);
     let recruit = recruit_conversation(&fx).unwrap_or_else(|e| panic!("{e}"));
@@ -1431,11 +1688,15 @@ fn cad1772_recruit_conversation_is_operator_only() {
     targeted.push("/api/master/state".into());
     targeted.push("/api/threads/master/stream".into());
     targeted.push("/api/agents".into());
+    timing.assertions();
 
     // Control: the owner sees the Recruit conversation and its live turn.
     let mut owner_seen = std::collections::BTreeSet::new();
     for route in &targeted {
-        let (status, body) = fx.sweep_get(route, &owner);
+        let (status, body) = {
+            let _phase = timing.phase("owner");
+            fx.sweep_get(route, &owner, true)
+        };
         if status == 200 {
             for hit in recruit_hits(&body) {
                 owner_seen.insert(hit.split(" @ ").next().unwrap().to_string());
@@ -1461,10 +1722,16 @@ fn cad1772_recruit_conversation_is_operator_only() {
     .iter()
     .map(|s| s.to_string())
     .collect();
-    let (swept, skipped) = swept_routes(&ids, &recruit);
+    let (swept, skipped) = {
+        let _phase = timing.phase("route_expansion");
+        swept_routes(&ids, &recruit)
+    };
     let mut admitted = 0;
     for route in targeted.iter().chain(swept.iter()) {
-        let (status, body) = fx.sweep_get(route, &member);
+        let (status, body) = {
+            let _phase = timing.phase("member");
+            fx.sweep_get(route, &member, false)
+        };
         if status != 200 {
             continue;
         }
@@ -1484,6 +1751,7 @@ fn cad1772_recruit_conversation_is_operator_only() {
         wrong.is_empty(),
         "Recruit conversation content reached a member: {wrong:#?}"
     );
+    timing.teardown();
 }
 
 // ------------------------------------------------------- 2. agent roles
@@ -1537,6 +1805,7 @@ fn finish(fx: &Fx, id: &str) {
 
 /// `cadence agent roles` as a spawned CLI against the fixture daemon.
 fn cli_roles(fx: &Fx, who: &str) -> (bool, String) {
+    let _wait = fx.timing.wait("cli_roles");
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
     cmd.env("HOME", fx.root.path().join("h"))
         .env("XDG_STATE_HOME", fx.root.path().join("xdg"))
@@ -1567,6 +1836,7 @@ fn cli_roles(fx: &Fx, who: &str) -> (bool, String) {
 
 #[test]
 fn cad1772_master_can_list_roles_and_app_turns_cannot() {
+    let timing = TestTiming::start("cad1772_master_can_list_roles_and_app_turns_cannot");
     use cadence_agent::master::{allowed_tools, Profile};
     let roles: Vec<&str> = cadence_agent::agent_roles::ROLES
         .iter()
@@ -1588,6 +1858,7 @@ fn cad1772_master_can_list_roles_and_app_turns_cannot() {
 
     let fx = Fx::start(Board::None);
     let (store, _home) = master_with_home(&fx);
+    timing.assertions();
     // The CLI command exists and lists the 12 roles.
     let (ok, text) = cli_roles(&fx, "operator");
     if !ok || roles.iter().any(|id| !text.contains(id)) {
@@ -1633,6 +1904,7 @@ fn cad1772_master_can_list_roles_and_app_turns_cannot() {
         )),
     }
     assert!(wrong.is_empty(), "agent roles: {wrong:#?}");
+    timing.teardown();
 }
 
 // -------------------------------------- round 2: the reserved install id
@@ -1648,6 +1920,8 @@ const APP_CHAT: &str = "real-recruit-app-chat-needle";
 /// Recruit (control).
 #[test]
 fn cad1772_real_install_named_recruit_is_not_the_recruit_conversation() {
+    let timing =
+        TestTiming::start("cad1772_real_install_named_recruit_is_not_the_recruit_conversation");
     use cadence_agent::store::app_contexts::ContextConfig;
     let fx = Fx::start(Board::Public);
     let (store, _home) = master_with_home(&fx);
@@ -1671,6 +1945,7 @@ fn cad1772_real_install_named_recruit_is_not_the_recruit_conversation() {
         .unwrap();
     let owner = fx.platform_cookie("owner");
     let member = fx.platform_cookie("member");
+    timing.assertions();
     let mut wrong = Vec::new();
     let reserved = |what: &str, e: &cadence_agent::Error| {
         eprintln!("CAD-1772 a real install named recruit refused at {what}: {e}");
@@ -1791,6 +2066,7 @@ fn cad1772_real_install_named_recruit_is_not_the_recruit_conversation() {
         ));
     }
     assert!(wrong.is_empty(), "a real install named recruit: {wrong:#?}");
+    timing.teardown();
 }
 
 /// Only the operator makes the Recruit conversation: a member, an agent
@@ -1798,6 +2074,7 @@ fn cad1772_real_install_named_recruit_is_not_the_recruit_conversation() {
 /// daemon RPC and on `POST /api/threads/master/conversations`.
 #[test]
 fn cad1772_recruit_create_refuses_non_operators() {
+    let timing = TestTiming::start("cad1772_recruit_create_refuses_non_operators");
     let mut wrong = Vec::new();
     let body = json!({"kind": "recruit"});
     let route = "/api/threads/master/conversations";
@@ -1807,6 +2084,7 @@ fn cad1772_recruit_create_refuses_non_operators() {
     fx.seed("master", None, None);
     fx.seed("helper", None, None);
     let params = json!({"alias": "master", "kind": "recruit"});
+    timing.assertions();
     for who in [
         Asserted::Agent("master".into()),
         Asserted::Agent("helper".into()),
@@ -1866,12 +2144,17 @@ fn cad1772_recruit_create_refuses_non_operators() {
     {
         wrong.push("control: operator RPC create refused".into());
     }
-    drop(fx);
+    {
+        let _teardown = timing.phase("teardown");
+        drop(fx);
+    }
 
     // Public board: a member is refused; the owner is the control.
+    timing.timing.switch_phase("setup");
     let fx = Fx::start(Board::Public);
     fx.seed("master", None, None);
     let member = fx.platform_cookie("member");
+    timing.assertions();
     let reply = fx.http(
         &Asserted::Operator,
         "POST",
@@ -1902,4 +2185,5 @@ fn cad1772_recruit_create_refuses_non_operators() {
         wrong.is_empty(),
         "Recruit create by a non-operator: {wrong:#?}"
     );
+    timing.teardown();
 }

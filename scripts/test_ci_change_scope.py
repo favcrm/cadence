@@ -128,8 +128,13 @@ class ScopeTests(unittest.TestCase):
         self.git("add", "src/consumer.rs")
         self.git("commit", "-qm", "share")
         self.base = self.git("rev-parse", "HEAD")
-        # Editing the shared target alone already forces full...
-        self.expect(self.scope(self.change(["tests/alpha.rs"])), "full")
+        # CAD-1970: a shared basename used to force the whole gate. It no
+        # longer does, because `tests-only` narrows no targets — the entire
+        # suite still runs — so sharing can only mean "the diff is still
+        # confined to tests/**.rs". Target narrowing is still refused.
+        result = self.scope(self.change(["tests/alpha.rs"]))
+        self.assertEqual(result["scope"], "tests-only", result)
+        self.assertEqual(result["targets"], [])
         # ...while the independent sibling still narrows.
         result = self.scope(self.change(["tests/beta.rs"]))
         self.assertEqual(result["scope"], "tests", result)
@@ -137,14 +142,70 @@ class ScopeTests(unittest.TestCase):
 
     def test_tests_scope_refuses_ambiguous_base_manifest(self):
         # An explicit [[test]] table or autotests = false makes target name
-        # to file mapping ambiguous; nested tests/**/main.rs is a target too.
+        # to file mapping ambiguous, so per-target narrowing is refused.
+        # CAD-1970: the diff is still confined to tests/**.rs, so it falls to
+        # `tests-only` — which runs the whole suite and every rust gate and
+        # only drops the build/cross/ui jobs that compile code a test edit
+        # cannot reach. Coverage of the change itself is unchanged.
         for extra in ('\n[[test]]\nname = "alpha"\npath = "tests/alpha.rs"\n',
                       'autotests = false\n'):
             with self.subTest(manifest=extra):
                 self.base_with_tests(manifest=self.MANIFEST + extra)
-                self.expect(self.scope(self.change(["tests/alpha.rs"])), "full")
+                result = self.scope(self.change(["tests/alpha.rs"]))
+                self.assertEqual(result["scope"], "tests-only", result)
+                self.assertEqual(result["rust"], "true")
+                self.assertEqual(result["ui"], "false")
+                self.assertEqual(result["tests"], "true")
+                self.assertEqual(result["targets"], [])
+                self.assertEqual(result["build"], "false")
+                self.assertEqual(result["cross"], "false")
         self.base_with_tests(extra=("tests/nested/main.rs",))
-        self.expect(self.scope(self.change(["tests/alpha.rs"])), "full")
+        self.assertEqual(
+            self.scope(self.change(["tests/alpha.rs"]))["scope"], "tests-only")
+
+    def test_tests_only_keeps_every_gate_that_can_see_the_change(self):
+        # The dropped jobs must be exactly the two that compile something
+        # else: a slice of rust that is not the test target, and another
+        # architecture. fmt, clippy --all-targets and every shard still run.
+        self.base_with_tests(manifest=self.MANIFEST + 'autotests = false\n')
+        result = self.scope(self.change(["tests/alpha.rs"]))
+        self.assertEqual(result["scope"], "tests-only", result)
+        self.assertEqual(
+            {k: result[k] for k in ("rust", "ui", "tests", "build", "cross")},
+            {"rust": "true", "ui": "false", "tests": "true",
+             "build": "false", "cross": "false"},
+        )
+        # Anything outside tests/**.rs is never tests-only.
+        for paths in (["tests/alpha.rs", "src/lib.rs"],
+                      ["tests/alpha.rs", "Cargo.toml"],
+                      ["tests/alpha.rs", "scripts/ci-change-scope.py"],
+                      ["tests/fixtures/data.json"],
+                      ["tests/alpha.rs", "tests/added.rs"]):
+            with self.subTest(paths=paths):
+                self.assertNotEqual(self.scope(self.change(paths))["scope"],
+                                    "tests-only")
+        # Non-PR events never narrow.
+        head = self.change(["tests/alpha.rs"])
+        for event in ("push", "merge_group", "workflow_dispatch"):
+            with self.subTest(event=event):
+                self.assertEqual(self.scope(head, event)["scope"], "full")
+
+    def test_tests_only_keeps_cross_for_the_target_that_cross_builds(self):
+        # ci.yml's cross legs compile tests/cad1425_client_update_refusal_acceptance.rs.
+        # An edit to that file is the one test-only change a build gate sees,
+        # so its cross legs stay while the build gate still drops.
+        self.base_with_tests(
+            manifest=self.MANIFEST + 'autotests = false\n',
+            extra=("tests/cad1425_client_update_refusal_acceptance.rs",))
+        result = self.scope(self.change(
+            ["tests/cad1425_client_update_refusal_acceptance.rs"]))
+        self.assertEqual(result["scope"], "tests-only", result)
+        self.assertEqual(result["cross"], "true")
+        self.assertEqual(result["build"], "false")
+        # An ordinary test file does not hold them.
+        result = self.scope(self.change(["tests/alpha.rs"]))
+        self.assertEqual(result["scope"], "tests-only", result)
+        self.assertEqual(result["cross"], "false")
 
     def test_deletion_rename_symlink_and_executable_changes_require_full(self):
         self.change(["docs/old.md"])
