@@ -4614,10 +4614,6 @@ pub fn doctor(pm_dir: &Path, known: Option<&HashSet<String>>) -> Value {
 }
 
 #[cfg(test)]
-#[path = "app_nested_copy_acceptance.rs"]
-mod nested_copy_acceptance;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 

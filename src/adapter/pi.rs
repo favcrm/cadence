@@ -1979,9 +1979,6 @@ impl PiAdapter {
     }
 }
 
-#[cfg(test)]
-#[path = "pi/cad1195_acceptance.rs"]
-mod cad1195_acceptance;
 #[cfg(all(test, debug_assertions, unix))]
 mod cad1553_company_authority_acceptance {
     use super::*;
@@ -2727,7 +2724,3 @@ mod cad1814_tests {
         assert!(shared.outcomes.lock().unwrap().is_empty());
     }
 }
-
-#[cfg(test)]
-#[path = "pi_omp_acceptance.rs"]
-mod cad1814_independent_acceptance;

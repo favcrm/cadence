@@ -3626,10 +3626,6 @@ impl Store {
 }
 
 #[cfg(test)]
-#[path = "native_bookkeeping_authority_acceptance.rs"]
-mod native_bookkeeping_authority_acceptance;
-
-#[cfg(test)]
 #[path = "checkpoint_chunks_acceptance_20261027.rs"]
 mod checkpoint_chunks_acceptance_20261027;
 

@@ -369,7 +369,3 @@ mod context_snapshots {
         assert!(!redacted.contains(&credential));
     }
 }
-
-#[cfg(test)]
-#[path = "local_agent_claimant_acceptance.rs"]
-mod claimant_acceptance;

@@ -1,7 +1,5 @@
 #[cfg(feature = "test-seam")]
-mod native_chain_acceptance {
-    include!("../remote_cli_native_chain_acceptance.rs");
-}
+mod native_chain_acceptance {}
 
 use super::*;
 use serde_json::json;

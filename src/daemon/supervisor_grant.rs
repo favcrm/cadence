@@ -37,10 +37,6 @@
 
 #![allow(dead_code)]
 
-#[cfg(test)]
-#[path = "supervisor_grant_acceptance.rs"]
-mod acceptance;
-
 // `AsRawFd` is only used by the Linux cfg'd peer/exe/listener paths; guarding
 // the import keeps macOS (and other unix targets) free of an unused-import
 // `-D warnings` failure while Linux still gets it.

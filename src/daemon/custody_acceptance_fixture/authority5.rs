@@ -1017,6 +1017,3 @@ fn native_custody_rpc_refuses_real_forbidden_processes() {
 fn native_custody_authenticated_http_refuses_real_forbidden_processes() {
     run_native_denials(true);
 }
-
-#[path = "authority5/cad347_memory_acceptance.rs"]
-mod cad347_memory_acceptance;

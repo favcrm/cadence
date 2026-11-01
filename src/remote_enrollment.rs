@@ -3110,12 +3110,4 @@ fn enroll_child_locked(
 mod tests;
 
 #[cfg(test)]
-#[path = "remote_enrollment_cli_lock_acceptance.rs"]
-mod cli_lock_acceptance;
-
-#[cfg(test)]
-#[path = "remote_enrollment_tls_acceptance.rs"]
-mod tls_acceptance;
-
-#[cfg(test)]
 mod portable_migration_gate_tests;

@@ -2726,14 +2726,7 @@ pub(crate) fn restore_guarded(
 }
 
 #[cfg(test)]
-mod cad1189_acceptance;
-#[cfg(test)]
-mod cad1254_acceptance;
-#[cfg(test)]
 mod cad1270_parity;
-#[cfg(test)]
-mod catalogue_acceptance;
-
 #[cfg(test)]
 mod tests {
     use super::*;

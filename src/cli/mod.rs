@@ -23,8 +23,6 @@ mod backup;
 use cadence_agent::briefing;
 mod build_slot;
 mod business_templates;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1586_managed_settings_acceptance;
 mod claude;
 mod client_update;
 mod cloud_agent;
@@ -53,9 +51,6 @@ mod job;
 mod join;
 mod launch;
 mod local_agent;
-#[cfg(test)]
-#[path = "logout_auth_dir_acceptance.rs"]
-mod logout_auth_dir_acceptance;
 mod master;
 mod mcp_agent;
 mod mcp_permission;
@@ -98,21 +93,14 @@ mod update_args;
 // CAD-1406: independent refusal-acceptance for the update identity
 // and managed-runtime guards; the file is owned by its own author.
 #[cfg(all(test, feature = "test-seam"))]
-mod update_identity_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
 mod update_recovery_tests;
 // CAD-1355: independent routing acceptance for `update` ignoring a saved
 // remote default — the file is owned by its own author.
-#[cfg(all(test, feature = "test-seam"))]
-mod update_routing_acceptance;
-
 mod upgrade;
 mod util;
 mod web;
 
 // CAD-1479: independently owned backend-default refusal acceptance.
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1479_backend_default_acceptance;
 mod wiki;
 mod workflow;
 

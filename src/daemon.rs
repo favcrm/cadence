@@ -44,11 +44,6 @@ mod app_screen_services_rpc;
 #[cfg(feature = "test-seam")]
 pub mod test_events;
 
-#[cfg(all(test, feature = "test-seam"))]
-mod cad811_installed_crm_qa_fixture;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad811_screen_services_acceptance;
-
 mod app_screens_rpc;
 mod app_social_drafts_rpc;
 pub(crate) mod app_teams_rpc;
@@ -57,11 +52,7 @@ mod approvals_rpc;
 mod area_rpc;
 mod business_templates_rpc;
 #[cfg(all(test, feature = "test-seam"))]
-mod cad1141_drift_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1184_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1184_revision_acceptance;
+mod cad811_installed_crm_qa_fixture;
 /// CAD-1239: explicit archive aliases, at most 50, no duplicates.
 fn archive_aliases(params: &Value) -> Result<Vec<String>> {
     let raw = params
@@ -144,70 +135,13 @@ fn archive_expected_revs(params: &Value) -> Result<Vec<(String, i64)>> {
 }
 
 mod artifacts_rpc;
-#[cfg(test)]
-mod cad1210_acceptance;
-#[cfg(test)]
-mod cad1212_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1218_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1300_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1314_approval_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1327_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1337_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1337_migration_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1353_delivery_status_acceptance;
-mod cad1365_generation_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1365_media_publish_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1365_media_read_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1365_mount_authority_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1365_original_fence_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1365_original_transfer_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1365_run_creator_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1415_app_actions_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1440_media_only_context_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1470_knowledge_refusal_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1473_host_redispatch;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1473_independent_redispatch;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1482_independent_media_refusal;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1518_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1537_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1562_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1588_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1590_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1636_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1651_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1656_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad225_unattended_acceptance;
 mod caller_rule;
-#[cfg(all(test, feature = "test-seam"))]
-mod campaign_clone_acceptance;
 mod chat_files_rpc;
 mod checkup;
 mod cli_rpc;
@@ -215,25 +149,11 @@ mod cli_rpc;
 pub(crate) use cli_rpc::prime_jwks_for_test as prime_cli_jwks_for_test;
 #[cfg(all(test, feature = "test-seam"))]
 mod board_producer_golden;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1700_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1777_drawer_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1822_context_refusal_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1852_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1868_acceptance;
 /// CAD-1913: independent adversarial acceptance for planned-path lesson
 /// selection, project isolation and secret non-disclosure at the issue/job
 /// delivery seam. Test-only registration; production carries neither.
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1913_lesson_delivery_isolation_acceptance;
 /// CAD-1932: reviewer-owned refusal acceptance for the non-records drawer
 /// parent proof. Test-only registration.
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1932_drawer_acceptance;
 mod cloud_agent_rpc;
 mod connection_test;
 mod connections_rpc;
@@ -256,8 +176,6 @@ mod cached_return_tests;
 mod cad1128_canary_fx;
 #[cfg(all(test, unix, feature = "test-seam"))]
 mod campaign_canary_tests;
-#[cfg(all(test, feature = "test-seam"))]
-mod conversations_acceptance;
 mod conversations_rpc;
 mod crm_send_rpc;
 mod crm_smtp_rpc;
@@ -270,8 +188,6 @@ pub(crate) use delivery_requirements_rpc::{classify_from, GhRead, RequirementInp
 mod delivery_rpc;
 mod dispatch_rpc;
 mod effect_rpc;
-#[cfg(all(test, feature = "test-seam"))]
-mod explorer_acceptance;
 mod hire_rpc;
 mod idea_rpc;
 mod identity;

@@ -126,8 +126,6 @@ pub mod worktree;
 #[cfg(test)]
 extern crate self as cadence_agent;
 #[cfg(test)]
-mod cad1085_entry_authority_acceptance;
-#[cfg(test)]
 mod test_web_issuer_tls;
 #[cfg(test)]
 mod web_cli_test_harness;

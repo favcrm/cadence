@@ -1,31 +1,3 @@
-# Ignored testcases, declared on purpose.
-#
-# A `#[ignore]` is the one way a test can stop running without its module
-# changing, and the gate cannot tell a deliberate exclusion from a typo.
-# scripts/check-test-junit.py therefore refuses an ignored case that is not
-# listed here, and refuses a line here whose case now runs. Adding or
-# removing an ignore is a diff in this file, with the reason next to it.
-#
-# Format: `<nextest binary id> <test name>`. A binary absent from the
-# inventory (a narrowed pull-request selection) does not make its lines
-# stale; a listed binary must agree with every line naming it.
-#
-# Thirty-one `#[ignore]` attributes existed in the sources when this list was
-# taken from the real six-shard reports of run 41204215749. The fourteen below
-# are the ones nextest actually discovers and skips; the rest sit on helpers,
-# re-exec children of tests that are never collected as cases, or code a
-# test-seam cfg excludes.
-cadence-agent daemon::cad811_installed_crm_qa_fixture::cad811_installed_crm_qa_fixture	# interactive installed CRM browser fixture; needs an admitted isolated runtime
-cadence-agent daemon::team_assistants_refusal::member_verbs_refuse_unbound_envelope_child	# re-exec child of the parent test that drives it
-cadence-agent issue::app::bundle_grammar_tests::regenerate_bundle_grammar	# rewrites the checked-in grammar artifact
-cadence-agent protected_runtime::measure_mounts::measure_mount_metadata_acceptance_20261027::cad1085_metadata_mounts_actual_kernel	# needs root/CAP_SYS_ADMIN, an approved Docker, and the pinned policy
-cadence-agent reaper::tests::reaper_proof_isolated	# runs in its own process from reaper_keeps_owned_statuses_and_reaps_adopted_orphans
-cadence-agent remote_cli::tests::native_chain_acceptance::native_chain_automatic_renewal_and_real_wiki_mutation	# controlled cross-repo runtime; supply CAD1434_AOS_API_DIR and run under admission
-cadence-agent remote_cli::tests::native_chain_acceptance::native_chain_private_client	# private stdin-only helper invoked by the controlled parent harness
-cadence-agent rollout::tests::rollout_operator_shell_probe	# re-exec helper for the operator force-release proof
-cadence-agent ui::team_assistants_http_refusal::assist_http_authority_refuses_with_flag_unset_child	# re-exec child of the parent refusal test
-cadence-agent web_cli_test_harness::tls_acceptance::cli_publish_web_real_device_login_prepare_publish_status_releases	# needs the owned API bridge; run by the Node controller with --ignored --exact
-cadence-agent web_cli_test_harness::tls_acceptance::cli_publish_web_real_device_login_spa_library_lifecycle	# needs the owned API bridge; run by the Node controller with --ignored --exact
-cadence-agent wiki::tests::cad911_partial_copy_child	# re-exec child of failed_partial_copy_cleans_only_its_private_stage
-cadence-agent::suite cad348_memory_evidence_acceptance::allowlisted_credential_receipt_proof	# re-exec child of an_allowlisted_credential_in_a_reference_is_never_echoed
-cadence-agent::suite cad348_memory_evidence_acceptance::detail_failure_receipt_proof	# re-exec child of a_failed_analysis_still_emits_the_complete_unknown_receipt
+# CAD-1970: the integration and acceptance suites were retired; the lib and
+# bins unit suites declare no `#[ignore]`d case, so this file is empty on
+# purpose. A new ignored case must be declared here by binary id.

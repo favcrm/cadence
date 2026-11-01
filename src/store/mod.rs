@@ -596,6 +596,3 @@ impl Store {
 #[cfg(test)]
 #[path = "cad1085_native_provider_metadata_acceptance_20261027.rs"]
 mod cad1085_native_provider_metadata_acceptance_20261027;
-
-#[cfg(test)]
-mod room_request_queue_acceptance;

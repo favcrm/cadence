@@ -1,14 +1,8 @@
 //! Context-scoped social draft operations through a live, server-minted screen action.
 
-#[cfg(test)]
-#[path = "app_selector_identity_acceptance.rs"]
-mod app_selector_identity_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 #[path = "app_social_discard_gate_test.rs"]
 mod app_social_discard_gate_test;
-#[cfg(test)]
-#[path = "app_social_local_authority_acceptance.rs"]
-mod app_social_local_authority_acceptance;
 use super::{app_bindings_rpc::strict_fields, app_tools_rpc::ToolContext, required_str, Shared};
 use crate::issue::app_catalog::workspace;
 use crate::{

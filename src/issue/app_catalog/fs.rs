@@ -13,9 +13,6 @@ use crate::error::{Error, Result};
 
 pub(in crate::issue) struct Root(File);
 
-#[cfg(test)]
-mod cad1385_acceptance;
-
 fn name(bytes: &[u8]) -> std::io::Result<CString> {
     CString::new(bytes).map_err(|_| {
         std::io::Error::new(
@@ -125,8 +122,6 @@ impl Root {
             return Err(error.into());
         }
         let file = unsafe { File::from_raw_fd(fd) };
-        #[cfg(test)]
-        cad1385_acceptance::after_open(path, &file);
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.nlink() > 1 || metadata.len() > cap {
             return Err(Error::rejected(

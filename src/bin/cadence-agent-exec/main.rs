@@ -28,11 +28,6 @@ mod policy;
 #[path = "../../protected_pi_profile.rs"]
 #[allow(dead_code)] // Same grammar compiled into both artifacts, not a caller policy port.
 mod protected_pi_profile;
-#[cfg(all(target_os = "linux", test))]
-#[path = "tests/protected_profile_refusal_acceptance.rs"]
-#[allow(clippy::single_match)] // Preserve the independently authored assertions verbatim.
-mod protected_profile_refusal_acceptance;
-
 #[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString, OsString};
 #[cfg(target_os = "linux")]

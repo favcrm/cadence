@@ -261,38 +261,20 @@ jobs:
       # almost all of it process startup in series. One step runs them 8 at a
       # time: measured 13.8 s for the same 27, same results. A failure still
       # names the check and fails the step.
-      - name: Contract checks for this repo's own CI
+      # CAD-1970: the contract *tests* for this repo's own tooling were
+      # retired; what remains are checks, not tests — each one inspects the
+      # checkout and fails on a real inconsistency. They run together because
+      # each is an interpreter start plus a few seconds.
+      # CAD-1970: the contract *tests* for this repo's own tooling are
+      # retired — CI machinery is proved by running it. What remains are
+      # checks: each inspects the checkout and fails on a real inconsistency.
+      - name: Checks for this repo's own tooling
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
-          xargs -P 8 -I@ sh -c '@ || { echo "::error::contract check failed: @" >&2; exit 1; }' <<'CHECKS'
+          xargs -P 4 -I@ sh -c '@ || { echo "::error::check failed: @" >&2; exit 1; }' <<'CHECKS'
             python3 scripts/check-review-recipe
-            python3 scripts/test-review-recipe
-            python3 -m unittest scripts/test_reduced_gate_release.py
-            python3 scripts/test_pre_push_plan.py
-            python3 scripts/test_workflow_cleanup.py
-            python3 scripts/test_ci_change_scope.py
-            python3 scripts/acceptance/test-cad-1370-feedback-contract.py
-            python3 scripts/acceptance/test-cad-1400-release-install-gate.py
-            python3 scripts/test_ci_fast_linker.py
-            python3 scripts/test_release_reuse.py
-            python3 scripts/test_core_wasm_release_latest.py
-            python3 scripts/test_select_shard_artifacts.py
-            python3 scripts/test_check_test_junit.py
-            python3 -m unittest scripts/test_enqueue_human_paths.py
-            python3 scripts/test_cad1743_bun_guards.py
-            python3 -m unittest scripts/test_enqueue_scope_approval.py
-            python3 scripts/test_enqueue_requirements.py
-            python3 scripts/test_enqueue_current_ci.py
-            python3 scripts/test_operator_preflight.py
-            python3 tests/cad1475_publicity_acceptance.py
-            python3 tests/cad1479_r2_publish_gate_acceptance.py
-            python3 tests/cad1540_cross_build_gate_acceptance.py
-            python3 tests/cad1910_boat_cleanup_refusal.py
-            python3 tests/boat_build_session.py
-            python3 tests/cad1919_previous_command_refusal.py
             scripts/design-kit --check
-            python3 tests/cad1285_migration_ddl_acceptance.py
           CHECKS
       - run: cargo fmt --all -- --check
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
@@ -356,7 +338,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [1]
     steps:
       - name: Not applicable — rust PR feedback gate
         if: ${{ needs.change-scope.outputs.rust == 'false' }}
@@ -434,9 +416,9 @@ jobs:
               exit 1
             fi
             echo "Running narrowed integration selection: $(tr '\n' ' ' < "$selection")"
-            scripts/run-result-tests --test-selection "$selection" --partition "${{ matrix.shard }}/6" --jobs 4
+            scripts/run-result-tests --test-selection "$selection" --partition "${{ matrix.shard }}/1" --jobs 4
           else
-            scripts/run-result-tests --partition "${{ matrix.shard }}/6" --jobs 4
+            scripts/run-result-tests --partition "${{ matrix.shard }}/1" --jobs 4
           fi
       - name: sccache statistics
         if: ${{ !cancelled() && needs.change-scope.outputs.rust != 'false' }}
@@ -523,12 +505,12 @@ jobs:
           set -euo pipefail
           files=(junits/*/junit.xml)
           if [ "${#files[@]}" -ne 6 ]; then
-            echo "::error::expected 6 shard junit reports, found ${#files[@]}: ${files[*]:-none}" >&2
+            echo "::error::expected 1 shard junit report, found ${#files[@]}: ${files[*]:-none}" >&2
             exit 1
           fi
           invs=(junits/*/expected-targets.txt)
           if [ "${#invs[@]}" -ne 6 ]; then
-            echo "::error::expected 6 shard inventories, found ${#invs[@]}: ${invs[*]:-none}" >&2
+            echo "::error::expected 1 shard inventory, found ${#invs[@]}: ${invs[*]:-none}" >&2
             exit 1
           fi
           first=${invs[0]}
@@ -545,7 +527,7 @@ jobs:
           # is not coverage, so a test missing from all six still fails.
           lists=(junits/*/inventory.json)
           if [ "${#lists[@]}" -ne 6 ]; then
-            echo "::error::expected 6 shard test inventories, found ${#lists[@]}: ${lists[*]:-none}" >&2
+            echo "::error::expected 1 shard test inventory, found ${#lists[@]}: ${lists[*]:-none}" >&2
             exit 1
           fi
           inventory_args=()

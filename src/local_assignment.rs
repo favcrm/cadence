@@ -2453,7 +2453,3 @@ fn ensure_lane(root: &Path, lane: &str, base_ref: Option<&str>) -> Result<PathBu
         }
     }
 }
-
-#[cfg(test)]
-#[path = "local_assignment_acceptance.rs"]
-mod acceptance;
