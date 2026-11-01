@@ -101,6 +101,19 @@ CREATE TABLE IF NOT EXISTS app_media_import_requests(
 /// capability and tool custody doors use.
 pub const IMPORT_BYTES: usize = 2 * 1024 * 1024;
 
+/// One import intent, exactly as the daemon proved it. A struct rather
+/// than seven positional arguments: the fields are all identity or
+/// custody material and are easy to transpose.
+pub(crate) struct MediaImport<'a> {
+    pub install: &'a str,
+    pub context: &'a str,
+    pub creator: &'a str,
+    pub media_type: &'a str,
+    pub bytes: &'a [u8],
+    pub source_receipt_id: &'a str,
+    pub request_id: &'a str,
+}
+
 /// One imported workspace image: the catalog row plus the verified
 /// custody bytes. Only the store's own readers see this shape; the
 /// frame still receives metadata only.
@@ -540,16 +553,16 @@ impl Store {
     /// and a refused attempt reserves nothing. `creator` is the
     /// caller-proven attribution, already in the catalog's closed
     /// tagged form.
-    pub(crate) fn app_media_import(
-        &self,
-        install: &str,
-        context: &str,
-        creator: &str,
-        media_type: &str,
-        bytes: &[u8],
-        source_receipt_id: &str,
-        request_id: &str,
-    ) -> Result<Value> {
+    pub(crate) fn app_media_import(&self, intent: MediaImport<'_>) -> Result<Value> {
+        let MediaImport {
+            install,
+            context,
+            creator,
+            media_type,
+            bytes,
+            source_receipt_id,
+            request_id,
+        } = intent;
         Creator::parse(creator)?;
         if !matches!(media_type, "image/png" | "image/jpeg" | "image/webp") {
             return Err(Error::rejected(

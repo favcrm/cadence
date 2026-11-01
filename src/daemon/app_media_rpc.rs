@@ -708,15 +708,16 @@ impl Shared {
                     &declared_mime,
                 )
                 .map_err(|(_, reason)| Error::rejected(reason))?;
-                self.store.app_media_import(
-                    &ctx.install_id,
-                    context,
-                    &media_actor(view).to_string(),
-                    media_type,
-                    &bytes,
-                    &receipt_id,
-                    &request_id,
-                )
+                self.store
+                    .app_media_import(crate::store::app_media::MediaImport {
+                        install: &ctx.install_id,
+                        context,
+                        creator: &media_actor(view).to_string(),
+                        media_type,
+                        bytes: &bytes,
+                        source_receipt_id: &receipt_id,
+                        request_id: &request_id,
+                    })
             },
         )
     }

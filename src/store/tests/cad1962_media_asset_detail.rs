@@ -13,6 +13,25 @@
 //! are exercised without repeating that fixture.
 
 use super::*;
+use crate::store::app_media::MediaImport;
+
+fn import(
+    s: &Store,
+    media_type: &str,
+    bytes: &[u8],
+    receipt: &str,
+    request: &str,
+) -> crate::error::Result<Value> {
+    s.app_media_import(MediaImport {
+        install: INSTALL_A,
+        context: "ctx-a",
+        creator: OPERATOR,
+        media_type,
+        bytes,
+        source_receipt_id: receipt,
+        request_id: request,
+    })
+}
 
 const INSTALL_A: &str = "install-a";
 const INSTALL_B: &str = "install-b";
@@ -127,17 +146,7 @@ const IMPORT_BYTES: &[u8] = b"not-really-a-png-but-the-store-trusts-the-declared
 fn an_import_copies_bytes_into_workspace_custody_and_replays() {
     let dir = tempfile::tempdir().unwrap();
     let s = Store::open(&dir.path().join("t.sqlite3")).unwrap();
-    let first = s
-        .app_media_import(
-            INSTALL_A,
-            "ctx-a",
-            OPERATOR,
-            "image/png",
-            IMPORT_BYTES,
-            "receipt-1",
-            "import-1",
-        )
-        .unwrap();
+    let first = import(&s, "image/png", IMPORT_BYTES, "receipt-1", "import-1").unwrap();
     let asset_id = first["receipt"]["asset_id"].as_str().unwrap().to_owned();
     assert_eq!(first["receipt"]["lifecycle"], "draft");
 
@@ -152,45 +161,15 @@ fn an_import_copies_bytes_into_workspace_custody_and_replays() {
     assert_eq!(imported.asset.lifecycle, "draft");
 
     // Identical replay returns the SAME asset, never a second copy.
-    let replay = s
-        .app_media_import(
-            INSTALL_A,
-            "ctx-a",
-            OPERATOR,
-            "image/png",
-            IMPORT_BYTES,
-            "receipt-1",
-            "import-1",
-        )
-        .unwrap();
+    let replay = import(&s, "image/png", IMPORT_BYTES, "receipt-1", "import-1").unwrap();
     assert_eq!(replay["receipt"]["asset_id"], json!(asset_id));
     assert_eq!(s.app_media_catalog(20, None).unwrap().0.len(), 1);
 
     // The same request id with different bytes refuses and reserves nothing.
-    assert!(s
-        .app_media_import(
-            INSTALL_A,
-            "ctx-a",
-            OPERATOR,
-            "image/png",
-            b"different-bytes",
-            "receipt-1",
-            "import-1"
-        )
-        .is_err());
+    assert!(import(&s, "image/png", b"different-bytes", "receipt-1", "import-1").is_err());
     // Equal bytes from a DIFFERENT receipt are different provenance, so the
     // same accepted request id refuses rather than claiming one intent.
-    assert!(s
-        .app_media_import(
-            INSTALL_A,
-            "ctx-a",
-            OPERATOR,
-            "image/png",
-            IMPORT_BYTES,
-            "receipt-2",
-            "import-1"
-        )
-        .is_err());
+    assert!(import(&s, "image/png", IMPORT_BYTES, "receipt-2", "import-1").is_err());
     assert_eq!(s.app_media_catalog(20, None).unwrap().0.len(), 1);
 }
 
@@ -198,17 +177,7 @@ fn an_import_copies_bytes_into_workspace_custody_and_replays() {
 fn an_imported_asset_is_a_draft_until_published_and_outlives_its_importer() {
     let dir = tempfile::tempdir().unwrap();
     let s = Store::open(&dir.path().join("t.sqlite3")).unwrap();
-    let created = s
-        .app_media_import(
-            INSTALL_A,
-            "ctx-a",
-            OPERATOR,
-            "image/jpeg",
-            IMPORT_BYTES,
-            "receipt-3",
-            "import-2",
-        )
-        .unwrap();
+    let created = import(&s, "image/jpeg", IMPORT_BYTES, "receipt-3", "import-2").unwrap();
     let asset_id = created["receipt"]["asset_id"].as_str().unwrap().to_owned();
 
     // The catalog is store-wide: another installation reads the row, as
