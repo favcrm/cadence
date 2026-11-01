@@ -29,9 +29,10 @@
 //!   install. A revoke or upgrade between mount and read fails closed.
 //!
 //! `input` is the closed union `{kind:"catalog", limit?:1..20,
-//! cursor?:opaque}` — `{kind:"asset", asset_id}` is recognized by the
-//! contract but NOT admitted until its custody check lands, and refuses
-//! explicitly. Catalog output is `{assets, next_cursor, current_actor}`.
+//! cursor?:opaque}` plus `{kind:"asset", asset_id}` — one catalog row's
+//! metadata projection, never a byte or a locator (CAD-1962). Catalog
+//! output is `{assets, next_cursor, current_actor}`; detail output is
+//! `{asset, current_actor}`.
 //! `current_actor` and each asset's `creator` carry the tagged app-port
 //! `Creator` union — `{kind:"user", id:<verified native
 //! BoardUser.sub>, label?}`, `{kind:"operator"}` or `{kind:"unknown"}`

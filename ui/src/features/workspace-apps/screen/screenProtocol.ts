@@ -261,19 +261,27 @@ export function wantsMedia(accepts: readonly string[] | undefined): boolean {
   return !!accepts && accepts.includes(SCREEN_MEDIA_V1);
 }
 
-/** CAD-1365 — closed media.call arg parsers. `kind:"asset"` detail and
- *  `media.generate` are recognized-but-unadmitted: they refuse here, so
- *  nothing strips or forwards them. Any extra field — including a
- *  forged authority/scope selector — refuses outright, never silently
- *  strips. Exported so the dispatcher re-validates a direct call.
+/** CAD-1365 — closed media.call arg parsers. `media.generate` is
+ *  recognized-but-unadmitted: it refuses here, so nothing strips or
+ *  forwards it. Any extra field — including a forged authority/scope
+ *  selector — refuses outright, never silently strips. Exported so the
+ *  dispatcher re-validates a direct call.
  *  `kind:"catalog"` only: `{kind}` or `{kind,limit,cursor}` with
- *  `limit` a safe integer 1..20 and `cursor` a string <= 160 chars. */
+ *  `limit` a safe integer 1..20 and `cursor` a string <= 160 chars.
+ *  CAD-1962: `kind:"asset"` detail is admitted as exactly
+ *  `{kind,asset_id}` with a canonical id — without it the frame would be
+ *  closed before the daemon's own detail read ever ran. */
 export function mediaReadArgs(args: ActionArgs): ActionArgs | null {
   const keys = Object.keys(args).sort().join();
   if (args.kind === "preview") {
     if (Object.keys(args).sort().join() !== "asset_id,expected_revision,kind") return null;
     if (typeof args.asset_id !== "string" || !MEDIA_ASSET_ID.test(args.asset_id)) return null;
     if (typeof args.expected_revision !== "number" || !Number.isSafeInteger(args.expected_revision) || args.expected_revision < 1) return null;
+    return args;
+  }
+  if (args.kind === "asset") {
+    if (keys !== "asset_id,kind") return null;
+    if (typeof args.asset_id !== "string" || !MEDIA_ASSET_ID.test(args.asset_id)) return null;
     return args;
   }
   if (keys !== "kind" && keys !== "kind,limit" && keys !== "cursor,kind" && keys !== "cursor,kind,limit") return null;
