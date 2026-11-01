@@ -89,6 +89,75 @@ unavailable identity refuses the operation instead of falling back to a generic
 prompt. The summarizer's `completeSimple` path keeps its original
 normalization, authentication and transport.
 
+**Hosted app scope.** `HostedSession.submit(text, operationId, app?)` and
+`ask(prompt, operationId?, app?)` accept the host-verified `AppScope` of the
+turn: `{ installId, contextId? }`, with `contextId` absent for an
+installation-only binding and both parts in the board's binding grammar (1–128
+characters of `[A-Za-z0-9_-]`). The host proves both against its own canonical
+store before it submits; the runtime only validates the shape, so a browser
+field, a model message or a scope read from somewhere else is never carried as
+verified scope. Omitting `app` is Home, and a Home operation's context is
+unchanged.
+
+The engine deduplicates a submission by request id alone — a repeated id
+returns its existing submission after comparing the submission type, never its
+text or metadata — so the runtime owns the check: the first admission of an
+operation id records a SHA-256 digest of its text and its app scope in the
+session object's `tenant_operation_scopes` table, an identical retry is the
+same operation, and a retry that changes the text or the scope is refused
+before the engine is asked. The text itself is never copied into that table, so
+the guard leaves no readable message behind when the engine's own reset or
+compaction retires its copy; the rows are kept because they are the operation
+ids' bindings, and dropping one would let a replay be re-bound. A refused
+admission writes nothing, and the binding is the session's SQLite, not one
+instance's memory, so queueing, retries and crash recovery keep the envelope.
+Before its first reservation the guard also asks the engine whether it already
+holds that operation id in any state — queued, placed or settled. An id the
+engine knows but this guard never admitted cannot be re-bound: the engine would
+replay its own stored turn while the guard recorded a different envelope, so
+that id is refused and the caller must use a new one.
+
+The admitted envelope is also placed with the input entry (`messageId` and
+`app`), so the transcript, a rebuilt object and a replayed retry all read the
+same durable record. The board's operator entry projects that stored binding as
+`payload.app` in its own shape, `{install_id, context_id?}` — the same object a
+`thread_send` retry sends back — and never re-derives one from a caller. A
+stored scope that does not validate fails that read or stream instead of being
+presented as Home.
+
+Inside a turn, the operation's scope reaches both the model and its tools. A
+run can hold more than one input — the engine appends each steering input to
+the live run — so the runtime attributes a run only when every one of its
+inputs carries the same scope, and refuses a run that mixes scopes instead of
+attributing it to one input. Each model request then carries a private,
+factual scope statement injected through `beforeRequest` (never a transcript
+entry) with just the validated `install_id`/`context_id` and the explicit
+limitation that it conveys no tool authority, permission or approval; the
+statement is context, never enforcement.
+
+Enforcement is a positive per-attempt attestation at the provider boundary.
+The engine only *reports* a hook error and continues the attempt, so a refusal
+raised in the hook would not stop the request. Instead the session installs a
+guard on its own `Models` at construction, and every attempt the hook serves
+authors one fresh message object into the session's set: the statement for an
+app turn, and for Home a content-identical clone of the request's last
+conversation message (no text is added or changed). `Models.streamSimple`
+refuses any request that carries none of them, before the provider is called,
+which settles the turn unanswered. A skipped hook, or a hook that cannot
+establish the scope — an unattributable run, a mixed run, a malformed stored
+scope — authors nothing and is therefore refused rather than sent unscoped. A
+fresh object per attempt is what makes an attestation un-reusable by any later
+request. Compaction's summarizer keeps the original unguarded path, and the
+operation guard composes with the identity guard on the same `Models`: both
+checks run, in install order.
+
+Each tool call receives `ToolInvocation.app`, the same resolved scope, after
+the refusal and live-authorization checks, so structured admission stays the
+authority. A tool that runs outside an operation, such as one in another
+conversation's run, gets none. A malformed stored scope or a mixed run
+therefore refuses the request or the execution rather than acting outside the
+envelope.
+
 Each `/thread-stream` connection reads `threadContext()` once. Its metadata
 composes into the `master` frame under the runtime's own fields, so business
 identity such as `identity` and `actor_identity` can be added but never

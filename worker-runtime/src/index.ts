@@ -6,6 +6,7 @@
  */
 export { HostedSession } from "./hosted-session.ts";
 export type {
+  AppScope,
   AskResult,
   AssistantIdentityContext,
   GenerationIdentity,
