@@ -500,12 +500,12 @@ jobs:
         run: |
           set -euo pipefail
           files=(junits/*/junit.xml)
-          if [ "${#files[@]}" -ne 6 ]; then
+          if [ "${#files[@]}" -ne 1 ]; then
             echo "::error::expected 1 shard junit report, found ${#files[@]}: ${files[*]:-none}" >&2
             exit 1
           fi
           invs=(junits/*/expected-targets.txt)
-          if [ "${#invs[@]}" -ne 6 ]; then
+          if [ "${#invs[@]}" -ne 1 ]; then
             echo "::error::expected 1 shard inventory, found ${#invs[@]}: ${invs[*]:-none}" >&2
             exit 1
           fi
@@ -522,7 +522,7 @@ jobs:
           # every discovered test exactly once. Agreement among the reports
           # is not coverage, so a test missing from all six still fails.
           lists=(junits/*/inventory.json)
-          if [ "${#lists[@]}" -ne 6 ]; then
+          if [ "${#lists[@]}" -ne 1 ]; then
             echo "::error::expected 1 shard test inventory, found ${#lists[@]}: ${lists[*]:-none}" >&2
             exit 1
           fi
