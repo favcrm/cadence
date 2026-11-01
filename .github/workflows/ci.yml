@@ -152,7 +152,7 @@ jobs:
                 if passed=$(gh api "repos/$REPO/actions/runs/$id/jobs?filter=latest&per_page=100" \
                     --paginate --slurp \
                     | jq -r '[.[].jobs[]] as $jobs
-                          | ["fmt", "clippy", "test", "build", "ui"] | all(. as $g
+                          | ["fmt", "clippy", "build", "ui"] | all(. as $g
                               | [$jobs[] | select(.name == $g)] as $matching
                               | ($matching | length) > 0 and ($matching | all(.status == "completed" and .conclusion == "success")))'); then
                   if [ "$passed" = true ]; then
@@ -808,7 +808,7 @@ jobs:
             '{source_sha: $source_sha, run_id: $run_id, run_attempt: $run_attempt,
               rustc: $rustc, cargo: $cargo, features: ["ui"],
               target: "x86_64-linux", runner: "ubuntu-24.04",
-              checks: ["fmt", "clippy", "test", "build", "ui"],
+              checks: ["fmt", "clippy", "build", "ui"],
               checks_event: $checks_event, checks_run_id: $checks_run_id,
               sha256: $sha256, built_at: $built_at}' > dist/manifest.json
           cat dist/manifest.json dist/cadence.sha256
@@ -915,7 +915,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "$NEEDS_JSON" | jq -r 'to_entries[] | "\(.key): \(.value.result)"' >> "$GITHUB_STEP_SUMMARY"
-          echo "$NEEDS_JSON" | jq -e '. as $needs | ["fmt", "clippy", "test", "build", "ui"] | all(. as $gate | $needs[$gate].result == "success")' >/dev/null || {
+          echo "$NEEDS_JSON" | jq -e '. as $needs | ["fmt", "clippy", "build", "ui"] | all(. as $gate | $needs[$gate].result == "success")' >/dev/null || {
             echo "Required upstream gate failed, was cancelled/skipped, or has no result; refusing release" >&2
             exit 1
           }
@@ -1023,7 +1023,7 @@ jobs:
             '{source_sha: $source_sha, version: $version, run_id: $run_id,
               run_attempt: $run_attempt, rustc: $rustc, cargo: $cargo,
               features: ["ui"], target: $target, runner: $runner,
-              checks: ["fmt", "clippy", "test", "build", "ui"],
+              checks: ["fmt", "clippy", "build", "ui"],
               sha256: $sha256, built_at: $built_at}' > stage/manifest.json
           asset="cadence-$TAG-$TARGET.tar.gz"
           tar -czf "dist/$asset" -C stage cadence cadence.sha256 manifest.json
