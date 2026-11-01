@@ -183,9 +183,12 @@ the code you just wrote.
 
 ### Testing principles
 
-CI runs **one** test job over the lib and bins unit suites. Everything else —
-per-module acceptance suites, integration targets, contract tests for the CI
-scripts themselves — is retired. Write a test only when it earns its place, and
+CI does not run tests. `ci.yml` proves the code compiles for the shipping
+features and both targets, lints it, and proves the release seam on the merge
+queue and main; the suite runs on a schedule and on demand (`tests.yml`), where
+a red test finds its owner instead of blocking an unrelated push. Per-module
+acceptance suites, integration targets and contract tests for the CI scripts
+themselves are retired. Write a test only when it earns its place, and
 then to these rules:
 
 - **Direct functions, not processes.** Business logic is tested by calling it.
