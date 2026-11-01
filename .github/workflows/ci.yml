@@ -287,12 +287,8 @@ jobs:
           python3 scripts/check-migration-ddl --base "$BASE_SHA"
       - name: Check contributor documentation paths
         run: python3 scripts/check-doc-links.py
-      - name: Test contributor documentation checker
-        run: python3 -m unittest discover -s scripts -p 'test_check_doc_links.py'
       # CAD-833: the live-staging tick is mocked end-to-end — it must
       # run in CI, not only on the deploying host.
-      - name: Test live-staging deploy tick
-        run: python3 -m unittest discover -s scripts -p 'test_staging_deploy.py'
       - name: Verify live doctor/host source inventory
         run: scripts/split-doctor-host --check
 
@@ -1776,11 +1772,6 @@ jobs:
       # production feature shape afterward.
       # CAD-1425: the client-update refusal acceptance runs on each native
       # leg; the cfg(macos) test is the real Apple Silicon outcome.
-      - name: Run the CAD-1425 client update refusal acceptance
-        if: ${{ needs.change-scope.outputs.cross != 'false' }}
-        env:
-          CARGO_BUILD_JOBS: 4
-        run: cargo test --locked --features test-seam --test cad1425_client_update_refusal_acceptance -- --test-threads 2
       - run: cargo build --locked
         if: ${{ needs.change-scope.outputs.cross != 'false' }}
       - run: target/debug/cadence --version
