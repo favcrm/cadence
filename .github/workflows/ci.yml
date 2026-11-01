@@ -601,7 +601,8 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 4
         run: |
-          cargo test --no-run --locked --features test-seam --test cad1425_client_update_refusal_acceptance
+          # CAD-1970: the CAD-1425 acceptance target was retired with the test
+          # reset; the dev-profile build is what the cross gates now restore.
           cargo build --locked
 
   # CAD-1131: build the release binary once per git TREE. A queue entry's
