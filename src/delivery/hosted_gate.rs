@@ -549,6 +549,42 @@ pub fn scope(target: &RemoteTarget, wake_timeout: u64, issue: &str) -> Result<(V
     scope_answer(&body, issue)
 }
 
+/// `cadence audit verdict` (CAD-1542) for a hosted org: record one reviewer's
+/// verdict for exactly this issue, PR and head. The board takes the reviewer
+/// from the authenticated caller, never from an argument, and a second verdict
+/// of the same kind for the same head returns the first.
+#[allow(clippy::too_many_arguments)]
+pub fn verdict(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    issue: &str,
+    pr: u64,
+    head: &str,
+    kind: &str,
+    outcome: &str,
+    title_outcome: &str,
+    section_outcome: &str,
+    risk: &str,
+    body: &str,
+) -> Result<Value> {
+    call(
+        target,
+        wake_timeout,
+        "audit_verdict",
+        args(&[
+            ("issue", json!(issue)),
+            ("pr", json!(pr)),
+            ("head", json!(head)),
+            ("kind", json!(kind)),
+            ("outcome", json!(outcome)),
+            ("title_outcome", json!(title_outcome)),
+            ("section_outcome", json!(section_outcome)),
+            ("risk", json!(risk)),
+            ("body", json!(body)),
+        ]),
+    )
+}
+
 /// `cadence audit verdicts` (CAD-1946) for a hosted org: the org's own read
 /// of the verdicts naming this issue, PR and full head. A refused or
 /// unreadable answer is exit 1 — never the notes folder on this machine, which

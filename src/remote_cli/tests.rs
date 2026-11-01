@@ -45,6 +45,19 @@ fn store_credential(dir: &Path, endpoint: &str) {
 }
 
 #[test]
+fn audit_verdict_is_a_registered_mutating_write() {
+    use super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb, REMOTE_VERBS};
+
+    assert!(REMOTE_VERBS.contains(&"audit_verdict"));
+    assert_eq!(cli_requested_scopes("audit_verdict"), &["cli.write"]);
+    assert!(mutating_cli_verb("audit_verdict"));
+    assert!(
+        lost_mutation_note("audit_verdict").contains("audit verdicts"),
+        "a lost verdict write must send the caller back to the read, not a blind retry"
+    );
+}
+
+#[test]
 fn assignment_identity_survives_saved_login_reloads() {
     let dir = tempfile::tempdir().unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();

@@ -1781,6 +1781,85 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             )?)
         }
         Commands::Audit {
+            action:
+                Some(AuditAction::Verdict {
+                    issue,
+                    pr,
+                    head,
+                    kind,
+                    outcome,
+                    title_outcome,
+                    section_outcome,
+                    risk,
+                    file,
+                    text,
+                }),
+            ..
+        } => {
+            let head = super::audit::full_head(head)?;
+            if kind != "standards" && kind != "spec" {
+                return Err(Error::usage(
+                    "audit verdict --kind is `standards` or `spec`; nothing was sent",
+                ));
+            }
+            if outcome != "pass" && outcome != "revise" {
+                return Err(Error::usage(
+                    "audit verdict --outcome is `pass` or `revise`; nothing was sent",
+                ));
+            }
+            let title_outcome = title_outcome.as_deref().unwrap_or(outcome);
+            let section_outcome = section_outcome.as_deref().unwrap_or(outcome);
+            for value in [title_outcome, section_outcome] {
+                if value != "pass" && value != "revise" {
+                    return Err(Error::usage(
+                        "audit verdict title/section outcome is `pass` or `revise`; nothing was sent",
+                    ));
+                }
+            }
+            // The findings are read client-side; `-` is stdin. A verdict
+            // without findings is refused before send.
+            let body =
+                match (text, file) {
+                    (Some(t), _) => t.clone(),
+                    (None, Some(f)) if f.as_os_str() == "-" => {
+                        std::io::read_to_string(std::io::stdin())?
+                    }
+                    (None, Some(f)) => std::fs::read_to_string(f).map_err(|e| {
+                        Error::rejected(format!(
+                            "audit verdict --file {}: cannot read it locally: {e}",
+                            f.display()
+                        ))
+                    })?,
+                    (None, None) => return Err(Error::usage(
+                        "a verdict needs its findings — pass --text or --file; nothing was sent",
+                    )),
+                };
+            if body.trim().is_empty() {
+                return Err(Error::usage(
+                    "a verdict needs its findings — nothing was sent",
+                ));
+            }
+            if body.len() > 16 * 1024 {
+                return Err(Error::usage(
+                    "verdict text exceeds the 16 KB cap — trim it; nothing was sent",
+                ));
+            }
+            let recorded = hosted_gate::verdict(
+                target,
+                wake_timeout,
+                issue.trim(),
+                *pr,
+                &head,
+                kind,
+                outcome,
+                title_outcome,
+                section_outcome,
+                risk,
+                &body,
+            )?;
+            printed((recorded, 0))
+        }
+        Commands::Audit {
             action: Some(AuditAction::Verdicts {
                 issue, pr, head, ..
             }),
