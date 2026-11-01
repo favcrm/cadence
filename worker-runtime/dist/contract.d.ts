@@ -53,14 +53,19 @@ export interface ToolInvocation {
 export interface ToolContext {
     readonly abortSignal?: AbortSignal;
 }
-/** One text part of a tool result. */
-export interface ToolContent {
+/** A tool result presented to the model; only text is projected to the board. */
+export type ToolContent = {
     readonly type: "text";
     readonly text: string;
-}
+} | {
+    readonly type: "image";
+    /** Base64-encoded image bytes, without a data URL prefix. */
+    readonly data: string;
+    readonly mimeType: "image/png" | "image/jpeg" | "image/webp";
+};
 /** What a tool returns to the model. */
 export interface ToolResult {
-    /** Text parts for the model; omitted means no output of its own. */
+    /** Text and optional bounded image parts; omitted means no output of its own. */
     readonly output?: readonly ToolContent[];
     readonly isError?: boolean;
 }
@@ -157,6 +162,18 @@ export interface ThreadContext {
 export interface HostedSessionOptions {
     /** The platform default alias this deployment sends. */
     readonly modelAlias: string;
+    /**
+     * The model transport accepts image input. Default false: image tool results
+     * become an explicit error. A host opting in must validate the resolved
+     * model and image pricing for each request; this flag does not select one.
+     */
+    readonly acceptsToolImages?: boolean;
+    /**
+     * Maximum images in one model request across the entire history. Defaults
+     * to one; set a higher value only when every model the alias may resolve to
+     * permits it. The gateway must still validate the model and cost per call.
+     */
+    readonly maxImagesPerRequest?: 1 | 2 | 3 | 4;
     /**
      * One model request through the platform proxy. The runtime relays the
      * returned bytes unchanged and only observes the served-model label.

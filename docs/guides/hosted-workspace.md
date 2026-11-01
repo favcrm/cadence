@@ -68,6 +68,26 @@ checked before and after the authority check. Tool handlers receive only the
 neutral invocation identity, clock and cancellation context, not the engine's
 model registry or nested-execution API.
 
+**Tool images.** A tool may return base64 PNG, JPEG or WebP parts alongside
+text. The runtime accepts at most four image parts and 192 KiB of encoded image
+data per result. Invalid base64, unsupported media types or oversized parts
+produce an explicit tool error; the runtime does not decode image contents.
+Image bytes are retained in the conversation's private engine records for
+recovery, but are excluded from the board thread projection. The owner-only raw
+event stream retains the image's media type and a redacted marker, not its bytes.
+For each model request the runtime keeps the newest images that fit the
+192 KiB total budget and a configurable image-count limit, replacing omitted
+parts with an explicit notice to the model. The count defaults to one; a host
+may set `maxImagesPerRequest` from one to four only when every model its alias
+may resolve to permits that many. The private durable history is not changed.
+
+Image input is off by default. A host may set `acceptsToolImages: true` only
+when its model gateway can receive images and verifies the resolved model and
+image pricing for each request. Without that opt-in, an image result reports
+that image input is unavailable instead of silently dropping it. This runtime
+contract does not itself provide browser access, select a vision model or add
+image support to AgenticOS's gateway.
+
 **Hosted identity.** A host that has a committed assistant identity may supply
 two optional domain-data callbacks on `HostedSessionOptions`: `identity()`
 returns the current personal profile or workspace identity, and

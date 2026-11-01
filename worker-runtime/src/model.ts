@@ -1,6 +1,7 @@
 import type { Api, Model, Provider } from "@earendil-works/pi-ai";
 import { CLOUDFLARE_AI_API, CLOUDFLARE_PROVIDER_ID } from "agents/models/pi-ai";
 import type { GenerationIdentity } from "./contract.ts";
+import { MAX_IMAGE_BASE64_CHARS, MAX_IMAGE_PARTS } from "./image-limits.ts";
 
 /**
  * Model transport for one hosted conversation.
@@ -24,10 +25,7 @@ const MODEL_MAX_OUTPUT_TOKENS = 8192;
  * id and sends the alias; these entries only let the old session wake and
  * reach that transport.
  */
-const LEGACY_MODEL_IDS = [
-  "@cf/zai-org/glm-5.3-flash",
-  "z-ai/glm-5.3-flash",
-] as const;
+const LEGACY_MODEL_IDS = ["@cf/zai-org/glm-5.3-flash", "z-ai/glm-5.3-flash"] as const;
 
 /**
  * The descriptor for the platform default.
@@ -35,14 +33,14 @@ const LEGACY_MODEL_IDS = [
  * The engine needs a model object (id, api, provider, cost, windows); the id
  * here is the alias the platform resolves, never a provider model id.
  */
-export function defaultModel(alias: string): Model<Api> {
+export function defaultModel(alias: string, acceptsImages = false): Model<Api> {
   return {
     id: alias,
     name: "Platform default",
     api: CLOUDFLARE_AI_API,
     provider: CLOUDFLARE_PROVIDER_ID,
     baseUrl: "",
-    input: ["text"],
+    input: acceptsImages ? ["text", "image"] : ["text"],
     cost: { cacheRead: 0, cacheWrite: 0, input: 0, output: 0 },
     reasoning: false,
     contextWindow: MODEL_CONTEXT_WINDOW,
@@ -51,9 +49,10 @@ export function defaultModel(alias: string): Model<Api> {
 }
 
 /** Legacy descriptors use the same transport; their concrete id is never sent. */
-function legacyModels(): Model<Api>[] {
+function legacyModels(model: Model<Api>): Model<Api>[] {
   return LEGACY_MODEL_IDS.map((id) => ({
-    ...defaultModel(id),
+    ...model,
+    id,
     name: "Legacy tenant model",
   }));
 }
@@ -67,18 +66,12 @@ function legacyModels(): Model<Api>[] {
  * appear in the provider's catalog. The provider's streaming implementation is
  * unchanged — every model on it runs through the private transport.
  */
-export function withDefaultModel(
-  provider: Provider,
-  model: Model<Api>,
-): Provider {
-  const models = [model, ...legacyModels()];
+export function withDefaultModel(provider: Provider, model: Model<Api>): Provider {
+  const models = [model, ...legacyModels(model)];
   return {
     ...provider,
     getModels: () => [...provider.getModels(), ...models],
-    getAllModels: () => [
-      ...(provider.getAllModels?.() ?? provider.getModels()),
-      ...models,
-    ],
+    getAllModels: () => [...(provider.getAllModels?.() ?? provider.getModels()), ...models],
   };
 }
 
@@ -99,10 +92,7 @@ export function captureResolvedModel(
 ): Response {
   if (!response.ok || response.body === null) return response;
   const contentType = response.headers.get("content-type") ?? "";
-  if (
-    !contentType.includes("text/event-stream") &&
-    !contentType.includes("application/json")
-  ) {
+  if (!contentType.includes("text/event-stream") && !contentType.includes("application/json")) {
     return response;
   }
   const reader = response.body.getReader();
@@ -171,6 +161,83 @@ export interface MeteredBinding {
 }
 
 /**
+ * Retain the newest image parts that fit one gateway request. Durable session
+ * history is untouched; each omitted image is named in the model input.
+ */
+function boundImageHistory(
+  input: Record<string, unknown>,
+  maxImages: number,
+): Record<string, unknown> {
+  if (!Array.isArray(input.messages)) return input;
+  const omitted = new Map<number, Set<number>>();
+  let count = 0;
+  let bytes = 0;
+  for (let i = input.messages.length - 1; i >= 0; i--) {
+    const message: unknown = input.messages[i];
+    if (
+      typeof message !== "object" ||
+      message === null ||
+      !("role" in message) ||
+      message.role !== "user" ||
+      !("content" in message) ||
+      !Array.isArray(message.content)
+    )
+      continue;
+    for (let j = message.content.length - 1; j >= 0; j--) {
+      const part: unknown = message.content[j];
+      if (
+        typeof part !== "object" ||
+        part === null ||
+        !("type" in part) ||
+        part.type !== "image_url" ||
+        !("image_url" in part) ||
+        typeof part.image_url !== "object" ||
+        part.image_url === null ||
+        !("url" in part.image_url)
+      )
+        continue;
+      const url = part.image_url.url;
+      if (typeof url !== "string" || !/^data:image\/(?:png|jpeg|webp);base64,/.test(url)) continue;
+      const size = url.length - url.indexOf(",") - 1;
+      if (count >= maxImages || bytes + size > MAX_IMAGE_BASE64_CHARS) {
+        const indexes = omitted.get(i) ?? new Set<number>();
+        indexes.add(j);
+        omitted.set(i, indexes);
+      } else {
+        count++;
+        bytes += size;
+      }
+    }
+  }
+  if (omitted.size === 0) return input;
+  return {
+    ...input,
+    messages: input.messages.map((message: unknown, messageIndex: number) => {
+      const indexes = omitted.get(messageIndex);
+      if (
+        !indexes ||
+        typeof message !== "object" ||
+        message === null ||
+        !("content" in message) ||
+        !Array.isArray(message.content)
+      )
+        return message;
+      return {
+        ...message,
+        content: message.content.map((part: unknown, partIndex: number) =>
+          indexes.has(partIndex)
+            ? {
+                type: "text",
+                text: "[An image was omitted from this request to fit the image limit.]",
+              }
+            : part,
+        ),
+      };
+    }),
+  };
+}
+
+/**
  * The private model endpoint.
  *
  * `identity` reads the engine's current durable generation checkpoint and must
@@ -184,7 +251,14 @@ export function meteredBinding(
   transport: MeteredTransport,
   identity: () => GenerationIdentity | null,
   onModelResolved?: (model: string) => void,
+  maxImagesPerRequest = 1,
 ): MeteredBinding {
+  if (
+    !Number.isSafeInteger(maxImagesPerRequest) ||
+    maxImagesPerRequest < 1 ||
+    maxImagesPerRequest > MAX_IMAGE_PARTS
+  )
+    throw new Error("Invalid model image limit.");
   return {
     async run(_model, input, options) {
       const current = identity();
@@ -201,19 +275,16 @@ export function meteredBinding(
         );
       }
       const response = await transport.requestModel(
-        input,
+        boundImageHistory(input, maxImagesPerRequest),
         current,
         options?.signal,
       );
-      const metered = onModelResolved
-        ? captureResolvedModel(response, onModelResolved)
-        : response;
+      const metered = onModelResolved ? captureResolvedModel(response, onModelResolved) : response;
       if (options?.returnRawResponse !== false) return metered;
       return metered.json();
     },
     async fetch(input, init) {
-      const url =
-        input instanceof Request ? input.url : new URL(String(input)).href;
+      const url = input instanceof Request ? input.url : new URL(String(input)).href;
       const signal = input instanceof Request ? input.signal : init?.signal;
       if (!transport.resumeModel) {
         return Response.json(
