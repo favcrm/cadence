@@ -5,6 +5,10 @@
                              [--notes-dir DIR] [--author ALIAS ...]
                              [--dry-run] [--poll-secs N] [--poll-interval N]
 
+Every `cadence` call uses the build named by CADENCE_BIN (default: `cadence` on
+PATH), so a host that also carries a newer build can point the gate at it
+instead of seeing hosted verbs reported as unavailable.
+
 Refuses (exit 1, one reason per line on stderr, every failing rule listed)
 unless ALL of these hold for the pinned head:
 
@@ -107,11 +111,26 @@ FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 def run(argv, input_text=None):
     """(returncode, stdout, stderr); a missing binary is rc 127."""
+    # A host can carry several Cadence builds. `cadence` on PATH may predate the
+    # hosted verbs this gate needs, so let the caller name the build it means
+    # instead of making every refusal look like a gate failure.
+    if argv and argv[0] == "cadence":
+        argv = [os.environ.get("CADENCE_BIN", "cadence"), *argv[1:]]
     try:
         r = subprocess.run(argv, input=input_text, capture_output=True, text=True)
     except OSError as e:
         return 127, "", str(e)
     return r.returncode, r.stdout, r.stderr
+
+
+def stale_cli_hint(text):
+    """Name the real cause when the selected client predates a hosted verb."""
+    if "not available on a remote org" not in text and "not available on a remote" not in text:
+        return ""
+    return (
+        " — the selected cadence client does not support this hosted verb;"
+        " set CADENCE_BIN to a current build instead of retrying the same binary"
+    )
 
 
 def gh_json(argv):
@@ -506,7 +525,11 @@ def read_verdicts(notes_dir, issue, pr, head):
             raise ValueError("unexpected shape")
         return verdicts, skipped
     except (ValueError, KeyError, TypeError, AttributeError):
-        raise RuntimeError(f"cannot read the verdict notes via `cadence audit verdicts` (rc {rc}): {(err or out).strip()[:200]}")
+        detail = (err or out).strip()[:200]
+        raise RuntimeError(
+            f"cannot read the verdict notes via `cadence audit verdicts` (rc {rc}): {detail}"
+            + stale_cli_hint(detail)
+        )
 
 
 def check_reviews(verdicts, qualifies_one, need_qa, authors, issue):
