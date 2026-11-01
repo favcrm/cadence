@@ -169,6 +169,12 @@ export interface HostedSessionOptions {
      */
     readonly acceptsToolImages?: boolean;
     /**
+     * Maximum images in one model request across the entire history. Defaults
+     * to one; set a higher value only when every model the alias may resolve to
+     * permits it. The gateway must still validate the model and cost per call.
+     */
+    readonly maxImagesPerRequest?: 1 | 2 | 3 | 4;
+    /**
      * One model request through the platform proxy. The runtime relays the
      * returned bytes unchanged and only observes the served-model label.
      */

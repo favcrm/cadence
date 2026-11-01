@@ -56187,7 +56187,7 @@ function captureResolvedModel(response, onModelResolved) {
     headers: response.headers
   });
 }
-function boundImageHistory(input) {
+function boundImageHistory(input, maxImages) {
   if (!Array.isArray(input.messages))
     return input;
   const omitted = new Map;
@@ -56205,7 +56205,7 @@ function boundImageHistory(input) {
       if (typeof url !== "string" || !/^data:image\/(?:png|jpeg|webp);base64,/.test(url))
         continue;
       const size = url.length - url.indexOf(",") - 1;
-      if (count >= MAX_IMAGE_PARTS || bytes + size > MAX_IMAGE_BASE64_CHARS) {
+      if (count >= maxImages || bytes + size > MAX_IMAGE_BASE64_CHARS) {
         const indexes = omitted.get(i) ?? new Set;
         indexes.add(j);
         omitted.set(i, indexes);
@@ -56233,7 +56233,9 @@ function boundImageHistory(input) {
     })
   };
 }
-function meteredBinding(transport, identity, onModelResolved) {
+function meteredBinding(transport, identity, onModelResolved, maxImagesPerRequest = 1) {
+  if (!Number.isSafeInteger(maxImagesPerRequest) || maxImagesPerRequest < 1 || maxImagesPerRequest > MAX_IMAGE_PARTS)
+    throw new Error("Invalid model image limit.");
   return {
     async run(_model, input, options) {
       const current = identity();
@@ -56246,7 +56248,7 @@ function meteredBinding(transport, identity, onModelResolved) {
           }
         }, { status: 409 });
       }
-      const response = await transport.requestModel(boundImageHistory(input), current, options?.signal);
+      const response = await transport.requestModel(boundImageHistory(input, maxImagesPerRequest), current, options?.signal);
       const metered = onModelResolved ? captureResolvedModel(response, onModelResolved) : response;
       if (options?.returnRawResponse !== false)
         return metered;
@@ -56591,7 +56593,7 @@ class HostedSession extends DurableObject {
       authorizeTool: (name) => options.authorizeTool(name)
     };
     const ai = createAI({
-      binding: meteredBinding(options, () => this.generationIdentity(), (served) => this.recordResolvedModel(served))
+      binding: meteredBinding(options, () => this.generationIdentity(), (served) => this.recordResolvedModel(served), options.maxImagesPerRequest)
     });
     this.models.setProvider(withDefaultModel(ai.provider, model));
     this.registry.install(intentGuard(options.toolRefusal));
