@@ -94,6 +94,8 @@ const bannerSlot = document.getElementById("banner-slot");
 const actionSlot = document.getElementById("action-slot");
 const live = document.getElementById("live");
 const picker = document.getElementById("state");
+const headDetail = document.getElementById("head-detail");
+let sendBackDraft = "";
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -135,10 +137,13 @@ function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
 }
 
-function render(key) {
+function render(key, focusNext = false) {
   const state = STATES[key];
   subEl.textContent = state.sub;
   summaryEl.textContent = state.summary ?? "";
+  headDetail.textContent = key === "head-moved"
+    ? "41b7e02 (current); 290710c (reviewed)"
+    : "290710c4d1e8f0a7c6b5a4938271605f4e3d2c1b";
 
   for (const row of ROWS) {
     const details = rowsEl.querySelector(`[data-id="${row.id}"]`);
@@ -182,21 +187,58 @@ function render(key) {
   if (state.action === "stepup") {
     const panel = el("div", "rc-stepup");
     panel.append(el("p", null, "Confirm it's you. The board will not take an approval from an older sign-in."));
-    panel.append(make("Confirm with passkey", "btn btn-primary btn-sm mt-2", () => render("merging")));
+    panel.append(make("Confirm with passkey", "btn btn-primary btn-sm mt-2", () => render("merging", true)));
     bannerSlot.append(panel);
   }
 
   if (state.action === "approve") {
-    actionSlot.append(make("Approve and merge", "btn btn-primary", () => render("step-up")));
+    actionSlot.append(make("Approve and merge", "btn btn-primary", () => render("step-up", true)));
   }
   if (state.action === "revoke") {
-    actionSlot.append(make("Take my approval back", "btn btn-ghost btn-sm", () => render("ready")));
+    actionSlot.append(make("Take my approval back", "btn btn-ghost btn-sm", () => render("ready", true)));
   }
   if (state.action === "retry") {
-    actionSlot.append(make("Check again", "btn btn-ghost btn-sm", () => render("ready")));
+    actionSlot.append(make("Check again", "btn btn-ghost btn-sm", () => render("ready", true)));
   }
   if (state.action === "send-back") {
-    actionSlot.append(make("Send back with a reason", "btn btn-ghost btn-sm"));
+    const sendBack = make("Send back with a reason", "btn btn-ghost btn-sm", () => {
+      if (bannerSlot.querySelector("form")) return;
+      const form = el("form", "rc-stepup rc-send-back");
+      const label = el("label", null, "Reason for sending back");
+      label.htmlFor = "send-back-reason";
+      const reason = el("textarea", "field");
+      reason.id = "send-back-reason";
+      reason.required = true;
+      reason.value = sendBackDraft;
+      reason.addEventListener("input", () => { sendBackDraft = reason.value; });
+      const submit = el("button", "btn btn-primary btn-sm", "Send back");
+      submit.type = "submit";
+      const cancel = make("Cancel", "btn btn-ghost btn-sm", () => {
+        form.remove();
+        sendBack.focus();
+      });
+      form.append(label, reason, submit, cancel);
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        if (!reason.value.trim()) {
+          reason.focus();
+          return;
+        }
+        sendBackDraft = "";
+        form.replaceChildren(el("p", null, "Sent back for changes (simulation)."));
+        form.tabIndex = -1;
+        sendBack.remove();
+        live.textContent = "Sent back for changes. This is a simulation.";
+        form.focus();
+      });
+      bannerSlot.append(form);
+      reason.focus();
+    });
+    actionSlot.append(sendBack);
+  }
+
+  if (focusNext) {
+    (bannerSlot.querySelector("button") || actionSlot.querySelector("button"))?.focus();
   }
 
   live.textContent = `${state.sub}. ${state.banner ? state.banner[1] : ""}`;
@@ -232,4 +274,4 @@ sheet.querySelector("button.x").addEventListener("click", () => live.focus?.());
 renderRows();
 syncTheme();
 const initial = new URLSearchParams(location.search).get("state");
-render(STATES[initial] ? initial : "ready");
+render(Object.hasOwn(STATES, initial) ? initial : "ready");

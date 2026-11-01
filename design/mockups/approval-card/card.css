@@ -113,6 +113,10 @@
   color: var(--color-ink-300);
 }
 
+.rc-send-back { display: flex; flex-wrap: wrap; gap: 8px; }
+.rc-send-back label, .rc-send-back textarea { width: 100%; }
+.rc-send-back textarea { min-height: 80px; resize: vertical; }
+
 .rc-progress {
   display: flex;
   gap: 12px;
