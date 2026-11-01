@@ -123,7 +123,11 @@ struct Attempt {
     /// CAD-1964: the hosted profile this session claimed under. There is no
     /// local actor and therefore no kickoff; the claim itself is the only
     /// authority a report may name.
-    #[serde(default)]
+    ///
+    /// Omitted when unset: this struct refuses unknown fields, so writing a
+    /// null here would make a shared ledger unreadable to an older client
+    /// that has never heard of the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     session_profile: Option<String>,
 }
 
