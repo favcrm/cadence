@@ -1701,6 +1701,31 @@ fn failed_resume_blocks_the_resumed_claim_again() {
     assert_eq!(claim.as_deref(), Some(original_claim.as_str()));
 }
 
+/// A shared state directory serves every client build on the host, and the
+/// ledger refuses unknown fields. The alias path must therefore keep writing
+/// the same record an older client can still read.
+#[test]
+fn the_alias_ledger_writes_no_profile_key_for_older_clients() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    board.seed("dispatch", "queued", Some(ME), ME);
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+    let mut deliver = |kickoff: &Kickoff| Ok(json!({"message": kickoff.message_id}));
+    coord
+        .connect(Some(repo.path()), None, Some("worker"), &mut deliver)
+        .expect("alias path claims and delivers");
+
+    let raw = serde_json::to_string(&ledger_file(auth.path())).expect("ledger");
+
+    assert!(
+        !raw.contains("session_profile"),
+        "a field an older client cannot parse must not be written: {raw}"
+    );
+}
+
 #[test]
 fn a_session_claim_names_the_profile_it_runs_under() {
     let auth = private_dir();
