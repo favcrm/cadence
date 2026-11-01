@@ -222,7 +222,7 @@ jobs:
             if python3 -I "$policy" --repo "$GITHUB_WORKSPACE" --base "$BASE" --head "$HEAD" --event "$EVENT" >"$result"; then
               # The tests scope is emitted only by a base classifier that
               # knows the new fields; legacy docs/ui records still apply.
-              if jq -e '(.scope == "docs" and .rust == "false" and .ui == "false" and (.tests // "false") == "false") or (.scope == "ui" and .rust == "false" and .ui == "true" and (.tests // "false") == "false") or (.scope == "tests" and .rust == "true" and .ui == "false" and .tests == "true" and (.targets | type == "array") and (.targets | length) > 0 and (.targets | all(type == "string" and test("^[A-Za-z0-9_]+$")))) or (.scope == "full" and .rust == "true" and .ui == "true") or (.scope == "tests-only" and .rust == "true" and .ui == "false" and .tests == "true" and (.targets // []) == [] and .build == "false" and (.cross == "false" or .cross == "true"))' "$result" >/dev/null; then
+              if jq -e '(.scope == "docs" and .rust == "false" and .ui == "false" and (.tests // "false") == "false") or (.scope == "ui" and .rust == "false" and .ui == "true" and (.tests // "false") == "false") or (.scope == "tests" and .rust == "true" and .ui == "false" and .tests == "true" and (.targets | type == "array") and (.targets | length) > 0 and (.targets | all(type == "string" and test("^[A-Za-z0-9_]+$")))) or (.scope == "full" and .rust == "true" and .ui == "true") or (.scope == "tests-only" and .rust == "true" and .ui == "false" and .tests == "true" and ((.targets // []) | length) == 0 and .build == "false" and (.cross == "false" or .cross == "true"))' "$result" >/dev/null; then
                 rust=$(jq -r .rust "$result")
                 ui=$(jq -r .ui "$result")
                 scope=$(jq -r .scope "$result")
@@ -576,11 +576,8 @@ jobs:
     runs-on: instabox-medium
     timeout-minutes: 20
     steps:
-      - name: Not applicable — tests-only PR (build, release and cross gates run in the merge queue)
-        if: ${{ needs.change-scope.outputs.build == 'false' }}
-        run: echo 'the diff is confined to tests/**.rs so nothing the shipping binary, the release seam or another target compiles can change. clippy --all-targets and the full suite still run; the merge queue runs this gate in full.' >> "$GITHUB_STEP_SUMMARY"
       - name: Not applicable — rust PR feedback gate
-        if: ${{ needs.change-scope.outputs.rust == 'false' }}
+        if: ${{ needs.change-scope.outputs.rust == 'false' && needs.change-scope.outputs.build != 'false' }}
         run: echo 'rust commands not run for this PR scope; full integration gates still run in the merge queue.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: scripts/ci-rust-toolchain --profile minimal
@@ -614,7 +611,6 @@ jobs:
       - name: Package and clean-consumer check for the app toolchain
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         run: scripts/app-toolchain-acceptance.sh "$GITHUB_WORKSPACE/target/ci/cadence"
-        if: ${{ needs.change-scope.outputs.build != 'false' }}
       - name: Rehearse offline hosted migration with the built CLI
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         env:
@@ -633,7 +629,6 @@ jobs:
       # shipped default-feature binary proves its bytes carry none of
       # the seam. The step below is the guard's own tripwire: it builds
       # the forbidden combination and asserts the compile_error fires.
-        if: ${{ needs.change-scope.outputs.build != 'false' }}
       - name: Assert the ci-profile gate binary carries no test seam
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         run: |
@@ -652,7 +647,6 @@ jobs:
       # builds the forbidden combination and asserts it fails with the
       # seam's own compile_error message (any other failure — a missing
       # dep, a syntax error — must not count, so grep the message).
-        if: ${{ needs.change-scope.outputs.build != 'false' }}
       - name: Assert the test seam refuses a release build
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         run: sh scripts/check-release-test-seam
@@ -1784,18 +1778,18 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        if: matrix.target == 'aarch64-macos'
+        if: ${{ matrix.target == 'aarch64-macos' && needs.change-scope.outputs.cross != 'false' }}
         with:
           bun-version-file: ui/package.json
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: matrix.target == 'aarch64-macos'
+        if: ${{ matrix.target == 'aarch64-macos' && needs.change-scope.outputs.cross != 'false' }}
         with:
           node-version: 22
       - run: bun install --frozen-lockfile
-        if: matrix.target == 'aarch64-macos' && needs.change-scope.outputs.cross != 'false'
+        if: ${{ matrix.target == 'aarch64-macos' && needs.change-scope.outputs.cross != 'false' }}
         working-directory: ui
       - run: bun run build
-        if: matrix.target == 'aarch64-macos' && needs.change-scope.outputs.cross != 'false'
+        if: ${{ matrix.target == 'aarch64-macos' && needs.change-scope.outputs.cross != 'false' }}
         working-directory: ui
       - run: scripts/ci-rust-toolchain --profile minimal
         if: ${{ needs.change-scope.outputs.cross != 'false' }}
