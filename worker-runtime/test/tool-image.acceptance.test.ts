@@ -13,6 +13,7 @@ import {
   meteredBinding,
   withDefaultModel,
 } from "../src/model.ts";
+import { rawSessionFrame } from "../src/session-stream.ts";
 import { threadEntries } from "../src/transcript.ts";
 
 // A synthetic one-pixel PNG; no real browsing or provider call is involved.
@@ -120,7 +121,12 @@ async function observe(
       BACKGROUND_CONTEXT,
     );
     expect(outcome.status).toBe("done");
-    return { requests, thread: threadEntries(records.items, true) };
+    return {
+      requests,
+      thread: threadEntries(records.items, true),
+      rawSnapshot: rawSessionFrame({ type: "snapshot", snapshot: { entries: records.items } }),
+      rawEvents: records.items.map((entry) => rawSessionFrame({ type: "message_end", entry })),
+    };
   } finally {
     await harness.close(BACKGROUND_CONTEXT);
   }
@@ -128,7 +134,7 @@ async function observe(
 
 describe("visual tool results through the hosted model path", () => {
   it("delivers image bytes to a vision-capable host without exposing them in the board thread", async () => {
-    const { requests, thread } = await observe(true);
+    const { requests, thread, rawSnapshot, rawEvents } = await observe(true);
     expect(requests).toHaveLength(2);
     expect(requests[1]).toMatchObject({
       messages: expect.arrayContaining([
@@ -142,6 +148,10 @@ describe("visual tool results through the hosted model path", () => {
     });
     expect(JSON.stringify(thread)).toContain("Synthetic page capture.");
     expect(JSON.stringify(thread)).not.toContain(PNG);
+    for (const frame of [rawSnapshot, ...rawEvents]) {
+      expect(frame).not.toContain(PNG);
+    }
+    expect(rawSnapshot).toContain('"redacted":true');
   });
 
   it("reports unsupported image input instead of silently sending text that claims an image was attached", async () => {

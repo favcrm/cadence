@@ -3,6 +3,28 @@ import type { AgentEvent, AgentEventStream } from "@earendil-works/pi-durable";
 type Emit = (frame: string) => void;
 
 /**
+ * The owner-only diagnostic stream carries engine snapshots and events, not
+ * the board projection. Keep the image marker but never serialize image bytes
+ * into that browser-facing stream.
+ */
+export function rawSessionFrame(event: unknown): string {
+  const json = JSON.stringify(event, (_key, value: unknown) => {
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+      return value;
+    const part = value as Record<string, unknown>;
+    if (
+      part.type === "image" &&
+      typeof part.data === "string" &&
+      typeof part.mimeType === "string"
+    ) {
+      return { type: "image", mimeType: part.mimeType, redacted: true };
+    }
+    return value;
+  });
+  return `data: ${json}\n\n`;
+}
+
+/**
  * Both wire formats own the same watch lifecycle and cancellation rules.
  *
  * The returned body closes when the engine retires the watch (so a browser

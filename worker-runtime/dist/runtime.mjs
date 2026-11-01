@@ -56331,6 +56331,20 @@ var runtimeHealthSkills = skillSource({
 });
 
 // src/session-stream.ts
+function rawSessionFrame(event) {
+  const json = JSON.stringify(event, (_key, value) => {
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+      return value;
+    const part = value;
+    if (part.type === "image" && typeof part.data === "string" && typeof part.mimeType === "string") {
+      return { type: "image", mimeType: part.mimeType, redacted: true };
+    }
+    return value;
+  });
+  return `data: ${json}
+
+`;
+}
 function sessionEventResponse(watch, format) {
   const encoder = new TextEncoder;
   let closed = false;
@@ -56614,15 +56628,11 @@ data: ${JSON.stringify(masterState(model, { running: false, queued: 0 }, master?
     const stream = await this.harness.session().events();
     return sessionEventResponse(stream, {
       snapshot: (send) => {
-        send(`data: ${JSON.stringify({ type: "snapshot", snapshot: stream.snapshot })}
-
-`);
+        send(rawSessionFrame({ type: "snapshot", snapshot: stream.snapshot }));
       },
       events: async (events, send) => {
         for (const event of events)
-          send(`data: ${JSON.stringify(event)}
-
-`);
+          send(rawSessionFrame(event));
       }
     });
   }

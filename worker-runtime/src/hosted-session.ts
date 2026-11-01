@@ -31,7 +31,7 @@ import {
   runtimeHealthSkills,
   runtimeProfile,
 } from "./profile.ts";
-import { sessionEventResponse } from "./session-stream.ts";
+import { rawSessionFrame, sessionEventResponse } from "./session-stream.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { authorizeTools } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
@@ -230,12 +230,10 @@ export class HostedSession<
     const stream = await this.harness.session().events();
     return sessionEventResponse(stream, {
       snapshot: (send) => {
-        send(
-          `data: ${JSON.stringify({ type: "snapshot", snapshot: stream.snapshot })}\n\n`,
-        );
+        send(rawSessionFrame({ type: "snapshot", snapshot: stream.snapshot }));
       },
       events: async (events, send) => {
-        for (const event of events) send(`data: ${JSON.stringify(event)}\n\n`);
+        for (const event of events) send(rawSessionFrame(event));
       },
     });
   }

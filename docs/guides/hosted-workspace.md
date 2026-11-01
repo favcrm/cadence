@@ -72,7 +72,8 @@ model registry or nested-execution API.
 text. The runtime accepts at most four image parts and 192 KiB of encoded image
 data per result. Malformed or oversized images produce an explicit tool error;
 image bytes are retained in the conversation's private engine records for
-recovery, but are excluded from the board thread projection.
+recovery, but are excluded from the board thread projection. The owner-only raw
+event stream retains the image's media type and a redacted marker, not its bytes.
 
 Image input is off by default. A host may set `acceptsToolImages: true` only
 when its model gateway can receive images and verifies the resolved model and
