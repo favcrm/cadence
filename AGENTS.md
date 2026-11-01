@@ -237,17 +237,31 @@ looking.
 - Use the selected hosted workspace for shared issues and wiki; do not fall
   back to a local tracker when a hosted operation is unavailable. See
   `docs/guides/hosted-workspace.md` for supported paths and identity boundaries.
-- `issue start` on a hosted org can return a waiting assignment rather than a
-  worktree or running agent. Inspect the assignment and actual result; a queue
-  receipt, a selected alias, or a status change is not proof of execution.
+- `issue start <ID> --repo <checkout> --profile <ap_…> [--base <ref>]` starts an
+  issue for the calling session: it claims only that issue, opens the lane from
+  `<ref>`, and needs no local alias or daemon. The receipt names the request and
+  the outcome separately — `base` and `profile` are what you asked for; `head`,
+  `branch` and `profile_recorded` are what happened. A queued or waiting
+  assignment has not created a lane and is not proof of execution.
+- A lane minted by `issue start` carries the repository's pre-push hook. A
+  hand-made worktree does not: its push runs no gate, so run
+  `scripts/boat-build --receipt -- scripts/pre-push --base origin/main` yourself
+  and say so. Do not report a gate result you did not run.
 - A local connected agent has its own native daemon; hosted board access does
   not require that daemon. Do not connect a runner blindly when it might claim
   unrelated waiting work. Agent identity is established by the supported
   authenticated path, not by supplying an alias or borrowing a human login.
-- Hosted project work and local software delivery are distinct. Until the
-  hosted gate is available, its refusal is a delivery limitation, not a pass;
-  any exception remains operator-controlled and does not grant an agent merge
-  or approval authority.
+- A reviewer files one verdict per exact head with
+  `cadence audit verdict --issue <ID> --pr <n> --head <sha> --kind standards|spec
+  --outcome pass|revise`. The merge gate counts distinct reviewers and refuses
+  the author's own; a new head voids every verdict on the old one. Read them back
+  with `cadence audit verdicts`.
+- When more than one Cadence build is on the host, point the merge gate at the
+  intended one with `CADENCE_BIN`. A refusal saying a hosted verb is "not
+  available on a remote org" names a stale client, not a problem with the PR.
+- Hosted project work and local software delivery are distinct. If the merge gate
+  refuses, report its exact refusal; an exception remains operator-controlled and
+  does not grant an agent merge or approval authority.
 
 ### Before you start, and before every push
 
