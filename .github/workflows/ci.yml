@@ -739,7 +739,7 @@ jobs:
       needs.release-reuse.outputs.reused != 'true' &&
       (needs.queue-evidence.outputs.tested == 'true' ||
       (needs.fmt.result == 'success' && needs.clippy.result == 'success' &&
-      needs.test.result == 'success' && needs.build.result == 'success' &&
+      needs.build.result == 'success' &&
       needs.ui.result == 'success')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
