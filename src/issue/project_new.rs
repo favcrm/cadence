@@ -49,6 +49,13 @@ pub struct Request {
     pub agents: Vec<String>,
     /// The issue the project is created for — its `Issue:` trailer.
     pub issue: Option<String>,
+    /// Visibility recorded in the project's first `project.yaml` (CAD-1950).
+    /// Absent is workspace-visible, the same default the type carries.
+    pub visibility: project::Visibility,
+    /// Grants recorded with a private policy; refused with any other
+    /// visibility, because a stored grant list that never applies is a
+    /// policy the caller cannot see the effect of.
+    pub grants: Vec<String>,
 }
 
 /// A project key `project new` accepts: well formed and not reserved.
@@ -172,6 +179,22 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
             "--goal and --agent require --repo; they seed repository-local PROJECT.md",
         ));
     }
+    // CAD-1950: the visibility choice is part of creating the project, so it
+    // is validated here — before the lock and before anything is written.
+    if req.visibility == project::Visibility::Private && !write::private_available() {
+        return Err(Error::rejected(write::PRIVATE_UNAVAILABLE));
+    }
+    if !req.grants.is_empty() && req.visibility != project::Visibility::Private {
+        return Err(Error::rejected(
+            "--grant needs --visibility private; a grant stored on a \
+             workspace-visible project would never apply",
+        ));
+    }
+    let grants = req
+        .grants
+        .iter()
+        .map(|raw| project::Grant::parse(raw))
+        .collect::<Result<Vec<_>>>()?;
     let agents = if req.repo.is_some() {
         parse_agents(&req.agents)?
     } else {
@@ -274,6 +297,31 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
                 p.prefix
             )));
         }
+        // CAD-1950: `project new` stays idempotent for the same request. A
+        // second run that would change access is a policy edit, and there is
+        // one verb for that (`issue project policy`) with its own version
+        // bump — so it is refused here rather than quietly rewritten.
+        let recorded_matches = match &p.policy {
+            // A grant list the caller did not name is not a request to change
+            // it: `project new` is idempotent, and a project that already
+            // carries grants (stored while visible, or recorded private) must
+            // still be a no-op for a plain re-run. Only a named list is
+            // compared, and naming one is already refused unless the request
+            // is private.
+            Some(recorded) => {
+                recorded.visibility == req.visibility
+                    && (grants.is_empty() || recorded.members == grants)
+            }
+            // No recorded policy keeps everyone's access (REQ-007), which is
+            // what a workspace-visible request asks for and nothing else is.
+            None => req.visibility == project::Visibility::WorkspaceVisible,
+        };
+        if !recorded_matches {
+            return Err(Error::rejected(format!(
+                "Project '{key}' already exists with a different access policy — \
+                 change it with `cadence issue project policy {key}`; nothing written"
+            )));
+        }
     }
     let prefix = match (existing, prefix) {
         (Some(p), _) => p.prefix.clone(),
@@ -353,11 +401,16 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
                 build: None,
                 memory: None,
                 intake: None,
-                // AOS-274: identity is minted once, and every project
-                // records an explicit policy. Only workspace-visible is
-                // created until the isolation gate passes.
+                // AOS-274 / CAD-1950: identity is minted once, and every
+                // project records an explicit policy. The visibility is the
+                // caller's choice at creation; the gate above already refused
+                // private when this build cannot record it.
                 id: Some(project::new_id()),
-                policy: Some(project::ProjectPolicy::workspace_visible()),
+                policy: Some(project::ProjectPolicy {
+                    version: 1,
+                    visibility: req.visibility,
+                    members: grants.clone(),
+                }),
             })
             .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
             let file = dir.join("project.yaml");
@@ -708,5 +761,131 @@ mod tests {
         assert!(!pm.dir.join("x").exists());
         // Without the guard the same repo registers.
         run(&pm, &req("x", &inside), "operator", &[]).unwrap();
+    }
+
+    /// CAD-1950: creation records the policy it was asked for, in the first
+    /// commit, and the default is still workspace-visible.
+    #[test]
+    fn creation_records_workspace_visible_by_default() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm = pm(tmp.path());
+        let a = repo(tmp.path(), "a");
+        let out = run(&pm, &req("demo", &a), "operator", &[]).unwrap();
+        assert_eq!(out["changed"], true, "{out}");
+        let project = project::load(&pm.dir.join("demo/project.yaml")).unwrap();
+        let policy = project.policy.expect("creation records a policy");
+        assert_eq!(policy.visibility, project::Visibility::WorkspaceVisible);
+        assert_eq!(policy.version, 1);
+        assert!(policy.members.is_empty());
+    }
+
+    /// The gate is one answer: what the policy verb refuses, creation refuses
+    /// too, with the same sentence, and nothing is written.
+    #[test]
+    fn private_at_creation_is_refused_until_the_gate_passes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm = pm(tmp.path());
+        let a = repo(tmp.path(), "a");
+        let before = commits(&pm);
+        let err = run(
+            &pm,
+            &Request {
+                visibility: project::Visibility::Private,
+                grants: vec!["users/alex".into()],
+                ..req("pay", &a)
+            },
+            "operator",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, write::PRIVATE_UNAVAILABLE, "{err}");
+        assert_eq!(commits(&pm), before, "a refusal commits nothing");
+        assert!(!pm.dir.join("pay").exists());
+    }
+
+    /// A grant stored on a workspace-visible project would never apply, so
+    /// the combination is refused rather than recorded.
+    #[test]
+    fn grants_are_refused_unless_the_project_is_private() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm = pm(tmp.path());
+        let a = repo(tmp.path(), "a");
+        let err = run(
+            &pm,
+            &Request {
+                grants: vec!["users/alex".into()],
+                ..req("pay", &a)
+            },
+            "operator",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--grant needs --visibility private"), "{err}");
+        assert!(!pm.dir.join("pay").exists());
+    }
+
+    /// A project that already carries grants is still a no-op for a plain
+    /// re-run: an unmentioned grant list is not a request to change it, and
+    /// `project new` is used idempotently by the daemon's own callers.
+    #[test]
+    fn a_rerun_leaves_a_stored_grant_list_alone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm = pm(tmp.path());
+        let a = repo(tmp.path(), "a");
+        run(&pm, &req("legal", &a), "operator", &[]).unwrap();
+
+        // Record a grant list the way `issue project policy` would, then
+        // re-run creation with no grant named.
+        let path = pm.dir.join("legal/project.yaml");
+        let mut project = project::load(&path).unwrap();
+        let mut policy = project.policy.clone().unwrap();
+        policy.members = vec![project::Grant::parse("users/alex").unwrap()];
+        project.policy = Some(policy);
+        std::fs::write(&path, serde_yaml::to_string(&project).unwrap()).unwrap();
+
+        let out = run(&pm, &req("legal", &a), "operator", &[]).unwrap();
+        assert_eq!(out["changed"], false, "{out}");
+        let after = project::load(&path).unwrap().policy.unwrap();
+        assert_eq!(after.members.len(), 1, "a re-run dropped the stored grant");
+        assert_eq!(after.members[0].as_str(), "users/alex");
+    }
+
+    /// `project new` stays idempotent for the same request. A second run that
+    /// would rewrite access is refused — that is `issue project policy`'s job,
+    /// with its own version bump.
+    #[test]
+    fn a_second_run_cannot_change_a_recorded_policy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm = pm(tmp.path());
+        let a = repo(tmp.path(), "a");
+        run(&pm, &req("demo", &a), "operator", &[]).unwrap();
+
+        // Same request: a no-op.
+        let out = run(&pm, &req("demo", &a), "operator", &[]).unwrap();
+        assert_eq!(out["changed"], false, "{out}");
+
+        // A record that is already private (written before the gate, or by a
+        // later build) cannot be widened by re-running creation.
+        let path = pm.dir.join("demo/project.yaml");
+        let mut project = project::load(&path).unwrap();
+        project.policy = Some(project::ProjectPolicy {
+            version: 4,
+            visibility: project::Visibility::Private,
+            members: Vec::new(),
+        });
+        std::fs::write(&path, serde_yaml::to_string(&project).unwrap()).unwrap();
+        let before = commits(&pm);
+        let err = run(&pm, &req("demo", &a), "operator", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different access policy"), "{err}");
+        assert_eq!(commits(&pm), before);
+        assert_eq!(
+            project::load(&path).unwrap().policy.unwrap().version,
+            4,
+            "a refused creation left the recorded policy alone"
+        );
     }
 }

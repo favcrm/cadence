@@ -41,7 +41,7 @@ import { MY_WORK_URL_KEYS, readMyWorkView, writeMyWorkView, type MyWorkView } fr
  * routing is unit-tested in plain node (tests/router.test.ts).
  */
 
-export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows";
+export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows" | "settings";
 export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). */
 export type WikiMode = "browse" | "edit" | "history" | "search" | "upload";
@@ -225,7 +225,7 @@ export function matchRoute(pathname: string): Route {
       if (!a) return { screen: "projects", slug: null, section: "overview" };
       const slug = segment(a);
       if (slug && !b) return { screen: "projects", slug, section: "overview" };
-      if (slug && (b === "overview" || b === "issues" || b === "context" || b === "epics" || b === "milestones" || b === "workflows")) {
+      if (slug && (b === "overview" || b === "issues" || b === "context" || b === "epics" || b === "milestones" || b === "workflows" || b === "settings")) {
         return { screen: "projects", slug, section: b };
       }
     }
