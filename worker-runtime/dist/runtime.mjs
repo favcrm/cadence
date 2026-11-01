@@ -56193,7 +56193,6 @@ function boundImageHistory(input) {
   const omitted = new Map;
   let count = 0;
   let bytes = 0;
-  let full = false;
   for (let i = input.messages.length - 1;i >= 0; i--) {
     const message = input.messages[i];
     if (typeof message !== "object" || message === null || !("role" in message) || message.role !== "user" || !("content" in message) || !Array.isArray(message.content))
@@ -56206,8 +56205,7 @@ function boundImageHistory(input) {
       if (typeof url !== "string" || !/^data:image\/(?:png|jpeg|webp);base64,/.test(url))
         continue;
       const size = url.length - url.indexOf(",") - 1;
-      if (full || count >= MAX_IMAGE_PARTS || bytes + size > MAX_IMAGE_BASE64_CHARS) {
-        full = true;
+      if (count >= MAX_IMAGE_PARTS || bytes + size > MAX_IMAGE_BASE64_CHARS) {
         const indexes = omitted.get(i) ?? new Set;
         indexes.add(j);
         omitted.set(i, indexes);

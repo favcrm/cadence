@@ -167,6 +167,33 @@ describe("visual tool results through the hosted model path", () => {
     expect(JSON.stringify(parts)).toMatch(/image.{0,100}omitted/i);
   });
 
+  it("uses the remaining image budget for an older screenshot that fits", async () => {
+    const older = "A".repeat(50 * 1024);
+    const middle = "B".repeat(110 * 1024);
+    const newest = "C".repeat(100 * 1024);
+    const messages = [older, middle, newest].map((data) => ({
+      role: "user",
+      content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${data}` } }],
+    }));
+    let forwarded: Record<string, unknown> | undefined;
+    const binding = meteredBinding(
+      {
+        async requestModel(input) {
+          forwarded = input;
+          return Response.json({ ok: true });
+        },
+      },
+      () => ({ conversation: "1", task: "2", cutoff: "3" }),
+    );
+    await binding.run("default", { messages });
+    const sent = JSON.stringify(forwarded);
+    expect(sent.includes(older)).toBe(true);
+    expect(sent.includes(middle)).toBe(false);
+    expect(sent.includes(newest)).toBe(true);
+    expect(sent).toMatch(/image.{0,100}omitted/i);
+    expect(messages[1]?.content[0]?.image_url.url.endsWith(middle)).toBe(true);
+  });
+
   it("reports unsupported image input instead of silently sending text that claims an image was attached", async () => {
     const { requests, thread } = await observe(false);
     expect(requests).toHaveLength(2);

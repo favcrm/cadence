@@ -169,7 +169,6 @@ function boundImageHistory(input: Record<string, unknown>): Record<string, unkno
   const omitted = new Map<number, Set<number>>();
   let count = 0;
   let bytes = 0;
-  let full = false;
   for (let i = input.messages.length - 1; i >= 0; i--) {
     const message: unknown = input.messages[i];
     if (
@@ -197,8 +196,7 @@ function boundImageHistory(input: Record<string, unknown>): Record<string, unkno
       const url = part.image_url.url;
       if (typeof url !== "string" || !/^data:image\/(?:png|jpeg|webp);base64,/.test(url)) continue;
       const size = url.length - url.indexOf(",") - 1;
-      if (full || count >= MAX_IMAGE_PARTS || bytes + size > MAX_IMAGE_BASE64_CHARS) {
-        full = true;
+      if (count >= MAX_IMAGE_PARTS || bytes + size > MAX_IMAGE_BASE64_CHARS) {
         const indexes = omitted.get(i) ?? new Set<number>();
         indexes.add(j);
         omitted.set(i, indexes);
