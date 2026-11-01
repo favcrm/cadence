@@ -55867,7 +55867,25 @@ function authorizeTools(group, authority) {
 }
 
 // src/engine.ts
-function registration(tool) {
+var MAX_IMAGE_BASE64_CHARS = 192 * 1024;
+var MAX_IMAGE_PARTS = 4;
+var BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
+function imageError(output, acceptsImages) {
+  let count = 0;
+  let bytes = 0;
+  for (const part of output) {
+    if (part.type !== "image")
+      continue;
+    if (!acceptsImages)
+      return "Image input is unavailable for this session.";
+    count += 1;
+    bytes += typeof part.data === "string" ? part.data.length : 0;
+    if (count > MAX_IMAGE_PARTS || bytes > MAX_IMAGE_BASE64_CHARS || part.mimeType !== "image/png" && part.mimeType !== "image/jpeg" && part.mimeType !== "image/webp" || typeof part.data !== "string" || part.data.length === 0 || part.data.length % 4 !== 0 || !BASE64.test(part.data))
+      return "Image output is invalid or too large.";
+  }
+  return;
+}
+function registration(tool, acceptsImages) {
   return {
     name: tool.name,
     description: tool.description,
@@ -55879,22 +55897,26 @@ function registration(tool) {
         taskId: api.taskId,
         now: () => api.now()
       }, { abortSignal: context.abortSignal });
+      const error = result.output && imageError(result.output, acceptsImages);
+      if (error)
+        return { output: [{ type: "text", text: error }], isError: true };
       return {
         ...result.output ? {
-          output: result.output.map((part) => ({
-            type: "text",
-            text: part.text
-          }))
+          output: result.output.map((part) => part.type === "text" ? { type: "text", text: part.text } : {
+            type: "image",
+            data: part.data,
+            mimeType: part.mimeType
+          })
         } : {},
         ...result.isError ? { isError: true } : {}
       };
     }
   };
 }
-function runtimeExtension(group) {
+function runtimeExtension(group, acceptsImages = false) {
   return {
     name: group.name,
-    ...group.tools ? { tools: group.tools.map(registration) } : {}
+    ...group.tools ? { tools: group.tools.map((tool) => registration(tool, acceptsImages)) } : {}
   };
 }
 function authorizeRegistration(tool, authority) {
@@ -56091,28 +56113,29 @@ var LEGACY_MODEL_IDS = [
   "@cf/zai-org/glm-5.3-flash",
   "z-ai/glm-5.3-flash"
 ];
-function defaultModel(alias) {
+function defaultModel(alias, acceptsImages = false) {
   return {
     id: alias,
     name: "Platform default",
     api: CLOUDFLARE_AI_API,
     provider: CLOUDFLARE_PROVIDER_ID,
     baseUrl: "",
-    input: ["text"],
+    input: acceptsImages ? ["text", "image"] : ["text"],
     cost: { cacheRead: 0, cacheWrite: 0, input: 0, output: 0 },
     reasoning: false,
     contextWindow: MODEL_CONTEXT_WINDOW,
     maxTokens: MODEL_MAX_OUTPUT_TOKENS
   };
 }
-function legacyModels() {
+function legacyModels(model) {
   return LEGACY_MODEL_IDS.map((id) => ({
-    ...defaultModel(id),
+    ...model,
+    id,
     name: "Legacy tenant model"
   }));
 }
 function withDefaultModel(provider, model) {
-  const models = [model, ...legacyModels()];
+  const models = [model, ...legacyModels(model)];
   return {
     ...provider,
     getModels: () => [...provider.getModels(), ...models],
@@ -56505,7 +56528,8 @@ class HostedSession extends DurableObject {
     this.options = options;
     if (!ctx.id.name)
       throw new Error("HostedSession requires a named conversation");
-    const model = defaultModel(options.modelAlias);
+    const acceptsImages = options.acceptsToolImages === true;
+    const model = defaultModel(options.modelAlias, acceptsImages);
     const authority = {
       toolRefusal: (name) => options.toolRefusal(name),
       authorizeTool: (name) => options.authorizeTool(name)
@@ -56523,7 +56547,7 @@ class HostedSession extends DurableObject {
       guardModelRequests(this.models, identityMessages);
     }
     for (const group of options.tools) {
-      this.registry.install(runtimeExtension(authorizeTools(group, authority)));
+      this.registry.install(runtimeExtension(authorizeTools(group, authority), acceptsImages));
     }
     this.harness = new PiHarness({
       harness: async ({ storage, context, onWake }) => {

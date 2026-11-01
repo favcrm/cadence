@@ -35,14 +35,14 @@ const LEGACY_MODEL_IDS = [
  * The engine needs a model object (id, api, provider, cost, windows); the id
  * here is the alias the platform resolves, never a provider model id.
  */
-export function defaultModel(alias: string): Model<Api> {
+export function defaultModel(alias: string, acceptsImages = false): Model<Api> {
   return {
     id: alias,
     name: "Platform default",
     api: CLOUDFLARE_AI_API,
     provider: CLOUDFLARE_PROVIDER_ID,
     baseUrl: "",
-    input: ["text"],
+    input: acceptsImages ? ["text", "image"] : ["text"],
     cost: { cacheRead: 0, cacheWrite: 0, input: 0, output: 0 },
     reasoning: false,
     contextWindow: MODEL_CONTEXT_WINDOW,
@@ -51,9 +51,10 @@ export function defaultModel(alias: string): Model<Api> {
 }
 
 /** Legacy descriptors use the same transport; their concrete id is never sent. */
-function legacyModels(): Model<Api>[] {
+function legacyModels(model: Model<Api>): Model<Api>[] {
   return LEGACY_MODEL_IDS.map((id) => ({
-    ...defaultModel(id),
+    ...model,
+    id,
     name: "Legacy tenant model",
   }));
 }
@@ -71,7 +72,7 @@ export function withDefaultModel(
   provider: Provider,
   model: Model<Api>,
 ): Provider {
-  const models = [model, ...legacyModels()];
+  const models = [model, ...legacyModels(model)];
   return {
     ...provider,
     getModels: () => [...provider.getModels(), ...models],

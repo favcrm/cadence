@@ -79,7 +79,8 @@ export class HostedSession<
     this.options = options;
     if (!ctx.id.name)
       throw new Error("HostedSession requires a named conversation");
-    const model = defaultModel(options.modelAlias);
+    const acceptsImages = options.acceptsToolImages === true;
+    const model = defaultModel(options.modelAlias, acceptsImages);
     const authority: ToolAuthority = {
       toolRefusal: (name) => options.toolRefusal(name),
       authorizeTool: (name) => options.authorizeTool(name),
@@ -113,7 +114,9 @@ export class HostedSession<
       guardModelRequests(this.models, identityMessages);
     }
     for (const group of options.tools) {
-      this.registry.install(runtimeExtension(authorizeTools(group, authority)));
+      this.registry.install(
+        runtimeExtension(authorizeTools(group, authority), acceptsImages),
+      );
     }
     this.harness = new PiHarness({
       harness: async ({ storage, context, onWake }) => {
