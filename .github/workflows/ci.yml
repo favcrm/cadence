@@ -194,6 +194,8 @@ jobs:
       scope: ${{ steps.scope.outputs.scope }}
       tests: ${{ steps.scope.outputs.tests }}
       targets: ${{ steps.scope.outputs.targets }}
+      build: ${{ steps.scope.outputs.build }}
+      cross: ${{ steps.scope.outputs.cross }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         if: github.event_name == 'pull_request'
@@ -212,17 +214,21 @@ jobs:
           scope=full
           tests=true
           targets='[]'
+          build=true
+          cross=true
           policy="$RUNNER_TEMP/ci-change-scope.py"
           result="$RUNNER_TEMP/ci-change-scope.json"
           if [ "$EVENT" = pull_request ] && git show "$BASE:scripts/ci-change-scope.py" >"$policy"; then
             if python3 -I "$policy" --repo "$GITHUB_WORKSPACE" --base "$BASE" --head "$HEAD" --event "$EVENT" >"$result"; then
               # The tests scope is emitted only by a base classifier that
               # knows the new fields; legacy docs/ui records still apply.
-              if jq -e '(.scope == "docs" and .rust == "false" and .ui == "false" and (.tests // "false") == "false") or (.scope == "ui" and .rust == "false" and .ui == "true" and (.tests // "false") == "false") or (.scope == "tests" and .rust == "true" and .ui == "false" and .tests == "true" and (.targets | type == "array") and (.targets | length) > 0 and (.targets | all(type == "string" and test("^[A-Za-z0-9_]+$")))) or (.scope == "full" and .rust == "true" and .ui == "true")' "$result" >/dev/null; then
+              if jq -e '(.scope == "docs" and .rust == "false" and .ui == "false" and (.tests // "false") == "false") or (.scope == "ui" and .rust == "false" and .ui == "true" and (.tests // "false") == "false") or (.scope == "tests" and .rust == "true" and .ui == "false" and .tests == "true" and (.targets | type == "array") and (.targets | length) > 0 and (.targets | all(type == "string" and test("^[A-Za-z0-9_]+$")))) or (.scope == "full" and .rust == "true" and .ui == "true") or (.scope == "tests-only" and .rust == "true" and .ui == "false" and .tests == "true" and (.targets // []) == [] and .build == "false" and (.cross == "false" or .cross == "true"))' "$result" >/dev/null; then
                 rust=$(jq -r .rust "$result")
                 ui=$(jq -r .ui "$result")
                 scope=$(jq -r .scope "$result")
                 tests=$(jq -r .tests "$result")
+                build=$(jq -r '.build // "true"' "$result")
+                cross=$(jq -r '.cross // "true"' "$result")
                 if [ "$scope" = tests ]; then
                   targets=$(jq -c .targets "$result")
                 fi
@@ -234,7 +240,9 @@ jobs:
           echo "scope=$scope" >> "$GITHUB_OUTPUT"
           echo "tests=$tests" >> "$GITHUB_OUTPUT"
           echo "targets=$targets" >> "$GITHUB_OUTPUT"
-          echo "PR feedback scope: $scope; rust=$rust; ui=$ui; tests=$tests; targets=$targets. Merge queue always runs full integration validation." >> "$GITHUB_STEP_SUMMARY"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "cross=$cross" >> "$GITHUB_OUTPUT"
+          echo "PR feedback scope: $scope; rust=$rust; ui=$ui; tests=$tests; build=$build; cross=$cross; targets=$targets. Merge queue always runs full integration validation." >> "$GITHUB_STEP_SUMMARY"
 
   fmt:
     needs: [queue-evidence, change-scope]
@@ -568,43 +576,47 @@ jobs:
     runs-on: instabox-medium
     timeout-minutes: 20
     steps:
+      - name: Not applicable — tests-only PR (build, release and cross gates run in the merge queue)
+        if: ${{ needs.change-scope.outputs.build == 'false' }}
+        run: echo 'the diff is confined to tests/**.rs so nothing the shipping binary, the release seam or another target compiles can change. clippy --all-targets and the full suite still run; the merge queue runs this gate in full.' >> "$GITHUB_STEP_SUMMARY"
       - name: Not applicable — rust PR feedback gate
         if: ${{ needs.change-scope.outputs.rust == 'false' }}
         run: echo 'rust commands not run for this PR scope; full integration gates still run in the merge queue.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: scripts/ci-rust-toolchain --profile minimal
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         with:
           shared-key: gate-release
           save-if: false
       # CAD-1103: the linker flag follows rust-cache, which hashes RUST* env.
       - name: Enable fast linker (mold/lld; falls back to the default linker)
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
       - name: Enable shared sccache (no-op without credentials)
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         env:
           SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
           SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
           SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         with:
           bun-version-file: ui/package.json
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         with:
           node-version: 22
       - run: cargo build --profile ci --locked
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
       - name: Package and clean-consumer check for the app toolchain
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         run: scripts/app-toolchain-acceptance.sh "$GITHUB_WORKSPACE/target/ci/cadence"
+        if: ${{ needs.change-scope.outputs.build != 'false' }}
       - name: Rehearse offline hosted migration with the built CLI
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         env:
           CADENCE_REHEARSAL_BINARY: ${{ github.workspace }}/target/ci/cadence
         run: python3 scripts/test-hosted-migration.py -v
@@ -621,8 +633,9 @@ jobs:
       # shipped default-feature binary proves its bytes carry none of
       # the seam. The step below is the guard's own tripwire: it builds
       # the forbidden combination and asserts the compile_error fires.
+        if: ${{ needs.change-scope.outputs.build != 'false' }}
       - name: Assert the ci-profile gate binary carries no test seam
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         run: |
           if grep -aq 'cadence-test-seam-v1' target/ci/cadence; then
             echo "release binary contains the CAD-482 test seam" >&2
@@ -639,11 +652,12 @@ jobs:
       # builds the forbidden combination and asserts it fails with the
       # seam's own compile_error message (any other failure — a missing
       # dep, a syntax error — must not count, so grep the message).
+        if: ${{ needs.change-scope.outputs.build != 'false' }}
       - name: Assert the test seam refuses a release build
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         run: sh scripts/check-release-test-seam
       - name: sccache statistics
-        if: ${{ !cancelled() && needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ !cancelled() && needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
 
   ui:
@@ -1778,15 +1792,17 @@ jobs:
         with:
           node-version: 22
       - run: bun install --frozen-lockfile
-        if: matrix.target == 'aarch64-macos'
+        if: matrix.target == 'aarch64-macos' && needs.change-scope.outputs.cross != 'false'
         working-directory: ui
       - run: bun run build
-        if: matrix.target == 'aarch64-macos'
+        if: matrix.target == 'aarch64-macos' && needs.change-scope.outputs.cross != 'false'
         working-directory: ui
       - run: scripts/ci-rust-toolchain --profile minimal
+        if: ${{ needs.change-scope.outputs.cross != 'false' }}
       # Restore-only cache with both test-seam/test and default/dev dependencies.
       # Keep the epoch aligned with cache-warm-cross; only main saves it.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: ${{ needs.change-scope.outputs.cross != 'false' }}
         with:
           shared-key: cross-dual2-${{ matrix.target }}
           save-if: false
@@ -1796,11 +1812,14 @@ jobs:
       # CAD-1425: the client-update refusal acceptance runs on each native
       # leg; the cfg(macos) test is the real Apple Silicon outcome.
       - name: Run the CAD-1425 client update refusal acceptance
+        if: ${{ needs.change-scope.outputs.cross != 'false' }}
         env:
           CARGO_BUILD_JOBS: 4
         run: cargo test --locked --features test-seam --test cad1425_client_update_refusal_acceptance -- --test-threads 2
       - run: cargo build --locked
+        if: ${{ needs.change-scope.outputs.cross != 'false' }}
       - run: target/debug/cadence --version
+        if: ${{ needs.change-scope.outputs.cross != 'false' }}
 
   # CAD-1540: `cross-build` cannot be a required check itself — `change-scope`
   # skips it on docs-only changes, and a skipped or absent context blocks merges

@@ -173,11 +173,24 @@ def main() -> None:
                       ev, f"event-{ev or 'empty'}")
 
         # Shared: a base .rs source referencing the test file's name.
+        #
+        # CAD-1970: sharing still forbids per-target NARROWING, but it no
+        # longer forces the build/cross/ui gates, because `tests-only` runs
+        # every target in the full suite. The refusal this case guards is the
+        # one that matters — no `targets` may be emitted for a shared file.
         (repo / "src" / "consumer.rs").write_text("// uses tests/beta.rs\n")
         base_shared = commit(repo)
-        must_full(repo, base_shared, edit(repo, base_shared,
-                                          [("w", "tests/beta.rs")]),
-                  "pull_request", "shared-ref")
+        shared = classify(repo, base_shared,
+                          edit(repo, base_shared, [("w", "tests/beta.rs")]),
+                          "pull_request")
+        if scope_of(shared) == "tests" or shared.get("targets"):
+            fail(f"shared-ref must not narrow targets: {shared!r}")
+        shared_scope = shared.get("scope")
+        if shared_scope == "tests-only":
+            if shared.get("build") != "false":
+                fail(f"shared-ref must drop the build gate: {shared!r}")
+        elif shared_scope != "full":
+            fail(f"shared-ref: unexpected scope {shared_scope!r}")
         # ...while its unreferenced sibling still narrows.
         doc = classify(repo, base_shared,
                        edit(repo, base_shared, [("w", "tests/alpha.rs")]),
