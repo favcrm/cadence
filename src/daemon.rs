@@ -136,10 +136,6 @@ fn archive_expected_revs(params: &Value) -> Result<Vec<(String, i64)>> {
 
 mod artifacts_rpc;
 #[cfg(all(test, feature = "test-seam"))]
-mod cad1473_host_redispatch;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1473_independent_redispatch;
-#[cfg(all(test, feature = "test-seam"))]
 mod cad1482_independent_media_refusal;
 mod caller_rule;
 mod chat_files_rpc;

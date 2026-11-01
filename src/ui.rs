@@ -88,8 +88,6 @@ mod updates;
 mod whatsapp;
 mod wiki;
 mod wiki_envelope;
-#[cfg(all(test, feature = "test-seam"))]
-pub(crate) use wiki_envelope::prime_jwks_for_test;
 mod work_conversations;
 mod workflows;
 mod write_path;

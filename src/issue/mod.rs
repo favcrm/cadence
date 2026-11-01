@@ -1170,10 +1170,6 @@ Paths never encode title, status or parent. Issues are never deleted — set\n\
 #[cfg(test)]
 mod lock_tests;
 
-#[cfg(all(test, feature = "test-seam"))]
-pub(crate) fn set_lock_waiting_observer_for_test(sender: Option<std::sync::mpsc::Sender<()>>) {
-    pmlock::WAITING.with(|observer| *observer.borrow_mut() = sender);
-}
 #[cfg(test)]
 mod tests {
     use super::*;
