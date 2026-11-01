@@ -197,8 +197,20 @@ impl Shared {
             .tool_session(token, key, origin)
             .ok_or_else(|| Error::rejected("media image needs a live operator session"))?;
         let ctx = self.tool_context_proven(action_token, &session)?;
-        ctx.context_id
+        let context_id = ctx
+            .context_id
+            .as_deref()
             .ok_or_else(|| Error::rejected("media image needs a mounted active context"))?;
+        // Presence is not liveness: the context must still be the active
+        // one this installation owns. `tool_context_proven` proves the
+        // token and session, not `app_contexts.state`, so an archive that
+        // landed while the preview was being prepared refuses here.
+        let (_, proof) = self.store.app_context_proof(&ctx.install_id, context_id)?;
+        if proof.install_id != ctx.install_id {
+            return Err(Error::rejected(
+                "media image context belongs to another installation",
+            ));
+        }
         Ok(())
     }
 
@@ -702,6 +714,7 @@ impl Shared {
                     &media_actor(view).to_string(),
                     media_type,
                     &bytes,
+                    &receipt_id,
                     &request_id,
                 )
             },

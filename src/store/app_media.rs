@@ -82,6 +82,7 @@ pub(super) const SCHEMA_V61: &str = "
 CREATE TABLE IF NOT EXISTS app_media_imports(
     asset_id TEXT PRIMARY KEY REFERENCES app_media_assets(id),
     context_id TEXT NOT NULL,
+    source_receipt_id TEXT NOT NULL,
     media_type TEXT NOT NULL CHECK(media_type IN ('image/png','image/jpeg','image/webp')),
     sha256 TEXT NOT NULL,
     size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
@@ -90,6 +91,7 @@ CREATE TABLE IF NOT EXISTS app_media_imports(
 CREATE TABLE IF NOT EXISTS app_media_import_requests(
     request_id TEXT PRIMARY KEY,
     asset_id TEXT NOT NULL,
+    source_receipt_id TEXT NOT NULL,
     sha256 TEXT NOT NULL,
     result TEXT NOT NULL,
     created REAL NOT NULL);
@@ -104,6 +106,9 @@ pub const IMPORT_BYTES: usize = 2 * 1024 * 1024;
 /// frame still receives metadata only.
 pub struct ImportedImage {
     pub asset: MediaAsset,
+    /// The verified receipt this image was promoted from — kept with the
+    /// bytes so the provenance survives the producing installation.
+    pub source_receipt_id: String,
     pub media_type: String,
     pub sha256: String,
     pub bytes: Vec<u8>,
@@ -542,6 +547,7 @@ impl Store {
         creator: &str,
         media_type: &str,
         bytes: &[u8],
+        source_receipt_id: &str,
         request_id: &str,
     ) -> Result<Value> {
         Creator::parse(creator)?;
@@ -557,14 +563,17 @@ impl Store {
         }
         let digest = super::app_runs::artifact_digest(bytes);
         self.write_tx(|tx| {
-            if let Some((stored_digest, result)) = tx.query_opt(
-                "SELECT sha256,result FROM app_media_import_requests WHERE request_id=?1",
+            if let Some((stored_digest, stored_source, result)) = tx.query_opt(
+                "SELECT sha256,source_receipt_id,result FROM app_media_import_requests WHERE request_id=?1",
                 params![request_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
             )? {
-                if stored_digest != digest {
+                // Equal bytes are not equal provenance: a replay names the
+                // SAME accepted intent only when it selects the same source
+                // receipt. A different receipt under this id refuses.
+                if stored_digest != digest || stored_source != source_receipt_id {
                     return Err(Error::rejected(
-                        "media import request id is already used by different bytes",
+                        "media import request id is already used by a different source",
                     ));
                 }
                 return serde_json::from_str(&result)
@@ -602,11 +611,12 @@ impl Store {
             )?;
             tx.execute(
                 "INSERT INTO app_media_imports(
-                    asset_id,context_id,media_type,sha256,size_bytes,bytes,created)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    asset_id,context_id,source_receipt_id,media_type,sha256,size_bytes,bytes,created)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     asset.id,
                     context,
+                    source_receipt_id,
                     media_type,
                     digest,
                     bytes.len() as i64,
@@ -624,9 +634,16 @@ impl Store {
             });
             tx.execute(
                 "INSERT INTO app_media_import_requests(
-                    request_id,asset_id,sha256,result,created)
-                 VALUES(?1,?2,?3,?4,?5)",
-                params![request_id, asset.id, digest, result.to_string(), at],
+                    request_id,asset_id,source_receipt_id,sha256,result,created)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    request_id,
+                    asset.id,
+                    source_receipt_id,
+                    digest,
+                    result.to_string(),
+                    at
+                ],
             )?;
             Ok(result)
         })
@@ -643,7 +660,7 @@ impl Store {
         let conn = self.conn();
         let row = conn.query_opt(
             "SELECT a.id,a.install_id,a.title,a.kind,a.lifecycle,a.revision,a.creator,a.created,a.updated,
-                    i.media_type,i.sha256,i.bytes
+                    i.media_type,i.sha256,i.bytes,i.source_receipt_id
              FROM app_media_assets a JOIN app_media_imports i ON i.asset_id=a.id
              WHERE a.id=?1",
             params![asset_id],
@@ -653,10 +670,11 @@ impl Store {
                     r.get::<_, String>(9)?,
                     r.get::<_, String>(10)?,
                     r.get::<_, Vec<u8>>(11)?,
+                    r.get::<_, String>(12)?,
                 ))
             },
         )?;
-        let Some((asset, media_type, sha256, bytes)) = row else {
+        let Some((asset, media_type, sha256, bytes, source_receipt_id)) = row else {
             return Ok(None);
         };
         let asset = asset.checked()?;
@@ -671,6 +689,7 @@ impl Store {
         }
         Ok(Some(ImportedImage {
             asset,
+            source_receipt_id,
             media_type,
             sha256,
             bytes,

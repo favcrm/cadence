@@ -239,13 +239,21 @@ const CATALOG: &[(&str, &[&str])] = &[
     ),
     (
         "app_media_import_requests",
-        &["request_id", "asset_id", "sha256", "result", "created"],
+        &[
+            "request_id",
+            "asset_id",
+            "source_receipt_id",
+            "sha256",
+            "result",
+            "created",
+        ],
     ),
     (
         "app_media_imports",
         &[
             "asset_id",
             "context_id",
+            "source_receipt_id",
             "media_type",
             "sha256",
             "size_bytes",

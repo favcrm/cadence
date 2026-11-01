@@ -134,6 +134,7 @@ fn an_import_copies_bytes_into_workspace_custody_and_replays() {
             OPERATOR,
             "image/png",
             IMPORT_BYTES,
+            "receipt-1",
             "import-1",
         )
         .unwrap();
@@ -141,6 +142,10 @@ fn an_import_copies_bytes_into_workspace_custody_and_replays() {
     assert_eq!(first["receipt"]["lifecycle"], "draft");
 
     let imported = s.app_media_imported_image(&asset_id).unwrap().unwrap();
+    assert_eq!(
+        imported.source_receipt_id, "receipt-1",
+        "the promoted receipt is retained with the bytes"
+    );
     assert_eq!(imported.media_type, "image/png");
     assert_eq!(imported.bytes, IMPORT_BYTES);
     assert_eq!(imported.asset.install_id, INSTALL_A);
@@ -154,6 +159,7 @@ fn an_import_copies_bytes_into_workspace_custody_and_replays() {
             OPERATOR,
             "image/png",
             IMPORT_BYTES,
+            "receipt-1",
             "import-1",
         )
         .unwrap();
@@ -168,6 +174,20 @@ fn an_import_copies_bytes_into_workspace_custody_and_replays() {
             OPERATOR,
             "image/png",
             b"different-bytes",
+            "receipt-1",
+            "import-1"
+        )
+        .is_err());
+    // Equal bytes from a DIFFERENT receipt are different provenance, so the
+    // same accepted request id refuses rather than claiming one intent.
+    assert!(s
+        .app_media_import(
+            INSTALL_A,
+            "ctx-a",
+            OPERATOR,
+            "image/png",
+            IMPORT_BYTES,
+            "receipt-2",
             "import-1"
         )
         .is_err());
@@ -185,6 +205,7 @@ fn an_imported_asset_is_a_draft_until_published_and_outlives_its_importer() {
             OPERATOR,
             "image/jpeg",
             IMPORT_BYTES,
+            "receipt-3",
             "import-2",
         )
         .unwrap();
