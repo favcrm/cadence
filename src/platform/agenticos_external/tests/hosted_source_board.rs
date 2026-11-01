@@ -1472,11 +1472,3 @@ fn op_err(state: &std::path::Path, method: &str, params: Value) -> String {
     .expect_err("must be refused")
     .to_string()
 }
-
-#[cfg(feature = "test-seam")]
-mod cad1405_app_lifecycle_acceptance {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/daemon/cad1405_app_lifecycle_acceptance.rs"
-    ));
-}

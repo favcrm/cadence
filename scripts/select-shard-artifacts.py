@@ -27,8 +27,9 @@ import re
 import subprocess
 import sys
 
-SHARDS = range(1, 7)
-JOB_NAME = re.compile(r"test-shards \(([1-6])\)")
+# CAD-1970: one shard. Keep the constant in step with ci.yml's test-shards matrix.
+SHARDS = range(1, 2)
+JOB_NAME = re.compile(r"test-shards \(([0-9]+)\)")
 PENDING = ("queued", "in_progress")
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")

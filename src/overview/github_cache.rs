@@ -84,12 +84,6 @@ pub(super) fn refresh_floor_secs(repos: usize) -> i64 {
 /// too: a failing repo is retried once per floor, not once per request.
 type MemoRow = (String, Instant, Result<Value, String>);
 static REPO_MEMO: Mutex<Vec<MemoRow>> = Mutex::new(Vec::new());
-
-#[cfg(test)]
-pub(super) fn reset_repo_memo() {
-    REPO_MEMO.lock().unwrap_or_else(|e| e.into_inner()).clear();
-}
-
 fn memoized(
     slug: &str,
     every: Duration,

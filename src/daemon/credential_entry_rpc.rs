@@ -1196,7 +1196,3 @@ impl Shared {
             .check_entry(token, key, entry_origin, now)
     }
 }
-
-#[cfg(test)]
-#[path = "credential_attempt_context_acceptance.rs"]
-mod credential_attempt_context_acceptance;

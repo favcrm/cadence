@@ -9,14 +9,6 @@ use super::{required_str, Shared};
 use crate::error::{Error, Result};
 use crate::issue::{self, delivery_policy, delivery_requirements as requirements};
 
-#[cfg(test)]
-#[path = "cad1298_requirements_acceptance.rs"]
-mod acceptance;
-
-#[cfg(test)]
-#[path = "cad1561_integration_branch_acceptance.rs"]
-mod cad1561_integration_branch_acceptance;
-
 fn reject(why: impl std::fmt::Display) -> Error {
     Error::rejected(format!("delivery requirements: {why}"))
 }

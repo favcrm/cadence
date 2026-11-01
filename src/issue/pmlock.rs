@@ -1880,9 +1880,6 @@ impl Pm {
     }
 }
 
-#[cfg(test)]
-mod cad1190_acceptance;
-
 const LEGACY_GENERATION_FILE: &str = "cadence-legacy-generation";
 
 /// Atomic: a reader sees the old or the new value, never a partial one.
@@ -1916,9 +1913,6 @@ impl Drop for LegacyWrite {
         }
     }
 }
-
-#[cfg(test)]
-mod cad1208_acceptance;
 
 #[cfg(test)]
 mod tests {

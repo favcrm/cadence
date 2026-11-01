@@ -12,8 +12,12 @@ import json, sys
 meta = json.load(sys.stdin)
 names = sorted({t["name"] for p in meta["packages"] for t in p["targets"]
                 if "test" in t["kind"]})
-if not names:
-    sys.exit("result-test-args: cargo reports no test targets")
+# CAD-1970: integration targets are retired; the lib and bins suites are the
+# selection. Still fail closed when cargo reports nothing runnable at all.
+suites = sorted({t["name"] for p in meta["packages"] for t in p["targets"]
+                 if {"lib", "bin"} & set(t["kind"])})
+if not suites:
+    sys.exit("result-test-args: cargo reports no lib or bin suite")
 for n in names:
     print("--test")
     print(n)

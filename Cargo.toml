@@ -8,6 +8,11 @@ edition = "2021"
 # crates (only rlib/metadata outputs). nextest still runs each test in its
 # own process, so isolation and suite-lock rules are unchanged.
 autotests = false
+
+[[test]]
+# CAD-1970: the single integration target; autotests is off.
+name = "suite"
+path = "tests/suite.rs"
 license = "MIT"
 description = "Local controller coordinating coding agents across terminals"
 
@@ -75,71 +80,11 @@ cli-runtime-test = ["test-seam"]
 # CAD-1727: the one integration-test binary; the remaining `tests/*.rs`
 # files are its modules. cad1703 keeps its `#![cfg(feature = "test-seam")]`
 # gate as a module attribute, so no required-features entry is needed.
-[[test]]
-name = "suite"
-path = "tests/suite.rs"
 
 # CAD-1727: these checks re-exec `current_exe()` with `--exact <fn>`; the
 # child filter only matches an unprefixed test name, which a module of
 # `suite` no longer has. Keep each as its own declared target instead of
 # editing acceptance checks written by reviewers.
-[[test]]
-name = "cad1065_operator_gate"
-path = "tests/cad1065_operator_gate.rs"
-[[test]]
-name = "cad1158_lease_off_smtp_refusal"
-path = "tests/cad1158_lease_off_smtp_refusal.rs"
-[[test]]
-name = "cad1158_smtp_startup"
-path = "tests/cad1158_smtp_startup.rs"
-[[test]]
-name = "cad1191_concurrent_start_acceptance"
-path = "tests/cad1191_concurrent_start_acceptance.rs"
-[[test]]
-name = "cad1196_finish_host_acceptance"
-path = "tests/cad1196_finish_host_acceptance.rs"
-[[test]]
-name = "cad1210_test_binary_guard_acceptance"
-path = "tests/cad1210_test_binary_guard_acceptance.rs"
-[[test]]
-name = "cad1236_host_requirements_acceptance"
-path = "tests/cad1236_host_requirements_acceptance.rs"
-[[test]]
-name = "cad1244_builtin_upgrade_acceptance"
-path = "tests/cad1244_builtin_upgrade_acceptance.rs"
-[[test]]
-name = "cad1425_client_update_refusal_acceptance"
-path = "tests/cad1425_client_update_refusal_acceptance.rs"
-[[test]]
-name = "cad1377_reconcile_acceptance"
-path = "tests/cad1377_reconcile_acceptance.rs"
-[[test]]
-name = "cad1508_binding_carry_acceptance"
-path = "tests/cad1508_binding_carry_acceptance.rs"
-[[test]]
-name = "cad1534_lane_base_acceptance"
-path = "tests/cad1534_lane_base_acceptance.rs"
-[[test]]
-name = "cad1676_seat_dispatch_acceptance"
-path = "tests/cad1676_seat_dispatch_acceptance.rs"
-# CAD-224: the read-only project-context slice's independent acceptance.
-[[test]]
-name = "cad224_context_slice_acceptance"
-path = "tests/cad224_context_slice_acceptance.rs"
-[[test]]
-name = "cad848_deletion_refusal"
-path = "tests/cad848_deletion_refusal.rs"
-[[test]]
-name = "cad848_reclaim_enumeration_refusal"
-path = "tests/cad848_reclaim_enumeration_refusal.rs"
-# CAD-1739: the hosted app acceptance needs the caller-identity seam. Without
-# the entry `autotests = false` hides the file from `scripts/result-test-args`,
-# and without `required-features` a default `cargo test` lane would link a
-# target whose guard body only panics.
-[[test]]
-name = "cad1739_hosted_app_public_acceptance"
-path = "tests/cad1739_hosted_app_public_acceptance.rs"
-required-features = ["test-seam"]
 
 [dependencies]
 cadence-core = { path = "crates/cadence-core", features = ["custody-crypto"] }

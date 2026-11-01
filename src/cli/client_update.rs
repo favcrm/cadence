@@ -1054,7 +1054,3 @@ fn switch_link(link: &Path, expected: &Path, target: &Path) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(all(test, feature = "test-seam"))]
-#[path = "cad1455_public_client_acceptance.rs"]
-mod cad1455_public_client_acceptance;

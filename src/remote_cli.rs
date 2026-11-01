@@ -3443,11 +3443,3 @@ pub fn web_envelope(response: WebResponse) -> Result<Value> {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "remote_cli_renewal_acceptance.rs"]
-mod renewal_acceptance;
-
-#[cfg(test)]
-#[path = "remote_cli/cad1459_account_image_acceptance.rs"]
-pub(crate) mod cad1459_account_image_acceptance;

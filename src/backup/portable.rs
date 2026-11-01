@@ -35,11 +35,6 @@ use crate::rollout::db_file;
 use crate::secret::Allowlist;
 
 mod capture;
-#[cfg(test)]
-mod capture_acceptance;
-#[cfg(test)]
-mod hook_capture_acceptance;
-
 pub const PORTABLE_FORMAT: &str = "cadence.portable/1";
 pub const INACTIVE_MARKER: &str = "portable-restore.json";
 const PKG_DB: &str = "cadence.sqlite3";

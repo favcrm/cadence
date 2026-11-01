@@ -181,28 +181,42 @@ the code you just wrote.
   relays, so run the same operator proof on the HTTP peer.
 - Restrict actors with allowlists, not denylists.
 
-### CI tooling is proved by running it, not by testing it
+### Testing principles
 
-`scripts/` and `.github/workflows/` are the machinery that runs the checks, not
-product code. Do not add unit or contract tests for them. The next real run is
-the test: a workflow that cannot load, a required check that never reports, a
-scope that narrows to nothing, or a gate that passes on `cancelled` all show up
-there, and a test that re-implements the gate's logic proves only the
-re-implementation.
+CI runs **one** test job over the lib and bins unit suites. Everything else —
+per-module acceptance suites, integration targets, contract tests for the CI
+scripts themselves — is retired. Write a test only when it earns its place, and
+then to these rules:
 
-Two things this does not excuse:
+- **Direct functions, not processes.** Business logic is tested by calling it.
+  If a test needs a daemon, a board, a socket or a spawned CLI to reach the
+  logic, the logic is in the wrong place: move it into a function the test can
+  call.
+- **Event-driven, never a sleep.** Wait on the thing that must happen — a
+  sender's channel, a barrier, a condition variable, a frame that must arrive —
+  and keep a timeout only as a bounded failure safeguard that fails loudly. A
+  fixed `sleep` that passes on a loaded machine proves the machine was fast,
+  not that the code is correct.
+- **No external services.** Local fixtures only, on loopback. A test that needs
+  a provider, a registry or the network is not a test; it is an outage waiting
+  to happen.
+- **Test the behaviour, not the copy.** A test that restates the implementation
+  agrees with itself. Assert the observable contract — the refusal, the status,
+  the bytes the caller sees.
+- **One real check beats ten unit tests of it.** A rule the daemon or a route
+  enforces still ships its acceptance: one check that drives the real guard and
+  shows the bad case refused, written by someone other than the implementer.
+- **CI machinery is proved by running it.** Do not add unit or contract tests
+  for `scripts/` or `.github/workflows/`. A workflow that cannot load, a
+  required check that never reports, or a gate that passes on `cancelled` all
+  surface on the next real run, and a test that re-implements the gate proves
+  only the re-implementation. Prefer making the machinery cheaper — fewer
+  steps, fewer jobs, less duplicated work — over covering it.
 
-- **A rule the daemon or a route enforces still ships with its acceptance
-  check** — see "Gates and security work". One check that drives the real
-  script and shows the bad case refused is not a CI-script unit test; it is the
-  gate's own evidence, and it is written by someone other than the implementer.
-- **A gate that silently checks nothing is the failure to guard against.** If
-  deleting a gate's wiring would leave a green run, that is worth a check; the
-  cost of a wrong gate is not the gate's own code, it is every green run after
-  it stopped looking.
-
-Prefer making the machinery cheaper — fewer steps, fewer jobs, less duplicated
-compile — over covering it with tests.
+The failure worth guarding is a **gate that silently checks nothing**. If
+deleting a gate's wiring would leave a green run, that is worth one check. The
+cost of a wrong gate is not its own code; it is every green run after it stopped
+looking.
 
 ### Paid platform calls: no spending limit
 

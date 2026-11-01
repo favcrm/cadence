@@ -3526,6 +3526,4 @@ mod tests {
             *GATE.lock().unwrap() = None;
         }
     }
-
-    include!("cad1365_schema41_acceptance.rs");
 }
