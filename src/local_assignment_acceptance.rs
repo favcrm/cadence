@@ -61,6 +61,8 @@ struct Board {
     next_assignment: u64,
     next_claim: u64,
     fail_reassign: bool,
+    /// Board predates profile claims: a body naming one is refused as invalid.
+    reject_profile: bool,
 }
 
 impl Script {
@@ -153,6 +155,7 @@ impl Board {
             next_assignment: 1,
             next_claim: 1,
             fail_reassign: false,
+            reject_profile: false,
         }
     }
 
@@ -322,6 +325,9 @@ impl Board {
         let generation = body.get("expected_generation").and_then(Value::as_u64);
         let client = body.get("client_agent_id").and_then(Value::as_str);
         let profile = body.get("profile_id").and_then(Value::as_str);
+        if profile.is_some() && self.reject_profile {
+            return http(400, "invalid_request");
+        }
         if generation != Some(self.rows[index].generation) {
             return http(409, "fenced");
         }
@@ -1765,6 +1771,44 @@ fn a_session_claim_names_the_profile_it_runs_under() {
 
 /// CAD-1976: the lane must come from the base the caller names, not from
 /// whatever the checkout happens to point at.
+/// A board that predates profile claims refuses the extra field before any
+/// effect. The profile is descriptive, so the claim proceeds without it —
+/// under the same client id and the same fences.
+#[test]
+fn a_board_without_profile_claims_still_accepts_the_session_claim() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    board.reject_profile = true;
+    let mine = board.seed("start", "waiting", None, ME);
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+
+    let started = coord
+        .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None)
+        .expect("claims without the field");
+
+    assert_eq!(started["state"], "running");
+    assert_eq!(script.row(&mine).0, "running");
+    let claims: Vec<_> = script
+        .calls()
+        .into_iter()
+        .filter(|call| call.is_suffix("/claim"))
+        .collect();
+    assert_eq!(
+        claims.len(),
+        2,
+        "one refusal, then a retry without the field"
+    );
+    assert_eq!(claims[0].body["profile_id"], json!(PROFILE));
+    assert!(claims[1].body.get("profile_id").is_none());
+    assert_eq!(
+        claims[1].body["client_agent_id"],
+        claims[0].body["client_agent_id"]
+    );
+}
+
 #[test]
 fn a_session_start_cuts_the_lane_from_the_named_base() {
     let auth = private_dir();

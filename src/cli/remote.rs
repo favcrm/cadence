@@ -1598,7 +1598,6 @@ pub(super) fn run(
     } = &command
     {
         if *job
-            || base.is_some()
             || owner.is_some()
             || pm.is_some()
             || spec.is_some()

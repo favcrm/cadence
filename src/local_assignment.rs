@@ -748,6 +748,10 @@ impl<H: CoordHttp> Coordinator<H> {
             401 | 403 => Err(Error::rejected(
                 "the hosted org refused this session — run `cadence login` again; nothing ran locally",
             )),
+            400 => Err(Error::invalid(
+                "invalid_request",
+                "the board refused this request body as invalid; a field it does not know is the usual cause, and nothing was recorded",
+            )),
             404 => Err(Error::invalid(
                 "api_missing",
                 "hosted local-assignment routes are not on this board yet; nothing ran locally and no container verb was sent",
@@ -1000,17 +1004,45 @@ impl<H: CoordHttp> Coordinator<H> {
             "expected_generation": assignment.generation,
             "client_agent_id": client_agent_id,
         });
+        let mut expected_profile = profile.is_some();
         if let Some(profile) = profile {
             body["profile_id"] = json!(profile);
         }
-        let value = self.exchange(
+        let value = match self.exchange(
             "POST",
             &format!("{}/{}/claim", self.base(), assignment.assignment_id),
             Some(&body),
-        )?;
+        ) {
+            Ok(value) => value,
+            // A board that predates profile claims refuses the extra field as
+            // an invalid body before any effect. The profile is descriptive,
+            // never authority, so claiming without it is the same claim under
+            // the same client id — say so, and keep the fence.
+            Err(error) if profile.is_some() && error.code() == Some("invalid_request") => {
+                eprintln!(
+                    "cadence: this board does not accept a profile on a claim; claiming without \
+                     it — the profile is not recorded here"
+                );
+                expected_profile = false;
+                let retry = json!({
+                    "version": VERSION,
+                    "organization_id": self.org_id,
+                    "expected_generation": assignment.generation,
+                    "client_agent_id": client_agent_id,
+                });
+                self.exchange(
+                    "POST",
+                    &format!("{}/{}/claim", self.base(), assignment.assignment_id),
+                    Some(&retry),
+                )?
+            }
+            Err(error) => return Err(error),
+        };
         let claimed = self.parse_owned(&value)?;
-        if profile
-            .is_some_and(|profile| value.get("profile_id").and_then(Value::as_str) != Some(profile))
+        if expected_profile
+            && profile.is_some_and(|profile| {
+                value.get("profile_id").and_then(Value::as_str) != Some(profile)
+            })
         {
             return Err(Error::rejected(
                 "claim response did not record the profile this claim named",
