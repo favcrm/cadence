@@ -53,6 +53,11 @@ see the release record for advanced source overrides and verification requiremen
 
 ## Quick start
 
+Joining someone else's workspace? You do not need this install to use the
+board: accept the invitation in the browser, sign in with the address that
+received it, and choose **Open app**. The steps below are for the machine that
+will run Cadence itself.
+
 ```bash
 cadence setup                  # idempotent first run: state dir, tracker,
                                #  skill, daemon and board; reports provider CLIs

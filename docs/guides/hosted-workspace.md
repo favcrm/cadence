@@ -137,10 +137,35 @@ cadence --org acme team invites
 cadence --org acme team list
 ```
 
-The teammate accepts the workspace invitation through the platform and runs
-`cadence login acme` on their own machine/account. Each person has their own
-saved credential and private configuration; never copy the owner's credential,
-browser cookie or another agent's state. A member can approve ordinary CLI/wiki
+### Join in the browser (no install)
+
+The teammate can accept the invitation and use the shared board without
+installing anything. They open the invitation link from the email, sign in with
+the address that received it, choose **Join company** to accept, then choose
+**Open app**. The board then shows the workspaces they belong to; picking one
+opens that workspace's board. Nothing on this path creates a credential,
+registers an agent or installs a CLI.
+
+If the browser cannot join, the cause changes the next step:
+
+- **Wrong account** — sign out and sign in with the address that received the
+  invitation.
+- **Expired, revoked or already used** — ask a workspace owner to invite that
+  address again.
+- **No matching workspace** — the invitation was not accepted under this
+  account, the workspace is archived, or the slug hint supplied to `cadence
+  login <slug>` names a workspace this account does not belong to. An
+  invitation does not create membership by itself; ask an owner to check
+  `cadence --org <slug> team list`. If the login hint is wrong, restart
+  `cadence login` without a hint to choose an eligible workspace, or use the
+  correct slug.
+
+### Connect a computer (optional)
+
+`cadence login acme` is for the machine that will run Cadence, not a
+requirement for reading or updating the board. Each person has their own saved
+credential and private configuration; never copy the owner's credential, browser
+cookie or another agent's state. A member can approve ordinary CLI/wiki
 collaboration. App lifecycle changes below require a current **human owner**.
 Invitation acceptance, credential consent and local-agent registration are
 separate actions; installing an app does not perform any of them.
