@@ -265,23 +265,32 @@ function HomeList({
   // owns the message does not also grow a second typing row.
   const turnKey = new Map<string, string>();
   const claimedTurns = new Set<string>();
+  // A split turn's later segments continue the send the opening run proved;
+  // historical runs never inherit the working id.
+  let carry: string | null = null;
   for (const run of runs) {
-    if (!run.turn) continue;
+    if (!run.turn) {
+      if (run.item.type === "operator" || run.item.type === "pending") carry = null;
+      continue;
+    }
+    const isFlight = flightKey !== null && run.items.some((item) => item.key === flightKey);
     // The send's own id, not the daemon's working id. Hosted agent rows
     // often carry neither, and the working id can differ from the send.
     // The empty typing row is keyed by the send, and this run keeps that
     // same id after the answer lands or working clears — identity must not
     // depend on the turn still being in flight, or the head remounts.
     const remembered = stickySends.current.get(run.key);
-    const certain = run.message ?? activeSendId(items, running);
-    const msg = run.message ?? remembered ?? certain ?? sendBefore(items, run.items, queuedSet);
-    // Only a send the transcript or the working id names is remembered; a
-    // value guessed from the queue at first sight could be wrong.
+    const runningSend = isFlight ? activeSendId(items, running) : null;
+    const certain = run.message ?? runningSend ?? carry;
+    const msg: string | null = run.message ?? remembered ?? runningSend ?? carry ?? sendBefore(items, run.items, queuedSet);
+    // Only a send the transcript, the move it opened, or the working id
+    // names is remembered; a value guessed from the queue could be wrong.
     if (certain !== null && remembered === undefined) stickySends.current.set(run.key, certain);
     if (msg && !claimedTurns.has(msg)) {
       claimedTurns.add(msg);
       turnKey.set(run.key, `turn:${msg}`);
     }
+    carry = run.items.some((item) => item.type === "answer") ? null : msg;
   }
   const typingTail: { current: { key: string; node: ReactNode } | null } = { current: null };
   const row = (item: ThreadItem) => {
@@ -1646,15 +1655,24 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     // untagged and tagged segments on distinct keys.
     const effective = new Map<string, string | null>();
     const queuedSet = new Set((masterState.data?.queue ?? []).map((q) => q.message));
+    // A split turn's later segments continue the send its opening run
+    // proved; historical runs never inherit the working id.
+    let carry: string | null = null;
     for (const run of runs) {
-      if (!run.turn) continue;
+      if (!run.turn) {
+        if (run.item.type === "operator" || run.item.type === "pending") carry = null;
+        continue;
+      }
+      const isFlight = flightKey !== null && run.items.some((item) => item.key === flightKey);
       const remembered = stickySends.current.get(run.key);
-      const certain = run.message ?? activeSendId(shown, runningMessage);
-      const send = run.message ?? remembered ?? certain ?? sendBefore(shown, run.items, queuedSet);
-      // Only a send the transcript or the working id names is remembered; a
-      // value guessed from the queue at first sight could be wrong.
+      const runningSend = isFlight ? activeSendId(shown, runningMessage) : null;
+      const certain = run.message ?? runningSend ?? carry;
+      const send: string | null = run.message ?? remembered ?? runningSend ?? carry ?? sendBefore(shown, run.items, queuedSet);
+      // Only a send the transcript, the move it opened, or the working id
+      // names is remembered; a value guessed from the queue could be wrong.
       if (certain !== null && remembered === undefined) stickySends.current.set(run.key, certain);
       effective.set(run.key, send);
+      carry = run.items.some((item) => item.type === "answer") ? null : send;
     }
     const perMessage = new Map<string, number>();
     // Completion is the message's, not a segment's: an answer in any run of

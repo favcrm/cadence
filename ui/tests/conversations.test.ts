@@ -772,6 +772,30 @@ await settle();
 equal(host.querySelectorAll(".app-chat-list [data-chat-run] .turn-head").length, 1, "a system-only gap paints one head");
 equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "a system-only gap paints one typing row");
 equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "a system-only gap appends no standalone typing head");
+// A conversation opened cold: completed untagged history must keep its own
+// send, and the working send must own the typing bubble.
+threads["c-split"] = [
+  ent(1, "operator", "message", "old ask", "m-old"),
+  ent(2, "agent", "thinking", "old work", null),
+  ent(3, "agent", "turn_result", "old answer", null),
+  ent(4, "operator", "message", "new ask", "m-next"),
+  ent(5, "agent", "thinking", "new work", null),
+];
+turn = { state: "working", message: "m-next", conversation: "c-split" };
+await pick("General");
+await pick("Split turn");
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+const coldRuns = Array.from(host.querySelectorAll(".app-chat-list [data-chat-run]")) as HTMLElement[];
+equal(coldRuns.length, 2, "cold history and the new send paint two runs");
+assert(coldRuns[0].querySelector(".turn-head") !== null, "the historical run keeps its head");
+assert(coldRuns[1].querySelector(".turn-head") !== null, "the new send paints its own head");
+assert(coldRuns[1].querySelector('[data-kind="typing"]') !== null, "the new send's run owns the typing bubble");
+assert(coldRuns[0].querySelector('[data-kind="typing"]') === null, "the historical run is not typing for the new send");
+equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head follows cold history");
 
 await React.act(async () => { root.unmount(); });
 console.log("conversations checks passed");
