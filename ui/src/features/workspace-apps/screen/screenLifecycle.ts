@@ -99,7 +99,8 @@ export type MountReceipt = { mount: string; bridge_nonce: string; generation: nu
   tools?: string[];
   /** CAD-1365: host-held media metadata for a `screen-media.v1` package
    *  — the daemon-minted record of the media permissions the screen
-   *  DECLARED (`media.read` / `media.publish`, either or both, never
+   *  DECLARED (`media.read` / `media.publish` / `media.import`, any
+   *  subset, never
    *  wider). Declaration metadata only: dispatch still requires the
    *  mount's action token and the child's `screen-media.v1` opt-in, and
    *  the daemon re-proves the declaration natively on every call. */
@@ -130,14 +131,14 @@ export function parseMount(value: unknown, tag: string): MountReceipt | null {
   const toolsOk = tools === undefined || (Array.isArray(tools) && tools.length <= 32 &&
     new Set(tools).size === tools.length && tools.every(a => typeof a === "string" && TOOL_ALIAS.test(a)));
   // `media` is a closed object when present: exactly
-  // {contract:"screen-media.v1", may:[1..2 distinct declared verbs]}.
+  // {contract:"screen-media.v1", may:[1..4 distinct declared verbs]}.
   const media = v.media;
   const mediaOk = media === undefined || (typeof media === "object" && media !== null && !Array.isArray(media) &&
     Object.keys(media as Record<string, unknown>).sort().join() === "contract,may" &&
     (media as Record<string, unknown>).contract === SCREEN_MEDIA_V1 &&
     Array.isArray((media as Record<string, unknown>).may) &&
     ((media as Record<string, unknown>).may as unknown[]).length >= 1 &&
-    ((media as Record<string, unknown>).may as unknown[]).length <= 3 &&
+    ((media as Record<string, unknown>).may as unknown[]).length <= 4 &&
     new Set((media as Record<string, unknown>).may as unknown[]).size === ((media as Record<string, unknown>).may as unknown[]).length &&
     ((media as Record<string, unknown>).may as unknown[]).every(m => isMediaVerb(m as string)));
   const action = v.action_token;

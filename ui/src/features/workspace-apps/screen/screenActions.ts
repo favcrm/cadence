@@ -5,7 +5,7 @@ import { rememberContext } from "../contextSelection";
 import { workspaceApps, type AppContext, type CapabilityQuote, type Installation, type PublishDestination, type WorkspaceRun } from "../workspaceApps";
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
 import { accountLabel, connectReturnTo, destinationBindings, isPublishToolkit, sendSlot, bindingToUse } from "../socialConnect";
-import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE, parseScreenDrawerCall, mediaChatAttachArgs, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
+import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE, parseScreenDrawerCall, mediaChatAttachArgs, mediaImportArgs, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
 import type { ScreenActions } from "./screenLifecycle";
 import type { Planner, SlotPlan } from "./screenSlot";
 
@@ -148,6 +148,26 @@ async function mediaPublish(args: Record<string, unknown>, ui: { actionToken?: s
       action_token: actionToken,
       asset_id: checked.asset_id as string,
       expected_revision: checked.expected_revision as number,
+      request_id: checked.request_id as string,
+    });
+    return { ok: true, data: out };
+  } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+}
+
+/** CAD-1962 — `media.import`: promote ONE retained image this
+ *  installation owns into the shared workspace library, as a draft. The
+ *  daemon re-proves the mount, the declared `media.import` permission and
+ *  the custody before copying, so the frame only names the receipt and a
+ *  request id. */
+async function mediaImport(args: Record<string, unknown>, ui: { actionToken?: string }): Promise<ActionResult> {
+  const checked = mediaImportArgs(args);
+  const actionToken = ui.actionToken;
+  if (!checked || typeof actionToken !== "string" || !/^[a-f0-9]{64}$/.test(actionToken))
+    return refuse("bad_args", "That request is not valid.");
+  try {
+    const out = await workspaceApps.mediaImport({
+      action_token: actionToken,
+      receipt_id: checked.receipt_id as string,
       request_id: checked.request_id as string,
     });
     return { ok: true, data: out };
@@ -475,6 +495,7 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "media.read": () => mediaRead(args, ui),
     "media.chat.attach": () => mediaChatAttach(args, ui),
     "media.publish": () => mediaPublish(args, ui),
+    "media.import": () => mediaImport(args, ui),
   };
   return Promise.resolve().then(table[verb as (typeof CALL_VERBS)[number]]).catch((error: unknown): ActionResult => ({ ok: false, refusal: plainRefusal(error) }));
 }

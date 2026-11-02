@@ -377,6 +377,11 @@ export const workspaceApps = {
    *  `{action_token, asset_id, expected_revision, request_id}` only. */
   mediaPublish: (body: { action_token: string; asset_id: string; expected_revision: number; request_id: string }) =>
     request<Record<string, unknown>>("/api/app-media/publish", undefined, body),
+  /** CAD-1962: `media.import` relay — exactly `{action_token,
+   *  receipt_id, request_id}`. The daemon copies the receipt's verified
+   *  bytes into workspace custody and answers with the new draft asset. */
+  mediaImport: (body: { action_token: string; receipt_id: string; request_id: string }) =>
+    request<Record<string, unknown>>("/api/app-media/import", undefined, body),
   socialDraftAction: (operation: "create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/save"|"effect-stage"|"confirm"|"schedule"|"reschedule"|"cancel", body: Record<string, unknown> & { alias: string }) =>
     request<Record<string, unknown>>(`/api/app-social-drafts/${operation}`, undefined, toolActionBody(body)),
   /** SOC-32: the host-owned image upload door. `file` goes as multipart; the
