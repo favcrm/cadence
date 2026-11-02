@@ -37,7 +37,7 @@ use crate::error::{Error, Result};
 use crate::issue::model;
 
 /// Largest raw manifest, bytes — checked before any parse.
-const MAX_MANIFEST_BYTES: usize = 32_768;
+pub(crate) const MAX_MANIFEST_BYTES: usize = 32_768;
 /// Deepest `{}`/`[]` nesting — an iterative quote/escape-aware scan
 /// refuses deeper manifests before serde sees them.
 const MAX_DEPTH: usize = 32;
@@ -45,24 +45,9 @@ const MAX_DEPTH: usize = 32;
 /// the bounded `Value` tree.
 const MAX_NODES: usize = 4_096;
 /// Most assets, declared and supplied alike.
-const MAX_ASSETS: usize = 32;
-/// Largest single `.js` asset body — the screen entry/leaves get the
-/// larger script budget (CAD-1254: the install gate's screen-asset cap).
-const MAX_JS_BYTES: u64 = crate::issue::app::MAX_SCREEN_ASSET_BYTES;
-/// Largest non-js asset body, UTF-8 bytes.
-const MAX_ASSET_BYTES: u64 = 131_072;
-/// Largest sum of every supplied asset body, bytes.
-const MAX_TOTAL_BYTES: u64 = 524_288;
-
-/// The per-leaf bound: `.js` gets the larger screen-script budget,
-/// every other asset the flat cap. Keyed on the leaf name's extension.
-fn asset_bound(name: &str) -> u64 {
-    if name.rsplit_once('.').map(|(_, e)| e) == Some("js") {
-        MAX_JS_BYTES
-    } else {
-        MAX_ASSET_BYTES
-    }
-}
+pub(crate) const MAX_ASSETS: usize = 32;
+/// A screen's supplied assets share the enclosing app's aggregate budget.
+pub(crate) const MAX_TOTAL_BYTES: u64 = crate::issue::app::MAX_APP_BYTES;
 
 /// The read-only contract — a mounted frame may only receive the
 /// host-pushed projection (its `may` is empty).
@@ -724,7 +709,7 @@ pub fn validate_map(
     let mut total_bytes = 0u64;
     for (name, body) in assets.iter() {
         let len = body.len() as u64;
-        let bound = asset_bound(name);
+        let bound = MAX_TOTAL_BYTES;
         if len > bound {
             return Err(Error::rejected(format!(
                 "asset {name:?} body is {len} bytes — at most {bound}"
@@ -1069,7 +1054,7 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
         check_asset_name(&asset.name)?;
         check_media(&asset.name, &asset.media_type)?;
         check_digest(&asset.sha256, "asset sha256")?;
-        let bound = asset_bound(&asset.name);
+        let bound = MAX_TOTAL_BYTES;
         if asset.size > bound {
             return Err(Error::rejected(format!(
                 "asset {:?} declares {} bytes — at most {bound}",

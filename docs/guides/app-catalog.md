@@ -93,10 +93,11 @@ Native install/run/business records remain native-owned; this is not their migra
 daemon, no store and no PM read or write — usable in an app repo's CI before
 anything talks to a host. The `builtin:<catalog-id>` source form is retired
 (CAD-1422) and refused at the source stage (`app_check_source`). It runs the same bundle snapshot and content
-validation `install-check` runs (entry grammar, per-file caps — 384 KiB for a
-screen JS/CSS asset, 16 KiB for a skill member, 4 KiB for a `skill.json`, and
-256 KiB elsewhere — the 2 MiB aggregate, the manifest
-including `summary`, descriptor forbidden keys, workflow checks, the full
+validation `install-check` runs (entry grammar, per-file caps — screen JS, CSS,
+SVG and JSON assets share the 2 MiB aggregate app budget; `screens.json` is
+limited to 32 KiB; skill members to 16 KiB and `skill.json` to 4 KiB; other
+files to 256 KiB — the 2 MiB aggregate, the manifest including `summary`,
+descriptor forbidden keys, workflow checks, the full
 `app-screens/v1|v2` declaration integrity for every `screens/<tag>/` package
 (`screens.json` body, declared↔supplied asset set, sha256+size matches — the
 same `app_screen_pkg::extract` the mount RPC re-runs), every `skills/<tag>/`
@@ -111,9 +112,15 @@ the same lowercase ASCII/digit/hyphen grammar as other app tags (1–32 bytes,
 no leading hyphen); links, nested storage directories and alternate extensions
 are refused. Storage members require exactly
 `needs.requires.contracts: {app-storage: [1]}`, and that requirement needs its
-root declaration. The generated document is
-`contracts/bundle-grammar/v3/grammar.json`; versions 1 and 2 remain historical
+root declaration. The current generated document is
+`contracts/bundle-grammar/v4/grammar.json`; versions 1–3 remain historical
 artifacts, not a second current admission path.
+
+Version 4 preserves the version-3 path grammar and publishes the screen asset,
+declaration, count and aggregate bounds. Individual screen assets no longer
+have smaller JS, CSS, SVG or JSON quotas; every file still counts toward the
+whole app's 2 MiB budget. Frame documents may exceed the old 768 KiB limit
+when their approved package fits that budget.
 
 The version-3 grammar adds one directory, `skills/<tag>/`: an installed skill
 package. It holds a required `skill.json` manifest, flat root text leaves

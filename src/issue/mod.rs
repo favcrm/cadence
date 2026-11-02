@@ -1168,6 +1168,9 @@ Paths never encode title, status or parent. Issues are never deleted — set\n\
   `.git/cadence-write.flock` (`.write.lock` fences older binaries).\n";
 
 #[cfg(test)]
+mod app_screen_bound_acceptance;
+
+#[cfg(test)]
 mod lock_tests;
 
 #[cfg(test)]
