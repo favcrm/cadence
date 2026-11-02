@@ -607,7 +607,10 @@ fn private_dir(dir: &Path, create: bool) -> Result<()> {
         return Err(reject("Enrollment directory must be absolute"));
     }
     if create && !dir.exists() {
-        fs::create_dir_all(dir)?;
+        // Inside the consolidated home this creates the home root and the
+        // config root above it 0700; elsewhere it is the plain
+        // `create_dir_all` this writer had.
+        crate::home::create_home_dir(dir)?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     let meta = fs::symlink_metadata(dir)?;
@@ -2318,6 +2321,9 @@ pub(crate) const CLOUD_AGENT_LOGIN_SCOPES: [&str; 3] =
 /// unrequested or duplicate capability, and it never drops a CLI scope.
 /// Requested web scopes and requested cloud-agent scopes are kept whole:
 /// asking for them and receiving only some of them is not a usable login.
+/// The first run's optional owner-only `billing.read` is the opposite: an
+/// owner may decline it and a member cannot consent it, so its absence is a
+/// valid narrowed grant. `billing.cancel` is never requested here.
 fn consented_caps(caps: &[Value], requested: &[&str]) -> bool {
     let mut seen = BTreeSet::new();
     caps.iter().all(|c| {
@@ -2603,6 +2609,14 @@ enum LoginScope {
     Settings,
     /// Both opt-ins on one consent: `--web --settings`.
     WebAndSettings,
+    /// CAD-1922: the first run's one sign-in/registration grant. It is the
+    /// ordinary wiki login plus the optional, owner-only `billing.read`, so
+    /// the handover can read this workspace's own offer. `billing.cancel` is
+    /// never requested, and the approving owner may decline `billing.read`
+    /// (owner-only scopes start unchecked); a member cannot consent it at
+    /// all. Either way the issuer returns a narrowed grant that
+    /// [`consented_caps`] accepts.
+    FirstRun,
 }
 
 impl LoginScope {
@@ -2621,6 +2635,13 @@ impl LoginScope {
                 "settings.read",
                 "settings.write",
             ],
+            LoginScope::FirstRun => vec![
+                "cli.read",
+                "cli.write",
+                "wiki.read",
+                "wiki.write",
+                "billing.read",
+            ],
         }
     }
 }
@@ -2632,6 +2653,32 @@ pub fn login_portal(
     show_code: impl FnOnce(&str, &str) -> Result<()>,
 ) -> Result<LoginGrant> {
     login_portal_scoped(issuer, hint, dir, show_code, false, false, false, false)
+}
+
+/// CAD-1922: the first run's one sign-in grant. It is the same device flow and
+/// the same single browser approval as [`login_portal`]; it additionally
+/// *requests* the optional owner-only `billing.read` so the handover can read
+/// this workspace's own offer. The approving owner may decline it (owner-only
+/// scopes start unchecked), and a member cannot consent it at all; the issuer
+/// then returns the ordinary narrowed grant, which [`consented_caps`] accepts.
+/// `billing.cancel` is never requested.
+pub fn login_portal_first_run(
+    issuer: &str,
+    hint: Option<&str>,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+) -> Result<LoginGrant> {
+    let issuer = origin(issuer, cfg!(test))?;
+    login_device_flow(
+        &issuer,
+        None,
+        hint,
+        dir,
+        show_code,
+        &mut RealLoginRuntime,
+        LoginScope::FirstRun,
+        false,
+    )
 }
 
 /// The portal login. `web` adds the Publish Web scopes (`cadence login
@@ -2692,12 +2739,56 @@ pub fn register_portal(
     )
 }
 
+/// CAD-1922: the first run's registration grant. It is the same single
+/// `/register` handoff and device grant as [`register_portal`], and it
+/// *requests* the optional owner-only `billing.read` on that one consent. The
+/// new workspace's owner may decline it; a member cannot consent it. Either
+/// way the registration and sign-in still complete with the narrowed grant.
+/// `billing.cancel` is never requested.
+pub fn register_portal_first_run(
+    issuer: &str,
+    name: Option<&str>,
+    workspace_slug: Option<&str>,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+) -> Result<LoginGrant> {
+    register_portal_scoped_with(
+        issuer,
+        name,
+        workspace_slug,
+        dir,
+        show_code,
+        LoginScope::FirstRun,
+        &mut RealLoginRuntime,
+    )
+}
+
 fn register_portal_with(
     issuer: &str,
     name: Option<&str>,
     workspace_slug: Option<&str>,
     dir: &Path,
     show_code: impl FnOnce(&str, &str) -> Result<()>,
+    runtime: &mut dyn LoginRuntime,
+) -> Result<LoginGrant> {
+    register_portal_scoped_with(
+        issuer,
+        name,
+        workspace_slug,
+        dir,
+        show_code,
+        LoginScope::Wiki,
+        runtime,
+    )
+}
+
+fn register_portal_scoped_with(
+    issuer: &str,
+    name: Option<&str>,
+    workspace_slug: Option<&str>,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+    scope: LoginScope,
     runtime: &mut dyn LoginRuntime,
 ) -> Result<LoginGrant> {
     let issuer = origin(issuer, cfg!(test))?;
@@ -2721,7 +2812,7 @@ fn register_portal_with(
             show_code(&registration, code)
         },
         runtime,
-        LoginScope::Wiki,
+        scope,
         false,
     )
 }

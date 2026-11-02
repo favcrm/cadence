@@ -473,6 +473,12 @@ const CAPABILITIES: &[&str] = &[
     "settings.write",
     // CAD-1946: opt-in like settings — the operator's merge approval.
     "audit.approve",
+    // CAD-1922: the first run's one sign-in/registration grant may carry the
+    // optional owner-only `billing.read`. Recognizing the scope here keeps
+    // renewal's exact-equality check working for a grant that includes it;
+    // it is never added to an ordinary login and `billing.cancel` is never
+    // recognized (it can only be minted by the separate owner action).
+    "billing.read",
 ];
 const RENEW_BEFORE: u64 = 60;
 const SKEW: u64 = 5;
@@ -1229,9 +1235,10 @@ fn cloud_renewal_refused(error: Error) -> Error {
     Error::gate_coded("cloud_agent_authority_missing", renewal_message(&error))
 }
 
-/// Known, unique capabilities that include the CLI pair. Wiki, web and
-/// settings are optional. The cloud-agent scopes are optional too, and only
-/// as the whole set: one or two of them is not a login this client rotates.
+/// Known, unique capabilities that include the CLI pair. Wiki, web,
+/// settings and the optional first-run `billing.read` are optional. The
+/// cloud-agent scopes are optional too, and only as the whole set: one or
+/// two of them is not a login this client rotates.
 fn valid_capabilities(values: &[String]) -> bool {
     let once = |c: &str| values.iter().filter(|v| v.as_str() == c).count() == 1;
     let cloud = crate::remote_enrollment::CLOUD_AGENT_LOGIN_SCOPES;

@@ -1,31 +1,49 @@
 //! The `CADENCE_HOME` resolver — the single source of every cadence
 //! path (CAD-392 expand step; decision D5, 2026-09-25).
 //!
-//! One home layout: `<home>/{state,tracker,vault,repos}` — default
-//! `~/.cadence` per user, `/var/lib/cadence` for a system install.
-//! Resolution order:
+//! One home layout: `<home>/{state,tracker,vault,repos,workspace,config}`
+//! — `~/.cadence` per user, `/var/lib/cadence` for a system install
+//! (CAD-1922; decision D5, 2026-09-25). Resolution order:
 //!
-//! 1. `$CADENCE_HOME` — must be absolute; the only switch into the
-//!    new layout. An operator sets it at daemon launch.
-//! 2. The legacy layout — always, otherwise: `tracker_dir` =
+//! 1. `$CADENCE_HOME` — must be absolute. An operator or installer sets
+//!    it, and a sandbox pins it to its own root.
+//! 2. A first run ([`Source::Fresh`]): nothing of an existing
+//!    installation exists under the legacy paths, so `~/.cadence` is the
+//!    default home — including inside a CI job's or container's own
+//!    isolated `$HOME`.
+//! 3. The legacy layout — always, otherwise: `tracker_dir` =
 //!    `$CADENCE_PM_DIR` or `~/pm`, `state_dir` = `$CADENCE_STATE_DIR`
 //!    or `$XDG_STATE_HOME/cadence` or `~/.local/state/cadence`,
-//!    `vault_dir` = `<tracker>/wiki` (CAD-579's wiki lives there
-//!    until the migration).
+//!    `vault_dir` = `<tracker>/wiki`, hosted config/credentials in
+//!    `$XDG_CONFIG_HOME/cadence` (CAD-579's wiki lives there until a
+//!    migration).
+//!
+//! **Nothing here moves, creates or deletes data, and no existing
+//! installation is migrated.** An installation in the legacy layout
+//! keeps its actual tracker, state, vault, configuration and
+//! credentials: the presence of any one of them — or an exported
+//! per-directory override — keeps every path on the legacy branch, so
+//! resolution can never switch a live install out from under its data.
+//! The new layout is chosen only when there is nothing to preserve.
 //!
 //! The `~/.cadence/LAYOUT` marker is deliberately not consulted:
 //! an unconfined agent shares the daemon's uid and could plant the
 //! marker to redirect tracker/state/vault on the next restart — an
 //! owner/mode check does not help against a same-uid writer. It is
-//! read only to be reported by `cadence doctor --host`; the
-//! operator-gated activation switch belongs to CAD-392's migrate
-//! step.
+//! read only to be reported by `cadence doctor --host`; an
+//! operator-gated migration switch belongs to CAD-392's migrate step,
+//! which this module does not implement.
 //!
 //! Per-directory overrides keep today's precedence in every branch:
 //! `$CADENCE_PM_DIR` and `$CADENCE_STATE_DIR` still beat the resolved
-//! default for their own directory, and the `--state-dir` flag still
-//! bypasses this module at the CLI layer. Nothing here moves data —
-//! the expand step only resolves.
+//! default for their own directory, and the `--state-dir` and
+//! `--auth-dir` flags still bypass this module at the CLI layer. An
+//! override overrides only its own directory — it never chooses the
+//! branch, because `cadence switch local` and a sandbox export it into
+//! their own process and a layout flip mid-command would move the vault
+//! and the hosted config. Nothing here moves, copies or deletes data, and
+//! no installation is migrated: the module only resolves, and a
+//! migration stays a separate operator-approved, backed-up operation.
 
 use std::path::{Path, PathBuf};
 
@@ -43,8 +61,17 @@ pub const LAYOUT_VERSION: &str = "1";
 pub enum Source {
     /// `$CADENCE_HOME` — an explicit new-layout root.
     Env,
-    /// No `$CADENCE_HOME` — today's split layout (`~/pm`, legacy
-    /// state dir). A `LAYOUT` marker never selects the new layout.
+    /// A `dev` sandbox this process is pinned to (CAD-1922). Its root is
+    /// the sandbox: the same layout a `CADENCE_HOME` would name, without
+    /// exporting one, so the overlap guard can read `CADENCE_HOME` as
+    /// production evidence.
+    Sandbox,
+    /// A first run: no legacy installation exists, so `~/.cadence` is
+    /// the default home (CAD-1922).
+    Fresh,
+    /// An existing installation: today's split layout (`~/pm`, legacy
+    /// state dir, `$XDG_CONFIG_HOME/cadence`). A `LAYOUT` marker never
+    /// selects the new layout.
     Legacy,
 }
 
@@ -52,6 +79,8 @@ impl Source {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Env => "CADENCE_HOME",
+            Self::Fresh => "fresh",
+            Self::Sandbox => "sandbox",
             Self::Legacy => "legacy",
         }
     }
@@ -59,7 +88,7 @@ impl Source {
 
 /// The resolved layout: the branch taken plus the home root. Under
 /// [`Source::Legacy`] `root` is the would-be `~/.cadence` — nothing
-/// reads it until the migration, but `repos_dir` and friends still
+/// reads it until a migration, but `repos_dir` and friends still
 /// resolve deterministically.
 #[derive(Clone, Debug)]
 pub struct Layout {
@@ -67,7 +96,7 @@ pub struct Layout {
     pub root: PathBuf,
     /// `root` carries a `LAYOUT` marker containing `1` — reporting
     /// only, for `cadence doctor --host`. A marker never activates
-    /// the new layout; only `$CADENCE_HOME` does.
+    /// the new layout; only `$CADENCE_HOME` or a first run does.
     pub marker_present: bool,
 }
 
@@ -75,6 +104,19 @@ pub struct Layout {
 /// root. Refuses a non-absolute `$CADENCE_HOME` — a relative root
 /// would follow the cwd.
 pub fn layout() -> Result<Layout> {
+    // A sandbox is its own home. The profile names it and the marker
+    // proves the root exists, so no `CADENCE_HOME` has to be exported for
+    // the sandbox's children to keep the caller's vault, repos, workspace
+    // and credentials out — which leaves that variable free to mean
+    // production evidence in the overlap guard.
+    if let Some(root) = crate::sandbox::active_home()? {
+        return Ok(Layout {
+            source: Source::Sandbox,
+            marker_present: layout_marker_declared(&root),
+            root,
+        });
+    }
+
     if let Some(root) = std::env::var_os("CADENCE_HOME").map(PathBuf::from) {
         if !root.is_absolute() {
             return Err(Error::rejected(format!(
@@ -82,6 +124,7 @@ pub fn layout() -> Result<Layout> {
                 root.display()
             )));
         }
+        refuse_symlinked_ancestry(&root)?;
         let root = guard_home(root)?;
         return Ok(Layout {
             source: Source::Env,
@@ -89,18 +132,123 @@ pub fn layout() -> Result<Layout> {
             root,
         });
     }
+    layout_without_env()
+}
+
+/// [`layout`] with `$CADENCE_HOME` unset — the production default this
+/// host would use, and what a sandbox compares its own roots against.
+fn layout_without_env() -> Result<Layout> {
     let root = default_home_root()?;
-    Ok(Layout {
-        source: Source::Legacy,
-        marker_present: layout_marker_declared(&root),
-        root,
-    })
+    let marker_present = layout_marker_declared(&root);
+    match installation(&root)? {
+        Installation::Legacy => Ok(Layout {
+            source: Source::Legacy,
+            marker_present,
+            root,
+        }),
+        Installation::Consolidated | Installation::FirstRun => Ok(Layout {
+            source: Source::Fresh,
+            marker_present,
+            root,
+        }),
+        Installation::Ambiguous => Err(Error::rejected(format!(
+            "two Cadence installations exist: {} holds state/, tracker/ or config/ \
+             and the legacy paths ({} or {} or {}) exist too — refusing to pick \
+             one. Remove the stray home, or set CADENCE_HOME to name the \
+             installation to use",
+            root.display(),
+            legacy_tracker_dir()?.display(),
+            legacy_state_dir()?.display(),
+            legacy_config_dir()?.display()
+        ))),
+    }
 }
 
 /// The resolved home root — `$CADENCE_HOME`, else `~/.cadence`
 /// whether or not the layout marker is present.
 pub fn home() -> Result<PathBuf> {
     Ok(layout()?.root)
+}
+
+/// [`home`] with `$CADENCE_HOME` unset — the production home a sandbox
+/// must never reach, whatever the caller's own environment says.
+pub fn home_default() -> Result<PathBuf> {
+    Ok(layout_without_env()?.root)
+}
+
+/// Which installation this machine already has, from filesystem evidence
+/// alone (CAD-1922).
+///
+/// The decision never looks at a per-directory override: `cadence switch
+/// local` and `sandbox::adopt` export `CADENCE_STATE_DIR`/`CADENCE_PM_DIR`
+/// into their own process, so letting an export pick the branch would flip
+/// the layout of the rest of that command (vault, config) and let it
+/// create a phantom tracker. An override only overrides its own
+/// directory.
+///
+/// The branch is sticky and ambiguity fails closed: once the consolidated
+/// home holds `state/`, `tracker/` or `config/`, a legacy path that
+/// appears later — a stray `~/pm`, an old binding — can neither flip the
+/// installation to the legacy layout nor be silently preferred. Both at
+/// once is refused, naming every root, so nothing is guessed and no data
+/// is moved. A probe that cannot be answered (a permission or I/O error, a
+/// dangling symlink) counts as present. Release and test-seam builds
+/// resolve identically.
+fn installation(root: &Path) -> Result<Installation> {
+    let legacy_paths = [
+        legacy_tracker_dir()?,
+        legacy_state_dir()?,
+        local_state_dir()?,
+        legacy_config_dir()?,
+    ];
+    // A per-directory override that names one of the legacy roots is the
+    // user's explicit choice of that root. Creating it must not then make
+    // the installation ambiguous on the next run, so naming it counts as
+    // legacy evidence here — the one case where an export decides the
+    // branch, because the effect would otherwise decide it silently.
+    let exported_legacy = ["CADENCE_STATE_DIR", "CADENCE_PM_DIR"].iter().any(|name| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .is_some_and(|path| legacy_paths.iter().any(|legacy| same_place(&path, legacy)))
+    });
+    let legacy = exported_legacy || legacy_paths.iter().any(|path| legacy_present(path));
+    let consolidated = [
+        root.join("state"),
+        root.join("tracker"),
+        root.join("config"),
+    ]
+    .iter()
+    .any(|path| legacy_present(path));
+    Ok(match (legacy, consolidated) {
+        (false, false) => Installation::FirstRun,
+        (false, true) => Installation::Consolidated,
+        (true, false) => Installation::Legacy,
+        (true, true) => Installation::Ambiguous,
+    })
+}
+
+/// What [`installation`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Installation {
+    /// Nothing anywhere: a genuine first run.
+    FirstRun,
+    /// The consolidated home already holds this machine's installation.
+    Consolidated,
+    /// The legacy split layout holds it.
+    Legacy,
+    /// Both hold one — never guessed, always refused.
+    Ambiguous,
+}
+
+/// Whether `path` exists as anything at all — a directory, a file or a
+/// dangling symlink. A probe that fails for any other reason (permission,
+/// I/O) counts as present: resolution then stays on the legacy branch
+/// rather than switching an installation it could not inspect.
+fn legacy_present(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Tracker (pm board) directory: `$CADENCE_PM_DIR`, else
@@ -145,34 +293,67 @@ pub fn state_default() -> Result<PathBuf> {
     }
 }
 
-/// The knowledge vault root: `<home>/vault` under the new layout;
-/// `<tracker_dir>/wiki` under the legacy one (CAD-579's wiki lives
-/// there until the CAD-392 migration moves it).
+/// The knowledge vault root. The vault follows the tracker it belongs
+/// to: a tracker inside the resolved home keeps `<home>/vault`, and a
+/// tracker outside it keeps `<tracker>/wiki` (CAD-579's wiki lives
+/// beside its tracker). An explicit `CADENCE_HOME` keeps `<home>/vault`
+/// for every tracker, as it did before.
+///
+/// The tracker's location — not the process branch — decides this, so a
+/// per-directory override (`cadence switch local`, `sandbox::adopt`)
+/// can never move a vault or make one appear at a phantom path.
 pub fn vault_dir() -> Result<PathBuf> {
-    match layout()? {
-        Layout {
-            source: Source::Legacy,
-            ..
-        } => Ok(tracker_dir()?.join("wiki")),
-        l => Ok(l.root.join("vault")),
-    }
+    vault_for(&tracker_dir()?)
 }
 
 /// The vault a *served* tracker uses — the instance-bound form of
-/// [`vault_dir`]: `<home>/vault` under the new layout; `tracker`'s
-/// `wiki/` under the legacy one. [`vault_dir`] resolves the env
-/// tracker, but a daemon's tracker is instance-bound (its own
-/// `CADENCE_PM_DIR` lives in `provider_env`, which process-env
-/// resolution cannot see) — under a test fixture the two disagree,
-/// and the wiki must follow the tracker actually being served.
+/// [`vault_dir`]: `<home>/vault` when `tracker` sits inside the resolved
+/// home (or `$CADENCE_HOME` is set); `tracker`'s `wiki/` otherwise.
+/// [`vault_dir`] resolves the env tracker, but a daemon's tracker is
+/// instance-bound (its own `CADENCE_PM_DIR` lives in `provider_env`,
+/// which process-env resolution cannot see) — under a test fixture the
+/// two disagree, and the wiki must follow the tracker actually being
+/// served.
 pub fn vault_for(tracker: &Path) -> Result<PathBuf> {
-    match layout()? {
-        Layout {
-            source: Source::Legacy,
-            ..
-        } => Ok(tracker.join("wiki")),
-        l => Ok(l.root.join("vault")),
+    let layout = layout()?;
+    if matches!(layout.source, Source::Env | Source::Sandbox) {
+        return Ok(layout.root.join("vault"));
     }
+    // Only the consolidated branch's *own* tracker (`<home>/tracker`) uses
+    // the home vault. A `CADENCE_PM_DIR` that merely happens to sit under
+    // the home — a legacy install pointed at `~/.cadence/old-pm`, say — is
+    // not that tracker, and its wiki must stay beside it: reading the
+    // branch would move an existing installation's knowledge root without
+    // the migration that CAD-392 still owns.
+    if same_place(tracker, &layout.root.join("tracker")) {
+        return Ok(layout.root.join("vault"));
+    }
+    Ok(tracker.join("wiki"))
+}
+
+/// Whether two paths name the same place. The comparison canonicalises
+/// first — so `~/.cadence/alias/../tracker` with `alias` present is the
+/// branch's own tracker, exactly as the OS resolves it — and falls back
+/// to folding `.`/`..` for a path that does not exist yet.
+fn same_place(a: &Path, b: &Path) -> bool {
+    comparable(a) == comparable(b)
+}
+
+fn comparable(p: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(p) {
+        return real;
+    }
+    let mut out = PathBuf::new();
+    for component in p.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Operational upload workspace: `<resolved-home>/workspace`. This is
@@ -180,6 +361,273 @@ pub fn vault_for(tracker: &Path) -> Result<PathBuf> {
 /// of the broader home-layout migration.
 pub fn workspace_dir() -> Result<PathBuf> {
     Ok(layout()?.root.join("workspace"))
+}
+
+/// Hosted config and credentials root. A first run — and an installation
+/// already living in the consolidated home — keeps them in `<home>/config`.
+/// A legacy installation keeps `$XDG_CONFIG_HOME/cadence` (else
+/// `~/.config/cadence`), where its credentials already are; so does an
+/// installation given an explicit `CADENCE_HOME` whose `XDG_CONFIG_HOME` is
+/// exported, or whose legacy root already holds something.
+///
+/// The decision follows the branch, not the environment: exporting
+/// `XDG_CONFIG_HOME` does not move a fresh installation's credentials into
+/// the legacy root, because the next run would then see both layouts and
+/// refuse the installation as ambiguous. A probe that cannot be answered
+/// counts as present, so credentials the resolver could not inspect are
+/// never abandoned. Under the consolidated home the path is refused when
+/// any level is a symlink, so a planted link cannot redirect credentials.
+///
+/// The directory is private: [`create_home_dir`] makes it and the home
+/// root above it 0700 on first use, and the credential files inside stay
+/// 0600. `--auth-dir` still bypasses this resolver at the CLI layer.
+pub fn config_dir() -> Result<PathBuf> {
+    let layout = layout()?;
+    config_root(&layout)
+}
+
+/// [`config_dir`] with `$CADENCE_HOME` unset — the production config a
+/// sandbox must never reach.
+pub fn config_default() -> Result<PathBuf> {
+    let layout = layout_without_env()?;
+    config_root(&layout)
+}
+
+/// The config root for a resolved layout. One branch, one store:
+///
+/// - a first run — and an installation already living in the consolidated
+///   home — keeps everything, credentials included, under that home.
+///   Honouring an exported `XDG_CONFIG_HOME` here would write the first
+///   credential into the legacy root, and the next run would then find
+///   legacy *and* consolidated evidence and refuse the installation as
+///   ambiguous;
+/// - a legacy installation keeps `$XDG_CONFIG_HOME/cadence`
+///   (`~/.config/cadence`), where its credentials already are;
+/// - an explicit `CADENCE_HOME` keeps an exported `XDG_CONFIG_HOME` and an
+///   existing legacy root, which name where credentials already live, and
+///   otherwise uses `<home>/config`.
+///
+/// A config root under the consolidated home is then checked for
+/// symlinks: a planted link would redirect credential reads and writes,
+/// so it is refused rather than followed.
+fn config_root(layout: &Layout) -> Result<PathBuf> {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").is_some_and(|value| !value.is_empty());
+    let legacy = legacy_config_dir()?;
+    let chosen = match layout.source {
+        // No `CADENCE_HOME` and no legacy evidence: a first run or an
+        // installation already living in the consolidated home. Both keep
+        // their config inside it; a legacy config root present at the same
+        // time would have made the layout `Ambiguous` and been refused
+        // before this point. A sandbox is its own install the same way.
+        Source::Fresh | Source::Sandbox => layout.root.join("config"),
+        Source::Legacy => legacy,
+        Source::Env => {
+            if xdg || legacy_present(&legacy) {
+                legacy
+            } else {
+                layout.root.join("config")
+            }
+        }
+    };
+    if chosen.starts_with(&layout.root) {
+        refuse_symlinked_under(&layout.root, &chosen)?;
+    }
+    Ok(chosen)
+}
+
+/// Refuse a root whose existing ancestry contains a symlink or a `..`.
+/// An explicit `CADENCE_HOME` is authoritative for credentials, so a
+/// planted link anywhere above it would redirect every write even when the
+/// leaf itself is not a link. Nothing below the first missing component is
+/// checked; the caller then creates it under the refusal rules above.
+fn refuse_symlinked_ancestry(root: &Path) -> Result<()> {
+    use std::path::Component;
+    // The lexical refusal comes first: the walk below stops at the first
+    // missing component, so a `..` after a missing prefix would otherwise
+    // never be seen and the OS would apply it later.
+    if root
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(Error::rejected(format!(
+            "{} is not a plain absolute home — refusing a CADENCE_HOME with `..` or a path \
+             prefix; name the installation's own absolute path",
+            root.display()
+        )));
+    }
+    let mut prefix = PathBuf::new();
+    for component in root.components() {
+        match component {
+            Component::RootDir => prefix.push("/"),
+            Component::Normal(part) => prefix.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => unreachable!("checked above"),
+        }
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(Error::rejected(format!(
+                    "{} is reached through the symlink {} — refusing to use it as CADENCE_HOME; \
+                     name the real installation directory",
+                    root.display(),
+                    prefix.display()
+                )))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a path under the consolidated home that is reached through a
+/// symlink, at any level from the home root down to the leaf.
+///
+/// The home is created by this installation, so nothing legitimate in it
+/// predates it: a symlinked `~/.cadence`, `~/.cadence/config` or
+/// `~/.cadence/config/remote-auth` is planted evidence that would send
+/// credential reads and writes somewhere else. Same-uid planting is the
+/// threat the ticket names, and a leaf-only check misses every ancestor.
+fn refuse_symlinked_under(root: &Path, path: &Path) -> Result<()> {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return Ok(());
+    };
+    // A `..` is resolved by the OS *after* it follows symlinks, so a walk
+    // that folds it lexically could check a path the write never takes.
+    // Generated paths never contain one; refuse instead of guessing.
+    if relative
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(Error::rejected(format!(
+            "{} contains a `..` component — refusing to resolve a consolidated path \
+             through it; name the installation with an absolute CADENCE_HOME instead",
+            path.display()
+        )));
+    }
+    let mut current = root.to_path_buf();
+    loop {
+        if std::fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(Error::rejected(format!(
+                "{} is reached through a symlink — refusing to read or write the \
+                 consolidated home through it; remove the link or set CADENCE_HOME to the \
+                 installation to use",
+                current.display()
+            )));
+        }
+        if current == path {
+            return Ok(());
+        }
+        match path.strip_prefix(&current).ok().and_then(|rest| {
+            rest.components()
+                .next()
+                .map(|c| current.join(c.as_os_str()))
+        }) {
+            Some(next) if next != current => current = next,
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// Refuse an effect on the invoking user's real consolidated home in a
+/// test process. [`create_home_dir`] already answers this for its own
+/// callers; a writer that creates with `create_dir_all` directly (setup's
+/// state and tracker initialization) calls this before its first effect.
+#[cfg(not(any(test, feature = "test-seam")))]
+pub fn refuse_real_home(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// [`refuse_real_home`] for builds that can run tests.
+#[cfg(any(test, feature = "test-seam"))]
+pub fn refuse_real_home(dir: &Path) -> Result<()> {
+    guard_home(dir.to_path_buf()).map(|_| ())
+}
+
+/// Create a directory that belongs to the consolidated home — the config
+/// root, a credential directory, the state or the tracker dir. When it
+/// sits inside the resolved home, the directory and every missing
+/// ancestor below the home root (the home root itself included) are
+/// created 0700, so a first run's home is private from the first write;
+/// elsewhere this is the plain `create_dir_all` the caller already had.
+///
+/// An existing directory is never re-created or widened. The one mode a
+/// caller may find tightened is a first run's own home root, which stays
+/// 0700 whoever created it first (a setup run, the daemon, a login): it
+/// is that installation's private home, not an existing installation's
+/// directory, and the legacy branch is never touched.
+pub fn create_home_dir(dir: &Path) -> Result<()> {
+    // An unresolvable layout (no HOME, an unreadable probe) must not
+    // block creating a dir the caller already named: that is the plain
+    // creation this helper replaced.
+    let Ok(layout) = layout() else {
+        std::fs::create_dir_all(dir)?;
+        return Ok(());
+    };
+    if !dir.starts_with(&layout.root) {
+        std::fs::create_dir_all(dir)?;
+        return Ok(());
+    }
+    // CAD-1227: a test process must never create in the invoking user's
+    // real `~/.cadence`. The guard sits on creation, not on resolution:
+    // resolving the branch is a read-only question (a daemon fixture
+    // asks it for its vault), while creating the home is the effect the
+    // guard exists to refuse.
+    guard_home(layout.root.clone())?;
+    create_private_tree(&layout.root, dir)?;
+    if layout.source == Source::Fresh {
+        tighten_private(&layout.root)?;
+    }
+    Ok(())
+}
+
+/// Narrow `dir` to 0700 when it is a real directory with group or other
+/// bits set. A symlink or a file is left alone.
+fn tighten_private(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.mode() & 0o077 == 0 {
+        return Ok(());
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Create `dir` and every missing directory between `root` and it with
+/// mode 0700. `root` must contain `dir`; nothing above `root` is created
+/// or changed, and an existing directory keeps its mode.
+pub fn create_private_tree(root: &Path, dir: &Path) -> Result<()> {
+    if !dir.starts_with(root) {
+        return Err(Error::rejected(format!(
+            "{} is not inside {} — refusing to create it as a private tree",
+            dir.display(),
+            root.display()
+        )));
+    }
+    if dir.exists() {
+        return Ok(());
+    }
+    use std::os::unix::fs::DirBuilderExt;
+    let mut missing = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(path) = cur {
+        if path.exists() {
+            break;
+        }
+        missing.push(path);
+        if path == root {
+            break;
+        }
+        cur = path.parent();
+    }
+    for path in missing.iter().rev() {
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 /// Resolve an instance's workspace from its captured daemon environment,
@@ -473,8 +921,8 @@ fn checked_root(path: &Path) -> Result<PathBuf> {
 }
 
 /// Managed repo checkouts: `<home>/repos` — under the legacy layout
-/// the would-be `~/.cadence/repos` (nothing reads it until the
-/// migration creates the layout).
+/// the same `~/.cadence/repos`, which an existing installation already
+/// uses for managed checkouts.
 pub fn repos_dir() -> Result<PathBuf> {
     Ok(layout()?.root.join("repos"))
 }
@@ -530,6 +978,38 @@ fn legacy_state_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(dir).join("cadence"));
     }
     local_state_dir()
+}
+
+/// The pre-`CADENCE_HOME` hosted config root — `$XDG_CONFIG_HOME/cadence`,
+/// else `~/.config/cadence`: where `orgs.json` and `remote-auth/` live
+/// for every installation that predates the consolidated home.
+fn legacy_config_dir() -> Result<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .ok_or_else(|| Error::rejected("Set HOME, XDG_CONFIG_HOME or --auth-dir"))?;
+    if !base.is_absolute() {
+        return Err(Error::rejected("Credential directory must be absolute"));
+    }
+    Ok(base.join("cadence"))
+}
+
+/// `pw_dir` for the invoking uid. `None` when the passwd database has no
+/// entry.
+#[cfg(any(test, feature = "test-seam"))]
+fn passwd_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: getpwuid returns null or a pointer to a static passwd
+    // record whose pw_dir is a NUL-terminated string; copied at once.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr((*pw).pw_dir);
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+    }
 }
 
 /// CAD-1210: a test process must never reach the invoking user's real
@@ -653,22 +1133,123 @@ fn real_home() -> Option<PathBuf> {
     if let Some(h) = std::env::var_os("CADENCE_TEST_REAL_HOME") {
         return Some(PathBuf::from(h));
     }
-    use std::os::unix::ffi::OsStrExt;
-    // SAFETY: getpwuid returns null or a pointer to a static passwd
-    // record whose pw_dir is a NUL-terminated string; copied at once.
-    unsafe {
-        let pw = libc::getpwuid(libc::getuid());
-        if pw.is_null() || (*pw).pw_dir.is_null() {
-            return None;
-        }
-        let dir = std::ffi::CStr::from_ptr((*pw).pw_dir);
-        Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
-    }
+    passwd_home()
 }
 
 #[cfg(test)]
 mod guard_tests {
     use super::*;
+
+    struct Cad1922HomeEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl Cad1922HomeEnv {
+        fn isolated(home: &Path) -> Self {
+            let names = [
+                "HOME",
+                "CADENCE_HOME",
+                "CADENCE_STATE_DIR",
+                "CADENCE_PM_DIR",
+                "CADENCE_PROFILE",
+                "CADENCE_SANDBOX_ROOT",
+                "XDG_STATE_HOME",
+                "XDG_CONFIG_HOME",
+            ];
+            let saved = Self(
+                names
+                    .iter()
+                    .map(|&name| (name, std::env::var_os(name)))
+                    .collect(),
+            );
+            for name in names {
+                std::env::remove_var(name);
+            }
+            std::env::set_var("HOME", home);
+            saved
+        }
+    }
+
+    impl Drop for Cad1922HomeEnv {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cad1922_symlinked_consolidated_config_is_refused() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home_root = fixture.path().join("home/.cadence");
+        let redirected = fixture.path().join("redirected-config");
+        std::fs::create_dir_all(&home_root).unwrap();
+        std::fs::create_dir_all(&redirected).unwrap();
+        let config = home_root.join("config");
+
+        // Positive control: a plain path under this home is acceptable.
+        refuse_symlinked_under(&home_root, &config).unwrap();
+        std::os::unix::fs::symlink(&redirected, &config).unwrap();
+
+        let error = refuse_symlinked_under(&home_root, &config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(error.contains(&config.display().to_string()), "{error}");
+        assert!(std::fs::symlink_metadata(&config)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_dir(&redirected).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn cad1922_first_run_config_stays_in_home_with_exported_xdg() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let xdg = fixture.path().join("xdg-config");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let _env = Cad1922HomeEnv::isolated(&home);
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+
+        let selected = layout().unwrap();
+        assert_eq!(selected.source, Source::Fresh);
+        assert_eq!(config_dir().unwrap(), home.join(".cadence/config"));
+        assert!(!xdg.join("cadence").exists());
+    }
+
+    #[test]
+    fn cad1922_exported_absent_legacy_roots_select_legacy() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = Cad1922HomeEnv::isolated(&home);
+        assert_eq!(layout().unwrap().source, Source::Fresh);
+
+        for (name, path) in [
+            ("CADENCE_STATE_DIR", home.join(".local/state/cadence")),
+            ("CADENCE_PM_DIR", home.join("pm")),
+        ] {
+            std::env::remove_var("CADENCE_STATE_DIR");
+            std::env::remove_var("CADENCE_PM_DIR");
+            assert!(
+                !path.exists(),
+                "the export, not a directory, must select legacy"
+            );
+            std::env::set_var(name, &path);
+
+            assert_eq!(layout().unwrap().source, Source::Legacy, "{name}");
+            let chosen = match name {
+                "CADENCE_STATE_DIR" => state_dir().unwrap(),
+                _ => tracker_dir().unwrap(),
+            };
+            assert_eq!(chosen, path, "{name}");
+            assert_eq!(config_dir().unwrap(), home.join(".config/cadence"));
+            assert!(!path.exists(), "resolving {name} must not create its root");
+        }
+    }
 
     #[test]
     fn production_roots_refuse_and_other_dirs_pass() {

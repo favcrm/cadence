@@ -214,18 +214,46 @@ pub fn staging_register(state_dir: &Path, board_port: u16, by: &str) -> Result<V
 /// never touch (CAD-1024, contract I5). Canonicalized, so a symlinked or
 /// `..`-spelled staging dir cannot alias a live one. `~/pm` is the
 /// production PM dir; `client::default_state_dir()`/`home::local_state_dir()`
-/// are the two spellings of the production state dir.
+/// are the two spellings of the production state dir; the consolidated
+/// home (`~/.cadence`) holds the tracker, state, vault, workspace, repos
+/// and hosted config of a first run (CAD-1922).
 pub(super) fn refuse_production_staging(state_dir: &Path) -> Result<()> {
     let ours = crate::sandbox::resolved(state_dir);
-    let mut forbidden: Vec<PathBuf> = Vec::new();
-    if let Ok(d) = crate::client::default_state_dir() {
-        forbidden.push(d);
+    // The inventory is spelled from `$HOME`/`$XDG_*` alone, never through
+    // a resolver that can fail: an `Ambiguous` installation made the
+    // branch selectors error, and silently dropping their roots registered
+    // a live instance as staging. Naming the roots directly keeps them in
+    // the list whatever the layout says.
+    let var = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    // An empty inventory is not proof of isolation: without `HOME` the
+    // tracker, home and config cannot be named, so refuse instead of
+    // registering a staging instance at a production path.
+    let home = var("HOME").ok_or_else(|| {
+        Error::rejected(
+            "HOME is not set to an absolute path — refusing to judge a staging root without \
+             the host's production paths",
+        )
+    })?;
+    let mut forbidden: Vec<PathBuf> = vec![
+        home.join("pm"),
+        home.join(".cadence"),
+        home.join(".local/state/cadence"),
+        home.join(".config/cadence"),
+    ];
+    for (name, leaf) in [
+        ("XDG_STATE_HOME", "cadence"),
+        ("XDG_CONFIG_HOME", "cadence"),
+    ] {
+        if let Some(base) = var(name) {
+            forbidden.push(base.join(leaf));
+        }
     }
-    if let Ok(d) = crate::home::local_state_dir() {
-        forbidden.push(d);
-    }
-    if let Ok(d) = crate::issue::home_default_dir() {
-        forbidden.push(d);
+    if let Some(root) = var("CADENCE_HOME").filter(|path| path.is_absolute()) {
+        forbidden.push(root);
     }
     for live in forbidden {
         let live = crate::sandbox::resolved(&live);
