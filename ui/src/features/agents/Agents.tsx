@@ -33,6 +33,8 @@ import {
   agentMatchesFilter,
   agentMatchesSearch,
   agentOrder,
+  profileMatchesFilter,
+  profileMatchesSearch,
   type AgentFilter,
 } from "./agentView";
 import "./agents.css";
@@ -48,7 +50,9 @@ function roleLine(a: Agent, roleTitle: string | undefined, hosted: boolean, t: (
   const title =
     roleTitle ?? (a.alias === MASTER ? t("Master") : (label(a.team_role) ?? label(a.role) ?? t("Agent")));
   const where = agentLocation(a) === "cloud" ? t("cloud") : hosted ? t("workspace") : t("this computer");
-  return `${title} · ${where}`;
+  // The model a runtime resolved to; `inherit` is not a model, so it is not shown.
+  const model = a.model && a.model !== "inherit" ? ` · ${a.model}` : "";
+  return `${title} · ${where}${model}`;
 }
 
 export default function Agents({
@@ -91,9 +95,18 @@ export default function Agents({
   const issueIndexed = issueIndex(issuesState.data ?? []);
   // Agents belong to the team, not a project: the roster lists them all.
   const allAgents = payload?.agents ?? [];
+  const profiles = payload?.profiles ?? [];
+  const idleProfiles = profiles.filter((p) => profileMatchesFilter(p, "all"));
   const counts = Object.fromEntries(
-    AGENT_FILTERS.map(({ value }) => [value, allAgents.filter((a) => agentMatchesFilter(a, value)).length]),
+    AGENT_FILTERS.map(({ value }) => [
+      value,
+      allAgents.filter((a) => agentMatchesFilter(a, value)).length +
+        idleProfiles.filter((p) => profileMatchesFilter(p, value)).length,
+    ]),
   ) as Record<AgentFilter, number>;
+  const shownProfiles = idleProfiles.filter(
+    (p) => profileMatchesFilter(p, filter) && profileMatchesSearch(p, query),
+  );
   const agents = allAgents
     .filter((a) => agentMatchesFilter(a, filter) && agentMatchesSearch(a, query, issueIndexed))
     .sort(
@@ -103,7 +116,7 @@ export default function Agents({
         a.alias.localeCompare(b.alias),
     );
   const emptyCopy =
-    allAgents.length === 0
+    allAgents.length + idleProfiles.length === 0
       ? t("No agents registered.")
       : filter === "current" && counts.current === 0 && !query.trim()
         ? t("No current agents. Select All, Stopped, or Mailboxes to see the full roster.")
@@ -111,8 +124,8 @@ export default function Agents({
   const agent = allAgents.find((a) => a.alias === open);
   const hosted = roles.data?.install.hosted ?? false;
   const suggestion = suggestedRoles(installed.data ?? [], roles.data?.roles ?? []);
-  const profiles = payload?.profiles ?? [];
-  const taken = [...allAgents.map((a) => a.alias), ...profiles.map((p) => p.id)];
+  const groups = allAgents.filter((a) => a.role === "pm").map((a) => a.alias);
+  const taken = [...allAgents.map((a) => a.alias), ...profiles.map((p) => p.alias)];
   const askMaster = onAsk;
   const hired = (profile: HiredProfile, role: AgentRole) => {
     setPicked(null);
@@ -146,6 +159,7 @@ export default function Agents({
         alias={open}
         observed={agent}
         roles={roles}
+        profiles={profiles}
         tab={tab}
         onTab={onTab}
         onBack={() => setOpen(null)}
@@ -166,7 +180,7 @@ export default function Agents({
       <>
         <Recruit
           roles={roles}
-          agents={allAgents}
+          profiles={profiles}
           hireBlock={hireBlock}
           onBack={() => onRecruit(false)}
           onPick={setPicked}
@@ -208,7 +222,7 @@ export default function Agents({
         </div>
       </div>
       <HireGate reason={hireBlock} />
-      {joined && (
+      {joined && profiles.some((p) => p.id === joined.profile.id && p.runtimes.length === 0) && (
         <div className="rc-nudge" role="status">
           <AgentAvatar slug="custom" look={joined.role.look} size={48} still />
           <div>
@@ -218,7 +232,7 @@ export default function Agents({
                 .replace("{role}", () => joined.role.title)}
             </div>
             <div className="s">{t("Idle · no runtime")}</div>
-            <ConnectRuntime profile={joined.profile} />
+            <ConnectRuntime profile={joined.profile} hosted={hosted} groups={groups} />
           </div>
         </div>
       )}
@@ -265,21 +279,22 @@ export default function Agents({
               <SeatCard
                 key={a.alias}
                 agent={a}
-                roleLine={roleLine(a, roleOf(a, roles.data)?.title, hosted, t)}
+                roleLine={roleLine(a, roleOf(a, roles.data, profiles)?.title, hosted, t)}
                 onOpen={() => setOpen(a.alias)}
               />
             ))}
-            {profiles.map((profile) => (
+            {shownProfiles.map((profile) => (
               <ProfileSeat
                 key={`profile-${profile.id}`}
                 profile={profile}
                 roleTitle={roles.data?.roles.find((r) => r.id === profile.catalogue)?.title ?? profile.role}
-                runtimes={allAgents.filter((a) => profile.runtimes.includes(a.alias))}
+                hosted={hosted}
+                groups={groups}
               />
             ))}
             {tile}
           </div>
-          {agents.length === 0 && (
+          {agents.length + shownProfiles.length === 0 && (
             <p className="text-label text-ink-500 mt-3" role="status">
               {emptyCopy}
             </p>
@@ -296,7 +311,7 @@ export default function Agents({
                     key={role.id}
                     role={role}
                     payload={roles.data!}
-                    onTeam={onTeamCount(role, allAgents)}
+                    onTeam={onTeamCount(role, profiles)}
                     onPick={setPicked}
                   />
                 ))}

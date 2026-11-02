@@ -339,7 +339,8 @@ pub struct AgentProfile {
     pub team_role: String,
     pub catalogue: Option<String>,
     pub look: Option<String>,
-    pub job: String,
+    /// The operator's to read: absent from the board's shared payload.
+    pub job: Option<String>,
     /// `inherit` or a model id.
     pub model: String,
     pub runtimes: Vec<String>,

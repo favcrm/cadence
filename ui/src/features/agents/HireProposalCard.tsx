@@ -34,7 +34,7 @@ export default function HireProposalCard({
   const role: AgentRole | undefined = roles.data?.roles.find((r) => r.id === roleId);
   const taken = [
     ...(roster.data?.agents ?? []).map((a) => a.alias),
-    ...(roster.data?.profiles ?? []).map((p) => p.id),
+    ...(roster.data?.profiles ?? []).map((p) => p.alias),
   ];
   const name = typeof proposal.name === "string" && proposal.name ? proposal.name : null;
   const job = typeof proposal.job === "string" ? proposal.job : undefined;

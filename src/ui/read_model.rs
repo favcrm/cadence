@@ -1649,7 +1649,7 @@ impl Model {
                 "agent_meta",
                 &json!({
                     "daemon": served["daemon"], "totals": served["totals"],
-                    "by_issue": served["by_issue"],
+                    "by_issue": served["by_issue"], "profiles": served["profiles"],
                     "snapshot_age_secs": served["snapshot_age_secs"],
                     "stale": served["stale"], "refresh_error": served["refresh_error"],
                 }),

@@ -127,6 +127,12 @@ pub(crate) fn redact_agents_payload(payload: &mut Value) {
             *row = member_agent_row(row);
         }
     }
+    // The job is the operator's to read.
+    if let Some(profiles) = payload["profiles"].as_array_mut() {
+        for profile in profiles.iter_mut() {
+            profile["job"] = Value::Null;
+        }
+    }
 }
 
 /// CAD-1767: what a non-operator may see of one event - an ALLOWLIST, so

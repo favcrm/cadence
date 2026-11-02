@@ -1,32 +1,62 @@
 import { useTranslate } from "../../lib/locale";
-import type { Agent, HiredProfile } from "../../lib/types";
+import type { HiredProfile } from "../../lib/types";
 import AgentAvatar from "./AgentAvatar";
-import { agentLocation } from "./agentView";
 
-/** How a runtime attaches to a profile, and how it reads the profile back. */
-export function ConnectRuntime({ profile }: { profile: HiredProfile }) {
+/** The providers `cadence join` takes. */
+const PROVIDERS = "claude, codex, pi, devin or cursor";
+
+/** How a runtime attaches to a profile and reads it back, as commands that run
+ *  as printed. A native board joins a runtime under a group (a pm agent); a
+ *  hosted board has no `join` and starts a session on an issue instead. */
+export function ConnectRuntime({
+  profile,
+  hosted,
+  groups,
+}: {
+  profile: HiredProfile;
+  hosted: boolean;
+  groups: string[];
+}) {
   const t = useTranslate();
   return (
     <div className="rc-connect">
       <b>{t("Connect a runtime")}</b>
       <small>{t("Read the profile:")}</small>
       <code>{`cadence agent context ${profile.id}`}</code>
-      <small>{t("Register a runtime against it:")}</small>
-      <code>{`cadence join <group> <provider> --alias <runtime-name> --profile ${profile.id}`}</code>
+      {hosted ? (
+        <>
+          <small>{t("Start a session on an issue under this profile:")}</small>
+          <code>{`cadence issue start <issue-id> --repo <path-to-checkout> --profile ${profile.id}`}</code>
+        </>
+      ) : groups.length > 0 ? (
+        <>
+          <small>{t("Register a runtime against it (provider: {providers}):").replace("{providers}", PROVIDERS)}</small>
+          <code>{`cadence join ${groups[0]} <provider> --profile ${profile.id}`}</code>
+        </>
+      ) : (
+        <>
+          <small>{t("A runtime joins a group. Create one first:")}</small>
+          <code>cadence agent register lead --provider inbox --role pm</code>
+          <small>{t("Then register a runtime against the profile (provider: {providers}):").replace("{providers}", PROVIDERS)}</small>
+          <code>{`cadence join lead <provider> --profile ${profile.id}`}</code>
+        </>
+      )}
     </div>
   );
 }
 
-/** A profile as a seat: with no runtime it is "Idle · no runtime" and shows how
- *  to connect one; with runtimes it says where each runs and on which model. */
+/** A profile with no runtime: "Idle · no runtime", and how to connect one. A
+ *  profile with runtimes is carried by their own seats. */
 export default function ProfileSeat({
   profile,
   roleTitle,
-  runtimes,
+  hosted,
+  groups,
 }: {
   profile: HiredProfile;
   roleTitle: string;
-  runtimes: Agent[];
+  hosted: boolean;
+  groups: string[];
 }) {
   const t = useTranslate();
   return (
@@ -37,19 +67,8 @@ export default function ProfileSeat({
         <div className="s">{roleTitle}</div>
       </div>
       <div className="st" style={{ display: "block" }}>
-        {runtimes.length === 0 ? (
-          <>
-            <div>{t("Idle · no runtime")}</div>
-            <ConnectRuntime profile={profile} />
-          </>
-        ) : (
-          runtimes.map((rt) => (
-            <div key={rt.alias}>
-              {rt.alias} · {agentLocation(rt) === "cloud" ? t("cloud") : t("this computer")} ·{" "}
-              {t("Model:")} {rt.model ?? profile.model}
-            </div>
-          ))
-        )}
+        <div>{t("Idle · no runtime")}</div>
+        <ConnectRuntime profile={profile} hosted={hosted} groups={groups} />
       </div>
     </div>
   );

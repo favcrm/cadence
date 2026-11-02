@@ -557,14 +557,8 @@ export interface AgentRegisterBody {
   params?: string;
 }
 
-/** CAD-1989: `POST /api/agent-profiles` body. A hire saves a profile only;
- *  `job` is sent only when edited, `model` only when one is picked. */
-export interface AgentProfileBody {
-  alias: string;
-  catalogue: string;
-  job?: string;
-  model?: string;
-}
+/** CAD-1989: `POST /api/agent-profiles` body, generated from the Rust type. */
+export type AgentProfileBody = Api.AgentProfileReq;
 
 /** One role of `GET /api/agent-roles`. Roles carry no model. */
 export interface AgentRole {
@@ -627,11 +621,7 @@ export type Agent = Omit<
 };
 
 /** `GET /api/agents` (the roster beside its snapshot's freshness). */
-export type AgentsPayload = Omit<Api.AgentsResponse, "agents" | "profiles"> & {
-  agents: Agent[];
-  /** Absent from a board that predates profiles. */
-  profiles?: HiredProfile[];
-};
+export type AgentsPayload = Omit<Api.AgentsResponse, "agents"> & { agents: Agent[] };
 
 /** One profile of `GET /api/agents` (CAD-1989): who an agent is, with the
  *  aliases of the runtimes registered against it. */

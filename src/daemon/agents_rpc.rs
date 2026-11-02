@@ -5,6 +5,13 @@ use super::*;
 impl Shared {
     pub(super) fn rpc_register(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = required_str(params, "alias")?;
+        // A profile and a runtime never share a name: two cards with one
+        // alias would be two things to @-mention.
+        if crate::agent_settings::profile_exists(&self.store, alias)? {
+            return Err(Error::rejected(format!(
+                "'{alias}' is already an agent profile - give the runtime another alias"
+            )));
+        }
         let provider = required_str(params, "provider")?;
         let endpoint =
             optional_str(params, "endpoint_kind").unwrap_or(registry::DEFAULT_ENDPOINT_KIND);
@@ -383,28 +390,47 @@ impl Shared {
                 crate::agent_roles::ids()
             ))
         })?;
-        let look = match optional_text(params, "look")? {
-            None => role.look,
-            Some(look) => crate::agent_roles::canonical_look(look)
-                .ok_or_else(|| Error::rejected(format!("Unknown look '{look}'")))?,
-        };
         crate::agent_settings::create_catalogue_profile(
             &self.store,
             alias,
             role,
-            look,
+            role.look,
             optional_text(params, "job")?,
             optional_text(params, "model")?,
         )
     }
 
-    /// CAD-1989: the hosted `agent_profile_context` envelope for a settings profile.
-    pub(super) fn rpc_agent_profile_context(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        crate::agent_settings::profile_context(
-            &self.store,
-            &self.store.agents()?,
-            required_str(params, "id")?,
-        )
+    /// CAD-1989: the hosted `agent_profile_context` envelope for a settings
+    /// profile. The job is the operator's: the operator, or an agent whose
+    /// own runtime row is registered against this profile, may read it;
+    /// every other caller is refused.
+    pub(super) fn rpc_agent_profile_context(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let id = required_str(params, "id")?;
+        if self.operator_evidence(peer_pid).is_err() {
+            let own = match self.caller_identity(peer_pid)? {
+                Caller::Agent(verified) => {
+                    verified
+                        .agent
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("profile"))
+                        .and_then(Value::as_str)
+                        == Some(id)
+                }
+                Caller::NoAgentIdentity => false,
+            };
+            if !own {
+                return Err(Error::rejected(
+                    "agent profile context is the operator's, or the context of a runtime \
+                     registered against that profile",
+                ));
+            }
+        }
+        crate::agent_settings::profile_context(&self.store, &self.store.agents()?, id)
     }
 
     /// CAD-1752: the role catalogue and what this install registers on. A

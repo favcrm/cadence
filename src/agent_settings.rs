@@ -2449,6 +2449,27 @@ pub struct LaunchProfile {
     pub digest: String,
 }
 
+/// What an `inherit` profile launches with: the role default when this
+/// harness can carry it, else `inherit` for the runtime to resolve. Never a
+/// refusal - only a model the profile or the caller names is strict.
+fn inherited_launch_model(
+    resolved: Option<&str>,
+    provider: &str,
+    endpoint: &str,
+    models: &[Value],
+    providers: &[Value],
+) -> String {
+    match resolved {
+        Some(model)
+            if registry::supports_model(provider, endpoint)
+                && validate_model_harness(model, provider, models, providers).is_ok() =>
+        {
+            model.to_string()
+        }
+        _ => "inherit".to_string(),
+    }
+}
+
 /// Resolve a settings profile for registration. The job is the instruction
 /// text. `role` is the team-role lookup, not the runtime role.
 pub fn launch_profile(
@@ -2475,13 +2496,16 @@ pub fn launch_profile(
     }
     let requested_model = requested_model.map(validate_model_id).transpose()?;
     let overlay = present_overlay(&current.doc.model_defaults, current.doc.pi.as_ref());
-    let model = resolve_model(&profile, &overlay)
-        .map(|(id, _)| id)
-        .unwrap_or_else(|| "inherit".to_string());
-    let selected = requested_model
-        .as_deref()
-        .or_else(|| (!provider_default && model != "inherit").then_some(model.as_str()));
-    if let Some(selected) = selected {
+    let resolved = resolve_model(&profile, &overlay).map(|(id, _)| id);
+    let model = resolved.clone().unwrap_or_else(|| "inherit".to_string());
+    // Only a model the profile or the caller names is strict. `inherit`
+    // takes the role default when this harness can carry it and otherwise
+    // stays `inherit` for the runtime to resolve - it is never a refusal.
+    let strict = requested_model
+        .clone()
+        .or_else(|| (!provider_default && profile.model != "inherit").then(|| model.clone()));
+    let mut model = model;
+    if let Some(selected) = strict {
         if !registry::supports_model(provider, endpoint) {
             return Err(Error::rejected(format!(
                 "harness '{provider}' does not accept a model"
@@ -2490,13 +2514,21 @@ pub fn launch_profile(
         let record = overlay
             .models
             .iter()
-            .find(|record| record["id"].as_str() == Some(selected));
+            .find(|record| record["id"].as_str() == Some(selected.as_str()));
         if record.is_none() && requested_model.is_none() {
             return Err(Error::rejected(format!(
                 "profile model '{selected}' has no registered provider"
             )));
         }
-        validate_model_harness(selected, provider, &overlay.models, &overlay.providers)?;
+        validate_model_harness(&selected, provider, &overlay.models, &overlay.providers)?;
+    } else if profile.model == "inherit" && !provider_default {
+        model = inherited_launch_model(
+            resolved.as_deref(),
+            provider,
+            endpoint,
+            &overlay.models,
+            &overlay.providers,
+        );
     }
     Ok(LaunchProfile {
         id: profile.id,
@@ -2697,7 +2729,7 @@ mod omp_harness_tests {
 /// CAD-1989: one profile as the board and `agent context` show it. `role` is
 /// the catalogue role's title when the profile came from one, else the team
 /// role; `team_role` is always the stored team role.
-fn profile_json(profile: &Profile, runtimes: &[String]) -> Value {
+fn profile_json(profile: &Profile, runtimes: &[String], with_job: bool) -> Value {
     let role = profile
         .catalogue
         .as_deref()
@@ -2706,25 +2738,46 @@ fn profile_json(profile: &Profile, runtimes: &[String]) -> Value {
     json!({
         "id": profile.id, "alias": profile.id, "role": role,
         "team_role": profile.role, "catalogue": profile.catalogue,
-        "look": profile.look, "job": profile.job, "model": profile.model,
-        "runtimes": runtimes,
+        "look": profile.look, "job": with_job.then_some(&profile.job),
+        "model": profile.model, "runtimes": runtimes,
     })
 }
 
-/// Every settings profile with the aliases of the runtimes registered
-/// against it (`params.profile == id`).
-pub fn profile_list(store: &Store, agents: &[Agent]) -> Result<Vec<Value>> {
-    Ok(profiles_from(&store.settings()?.doc.profiles)?
+/// Does a settings profile have this id?
+pub fn profile_exists(store: &Store, id: &str) -> Result<bool> {
+    Ok(store
+        .settings()?
+        .doc
+        .profiles
         .iter()
-        .map(|profile| {
-            let runtimes: Vec<String> = agents
-                .iter()
-                .filter(|agent| agent_profile(agent) == Some(profile.id.as_str()))
-                .map(|agent| agent.alias.clone())
-                .collect();
-            profile_json(profile, &runtimes)
-        })
-        .collect())
+        .any(|profile| profile.id == id))
+}
+
+/// Every settings profile with the aliases of the runtimes registered
+/// against it (`params.profile == id`). The job is the operator's to read:
+/// `with_job` is false unless the caller proved it. A body that cannot be
+/// parsed is logged and skipped, so one bad row does not fail the list.
+pub fn profile_list(store: &Store, agents: &[Agent], with_job: bool) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    for body in &store.settings()?.doc.profiles {
+        let profile = match parse_agent(&body.id, &body.text) {
+            Ok(profile) => profile,
+            Err(err) => {
+                eprintln!(
+                    "cadence: skipping unreadable agent profile '{}': {err}",
+                    body.id
+                );
+                continue;
+            }
+        };
+        let runtimes: Vec<String> = agents
+            .iter()
+            .filter(|agent| agent_profile(agent) == Some(profile.id.as_str()))
+            .map(|agent| agent.alias.clone())
+            .collect();
+        out.push(profile_json(&profile, &runtimes, with_job));
+    }
+    Ok(out)
 }
 
 /// `cadence agent context <id>` on a local board, in the hosted
@@ -2733,7 +2786,7 @@ pub fn profile_list(store: &Store, agents: &[Agent]) -> Result<Vec<Value>> {
 /// so each is named in `unavailable` rather than invented. `revision` is the
 /// settings revision the profile was read at.
 pub fn profile_context(store: &Store, agents: &[Agent], id: &str) -> Result<Value> {
-    let listed = profile_list(store, agents)?
+    let listed = profile_list(store, agents, true)?
         .into_iter()
         .find(|profile| profile["id"].as_str() == Some(id))
         .ok_or_else(|| Error::rejected(format!("unknown profile '{id}'")))?;
@@ -2776,7 +2829,7 @@ pub fn create_catalogue_profile(
     job: Option<&str>,
     model: Option<&str>,
 ) -> Result<Value> {
-    check_slug(alias)?;
+    crate::proto::identifier(alias, "Agent name")?;
     master::refuse_reserved_alias(alias)?;
     let current = store.settings()?;
     let taken =
@@ -2828,7 +2881,7 @@ pub fn create_catalogue_profile(
         text: profile.text.clone(),
     });
     store.save_settings(current.revision, doc, ACTOR)?;
-    Ok(profile_json(&profile, &[]))
+    Ok(profile_json(&profile, &[], true))
 }
 
 #[cfg(test)]
@@ -2856,5 +2909,47 @@ mod profile_context_tests {
         assert_eq!(context["knowledge"]["memory"]["available"], false);
         assert_eq!(context["unavailable"].as_array().unwrap().len(), 3);
         assert!(profile_context(&store, &[], "nope").is_err());
+    }
+}
+
+#[cfg(test)]
+mod inherit_tests {
+    use super::*;
+
+    /// CAD-1989: a Pi role default is not a refusal for an `inherit` profile
+    /// joined on another harness; it is simply not used there.
+    #[test]
+    fn inherit_with_a_pi_role_default_is_not_refused_on_claude_or_codex() {
+        let models = [json!({"id": "pi/fast", "provider": "pi-ext"})];
+        let providers = [json!({"id": "pi-ext", "kind": "Pi extension"})];
+        let on = |provider: &str, endpoint: &str| {
+            inherited_launch_model(Some("pi/fast"), provider, endpoint, &models, &providers)
+        };
+        assert_eq!(on("claude", "pty"), "inherit");
+        assert_eq!(on("codex", "managed"), "inherit");
+        assert_eq!(on("pi", "managed"), "pi/fast");
+        assert_eq!(
+            inherited_launch_model(None, "pi", "managed", &models, &providers),
+            "inherit"
+        );
+    }
+
+    #[test]
+    fn one_unreadable_profile_does_not_fail_the_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+        let role = crate::agent_roles::find("developer").unwrap();
+        create_catalogue_profile(&store, "dev-1", role, role.look, None, None).unwrap();
+        let current = store.settings().unwrap();
+        let mut doc = current.doc.clone();
+        doc.profiles.push(crate::store::ProfileBody {
+            id: "broken".to_string(),
+            text: "---\nrole: \"unterminated\n---\nbody\n".to_string(),
+        });
+        store.save_settings(current.revision, doc, ACTOR).unwrap();
+        let listed = profile_list(&store, &[], false).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], "dev-1");
+        assert!(listed[0]["job"].is_null());
     }
 }

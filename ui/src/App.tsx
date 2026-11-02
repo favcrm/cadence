@@ -557,6 +557,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             daemon: data.daemon as AgentsPayload["daemon"],
             totals: data.totals as AgentsPayload["totals"],
             by_issue: data.by_issue as AgentsPayload["by_issue"],
+            profiles: Array.isArray(data.profiles) ? (data.profiles as AgentsPayload["profiles"]) : value.profiles,
           }));
           // Issue-page lane stores depend on runtime state, including
           // changes which leave their issue card unchanged.

@@ -114,7 +114,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "agent_profile_create",
         Rule::Handler("operator_connection_on_agent: the operator only; no agent (CAD-1989)"),
     ),
-    ("agent_profile_context", Rule::Read),
+    (
+        "agent_profile_context",
+        Rule::Handler("operator, or the agent whose own runtime row is registered against that profile (CAD-1989)"),
+    ),
     (
         "agent_instructions_set",
         Rule::Handler("operator_connection_on_agent: the operator only; no agent, not even the target or its PM (CAD-1752)"),

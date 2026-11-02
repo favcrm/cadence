@@ -78,7 +78,11 @@
           "type": "string"
         },
         "job": {
-          "type": "string"
+          "description": "The operator's to read: absent from the board's shared payload.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "look": {
           "type": [
@@ -108,7 +112,6 @@
         "alias",
         "role",
         "team_role",
-        "job",
         "model",
         "runtimes"
       ]

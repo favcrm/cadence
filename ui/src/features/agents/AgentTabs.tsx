@@ -721,8 +721,8 @@ function Settings({ c }: { c: TabContext }) {
             <dd>{a.cwd ?? "—"}</dd>
             <dt>{t("team role")}</dt>
             <dd>{a.team_role ?? c.observed?.team_role ?? "—"}</dd>
-            <dt>{t("catalogue")}</dt>
-            <dd>{typeof a.params?.catalogue === "string" ? a.params.catalogue : "—"}</dd>
+            <dt>{t("profile")}</dt>
+            <dd>{typeof a.params?.profile === "string" ? a.params.profile : "—"}</dd>
             {identity
               .filter(([, v]) => shown(v))
               .map(([k, v]) => (
@@ -732,7 +732,7 @@ function Settings({ c }: { c: TabContext }) {
                 </div>
               ))}
             {Object.entries(a.params ?? {})
-              .filter(([k]) => k !== "catalogue")
+              .filter(([k]) => k !== "profile")
               .map(([k, v]) => (
               <div key={k} className="contents">
                 <dt title={`param ${k}`}>{k}</dt>

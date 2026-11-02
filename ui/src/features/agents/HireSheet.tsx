@@ -230,14 +230,15 @@ export default function HireSheet({
             <dd>{role.look}</dd>
           </dl>
         </details>
-        {err && (
-          <p role="alert" className="text-label text-fail">
-            {err}
-          </p>
-        )}
       </div>
       <div className="rc-sheet-f">
-        <span className="why">{why}</span>
+        {err ? (
+          <span className="why text-fail" role="alert">
+            {err}
+          </span>
+        ) : (
+          <span className="why">{why}</span>
+        )}
         <Button variant="ghost" size="sm" onClick={onClose}>
           {t("Cancel")}
         </Button>

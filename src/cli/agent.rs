@@ -313,7 +313,7 @@ pub(crate) enum AgentAction {
     /// description a runtime registers against, never a credential.
     Profiles,
     /// Print one agent profile's context: the profile and the job a runtime
-    /// registered against it (`cadence join <alias> --profile <id>`) is
+    /// registered against it (`cadence join <group> <provider> --profile <id>`) is
     /// briefed with. A hosted org adds the wiki pages under
     /// `agents/<id>/{profile,knowledge,memory}` the caller's own access allows.
     /// Read-only; it authenticates nobody.
