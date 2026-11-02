@@ -3032,6 +3032,8 @@ impl Shared {
             }
             "agent_register" => self.rpc_register(params, peer_pid),
             "agent_roles" => self.rpc_agent_roles(),
+            "agent_profile_create" => self.rpc_agent_profile_create(params, peer_pid),
+            "agent_profile_context" => self.rpc_agent_profile_context(params),
             "agent_instructions_set" => self.rpc_instructions_set(params, peer_pid),
             "model_defaults_get" => self.rpc_model_defaults_get(),
             "model_defaults_set" => self.rpc_model_defaults_set(params, peer_pid),
@@ -3148,7 +3150,9 @@ impl Shared {
                             )
                     })
                     .count();
-                Ok(json!({"agents": agents, "live": live}))
+                let profiles =
+                    crate::agent_settings::profile_list(&self.store, &self.store.agents()?)?;
+                Ok(json!({"agents": agents, "live": live, "profiles": profiles}))
             }
             "agent_identity" => {
                 if !params.as_object().is_some_and(|fields| fields.is_empty()) {

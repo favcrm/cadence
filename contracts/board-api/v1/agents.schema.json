@@ -23,6 +23,13 @@
     "daemon": {
       "$ref": "#/$defs/DaemonReach"
     },
+    "profiles": {
+      "description": "CAD-1989: the settings profiles, each with the runtime aliases\nregistered against it.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentProfile"
+      }
+    },
     "refresh_error": {
       "type": "boolean"
     },
@@ -48,11 +55,64 @@
     "daemon",
     "agents",
     "by_issue",
+    "profiles",
     "snapshot_age_secs",
     "stale",
     "refresh_error"
   ],
   "$defs": {
+    "AgentProfile": {
+      "description": "One agent profile of `GET /api/agents` (CAD-1989).",
+      "type": "object",
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "catalogue": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "job": {
+          "type": "string"
+        },
+        "look": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "`inherit` or a model id.",
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "runtimes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "team_role": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "alias",
+        "role",
+        "team_role",
+        "job",
+        "model",
+        "runtimes"
+      ]
+    },
     "AgentQuota": {
       "description": "A provider allowance record as the store keeps it. The envelope is fixed;\n`data` is the provider's own report (for Codex, its rate-limit buckets).",
       "type": "object",

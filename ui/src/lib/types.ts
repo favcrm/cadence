@@ -543,13 +543,9 @@ export interface UsageLimit {
  * `local` sends the existing provider and endpoint kind plus cwd. No
  * per-issue location exists.
  */
-/** CAD-1752: a hire from the built-in role catalogue sends `catalogue` and
- *  no location, provider or endpoint kind — the install picks the runtime. */
 export interface AgentRegisterBody {
   alias: string;
   location?: "local" | "cloud";
-  catalogue?: string;
-  look?: string;
   provider?: string;
   endpoint_kind?: string;
   role?: string;
@@ -561,7 +557,16 @@ export interface AgentRegisterBody {
   params?: string;
 }
 
-/** One role of `GET /api/agent-roles`. */
+/** CAD-1989: `POST /api/agent-profiles` body. A hire saves a profile only;
+ *  `job` is sent only when edited, `model` only when one is picked. */
+export interface AgentProfileBody {
+  alias: string;
+  catalogue: string;
+  job?: string;
+  model?: string;
+}
+
+/** One role of `GET /api/agent-roles`. Roles carry no model. */
 export interface AgentRole {
   id: string;
   category: string;
@@ -576,8 +581,6 @@ export interface AgentRole {
   first_tasks: string[];
   /** The text a hire stores as the agent's instructions. */
   instructions: string;
-  /** The model a hire would launch on, or why none resolves. */
-  model: { id: string; source: string } | { error: string };
 }
 
 export interface AgentRolesPayload {
@@ -624,7 +627,15 @@ export type Agent = Omit<
 };
 
 /** `GET /api/agents` (the roster beside its snapshot's freshness). */
-export type AgentsPayload = Omit<Api.AgentsResponse, "agents"> & { agents: Agent[] };
+export type AgentsPayload = Omit<Api.AgentsResponse, "agents" | "profiles"> & {
+  agents: Agent[];
+  /** Absent from a board that predates profiles. */
+  profiles?: HiredProfile[];
+};
+
+/** One profile of `GET /api/agents` (CAD-1989): who an agent is, with the
+ *  aliases of the runtimes registered against it. */
+export type HiredProfile = Api.AgentProfile;
 
 /** Best-effort destination for a verified app-scoped master turn. This is
  * navigation metadata only; the app route proves its binding independently. */

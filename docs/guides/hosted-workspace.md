@@ -248,7 +248,7 @@ cadence --org acme local-agent report <assignment-id> --state blocked --text "wa
 only the named issue. Inspect the receipt for the claim, lane and reporting
 instructions. The board checks claim and generation on reports, but the
 profile-derived client ID is not proof of a distinct session identity.
-`--profile` does not read profile content; load it with `context`. The
+`--profile` does not read profile content; load it with `context`. Hiring creates only such a profile (CAD-1989): no runtime, provider, sandbox or model is chosen, nothing launches, and `model` stays `inherit` until a runtime resolves it or one is set explicitly. A native board reads a profile the same way with `cadence agent context <alias>`. The
 authenticated caller, not the profile, carries authority.
 
 Profile claims depend on the deployed board and client versions. An older

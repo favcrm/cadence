@@ -61,6 +61,7 @@ pub(super) enum RouteId {
     Locale,
     Reports,
     AgentRegister,
+    AgentProfileCreate,
     CatalogInstall,
     CatalogGitCheck,
     CatalogRequest,
@@ -409,6 +410,7 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
     row!(Locale, "/api/locale", CallerScoped, &[]),
     row!(Reports, "/api/reports", AgentAllowed, &[]),
     row!(AgentRegister, "/api/agents", OperatorOnly, &[]),
+    row!(AgentProfileCreate, "/api/agent-profiles", OperatorOnly, &[]),
     row!(
         CatalogInstall,
         "/api/app-catalog/install",

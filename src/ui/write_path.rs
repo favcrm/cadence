@@ -8,8 +8,8 @@ use std::io::Read;
 use std::path::Path;
 
 use cadence_core::board_api::{
-    AgentRegisterReq, CardAgent, CommentReq, IssueDetail, LinkReq, NewIssueReq, PatchReq, RefReq,
-    ReportReq,
+    AgentProfileReq, AgentRegisterReq, CardAgent, CommentReq, IssueDetail, LinkReq, NewIssueReq,
+    PatchReq, RefReq, ReportReq,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -339,6 +339,34 @@ fn resolve_location(req: &AgentRegisterReq) -> std::result::Result<(String, Stri
     }
 }
 
+/// `POST /api/agent-profiles` (CAD-1989): a hire saves a profile and launches
+/// nothing. The operator gate ran in `admit`; the daemon proves it again.
+pub(crate) fn post_agent_profile(request: &mut Request, state_dir: &Path) -> HttpResp {
+    let bytes = match read_body(request, JSON_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: AgentProfileReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let params = json!({
+        "alias": req.alias.trim(),
+        "catalogue": req.catalogue,
+        "job": req.job,
+        "model": req.model,
+    });
+    match client::rpc(state_dir, "agent_profile_create", params) {
+        Ok(profile) => {
+            let bytes = serde_json::to_vec_pretty(&json!({"profile": profile})).unwrap_or_default();
+            let mut resp = Response::from_data(bytes).with_status_code(StatusCode(201));
+            resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+            resp
+        }
+        Err(err) => super::home::rpc_err(&err, "agent_profile_create"),
+    }
+}
+
 /// `POST /api/agents`: register one agent through the daemon's
 /// `agent_register` (`rpc_register`). The operator gate ran in `admit`;
 /// the daemon applies the same validation a CLI registration does.
@@ -351,49 +379,6 @@ pub(crate) fn post_agent(request: &mut Request, state_dir: &Path) -> HttpResp {
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    // CAD-1752: a catalogue hire is relayed without a runtime — the daemon
-    // takes provider and endpoint kind from the install and refuses a
-    // caller that names them; here the board refuses `location` as well.
-    if req.catalogue.is_some() {
-        if req.location.is_some() || req.provider.is_some() || req.endpoint_kind.is_some() {
-            return err_response(
-                400,
-                "a catalogue hire takes its runtime from the install - send no location, provider or endpoint kind",
-            );
-        }
-        let params = json!({
-            "alias": req.alias.trim(),
-            "catalogue": req.catalogue,
-            "look": req.look,
-            "role": req.role,
-            "team_role": req.team_role,
-            "model_policy": req.model_policy,
-            "cwd": req.cwd,
-            "sandbox": req.sandbox,
-            "instructions": req.instructions,
-            "params": req.params,
-        });
-        let instructions = match (&req.instructions, req.catalogue.as_deref()) {
-            (Some(text), _) => Some(text.clone()),
-            (None, Some(id)) => crate::agent_roles::find(id).map(|role| role.instructions()),
-            (None, None) => None,
-        };
-        return match client::rpc(state_dir, "agent_register", params) {
-            Ok(mut out) => {
-                crate::briefing::brief_registered(
-                    state_dir,
-                    req.alias.trim(),
-                    instructions.as_deref(),
-                    &mut out,
-                );
-                json_response(out)
-            }
-            Err(err) => super::home::rpc_err(&err, "agent_register"),
-        };
-    }
-    if req.look.is_some() {
-        return err_response(400, "look only applies to a catalogue hire");
-    }
     let (provider, endpoint_kind) = match resolve_location(&req) {
         Ok(pair) => pair,
         Err(message) => return err_response(400, &message),
@@ -1236,6 +1221,7 @@ pub(crate) fn write_route(
                 None => err_response(500, "unadmitted write"),
             },
             RouteId::AgentRegister => post_agent(&mut request, state_dir),
+            RouteId::AgentProfileCreate => post_agent_profile(&mut request, state_dir),
             RouteId::CatalogInstall => explorer_write(
                 &mut request,
                 state_dir,
@@ -2487,8 +2473,6 @@ mod agent_setup_tests {
             sandbox: None,
             instructions: None,
             params: None,
-            catalogue: None,
-            look: None,
         }
     }
 

@@ -15,6 +15,8 @@ import type {
   AgentAccess,
   AgentDetail,
   AgentRegisterBody,
+  AgentProfileBody,
+  HiredProfile,
   AgentRolesPayload,
   InstructionsResult,
   AgentsPayload,
@@ -928,8 +930,11 @@ export const api = {
    * endpoint kind to `sandbox`.
    */
   registerAgent: (body: AgentRegisterBody) => post<Record<string, unknown>>("/api/agents", body),
-  /** `GET /api/agent-roles` (CAD-1752) — the role catalogue, the install's
-   *  runtime and the model each role would launch on. Any signed-in viewer. */
+  /** `POST /api/agent-profiles` (CAD-1989) - a hire saves a profile and
+   *  launches nothing. Operator only. */
+  createAgentProfile: (body: AgentProfileBody) =>
+    post<{ profile: HiredProfile }>("/api/agent-profiles", body),
+  /** `GET /api/agent-roles` (CAD-1752) — the role catalogue. Any signed-in viewer. */
   agentRoles: () => get<AgentRolesPayload>("/api/agent-roles"),
   /** `POST /api/agents/<alias>/instructions` (CAD-1752) — replace the
    *  agent's standing instructions. Operator only. */

@@ -37,6 +37,10 @@ struct Profile {
     model: String,
     job: String,
     text: String,
+    /// CAD-1989: the catalogue role a hire copied this profile from, and the
+    /// avatar look chosen for it. Both are optional front matter.
+    catalogue: Option<String>,
+    look: Option<String>,
 }
 
 struct Overlay {
@@ -84,9 +88,17 @@ pub fn save(
     let _ = crate::secret::guard("agents settings", &config.to_string())?;
     store.import_legacy_settings(&pm.dir)?;
     let overlay = parse_overlay(config)?;
-    let profiles = parse_profiles(config, &overlay)?;
+    let mut profiles = parse_profiles(config, &overlay)?;
     let current = store.settings()?;
     let previous = profiles_from(&current.doc.profiles)?;
+    // The Settings form does not carry the catalogue id or look; an edit
+    // must not drop what a hire recorded.
+    for profile in &mut profiles {
+        if let Some(prior) = previous.iter().find(|prev| prev.id == profile.id) {
+            profile.catalogue = prior.catalogue.clone();
+            profile.look = prior.look.clone();
+        }
+    }
     let policy = current.doc.pi.clone();
     let token = revision_token(
         current.revision,
@@ -961,6 +973,8 @@ fn parse_profiles(config: &Value, overlay: &Overlay) -> Result<Vec<Profile>> {
             model,
             job,
             text: String::new(),
+            catalogue: None,
+            look: None,
         };
         out.push(profile);
     }
@@ -1771,6 +1785,8 @@ fn parse_agent(slug: &str, text: &str) -> Result<Profile> {
             model: "inherit".to_string(),
             job: text.trim().to_string(),
             text: text.to_string(),
+            catalogue: None,
+            look: None,
         });
     };
     let Some((front, body)) = rest.split_once("\n---\n") else {
@@ -1780,15 +1796,19 @@ fn parse_agent(slug: &str, text: &str) -> Result<Profile> {
             model: "inherit".to_string(),
             job: text.trim().to_string(),
             text: text.to_string(),
+            catalogue: None,
+            look: None,
         });
     };
     let mut role = None;
     let mut model = None;
+    let mut catalogue = None;
+    let mut look = None;
     for line in front.lines() {
         let Some((key, raw)) = line.split_once(':') else {
             continue;
         };
-        if !matches!(key.trim(), "role" | "model") {
+        if !matches!(key.trim(), "role" | "model" | "catalogue" | "look") {
             continue;
         }
         let raw = raw.trim();
@@ -1805,6 +1825,8 @@ fn parse_agent(slug: &str, text: &str) -> Result<Profile> {
         match key.trim() {
             "role" => role = Some(value),
             "model" => model = Some(value),
+            "catalogue" => catalogue = Some(value).filter(|v| !v.is_empty()),
+            "look" => look = Some(value).filter(|v| !v.is_empty()),
             _ => unreachable!(),
         }
     }
@@ -1821,12 +1843,23 @@ fn parse_agent(slug: &str, text: &str) -> Result<Profile> {
         model,
         job: body.trim().to_string(),
         text: text.to_string(),
+        catalogue,
+        look,
     })
 }
 
 fn render_agent(profile: &Profile) -> String {
+    let mut extra = String::new();
+    for (key, value) in [("catalogue", &profile.catalogue), ("look", &profile.look)] {
+        if let Some(value) = value {
+            extra.push_str(&format!(
+                "{key}: {}\n",
+                serde_json::to_string(value).expect("profile field is a serializable string")
+            ));
+        }
+    }
     format!(
-        "---\n{PROFILE_MARKER}: \"1\"\nrole: {}\nmodel: {}\n---\n{}\n",
+        "---\n{PROFILE_MARKER}: \"1\"\nrole: {}\nmodel: {}\n{extra}---\n{}\n",
         serde_json::to_string(&profile.role).expect("profile role is a serializable string"),
         serde_json::to_string(&profile.model).expect("profile model is a serializable string"),
         profile.job.trim()
@@ -2658,5 +2691,170 @@ mod omp_harness_tests {
         assert!(pi_family("", Some(omp)));
         assert!(pi_family("Pi extension", None));
         assert!(!pi_family("", None));
+    }
+}
+
+/// CAD-1989: one profile as the board and `agent context` show it. `role` is
+/// the catalogue role's title when the profile came from one, else the team
+/// role; `team_role` is always the stored team role.
+fn profile_json(profile: &Profile, runtimes: &[String]) -> Value {
+    let role = profile
+        .catalogue
+        .as_deref()
+        .and_then(crate::agent_roles::find)
+        .map_or(profile.role.as_str(), |role| role.title);
+    json!({
+        "id": profile.id, "alias": profile.id, "role": role,
+        "team_role": profile.role, "catalogue": profile.catalogue,
+        "look": profile.look, "job": profile.job, "model": profile.model,
+        "runtimes": runtimes,
+    })
+}
+
+/// Every settings profile with the aliases of the runtimes registered
+/// against it (`params.profile == id`).
+pub fn profile_list(store: &Store, agents: &[Agent]) -> Result<Vec<Value>> {
+    Ok(profiles_from(&store.settings()?.doc.profiles)?
+        .iter()
+        .map(|profile| {
+            let runtimes: Vec<String> = agents
+                .iter()
+                .filter(|agent| agent_profile(agent) == Some(profile.id.as_str()))
+                .map(|agent| agent.alias.clone())
+                .collect();
+            profile_json(profile, &runtimes)
+        })
+        .collect())
+}
+
+/// `cadence agent context <id>` on a local board, in the hosted
+/// `agent_profile_context` envelope: `{context: {profile, identity,
+/// knowledge, unavailable}}`. A native board keeps no per-profile wiki areas,
+/// so each is named in `unavailable` rather than invented. `revision` is the
+/// settings revision the profile was read at.
+pub fn profile_context(store: &Store, agents: &[Agent], id: &str) -> Result<Value> {
+    let listed = profile_list(store, agents)?
+        .into_iter()
+        .find(|profile| profile["id"].as_str() == Some(id))
+        .ok_or_else(|| Error::rejected(format!("unknown profile '{id}'")))?;
+    let skills = listed["catalogue"]
+        .as_str()
+        .and_then(crate::agent_roles::find)
+        .map_or(&[][..], |role| role.skills);
+    let reason = "a native board keeps no per-profile wiki area";
+    let area = json!({"available": false, "reason": reason});
+    Ok(json!({"context": {
+        "profile": {
+            "id": listed["id"], "name": listed["alias"], "role": listed["role"],
+            "responsibilities": listed["job"], "skills": skills,
+            "status": "active", "revision": store.settings()?.revision,
+            "model": listed["model"],
+        },
+        "identity": {
+            "attribution": "external",
+            "agent_authenticated": false,
+            "note": "This profile is context for an external session. Loading it does not authenticate the session as the agent, and it grants no review, merge or execution authority.",
+        },
+        "knowledge": {"profile": area, "knowledge": area, "memory": area},
+        "unavailable": [
+            format!("profile: {reason}"),
+            format!("knowledge: {reason}"),
+            format!("memory: {reason}"),
+        ],
+    }}))
+}
+
+/// A hire from the role catalogue: save a settings profile and nothing else.
+/// No runtime row, no home directory, no launch. `job` replaces the role's
+/// instructions only when given; a model other than `inherit` must be a
+/// registered one (an explicit model stays strict).
+pub fn create_catalogue_profile(
+    store: &Store,
+    alias: &str,
+    role: &crate::agent_roles::Role,
+    look: &str,
+    job: Option<&str>,
+    model: Option<&str>,
+) -> Result<Value> {
+    check_slug(alias)?;
+    master::refuse_reserved_alias(alias)?;
+    let current = store.settings()?;
+    let taken =
+        current.doc.profiles.iter().any(|p| p.id == alias) || store.agent_opt(alias)?.is_some();
+    if taken {
+        return Err(Error::conflict_coded(
+            "alias_taken",
+            format!("Agent '{alias}' already exists - pick another alias"),
+        ));
+    }
+    let model = validate_model_id(model.unwrap_or("inherit"))?;
+    if model != "inherit" {
+        let overlay = present_overlay(&current.doc.model_defaults, current.doc.pi.as_ref());
+        if !overlay
+            .models
+            .iter()
+            .any(|row| row["id"].as_str() == Some(model.as_str()))
+        {
+            return Err(Error::rejected(format!(
+                "model '{model}' is not a registered model - pick one from Settings > Agents or leave it to inherit"
+            )));
+        }
+    }
+    let job = job
+        .filter(|job| !job.trim().is_empty())
+        .map_or_else(|| role.instructions(), str::to_string);
+    check_markdown("profile job", &job, crate::master::AGENT_MAX_CHARS)?;
+    if job.len() > crate::store::MAX_INSTRUCTIONS_BYTES {
+        return Err(Error::rejected(format!(
+            "the job must be at most {} UTF-8 bytes",
+            crate::store::MAX_INSTRUCTIONS_BYTES
+        )));
+    }
+    let mut profile = Profile {
+        id: alias.to_string(),
+        role: role.team_role.to_string(),
+        model,
+        job,
+        text: String::new(),
+        catalogue: Some(role.id.to_string()),
+        look: Some(look.to_string()),
+    };
+    profile.text = render_agent(&profile);
+    master::check_file("AGENT.md", &profile.text)?;
+    let _ = crate::secret::guard("agent profile", &profile.text)?;
+    let mut doc = current.doc.clone();
+    doc.profiles.push(crate::store::ProfileBody {
+        id: profile.id.clone(),
+        text: profile.text.clone(),
+    });
+    store.save_settings(current.revision, doc, ACTOR)?;
+    Ok(profile_json(&profile, &[]))
+}
+
+#[cfg(test)]
+mod profile_context_tests {
+    use super::*;
+
+    /// CAD-1989: the native context is the hosted `agent_profile_context`
+    /// envelope, and a hire writes a profile but no agent row.
+    #[test]
+    fn native_context_matches_the_hosted_envelope() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+        let role = crate::agent_roles::find("developer").unwrap();
+        create_catalogue_profile(&store, "dev-1", role, role.look, None, None).unwrap();
+        assert!(store.agents().unwrap().is_empty());
+
+        let out = profile_context(&store, &[], "dev-1").unwrap();
+        let context = &out["context"];
+        assert_eq!(context["profile"]["id"], "dev-1");
+        assert_eq!(context["profile"]["model"], "inherit");
+        assert_eq!(context["profile"]["skills"], json!(role.skills));
+        assert_eq!(context["profile"]["status"], "active");
+        assert_eq!(context["identity"]["attribution"], "external");
+        assert_eq!(context["identity"]["agent_authenticated"], false);
+        assert_eq!(context["knowledge"]["memory"]["available"], false);
+        assert_eq!(context["unavailable"].as_array().unwrap().len(), 3);
+        assert!(profile_context(&store, &[], "nope").is_err());
     }
 }

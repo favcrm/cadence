@@ -756,6 +756,7 @@ pub(crate) fn agents_payload_typed(
             agents: vec![],
             totals: None,
             by_issue: BTreeMap::new(),
+            profiles: vec![],
         };
     };
     let task_map = jobs
@@ -957,6 +958,7 @@ pub(crate) fn agents_payload_typed(
         agents: out,
         totals: Some(totals),
         by_issue,
+        profiles: list["profiles"].as_array().cloned().unwrap_or_default(),
     }
 }
 

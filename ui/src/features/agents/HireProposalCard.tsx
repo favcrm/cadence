@@ -32,7 +32,10 @@ export default function HireProposalCard({
   const proposal = entry.payload ?? {};
   const roleId = typeof proposal.role === "string" ? proposal.role : "";
   const role: AgentRole | undefined = roles.data?.roles.find((r) => r.id === roleId);
-  const taken = (roster.data?.agents ?? []).map((a) => a.alias);
+  const taken = [
+    ...(roster.data?.agents ?? []).map((a) => a.alias),
+    ...(roster.data?.profiles ?? []).map((p) => p.id),
+  ];
   const name = typeof proposal.name === "string" && proposal.name ? proposal.name : null;
   const job = typeof proposal.job === "string" ? proposal.job : undefined;
 
@@ -58,8 +61,8 @@ export default function HireProposalCard({
       <HireGate reason={hireBlock} />
       {hired ? (
         <p className="ap-saved" role="status">
-          {t("Hired {name}.").replace("{name}", () => hired)}{" "}
-          <Button variant="ghost" size="sm" href={`/agents/${encodeURIComponent(hired)}`}>
+          {t("Added {name}.").replace("{name}", () => hired)}{" "}
+          <Button variant="ghost" size="sm" href="/agents">
             {t("Open")}
           </Button>
         </p>
@@ -69,7 +72,7 @@ export default function HireProposalCard({
             variant="primary"
             size="sm"
             disabled={hireBlock !== null}
-            title={hireBlock ?? t("Opens the hire sheet; nothing is hired until you press Hire")}
+            title={hireBlock ?? t("Opens the hire sheet; nothing is added until you press Add")}
             onClick={() => setOpen(true)}
           >
             {t("Review and hire")}
@@ -87,9 +90,9 @@ export default function HireProposalCard({
           job={job}
           taken={taken}
           onClose={() => setOpen(false)}
-          onHired={(alias) => {
+          onHired={(profile) => {
             setOpen(false);
-            setHiredNow(alias);
+            setHiredNow(profile.alias);
             void resources.agents.refresh();
           }}
         />

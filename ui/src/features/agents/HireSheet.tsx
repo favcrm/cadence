@@ -4,10 +4,13 @@ import { ApiError } from "../../lib/apiError";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import { HireBlock } from "../auth/WriteGate";
-import type { AgentRole, AgentRolesPayload } from "../../lib/types";
+import type { HiredProfile, AgentRole, AgentRolesPayload } from "../../lib/types";
 import AgentAvatar from "./AgentAvatar";
 import { HireGate } from "./RecruitCards";
-import { aliasProblem, categoryLabel, modelSourceText, runsOnText } from "./agentRoles";
+import { aliasProblem, categoryLabel } from "./agentRoles";
+
+/** The model a profile starts with: the runtime decides at launch. */
+const INHERIT = "inherit";
 
 function Chip({ text, planned = false }: { text: string; planned?: boolean }) {
   const t = useTranslate();
@@ -37,7 +40,7 @@ export default function HireSheet({
   job?: string;
   taken: string[];
   onClose: () => void;
-  onHired: (alias: string, role: AgentRole) => void;
+  onHired: (profile: HiredProfile, role: AgentRole) => void;
 }) {
   const t = useTranslate();
   const hireBlock = useContext(HireBlock);
@@ -46,10 +49,23 @@ export default function HireSheet({
   const [job, setJob] = useState(startJob ?? role.instructions);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const hosted = payload.install.hosted;
-  const modelError = "error" in role.model ? role.model.error : null;
+  const [model, setModel] = useState(INHERIT);
+  const [models, setModels] = useState<string[]>([]);
   const problem = aliasProblem(alias, taken);
-  const blocked = hireBlock !== null || modelError !== null || problem !== null;
+  const blocked = hireBlock !== null || problem !== null;
+
+  // The registered models are an optional choice: a failed read leaves the
+  // sheet on "Inherit from the runtime", which never blocks a hire.
+  useEffect(() => {
+    let live = true;
+    api
+      .agentSettings()
+      .then((snapshot) => live && setModels(snapshot.config.models.map((m) => m.id)))
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, []);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -70,13 +86,14 @@ export default function HireSheet({
     setErr(null);
     try {
       const name = alias.trim();
-      await api.registerAgent({
+      const { profile } = await api.createAgentProfile({
         alias: name,
         catalogue: role.id,
         // The role's job is the default; only an edited job is sent.
-        instructions: job !== role.instructions ? job : undefined,
+        job: job !== role.instructions ? job : undefined,
+        model: model !== INHERIT ? model : undefined,
       });
-      onHired(name, role);
+      onHired(profile, role);
     } catch (error) {
       setErr(error instanceof ApiError || error instanceof Error ? error.message : String(error));
     } finally {
@@ -84,7 +101,7 @@ export default function HireSheet({
     }
   };
 
-  const why = hireBlock !== null ? t("Only the operator can hire.") : t("Nothing runs until you hire.");
+  const why = hireBlock !== null ? t("Only the operator can hire.") : t("Nothing runs until a runtime connects.");
   return (
     <dialog
       ref={dialogRef}
@@ -145,26 +162,6 @@ export default function HireSheet({
           )}
         </label>
 
-        <div className="rc-runs">
-          <span className="ri" aria-hidden="true">
-            {hosted ? "☁" : "⌂"}
-          </span>
-          <div>
-            <b>{t("Runs on {where}").replace("{where}", () => t(runsOnText(hosted)))}</b>
-            <small>
-              {hosted
-                ? t("Always on, through your workspace's model gateway")
-                : t("Uses this computer and your model settings")}
-            </small>
-            {/* TODO(CAD-1753): gate on the real sandbox entitlement; for now the hosted flag. */}
-            {role.kind === "tickets" && hosted && (
-              <small className="sb">
-                {t("Ticket work can run in a cloud sandbox — chosen per ticket, not here.")}
-              </small>
-            )}
-          </div>
-        </div>
-
         <div className="rc-blk">
           <h4>{t("What it knows")}</h4>
           <div className="rc-kst-row">
@@ -200,18 +197,18 @@ export default function HireSheet({
           <p className="rc-note">{t("Not copied: logins, API keys, MCP servers. Connect them after hiring.")}</p>
         </div>
 
-        {modelError === null ? (
-          <div className="rc-modelrow">
-            {t("Model:")} <b>{"id" in role.model ? role.model.id : ""}</b>
-            <span>
-              · {modelSourceText(role)} · {t("set in Settings › Agents")}
-            </span>
-          </div>
-        ) : (
-          <div className="rc-modelrow bad" role="alert">
-            {t("No model can be chosen for this role:")} {modelError}
-          </div>
-        )}
+        <label className="rc-fld">
+          <span className="lab">{t("Model")}</span>
+          <select className="field" value={model} onChange={(event) => setModel(event.target.value)}>
+            <option value={INHERIT}>{t("Inherit from the runtime")}</option>
+            {models.map((id) => (
+              <option key={id} value={id}>
+                {id}
+              </option>
+            ))}
+          </select>
+          <span className="hint">{t("A model you pick is used as chosen or refused, never swapped.")}</span>
+        </label>
         <details className="rc-adv">
           <summary>{t("Customize job and advanced")}</summary>
           <label className="rc-fld">
@@ -225,13 +222,9 @@ export default function HireSheet({
           <dl className="rc-kv" style={{ marginTop: "0.75rem" }}>
             <dt>{t("team role")}</dt>
             <dd>{role.team_role}</dd>
-            <dt>{t("runtime")}</dt>
-            <dd>
-              {payload.install.provider} · {hosted ? t("agenticos gateway") : t("local")}
-            </dd>
             <dt>{t("catalogue")}</dt>
             <dd>
-              {role.id} {t("(recorded on the agent)")}
+              {role.id} {t("(recorded on the profile)")}
             </dd>
             <dt>{t("look")}</dt>
             <dd>{role.look}</dd>
@@ -251,10 +244,10 @@ export default function HireSheet({
         <Button
           variant="primary"
           disabled={blocked || saving}
-          title={hireBlock ?? modelError ?? undefined}
+          title={hireBlock ?? undefined}
           onClick={() => void hire()}
         >
-          {saving ? t("Hiring…") : t("Hire {name}").replace("{name}", () => alias.trim())}
+          {saving ? t("Adding…") : t("Add {name}").replace("{name}", () => alias.trim())}
         </Button>
       </div>
     </dialog>

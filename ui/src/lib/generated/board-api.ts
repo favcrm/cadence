@@ -35,6 +35,20 @@ export type ActorIdentity = {
   scope: "workspace";
 };
 
+/** One agent profile of `GET /api/agents` (CAD-1989). */
+export interface AgentProfile {
+  alias: string;
+  catalogue?: string | null;
+  id: string;
+  job: string;
+  look?: string | null;
+  /** `inherit` or a model id. */
+  model: string;
+  role: string;
+  runtimes: string[];
+  team_role: string;
+}
+
 /** A provider allowance record as the store keeps it. The envelope is fixed;
  * `data` is the provider's own report (for Codex, its rate-limit buckets). */
 export interface AgentQuota {
@@ -162,6 +176,9 @@ export interface AgentsResponse {
   /** Issue id to its bound agent strip. */
   by_issue: Record<string, CardAgent[]>;
   daemon: DaemonReach;
+  /** CAD-1989: the settings profiles, each with the runtime aliases
+   * registered against it. */
+  profiles: AgentProfile[];
   refresh_error: boolean;
   snapshot_age_secs: number;
   stale: boolean;
