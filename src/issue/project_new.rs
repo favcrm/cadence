@@ -20,6 +20,10 @@
 //! Idempotent: a second run with the same key and mode changes nothing.
 //! Repo-less projects cannot seed repository-local goal or staffing values.
 //! Refusals happen before anything is written.
+//!
+//! A checkout may be registered by several projects (CAD-2001): each one
+//! records its own `repos` row and gets its own `<pm>/<key>/PROJECT.md`,
+//! and a run never writes inside another project's key directory.
 
 use std::path::{Path, PathBuf};
 
@@ -234,20 +238,10 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
 
     let _lock = pm.lock()?;
     let projects = project::list(&pm.dir)?;
-    if let Some((root, remote)) = &identity {
-        if let Some(other) = projects.iter().find(|p| {
-            p.key != key
-                && p.repos
-                    .iter()
-                    .any(|r| same_repo(r, root, remote.as_deref()))
-        }) {
-            return Err(Error::rejected(format!(
-                "{} is already project '{}' — one repo, one project",
-                root.display(),
-                other.key
-            )));
-        }
-    }
+    // CAD-2001: a repo may be registered by several projects. A project
+    // registering a checkout another project already records is a shared
+    // repo, not a conflict — this call still writes only `<pm>/<key>/`,
+    // so no other project's project.yaml or PROJECT.md is touched.
     let existing = projects.iter().find(|p| p.key == key);
     if let Some(p) = existing {
         let same_mode = match &identity {
@@ -525,7 +519,6 @@ mod tests {
 
         let refusals = [
             (req("demo", &b), "different repo"),
-            (req("other", &a), "already project 'demo'"),
             (req("agents", &b), "reserved"),
             (req("Bad_Key", &b), "Invalid project key"),
             (req("fresh", &plain), "not a git repo"),
@@ -561,9 +554,30 @@ mod tests {
             assert!(err.contains(want), "{want}: {err}");
         }
         assert_eq!(commits(&pm), after, "a refusal commits nothing");
-        for key in ["other", "agents", "fresh"] {
+        for key in ["agents", "fresh"] {
             assert!(!pm.dir.join(key).exists(), "{key}");
         }
+
+        // CAD-2001: a repo may be registered by several projects. The
+        // second registration writes only its own key dir, so `demo`'s
+        // record and PROJECT.md are left exactly as they were.
+        let demo_yaml = std::fs::read(pm.dir.join("demo/project.yaml")).unwrap();
+        let demo_manifest = std::fs::read(work::config_file(&pm.dir, "demo")).unwrap();
+        let shared = run(&pm, &req("other", &a), "operator", &[]).unwrap();
+        assert_eq!(shared["changed"], true, "{shared}");
+        assert_eq!(shared["repo"].as_str(), a.to_str(), "{shared}");
+        assert_eq!(
+            std::fs::read(pm.dir.join("demo/project.yaml")).unwrap(),
+            demo_yaml
+        );
+        assert_eq!(
+            std::fs::read(work::config_file(&pm.dir, "demo")).unwrap(),
+            demo_manifest
+        );
+        let other = project::load(&pm.dir.join("other/project.yaml")).unwrap();
+        assert_eq!(other.repos[0].path.as_deref(), a.to_str());
+        assert_eq!(other.prefix, "OTH");
+        assert!(work::config_file(&pm.dir, "other").is_file());
     }
 
     #[test]

@@ -949,12 +949,17 @@ business: no `--ready`, no forced claims; the output prints the queued
 message id and the worker's probe verdict so the operator knows
 whether it lands now or when the pane idles.
 
-**Task context delivery (CAD-1822, CAD-1846).** Plain dispatch, explicit
-`dispatch --job --spec`, and native issue-linked job task dispatch use the
+**Task context delivery (CAD-1822, CAD-1846, CAD-2001).** Plain dispatch,
+explicit `dispatch --job --spec`, and native issue-linked job task dispatch use the
 same project-source and current-policy lesson selection for the actual
 worker's role. They pin the task contract and the assigned project's tracked
 sources, but only when that project's tracked
-`docs/cadence/project-context.yaml` at HEAD sets `agent_delivery: true`.
+`docs/cadence/projects/<key>/project-context.yaml` — or, when that is not
+tracked, `docs/cadence/project-context.yaml` — at HEAD sets
+`agent_delivery: true`. One checkout can serve several projects, so the
+per-project path is preferred and lets each project keep its own opt-in;
+the shared default serves only the project its `project:` names, and a
+manifest naming another project is refused, never read as this project's.
 Absent or false leaves every existing dispatch path unchanged. A
 tracked manifest the daemon cannot read or parse cannot prove the
 opt-in, so delivery stays off and dispatch is unchanged; once

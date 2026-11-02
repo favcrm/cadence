@@ -56,6 +56,116 @@ fn audit_verdict_is_a_registered_mutating_write() {
 }
 
 #[test]
+fn the_project_scoped_gate_verbs_are_registered_with_their_scopes() {
+    // CAD-2001: the review evidence is project-scoped, so this build sends the
+    // project verbs — and only those — for the gate and the operator.
+    use super::{
+        cli_requested_scopes, lost_mutation_note, mutating_cli_verb, PROJECT_SCOPED_GATE_VERBS,
+        REMOTE_VERBS,
+    };
+
+    for verb in [
+        "audit_approval_project",
+        "audit_verdicts_project",
+        "audit_verdict_project",
+        "audit_approve_project",
+        "audit_reviewers_project",
+        "audit_reviewers_project_set",
+        "audit_identities",
+        "audit_identities_set",
+    ] {
+        assert!(REMOTE_VERBS.contains(&verb), "{verb}");
+        assert!(PROJECT_SCOPED_GATE_VERBS.contains(&verb), "{verb}");
+    }
+    for verb in [
+        "audit_approval_project",
+        "audit_verdicts_project",
+        "audit_reviewers_project",
+        "audit_identities",
+    ] {
+        assert_eq!(cli_requested_scopes(verb), &["cli.read"], "{verb}");
+        assert!(!mutating_cli_verb(verb), "{verb}");
+    }
+    assert_eq!(
+        cli_requested_scopes("audit_verdict_project"),
+        &["cli.write"]
+    );
+    for verb in [
+        "audit_approve_project",
+        "audit_reviewers_project_set",
+        "audit_identities_set",
+    ] {
+        assert_eq!(
+            cli_requested_scopes(verb),
+            &["cli.write", "audit.approve"],
+            "{verb}"
+        );
+        assert!(mutating_cli_verb(verb), "{verb}");
+    }
+    // A lost write sends the caller back to the matching project read.
+    assert!(lost_mutation_note("audit_reviewers_project_set").contains("same project"));
+    assert!(lost_mutation_note("audit_identities_set").contains("audit identities"));
+    assert!(lost_mutation_note("audit_verdict_project").contains("audit verdicts"));
+}
+
+#[test]
+fn a_tenant_that_cannot_serve_a_project_verb_names_the_release_order() {
+    // An older tenant refuses the name (501 / 400 / 409 / 503) rather than
+    // answering, and the client must say so — never read it as "no evidence"
+    // and never fall back to the repo-scoped verbs.
+    use super::{tenant_cannot_serve, PROJECT_SCOPED_GATE_VERBS};
+
+    for verb in PROJECT_SCOPED_GATE_VERBS {
+        for (status, body) in [
+            (
+                501u16,
+                json!({"ok": false, "error": {"code": "not_implemented"}}),
+            ),
+            (
+                400,
+                json!({"ok": false, "error": {"code": "invalid_request"}}),
+            ),
+            (
+                409,
+                json!({"ok": false, "error": {"code": "container_required"}}),
+            ),
+            (
+                503,
+                json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+            ),
+        ] {
+            let why = tenant_cannot_serve(verb, status, Some(&body)).expect("a version signal");
+            assert!(why.contains("tenant"), "{why}");
+            assert!(why.contains("first"), "{why}");
+            assert!(why.contains("repo-scoped"), "{why}");
+            assert!(why.contains(verb), "{why}");
+        }
+        // A waking reply is the retry loop's, not a version problem.
+        assert!(tenant_cannot_serve(verb, 503, Some(&json!({"state": "waking"}))).is_none());
+        // A bare availability failure keeps its own decoder.
+        assert!(
+            tenant_cannot_serve(verb, 503, Some(&json!({"state": "board_unreachable"}))).is_none()
+        );
+        // An unrelated refusal is not blamed on the release order.
+        assert!(tenant_cannot_serve(
+            verb,
+            403,
+            Some(&json!({"ok": false, "error": {"code": "not_permitted"}}))
+        )
+        .is_none());
+    }
+    // A project with no proven policy is a real refusal with its own remedy.
+    let why = tenant_cannot_serve(
+        "audit_verdicts_project",
+        409,
+        Some(&json!({"ok": false, "error": {"code": "project_policy_unavailable"}})),
+    )
+    .expect("a refusal");
+    assert!(why.contains("access policy"), "{why}");
+    assert!(!why.contains("Release order"), "{why}");
+}
+
+#[test]
 fn audit_reviewers_set_is_a_registered_owner_write() {
     // AOS-473: the attestation is the owner's own act, so its write asks for
     // the same `audit.approve` scope as the merge approval — never a plain
