@@ -161,6 +161,30 @@ fn soc54_source_reads_are_selected_before_the_history_bound() {
             .map(|row| row["id"].as_str().unwrap().to_owned())
             .collect()
     };
+    // Stage two: the id-bounded source query must probe its ids, not scan the
+    // installation's receipts by install order.
+    let plan: Vec<String> = store
+        .conn()
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT id FROM app_tool_results
+              WHERE install_id=? AND json_extract(result,'$.kind')='social.source.posts'
+                AND id IN (?,?) ORDER BY created DESC, id DESC LIMIT ?",
+        )
+        .unwrap()
+        .query_map(rusqlite::params!["install1", "tool-src-2", "tool-src-1", 2i64], |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter().any(|line| line.contains("USING INDEX sqlite_autoindex_app_tool_results_1")),
+        "the id probe uses the primary key: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.starts_with("SCAN app_tool_results")),
+        "no full scan of the installation's receipts: {plan:?}"
+    );
     assert_eq!(
         ids(store
             .app_tool_source_results_for("install1", &all, 2)
