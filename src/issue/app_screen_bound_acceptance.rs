@@ -437,10 +437,7 @@ fn cad2008_unsafe_screen_member_names_are_refused() {
     assert!(extract(&files, "main").is_ok());
 
     let mut nested = files.clone();
-    nested.insert(
-        "screens/main/nested/client.js".to_string(),
-        js_body(KIB),
-    );
+    nested.insert("screens/main/nested/client.js".to_string(), js_body(KIB));
     assert!(
         extract(&nested, "main").is_err(),
         "a nested member under the tag dir is not a flat screen leaf"
