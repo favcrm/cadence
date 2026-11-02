@@ -229,13 +229,21 @@ pub(super) fn refuse_production_staging(state_dir: &Path) -> Result<()> {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
     };
-    let mut forbidden: Vec<PathBuf> = Vec::new();
-    if let Some(home) = var("HOME") {
-        forbidden.push(home.join("pm"));
-        forbidden.push(home.join(".cadence"));
-        forbidden.push(home.join(".local/state/cadence"));
-        forbidden.push(home.join(".config/cadence"));
-    }
+    // An empty inventory is not proof of isolation: without `HOME` the
+    // tracker, home and config cannot be named, so refuse instead of
+    // registering a staging instance at a production path.
+    let home = var("HOME").ok_or_else(|| {
+        Error::rejected(
+            "HOME is not set to an absolute path — refusing to judge a staging root without \
+             the host's production paths",
+        )
+    })?;
+    let mut forbidden: Vec<PathBuf> = vec![
+        home.join("pm"),
+        home.join(".cadence"),
+        home.join(".local/state/cadence"),
+        home.join(".config/cadence"),
+    ];
     for (name, leaf) in [
         ("XDG_STATE_HOME", "cadence"),
         ("XDG_CONFIG_HOME", "cadence"),
