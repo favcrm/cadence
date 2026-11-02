@@ -155,6 +155,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
     "master_status",
+    // CAD-1678 / AOS-328: the hosted workspace's own tool catalog. `tools`
+    // needs `cli.read`, `call` needs `cli.write`; the Worker decides per
+    // operation, so this client asks for the historical pair.
+    "platform_call",
     // CAD-1946: the merge gate. Reads (cli.read) and the operator's merge
     // approval (`audit.approve`, which only `cadence login --audit-approve`
     // requests; the hosted org admits it for the human owner only).
@@ -263,6 +267,7 @@ fn mutating_cli_verb(verb: &str) -> bool {
             | "audit_reviewers_project_set"
             | "audit_identities_set"
             | "project_new"
+            | "platform_call"
     ) || team_mutation_verb(verb)
 }
 
@@ -286,6 +291,10 @@ fn lost_mutation_note(verb: &str) -> &'static str {
         "the approval may or may not have been recorded — read `audit approval` for the same issue, repo and head before repeating it"
     } else if verb == "audit_verdict" || verb == "audit_verdict_project" {
         "the verdict may or may not have been recorded — read `audit verdicts` for the same head before repeating it"
+    } else if verb == "platform_call" {
+        "the tool call may or may not have run and been charged — replay the same \
+         command; the relayed key returns the door's recorded outcome instead of \
+         running it a second time"
     } else if verb == "issue_review" {
         "the verdict may or may not have been recorded — read the same issue before repeating it; a reviewer holds one verdict per revision"
     } else if verb == "project_new" {
@@ -1595,7 +1604,12 @@ fn call_once(
     // have landed, so the caller must reconcile by idempotency key, never
     // assume nothing landed. `message_send` reconciles on `arguments.message`;
     // the team mutations reconcile with a read (`team list` / `team invites`).
-    let mutating = matches!(surface, Surface::Cli) && mutating_cli_verb(verb);
+    // A platform call is mutating only when it runs a tool: listing the
+    // catalog changes nothing, so a lost answer there is not a possible charge.
+    let mutating = matches!(surface, Surface::Cli)
+        && mutating_cli_verb(verb)
+        && (verb != "platform_call"
+            || arguments.get("operation").and_then(Value::as_str) == Some("call"));
     post(
         &target.endpoint,
         &format!("{relay}/call"),
@@ -3142,6 +3156,33 @@ fn call_verb_until_retry(
         }
         let (status, retry_after, body) =
             call_once(target, &cred, surface, verb, &arguments, deadline)?;
+        let platform_operation = (verb == "platform_call")
+            .then(|| arguments.get("operation").and_then(Value::as_str))
+            .flatten();
+        if (200..300).contains(&status) {
+            match platform_operation {
+                Some("call")
+                    if !body.as_ref().is_some_and(|answer| {
+                        answer.get("ok").and_then(Value::as_bool) == Some(true)
+                            && answer.get("data").is_some_and(Value::is_object)
+                    }) =>
+                {
+                    return Err(Error::unknown(format!(
+                        "remote tool returned no usable receipt — {}",
+                        lost_mutation_note(verb)
+                    )));
+                }
+                Some("tools")
+                    if !body
+                        .as_ref()
+                        .and_then(|answer| answer.get("tools"))
+                        .is_some_and(Value::is_array) =>
+                {
+                    return Err(reject("the remote tool catalog is unavailable"));
+                }
+                _ => {}
+            }
+        }
         // A successful status without the complete, correlated enqueue
         // receipt cannot establish whether — or as whose message, in which
         // workspace and conversation — the mutation landed. Unknown, never
@@ -3274,6 +3315,16 @@ fn call_verb_until_retry(
             && status >= 500
             && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
             && !board_gate_refused(body.as_ref());
+        // An in-progress replay or explicit uncertain outcome can still be
+        // charged; a lost reply may also follow a funded dispatch.
+        let platform_outcome_unknown = platform_operation == Some("call")
+            && !board_gate_refused(body.as_ref())
+            && ((status == 409
+                && matches!(
+                    refusal_code.as_deref(),
+                    Some("uncertain" | "idempotency_in_progress")
+                ))
+                || (status >= 500 && body.as_ref().and_then(|b| b["state"].as_str()).is_none()));
         let unknown_correlation = refusal_correlation(body.as_ref());
         // CAD-2001: a project-scoped gate verb the tenant cannot serve is a
         // release-order problem, not an availability blip and not "no
@@ -3298,6 +3349,12 @@ fn call_verb_until_retry(
             Verdict::Done(Err(_e)) if project_create_unknown => {
                 return Err(Error::unknown(format!(
                     "the project create was not confirmed (outcome_unknown, HTTP {status}); {}",
+                    lost_mutation_note(verb)
+                )));
+            }
+            Verdict::Done(Err(_e)) if platform_outcome_unknown => {
+                return Err(Error::unknown(format!(
+                    "remote platform call returned HTTP {status} — {}",
                     lost_mutation_note(verb)
                 )));
             }
