@@ -2727,14 +2727,41 @@ pub fn profile_list(store: &Store, agents: &[Agent]) -> Result<Vec<Value>> {
         .collect())
 }
 
-/// `cadence agent context <id>` on a local board: the profile and the text a
-/// runtime registered against it is briefed with.
+/// `cadence agent context <id>` on a local board, in the hosted
+/// `agent_profile_context` envelope: `{context: {profile, identity,
+/// knowledge, unavailable}}`. A native board keeps no per-profile wiki areas,
+/// so each is named in `unavailable` rather than invented. `revision` is the
+/// settings revision the profile was read at.
 pub fn profile_context(store: &Store, agents: &[Agent], id: &str) -> Result<Value> {
-    let profile = profile_list(store, agents)?
+    let listed = profile_list(store, agents)?
         .into_iter()
         .find(|profile| profile["id"].as_str() == Some(id))
         .ok_or_else(|| Error::rejected(format!("unknown profile '{id}'")))?;
-    Ok(json!({"profile": profile, "context": profile["job"]}))
+    let skills = listed["catalogue"]
+        .as_str()
+        .and_then(crate::agent_roles::find)
+        .map_or(&[][..], |role| role.skills);
+    let reason = "a native board keeps no per-profile wiki area";
+    let area = json!({"available": false, "reason": reason});
+    Ok(json!({"context": {
+        "profile": {
+            "id": listed["id"], "name": listed["alias"], "role": listed["role"],
+            "responsibilities": listed["job"], "skills": skills,
+            "status": "active", "revision": store.settings()?.revision,
+            "model": listed["model"],
+        },
+        "identity": {
+            "attribution": "external",
+            "agent_authenticated": false,
+            "note": "This profile is context for an external session. Loading it does not authenticate the session as the agent, and it grants no review, merge or execution authority.",
+        },
+        "knowledge": {"profile": area, "knowledge": area, "memory": area},
+        "unavailable": [
+            format!("profile: {reason}"),
+            format!("knowledge: {reason}"),
+            format!("memory: {reason}"),
+        ],
+    }}))
 }
 
 /// A hire from the role catalogue: save a settings profile and nothing else.
@@ -2802,4 +2829,32 @@ pub fn create_catalogue_profile(
     });
     store.save_settings(current.revision, doc, ACTOR)?;
     Ok(profile_json(&profile, &[]))
+}
+
+#[cfg(test)]
+mod profile_context_tests {
+    use super::*;
+
+    /// CAD-1989: the native context is the hosted `agent_profile_context`
+    /// envelope, and a hire writes a profile but no agent row.
+    #[test]
+    fn native_context_matches_the_hosted_envelope() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+        let role = crate::agent_roles::find("developer").unwrap();
+        create_catalogue_profile(&store, "dev-1", role, role.look, None, None).unwrap();
+        assert!(store.agents().unwrap().is_empty());
+
+        let out = profile_context(&store, &[], "dev-1").unwrap();
+        let context = &out["context"];
+        assert_eq!(context["profile"]["id"], "dev-1");
+        assert_eq!(context["profile"]["model"], "inherit");
+        assert_eq!(context["profile"]["skills"], json!(role.skills));
+        assert_eq!(context["profile"]["status"], "active");
+        assert_eq!(context["identity"]["attribution"], "external");
+        assert_eq!(context["identity"]["agent_authenticated"], false);
+        assert_eq!(context["knowledge"]["memory"]["available"], false);
+        assert_eq!(context["unavailable"].as_array().unwrap().len(), 3);
+        assert!(profile_context(&store, &[], "nope").is_err());
+    }
 }

@@ -398,8 +398,7 @@ impl Shared {
         )
     }
 
-    /// CAD-1989: the profile and the text a runtime registered against it is
-    /// briefed with - the hosted `agent_profile_context` verb's local twin.
+    /// CAD-1989: the hosted `agent_profile_context` envelope for a settings profile.
     pub(super) fn rpc_agent_profile_context(self: &Arc<Self>, params: &Value) -> Result<Value> {
         crate::agent_settings::profile_context(
             &self.store,
@@ -408,10 +407,8 @@ impl Shared {
         )
     }
 
-    /// CAD-1752: the role catalogue plus what a hire registers on this
-    /// install and the model each role would launch on. A read: the
-    /// catalogue is static and the model rows come from the same settings
-    /// `model_defaults_get` already serves to any viewer.
+    /// CAD-1752: the role catalogue and what this install registers on. A
+    /// read: the catalogue is static and carries no model (CAD-1989).
     pub(super) fn rpc_agent_roles(self: &Arc<Self>) -> Result<Value> {
         let provider = "pi";
         let endpoint = registry::default_kind(provider)?;
