@@ -396,6 +396,30 @@ cadence project new reminders --repo ~/code/reminders [--prefix REM] \
                                             # different repo, key `agents`, a bad
                                             # key, a non-git path, the tracker or
                                             # the daemon state dir writes nothing
+cadence --org <slug> project new fav-bd --name "Fav BD" [--prefix FBD]
+                                            # CAD-1999, hosted org only: register
+                                            # an empty project in the org's own
+                                            # registry — no repo, no PROJECT.md.
+                                            # --name is the human label and is
+                                            # required; the same key, name and
+                                            # prefix is the same project. A key
+                                            # already registered (or already
+                                            # present only as its tickets'
+                                            # project) with a different name or
+                                            # prefix, or a prefix another project
+                                            # uses, refuses without writing. The
+                                            # live human workspace owner is the
+                                            # only caller the board admits.
+cadence --org <slug> issue project ls       # CAD-1999: the org's projects —
+                                            # registered ones plus the projects
+                                            # that exist only as their tickets'
+                                            # key (name = key for those).
+                                            # --sort/--limit/--fields are local
+                                            # transforms and refuse remotely
+cadence --org <slug> issue ls --project fav-bd
+                                            # CAD-1999: one project's tickets; an
+                                            # empty registered project reads as an
+                                            # empty list. One key per call.
 cadence issue new "title"                   # --project wins, else CADENCE_PROJECT,
                                             # else the cwd repo's remote/path; no
                                             # match fails closed. --parent, --priority,

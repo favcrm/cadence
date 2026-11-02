@@ -1,8 +1,11 @@
 //! CAD-1019 slice 2: dispatch for a `Remote` org selection — maps the
 //! allowlisted local commands to AOS-128 verbs and runs them through
 //! [`cadence_agent::remote_cli`]. Anything outside the allowlist is refused
-//! *here*, before a request is ever built. Operator-only verbs never map.
-//! `issue project policy` is `project_policy`; project add/list/set-remote stay local.
+//! *here*, before a request is ever built. Operator-only daemon verbs never
+//! map.
+//! `issue project policy` is `project_policy`; `project new` is
+//! `project_new` and `issue project ls` is `project_ls` on a hosted org,
+//! while `issue project add`/`set-remote` stay local.
 
 use super::*;
 use cadence_agent::remote_cli::RemoteTarget;
@@ -185,8 +188,10 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
         } => {
             // Straight pass-through of the list grammar; the remote
             // tracker owns the same flags the local `issue ls` parses.
+            // CAD-1999: `--project` now crosses the wire — the hosted
+            // route filters one registered (or ticket-derived) project,
+            // so a repeated flag refuses rather than silently keeping one.
             for (flag, present) in [
-                ("--project", !project.is_empty()),
                 ("--stage", !stage.is_empty()),
                 ("--health", !health.is_empty()),
                 ("--since", since.is_some()),
@@ -206,6 +211,15 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
                         "the remote route's filter does not implement it",
                     ));
                 }
+            }
+            if project.len() > 1 {
+                return Err(Error::rejected(
+                    "remote `issue ls` filters one --project at a time — the \
+                     hosted route takes a single key; nothing was sent",
+                ));
+            }
+            if let Some(key) = project.first() {
+                args.insert("project".into(), json!(key));
             }
             for (key, values) in [
                 ("status", status),
@@ -599,6 +613,99 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             args.insert("visibility".into(), json!(visibility));
             args.insert("grants".into(), json!(grants));
             "project_policy"
+        }
+        // CAD-1999: `cadence project new` on a hosted org registers an
+        // empty project — its key, its human-readable name and an optional
+        // issue-id prefix. The local-only flags register a git checkout and
+        // seed its PROJECT.md, which a hosted org has no path to, so they
+        // refuse before a request exists rather than being dropped. The
+        // name is required and sent as given: the registry keeps it
+        // distinct from the key (the key is lower-case, the name is the
+        // human label).
+        Commands::Project {
+            action:
+                ProjectCmd::New {
+                    key,
+                    name,
+                    repo,
+                    prefix,
+                    goal,
+                    agents,
+                    issue,
+                },
+        } => {
+            let mut local = Vec::new();
+            if repo.is_some() {
+                local.push("--repo");
+            }
+            if goal.is_some() {
+                local.push("--goal");
+            }
+            if !agents.is_empty() {
+                local.push("--agent");
+            }
+            if issue.is_some() {
+                local.push("--issue");
+            }
+            if !local.is_empty() {
+                return Err(Error::rejected(format!(
+                    "remote `project new` does not support {} — it registers an \
+                     empty hosted project, not a repo checkout or a seeded \
+                     PROJECT.md; nothing was sent",
+                    local.join(" ")
+                )));
+            }
+            let name = name.as_deref().map(str::trim).unwrap_or_default();
+            if name.is_empty() {
+                return Err(Error::rejected(
+                    "remote `project new` needs --name <human name> — the hosted \
+                     registry keeps it beside the key; nothing was sent",
+                ));
+            }
+            if name.len() > 200 {
+                return Err(Error::rejected(
+                    "remote `project new` --name must be at most 200 bytes — \
+                     nothing was sent",
+                ));
+            }
+            args.insert("key".into(), json!(key));
+            args.insert("name".into(), json!(name));
+            if let Some(prefix) = prefix {
+                args.insert("prefix".into(), json!(prefix));
+            }
+            "project_new"
+        }
+        // CAD-1999: `issue project ls` reads the hosted registry, which
+        // includes projects that exist only as their tickets' key. The
+        // route takes no arguments, so the local row transforms refuse
+        // instead of being applied to a shape the client does not own.
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Project {
+                    action:
+                        cadence_agent::issue::cli::ProjectAction::Ls {
+                            sort,
+                            limit,
+                            fields,
+                            json: _,
+                        },
+                },
+        } => {
+            for (flag, present) in [
+                ("--sort", sort.is_some()),
+                ("--limit", limit.is_some()),
+                ("--fields", !fields.is_empty()),
+            ] {
+                if present {
+                    return Err(unsupported(
+                        "issue project ls",
+                        flag,
+                        "the hosted project read returns the registry as it is; \
+                         sorting, truncating and field selection are local transforms",
+                    ));
+                }
+            }
+            "project_ls"
         }
         Commands::Message {
             action:
@@ -1327,7 +1434,8 @@ fn unavailable(command: &Commands) -> Error {
          remote verbs are: status, agent list, agent show, issue ls, \
          issue show, issue log, issue new, issue comment, issue set, \
          send/message send (--message required), message read, inbox (peek), \
-         issue project policy, wiki ls, wiki search, wiki cat, \
+         issue project policy, project new, issue project ls, wiki ls, \
+         wiki search, wiki cat, \
          wiki put (text), wiki cp, settings agents <verb>, master status, \
          team list, team invites, team invite, team revoke-invite, \
          team set-role, team remove, delivery requirements, audit approval, \
@@ -1660,6 +1768,20 @@ pub(super) fn run(
     }
     if let Some(code) = merge_gate(&target, &command, wake_timeout)? {
         return Ok(code);
+    }
+    // CAD-1999: a hosted project create is the live human workspace owner's
+    // own act — the same CAD-1586 rule the merge approval and Settings
+    // follow. A managed caller (worker, master, grant-bound argv child)
+    // spending the stored login would act as that owner, so it refuses
+    // before a request exists; the board's own owner check would otherwise
+    // be satisfied by the owner's credential, not by the caller.
+    if matches!(
+        &command,
+        Commands::Project {
+            action: ProjectCmd::New { .. }
+        }
+    ) {
+        refuse_managed(&target, "project new")?;
     }
     let (verb, args) = verb_for(&command)?;
     // CAD-1568: a remote send keeps its caller-chosen `--message` id for
@@ -2505,6 +2627,7 @@ mod read_contract_tests {
     #[test]
     fn issue_ls_sends_only_the_filter_the_route_owns() {
         let (verb, args) = outcome(&issue_ls(|l| {
+            l.project = vec!["ops".into()];
             l.status = vec!["doing".into()];
             l.tags = vec!["t".into()];
             l.owner = vec!["me".into()];
@@ -2516,6 +2639,7 @@ mod read_contract_tests {
         assert_eq!(
             args,
             json!({
+                "project": "ops",
                 "status": ["doing"], "tag": ["t"], "owner": ["me"],
                 "plan": ["approved"], "open": true,
             })
@@ -2523,10 +2647,17 @@ mod read_contract_tests {
     }
 
     #[test]
+    fn issue_ls_refuses_more_than_one_project() {
+        // CAD-1999: the hosted route filters a single key; a repeated
+        // `--project` must refuse, never silently keep one of them.
+        let err = outcome(&issue_ls(|l| l.project = vec!["ops".into(), "cad".into()])).unwrap_err();
+        assert!(err.contains("one --project"), "{err}");
+    }
+
+    #[test]
     fn issue_ls_rejects_every_flag_the_route_cannot_apply() {
         type Cases = Vec<(&'static str, fn(&mut IssueLs))>;
         let cases: Cases = vec![
-            ("--project", |l| l.project = vec!["cadence".into()]),
             ("--stage", |l| l.stage = vec!["build".into()]),
             ("--health", |l| l.health = vec!["on_track".into()]),
             ("--since", |l| l.since = Some("7d".into())),
@@ -2729,8 +2860,82 @@ mod read_contract_tests {
     }
 
     #[test]
-    fn remote_project_add_and_list_stay_unmapped() {
+    fn remote_project_new_and_ls_map_but_add_and_set_remote_stay_unmapped() {
         use cadence_agent::issue::cli::ProjectAction;
+        let (verb, args) = outcome(&Commands::Project {
+            action: ProjectCmd::New {
+                key: "ops".into(),
+                name: Some("Operations".into()),
+                repo: None,
+                prefix: Some("OPS".into()),
+                goal: None,
+                agents: vec![],
+                issue: None,
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "project_new");
+        assert_eq!(
+            args,
+            json!({"key": "ops", "name": "Operations", "prefix": "OPS"})
+        );
+
+        // The name is the hosted registry's own field: a create without it
+        // refuses, and the local repo/PROJECT.md flags never cross.
+        let err = outcome(&Commands::Project {
+            action: ProjectCmd::New {
+                key: "ops".into(),
+                name: None,
+                repo: None,
+                prefix: None,
+                goal: None,
+                agents: vec![],
+                issue: None,
+            },
+        })
+        .unwrap_err();
+        assert!(err.contains("--name"), "{err}");
+        let err = outcome(&Commands::Project {
+            action: ProjectCmd::New {
+                key: "ops".into(),
+                name: Some("Operations".into()),
+                repo: Some(std::path::PathBuf::from("/tmp/ops")),
+                prefix: None,
+                goal: None,
+                agents: vec![],
+                issue: None,
+            },
+        })
+        .unwrap_err();
+        assert!(err.contains("--repo"), "{err}");
+
+        let (verb, args) = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::Ls {
+                    sort: None,
+                    limit: None,
+                    fields: vec![],
+                    json: false,
+                },
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "project_ls");
+        assert_eq!(args, json!({}));
+
+        let err = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::Ls {
+                    sort: Some("key".into()),
+                    limit: None,
+                    fields: vec![],
+                    json: false,
+                },
+            },
+        })
+        .unwrap_err();
+        assert!(err.contains("--sort"), "{err}");
+
         let add = outcome(&Commands::Issue {
             action: IssueAction::Project {
                 action: ProjectAction::Add {
@@ -2745,18 +2950,6 @@ mod read_contract_tests {
         })
         .unwrap_err();
         assert!(add.contains("not available on a remote org"), "{add}");
-        let ls = outcome(&Commands::Issue {
-            action: IssueAction::Project {
-                action: ProjectAction::Ls {
-                    sort: None,
-                    limit: None,
-                    fields: vec![],
-                    json: false,
-                },
-            },
-        })
-        .unwrap_err();
-        assert!(ls.contains("not available on a remote org"), "{ls}");
         let set_remote = outcome(&Commands::Issue {
             action: IssueAction::Project {
                 action: ProjectAction::SetRemote {

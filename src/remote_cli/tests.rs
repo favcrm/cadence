@@ -78,6 +78,123 @@ fn audit_reviewers_set_is_a_registered_owner_write() {
 }
 
 #[test]
+fn project_verbs_are_a_registered_read_and_owner_write() {
+    // CAD-1999: the client refuses a verb missing from REMOTE_VERBS before a
+    // request exists, so the registry read and the owner write must both be
+    // registered — and the write must ask only for cli.write, while a lost
+    // answer reconciles with the read instead of a blind retry.
+    use super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb, REMOTE_VERBS};
+
+    assert!(REMOTE_VERBS.contains(&"project_ls"));
+    assert!(REMOTE_VERBS.contains(&"project_new"));
+    assert_eq!(cli_requested_scopes("project_ls"), &["cli.read"]);
+    assert_eq!(cli_requested_scopes("project_new"), &["cli.write"]);
+    assert!(!mutating_cli_verb("project_ls"));
+    assert!(mutating_cli_verb("project_new"));
+    assert!(
+        lost_mutation_note("project_new").contains("issue project ls"),
+        "a lost project create must send the caller back to the registry read"
+    );
+}
+
+#[test]
+fn project_new_without_a_correlated_receipt_is_unknown_and_not_retried() {
+    // CAD-1999: a 2xx proves the create only as the requested project echoed
+    // back. A `null`, `{ok:true}`, foreign or unrelated body cannot establish
+    // that THIS create landed — unknown, reconciled by the registry read,
+    // never a rejection and never a replay. The empty/204/non-JSON answer is
+    // the same check on a `None` body.
+    let args = || {
+        json!({"key": "ops", "name": "Operations"})
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    for receipt in [
+        Value::Null,
+        json!({"ok": true}),
+        json!({"project": {"key": "other", "name": "Operations"}}),
+        json!({"project": {"key": "ops", "name": "Other"}}),
+        json!({"project": "ops"}),
+    ] {
+        let (out, requests) = run(vec![(200, "", receipt)], "project_new", args(), 10);
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{err}");
+        let text = err.to_string();
+        assert!(text.contains("issue project ls"), "{text}");
+        assert!(!text.contains("retry later"), "{text}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a project create was replayed"
+        );
+    }
+
+    let (out, _) = run(
+        vec![(
+            200,
+            "",
+            json!({"project": {"key": "ops", "name": "Operations"}, "duplicate": false}),
+        )],
+        "project_new",
+        args(),
+        10,
+    );
+    assert!(out.is_ok(), "{:?}", out.err().map(|e| e.to_string()));
+}
+
+#[test]
+fn project_new_ambiguous_5xx_is_unknown_but_pre_forward_5xx_stays_definite() {
+    // CAD-1999: a 5xx naming no pre-forward worker `state` may follow a
+    // committed create. A 5xx that names one, and a board gate refusal
+    // (`hop: board`), are decided before the verb ran and stay definite.
+    let args = || {
+        json!({"key": "ops", "name": "Operations"})
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    for status in [500u16, 503] {
+        let (out, requests) = run(
+            vec![(status, "", json!({"ok": false}))],
+            "project_new",
+            args(),
+            1,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{status}: {err}");
+        let text = err.to_string();
+        assert!(text.contains("issue project ls"), "{status}: {text}");
+        assert!(!text.contains("retry later"), "{status}: {text}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "{status}: a project create was replayed"
+        );
+    }
+
+    let (out, _) = run(
+        vec![(500, "", json!({"state": "unavailable"}))],
+        "project_new",
+        args(),
+        1,
+    );
+    assert_eq!(out.unwrap_err().kind(), "rejected");
+
+    let (out, _) = run(
+        vec![(
+            500,
+            "",
+            json!({"ok": false, "error": {"code": "runtime_unavailable", "hop": "board"}}),
+        )],
+        "project_new",
+        args(),
+        1,
+    );
+    assert_eq!(out.unwrap_err().kind(), "rejected");
+}
+
+#[test]
 fn assignment_identity_survives_saved_login_reloads() {
     let dir = tempfile::tempdir().unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -334,6 +451,7 @@ fn fake_worker(
                     401 => "401 Unauthorized",
                     403 => "403 Forbidden",
                     409 => "409 Conflict",
+                    500 => "500 Internal Server Error",
                     503 => "503 Service Unavailable",
                     _ => "400 Bad Request",
                 };
