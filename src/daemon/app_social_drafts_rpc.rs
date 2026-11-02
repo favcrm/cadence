@@ -556,13 +556,12 @@ impl Shared {
                         let id = required_str(&receipt, "id")?;
                         let completed = receipt["created_at"].as_f64().unwrap_or(0.0);
                         if matches!(state.as_str(), "pending" | "uncertain") {
-                            records
-                                .app_social_tool_receipt_attach(
-                                    &context,
-                                    id,
-                                    completed,
-                                    receipt["result"]["kind"].as_str().unwrap_or(""),
-                                )?;
+                            records.app_social_tool_receipt_attach(
+                                &context,
+                                id,
+                                completed,
+                                receipt["result"]["kind"].as_str().unwrap_or(""),
+                            )?;
                             records.app_social_generation_complete_request(&request, id)?;
                             intent["state"] = json!("completed");
                             intent["receipt_id"] = json!(id);

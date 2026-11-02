@@ -860,11 +860,7 @@ impl RecordStore {
     /// left — so an upgraded install keeps its newest page even when unknown
     /// rows fill the allowance, plus as much older history as fits. The
     /// authoritative kind and ownership checks run on each returned receipt.
-    pub fn app_social_tool_receipt_ids(
-        &self,
-        context: &str,
-        limit: usize,
-    ) -> Result<Vec<String>> {
+    pub fn app_social_tool_receipt_ids(&self, context: &str, limit: usize) -> Result<Vec<String>> {
         let conn = self.conn();
         let typed = conn
             .prepare(

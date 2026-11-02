@@ -202,7 +202,9 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
         "the candidate window is read through its kind index: {plan:?}"
     );
     assert!(
-        !plan.iter().any(|line| line.trim_start().starts_with("SCAN app_social_tool_receipts")),
+        !plan.iter().any(|line| line
+            .trim_start()
+            .starts_with("SCAN app_social_tool_receipts")),
         "no full scan of the context's attachments: {plan:?}"
     );
     assert!(
@@ -309,7 +311,12 @@ fn soc54_receipt_kind_migrates_an_existing_database() {
     );
     assert_eq!(
         reopened.app_social_tool_receipt_ids("ctx-one", 5).unwrap(),
-        vec!["new-source", "legacy-source", "legacy-newer", "legacy-upload"]
+        vec![
+            "new-source",
+            "legacy-source",
+            "legacy-newer",
+            "legacy-upload"
+        ]
     );
 }
 
