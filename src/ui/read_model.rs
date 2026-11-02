@@ -2162,11 +2162,11 @@ mod tests {
             failed: false,
             agents_down: false,
         });
-        let model = Model::new(
+        let model = Arc::new(Model::new(
             Path::new("/nonexistent/state"),
             Path::new("/nonexistent/pm"),
             fetch,
-        );
+        ));
         let mut watch = blank_watch();
         let mut frames = Vec::new();
         model.tick(&mut watch, &mut frames);
