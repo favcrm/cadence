@@ -20,7 +20,6 @@ const role = (id: string, category: string, title: string, job: string): AgentRo
   tools: [],
   first_tasks: [],
   instructions: "",
-  model: { id: "m", source: "role_default" },
 });
 const roles = [
   role("quotation", "business", "Quotation", "Turns a request into a quote."),
