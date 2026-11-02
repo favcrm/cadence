@@ -701,7 +701,11 @@ assert(placeholder !== null, "a working turn with no stored step paints the send
 // A queued message after the working send must not take over the
 // placeholder's key: the first step still has to update this row.
 threads["c-split"].push(ent(2, "operator", "message", "queued behind", "m-next"));
-await React.act(async () => { await conversationThread("c-split").refresh(); });
+queue = [{ message: "m-next", conversation: "c-split" }];
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
 await settle();
 assert(placeholder.isConnected, "a newer queued send leaves the working placeholder mounted");
 threads["c-split"].push(ent(3, "agent", "thinking", "plan the split", null));
@@ -710,6 +714,15 @@ await settle();
 const landed = host.querySelector(".app-chat-list [data-chat-run]") as HTMLElement | null;
 assert(landed !== null, "the first step paints the turn row");
 assert(landed === placeholder, "the head updates in place when the first step lands");
+// Completion must not rename the run to the queued send either.
+threads["c-split"].push(ent(4, "agent", "turn_result", "Split answer.", null));
+turn = null;
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+assert(host.querySelector(".app-chat-list [data-chat-run]") === landed, "the head survives completion past a queued send");
 // The daemon's working id differs from the send id and a system row
 // splits the untagged run: ownership follows the adopted send, so the
 // last segment paints the dots and no second head appears.
@@ -729,6 +742,23 @@ equal(host.querySelectorAll(".app-chat-list [data-chat-run] .turn-head").length,
 equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "a split turn paints one typing row");
 equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head follows a split turn");
 assert(host.querySelector(".app-chat-list [data-chat-run]") === landed, "the split keeps the head's identity");
+// A system row between the working send and a queued message is transparent:
+// the real run is still adopted, so there is one head and one typing row.
+threads["c-split"] = [
+  ent(1, "operator", "message", "split ask", "m-split"),
+  ent(2, "system", "message", "system note", null),
+  ent(3, "operator", "message", "queued behind", "m-next"),
+  ent(4, "agent", "thinking", "plan the split", null),
+];
+turn = { state: "working", message: "m-split", conversation: "c-split" };
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+equal(host.querySelectorAll(".app-chat-list [data-chat-run] .turn-head").length, 1, "a system-only gap paints one head");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "a system-only gap paints one typing row");
+equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "a system-only gap appends no standalone typing head");
 
 await React.act(async () => { root.unmount(); });
 console.log("conversations checks passed");

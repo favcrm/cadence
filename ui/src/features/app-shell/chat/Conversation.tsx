@@ -40,6 +40,7 @@ import {
   addPending,
   activeSendId,
   discardPending,
+  sendBefore,
   inFlightTurnKey,
   itemMessage,
   newMessageId,
@@ -172,6 +173,8 @@ export interface HomeListProps {
   /** The running turn's message id, when a turn runs: a grouped turn uses it
    *  to show typing instead of a finished-looking answer. */
   running?: string | null;
+  /** Messages still queued behind the running turn: a run's send skips them. */
+  queued?: string[];
   /** Whether the whole thread has no `turn_result`. Every host passes its
    *  full list, not the rendered window. */
   legacyTranscript: boolean;
@@ -231,24 +234,12 @@ export default function Conversation(props: HomeListProps | AppPaneProps) {
  * head, one folded trace, one answer surface and its artifact cards; every
  * other item keeps the row renderer unchanged.
  */
-/** The user message this assistant run answers, when the entries themselves
- *  carry no message id. */
-function precedingUserMessage(items: ThreadItem[], runItems: ThreadItem[]): string | null {
-  const idx = items.indexOf(runItems[0]);
-  if (idx < 0) return null;
-  for (let i = idx - 1; i >= 0; i--) {
-    const item = items[i];
-    if (item.type !== "operator" && item.type !== "pending") continue;
-    return itemMessage(item);
-  }
-  return null;
-}
-
 function HomeList({
   items,
   readOnly,
   liveAfter,
   running = null,
+  queued = [],
   legacyTranscript,
   onOpenIssue,
   onRetry,
@@ -263,6 +254,7 @@ function HomeList({
   // errors); those notes must stay in the trace, never become older answers.
   const allowLegacy = legacyTranscript;
   const flightKey = inFlightTurnKey(items, running);
+  const queuedSet = useMemo(() => new Set(queued), [queued]);
   // One key for the send, from the empty typing row through the finished
   // answer, so the assistant head does not unmount and splash when the
   // first step lands. Computed before the rows, so a turn that already
@@ -271,13 +263,12 @@ function HomeList({
   const claimedTurns = new Set<string>();
   for (const run of runs) {
     if (!run.turn) continue;
-    const ownsFlight = flightKey !== null && run.items.some((item) => item.key === flightKey);
     // The send's own id, not the daemon's working id. Hosted agent rows
     // often carry neither, and the working id can differ from the send.
     // The empty typing row is keyed by the send, and this run keeps that
     // same id after the answer lands or working clears — identity must not
     // depend on the turn still being in flight, or the head remounts.
-    const msg = run.message ?? (ownsFlight ? activeSendId(items, running) ?? precedingUserMessage(items, run.items) : precedingUserMessage(items, run.items));
+    const msg = run.message ?? sendBefore(items, run.items, queuedSet);
     if (msg && !claimedTurns.has(msg)) {
       claimedTurns.add(msg);
       turnKey.set(run.key, `turn:${msg}`);
@@ -1637,12 +1628,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     // head. Counting segments on the adopted id also keeps a split turn's
     // untagged and tagged segments on distinct keys.
     const effective = new Map<string, string | null>();
-    const openSend = activeSendId(shown, runningMessage);
+    const queuedSet = new Set((masterState.data?.queue ?? []).map((q) => q.message));
     for (const run of runs) {
       if (!run.turn) continue;
-      const isFlight = flightKey !== null && run.items.some((item) => item.key === flightKey);
-      const before = precedingUserMessage(shown, run.items);
-      effective.set(run.key, run.message ?? (isFlight ? openSend ?? before : before));
+      effective.set(run.key, run.message ?? sendBefore(shown, run.items, queuedSet));
     }
     const perMessage = new Map<string, number>();
     // Completion is the message's, not a segment's: an answer in any run of
@@ -2080,7 +2069,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           // the last answer). A message queued behind it must not take over.
           const openSend = activeSendId(shown, runningMessage);
           const flightSend = flightRun !== null && flightRun.turn
-            ? flightRun.message ?? openSend ?? precedingUserMessage(shown, flightRun.items)
+            ? flightRun.message ?? sendBefore(shown, flightRun.items, new Set((masterState.data?.queue ?? []).map((q) => q.message)))
             : null;
           const lastUser = [...shown].reverse().find((item) => item.type === "operator" || item.type === "pending");
           const sendId = flightSend ?? openSend ?? (lastUser ? itemMessage(lastUser) : null) ?? pendingMessages.at(-1) ?? null;

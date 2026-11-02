@@ -539,6 +539,7 @@ const ThreadList = memo(function ThreadList({
   liveAfter,
   onRetry,
   working,
+  queued,
   stale,
 }: {
   items: ThreadItem[];
@@ -559,6 +560,8 @@ const ThreadList = memo(function ThreadList({
   /** The live turn: its own `message` id picks the row the activity
    *  belongs to; `since` drives the elapsed clock. Null otherwise. */
   working: { message: string | null; since: number | null } | null;
+  /** Messages still queued behind the running turn: a run's send skips them. */
+  queued: string[];
   /** CAD-1782: the thread stream is down, so these rows are a snapshot. */
   stale: boolean;
 }) {
@@ -627,6 +630,7 @@ const ThreadList = memo(function ThreadList({
         readOnly={readOnly}
         liveAfter={liveAfter}
         running={working?.message ?? null} /* null while a send is only submitting */
+        queued={queued}
         legacyTranscript={!items.some((item) => item.type === "answer")}
         onOpenIssue={onOpenIssue}
         onRetry={onRetry}
@@ -1457,6 +1461,7 @@ function MasterHome({
               liveAfter={liveAfter.current ?? 0}
               onRetry={onRetrySend}
               working={workingActivity}
+              queued={(master.data?.queue ?? []).map((q) => q.message)}
               stale={streamReconnecting && activeTurn}
             />
             {cmds.map((c) => (

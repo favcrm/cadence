@@ -476,6 +476,22 @@ export function activeSendId(items: ThreadItem[], runningMessage: string | null)
   return null;
 }
 
+/** The send a run belongs to: the nearest user row before it, skipping
+ *  messages still queued behind the running turn. A queued row can sit
+ *  between the working send and its first assistant rows. */
+export function sendBefore(items: ThreadItem[], runItems: ThreadItem[], queued: ReadonlySet<string>): string | null {
+  const idx = items.indexOf(runItems[0]);
+  if (idx < 0) return null;
+  for (let i = idx - 1; i >= 0; i--) {
+    const item = items[i];
+    if (item.type !== "operator" && item.type !== "pending") continue;
+    const id = itemMessage(item);
+    if (id !== null && queued.has(id)) continue;
+    return id;
+  }
+  return null;
+}
+
 /** The assistant item that opens the run still in flight for `message`.
  *  Null when that send has no assistant rows yet, or the run already has
  *  an answer. Hosted transcripts often omit the message id on agent rows,
@@ -494,12 +510,17 @@ export function inFlightTurnKey(items: ThreadItem[], message: string | null): st
   const isUser = (item: ThreadItem) => item.type === "operator" || item.type === "pending";
   // `present` distinguishes "no assistant rows yet" (fall through) from a
   // run that answered or names another send (refuse, never fall through).
+  const isTurn = (item: ThreadItem) =>
+    OPEN_TURN.has(item.type) || item.type === "answer" || item.type === "artifact";
   const runAfter = (start: number): { key: string | null; present: boolean } => {
     let first: string | null = null;
     let present = false;
     for (let i = start; i < items.length; i++) {
       const item = items[i];
       if (isUser(item)) break;
+      // A system or other non-turn row is transparent: it neither proves a
+      // run exists nor carries a send's provenance.
+      if (!isTurn(item)) continue;
       present = true;
       if (item.type === "answer") return { key: null, present };
       const tagged = itemMessage(item);

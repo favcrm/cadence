@@ -22,6 +22,7 @@ import {
   threadRuns,
   inFlightTurnKey,
   itemMessage,
+  sendBefore,
   rowPaintKey,
   type ThreadState,
 } from "../src/features/home/thread";
@@ -640,4 +641,19 @@ main().catch((e) => {
     }),
   );
   equal(inFlightTurnKey(sameId, "m-a"), "e2", "an untagged opener joins rows tagged with the same send");
+  // A system row between the send and its first assistant rows is
+  // transparent; a queued user row after it does not hide the run.
+  const gap = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [
+        entry(1, "operator", "message", "mine", { message: "m-a" }),
+        entry(2, "system", "message", "note"),
+        entry(3, "operator", "message", "queued", { message: "m-b" }),
+        entry(4, "agent", "thinking", "working"),
+      ],
+    }),
+  );
+  equal(inFlightTurnKey(gap, "m-a"), "e4", "a system gap lets the tail run be adopted");
+  equal(sendBefore(gap, [gap[3]], new Set(["m-b"])), "m-a", "a queued user row is skipped when naming the run's send");
 }
