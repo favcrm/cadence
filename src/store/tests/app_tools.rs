@@ -105,6 +105,73 @@ fn cad1177_tool_record_retains_one_receipt_and_replays_it() {
 }
 
 #[test]
+fn soc54_source_reads_are_selected_before_the_history_bound() {
+    let (_d, store) = fresh();
+    let input = json!({});
+    let source = json!({"kind": "social.source.posts", "handle": "brandhk", "posts": []});
+    let upload = json!({"kind": "social.upload.image"});
+    // Owned so the &str fields in the records outlive the calls.
+    // The record id IS the claimed call id; the claim must precede the row.
+    let rows: Vec<(String, String)> = (0..3)
+        .map(|i| (format!("req-src-{i}"), format!("tool-src-{i}")))
+        .chain((0..5).map(|i| (format!("req-up-{i}"), format!("zz-up-{i}"))))
+        .collect();
+    for (i, (request, id)) in rows.iter().enumerate() {
+        let is_source = i < 3;
+        store
+            .app_tool_claim(AppToolClaim {
+                request,
+                install: "install1",
+                alias: if is_source {
+                    "instagram.read"
+                } else {
+                    "social.image"
+                },
+                slot: if is_source { "source" } else { "image" },
+                binding_digest: "sha256:bind",
+                input_digest: "sha256:in",
+                call_id: id,
+            })
+            .unwrap();
+        store
+            .app_tool_record(AppToolRecord {
+                id,
+                request,
+                install: "install1",
+                alias: if is_source {
+                    "instagram.read"
+                } else {
+                    "social.image"
+                },
+                slot: if is_source { "source" } else { "image" },
+                binding_digest: "sha256:bind",
+                input_digest: "sha256:in",
+                input: &input,
+                result: if is_source { &source } else { &upload },
+                asset: None,
+            })
+            .unwrap();
+    }
+    // Five newer non-source receipts sit ahead of the three source reads. A
+    // bound applied before the kind filter would return nothing here; the
+    // filter runs first, so the newest two source reads come back.
+    let listed = store.app_tool_source_results("install1", 2).unwrap();
+    let ids: Vec<&str> = listed["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["tool-src-2", "tool-src-1"], "{listed}");
+    assert!(
+        store.app_tool_source_results("other", 2).unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn cad1177_tool_receipt_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.sqlite3");

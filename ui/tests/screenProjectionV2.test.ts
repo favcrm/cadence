@@ -331,6 +331,23 @@ void (async () => {
     "the single sources section stays the newest read and names its receipt");
   const collections = library.collections ?? [];
   check(collections.map(c => c.handle).join() === "sakeboyhk,shop2", `one entry per handle, newest read first: ${collections.map(c => c.handle).join()}`);
+  // SOC-54 wire budget: ten handles of long captions must not push the whole
+  // `sources` section past the PUSH cap, which would drop today's library too.
+  const fat = Array.from({ length: 10 }, (_, handle) => ({
+    ...read(`rcpt-fat-${handle}`, 1_790_001_000 + handle, `fat${handle}`, []),
+    result: { kind: "social.source.posts", handle: `fat${handle}`, profile_verified: true,
+      posts: Array.from({ length: 24 }, (_, post) => ({
+        id: `fat-${handle}-${post}`, caption: "c".repeat(600), permalink: `https://www.instagram.com/p/fat${handle}${post}/`,
+        media_kind: "image", published_at_unix: 1_789_000_000 + post, preview_url: null })) },
+  }) as unknown as ToolReceipt);
+  const fatPush = screenProjection(installation, "main", "ctx-a", [context], runs, effects, intents,
+    extras({ source: null, tools: fat }));
+  const fatSources = fatPush.sources ?? { handle: "", posts: [] };
+  const keptBytes = pushBytes(fatPush);
+  check(keptBytes <= PUSH_BYTES_MAX, `the enumerated library must fit the PUSH cap: ${keptBytes}`);
+  check(fatSources.collections?.length === 10, "every handle stays while the posts are trimmed");
+  const trimmed = (fatSources.collections ?? []).reduce((n, c) => n + c.posts.length, 0);
+  check(trimmed > 0 && trimmed < 240, `oldest posts are trimmed, not the whole section: ${trimmed}`);
   const kept = collections.find(c => c.handle === "sakeboyhk")!;
   check(kept.tool_receipt_id === "rcpt-new" && kept.posts.length === 2 && kept.fetched_at === 1_790_000_900,
     "a handle keeps the posts its older read proved");
