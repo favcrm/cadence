@@ -825,16 +825,6 @@ impl RecordStore {
     pub fn app_social_tool_receipt_contains(&self, context: &str, receipt: &str) -> Result<bool> {
         Ok(self.conn().query_row("SELECT EXISTS(SELECT 1 FROM app_social_tool_receipts WHERE install_id=? AND context_id=? AND receipt_id=?)",params![self.install(),context,receipt],|r|r.get(0))?)
     }
-    pub fn app_social_freshness_contains(&self, context: &str, receipt: &str) -> Result<bool> {
-        Ok(self.conn().query_row("SELECT EXISTS(SELECT 1 FROM app_social_freshness WHERE install_id=? AND context_id=? AND receipt_id=?)",params![self.install(),context,receipt],|r|r.get(0))?)
-    }
-    pub fn app_social_freshness_receipts(&self, context: &str) -> Result<Vec<String>> {
-        let conn = self.conn();
-        let rows=conn.prepare("SELECT receipt_id FROM app_social_freshness WHERE install_id=? AND context_id=? ORDER BY completed_at DESC,handle LIMIT 20")?
-            .query_map(params![self.install(), context], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
 
     pub fn app_social_sources_show(&self, context: &str) -> Result<Value> {
         let row = self.conn().query_row("SELECT revision,handles_json,updated FROM app_social_sources WHERE install_id=? AND context_id=?", params![self.install(), context], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?))).optional()?;

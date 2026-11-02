@@ -130,14 +130,29 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
     store
         .app_social_freshness_save("ctx-one", "kiva.wood", "receipt-stale", 12.0)
         .unwrap();
-    assert_eq!(
-        store.app_social_freshness_receipts("ctx-one").unwrap(),
-        vec!["receipt-new", "receipt-other"]
-    );
+    store
+        .app_social_tool_receipt_attach("ctx-one", "receipt-new", 20.0)
+        .unwrap();
+    store
+        .app_social_tool_receipt_attach("ctx-one", "receipt-old", 10.0)
+        .unwrap();
+    store
+        .app_social_tool_receipt_attach("ctx-two", "receipt-other", 15.0)
+        .unwrap();
+    // SOC-54: membership is per context and install — the screen library
+    // resolves source reads host-side and keeps only what this context holds.
     assert!(store
-        .app_social_freshness_receipts("ctx-two")
-        .unwrap()
-        .is_empty());
+        .app_social_tool_receipt_contains("ctx-one", "receipt-old")
+        .unwrap());
+    assert!(store
+        .app_social_tool_receipt_contains("ctx-one", "receipt-new")
+        .unwrap());
+    assert!(!store
+        .app_social_tool_receipt_contains("ctx-two", "receipt-new")
+        .unwrap());
+    assert!(store
+        .app_social_tool_receipt_contains("ctx-two", "receipt-other")
+        .unwrap());
 }
 
 #[test]

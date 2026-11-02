@@ -2,10 +2,10 @@
 // the real ScreenChannel a mounted frame talks to. Fixtures mirror the
 // daemon's app_run_show / installation / binding / receipt JSON.
 import { screenProjection, type ScreenExtras } from "../src/features/workspace-apps/screen/screenProjection";
-import { pushBytes, PUSH_BYTES_MAX, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
+import { pushBytes, PUSH_BYTES_MAX, shapeFor as screenProtocolShapeFor, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
 import { ScreenChannel, ASSET_QUEUE_MAX } from "../src/features/workspace-apps/screen/screenLifecycle";
 import { toPublishIntent, type PublishIntent } from "../src/features/workspace-apps/socialPublish";
-import type { AppBinding, AppContext, AppEffect, Installation, SourceReceipt, WorkspaceRun } from "../src/features/workspace-apps/workspaceApps";
+import type { AppBinding, AppContext, AppEffect, Installation, SourceReceipt, ToolReceipt, WorkspaceRun } from "../src/features/workspace-apps/workspaceApps";
 
 function check(value: unknown, label: string): void { if (!value) throw new Error(label); }
 const sha = (c: string) => `sha256:${c.repeat(64)}`;
@@ -308,5 +308,65 @@ void (async () => {
   check(!("publish_settings" in (legacyChild.port.sent[0] as object)) && !("publish_settings" in (intentsOnly.port.sent[0] as object)),
     "v1 and publish-intents.v1 children never receive publish_settings");
 
+  // SOC-54: the library is every retained read of this context, not only the
+  // newest one per handle, and each post names the receipt that proved it.
+  const read = (id: string, createdAt: number, handle: string, posts: Array<[string, number]>) => ({
+    id, request_id: `req-${id}`, install_id: "inst-1", alias: "instagram.read", slot: "source",
+    binding_digest: "b", input_digest: "i", digest: "d", input: { handle }, asset: null, created_at: createdAt,
+    result: { kind: "social.source.posts", handle, profile_verified: true, posts: posts.map(([post, when]) => ({
+      id: post, caption: post, permalink: `https://www.instagram.com/p/${post}/`, media_kind: "image",
+      published_at_unix: when, preview_url: null })) },
+  }) as unknown as ToolReceipt;
+  const tools = [
+    read("rcpt-new", 1_790_000_900, "sakeboyhk", [["post-9", 1_789_000_900]]),
+    read("rcpt-shop", 1_790_000_500, "shop2", [["post-7", 1_789_000_700]]),
+    read("rcpt-old", 1_790_000_100, "sakeboyhk", [["post-1", 1_789_000_000]]),
+    // Another install's retained read is never part of this library.
+    { ...read("rcpt-foreign", 1_790_000_950, "other", [["post-x", 1_789_000_950]]), install_id: "inst-2" } as unknown as ToolReceipt,
+  ];
+  const push = screenProjection(installation, "main", "ctx-a", [context], runs, effects, intents,
+    extras({ source: null, tools }));
+  const library = push.sources!;
+  check(library.tool_receipt_id === "rcpt-new" && library.posts.length === 1 && library.posts[0].receipt_id === "rcpt-new",
+    "the single sources section stays the newest read and names its receipt");
+  const collections = library.collections ?? [];
+  check(collections.map(c => c.handle).join() === "sakeboyhk,shop2", `one entry per handle, newest read first: ${collections.map(c => c.handle).join()}`);
+  // SOC-54 wire budget: ten handles of long captions must not push the whole
+  // `sources` section past the PUSH cap, which would drop today's library too.
+  const fat = Array.from({ length: 10 }, (_, handle) => ({
+    ...read(`rcpt-fat-${handle}`, 1_790_001_000 + handle, `fat${handle}`, []),
+    result: { kind: "social.source.posts", handle: `fat${handle}`, profile_verified: true,
+      posts: Array.from({ length: 24 }, (_, post) => ({
+        id: `fat-${handle}-${post}`, caption: "c".repeat(600), permalink: `https://www.instagram.com/p/fat${handle}${post}/`,
+        media_kind: "image", published_at_unix: 1_789_000_000 + post,
+        preview_url: `https://scontent-hkg1-1.cdninstagram.com/v/t51/${"d".repeat(1900)}.jpg` })) },
+  }) as unknown as ToolReceipt);
+  const fatPush = screenProjection(installation, "main", "ctx-a", [context], runs, effects, intents,
+    extras({ source: null, tools: fat }));
+  const fatSources = fatPush.sources ?? { handle: "", posts: [] };
+  const keptBytes = pushBytes(fatPush);
+  check(keptBytes <= PUSH_BYTES_MAX, `the enumerated library must fit the PUSH cap: ${keptBytes}`);
+  check(fatSources.collections?.length === 10, "every handle stays while the posts are trimmed");
+  const trimmed = (fatSources.collections ?? []).reduce((n, c) => n + c.posts.length, 0);
+  check(trimmed > 0 && trimmed < 240, `oldest posts are trimmed, not the whole section: ${trimmed}`);
+  // SOC-54 degrade order: when the newest page plus the history cannot fit,
+  // the history goes first. A fixed allowance cannot know the rest of the
+  // message, so force the overflow and check the protocol's own sequence.
+  const sample = fatSources.posts[0]!;
+  const overflow = { ...fatPush, sources: { ...fatSources, collections: Array.from({ length: 40 }, (_, handle) => ({
+    handle: `over${handle}`, fetched_at: 1_790_001_000,
+    posts: Array.from({ length: 24 }, (_, post) => ({ ...sample, id: `over-${handle}-${post}` })) })) } } as ScreenPush;
+  check(pushBytes(overflow) > PUSH_BYTES_MAX, "fixture: the enumerated history alone overflows the cap");
+  const trimmedPush = screenProtocolShapeFor(overflow, "v2");
+  check(trimmedPush !== null && !!trimmedPush.sources, "the newest page survives the byte cap");
+  check(!trimmedPush!.sources!.collections, "the enumerated history degrades before the library does");
+  check(pushBytes(trimmedPush!) <= PUSH_BYTES_MAX, `the degraded PUSH fits: ${pushBytes(trimmedPush!)}`);
+  const kept = collections.find(c => c.handle === "sakeboyhk")!;
+  check(kept.tool_receipt_id === "rcpt-new" && kept.posts.length === 2 && kept.fetched_at === 1_790_000_900,
+    "a handle keeps the posts its older read proved");
+  check(kept.posts[0].id === "post-9" && kept.posts[0].receipt_id === "rcpt-new" &&
+    kept.posts[1].id === "post-1" && kept.posts[1].receipt_id === "rcpt-old",
+    "each post names the receipt that proved it, not the handle's newest");
   console.log("screen.v2 projection and image channel checks pass");
 })().catch(error => setTimeout(() => { throw error; }));
+

@@ -336,6 +336,13 @@ var omit = (key) => (p) => ({
 });
 var DEGRADE = [
 	omit("caption_excerpt"),
+	(p) => ({
+		...p,
+		sources: p.sources && {
+			...p.sources,
+			collections: void 0
+		}
+	}),
 	({ sources: _s, ...p }) => p,
 	omit("inputs_used"),
 	(p) => ({
@@ -506,6 +513,8 @@ function intentRefusal(intent) {
 var EXCERPT_MAX = 600;
 var RATIONALE_MAX = 280;
 var POSTS_MAX = 24;
+/** SOC-54: how many handles `sources.collections` may name (the app saves 20). */
+var LIBRARY_HANDLES_MAX = 20;
 var STEPS_MAX = 16;
 var KEYS_MAX = 16;
 /** The wire grammars the package adapter (screen-v2.mjs) checks. */
@@ -639,8 +648,9 @@ function runV2(run, installation, extras) {
 function latestSourceRun(installation, runs) {
 	return runs.filter((run) => run.state === "succeeded" && Object.keys(run.snapshot.capabilities ?? {}).some((slot) => installation.capabilities?.[slot]?.effect === "read")).reduce((newest, run) => !newest || (run.updated ?? 0) >= (newest.updated ?? 0) ? run : newest, null);
 }
-/** One normalized source post, honestly shown (link + time) or withheld. */
-function sourcePost(post, seen) {
+/** One normalized source post, honestly shown (link + time) or withheld.
+*  `receiptId` is the retained read that returned it (SOC-54). */
+function sourcePost(post, seen, receiptId) {
 	const permalink = instagramLink(post.permalink);
 	const published = epoch(post.published_at_unix ?? void 0);
 	if (typeof post.id !== "string" || !isId(post.id) || seen.has(post.id) || !permalink || published === null) return null;
@@ -651,8 +661,32 @@ function sourcePost(post, seen) {
 		published_at: published,
 		permalink,
 		media_kind: text(post.media_kind ?? "", 32),
-		thumb_url: instagramThumb(post.preview_url)
+		thumb_url: instagramThumb(post.preview_url),
+		receipt_id: receiptId
 	});
+}
+/** SOC-54: how much of the enumeration a PUSH should normally carry. This is a
+*  preference, not the guarantee: `shapeFor` strips `collections` before it
+*  drops `sources`, because only the assembled message knows what the newest
+*  page plus the rest of the screen cost. Trimming here keeps most of the
+*  history for a large screen instead of losing it whole. */
+var COLLECTIONS_BYTES_MAX = 49152;
+/** Trim the enumeration to the wire budget: oldest posts first, from the
+*  handle holding the most, so one profile's long captions cannot drop
+*  another profile entirely. */
+function budgeted(collections) {
+	const out = collections.map((entry) => ({
+		...entry,
+		posts: [...entry.posts]
+	})).filter((entry) => entry.posts.length > 0);
+	const bytes = () => new TextEncoder().encode(JSON.stringify(out)).byteLength;
+	while (out.length > 0 && bytes() > COLLECTIONS_BYTES_MAX) {
+		let richest = 0;
+		for (let i = 1; i < out.length; i += 1) if (out[i].posts.length > out[richest].posts.length) richest = i;
+		out[richest].posts.pop();
+		for (let i = out.length - 1; i >= 0; i -= 1) if (out[i].posts.length === 0) out.splice(i, 1);
+	}
+	return out;
 }
 /** The library, or `null` (omitted: the frame shows it as unavailable)
 *  while no verified read is held. One authoritative latest source
@@ -667,16 +701,46 @@ function sourcePost(post, seen) {
 *  reload — the frame always shows the posts the user last fetched,
 *  never a stale source that merely ran a workflow earlier. */
 function sourcesOf(installation, scopedRuns, extras) {
-	const postsFrom = (posts) => {
+	const postsFrom = (posts, receiptId) => {
 		const seen = /* @__PURE__ */ new Set();
 		const out = [];
 		for (const post of list(posts)) {
 			if (out.length >= POSTS_MAX) break;
-			const row = sourcePost(post, seen);
+			const row = sourcePost(post, seen, receiptId);
 			if (row) out.push(row);
 		}
 		return out;
 	};
+	const retainedReads = () => extras?.tools ? extras.tools.filter((r) => r.install_id === installation.install_id && installation.capabilities?.[r.slot]?.effect === "read" && r.result?.kind === "social.source.posts" && typeof r.result.handle === "string" && HANDLE.test(r.result.handle)).sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0)) : [];
+	/** SOC-54: the retained history (bounded) grouped by handle, newest read
+	*  first, so a reload shows more than the last fetch.
+	*  A newer page wins for a post it repeats; an older read still contributes
+	*  the posts it proved and the rest of the page list, so a reload shows more
+	*  than the last fetch. Bounded per handle and in handle count. Run-bound
+	*  reads stay out: a draft from one is a `run` source, which `sources` names. */
+	const reads = retainedReads();
+	const collections = () => {
+		const byHandle = /* @__PURE__ */ new Map();
+		for (const read of reads) {
+			const handle = read.result.handle.replace(/^@/, "").toLowerCase();
+			const entry = byHandle.get(handle) ?? {
+				handle,
+				fetched_at: epoch(read.created_at) ?? void 0,
+				tool_receipt_id: read.id,
+				posts: []
+			};
+			const seen = new Set(entry.posts.map((post) => post.id));
+			for (const row of postsFrom(read.result.posts, read.id)) {
+				if (entry.posts.length >= POSTS_MAX) break;
+				if (seen.has(row.id)) continue;
+				seen.add(row.id);
+				entry.posts.push(row);
+			}
+			byHandle.set(handle, entry);
+		}
+		return [...byHandle.values()].slice(0, LIBRARY_HANDLES_MAX);
+	};
+	const library = budgeted(collections());
 	const latest = latestSourceRun(installation, scopedRuns);
 	const runReceipt = latest && extras?.source && extras.source.runId === latest.id ? extras.source.receipts.find((v) => v.run_id === latest.id && v.result?.kind === "social.source.posts") : void 0;
 	const runRead = latest && runReceipt && typeof runReceipt.result.handle === "string" && HANDLE.test(runReceipt.result.handle) ? {
@@ -685,18 +749,22 @@ function sourcesOf(installation, scopedRuns, extras) {
 		when: epoch(latest.updated),
 		posts: postsFrom(runReceipt.result.posts)
 	} : null;
-	const toolRead = extras?.tools ? extras.tools.filter((r) => r.install_id === installation.install_id && installation.capabilities?.[r.slot]?.effect === "read" && r.result?.kind === "social.source.posts" && typeof r.result.handle === "string" && HANDLE.test(r.result.handle)).sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0))[0] ?? null : null;
-	if (toolRead && (!runRead || (toolRead.created_at ?? 0) > (runRead.when ?? 0)) && toolRead) return present({
+	const toolRead = reads[0] ?? null;
+	const useTool = toolRead && (!runRead || (toolRead.created_at ?? 0) > (runRead.when ?? 0));
+	const spelled = library.length ? { collections: library } : {};
+	if (useTool && toolRead) return present({
 		handle: toolRead.result.handle,
 		tool_receipt_id: toolRead.id,
 		fetched_at: epoch(toolRead.created_at),
-		posts: postsFrom(toolRead.result.posts)
+		posts: postsFrom(toolRead.result.posts, toolRead.id),
+		...spelled
 	});
 	if (runRead) return present({
 		handle: runRead.handle,
 		run_id: runRead.run.id,
 		fetched_at: runRead.when,
-		posts: runRead.posts
+		posts: runRead.posts,
+		...spelled
 	});
 	return null;
 }

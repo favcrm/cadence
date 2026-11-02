@@ -407,6 +407,21 @@ export interface ScreenSourcePost {
   /** https URL on the Instagram CDN. Only a screen whose declaration opts
    *  into `remote_images: ["instagram-cdn"]` may load it (frame CSP). */
   thumb_url?: string;
+  /** SOC-54: the retained read receipt that returned this post. A library
+   *  keeps posts from earlier reads, so provenance is a per-post fact; the
+   *  collection's `tool_receipt_id` only names the read behind `sources`
+   *  itself. Omitted when the host cannot state it. */
+  receipt_id?: string;
+}
+/** SOC-54: the retained reads of one handle, merged newest-first (an entry can
+ *  therefore span several reads). `sources`
+ *  stays the single newest read (what an older app renders); `collections`
+ *  carries every retained standalone read, so a reload shows the library the
+ *  owner built instead of only the last page. Run-bound reads are not listed
+ *  here: a draft from them is a `run` source, which `sources` already names. */
+export interface ScreenSourceCollection {
+  handle: string; fetched_at?: number; tool_receipt_id?: string;
+  posts: ScreenSourcePost[];
 }
 export interface ScreenSources {
   handle: string; fetched_at?: number;
@@ -417,6 +432,10 @@ export interface ScreenSources {
    *  invocation (CAD-1177) — the retained app_tool receipt id, distinct
    *  from any run id. A screen keys refresh/edit to this, never a run. */
   tool_receipt_id?: string;
+  /** SOC-54: the retained standalone reads of this install, newest first and
+   *  bounded (handles, posts and bytes). Partial by design; absent when the
+   *  host cannot enumerate them. */
+  collections?: ScreenSourceCollection[];
 }
 export interface ScreenPublishSettings {
   revision: number;
@@ -726,6 +745,11 @@ const omit = (key: string) => (p: ScreenPush): ScreenPush => ({ ...p, runs: p.ru
   const row: Record<string, unknown> = { ...r }; delete row[key]; return row as ScreenPush["runs"][number]; }) });
 const DEGRADE: ((push: ScreenPush) => ScreenPush)[] = [
   omit("caption_excerpt"),
+  // SOC-54: the enumerated history is additive — give it up before the newest
+  // page the app already had. A fixed allowance inside the projection cannot
+  // know the rest of this PUSH, so the guarantee lives here, where the whole
+  // message is measured.
+  p => ({ ...p, sources: p.sources && { ...p.sources, collections: undefined } }),
   ({ sources: _s, ...p }) => p,
   omit("inputs_used"),
   p => ({ ...p, publish_intents: { status: "unavailable", withheld: 0, rows: [] } }),
