@@ -678,16 +678,58 @@ fn parse_profile(raw: Option<&str>) -> Option<String> {
 ///
 /// Answers only *which root*, never *may this run*: it runs no overlap
 /// guard, no marker policy beyond existence and no daemon check.
-pub fn active_root() -> Option<PathBuf> {
-    let name = profile()?;
-    let sb = Sandbox::open(&name).ok()?;
+pub fn active_home() -> Result<Option<PathBuf>> {
+    let Some(name) = profile() else {
+        return Ok(None);
+    };
+    let sb = Sandbox::open(&name)?;
     // The marker must name this sandbox: a copy of another sandbox's
     // marker is not a home for this profile.
-    let marker = read_marker(&sb).ok().flatten()?;
+    let Some(marker) = read_marker(&sb)? else {
+        return Ok(None);
+    };
     if marker["name"].as_str() != Some(name.as_str()) {
-        return None;
+        return Ok(None);
     }
-    Some(sb.root)
+    // The home this profile selects must not be a live installation. The
+    // marker is hand-writable, so a planted `{name}` beside a real
+    // `CADENCE_HOME` would otherwise point credential and vault reads at
+    // that install while the store ownership check only saw some other
+    // state dir. Fail closed instead of falling back to the environment:
+    // the environment is what the marker was trying to overrule.
+    refuse_home_overlap(&sb)?;
+    Ok(Some(sb.root))
+}
+
+/// Refuse a sandbox home that is, contains or sits inside a live dir. An
+/// export or `CADENCE_HOME` that names this very root is the sandbox
+/// claiming itself and is exempt; anything else that overlaps is a real
+/// installation and refuses. Stricter than the store guard on purpose:
+/// the resolver consults this before every home-derived path.
+fn refuse_home_overlap(sb: &Sandbox) -> Result<()> {
+    let root = resolved(&sb.root);
+    for (label, dir) in production_dirs(sb, true)? {
+        let live = resolved(&dir);
+        // A sandbox's own children export its state and tracker, which
+        // sit strictly inside its root; those are the sandbox itself. An
+        // equal path is never exempt — `CADENCE_HOME=<root>` beside a
+        // profile is a contradiction this resolver refuses rather than
+        // guesses.
+        let exported = label.starts_with("the exported ") || label.starts_with("the CADENCE_HOME ");
+        if exported && live != root && live.starts_with(&root) {
+            continue;
+        }
+        if root.starts_with(&live) || live.starts_with(&root) {
+            return Err(Error::rejected(format!(
+                "sandbox '{}' at {} overlaps {label} {} — refusing to use it as the home; \
+                 point CADENCE_SANDBOX_ROOT at a scratch dir",
+                sb.name,
+                sb.root.display(),
+                dir.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Refuse `what` — a write to state shared by the whole host — under a
@@ -1269,10 +1311,11 @@ pub fn adopt(state_dir: &Path) -> Result<Option<String>> {
     std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
     std::env::set_var("CADENCE_PM_DIR", root.join("pm"));
     std::env::set_var("CADENCE_STATE_DIR", state_dir);
-    // Pin the base this sandbox was found under: the resolver rebuilds the
-    // root from the profile name, and a shell without the base exported
-    // would otherwise look in the default one.
-    if let Ok(base) = base_dir() {
+    // Pin the base the *adopted* root came from, not whatever the ambient
+    // environment says: the resolver rebuilds the root from the profile
+    // name, and another exported base would select a different sandbox
+    // with the same name.
+    if let Some(base) = root.parent() {
         std::env::set_var("CADENCE_SANDBOX_ROOT", base);
     }
     Ok(Some(name))

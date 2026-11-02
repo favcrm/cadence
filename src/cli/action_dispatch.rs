@@ -629,20 +629,11 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     } else if matches!(cli.command, Commands::Dev { .. }) {
         org::resolve_dev(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
     } else if matches!(cli.command, Commands::Setup { .. }) {
-        // CAD-1922: `setup` installs on this machine, and its hosted
-        // routes are its own `--hosted`/`--register` flags. A saved
-        // remote default must not send it over the allowlist (which
-        // never carried Setup), and `--org` names a destination setup
-        // does not use.
-        if cli.org.is_some() {
-            return Err(Error::rejected(
-                "`setup` is local: it signs in through --hosted/--register, not --org",
-            ));
-        }
-        org::Resolved::Local(match cli.state_dir.clone() {
-            Some(dir) => dir,
-            None => cadence_agent::client::state_dir()?,
-        })
+        // CAD-1922: `setup` installs on this machine. The local-maintenance
+        // selector keeps a saved local connection's state/tracker pair,
+        // never routes a saved remote default over the allowlist, and
+        // refuses a remote `--org`/`CADENCE_ORG` instead of ignoring it.
+        org::resolve_setup(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
     } else {
         org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
     };

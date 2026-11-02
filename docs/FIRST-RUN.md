@@ -172,9 +172,12 @@ No outcome proposes another approval — the live instruction already says
 not to open a second login, and after an interruption (denial, expiry,
 transport failure, a grant that did not match) an approved credential may
 already exist server-side. The one next command is therefore always a
-truthful read of this machine, in the scope this run selected:
-`cadence status`, or `cadence status --org <workspace>` for a hosted
-scope.
+truthful read of this machine, in the scope this run selected: a local
+run hands over `cadence status --state-dir <this run's state dir>` (the
+pin keeps a saved remote org from retargeting it), and a hosted run with
+no inherited pin hands over `cadence status --org <workspace>`. A hosted
+run from a pinned shell — where `--org` would refuse a conflicting
+destination — also hands over the local, state-pinned read.
 
 ## Records and exit codes
 

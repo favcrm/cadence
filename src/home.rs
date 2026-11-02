@@ -109,7 +109,7 @@ pub fn layout() -> Result<Layout> {
     // the sandbox's children to keep the caller's vault, repos, workspace
     // and credentials out — which leaves that variable free to mean
     // production evidence in the overlap guard.
-    if let Some(root) = crate::sandbox::active_root() {
+    if let Some(root) = crate::sandbox::active_home()? {
         return Ok(Layout {
             source: Source::Sandbox,
             marker_present: layout_marker_declared(&root),

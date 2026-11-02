@@ -795,6 +795,7 @@ fn local_resolved(org: &str, state_dir: PathBuf, tracker_dir: PathBuf) -> Result
 enum LocalMaintenance {
     Update,
     Dev,
+    Setup,
 }
 
 impl LocalMaintenance {
@@ -811,6 +812,11 @@ impl LocalMaintenance {
                  is remote. A saved remote org does not select it. Omit the remote \
                  `--org`/`CADENCE_ORG`, or choose local (for example `CADENCE_ORG=local`)."
             )),
+            Self::Setup => Error::rejected(format!(
+                "`cadence setup` installs on this machine only — org '{name}' is \
+                 remote. Its hosted routes are its own `--hosted`/`--register` flags; \
+                 omit the remote `--org`/`CADENCE_ORG`, or choose local."
+            )),
         }
     }
 
@@ -819,7 +825,7 @@ impl LocalMaintenance {
     /// `CADENCE_ORG` beside it is a deliberate selection and must refuse
     /// instead of being dropped on the floor.
     fn refuse_remote_env_beside_pins(self) -> bool {
-        matches!(self, Self::Dev)
+        matches!(self, Self::Dev | Self::Setup)
     }
 }
 
@@ -887,6 +893,18 @@ pub(super) fn resolve_update(
 /// root is present, so that env is not silently discarded. `--org` on a
 /// pin still conflicts exactly as [`resolve`]; `--org` on a managed caller
 /// is still the managed-caller refusal, before any assignment lookup.
+/// `cadence setup` installs on this machine. It shares the local-maintenance
+/// selector, so a saved *local* connection keeps its state and tracker, a
+/// saved remote default never routes it over the allowlist, and a remote
+/// `--org`/`CADENCE_ORG` is refused rather than silently ignored.
+pub(super) fn resolve_setup(
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Resolved> {
+    resolve_local_maintenance(LocalMaintenance::Setup, org, state, tracker)
+}
+
 pub(super) fn resolve_dev(
     org: Option<&str>,
     state: Option<PathBuf>,
