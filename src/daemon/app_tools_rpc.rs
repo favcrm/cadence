@@ -1422,21 +1422,35 @@ impl Shared {
                 self.store.app_context_proof(install, context)?;
                 let records =
                     crate::store::app_records::RecordStore::open(&self.state_dir, install)?;
-                // SOC-54: the screen's library is every retained source read of
-                // this context, not the newest per handle — a reload must show
-                // the posts an owner already fetched. The kind filter and the
-                // bound run in the store, so unrelated receipts cannot evict a
-                // source read; membership in this context is checked here.
-                let results = self.store.app_tool_source_results(install, 100)?;
+                // SOC-54: the screen's library is the retained source reads OF
+                // THIS CONTEXT, bounded. The store filters kind before its page
+                // bound, and this loop applies context membership before the
+                // 100-row total — a single installation-wide window would let
+                // another context's reads starve this one. Pages stop at the
+                // total or when the source history is exhausted.
+                const PAGE: usize = 100;
+                const LIMIT: usize = 100;
                 let mut rows: Vec<Value> = Vec::new();
-                if let Some(all) = results["results"].as_array() {
-                    for row in all {
+                let mut offset = 0;
+                loop {
+                    let page = self
+                        .store
+                        .app_tool_source_results_page(install, offset, PAGE)?;
+                    let exhausted = page.len() < PAGE;
+                    for row in page {
+                        if rows.len() == LIMIT {
+                            break;
+                        }
                         let Some(id) = row["id"].as_str() else {
                             continue;
                         };
                         if records.app_social_tool_receipt_contains(context, id)? {
-                            rows.push(row.clone());
+                            rows.push(row);
                         }
+                    }
+                    offset += PAGE;
+                    if exhausted || rows.len() >= LIMIT {
+                        break;
                     }
                 }
                 Ok(json!({ "results": rows }))

@@ -2,7 +2,7 @@
 // the real ScreenChannel a mounted frame talks to. Fixtures mirror the
 // daemon's app_run_show / installation / binding / receipt JSON.
 import { screenProjection, type ScreenExtras } from "../src/features/workspace-apps/screen/screenProjection";
-import { pushBytes, PUSH_BYTES_MAX, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
+import { pushBytes, PUSH_BYTES_MAX, shapeFor as screenProtocolShapeFor, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
 import { ScreenChannel, ASSET_QUEUE_MAX } from "../src/features/workspace-apps/screen/screenLifecycle";
 import { toPublishIntent, type PublishIntent } from "../src/features/workspace-apps/socialPublish";
 import type { AppBinding, AppContext, AppEffect, Installation, SourceReceipt, ToolReceipt, WorkspaceRun } from "../src/features/workspace-apps/workspaceApps";
@@ -338,7 +338,8 @@ void (async () => {
     result: { kind: "social.source.posts", handle: `fat${handle}`, profile_verified: true,
       posts: Array.from({ length: 24 }, (_, post) => ({
         id: `fat-${handle}-${post}`, caption: "c".repeat(600), permalink: `https://www.instagram.com/p/fat${handle}${post}/`,
-        media_kind: "image", published_at_unix: 1_789_000_000 + post, preview_url: null })) },
+        media_kind: "image", published_at_unix: 1_789_000_000 + post,
+        preview_url: `https://scontent-hkg1-1.cdninstagram.com/v/t51/${"d".repeat(1900)}.jpg` })) },
   }) as unknown as ToolReceipt);
   const fatPush = screenProjection(installation, "main", "ctx-a", [context], runs, effects, intents,
     extras({ source: null, tools: fat }));
@@ -348,6 +349,18 @@ void (async () => {
   check(fatSources.collections?.length === 10, "every handle stays while the posts are trimmed");
   const trimmed = (fatSources.collections ?? []).reduce((n, c) => n + c.posts.length, 0);
   check(trimmed > 0 && trimmed < 240, `oldest posts are trimmed, not the whole section: ${trimmed}`);
+  // SOC-54 degrade order: when the newest page plus the history cannot fit,
+  // the history goes first. A fixed allowance cannot know the rest of the
+  // message, so force the overflow and check the protocol's own sequence.
+  const sample = fatSources.posts[0]!;
+  const overflow = { ...fatPush, sources: { ...fatSources, collections: Array.from({ length: 40 }, (_, handle) => ({
+    handle: `over${handle}`, fetched_at: 1_790_001_000,
+    posts: Array.from({ length: 24 }, (_, post) => ({ ...sample, id: `over-${handle}-${post}` })) })) } } as ScreenPush;
+  check(pushBytes(overflow) > PUSH_BYTES_MAX, "fixture: the enumerated history alone overflows the cap");
+  const trimmedPush = screenProtocolShapeFor(overflow, "v2");
+  check(trimmedPush !== null && !!trimmedPush.sources, "the newest page survives the byte cap");
+  check(!trimmedPush!.sources!.collections, "the enumerated history degrades before the library does");
+  check(pushBytes(trimmedPush!) <= PUSH_BYTES_MAX, `the degraded PUSH fits: ${pushBytes(trimmedPush!)}`);
   const kept = collections.find(c => c.handle === "sakeboyhk")!;
   check(kept.tool_receipt_id === "rcpt-new" && kept.posts.length === 2 && kept.fetched_at === 1_790_000_900,
     "a handle keeps the posts its older read proved");

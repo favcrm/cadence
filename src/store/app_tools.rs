@@ -513,27 +513,31 @@ impl Store {
                 .is_some_and(|posts| posts.iter().any(|p| p["id"] == post_id)))
     }
 
-    /// The newest retained SOURCE reads of one installation (SOC-54). The
-    /// kind filter runs before the bound, so an upload, caption or image
-    /// receipt can never evict a source read from the screen library — the
-    /// eviction the caller's context membership check would otherwise see.
-    pub(crate) fn app_tool_source_results(&self, install: &str, limit: usize) -> Result<Value> {
+    /// One page of the retained SOURCE reads of an installation, newest
+    /// first (SOC-54). The kind filter runs before the bound, so an upload,
+    /// caption or image receipt can never evict a source read from the screen
+    /// library. A page, not a total: the caller's context membership filter
+    /// runs above this store, so a single installation-wide window would let
+    /// another context's reads starve the one asked for.
+    pub(crate) fn app_tool_source_results_page(
+        &self,
+        install: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
         let conn = self.conn();
         let ids = conn
             .prepare(
                 "SELECT id FROM app_tool_results
                   WHERE install_id=? AND json_extract(result,'$.kind')='social.source.posts'
-                  ORDER BY created DESC, id DESC LIMIT ?",
+                  ORDER BY created DESC, id DESC LIMIT ? OFFSET ?",
             )?
-            .query_map(params![install, limit as i64], |r| r.get::<_, String>(0))?
+            .query_map(params![install, limit as i64, offset as i64], |r| {
+                r.get::<_, String>(0)
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(conn);
-        Ok(json!({
-            "results": ids
-                .iter()
-                .map(|id| self.app_tool_result(id))
-                .collect::<Result<Vec<_>>>()?,
-        }))
+        ids.iter().map(|id| self.app_tool_result(id)).collect()
     }
 
     pub(crate) fn app_tool_results(&self, install: &str) -> Result<Value> {

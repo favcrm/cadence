@@ -432,8 +432,9 @@ export interface ScreenSources {
    *  invocation (CAD-1177) — the retained app_tool receipt id, distinct
    *  from any run id. A screen keys refresh/edit to this, never a run. */
   tool_receipt_id?: string;
-  /** SOC-54: every retained standalone read of this install, newest first,
-   *  bounded by the host. Absent when the host cannot enumerate them. */
+  /** SOC-54: the retained standalone reads of this install, newest first and
+   *  bounded (handles, posts and bytes). Partial by design; absent when the
+   *  host cannot enumerate them. */
   collections?: ScreenSourceCollection[];
 }
 export interface ScreenPublishSettings {
@@ -744,6 +745,11 @@ const omit = (key: string) => (p: ScreenPush): ScreenPush => ({ ...p, runs: p.ru
   const row: Record<string, unknown> = { ...r }; delete row[key]; return row as ScreenPush["runs"][number]; }) });
 const DEGRADE: ((push: ScreenPush) => ScreenPush)[] = [
   omit("caption_excerpt"),
+  // SOC-54: the enumerated history is additive — give it up before the newest
+  // page the app already had. A fixed allowance inside the projection cannot
+  // know the rest of this PUSH, so the guarantee lives here, where the whole
+  // message is measured.
+  p => ({ ...p, sources: p.sources && { ...p.sources, collections: undefined } }),
   ({ sources: _s, ...p }) => p,
   omit("inputs_used"),
   p => ({ ...p, publish_intents: { status: "unavailable", withheld: 0, rows: [] } }),

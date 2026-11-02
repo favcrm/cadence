@@ -336,6 +336,13 @@ var omit = (key) => (p) => ({
 });
 var DEGRADE = [
 	omit("caption_excerpt"),
+	(p) => ({
+		...p,
+		sources: p.sources && {
+			...p.sources,
+			collections: void 0
+		}
+	}),
 	({ sources: _s, ...p }) => p,
 	omit("inputs_used"),
 	(p) => ({
@@ -658,10 +665,11 @@ function sourcePost(post, seen, receiptId) {
 		receipt_id: receiptId
 	});
 }
-/** SOC-54: how many bytes the enumeration may add to a PUSH. The frame's
-*  degrade sequence drops the WHOLE `sources` section when a PUSH is too
-*  large, which would cost the app the newest page it already had — so the
-*  history is trimmed rather than allowed to evict it. */
+/** SOC-54: how much of the enumeration a PUSH should normally carry. This is a
+*  preference, not the guarantee: `shapeFor` strips `collections` before it
+*  drops `sources`, because only the assembled message knows what the newest
+*  page plus the rest of the screen cost. Trimming here keeps most of the
+*  history for a large screen instead of losing it whole. */
 var COLLECTIONS_BYTES_MAX = 49152;
 /** Trim the enumeration to the wire budget: oldest posts first, from the
 *  handle holding the most, so one profile's long captions cannot drop
@@ -704,7 +712,8 @@ function sourcesOf(installation, scopedRuns, extras) {
 		return out;
 	};
 	const retainedReads = () => extras?.tools ? extras.tools.filter((r) => r.install_id === installation.install_id && installation.capabilities?.[r.slot]?.effect === "read" && r.result?.kind === "social.source.posts" && typeof r.result.handle === "string" && HANDLE.test(r.result.handle)).sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0)) : [];
-	/** SOC-54: the library as every retained read built it, grouped by handle.
+	/** SOC-54: the retained history (bounded) grouped by handle, newest read
+	*  first, so a reload shows more than the last fetch.
 	*  A newer page wins for a post it repeats; an older read still contributes
 	*  the posts it proved and the rest of the page list, so a reload shows more
 	*  than the last fetch. Bounded per handle and in handle count. Run-bound
