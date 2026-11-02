@@ -20,13 +20,14 @@
 //! `lifecycle` is the draft/published curation lifecycle, not a
 //! private/shared vault boundary.
 //!
-//! The only write admitted here is `app_media_publish`'s atomic
-//! accepted-intent step (`app_media_publish_in`): a draft→published
-//! metadata move (lifecycle, revision +1, `updated`) plus the frozen
-//! accepted receipt, in one sealed tx. Generation writes land with
-//! their own admitted acceptance. The row is re-validated on read — a
-//! malformed stored row refuses the page rather than surfacing forged
-//! fields to a frame.
+//! Writes here are the catalog's own admitted steps, each in one sealed
+//! tx: `app_media_publish_in`'s draft→published metadata move (lifecycle,
+//! revision +1, `updated`) plus its frozen accepted receipt, and
+//! `app_media_import`'s workspace-custody copy of an installation's
+//! retained image (CAD-1962), which also creates the draft row. Generation
+//! writes land with their own admitted acceptance. The row is re-validated
+//! on read — a malformed stored row refuses the page rather than surfacing
+//! forged fields to a frame.
 
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
