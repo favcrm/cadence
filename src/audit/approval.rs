@@ -202,6 +202,10 @@ pub(super) fn title_kind_and_result(title: &str, issue: &str) -> (&'static str, 
 /// do not bind to this PR and head are listed under `skipped` with a
 /// reason, never dropped silently. Symlinks are skipped, never followed.
 /// CAD-918: the delegated approval reads its notes through this too.
+///
+/// AOS-473: the document says `origin:"local"`. The merge gate counts a
+/// hosted document by attested principal and an unmarked one as local, so
+/// the marker is what keeps these notes under today's rule.
 pub(crate) fn verdicts_in(dir: &Path, issue: &str, pr: u64, head: &str) -> Result<Value> {
     let read = std::fs::read_dir(dir).map_err(|e| {
         Error::rejected(format!("cannot read the notes dir {}: {e}", dir.display()))
@@ -292,8 +296,10 @@ pub(crate) fn verdicts_in(dir: &Path, issue: &str, pr: u64, head: &str) -> Resul
             "risk": risk_raw, "head": head,
         }));
     }
-    Ok(json!({"issue": issue, "pr": pr, "head": head,
-              "verdicts": verdicts, "skipped": skipped}))
+    Ok(
+        json!({"origin": "local", "issue": issue, "pr": pr, "head": head,
+              "verdicts": verdicts, "skipped": skipped}),
+    )
 }
 
 /// `cadence audit verdicts`: read-only; one JSON document.

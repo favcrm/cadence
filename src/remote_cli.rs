@@ -145,6 +145,11 @@ pub const REMOTE_VERBS: &[&str] = &[
     "audit_verdict",
     "audit_scope",
     "audit_approve",
+    // AOS-473: the owner's reviewer attestations. The read is scoped like
+    // every other gate read; the write rides the same `audit.approve` login
+    // as the merge approval, because an attestation is the owner's own act.
+    "audit_reviewers",
+    "audit_reviewers_set",
 ];
 
 /// Scope a cli authorize request asks for. Existing container verbs keep
@@ -157,6 +162,7 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "delivery_policy"
         | "audit_approval"
         | "audit_verdicts"
+        | "audit_reviewers"
         | "audit_scope"
         | "agent_profile_list"
         | "agent_profile_context"
@@ -164,7 +170,9 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         // The owner's merge approval and the delivery inputs it binds both
         // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
         "audit_verdict" => &["cli.write"],
-        "audit_approve" | "delivery_policy_set" => &["cli.write", "audit.approve"],
+        "audit_approve" | "audit_reviewers_set" | "delivery_policy_set" => {
+            &["cli.write", "audit.approve"]
+        }
         "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => &["cli.write"],
         _ => &["cli.read", "cli.write"],
     }
@@ -191,7 +199,7 @@ fn team_mutation_verb(verb: &str) -> bool {
 fn mutating_cli_verb(verb: &str) -> bool {
     matches!(
         verb,
-        "message_send" | "issue_attach" | "issue_review" | "audit_verdict"
+        "message_send" | "issue_attach" | "issue_review" | "audit_verdict" | "audit_reviewers_set"
     ) || team_mutation_verb(verb)
 }
 
@@ -205,6 +213,8 @@ fn lost_mutation_note(verb: &str) -> &'static str {
         "the send may or may not have been recorded"
     } else if verb == "issue_attach" {
         "the attachment may or may not have been recorded — inspect the same issue and artifact before repeating it"
+    } else if verb == "audit_reviewers_set" {
+        "the attestation may or may not have been recorded — read `audit reviewers` for the same repo before repeating it"
     } else if verb == "audit_verdict" {
         "the verdict may or may not have been recorded — read `audit verdicts` for the same head before repeating it"
     } else if verb == "issue_review" {

@@ -569,6 +569,8 @@ fn verdicts_bind_head_and_pr_and_report_what_they_skip() {
     )
     .unwrap();
     let v = verdicts_in(d, "CAD-9", 5, h).unwrap();
+    // AOS-473: the marker is what keeps these notes on the local counting rule.
+    assert_eq!(v["origin"], "local");
     let rows: Vec<(String, String, String, String)> = v["verdicts"]
         .as_array()
         .unwrap()

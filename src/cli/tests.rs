@@ -510,6 +510,180 @@ fn audit_approve_and_revoke_parse() {
 }
 
 #[test]
+fn audit_reviewers_read_and_set_parse() {
+    // AOS-473: one `--repo` flag serves both forms, so the set verb can be
+    // written exactly as the contract documents it.
+    let cli =
+        Cli::try_parse_from(["cadence", "audit", "reviewers", "--repo", "favcrm/cadence"]).unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Reviewers { repo, action }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit reviewers must parse to AuditAction::Reviewers");
+    };
+    assert_eq!(
+        (repo.as_deref(), action.is_none()),
+        (Some("favcrm/cadence"), true)
+    );
+
+    let cli = Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "reviewers",
+        "set",
+        "--repo",
+        "favcrm/cadence",
+        "--reviewer",
+        "alice=user_a",
+        "--reviewer",
+        "bob=user_b",
+    ])
+    .unwrap();
+    let Commands::Audit {
+        action:
+            Some(AuditAction::Reviewers {
+                repo,
+                action:
+                    Some(super::audit::ReviewersAction::Set {
+                        repo: set_repo,
+                        reviewer,
+                    }),
+            }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit reviewers set must parse to ReviewersAction::Set");
+    };
+    assert!(repo.is_none());
+    assert_eq!(set_repo, "favcrm/cadence");
+    assert_eq!(reviewer, vec!["alice=user_a", "bob=user_b"]);
+    // The set names its repo and takes at least one row.
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "reviewers",
+        "set",
+        "--reviewer",
+        "alice=user_a"
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "reviewers",
+        "set",
+        "--repo",
+        "favcrm/cadence"
+    ])
+    .is_err());
+
+    let pairs =
+        super::audit::reviewer_pairs(&[" Alice = user_a ".into(), "bob=user_b".into()]).unwrap();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Alice".to_string(), "user_a".to_string()),
+            ("bob".to_string(), "user_b".to_string())
+        ]
+    );
+    for rows in [
+        vec![],
+        vec!["alice".to_string()],
+        vec!["=user_a".to_string()],
+        vec!["alice=".to_string()],
+        vec!["alice=user_a=user_b".to_string()],
+        vec!["alice=user_a".to_string(), "ALICE=user_b".to_string()],
+        vec!["alice=user_a".to_string(), "bob=user_a".to_string()],
+        (0..33).map(|i| format!("l{i}=s{i}")).collect(),
+    ] {
+        assert!(super::audit::reviewer_pairs(&rows).is_err(), "{rows:?}");
+    }
+}
+
+#[test]
+fn audit_verdicts_binds_repo_only_when_given() {
+    let head = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    let cli = Cli::try_parse_from([
+        "cadence", "audit", "verdicts", "--issue", "CAD-1", "--pr", "7", "--head", head,
+    ])
+    .unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Verdicts { repo, .. }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit verdicts must parse to AuditAction::Verdicts");
+    };
+    assert_eq!(repo, None);
+    let cli = Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "verdicts",
+        "--issue",
+        "CAD-1",
+        "--pr",
+        "7",
+        "--head",
+        head,
+        "--repo",
+        "favcrm/cadence",
+    ])
+    .unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Verdicts { repo, .. }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit verdicts must parse to AuditAction::Verdicts");
+    };
+    assert_eq!(repo.as_deref(), Some("favcrm/cadence"));
+}
+
+#[test]
+fn audit_verdict_takes_its_repo() {
+    // AOS-473: the write names the repository, resolved like `audit verdicts`
+    // (cwd github.com origin) when the flag is absent.
+    let head = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    let base = [
+        "cadence",
+        "audit",
+        "verdict",
+        "--issue",
+        "CAD-1",
+        "--pr",
+        "7",
+        "--head",
+        head,
+        "--kind",
+        "spec-security",
+        "--outcome",
+        "pass",
+        "--text",
+        "findings",
+    ];
+    let cli = Cli::try_parse_from(base).unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Verdict { repo, kind, .. }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit verdict must parse to AuditAction::Verdict");
+    };
+    assert_eq!((repo, kind.as_str()), (None, "spec-security"));
+    let cli =
+        Cli::try_parse_from(base.iter().copied().chain(["--repo", "favcrm/cadence"])).unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Verdict { repo, .. }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit verdict must parse to AuditAction::Verdict");
+    };
+    assert_eq!(repo.as_deref(), Some("favcrm/cadence"));
+}
+
+#[test]
 fn broker_approvals_flags_parse() {
     // `cadence claude` — broker parses; refused with --bypass/--tui;
     // the timeout requires the flag.

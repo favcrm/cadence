@@ -25,7 +25,13 @@ unless ALL of these hold for the pinned head:
     or one (`Review (standards+spec)`) when every change is on the one-review
     list (docs/roles/one-review-paths.toml, CAD-957, read at the PR's base
     commit so a PR cannot widen its own list). A `ui/` change also needs a
-    Browser QA pass;
+    Browser QA pass. AOS-473: a document whose `origin` is `hosted` is counted
+    by the owner's attestation instead — the row must name this repo and carry
+    a reviewer_id and a github_login, distinct reviewers are principals, and
+    the author check compares the attested login. Two rows of one reviewer and
+    kind that share a stamp are refused unless they say the same thing. A local
+    document (or one from an older client, which has no marker) counts as
+    before;
   * a ticket comment for this head lists those verdict notes (created after
     the other gates pass; dry-run only checks an existing comment);
   * for a human-class diff (a path trigger, more than 1500 changed lines, or
@@ -514,35 +520,102 @@ def required_check_reasons(repo, head, base_oid, required, rollup, runs):
 # ---- verdict notes (parsed by `cadence audit verdicts`) --------------------
 
 def read_verdicts(notes_dir, issue, pr, head):
-    """(verdicts, skipped) from the audit's own note parser. Raises on failure."""
+    """(verdicts, skipped, origin) from the audit's own verdict reader.
+
+    AOS-473: the document says where it came from. `hosted` is the org's own
+    record, whose rows carry the owner's reviewer attestation; `local` — and
+    an older client, which sends no marker — keeps the existing counting. Any
+    other value is a document this gate cannot classify, so it refuses rather
+    than guess. Raises on failure."""
     rc, out, err = run(["cadence", "audit", "verdicts", "--issue", issue, "--pr", str(pr),
                         "--head", head, "--notes-dir", notes_dir])
     try:
         doc = json.loads(out)
         verdicts, skipped = doc["verdicts"], doc.get("skipped", [])
+        origin = doc.get("origin", "local")
         keys = ("name", "stamp", "reviewer", "kind", "outcome", "title_outcome", "section_outcome", "risk")
-        if rc != 0 or not all(isinstance(v, dict) and all(k in v for k in keys) for v in verdicts):
+        if rc != 0 or not isinstance(verdicts, list) or not all(isinstance(v, dict) and all(k in v for k in keys) for v in verdicts):
             raise ValueError("unexpected shape")
-        return verdicts, skipped
     except (ValueError, KeyError, TypeError, AttributeError):
         detail = (err or out).strip()[:200]
         raise RuntimeError(
             f"cannot read the verdict notes via `cadence audit verdicts` (rc {rc}): {detail}"
             + stale_cli_hint(detail)
         )
+    if origin not in ("local", "hosted"):
+        raise RuntimeError(
+            f"the verdict document names origin {origin!r}, which is neither local nor hosted; "
+            "refusing to guess which counting rule applies")
+    return verdicts, skipped, origin
 
 
-def check_reviews(verdicts, qualifies_one, need_qa, authors, issue):
+def reviewer_key(v, hosted):
+    """The identity a verdict counts as. A hosted row counts the attested
+    principal (`reviewer_id`), never the login string: two logins for one
+    person are one reviewer, and one login for two people is two. A local
+    note counts its `From:` reviewer, as before (AOS-473)."""
+    if hosted is not None:
+        return (v.get("reviewer_id") or "").strip() or (v.get("reviewer") or "").strip()
+    return v.get("reviewer") or ""
+
+
+def unbound_reason(n, hosted):
+    """Why a hosted verdict cannot count, or "" when it can (AOS-473).
+
+    A hosted row is evidence only on the owner's attestation for this repo:
+    the row must name the PR's repo and carry both the principal and the
+    login the owner bound to it. An unproven row never falls back to local
+    counting, and the refusal names the remedy that actually applies."""
+    problems, remedy = [], []
+    row_repo = (n.get("repo") or "").strip()
+    if not row_repo:
+        problems.append("names no repo")
+        remedy.append("read the verdicts with --repo <owner/name>")
+    elif row_repo.lower() != hosted["repo"].lower():
+        problems.append(f"names repo {row_repo}, not the PR's repo {hosted['repo']}")
+        remedy.append("run the gate in the PR's checkout: the hosted read binds the "
+                      "cwd's github.com origin")
+    if not (n.get("reviewer_id") or "").strip():
+        problems.append("has no attested reviewer_id")
+        remedy.append("the workspace owner must attest the reviewer for this repo "
+                      "(`cadence audit reviewers set`)")
+    if not (n.get("github_login") or "").strip():
+        problems.append("has no attested github_login")
+        remedy.append("the workspace owner must attest the reviewer for this repo "
+                      "(`cadence audit reviewers set`)")
+    if not problems:
+        return ""
+    return (f"hosted verdict {n['name']} cannot count: it " + ", and it ".join(problems)
+            + " — " + "; ".join(dict.fromkeys(remedy)))
+
+
+def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None):
     """(reasons, counted notes).
 
     Every head-pinned note counts toward a refusal, whatever its kind or file
     name: a non-pass note refuses unless the SAME reviewer has a later-stamped
     pass of a recognised kind, and an unstamped non-pass note always refuses.
-    Notes are ordered by the file-name stamp, never mtime."""
+    Notes are ordered by the file-name stamp, never mtime.
+
+    `hosted` is `{"repo": owner/name}` when the document came from the org.
+    Then a counted row must be attested for this repo and the author check
+    compares the attested login (AOS-473). Without it, the counting is the
+    local one, unchanged.
+
+    Two rows of one reviewer and one kind that share a stamp state no order, so
+    neither is the current evidence: a hosted document appends corrections, and
+    a same-second pass filed next to a revise would otherwise resolve to
+    whichever row sorted first once a later pass of another kind superseded the
+    non-pass scan. Equal stamps are only harmless when the rows say the same
+    thing (a duplicate file), and the refusal stands independently of any newer
+    row of another kind."""
     reasons, counted = [], []
+    identity = lambda v: reviewer_key(v, hosted)
+    evidence = lambda n: (n["outcome"], n["title_outcome"], n["section_outcome"])
+    ambiguous = set()  # (identity, kind) whose latest stamp holds disagreeing rows
     by_reviewer = {}
     for v in verdicts:
-        by_reviewer.setdefault(v["reviewer"], []).append(v)
+        by_reviewer.setdefault(identity(v), []).append(v)
     for who, notes in sorted(by_reviewer.items()):
         stamped = [n for n in notes if n["stamp"]]
         passes = [n for n in stamped if n["outcome"] == "pass" and n["kind"] != "other"]
@@ -555,6 +628,17 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue):
             reasons.append(
                 f"verdict by {who or '(no reviewer)'} on this head is not a pass "
                 f"(outcome '{n['outcome']}', title '{n['title_outcome']}', section '{n['section_outcome']}'){why}: {n['name']}")
+        by_kind = {}
+        for n in stamped:
+            by_kind.setdefault(n["kind"], []).append(n)
+        for kind, rows in sorted(by_kind.items()):
+            newest = max(r["stamp"] for r in rows)
+            top = [r for r in rows if r["stamp"] == newest]
+            if len(top) > 1 and len({evidence(r) for r in top}) > 1:
+                ambiguous.add((who, kind))
+                reasons.append(
+                    f"cannot order two {kind} verdicts by {who or '(no reviewer)'} with the same "
+                    f"stamp {newest}: {' and '.join(sorted(r['name'] for r in top))}")
         if stamped:
             newest = max(n["stamp"] for n in stamped)
             names = sorted({n["name"] for n in stamped if n["stamp"] == newest})
@@ -565,20 +649,36 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue):
     for v in verdicts:
         if v["kind"] == "other" or not v["stamp"]:
             continue
-        cur = latest.get((v["reviewer"], v["kind"]))
+        key = (identity(v), v["kind"])
+        if key in ambiguous:
+            continue  # no order, so no current evidence
+        cur = latest.get(key)
         if cur is None or v["stamp"] > cur["stamp"]:
-            latest[(v["reviewer"], v["kind"])] = v
+            latest[key] = v
     for n in latest.values():
-        who = n["reviewer"]
+        who = identity(n)
         if n["outcome"] != "pass":
             continue  # already refused above unless superseded
         if not who:
-            reasons.append(f"verdict note has no 'From:' reviewer: {n['name']}")
+            reasons.append(
+                f"hosted verdict {n['name']} has no reviewer_id to count by" if hosted is not None
+                else f"verdict note has no 'From:' reviewer: {n['name']}")
+            continue
+        if hosted is not None:
+            unbound = unbound_reason(n, hosted)
+            if unbound:
+                reasons.append(unbound)
+            elif (n.get("github_login") or "").strip().lower() in authors:
+                reasons.append(
+                    f"verdict by {n.get('github_login')} ({n['name']}) is not independent: "
+                    f"the owner attested that login as the PR author")
+            else:
+                counted.append(n)
         elif who in authors:
             reasons.append(f"verdict by {who} is not independent: they are the PR author ({n['name']})")
         else:
             counted.append(n)
-    by = lambda kind: {n["reviewer"] for n in counted if n["kind"] == kind}
+    by = lambda kind: {identity(n) for n in counted if n["kind"] == kind}
     std, spec, combined = by("standards"), by("spec-security"), by("combined")
     two = bool(std) and bool(spec) and any(a != b for a in std for b in spec)
     if qualifies_one:
@@ -1047,23 +1147,30 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             reasons.append(str(e))
 
     verdicts, counted = [], []
+    origin = "local"
     if issue:
         try:
-            verdicts, skipped = read_verdicts(args.notes_dir, issue, pr, head)
+            verdicts, skipped, origin = read_verdicts(args.notes_dir, issue, pr, head)
             for sk in skipped:
-                report.append(f"skipped note {sk['name']}: {sk['reason']}")
+                report.append(f"skipped note {sk.get('name', '?')}: {sk.get('reason', sk)}")
             for v in verdicts:
                 if v["kind"] == "other":
                     report.append(f"ignored note {v['name']}: its title names no known review kind")
         except RuntimeError as e:
             reasons.append(str(e))
+        # AOS-473: the origin the document names decides the counting rule. A
+        # hosted document is the org's attested record for this repo; anything
+        # else keeps the local rule. A failed read leaves no verdicts to count.
+        hosted = {"repo": repo} if origin == "hosted" else None
+        if hosted is not None:
+            report.append(f"verdict origin: hosted ({repo}); counting attested principals")
         active = authority is not None and authority["requirements"]["activation"] == "active"
         klass = authority["requirements"]["class"] if authority else None
         counted = []
         if not active or klass == "strict":
             native_one = bool(authority and authority["requirements"]["reviews"] == 1)
             effective_one = one and native_one
-            rs, counted = check_reviews(verdicts, effective_one, need_qa, authors, issue)
+            rs, counted = check_reviews(verdicts, effective_one, need_qa, authors, issue, hosted)
             reasons += rs
         elif klass == "routine":
             if authority["readiness"] is None:
@@ -1073,12 +1180,12 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                 if ci_url is not None and ci_url != ready["ci_run_url"]:
                     reasons.append("native routine readiness CI run is not the actual successful ci.yml run at this head")
             if need_qa:
-                reasons += check_reviews(verdicts, True, True, authors, issue)[0]
+                reasons += check_reviews(verdicts, True, True, authors, issue, hosted)[0]
         elif klass == "consequential":
-            rs, counted = check_reviews(verdicts, True, need_qa, authors, issue)
+            rs, counted = check_reviews(verdicts, True, need_qa, authors, issue, hosted)
             reasons += rs
             combined = [n for n in counted if n.get("kind") == "combined"]
-            if len({n.get("reviewer") for n in combined}) != 1:
+            if len({reviewer_key(n, hosted) for n in combined}) != 1:
                 reasons.append(f"active {klass} delivery requires exactly one independent combined review")
         report.append("counted verdicts: " + (", ".join(f"{n['reviewer']} {n['kind']} ({n['name']})" for n in counted) or "none"))
 
