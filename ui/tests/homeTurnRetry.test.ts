@@ -254,6 +254,39 @@ async function main() {
   await settle();
   assert(face.isConnected, "the assistant face stays mounted when the answer lands");
   assert(host.querySelectorAll('[data-kind="typing"]').length === 0, "a landed answer clears the typing bubble");
+  // A mismatched working id with a send queued behind it: the placeholder
+  // belongs to the send being worked, not to the newest queued row.
+  streamMaster.turn = { state: "working", message: "server-a", conversation: "home-thread" };
+  streamMaster.queue = [{ message: "ui-b", conversation: "home-thread" }];
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      pending: [],
+      entries: [
+        ...state!.entries,
+        { seq: 30, role: "operator", kind: "message", message: "ui-a", text: "A ask" },
+        { seq: 31, role: "operator", kind: "message", message: "ui-b", text: "B queued" },
+      ],
+    }));
+  });
+  await settle();
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: { state: "working", message: "server-a", conversation: "home-thread" }, queue: [{ message: "ui-b", conversation: "home-thread" }] }));
+  });
+  await settle();
+  const queuedTurn = host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') ?? null;
+  assert(queuedTurn !== null, "the working placeholder paints with a queued send behind it");
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [
+        ...state!.entries,
+        { seq: 32, role: "agent", kind: "thinking", message: null, text: "A works" },
+      ],
+    }));
+  });
+  await settle();
+  assert(host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') === queuedTurn, "the placeholder updates in place when the first step lands behind a queued send");
   await React.act(async () => {
     streamMaster.turn = null;
     streamMaster.queue = [];

@@ -835,6 +835,29 @@ assert(host.querySelector(".app-chat-list [data-chat-run]") === mismatchRun, "an
 assert(mismatchRun.querySelector('[data-kind="typing"]') === null, "the answered run is not typing for the queued send");
 equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "only the queued send types");
 assert(host.querySelectorAll(".app-chat-list [data-chat-typing]").length === 0, "no standalone typing head follows the adopted run");
+// Before any step exists, a mismatched daemon id plus a queued user must
+// still key the placeholder to the send being worked.
+convs["install-crm"].push(conv("c-split3", { title: "Split turn three" }));
+threads["c-split3"] = [
+  ent(1, "operator", "message", "mismatch ask", "m-split"),
+  ent(2, "operator", "message", "queued behind", "m-next"),
+];
+queue = [{ message: "m-next", conversation: "c-split3" }];
+turn = { state: "working", message: "server-split", conversation: "c-split3" };
+await React.act(async () => { await conversationList("install-crm").refresh(); });
+await settle();
+await pick("Split turn three");
+await React.act(async () => {
+  await conversationThread("c-split3").refresh();
+  await resources.masterConversation("c-split3").refresh();
+});
+await settle();
+const noOpener = host.querySelector(".app-chat-list [data-chat-typing]") as HTMLElement | null;
+assert(noOpener !== null, "a mismatched working id paints the placeholder before any step");
+threads["c-split3"].push(ent(3, "agent", "thinking", "mismatched work", null));
+await React.act(async () => { await conversationThread("c-split3").refresh(); });
+await settle();
+assert(host.querySelector(".app-chat-list [data-chat-run]") === noOpener, "the placeholder updates in place when the mismatched first step lands");
 
 await React.act(async () => { root.unmount(); });
 console.log("conversations checks passed");

@@ -255,6 +255,17 @@ function HomeList({
   const allowLegacy = legacyTranscript;
   const flightKey = inFlightTurnKey(items, running);
   const queuedSet = useMemo(() => new Set(queued), [queued]);
+  // The tail send: the newest user row that is not still queued. With the
+  // daemon's id naming no user, this is the placeholder's only evidence.
+  const tailSend = (() => {
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i];
+      if (item.type !== "operator" && item.type !== "pending") continue;
+      const id = itemMessage(item);
+      if (id !== null && !queuedSet.has(id)) return id;
+    }
+    return null;
+  })();
   // A run keeps the send it was first seen with. Queue membership changes
   // when a queued message starts or is cancelled; re-deriving the send then
   // would rename the stored run and steal the new send's placeholder.
@@ -308,8 +319,9 @@ function HomeList({
       (item.type === "operator" || item.type === "pending");
     if (hoist) {
       const msg = itemMessage(item);
-      if (!msg || !claimedTurns.has(msg)) {
-        typingTail.current = { key: msg ? `turn:${msg}` : "typing-tail", node: act.node };
+      const send = tailSend ?? msg;
+      if (!send || !claimedTurns.has(send)) {
+        typingTail.current = { key: send ? `turn:${send}` : "typing-tail", node: act.node };
       }
     }
     return (
@@ -2123,7 +2135,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
               ?? activeSendId(shown, runningMessage)
               ?? sendBefore(shown, flightRun.items, new Set((masterState.data?.queue ?? []).map((q) => q.message)))
             : null;
-          const lastUser = [...shown].reverse().find((item) => item.type === "operator" || item.type === "pending");
+          const queuedSet = new Set((masterState.data?.queue ?? []).map((q) => q.message));
+          const lastUser = [...shown].reverse().find((item) => {
+            if (item.type !== "operator" && item.type !== "pending") return false;
+            const id = itemMessage(item);
+            return id === null || !queuedSet.has(id);
+          });
           const sendId = flightSend ?? openSend ?? (lastUser ? itemMessage(lastUser) : null) ?? pendingMessages.at(-1) ?? null;
           const claimed = sendId !== null && runViews.some((view) => view.kind === "turn" && view.key === sendId);
           const typingKey = sendId !== null && !claimed ? sendId : "typing-tail";
