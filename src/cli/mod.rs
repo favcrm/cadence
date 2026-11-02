@@ -625,8 +625,11 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
         AuditAction::Approval { .. }
         | AuditAction::Verdicts { .. }
         | AuditAction::Scope { .. }
-        | AuditAction::Verdict { .. } => {
-            unreachable!("audit approval/verdicts/scope/verdict are handled in cli::audit::run")
+        | AuditAction::Verdict { .. }
+        | AuditAction::Reviewers { .. } => {
+            unreachable!(
+                "audit approval/verdicts/scope/verdict/reviewers are handled in cli::audit::run"
+            )
         }
         AuditAction::Designate {
             alias,

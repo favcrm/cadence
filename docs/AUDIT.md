@@ -57,6 +57,26 @@ skipped, never followed. Neither `approval` nor `verdicts` writes anything —
 the verdict read does not even take the registry lock — and the local read
 needs no daemon, state dir or `HOME`.
 
+The document says where it came from (AOS-473): `origin` is `local` for the
+note parse and `hosted` for the org's record, and the merge gate applies the
+attested rule only to `hosted`. A hosted read takes `--repo` (default: the cwd
+checkout's github.com origin), sends it, and refuses an answer naming another
+repository; each hosted entry carries `repo`, `reviewer_id` and
+`github_login`. A local read refuses `--repo`, because notes are not
+repo-scoped. The binding itself is the workspace owner's record:
+
+```bash
+cadence audit reviewers --repo favcrm/cadence   # JSON: the attested logins and principals for that repo
+cadence audit reviewers set --repo favcrm/cadence \
+    --reviewer alice=user_a --reviewer bob=user_b   # owner only, `audit.approve`; replaces the repo's whole set
+```
+
+`set` requires the same opt-in `audit.approve` login as `audit approve`.
+Leaving a reviewer out of the list stops new verdicts for that repo only: rows
+already filed keep their stored login and stay countable for their head,
+because evidence must never be erasable — an owner must not be able to hide a
+`revise` by unbinding.
+
 Two operator verbs write the approval evidence the report reads (see
 [Operator approval evidence](#operator-approval-evidence-the-human-class-gate)):
 
