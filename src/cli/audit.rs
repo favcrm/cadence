@@ -68,11 +68,14 @@ pub(crate) enum AuditAction {
         #[arg(long)]
         issue: String,
     },
-    /// Read-only (CAD-959): the verdict notes of ISSUE that name PR `--pr`
-    /// and the full `--head`, parsed by the audit's own note parser, plus
-    /// a `skipped` list with the reason for every note of the issue that
-    /// does not bind. Reviewer identity is the FIRST whitespace token of
-    /// `From:`, lower-cased (the rest is prose). One JSON document.
+    /// Read-only (CAD-959): the verdicts of ISSUE that name PR `--pr` and the
+    /// full `--head`, plus a `skipped` list with the reason for every note of
+    /// the issue that does not bind. The org this invocation selects decides
+    /// the source, exactly as `--org`/`CADENCE_ORG` route every other verb: a
+    /// local org parses `--notes-dir` with the audit's own note parser, a
+    /// hosted org reads its own record and never this machine's notes.
+    /// Reviewer identity is the FIRST whitespace token of `From:`,
+    /// lower-cased (the rest is prose). One JSON document.
     Verdicts {
         /// Tracker issue id the notes belong to (`Issue:` header).
         #[arg(long)]
@@ -83,7 +86,7 @@ pub(crate) enum AuditAction {
         /// Full 40-hex head SHA the notes must pin.
         #[arg(long)]
         head: String,
-        /// Notes directory (default /var/www/agent-notes).
+        /// Notes directory (local orgs; default /var/www/agent-notes).
         #[arg(long)]
         notes_dir: Option<PathBuf>,
     },
@@ -177,12 +180,12 @@ pub(super) fn run(
         Some(AuditAction::Verdict { .. }) => Err(Error::rejected(
             "audit verdict records a verdict in the hosted org; select it with `--org <org>`.              Nothing was written",
         )),
-        Some(AuditAction::Verdicts {
-            issue,
-            pr,
-            head,
-            notes_dir,
-        }) => verdicts(&issue, pr, &head, notes_dir.as_deref()),
+        // Dispatched before the state dir resolved: `audit verdicts` routes
+        // through the org resolver there (CAD-1981), so a hosted selection
+        // never reaches this local-only reader.
+        Some(AuditAction::Verdicts { .. }) => {
+            unreachable!("audit verdicts is dispatched before state-dir")
+        }
         Some(AuditAction::Scope { issue }) => {
             let (v, code) = cadence_agent::audit::scope_check(&state_dir, issue.trim());
             print_json(&v);
@@ -220,8 +223,11 @@ pub(super) fn run(
     }
 }
 
-/// `cadence audit verdicts`: a pure parse of the notes directory. It
-/// needs no daemon, state dir or org, so every org runs it here (CAD-1946).
+/// `cadence audit verdicts` for a local selection: a pure parse of the
+/// notes directory. It needs no daemon, state dir or `HOME`, and the
+/// dispatcher reaches it before any of those resolve; a hosted selection
+/// never reaches here and answers through the org's own read (CAD-1946,
+/// CAD-1981).
 pub(super) fn verdicts(
     issue: &str,
     pr: u64,

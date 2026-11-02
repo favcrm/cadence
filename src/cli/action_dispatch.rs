@@ -187,6 +187,15 @@ pub(super) fn self_actor_payload(alias: &str, show: &Value) -> Value {
     json!({"alias": alias, "running": running})
 }
 
+/// The inherited tracker pin, `CADENCE_PM_DIR`, guarded exactly as the
+/// daemon's `provider_env` sets it. Passed to `org::resolve`/`org::route`
+/// as their `tracker` pin; `None` when this process inherited no tracker.
+fn tracker_pin() -> Result<Option<PathBuf>> {
+    std::env::var_os("CADENCE_PM_DIR")
+        .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
+        .transpose()
+}
+
 pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     // Offline syntax discovery: no org, state, tracker, login, or daemon.
     if matches!(
@@ -414,26 +423,38 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         }
         _ => {}
     }
-    // CAD-1946: `audit verdicts` parses the notes directory only for a local
-    // selection, and does so before org resolution reaches a daemon or state
-    // dir. A hosted selection answers through the org's own read: a hosted org
-    // that cannot answer must refuse, never fall back to whatever notes happen
-    // to be on this machine — that fallback answers an empty list and reads as
-    // "no verdicts were filed".
-    if let Commands::Audit {
-        action:
-            Some(audit::AuditAction::Verdicts {
-                issue,
-                pr,
-                head,
-                notes_dir,
-            }),
-        ..
-    } = &cli.command
-    {
-        if org::selected_is_local()? {
-            return audit::verdicts(issue, *pr, head, notes_dir.as_deref());
-        }
+    // CAD-1946 / CAD-1981: `audit verdicts` routes through the shared selector
+    // as every other verb does, so this invocation's `--org`/`CADENCE_ORG`
+    // selects the destination here too — the registry's selected row alone
+    // cannot decide it, and an unknown or pinned selector must refuse rather
+    // than read local notes. `org::route` answers the arm only, reading the
+    // registry without its lock and materializing no local state dir: a local
+    // selection therefore parses the notes directory offline, with no daemon,
+    // no state dir and no `HOME`. A hosted selection answers through the org's
+    // own read: a hosted org that cannot answer must refuse, never fall back to
+    // whatever notes happen to be on this machine — that fallback answers an
+    // empty list and reads as "no verdicts were filed".
+    let verdict_args = match &cli.command {
+        Commands::Audit {
+            action:
+                Some(audit::AuditAction::Verdicts {
+                    issue,
+                    pr,
+                    head,
+                    notes_dir,
+                }),
+            ..
+        } => Some((issue.clone(), *pr, head.clone(), notes_dir.clone())),
+        _ => None,
+    };
+    if let Some((issue, pr, head, notes_dir)) = verdict_args {
+        let tracker = tracker_pin()?;
+        return match org::route(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
+            org::Routed::Local => audit::verdicts(&issue, pr, &head, notes_dir.as_deref()),
+            org::Routed::Remote(target) => {
+                remote::run(target, cli.command, cli.wake_timeout, cli.state_dir)
+            }
+        };
     }
     // Hosted metadata never needs local sandbox adoption, permission replay,
     // daemon startup, or the generic native/container verb map. Refuse an
@@ -492,9 +513,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 "a managed agent cannot administer the human team. A saved login is not team authority. Nothing was sent",
             ));
         }
-        let tracker = std::env::var_os("CADENCE_PM_DIR")
-            .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
-            .transpose()?;
+        let tracker = tracker_pin()?;
         let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
             org::Resolved::Remote(target) => target,
             org::Resolved::Local(_) => {
@@ -615,9 +634,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     {
         return app::run_inspect(source, *json);
     }
-    let tracker = std::env::var_os("CADENCE_PM_DIR")
-        .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
-        .transpose()?;
+    let tracker = tracker_pin()?;
     // CAD-1355 / CAD-1545: `update` and `dev` are local maintenance, so
     // they resolve through the shared local-maintenance selector — a saved
     // remote default never routes them, and an explicit remote
