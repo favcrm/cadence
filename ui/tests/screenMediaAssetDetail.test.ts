@@ -6,7 +6,8 @@
  *
  * Pure parser check: no renderer, no network, no authority proof.
  */
-import { mediaReadArgs } from "../src/features/workspace-apps/screen/screenProtocol";
+import { isMediaVerb, mediaImportArgs, mediaReadArgs, MEDIA_VERBS } from "../src/features/workspace-apps/screen/screenProtocol";
+import { parseMount } from "../src/features/workspace-apps/screen/screenLifecycle";
 
 const ID = `med-${"a".repeat(32)}`;
 const OTHER = `med-${"b".repeat(32)}`;
@@ -44,3 +45,29 @@ equal(
   "preview still admitted",
 );
 refused(mediaReadArgs({ kind: "media.generate" }), "generate stays unadmitted");
+
+// CAD-1962 import: the mount must admit the permission the daemon mints,
+// or the receipt is rejected and the screen never mounts.
+equal(isMediaVerb("media.import"), true, "media.import is a media verb");
+equal(MEDIA_VERBS.length, 4, "all four declared media permissions are admitted");
+equal(mediaImportArgs({ receipt_id: "receipt-1", request_id: "req-1" }), { receipt_id: "receipt-1", request_id: "req-1" }, "canonical import args");
+refused(mediaImportArgs({ receipt_id: "receipt-1", request_id: "req-1", asset_id: ID }), "import extra field");
+refused(mediaImportArgs({ receipt_id: "receipt-1" }), "import missing request id");
+refused(mediaImportArgs({ receipt_id: "", request_id: "req-1" }), "import empty receipt");
+refused(mediaImportArgs({ receipt_id: "receipt 1", request_id: "req-1" }), "import receipt grammar");
+refused(mediaImportArgs({ receipt_id: "receipt-1", request_id: "req/1" }), "import request grammar");
+
+const mountReceipt = {
+  mount: `/api/app-screen/${"a".repeat(64)}`,
+  bridge_nonce: "b".repeat(64),
+  generation: 1,
+  tag: "main",
+  action_token: "c".repeat(64),
+  media: {
+    contract: "screen-media.v1",
+    may: ["media.read", "media.publish", "media.import", "media.chat.attach"],
+  },
+};
+equal(parseMount(mountReceipt, "main") !== null, true, "a mount declaring media.import is admitted");
+const unknownVerb = { ...mountReceipt, media: { contract: "screen-media.v1", may: ["media.generate"] } };
+equal(parseMount(unknownVerb, "main"), null, "an unknown media verb still refuses the mount");
