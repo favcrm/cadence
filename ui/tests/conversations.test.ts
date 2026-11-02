@@ -723,6 +723,19 @@ await React.act(async () => {
 });
 await settle();
 assert(host.querySelector(".app-chat-list [data-chat-run]") === landed, "the head survives completion past a queued send");
+// The queued send starting must not re-attribute the answered run to it.
+queue = [];
+turn = { state: "working", message: "m-next", conversation: "c-split" };
+threads["c-split"].push(ent(5, "agent", "thinking", "B starts", null));
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+assert(host.querySelector(".app-chat-list [data-chat-run]") === landed, "the answered run keeps its identity when the queued send starts");
+equal(host.querySelectorAll(".app-chat-list [data-chat-run] .turn-head").length, 2, "each send paints its own head");
+assert(landed.querySelector('[data-turn-state="running"]') === null, "the answered run is not marked running for the new send");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "only the new send is typing");
 // The daemon's working id differs from the send id and a system row
 // splits the untagged run: ownership follows the adopted send, so the
 // last segment paints the dots and no second head appears.

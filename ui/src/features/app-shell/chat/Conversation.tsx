@@ -255,6 +255,10 @@ function HomeList({
   const allowLegacy = legacyTranscript;
   const flightKey = inFlightTurnKey(items, running);
   const queuedSet = useMemo(() => new Set(queued), [queued]);
+  // A run keeps the send it was first seen with. Queue membership changes
+  // when a queued message starts or is cancelled; re-deriving the send then
+  // would rename the stored run and steal the new send's placeholder.
+  const stickySends = useRef(new Map<string, string>());
   // One key for the send, from the empty typing row through the finished
   // answer, so the assistant head does not unmount and splash when the
   // first step lands. Computed before the rows, so a turn that already
@@ -268,7 +272,12 @@ function HomeList({
     // The empty typing row is keyed by the send, and this run keeps that
     // same id after the answer lands or working clears — identity must not
     // depend on the turn still being in flight, or the head remounts.
-    const msg = run.message ?? sendBefore(items, run.items, queuedSet);
+    const remembered = stickySends.current.get(run.key);
+    const certain = run.message ?? activeSendId(items, running);
+    const msg = run.message ?? remembered ?? certain ?? sendBefore(items, run.items, queuedSet);
+    // Only a send the transcript or the working id names is remembered; a
+    // value guessed from the queue at first sight could be wrong.
+    if (certain !== null && remembered === undefined) stickySends.current.set(run.key, certain);
     if (msg && !claimedTurns.has(msg)) {
       claimedTurns.add(msg);
       turnKey.set(run.key, `turn:${msg}`);
@@ -1618,6 +1627,14 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     () => new Map(shown.map((item, i) => [item.key, directives[i]?.directive ?? null])),
     [shown, directives],
   );
+  const stickySends = useRef(new Map<string, string>());
+  const stickyScope = useRef<string | null>(null);
+  // Item keys restart per thread: a map kept across a conversation switch
+  // would give a new run the old thread's send.
+  if (stickyScope.current !== convId) {
+    stickyScope.current = convId;
+    stickySends.current = new Map();
+  }
   const runViews = useMemo(() => {
     const flightKey = inFlightTurnKey(shown, runningMessage);
     const special = (item: ThreadItem) =>
@@ -1631,7 +1648,13 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     const queuedSet = new Set((masterState.data?.queue ?? []).map((q) => q.message));
     for (const run of runs) {
       if (!run.turn) continue;
-      effective.set(run.key, run.message ?? sendBefore(shown, run.items, queuedSet));
+      const remembered = stickySends.current.get(run.key);
+      const certain = run.message ?? activeSendId(shown, runningMessage);
+      const send = run.message ?? remembered ?? certain ?? sendBefore(shown, run.items, queuedSet);
+      // Only a send the transcript or the working id names is remembered; a
+      // value guessed from the queue at first sight could be wrong.
+      if (certain !== null && remembered === undefined) stickySends.current.set(run.key, certain);
+      effective.set(run.key, send);
     }
     const perMessage = new Map<string, number>();
     // Completion is the message's, not a segment's: an answer in any run of
@@ -2015,7 +2038,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
               className="text-secondary text-ink-300 break-words"
               data-chat-item
               data-chat-run
-            >
+                          >
               <ThreadTurn
                 items={safe}
                 density={density}
@@ -2069,7 +2092,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           // the last answer). A message queued behind it must not take over.
           const openSend = activeSendId(shown, runningMessage);
           const flightSend = flightRun !== null && flightRun.turn
-            ? flightRun.message ?? sendBefore(shown, flightRun.items, new Set((masterState.data?.queue ?? []).map((q) => q.message)))
+            ? flightRun.message
+              ?? stickySends.current.get(flightRun.key)
+              ?? activeSendId(shown, runningMessage)
+              ?? sendBefore(shown, flightRun.items, new Set((masterState.data?.queue ?? []).map((q) => q.message)))
             : null;
           const lastUser = [...shown].reverse().find((item) => item.type === "operator" || item.type === "pending");
           const sendId = flightSend ?? openSend ?? (lastUser ? itemMessage(lastUser) : null) ?? pendingMessages.at(-1) ?? null;
