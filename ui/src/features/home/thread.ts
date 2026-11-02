@@ -479,7 +479,7 @@ export function activeSendId(items: ThreadItem[], runningMessage: string | null)
 /** The send a run belongs to: the nearest user row before it, skipping
  *  messages still queued behind the running turn. A queued row can sit
  *  between the working send and its first assistant rows. */
-export function sendBefore(items: ThreadItem[], runItems: ThreadItem[], queued: ReadonlySet<string>): string | null {
+export function sendBefore(items: ThreadItem[], runItems: ThreadItem[], queued: ReadonlySet<string>, skip: string | null = null): string | null {
   const idx = items.indexOf(runItems[0]);
   if (idx < 0) return null;
   for (let i = idx - 1; i >= 0; i--) {
@@ -487,7 +487,7 @@ export function sendBefore(items: ThreadItem[], runItems: ThreadItem[], queued: 
     if (item.type !== "operator" && item.type !== "pending") continue;
     if (item.type === "pending" && item.pending.state === "failed") continue;
     const id = itemMessage(item);
-    if (id !== null && queued.has(id)) continue;
+    if (id !== null && (queued.has(id) || id === skip)) continue;
     return id;
   }
   return null;

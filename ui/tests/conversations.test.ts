@@ -835,6 +835,26 @@ assert(host.querySelector(".app-chat-list [data-chat-run]") === mismatchRun, "an
 assert(mismatchRun.querySelector('[data-kind="typing"]') === null, "the answered run is not typing for the queued send");
 equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "only the queued send types");
 assert(host.querySelectorAll(".app-chat-list [data-chat-typing]").length === 0, "no standalone typing head follows the adopted run");
+// A later queued send must not rekey the one already running.
+threads["c-split2"].push(ent(6, "operator", "message", "third ask", "m-third"));
+queue = [{ message: "m-third", conversation: "c-split2" }];
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+const runningRun = host.querySelectorAll(".app-chat-list [data-chat-run]")[1] as HTMLElement | undefined;
+assert(runningRun !== undefined, "the running send has its own run");
+queue = [];
+turn = { state: "working", message: "m-third", conversation: "c-split2" };
+threads["c-split2"].push(ent(7, "agent", "thinking", "third works", null));
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+assert(host.querySelectorAll(".app-chat-list [data-chat-run]")[1] === runningRun, "the running send keeps its identity when another starts");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "only the newest send types");
 // Before any step exists, a mismatched daemon id plus a queued user must
 // still key the placeholder to the send being worked.
 convs["install-crm"].push(conv("c-split3", { title: "Split turn three" }));

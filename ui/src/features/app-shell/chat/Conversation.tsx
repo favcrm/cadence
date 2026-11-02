@@ -2,6 +2,8 @@ import { chatContext } from "../chatScreen";
 import { useCanvasFeed } from "../../canvas/feed";
 import {
   Fragment,
+  cloneElement,
+  isValidElement,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -277,37 +279,56 @@ function HomeList({
   // owns the message does not also grow a second typing row.
   const turnKey = new Map<string, string>();
   const claimedTurns = new Set<string>();
+  // The run the daemon is working: the opener's run, else the newest run
+  // without an answer. Its send is the evidence for the placeholder and for
+  // every segment that continues it.
+  const workingSend = activeSendId(items, running);
+  const workingRunKey = (() => {
+    if (running === null) return null;
+    if (flightKey !== null) {
+      for (const run of runs) {
+        if (run.turn && run.items.some((item) => item.key === flightKey)) return run.key;
+      }
+    }
+    // Without an opener, only a run whose send the working id names can be
+    // the working one; a newer send with no rows yet is the placeholder's.
+    if (workingSend === null) return null;
+    for (let i = runs.length - 1; i >= 0; i--) {
+      const run = runs[i];
+      if (!run.turn) continue;
+      if (run.items.some((item) => item.type === "answer")) continue;
+      if (sendBefore(items, run.items, queuedSet) === workingSend) return run.key;
+    }
+    return null;
+  })();
+  const workingIndex = workingRunKey === null ? -1 : runs.findIndex((run) => run.key === workingRunKey);
   // A split turn's later segments continue the send the opening run proved;
-  // historical runs never inherit the working id.
+  // a run before the working one must not take that send from it.
   let carry: string | null = null;
-  for (const run of runs) {
+  runs.forEach((run, index) => {
     if (!run.turn) {
       if (run.item.type === "operator" || run.item.type === "pending") carry = null;
-      continue;
+      return;
     }
-    const isFlight = flightKey !== null && run.items.some((item) => item.key === flightKey);
-    // The send's own id, not the daemon's working id. Hosted agent rows
-    // often carry neither, and the working id can differ from the send.
-    // The empty typing row is keyed by the send, and this run keeps that
-    // same id after the answer lands or working clears — identity must not
-    // depend on the turn still being in flight, or the head remounts.
+    const isWorking = index === workingIndex;
     const remembered = stickySends.current.get(run.key);
-    const runningSend = isFlight ? activeSendId(items, running) : null;
-    const certain = run.message ?? runningSend ?? carry;
-    const msg: string | null = run.message ?? remembered ?? runningSend ?? carry ?? sendBefore(items, run.items, queuedSet);
-    // Remember the send the transcript, the move's opener, or the working
-    // id names. A flight run whose daemon id matches no user row still
-    // adopts its nearest non-queued user row, and that adoption must
-    // survive the queue changing around it.
-    if (remembered === undefined && msg !== null && (certain !== null || isFlight)) {
-      stickySends.current.set(run.key, msg);
+    const certain = run.message ?? (isWorking ? workingSend : null) ?? carry;
+    const send: string | null = run.message
+      ?? remembered
+      ?? (isWorking ? workingSend ?? carry : null)
+      ?? carry
+      ?? sendBefore(items, run.items, queuedSet, index < workingIndex ? workingSend : null);
+    // Remember the send the transcript, the working move, or a continued
+    // segment names. A value guessed from the queue could be wrong.
+    if (remembered === undefined && send !== null && (certain !== null || isWorking)) {
+      stickySends.current.set(run.key, send);
     }
-    if (msg && !claimedTurns.has(msg)) {
-      claimedTurns.add(msg);
-      turnKey.set(run.key, `turn:${msg}`);
+    if (send && !claimedTurns.has(send)) {
+      claimedTurns.add(send);
+      turnKey.set(run.key, `turn:${send}`);
     }
-    carry = run.items.some((item) => item.type === "answer") ? null : msg;
-  }
+    carry = run.items.some((item) => item.type === "answer") ? null : send ?? carry;
+  });
   const typingTail: { current: { key: string; node: ReactNode } | null } = { current: null };
   const row = (item: ThreadItem) => {
     // Live items (or the operator's pending ones) enter with the rise
@@ -364,7 +385,9 @@ function HomeList({
         // calendar day it already showed.
         const pushRow = (node: ReactNode, key: string) => {
           if (dayMs !== null) rows.push(<DayDivider key={`${key}-day`} ms={dayMs} />);
-          rows.push(<Fragment key={key}>{node}</Fragment>);
+          // The row carries the key, not a keyed Fragment around it: a day
+          // divider appearing as its sibling must not remount the row.
+          rows.push(isValidElement(node) ? cloneElement(node, { key }) : <Fragment key={key}>{node}</Fragment>);
         };
         if (!run.turn) {
           pushRow(row(run.item), rowPaintKey(run.item));
@@ -383,8 +406,14 @@ function HomeList({
         // unfolding that earlier turn's answer. `flightKey` covers a run
         // whose agent rows never received the send's message id.
         const ownsFlight = flightKey !== null && run.items.some((item) => item.key === flightKey);
+        // The run's adopted send is the same evidence the placeholder used:
+        // a working id that names this run's send makes it the live turn,
+        // even when an earlier answered run sits between the two.
+        const adoptedRunning =
+          run.key === workingRunKey || (running !== null && turnKey.get(run.key) === `turn:${running}`);
         const busy =
           ownsFlight ||
+          adoptedRunning ||
           (!hasFallback && acts.some((act) => act !== null)) ||
           (running !== null && run.items.some((item) => itemMessage(item) === running));
         const live = Number(run.key.slice(1)) > liveAfter;
@@ -420,9 +449,7 @@ function HomeList({
         // the array remounts the head when the first step lands.
         if (typingTail.current) {
           rows.push(
-            <Fragment key={typingTail.current.key}>
-              <li className="min-w-0 space-y-4">{typingTail.current.node}</li>
-            </Fragment>,
+            <li key={typingTail.current.key} className="min-w-0 space-y-4">{typingTail.current.node}</li>,
           );
         }
         return rows;
@@ -1683,29 +1710,53 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     // untagged and tagged segments on distinct keys.
     const effective = new Map<string, string | null>();
     const queuedSet = new Set((masterState.data?.queue ?? []).map((q) => q.message));
+    // The run the daemon is working: the opener's run, else the newest run
+    // without an answer. Its send is evidence for its segments and for the
+    // placeholder, even when an earlier answered run sits between them.
+    const workingSend = activeSendId(shown, runningMessage);
+    const workingRunKey = (() => {
+      if (runningMessage === null) return null;
+      if (flightKey !== null) {
+        for (const run of runs) {
+          if (run.turn && run.items.some((item) => item.key === flightKey)) return run.key;
+        }
+      }
+      // Without an opener, only a run whose send the working id names can be
+      // the working one; a newer send with no rows yet is the placeholder's.
+      if (workingSend === null) return null;
+      for (let i = runs.length - 1; i >= 0; i--) {
+        const run = runs[i];
+        if (!run.turn) continue;
+        if (run.items.some((item) => item.type === "answer")) continue;
+        if (sendBefore(shown, run.items, queuedSet) === workingSend) return run.key;
+      }
+      return null;
+    })();
+    const workingIndex = workingRunKey === null ? -1 : runs.findIndex((run) => run.key === workingRunKey);
     // A split turn's later segments continue the send its opening run
-    // proved; historical runs never inherit the working id.
+    // proved; a run before the working one must not take that send.
     let carry: string | null = null;
-    for (const run of runs) {
+    runs.forEach((run, index) => {
       if (!run.turn) {
         if (run.item.type === "operator" || run.item.type === "pending") carry = null;
-        continue;
+        return;
       }
-      const isFlight = flightKey !== null && run.items.some((item) => item.key === flightKey);
+      const isWorking = index === workingIndex;
       const remembered = stickySends.current.get(run.key);
-      const runningSend = isFlight ? activeSendId(shown, runningMessage) : null;
-      const certain = run.message ?? runningSend ?? carry;
-      const send: string | null = run.message ?? remembered ?? runningSend ?? carry ?? sendBefore(shown, run.items, queuedSet);
-      // Remember the send the transcript, the move's opener, or the working
-      // id names. A flight run whose daemon id matches no user row still
-      // adopts its nearest non-queued user row, and that adoption must
-      // survive the queue changing around it.
-      if (remembered === undefined && send !== null && (certain !== null || isFlight)) {
+      const send: string | null = run.message
+        ?? remembered
+        ?? (isWorking ? workingSend ?? carry : null)
+        ?? carry
+        ?? sendBefore(shown, run.items, queuedSet, index < workingIndex ? workingSend : null);
+      const evidence = run.message
+        ?? (isWorking ? workingSend ?? send : null)
+        ?? carry;
+      if (remembered === undefined && send !== null && evidence !== null) {
         stickySends.current.set(run.key, send);
       }
       effective.set(run.key, send);
-      carry = run.items.some((item) => item.type === "answer") ? null : send;
-    }
+      carry = run.items.some((item) => item.type === "answer") ? null : send ?? carry;
+    });
     const perMessage = new Map<string, number>();
     // Completion is the message's, not a segment's: an answer in any run of
     // a split turn completes the whole turn.
@@ -1749,6 +1800,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       const cardAnswer = cards.some((item) => item.type === "answer");
       const answerItem = run.items.find((item) => item.type === "answer" && !special(item)) ?? null;
       const owns =
+        run.key === workingRunKey ||
         (flightKey !== null && run.items.some((item) => item.key === flightKey)) ||
         (message !== null && message === flightSend);
       return {
@@ -2045,7 +2097,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           if (day !== null) prevDay = day;
           const pushRow = (node: ReactNode, key: string) => {
             if (dayMs !== null) rows.push(<DayDivider key={`${key}-day`} ms={dayMs} />);
-            rows.push(<Fragment key={key}>{node}</Fragment>);
+            // The row carries the key, not a keyed Fragment around it: a day
+            // divider appearing as its sibling must not remount the row.
+            rows.push(isValidElement(node) ? cloneElement(node, { key }) : <Fragment key={key}>{node}</Fragment>);
           };
           const row = (item: ThreadItem, index: number) => (
             <AppRow
@@ -2159,11 +2213,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           const typingKey = sendId !== null && !claimed ? sendId : "typing-tail";
           if (reserveTyping && !runViews.some((view) => view.kind === "turn" && view.key === typingKey)) {
             rows.push(
-              <Fragment key={typingKey}>
-                <li className="text-secondary text-ink-300 break-words" data-chat-typing>
-                  <ThreadTurn items={[]} running density={density} />
-                </li>
-              </Fragment>,
+              <li key={typingKey} className="text-secondary text-ink-300 break-words" data-chat-typing>
+                <ThreadTurn items={[]} running density={density} />
+              </li>,
             );
           }
           return rows;

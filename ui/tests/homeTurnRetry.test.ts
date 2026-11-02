@@ -349,6 +349,31 @@ async function main() {
   });
   await settle();
   assert(host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') === systemTurn, "the first step replaces the system-carried placeholder in place");
+  // An answered run between the working send and its own steps must not hide
+  // the running send: the adopted id is the evidence, not the helper alone.
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      pending: [],
+      entries: [
+        ...state!.entries,
+        { seq: 60, role: "operator", kind: "message", message: "ui-e", text: "E ask" },
+        { seq: 61, role: "operator", kind: "message", message: "ui-f", text: "F ask" },
+        { seq: 62, role: "agent", kind: "thinking", message: null, text: "E works" },
+        { seq: 63, role: "agent", kind: "turn_result", message: null, text: "E answer" },
+        { seq: 64, role: "agent", kind: "thinking", message: null, text: "F works" },
+      ],
+    }));
+  });
+  await settle();
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: { state: "working", message: "ui-f", conversation: "home-thread" }, queue: [] }));
+  });
+  await settle();
+  const interleavedTyping = host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') ?? null;
+  assert(interleavedTyping !== null, "the working send paints typing behind an earlier answered run");
+  assert(host.querySelectorAll('[data-kind="typing"]').length === 1, "one typing bubble for the interleaved send");
+  assert(host.querySelectorAll('[data-chat-typing]').length === 0, "no standalone typing head behind an answered run");
   await React.act(async () => {
     streamMaster.turn = null;
     streamMaster.queue = [];
