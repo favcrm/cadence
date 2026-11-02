@@ -132,13 +132,13 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
         .app_social_freshness_save("ctx-one", "kiva.wood", "receipt-stale", 12.0)
         .unwrap();
     store
-        .app_social_tool_receipt_attach("ctx-one", "receipt-new", 20.0)
+        .app_social_tool_receipt_attach("ctx-one", "receipt-new", 20.0, "social.source.posts")
         .unwrap();
     store
-        .app_social_tool_receipt_attach("ctx-one", "receipt-old", 10.0)
+        .app_social_tool_receipt_attach("ctx-one", "receipt-old", 10.0, "social.source.posts")
         .unwrap();
     store
-        .app_social_tool_receipt_attach("ctx-two", "receipt-other", 15.0)
+        .app_social_tool_receipt_attach("ctx-two", "receipt-other", 15.0, "social.source.posts")
         .unwrap();
     // SOC-54: membership is per context and install — the screen library
     // resolves source reads host-side and keeps only what this context holds.
@@ -168,9 +168,17 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
+    // The kind-filtered covering index narrows the window to this context's
+    // source reads (plus legacy unknown-kind rows) before the small ORDER BY
+    // sort; the sort is over that window, never the context's whole history.
     assert!(
-        plan.iter().any(|line| line.contains("app_social_tool_receipts_order")),
-        "candidate order uses its index: {plan:?}"
+        plan.iter()
+            .any(|line| line.contains("USING COVERING INDEX app_social_tool_receipts_source_order")),
+        "the candidate window is read through its kind index: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.trim_start().starts_with("SCAN app_social_tool_receipts")),
+        "no full scan of the context's attachments: {plan:?}"
     );
     // The candidate query orders by completed_at; the schema must carry the
     // index that makes that order a walk rather than a sort of the context's
@@ -179,12 +187,28 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
         store
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='app_social_tool_receipts_order'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='app_social_tool_receipts_source_order'",
                 [],
                 |r| r.get::<_, i64>(0)
             )
             .unwrap()
             == 1
+    );
+    // SOC-54: an upload cannot evict a source read from the candidate window.
+    // Three newer uploads and one older source, window 3 — the source must
+    // still be a candidate, because the window selects on kind.
+    store
+        .app_social_tool_receipt_attach("ctx-one", "up-1", 31.0, "social.uploaded_image")
+        .unwrap();
+    store
+        .app_social_tool_receipt_attach("ctx-one", "up-2", 32.0, "social.uploaded_image")
+        .unwrap();
+    store
+        .app_social_tool_receipt_attach("ctx-one", "up-3", 33.0, "social.uploaded_image")
+        .unwrap();
+    assert_eq!(
+        store.app_social_tool_receipt_ids("ctx-one", 2).unwrap(),
+        vec!["receipt-new", "receipt-old"]
     );
     // The candidate window the screen read is bounded by: this context's own
     // attachments, newest first, and never another context's.
@@ -581,7 +605,7 @@ fn uploaded_receipt_is_context_scoped_and_image_updates_are_revision_checked() {
     let root = tempfile::tempdir().unwrap();
     let store = RecordStore::open(root.path(), "install-social").unwrap();
     store
-        .app_social_tool_receipt_attach("ctx-one", "up-image", 1.0)
+        .app_social_tool_receipt_attach("ctx-one", "up-image", 1.0, "social.uploaded_image")
         .unwrap();
     assert!(store
         .app_social_tool_receipt_contains("ctx-one", "up-image")

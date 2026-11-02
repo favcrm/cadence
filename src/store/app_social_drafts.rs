@@ -43,8 +43,9 @@ CREATE TABLE IF NOT EXISTS app_social_source_requests(\
  intent_digest TEXT NOT NULL, at REAL NOT NULL);\
 CREATE TABLE IF NOT EXISTS app_social_tool_receipts(\
  install_id TEXT NOT NULL, context_id TEXT NOT NULL, receipt_id TEXT NOT NULL, completed_at REAL NOT NULL,\
+ kind TEXT NOT NULL DEFAULT '',\
  PRIMARY KEY(context_id,receipt_id));\
-CREATE INDEX IF NOT EXISTS app_social_tool_receipts_order ON app_social_tool_receipts(install_id,context_id,completed_at DESC,receipt_id DESC);\
+CREATE INDEX IF NOT EXISTS app_social_tool_receipts_source_order ON app_social_tool_receipts(install_id,context_id,kind,completed_at DESC,receipt_id DESC);\
 CREATE TABLE IF NOT EXISTS app_social_freshness(\
  install_id TEXT NOT NULL, context_id TEXT NOT NULL, handle TEXT NOT NULL, receipt_id TEXT NOT NULL, completed_at REAL NOT NULL,\
  PRIMARY KEY(context_id,handle));\
@@ -355,6 +356,18 @@ pub(crate) fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
     conn.execute_batch(DRAFT_SCHEMA)
         .map_err(|e| Error::internal(format!("social draft schema unavailable: {e}")))?;
     migrate_social_effect_schedule_schema(conn)?;
+    // SOC-54: the retained-receipt kind selects the screen library window.
+    // Additive: rows written before it stay '' (unknown) and remain eligible.
+    let receipt_columns = conn
+        .prepare("PRAGMA table_info(app_social_tool_receipts)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !receipt_columns.iter().any(|c| c == "kind") {
+        conn.execute(
+            "ALTER TABLE app_social_tool_receipts ADD COLUMN kind TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
     // CAD-1303: soft discard marker. Additive; the file schema version stays.
     let draft_columns = conn
         .prepare("PRAGMA table_info(app_social_drafts)")?
@@ -815,22 +828,29 @@ impl RecordStore {
         rows.into_iter().map(|r|Ok(json!({"alias":r.0,"tool":r.1,"input_digest":r.2,"input":serde_json::from_str::<Value>(&r.3).map_err(|_|Error::rejected("generation input is corrupt"))?,"scope":serde_json::from_str::<Value>(&r.4).map_err(|_|Error::rejected("generation intent scope is corrupt"))?,"request_id":r.5,"state":r.6,"receipt_id":r.7,"outcome":r.8,"updated_at":r.9}))).collect()
     }
 
+    /// Retain one tool receipt for this context (SOC-54 records its kind).
+    /// `kind` is the receipt's own `result.kind`; the screen library selects on
+    /// it, so an upload or caption receipt cannot consume the source window.
+    /// Rows written before this column existed keep `''` (unknown) and stay
+    /// eligible, bounded, rather than disappearing on upgrade.
     pub fn app_social_tool_receipt_attach(
         &self,
         context: &str,
         receipt: &str,
         completed: f64,
+        kind: &str,
     ) -> Result<()> {
-        self.write_tx(|tx|{tx.execute("INSERT OR IGNORE INTO app_social_tool_receipts(install_id,context_id,receipt_id,completed_at) VALUES(?,?,?,?)",params![self.install(),context,receipt,completed])?;Ok(())})
+        self.write_tx(|tx|{tx.execute("INSERT OR IGNORE INTO app_social_tool_receipts(install_id,context_id,receipt_id,completed_at,kind) VALUES(?,?,?,?,?)",params![self.install(),context,receipt,completed,kind])?;Ok(())})
     }
     pub fn app_social_tool_receipt_contains(&self, context: &str, receipt: &str) -> Result<bool> {
         Ok(self.conn().query_row("SELECT EXISTS(SELECT 1 FROM app_social_tool_receipts WHERE install_id=? AND context_id=? AND receipt_id=?)",params![self.install(),context,receipt],|r|r.get(0))?)
     }
 
-    /// SOC-54: this context's newest attached receipt ids, bounded. The screen
+    /// SOC-54: this context's newest SOURCE receipt ids, bounded. The screen
     /// library uses it as the candidate set, so a read never scans another
-    /// context's history — the work is the caller's own window, not the
-    /// installation's.
+    /// context's history — the work is the caller's own source window, not the
+    /// installation's, and an upload cannot consume it. Rows retained before
+    /// the kind column existed (`''`) stay eligible.
     pub fn app_social_tool_receipt_ids(
         &self,
         context: &str,
@@ -840,7 +860,7 @@ impl RecordStore {
         let rows = conn
             .prepare(
                 "SELECT receipt_id FROM app_social_tool_receipts
-                  WHERE install_id=? AND context_id=?
+                  WHERE install_id=? AND context_id=? AND kind IN ('social.source.posts','')
                   ORDER BY completed_at DESC, receipt_id DESC LIMIT ?",
             )?
             .query_map(params![self.install(), context, limit as i64], |r| {

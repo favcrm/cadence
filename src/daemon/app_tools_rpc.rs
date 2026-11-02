@@ -814,7 +814,12 @@ impl Shared {
                         &self.state_dir,
                         &ctx.install_id,
                     )?;
-                    scoped.app_social_tool_receipt_attach(context, receipt_id, completed)?;
+                    scoped.app_social_tool_receipt_attach(
+                        context,
+                        receipt_id,
+                        completed,
+                        existing["result"]["kind"].as_str().unwrap_or(""),
+                    )?;
                     scoped.app_social_generation_complete_request(request_id, receipt_id)?;
                     if existing["result"]["kind"] == "social.source.posts" {
                         let handle = existing["result"]["handle"]
@@ -1327,6 +1332,7 @@ impl Shared {
                             context,
                             required_str(&receipt, "id")?,
                             created,
+                            receipt["result"]["kind"].as_str().unwrap_or(""),
                         )?;
                 }
             }
