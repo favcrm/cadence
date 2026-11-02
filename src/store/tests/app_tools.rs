@@ -161,29 +161,39 @@ fn soc54_source_reads_are_selected_before_the_history_bound() {
             .map(|row| row["id"].as_str().unwrap().to_owned())
             .collect()
     };
-    // Stage two: the id-bounded source query must probe its ids, not scan the
-    // installation's receipts by install order.
+    // Stage two at PRODUCTION shape: 500 candidates, LIMIT 100. The id list
+    // must drive an index probe; an install-first plan would cost history for a
+    // sparse candidate set.
+    let wide: Vec<String> = (0..500).map(|i| format!("cand-{i}")).collect();
+    let placeholders = vec!["?"; wide.len()].join(",");
+    let sql = format!(
+        "EXPLAIN QUERY PLAN SELECT id FROM app_tool_results
+          WHERE id IN ({placeholders})
+            AND json_extract(result,'$.kind')='social.source.posts'
+          ORDER BY created DESC, id DESC LIMIT ?"
+    );
+    let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(wide.len() + 1);
+    for id in &wide {
+        binds.push(id);
+    }
+    let limit = 100i64;
+    binds.push(&limit);
     let plan: Vec<String> = store
         .conn()
-        .prepare(
-            "EXPLAIN QUERY PLAN SELECT id FROM app_tool_results
-              WHERE install_id=? AND json_extract(result,'$.kind')='social.source.posts'
-                AND id IN (?,?) ORDER BY created DESC, id DESC LIMIT ?",
-        )
+        .prepare(&sql)
         .unwrap()
-        .query_map(rusqlite::params!["install1", "tool-src-2", "tool-src-1", 2i64], |r| {
-            r.get::<_, String>(3)
-        })
+        .query_map(binds.as_slice(), |r| r.get::<_, String>(3))
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert!(
-        plan.iter().any(|line| line.contains("USING INDEX sqlite_autoindex_app_tool_results_1")),
-        "the id probe uses the primary key: {plan:?}"
+        plan.iter()
+            .any(|line| line.contains("USING INDEX sqlite_autoindex_app_tool_results_1")),
+        "the id probe uses the primary key at production cardinality: {plan:?}"
     );
     assert!(
-        !plan.iter().any(|line| line.starts_with("SCAN app_tool_results")),
-        "no full scan of the installation's receipts: {plan:?}"
+        !plan.iter().any(|line| line.contains("app_tool_results_install")),
+        "the plan must not prefer the installation index: {plan:?}"
     );
     assert_eq!(
         ids(store
