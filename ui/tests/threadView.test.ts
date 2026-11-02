@@ -299,8 +299,13 @@ for (const density of ["full", "compact"] as const) {
   ok(count(complete, 'data-kind="answer"') === 1, "turn: one answer surface");
   ok(complete.includes("<strong>One</strong>"), "turn: answer Markdown bold");
   ok(!complete.includes("answer-kicker"), "turn: no redundant Answer kicker bar");
-  ok(complete.includes("turn-copy") && complete.includes(">Copy<"), "turn: Copy action remains available in the head");
-  ok(count(complete, "answer-copy") === 0, "turn: the answer surface carries no copy chrome over its text");
+  ok(complete.includes("turn-copy") && complete.includes(">Copy<"), "turn: Copy stays in the head");
+  {
+    const answerAt = complete.indexOf('data-kind="answer"');
+    ok(answerAt >= 0 && complete.indexOf("turn-copy") < answerAt, "turn: Copy is in the head, not on the answer");
+    ok(!complete.slice(answerAt).includes("turn-copy"), "turn: the answer bubble has no Copy control");
+  }
+  ok(count(complete, "answer-copy") === 0, "turn: no Answer kicker copy");
   ok(complete.includes("<table>") && complete.includes(">PILOT-1<"), "turn: answer Markdown table");
   ok(!complete.includes("| id | title |"), "turn: no literal Markdown pipes");
   // Artifacts come after the answer, still the existing card.
@@ -315,8 +320,23 @@ for (const density of ["full", "compact"] as const) {
   const running = renderTurn(runningItems, true);
   ok(running.includes('data-turn-state="running"'), "streaming: running state");
   ok(running.includes("Thinking…"), "streaming: the trace says it is thinking");
+  {
+    const summaryAt = running.indexOf("turntrace-summary");
+    const listAt = running.indexOf("turntrace-list");
+    ok(summaryAt >= 0 && listAt > summaryAt, "streaming: the summary sits in the trace head");
+    ok(running.slice(summaryAt, listAt).includes("Bash: cadence board read"), "streaming: the summary is the latest step");
+    ok(!running.slice(summaryAt, listAt).includes("Reading the board"), "streaming: the summary is not the first note");
+    const list = running.slice(listAt);
+    ok(list.indexOf("Bash: cadence board read") < list.indexOf("Reading the board"), "streaming: the open trace leads with the latest step");
+  }
+  {
+    const list = complete.slice(complete.indexOf("turntrace-list"));
+    ok(list.indexOf("Bash: cadence board read") < list.indexOf("Board read; one pending action."), "trace: the latest tool leads the open list");
+    ok(list.indexOf("Board read; one pending action.") < list.indexOf("Read the board, then the pending queue."), "trace: the opening note follows the later steps");
+  }
   ok(count(running, 'data-kind="typing"') === 1, "streaming: one typing row");
-  ok(running.indexOf('data-kind="typing"') < running.indexOf('data-kind="turn-trace"'), "streaming: the typing bubble leads the trace");
+  ok(running.indexOf('data-kind="turn-trace"') < running.indexOf('data-kind="typing"'), "streaming: the typing bubble follows the trace");
+  ok(running.includes("Running Bash: cadence board read"), "streaming: the typing bubble names the latest step");
   ok(count(running, "<i></i>") === 3, "streaming: exactly three dots");
   ok(!running.includes('data-kind="answer"'), "streaming: no answer body");
   ok(!running.toLowerCase().includes("skeleton"), "streaming: no skeleton");
@@ -343,10 +363,10 @@ for (const density of ["full", "compact"] as const) {
     threadItems(state([agent(1, "assistant_text", "Provider error")])),
   );
   ok(!errorNote.includes('data-kind="answer"'), "current note: no legacy answer");
-  ok(errorNote.includes('data-kind="no-answer"'), "current note: no answer state");
+  ok(!errorNote.includes('data-kind="no-answer"'), "current note: no empty-answer line");
 
-  // A tool-turn note is not a reply: it stays in the trace and the completed
-  // turn says no answer returned instead of inventing one from position.
+  // A tool-turn note is not a reply: it stays in the trace. A finished
+  // turn with no answer does not invent one, and it does not say so.
   const toolTurn = renderTurn(
     threadItems(
       state([
@@ -356,12 +376,12 @@ for (const density of ["full", "compact"] as const) {
     ),
   );
   ok(!toolTurn.includes('data-kind="answer"'), "tool turn: no invented answer");
-  ok(toolTurn.includes('data-kind="no-answer"'), "tool turn: no answer state");
+  ok(!toolTurn.includes('data-kind="no-answer"'), "tool turn: no empty-answer line");
   ok(toolTurn.includes("Checking the board."), "tool turn: the note stays in the trace");
   const toolsOnly = renderTurn(threadItems(state([agent(1, "tool_call", "Bash: cadence board read")])));
-  ok(toolsOnly.includes('data-kind="no-answer"'), "tools only: no answer state");
+  ok(!toolsOnly.includes('data-kind="no-answer"'), "tools only: no empty-answer line");
   const emptyAnswer = renderTurn(threadItems(state([agent(1, "turn_result", "   ")])));
-  ok(emptyAnswer.includes('data-kind="no-answer"'), "empty answer: no-answer state");
+  ok(!emptyAnswer.includes('data-kind="no-answer"'), "empty answer: no empty-answer line");
   ok(!emptyAnswer.includes('data-kind="answer"'), "empty answer: no empty surface");
 
   // A failed turn keeps its reason and no empty answer body.

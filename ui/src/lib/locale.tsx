@@ -1493,7 +1493,6 @@ Object.assign(zhTW, {
   "Assistant answer": "助理回答",
   "Assistant is typing": "助理正在輸入",
   "Earlier transcript": "較早的對話紀錄",
-  "No answer returned": "未傳回回答",
   // CAD-1797: settings shell and app-wide email sending.
   "Settings sections": "設定區段",
   "Sending app": "寄送應用程式",

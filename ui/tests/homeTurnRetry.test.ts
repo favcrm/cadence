@@ -192,8 +192,55 @@ async function main() {
   const typingIndex = listItems.findIndex((row) => row.contains(typingRows[0]));
   const operatorIndex = listItems.findIndex((row) => row.querySelector('[data-chat-message="user"]'));
   assert(typingIndex === listItems.length - 1 && operatorIndex >= 0 && typingIndex > operatorIndex, "the typing bubble trails the operator's message");
+  const face = typingTurn.querySelector(".assistant-face");
+  assert(face !== null, "the submitting turn paints one assistant face");
+  const rowEl = typingTurn.parentElement;
+  // The first stored step often has no message id, and the daemon's working
+  // id is not the send id. The face has to stay mounted across that handoff.
   await React.act(async () => {
-    resources.masterThread.write((state) => ({ ...state!, pending: [] }));
+    streamMaster.turn = { state: "working", message: "server-id", conversation: "home-thread" };
+    streamMaster.queue = [];
+    resources.masterThread.write((state) => ({
+      ...state!,
+      pending: [],
+      entries: [
+        ...state!.entries,
+        { seq: 20, role: "operator", kind: "message", message: "ui-submitting", text: "While the POST is in flight" },
+        { seq: 21, role: "agent", kind: "thinking", message: null, text: "Reading the board." },
+      ],
+    }));
+    resources.masterState.write(() => ({
+      alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true,
+      turn: { state: "working", message: "server-id", conversation: "home-thread" }, queue: [],
+    }));
+  });
+  await settle();
+  assert(face.isConnected && rowEl?.isConnected === true, "the assistant face stays mounted when the first untagged step lands");
+  assert(host.querySelectorAll('[data-kind="typing"]').length === 1, "the first step does not paint a second typing bubble");
+  assert(host.querySelectorAll('[data-kind="turn"][data-turn-state="running"]').length === 1, "the first step does not paint a second assistant head");
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [
+        ...state!.entries,
+        { seq: 22, role: "agent", kind: "tool_call", message: null, text: "Bash: cadence board read" },
+      ],
+    }));
+  });
+  await settle();
+  assert(face.isConnected, "the assistant face stays mounted when the tool call lands");
+  const bubble = host.querySelector('[data-kind="typing"]');
+  assert(bubble !== null && bubble.textContent?.includes("Running Bash: cadence board read") === true, "the typing bubble names the tool now running");
+  const trace = host.querySelector('[data-kind="turn-trace"]');
+  assert(
+    trace !== null && (bubble.compareDocumentPosition(trace) & Node.DOCUMENT_POSITION_PRECEDING) !== 0,
+    "the typing bubble follows the trace",
+  );
+  await React.act(async () => {
+    streamMaster.turn = null;
+    streamMaster.queue = [];
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
+    resources.masterThread.write((state) => ({ ...state!, pending: state!.pending.filter((row) => row.state === "failed") }));
   });
   await settle();
   assert(host.querySelectorAll('[data-kind="typing"]').length === 0, "the typing bubble clears once the send settles out of submitting");

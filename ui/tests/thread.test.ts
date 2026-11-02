@@ -20,7 +20,9 @@ import {
   settlePending,
   threadItems,
   threadRuns,
+  inFlightTurnKey,
   itemMessage,
+  rowPaintKey,
   type ThreadState,
 } from "../src/features/home/thread";
 import { composerBlock, masterStatus } from "../src/features/home/master";
@@ -554,4 +556,53 @@ main().catch((e) => {
   );
   const pending = threadItems(addPending(s, "ui-p", "hi", 1));
   equal(itemMessage(pending[pending.length - 1]), "ui-p", "a pending row names its message");
+  equal(rowPaintKey(pending[pending.length - 1]), "user:ui-p", "a pending row shares its paint key with the stored send");
+  const storedUser = threadItems(
+    mergePage(null, { thread: { id: "t1" }, entries: [entry(1, "operator", "message", "hi", { message: "ui-p" })] }),
+  )[0];
+  equal(rowPaintKey(storedUser), "user:ui-p", "the stored operator row keeps that paint key");
+}
+
+{
+  const open = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [
+        entry(1, "operator", "message", "what is outstanding?", { message: "ui-1" }),
+        entry(2, "agent", "tool_call", "board_pending_actions"),
+        entry(3, "agent", "tool_call", "board_list_issues {\"limit\":50}"),
+      ],
+    }),
+  );
+  equal(inFlightTurnKey(open, "ui-1"), "e2", "an untagged tool run after the send is that turn");
+  equal(inFlightTurnKey(open, "server-id"), "e2", "a working id that matches no row still adopts the untagged run");
+  equal(inFlightTurnKey(open, null), null, "a submit with no id does not claim an older run");
+  const answered = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [
+        entry(1, "operator", "message", "what is outstanding?", { message: "ui-1" }),
+        entry(2, "agent", "tool_call", "board_pending_actions"),
+        entry(3, "agent", "turn_result", "Nothing is waiting."),
+      ],
+    }),
+  );
+  equal(inFlightTurnKey(answered, "ui-1"), null, "a landed answer is not still in flight");
+  const tagged = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [
+        entry(1, "operator", "message", "older", { message: "m-old" }),
+        entry(2, "agent", "tool_call", "board_read", { message: "m-old" }),
+      ],
+    }),
+  );
+  equal(inFlightTurnKey(tagged, "m-other"), null, "a run tagged for another message is not adopted");
+  const waiting = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [entry(1, "operator", "message", "hello", { message: "ui-1" })],
+    }),
+  );
+  equal(inFlightTurnKey(waiting, "ui-1"), null, "a send with no assistant rows yet has no in-flight run");
 }

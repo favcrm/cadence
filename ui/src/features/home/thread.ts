@@ -450,6 +450,54 @@ export function itemMessage(item: ThreadItem): string | null {
   return item.entry.message ?? null;
 }
 
+/** React key for a user row. The optimistic pending row and the stored
+ *  operator entry share one message id; one key keeps that row (and the
+ *  typing block under it) from unmounting and rising in again when the
+ *  send is acknowledged. */
+export function rowPaintKey(item: ThreadItem): string {
+  const message = itemMessage(item);
+  if ((item.type === "operator" || item.type === "pending") && message) return `user:${message}`;
+  return item.key;
+}
+
+const OPEN_TURN = new Set(["thinking", "commentary", "tools", "hire"]);
+
+/** The assistant item that opens the run still in flight for `message`.
+ *  Null when that send has no assistant rows yet, or the run already has
+ *  an answer. Hosted transcripts often omit the message id on agent rows,
+ *  so the run is the contiguous assistant items after the user row. A
+ *  working id that matches no user row still adopts that open run when
+ *  its own entries are untagged — otherwise the real turn paints as
+ *  finished and a second assistant head is appended under it. */
+export function inFlightTurnKey(items: ThreadItem[], message: string | null): string | null {
+  if (message === null || message === "") return null;
+  const openAfter = (index: number): string | null => {
+    let first: string | null = null;
+    for (let i = index + 1; i < items.length; i++) {
+      const item = items[i];
+      if (item.type === "operator" || item.type === "pending") break;
+      if (item.type === "answer") return null;
+      if (first === null && OPEN_TURN.has(item.type)) first = item.key;
+    }
+    return first;
+  };
+  const idx = items.findIndex(
+    (item) => (item.type === "operator" || item.type === "pending") && itemMessage(item) === message,
+  );
+  if (idx >= 0) return openAfter(idx);
+  let lastUser = -1;
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].type === "operator" || items[i].type === "pending") lastUser = i;
+  }
+  if (lastUser < 0) return null;
+  const key = openAfter(lastUser);
+  if (key === null) return null;
+  const opener = items.find((item) => item.key === key);
+  const tagged = opener ? itemMessage(opener) : null;
+  if (tagged !== null && tagged !== message) return null;
+  return key;
+}
+
 // ---- CAD-551: steps, refusals, and the working row's "what now" ----
 
 /** A tool call that runs `cadence artifact put` (not text that merely names

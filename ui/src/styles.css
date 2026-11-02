@@ -729,17 +729,21 @@ pre {
   max-width: min(100%, 40rem);
   margin: 0 0 .5rem;
 }
-.turntrace-head {
-  color: var(--color-ink-500);
-}
-/* A running turn's trace is a disclosure under the typing bubble, not a
-   second loading bar. The head shrinks to its label. */
-.turn[data-turn-state="running"] .turntrace {
-  margin-top: .35rem;
-}
-.turn[data-turn-state="running"] .turntrace-head {
+/* Beat `.steps-head { width: 100% }`. A full-width head parks "8 steps"
+   at the far edge of the column, away from the latest step name. */
+.turntrace > .turntrace-head {
   width: fit-content;
   max-width: 100%;
+  min-width: 0;
+  padding: .15rem .5rem .15rem .3rem;
+  border-radius: .375rem;
+  background: color-mix(in srgb, var(--color-ink-800) 65%, transparent);
+  color: var(--color-ink-500);
+}
+.turntrace-head:hover,
+.turntrace[data-open] .turntrace-head {
+  background: var(--color-ink-800);
+  color: var(--color-ink-200);
 }
 .turntrace-title {
   color: var(--color-ink-300);
@@ -754,13 +758,28 @@ pre {
   white-space: nowrap;
 }
 .turntrace-count {
-  margin-left: auto;
-  color: var(--color-ink-500);
+  margin-left: .15rem;
+  padding: 0 .35rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 999px;
+  background: var(--color-ink-850);
+  color: var(--color-ink-400);
+  font-size: .625rem;
   white-space: nowrap;
+}
+.turntrace-count[data-warn] {
+  color: var(--color-warn);
+  border-color: color-mix(in srgb, var(--color-warn) 35%, var(--color-ink-700));
 }
 .turntrace .steps-body > .turntrace-wrap {
   overflow: hidden;
   min-height: 0;
+}
+/* The latest rows lead. Cap the rest so an early reasoning dump cannot
+   push the answer off the thread. */
+.turntrace[data-open] .steps-body > .turntrace-wrap {
+  max-height: 16rem;
+  overflow-y: auto;
 }
 .turntrace-list {
   display: flex;
@@ -820,23 +839,25 @@ pre {
 }
 
 /* The answer: one surface, the Markdown measure, and only the chrome the
-   turn owns. Tables lose their grid, a blockquote reads as the one staged
-   callout, code and issue links as quiet chips. */
+   turn owns. Tables wrap inside that measure, a blockquote reads as the
+   one staged callout, code and issue links as quiet chips. */
 .answer {
   display: inline-block;
   width: fit-content;
   min-width: 0;
   max-width: min(100%, 40rem);
   margin-top: .25rem;
-  padding: .7rem 1rem;
+  padding: 1.125rem 1.375rem;
   border-radius: .375rem 1.1rem 1.1rem 1.1rem;
   background: var(--color-ink-850);
   border: 0;
   text-align: left;
   overflow-wrap: anywhere;
 }
-.answer:has(pre, table) {
-  max-width: min(100%, 48rem);
+/* One short paragraph stays a bubble. A list, table, or second paragraph
+   keeps the reading padding. */
+.answer:not(:has(.answer-body :is(ul, ol, pre, table, blockquote, h1, h2, h3, h4, h5, h6, p ~ p))) {
+  padding: .65rem 1rem;
 }
 .answer-head {
   display: flex;
@@ -853,6 +874,7 @@ pre {
   color: var(--color-ink-500);
   font-size: .5625rem;
 }
+/* In the turn head, revealed by hover or focus. Never on the answer text. */
 .turn-copy {
   margin-left: .5rem;
   padding: 0 .1rem;
@@ -891,18 +913,18 @@ pre {
   background: color-mix(in srgb, var(--color-fail) 9%, var(--color-ink-850));
   line-height: 1.45;
 }
-.noanswer {
-  margin: .25rem 0 .5rem;
-  color: var(--color-ink-500);
-  font-size: var(--text-micro);
-}
 
 
-.answer .issue-reader table {
-  border-collapse: collapse;
-  display: block;
+/* Stay a table inside the 40rem bubble. `display: block` plus nowrap
+   made the bubble grow to its max and still scroll (a 4-column issue
+   list is wider than 48rem), which turned the prose into a slab. */
+.answer .issue-reader table,
+.chat-bubble.issue-reader table {
+  display: table;
+  width: 100%;
   max-inline-size: 100%;
-  overflow-x: auto;
+  overflow: visible;
+  border-collapse: collapse;
 }
 .answer .issue-reader thead th {
   border-bottom: 1px solid var(--color-ink-800);
@@ -910,9 +932,14 @@ pre {
   font-weight: 500;
 }
 .answer .issue-reader th,
-.answer .issue-reader td {
-  padding-right: .35rem;
-  white-space: nowrap;
+.answer .issue-reader td,
+.chat-bubble.issue-reader th,
+.chat-bubble.issue-reader td,
+.answer .issue-reader td:first-child,
+.chat-bubble.issue-reader td:first-child {
+  padding: .35rem .65rem .35rem 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .answer .issue-reader tbody tr + tr td {
   border-top: 1px solid color-mix(in srgb, var(--color-ink-800) 60%, transparent);
@@ -968,11 +995,21 @@ pre {
 .typing {
   display: inline-flex;
   align-items: center;
+  gap: .625rem;
   width: fit-content;
+  max-width: min(100%, 34rem);
   margin-top: .15rem;
-  padding: .55rem .85rem;
+  padding: .65rem .95rem;
   border-radius: .375rem 1.1rem 1.1rem 1.1rem;
   background: var(--color-ink-850);
+}
+.typing-step {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-ink-300);
+  font-size: var(--text-label);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .typing-dots {
   display: inline-flex;
@@ -1241,19 +1278,24 @@ pre {
   width: fit-content;
   min-width: 0;
   max-width: min(100%, 40rem);
-  padding: 1rem 1.25rem;
+  padding: 1.125rem 1.375rem;
   border-radius: 0.375rem 1.1rem 1.1rem 1.1rem;
   background: var(--color-ink-850);
   border: 0;
   text-align: left;
   overflow-wrap: anywhere;
 }
-[data-chat-message="user"] .chat-bubble {
+[data-chat-message="assistant"] .chat-bubble:not(:has(:is(ul, ol, pre, table, blockquote, h1, h2, h3, h4, h5, h6, p ~ p))) {
+  padding: .65rem 1rem;
+}
+[data-chat-message="user"] .chat-bubble,
+[data-chat-message="user"] .chat-bubble.text-body {
   max-width: min(100%, 34rem);
   padding: 0.7rem 1rem;
   border-radius: 1.1rem 1.1rem 0.35rem 1.1rem;
   background: color-mix(in srgb, var(--color-accent) 11%, var(--color-ink-850));
   color: var(--color-ink-100);
+  line-height: 1.55;
 }
 [data-chat-message] .refsrow {
   margin-top: 0.5rem;
@@ -1273,15 +1315,9 @@ pre {
 .chat-bubble > :last-child {
   margin-block-end: 0;
 }
-/* Prose keeps the 76-character measure; code and tables get the wider
-   surface they need. Without :has support the bubble simply stays at the
-   prose measure and the block scrolls. */
-.chat-bubble:has(pre, table) {
-  max-width: min(100%, 48rem);
-}
-.chat-bubble:has(pre, table) > :is(p, ul, ol, blockquote, h1, h2, h3, h4):not(:has(> img:only-child)) {
-  max-width: 34rem;
-}
+/* Code and tables stay inside the bubble and scroll or wrap. Widening
+   the surface to 48rem filled the 52rem column and still clipped a
+   real issue table. */
 /* A fenced block: language label and Copy above the code, one surface. */
 .codeblock {
   margin-block: 0.6rem;

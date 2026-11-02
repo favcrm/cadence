@@ -39,8 +39,10 @@ import CorrectionReport from "../../wiki/CorrectionReport";
 import {
   addPending,
   discardPending,
+  inFlightTurnKey,
   itemMessage,
   newMessageId,
+  rowPaintKey,
   settlePending,
   stepSummary,
   threadItems,
@@ -228,6 +230,19 @@ export default function Conversation(props: HomeListProps | AppPaneProps) {
  * head, one folded trace, one answer surface and its artifact cards; every
  * other item keeps the row renderer unchanged.
  */
+/** The user message this assistant run answers, when the entries themselves
+ *  carry no message id. */
+function precedingUserMessage(items: ThreadItem[], runItems: ThreadItem[]): string | null {
+  const idx = items.indexOf(runItems[0]);
+  if (idx < 0) return null;
+  for (let i = idx - 1; i >= 0; i--) {
+    const item = items[i];
+    if (item.type !== "operator" && item.type !== "pending") continue;
+    return itemMessage(item);
+  }
+  return null;
+}
+
 function HomeList({
   items,
   readOnly,
@@ -246,17 +261,50 @@ function HomeList({
   // current transcript may legitimately have answer-less runs (tool turns,
   // errors); those notes must stay in the trace, never become older answers.
   const allowLegacy = legacyTranscript;
+  const flightKey = inFlightTurnKey(items, running);
+  // One key for the send, from the empty typing row through the finished
+  // answer, so the assistant head does not unmount and splash when the
+  // first step lands. Computed before the rows, so a turn that already
+  // owns the message does not also grow a second typing row.
+  const turnKey = new Map<string, string>();
+  const claimedTurns = new Set<string>();
+  for (const run of runs) {
+    if (!run.turn) continue;
+    const ownsFlight = flightKey !== null && run.items.some((item) => item.key === flightKey);
+    // The send's own id, not the daemon's working id. Hosted agent rows
+    // often carry neither, and the working id can differ from the send.
+    // The empty typing row is keyed by the send, so this run must use
+    // that same id or the assistant head unmounts and splashes.
+    const msg =
+      run.message ??
+      (ownsFlight ? precedingUserMessage(items, run.items) ?? running : null);
+    if (msg && !claimedTurns.has(msg)) {
+      claimedTurns.add(msg);
+      turnKey.set(run.key, `turn:${msg}`);
+    }
+  }
+  const typingTail: { current: { key: string; node: ReactNode } | null } = { current: null };
   const row = (item: ThreadItem) => {
     // Live items (or the operator's pending ones) enter with the rise
     // animation; anything at or below the mount seq is history.
     const live = item.type === "pending" || Number(item.key.slice(1)) > liveAfter;
     const act = activity?.(item) ?? null;
+    const hoist =
+      act?.kind === "row" &&
+      act.position === "after" &&
+      (item.type === "operator" || item.type === "pending");
+    if (hoist) {
+      const msg = itemMessage(item);
+      if (!msg || !claimedTurns.has(msg)) {
+        typingTail.current = { key: msg ? `turn:${msg}` : "typing-tail", node: act.node };
+      }
+    }
     return (
-      <li key={item.key} className={`min-w-0 space-y-2${live ? " msg-in" : ""}`}>
+      <li key={rowPaintKey(item)} className={`min-w-0 space-y-2${live ? " msg-in" : ""}`}>
         {act?.kind === "row" && act.position === "before" ? act.node : null}
         <ThreadItemView item={item} readOnly={readOnly} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={onDiscard} activity={act?.kind === "header" ? act.node : undefined} />
         {item.type === "answer" && <CorrectionReport question={visibleQuestion(items, items.indexOf(item))} answer={item.entry.text} />}
-        {act?.kind === "row" && act.position === "after" ? act.node : null}
+        {act?.kind === "row" && act.position === "after" && !hoist ? act.node : null}
         {after?.(item)}
       </li>
     );
@@ -264,36 +312,52 @@ function HomeList({
   return (
     <ol className="space-y-6 min-w-0" role="log" aria-live="polite" aria-relevant="additions" aria-label={t("messages")} data-rendered={items.length}>
       {(() => {
+        const rows: ReactNode[] = [];
         let prevDay: string | null = null;
-        return runs.map((run) => {
+        for (const run of runs) {
         const first = run.turn ? run.items[0] : run.item;
         const created = itemCreated(first);
         const day = created === null ? null : dayKey(created);
-        const divider = day !== null && day !== prevDay && created !== null
-          ? <DayDivider key={`day-${day}`} ms={created} />
-          : null;
+        const dayMs = day !== null && day !== prevDay && created !== null ? created : null;
         if (day !== null) prevDay = day;
-        const wrap = (node: ReactNode, key: string) => (
-          <Fragment key={key}>{divider}{node}</Fragment>
-        );
-        if (!run.turn) return wrap(row(run.item), run.key);
+        // The day rule is its own keyed sibling, not the row fragment's
+        // first child: a null-then-present first child remounts the row,
+        // and the assistant head splashes when the first step lands.
+        // The key includes the row, because a transcript can return to a
+        // calendar day it already showed.
+        const pushRow = (node: ReactNode, key: string) => {
+          if (dayMs !== null) rows.push(<DayDivider key={`${key}-day`} ms={dayMs} />);
+          rows.push(<Fragment key={key}>{node}</Fragment>);
+        };
+        if (!run.turn) {
+          pushRow(row(run.item), rowPaintKey(run.item));
+          continue;
+        }
         const acts = run.items.map((item) => activity?.(item) ?? null);
         // A hire proposal is its own card; keep the existing flat row
         // instead of folding it into a trace.
         if (run.items.some((item) => item.type === "hire")) {
-          return wrap(<>{run.items.map(row)}</>, run.key);
+          pushRow(<>{run.items.map(row)}</>, run.key);
+          continue;
         }
         const hasFallback = acts.some((act) => act?.kind === "row" && act.fallback === true);
         // The turn's own live rows fold into the head and the typing dots;
         // an unnamed-turn fallback rides after a completed turn without
-        // unfolding that earlier turn's answer.
+        // unfolding that earlier turn's answer. `flightKey` covers a run
+        // whose agent rows never received the send's message id.
+        const ownsFlight = flightKey !== null && run.items.some((item) => item.key === flightKey);
         const busy =
+          ownsFlight ||
           (!hasFallback && acts.some((act) => act !== null)) ||
           (running !== null && run.items.some((item) => itemMessage(item) === running));
         const live = Number(run.key.slice(1)) > liveAfter;
         const answer = run.items.find((item) => item.type === "answer");
-        return wrap(
-          <li className={`min-w-0 space-y-4${live ? " msg-in" : ""}`}>
+        if (hasFallback) {
+          const fallback = acts.find((act) => act?.kind === "row" && act.fallback === true);
+          if (fallback?.kind === "row") typingTail.current = { key: "typing-tail", node: fallback.node };
+        }
+        pushRow(
+          <li className={`min-w-0 space-y-4${live && !turnKey.has(run.key) ? " msg-in" : ""}`}>
             <ThreadTurn
               items={run.items}
               running={busy}
@@ -310,16 +374,21 @@ function HomeList({
                 </>
               }
             />
-            {hasFallback &&
-              acts.map((act, idx) =>
-                act?.kind === "row" && act.fallback === true ? (
-                  <Fragment key={`fallback-${idx}`}>{act.node}</Fragment>
-                ) : null,
-              )}
           </li>,
-          run.key,
+          turnKey.get(run.key) ?? run.key,
         );
-        });
+        }
+        // Same list as the runs, so a `turn:<send>` placeholder and the
+        // run that adopts that send are one keyed row. A sibling after
+        // the array remounts the head when the first step lands.
+        if (typingTail.current) {
+          rows.push(
+            <Fragment key={typingTail.current.key}>
+              <li className="min-w-0 space-y-4">{typingTail.current.node}</li>
+            </Fragment>,
+          );
+        }
+        return rows;
       })()}
     </ol>
   );
@@ -1559,6 +1628,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     [shown, directives],
   );
   const runViews = useMemo(() => {
+    const flightKey = inFlightTurnKey(shown, runningMessage);
     const special = (item: ThreadItem) =>
       directiveByKey.get(item.key) != null || plan.has(item.key) || item.type === "hire";
     const perMessage = new Map<string, number>();
@@ -1584,22 +1654,18 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       const cardAnswer = cards.some((item) => item.type === "answer");
       const answerItem = run.items.find((item) => item.type === "answer" && !special(item)) ?? null;
       const owns =
-        message !== null && runningMessage !== null && run.items.some((item) => itemMessage(item) === runningMessage);
+        (flightKey !== null && run.items.some((item) => item.key === flightKey)) ||
+        (message !== null && runningMessage !== null && run.items.some((item) => itemMessage(item) === runningMessage));
+      // Same id the sending placeholder uses, so the head updates in place
+      // when the first untagged step lands instead of mounting a second one.
+      const stable = message ?? (owns ? precedingUserMessage(shown, run.items) : null);
       return {
         kind: "turn" as const,
         run,
         cards,
         answerItem,
-        // Only a card/frame answer is external to the body; anything else
-        // leaves ThreadTurn's own text/failure check in charge. A segment
-        // with no answer of its own is complete when the message answered
-        // elsewhere, so it never claims the turn returned nothing.
-        answered:
-          cardAnswer || (answerItem === null && message !== null && answeredByMessage.get(message) === true)
-            ? true
-            : undefined,
         owns,
-        key: message === null ? run.key : ordinal === 1 ? message : `${message}#${ordinal}`,
+        key: stable === null ? run.key : ordinal === 1 ? stable : `${stable}#${ordinal}`,
         head: ordinal === 1,
         continued: ordinal < total,
         // The dots belong to the turn's last segment, and only while it has
@@ -1614,7 +1680,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           !(message !== null && answeredByMessage.get(message) === true),
       };
     });
-  }, [runs, directiveByKey, plan, runningMessage]);
+  }, [runs, shown, directiveByKey, plan, runningMessage]);
   // Only a run that will actually paint dots owns the indicator; a turn whose
   // answer already landed keeps the pane's standalone row while master state
   // still reports it working (the pre-CAD-1886 behaviour).
@@ -1879,15 +1945,18 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       )}
       <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} role="log" aria-live="polite" aria-relevant="additions" aria-label={t("Conversation messages")}>
         {(() => {
+          const rows: ReactNode[] = [];
           let prevDay: string | null = null;
-          return runViews.map((view) => {
+          for (const view of runViews) {
           const first = view.kind === "turn" ? view.run.items[0] : view.run.item;
           const created = itemCreated(first);
           const day = created === null ? null : dayKey(created);
-          const divider = day !== null && day !== prevDay && created !== null
-            ? <DayDivider key={`day-${day}`} ms={created} />
-            : null;
+          const dayMs = day !== null && day !== prevDay && created !== null ? created : null;
           if (day !== null) prevDay = day;
+          const pushRow = (node: ReactNode, key: string) => {
+            if (dayMs !== null) rows.push(<DayDivider key={`${key}-day`} ms={dayMs} />);
+            rows.push(<Fragment key={key}>{node}</Fragment>);
+          };
           const row = (item: ThreadItem, index: number) => (
             <AppRow
               item={item}
@@ -1906,18 +1975,17 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           if (view.kind === "item") {
             const item = view.run.item;
             const index = shown.indexOf(item);
-            return (
-              <Fragment key={item.key}>
-                {divider}
-                <li
-                  className="text-secondary text-ink-300 break-words"
-                  data-chat-item
-                  data-item-key={item.key}
-                >
-                  {row(item, index)}
-                </li>
-              </Fragment>
+            pushRow(
+              <li
+                className="text-secondary text-ink-300 break-words"
+                data-chat-item
+                data-item-key={item.key}
+              >
+                {row(item, index)}
+              </li>,
+              rowPaintKey(item),
             );
+            continue;
           }
           const key = view.key;
           // Cards render through their guarded AppRow, never through the
@@ -1925,9 +1993,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           const safe = view.run.items.filter((item) => !view.cards.includes(item)).map(hideItem);
           const hiddenAnswer = view.answerItem ? hideItem(view.answerItem) : null;
           const answerText = hiddenAnswer?.type === "answer" ? hiddenAnswer.entry.text : null;
-          return (
-            <Fragment key={key}>
-            {divider}
+          pushRow(
             <li
               className="text-secondary text-ink-300 break-words"
               data-chat-item
@@ -1940,7 +2006,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                 continued={view.continued}
                 allowLegacy={legacyTranscript}
                 copy={false}
-                answered={view.answered}
                 running={view.running}
                 after={
                   <>
@@ -1958,16 +2023,29 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                   </>
                 }
               />
-            </li>
-            </Fragment>
+            </li>,
+            key,
           );
-          });
+          }
+          // In this array, not after it. The sending row's key is the
+          // send id, which the first untagged run adopts, so the face
+          // updates in place. A still-working turn that already answered
+          // keeps a separate tail and must not reuse the turn's key.
+          const reserveTyping =
+            turnState.kind === "sending" ||
+            ((turnState.kind === "working" || turnState.kind === "writing") && !typingOwned);
+          const typingKey = turnState.kind === "sending" ? (pendingMessages.at(-1) ?? "typing-tail") : "typing-tail";
+          if (reserveTyping && !runViews.some((view) => view.kind === "turn" && view.key === typingKey)) {
+            rows.push(
+              <Fragment key={typingKey}>
+                <li className="text-secondary text-ink-300 break-words" data-chat-typing>
+                  <ThreadTurn items={[]} running density={density} />
+                </li>
+              </Fragment>,
+            );
+          }
+          return rows;
         })()}
-        {(turnState.kind === "sending" || ((turnState.kind === "working" || turnState.kind === "writing") && !typingOwned)) && (
-          <li className="text-secondary text-ink-300 break-words" data-chat-typing>
-            <ThreadTurn items={[]} running density={density} />
-          </li>
-        )}
       </ol>
       <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
       {unseen > 0 && (

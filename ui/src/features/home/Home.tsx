@@ -66,6 +66,7 @@ import { agentOn } from "../../lib/agentOn";
 import SinceCard from "./SinceCard";
 import {
   discardPending,
+  inFlightTurnKey,
   lastSeq,
   newMessageId,
   openStep,
@@ -590,6 +591,11 @@ const ThreadList = memo(function ThreadList({
   const fallbackItem =
     working && anchorItem === null && shown.length > 0 ? shown[shown.length - 1] : null;
   const activityItem = anchorItem ?? fallbackItem;
+  // Once this send already has reasoning or tool rows, those rows ARE the
+  // turn. A second empty assistant (face, "now", dots) under them is the
+  // splash: hosted agent entries often carry no message id, so the anchor
+  // misses them and the fallback used to append another head.
+  const flightKey = inFlightTurnKey(shown, working?.message ?? null);
   if (items.length === 0 && !moreBefore) return null;
   return (
     <>
@@ -612,6 +618,7 @@ const ThreadList = memo(function ThreadList({
         onRetry={onRetry}
         onDiscard={discard}
         activity={(item) => {
+          if (flightKey !== null) return null;
           if (!working || activityItem === null || item.key !== activityItem.key) return null;
           const live = <AssistantActivity since={working.since} />;
           // The anchored row shows this turn's own newest entry time. A
@@ -639,6 +646,9 @@ const ThreadList = memo(function ThreadList({
             anchorItem === null || item.type === "operator" || item.type === "pending";
           return {
             kind: "row",
+            // One assistant turn: face, "now", and the typing bubble. HomeList
+            // paints it as its own row under the message, and keeps that row's
+            // key when the real steps arrive, so the head does not splash.
             node: needsTypingTurn ? <ThreadTurn items={[]} running /> : <AssistantNameRow at={at} live={live} />,
             position: below ? "after" : "before",
             ...(anchorItem === null ? { fallback: true as const } : {}),
