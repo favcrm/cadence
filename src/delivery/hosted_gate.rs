@@ -68,6 +68,15 @@ fn text<'a>(body: &'a Value, key: &str, verb: &str) -> Result<&'a str> {
         .ok_or_else(|| refuse(format!("`{verb}` answer has no {key}")))
 }
 
+/// The same check for one row of an answer's list, so a refusal names the row
+/// field rather than the whole answer.
+fn row_text<'a>(row: &'a Value, key: &str, verb: &str) -> Result<&'a str> {
+    row.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| refuse(format!("`{verb}` row has no {key}")))
+}
+
 // ---- delivery requirements ------------------------------------------------
 
 /// What `delivery_policy` answered for one project: the stored
@@ -537,14 +546,17 @@ pub fn scope(target: &RemoteTarget, wake_timeout: u64, issue: &str) -> Result<(V
     scope_answer(&body, issue)
 }
 
-/// `cadence audit verdict` (CAD-1542) for a hosted org: record one reviewer's
-/// verdict for exactly this issue, PR and head. The board takes the reviewer
-/// from the authenticated caller, never from an argument, and a second verdict
-/// of the same kind for the same head returns the first.
+/// `cadence audit verdict` (CAD-1542, AOS-473) for a hosted org: record one
+/// reviewer's verdict for exactly this repo, issue, PR and head. The board
+/// takes the reviewer from the authenticated caller, never from an argument,
+/// and binds the row to the owner's attestation of that caller for `repo`
+/// (AOS-473: a repeat of the same kind, head and findings returns the latest
+/// row with `duplicate: true`; a changed one appends a correction).
 #[allow(clippy::too_many_arguments)]
 pub fn verdict(
     target: &RemoteTarget,
     wake_timeout: u64,
+    repo: &str,
     issue: &str,
     pr: u64,
     head: &str,
@@ -560,6 +572,7 @@ pub fn verdict(
         wake_timeout,
         "audit_verdict",
         args(&[
+            ("repo", json!(repo)),
             ("issue", json!(issue)),
             ("pr", json!(pr)),
             ("head", json!(head)),
@@ -573,13 +586,14 @@ pub fn verdict(
     )
 }
 
-/// `cadence audit verdicts` (CAD-1946) for a hosted org: the org's own read
-/// of the verdicts naming this issue, PR and full head. A refused or
-/// unreadable answer is exit 1 — never the notes folder on this machine, which
-/// would answer an empty list and read as "nothing was filed".
+/// `cadence audit verdicts` (CAD-1946, AOS-473) for a hosted org: the org's
+/// own read of the verdicts naming this repo, issue, PR and full head. A
+/// refused or unreadable answer is exit 1 — never the notes folder on this
+/// machine, which would answer an empty list and read as "nothing was filed".
 pub fn verdicts(
     target: &RemoteTarget,
     wake_timeout: u64,
+    repo: &str,
     issue: &str,
     pr: u64,
     head: &str,
@@ -589,16 +603,70 @@ pub fn verdicts(
         wake_timeout,
         "audit_verdicts",
         args(&[
+            ("repo", json!(repo)),
             ("issue", json!(issue)),
             ("pr", json!(pr)),
             ("head", json!(head)),
         ]),
     )?;
-    verdicts_answer(&body, issue, pr, head)
+    verdicts_answer(&body, repo, issue, pr, head)
 }
 
+/// The kinds a hosted row may name. `spec` is retired by AOS-473 but a row
+/// stored before it keeps its kind on read-back; the gate counts only the
+/// recognised kinds.
+const VERDICT_KINDS: [&str; 6] = [
+    "standards",
+    "spec-security",
+    "spec",
+    "combined",
+    "browser-qa",
+    "other",
+];
+
+/// One hosted verdict row in the contract's entry shape, so the gate reads
+/// one document shape from both origins. The binding is part of the evidence:
+/// a row whose repo is not the requested one, or whose `reviewer_id` or
+/// `github_login` is empty, proves nothing and refuses the whole answer.
+fn verdict_entry(row: &Value, repo: &str, verb: &str) -> Result<Value> {
+    let kind = row_text(row, "kind", verb)?;
+    if !VERDICT_KINDS.contains(&kind) {
+        return Err(refuse(format!("`{verb}` row names kind {kind:?}")));
+    }
+    if !row["repo"]
+        .as_str()
+        .is_some_and(|r| r.eq_ignore_ascii_case(repo))
+    {
+        return Err(refuse(format!(
+            "`{verb}` row names another repo than {repo}: {}",
+            short(row)
+        )));
+    }
+    let risk = row["risk"]
+        .as_str()
+        .ok_or_else(|| refuse(format!("`{verb}` row has no risk: {}", short(row))))?;
+    Ok(json!({
+        "name": row_text(row, "name", verb)?,
+        "stamp": row_text(row, "stamp", verb)?,
+        "reviewer": row_text(row, "reviewer", verb)?,
+        "reviewer_id": row_text(row, "reviewer_id", verb)?,
+        "github_login": row_text(row, "github_login", verb)?,
+        "repo": repo,
+        "kind": kind,
+        "outcome": row_text(row, "outcome", verb)?,
+        "title_outcome": row_text(row, "title_outcome", verb)?,
+        "section_outcome": row_text(row, "section_outcome", verb)?,
+        "risk": risk,
+    }))
+}
+
+/// The answer must be a hosted document about exactly this repo, issue, PR
+/// and head. `origin` is what makes the gate apply the attested rule: an
+/// answer without it, or one claiming another origin, is refused here rather
+/// than passed on as local notes.
 pub(crate) fn verdicts_answer(
     body: &Value,
+    repo: &str,
     issue: &str,
     pr: u64,
     head: &str,
@@ -608,6 +676,23 @@ pub(crate) fn verdicts_answer(
     if state != "ok" {
         let reason = body["reason"].as_str().unwrap_or(state);
         return Ok((json!({"state": state, "reason": reason}), 1));
+    }
+    match body["origin"].as_str() {
+        Some("hosted") => {}
+        Some(origin) => {
+            return Err(refuse(format!(
+                "`{verb}` answered origin {origin:?}, not \"hosted\""
+            )))
+        }
+        None => return Err(refuse(format!("`{verb}` answer has no origin marker"))),
+    }
+    if !body["repo"]
+        .as_str()
+        .is_some_and(|r| r.eq_ignore_ascii_case(repo))
+    {
+        return Err(refuse(format!(
+            "`{verb}` answered for another repo than {repo}"
+        )));
     }
     if !body["issue"]
         .as_str()
@@ -633,18 +718,150 @@ pub(crate) fn verdicts_answer(
     let verdicts = body["verdicts"]
         .as_array()
         .ok_or_else(|| refuse(format!("`{verb}` answer has no verdicts list")))?
+        .iter()
+        .map(|row| verdict_entry(row, repo, verb))
+        .collect::<Result<Vec<_>>>()?;
+    let skipped = body["skipped"]
+        .as_array()
+        .ok_or_else(|| refuse(format!("`{verb}` answer has no skipped list")))?
         .clone();
-    let mut doc = json!({
-        "state": "ok",
-        "issue": issue,
-        "pr": pr,
-        "head": head,
-        "verdicts": verdicts,
-    });
-    if let Some(note) = body["note"].as_str() {
-        doc["note"] = json!(note);
+    Ok((
+        json!({
+            "state": "ok",
+            "origin": "hosted",
+            "repo": repo,
+            "issue": issue,
+            "pr": pr,
+            "head": head,
+            "verdicts": verdicts,
+            "skipped": skipped,
+        }),
+        0,
+    ))
+}
+
+// ---- reviewer attestations (AOS-473) ---------------------------------------
+
+/// `cadence audit reviewers` for a hosted org: the workspace owner's
+/// attestations, limited to `repo`. `audit_reviewers` takes no arguments and
+/// reads the whole workspace, so the selection is made here.
+pub fn reviewers(target: &RemoteTarget, wake_timeout: u64, repo: &str) -> Result<(Value, i32)> {
+    let body = call(target, wake_timeout, "audit_reviewers", Map::new())?;
+    reviewers_answer(&body, repo)
+}
+
+/// One attestation row: a lowercase `owner/name` repo, the GitHub login the
+/// owner attested, the workspace principal it is, and when it was recorded.
+fn reviewer_row(row: &Value, verb: &str) -> Result<Value> {
+    let repo = row_text(row, "repo", verb)?;
+    if !valid_repo(repo) {
+        return Err(refuse(format!(
+            "`{verb}` row names repo {repo:?}, not owner/name"
+        )));
     }
-    Ok((doc, 0))
+    Ok(json!({
+        "repo": repo.to_ascii_lowercase(),
+        "github_login": row_text(row, "github_login", verb)?,
+        "subject_id": row_text(row, "subject_id", verb)?,
+        "recorded_at": row_text(row, "recorded_at", verb)?,
+    }))
+}
+
+pub(crate) fn reviewers_answer(body: &Value, repo: &str) -> Result<(Value, i32)> {
+    let verb = "audit_reviewers";
+    let state = text(body, "state", verb)?;
+    if state != "ok" {
+        let reason = body["reason"].as_str().unwrap_or(state);
+        return Ok((json!({"state": state, "reason": reason}), 1));
+    }
+    let mut rows = body["reviewers"]
+        .as_array()
+        .ok_or_else(|| refuse(format!("`{verb}` answer has no reviewers list")))?
+        .iter()
+        .map(|row| reviewer_row(row, verb))
+        .collect::<Result<Vec<_>>>()?;
+    rows.retain(|row| {
+        row["repo"]
+            .as_str()
+            .is_some_and(|r| r.eq_ignore_ascii_case(repo))
+    });
+    Ok((json!({"state": "ok", "repo": repo, "reviewers": rows}), 0))
+}
+
+/// `cadence audit reviewers set`: replace `repo`'s whole attestation map.
+/// The tenant checks the live owner and the `audit.approve` scope; the
+/// receipt must name exactly the repo and rows sent, or the command refuses
+/// — an attestation that was not recorded must never read as recorded.
+pub fn set_reviewers(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    repo: &str,
+    reviewers: &[(String, String)],
+) -> Result<Value> {
+    let rows: Vec<Value> = reviewers
+        .iter()
+        .map(|(login, subject)| json!({"github_login": login, "subject_id": subject}))
+        .collect();
+    let body = call(
+        target,
+        wake_timeout,
+        "audit_reviewers_set",
+        args(&[("repo", json!(repo)), ("reviewers", json!(rows))]),
+    )?;
+    set_reviewers_answer(&body, repo, reviewers)
+}
+
+pub(crate) fn set_reviewers_answer(
+    body: &Value,
+    repo: &str,
+    reviewers: &[(String, String)],
+) -> Result<Value> {
+    let verb = "audit_reviewers_set";
+    if body["state"].as_str() != Some("recorded") {
+        return Err(refuse(format!(
+            "`{verb}` did not record the attestations: {}",
+            short(body)
+        )));
+    }
+    if !body["repo"]
+        .as_str()
+        .is_some_and(|r| r.eq_ignore_ascii_case(repo))
+    {
+        return Err(refuse(format!(
+            "`{verb}` receipt names another repo than {repo}"
+        )));
+    }
+    let rows = body["reviewers"]
+        .as_array()
+        .ok_or_else(|| refuse(format!("`{verb}` receipt has no reviewers list")))?
+        .iter()
+        .map(|row| reviewer_row(row, verb))
+        .collect::<Result<Vec<_>>>()?;
+    // The receipt proves the map that now stands: it must be exactly the rows
+    // sent, matched by login and principal (the tenant lowercases the login).
+    let key = |row: &Value| {
+        (
+            row["github_login"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+            row["subject_id"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+    let mut recorded: Vec<(String, String)> = rows.iter().map(key).collect();
+    let mut sent: Vec<(String, String)> = reviewers
+        .iter()
+        .map(|(login, subject)| (login.to_ascii_lowercase(), subject.clone()))
+        .collect();
+    recorded.sort();
+    sent.sort();
+    if recorded != sent {
+        return Err(refuse(format!(
+            "`{verb}` receipt does not echo the {} attestation(s) sent",
+            reviewers.len()
+        )));
+    }
+    Ok(json!({"state": "recorded", "repo": repo, "reviewers": rows}))
 }
 
 pub(crate) fn scope_answer(body: &Value, issue: &str) -> Result<(Value, i32)> {
@@ -868,31 +1085,174 @@ mod tests {
         .is_err());
     }
 
+    fn entry(repo: &str, kind: &str, reviewer_id: &str, login: &str, stamp: &str) -> Value {
+        json!({"name": format!("{stamp}-{kind}-verdict.md"), "stamp": stamp,
+               "reviewer": login, "reviewer_id": reviewer_id, "github_login": login,
+               "repo": repo, "kind": kind, "outcome": "pass",
+               "title_outcome": "pass", "section_outcome": "pass", "risk": "auto"})
+    }
+
+    fn hosted_doc() -> Value {
+        json!({"state": "ok", "origin": "hosted", "repo": "favcrm/cadence",
+               "issue": "CAD-1", "pr": 7, "head": HEAD, "skipped": [],
+               "verdicts": [entry("favcrm/cadence", "standards", "user_a", "alice",
+                                  "20261101120000")]})
+    }
+
     #[test]
     fn verdicts_answer_binds_the_issue_pr_and_head() {
-        let ok = json!({"state": "ok", "issue": "CAD-1", "pr": 7, "head": HEAD,
-                        "verdicts": [], "note": "none recorded"});
-        let (doc, code) = verdicts_answer(&ok, "CAD-1", 7, HEAD).unwrap();
+        let ok = hosted_doc();
+        let (doc, code) = verdicts_answer(&ok, "favcrm/cadence", "CAD-1", 7, HEAD).unwrap();
         assert_eq!(code, 0);
-        assert_eq!(doc["verdicts"], json!([]));
-        assert_eq!(doc["note"], json!("none recorded"));
+        assert_eq!(doc["origin"], "hosted");
+        assert_eq!(doc["repo"], "favcrm/cadence");
+        assert_eq!(doc["skipped"], json!([]));
+        assert_eq!(doc["verdicts"][0]["reviewer_id"], "user_a");
+        assert_eq!(doc["verdicts"][0]["github_login"], "alice");
         // Another issue, PR or head is a refusal, never a silent empty answer.
-        assert!(verdicts_answer(&ok, "CAD-2", 7, HEAD).is_err());
-        assert!(verdicts_answer(&ok, "CAD-1", 8, HEAD).is_err());
-        assert!(verdicts_answer(&ok, "CAD-1", 7, OTHER).is_err());
+        assert!(verdicts_answer(&ok, "favcrm/cadence", "CAD-2", 7, HEAD).is_err());
+        assert!(verdicts_answer(&ok, "favcrm/cadence", "CAD-1", 8, HEAD).is_err());
+        assert!(verdicts_answer(&ok, "favcrm/cadence", "CAD-1", 7, OTHER).is_err());
         // A refused read exits 1 with its reason; it does not become "empty".
         let unknown = json!({"state": "unknown", "reason": "store unreadable"});
-        let (_, code) = verdicts_answer(&unknown, "CAD-1", 7, HEAD).unwrap();
+        let (_, code) = verdicts_answer(&unknown, "favcrm/cadence", "CAD-1", 7, HEAD).unwrap();
         assert_eq!(code, 1);
         // An answer without a list is malformed, not empty.
-        assert!(verdicts_answer(
-            &json!({"state": "ok", "issue": "CAD-1", "pr": 7, "head": HEAD}),
-            "CAD-1",
-            7,
-            HEAD
+        for body in [
+            json!({"state": "ok", "origin": "hosted", "repo": "favcrm/cadence",
+                   "issue": "CAD-1", "pr": 7, "head": HEAD, "skipped": []}),
+            json!({"state": "ok", "origin": "hosted", "repo": "favcrm/cadence",
+                   "issue": "CAD-1", "pr": 7, "head": HEAD, "verdicts": []}),
+            json!({}),
+        ] {
+            assert!(
+                verdicts_answer(&body, "favcrm/cadence", "CAD-1", 7, HEAD).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hosted_read_must_name_this_repo_and_carry_the_hosted_origin() {
+        let ok = hosted_doc();
+        // The repo the read asked for is part of the binding: an answer about
+        // another repository proves nothing about this one.
+        let err = verdicts_answer(&ok, "favcrm/pm", "CAD-1", 7, HEAD).unwrap_err();
+        assert!(err.to_string().contains("another repo"), "{err}");
+        // Case is not evidence, so it is not a difference either.
+        assert!(verdicts_answer(&ok, "FavCRM/Cadence", "CAD-1", 7, HEAD).is_ok());
+        // No marker is not "local": the client never decides the origin.
+        for origin in [json!(null), json!("local"), json!("Hosted"), json!("")] {
+            let mut body = ok.clone();
+            if origin.is_null() {
+                body.as_object_mut().unwrap().remove("origin");
+            } else {
+                body["origin"] = origin.clone();
+            }
+            let err = verdicts_answer(&body, "favcrm/cadence", "CAD-1", 7, HEAD).unwrap_err();
+            assert!(err.to_string().contains("origin"), "{origin}: {err}");
+        }
+        let mut missing_repo = ok.clone();
+        missing_repo.as_object_mut().unwrap().remove("repo");
+        assert!(verdicts_answer(&missing_repo, "favcrm/cadence", "CAD-1", 7, HEAD).is_err());
+    }
+
+    #[test]
+    fn a_hosted_row_without_its_binding_refuses_the_answer() {
+        let ok = hosted_doc();
+        // Every entry must carry the attestation the gate counts by.
+        for (key, value) in [
+            ("reviewer_id", json!("")),
+            ("github_login", json!("")),
+            ("reviewer", json!("  ")),
+            ("repo", json!("favcrm/other")),
+            ("kind", json!("inspection")),
+            ("name", json!(null)),
+            ("stamp", json!("")),
+            ("outcome", json!("")),
+            ("risk", json!(null)),
+        ] {
+            let mut body = ok.clone();
+            body["verdicts"][0][key] = value.clone();
+            assert!(
+                verdicts_answer(&body, "favcrm/cadence", "CAD-1", 7, HEAD).is_err(),
+                "{key} = {value}"
+            );
+        }
+        // A row stored before AOS-473 keeps its retired kind on read-back.
+        let mut legacy = ok.clone();
+        legacy["verdicts"][0]["kind"] = json!("spec");
+        assert!(verdicts_answer(&legacy, "favcrm/cadence", "CAD-1", 7, HEAD).is_ok());
+    }
+
+    #[test]
+    fn reviewers_answer_selects_the_requested_repo_and_checks_every_row() {
+        let body = json!({"state": "ok", "reviewers": [
+            {"repo": "favcrm/pm", "github_login": "bob", "subject_id": "user_b",
+             "recorded_at": "2026-11-01T12:00:00.000Z"},
+            {"repo": "favcrm/cadence", "github_login": "alice", "subject_id": "user_a",
+             "recorded_at": "2026-11-01T11:00:00.000Z"},
+        ]});
+        let (doc, code) = reviewers_answer(&body, "favcrm/cadence").unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(doc["repo"], "favcrm/cadence");
+        assert_eq!(doc["reviewers"].as_array().unwrap().len(), 1);
+        assert_eq!(doc["reviewers"][0]["github_login"], "alice");
+        assert_eq!(doc["reviewers"][0]["subject_id"], "user_a");
+        // A repo with no attestation is an empty list, not another repo's rows.
+        assert_eq!(
+            reviewers_answer(&body, "favcrm/other").unwrap().0["reviewers"],
+            json!([])
+        );
+        let (refused, code) = reviewers_answer(
+            &json!({"state": "unknown", "reason": "store unreadable"}),
+            "favcrm/cadence",
         )
-        .is_err());
-        assert!(verdicts_answer(&json!({}), "CAD-1", 7, HEAD).is_err());
+        .unwrap();
+        assert_eq!((refused["state"].as_str(), code), (Some("unknown"), 1));
+        for row in [
+            json!({"repo": "favcrm/cadence", "github_login": "alice"}),
+            json!({"repo": "favcrm/cadence", "github_login": "", "subject_id": "user_a",
+                   "recorded_at": "t"}),
+            json!({"repo": "github.com/favcrm/cadence", "github_login": "alice",
+                   "subject_id": "user_a", "recorded_at": "t"}),
+        ] {
+            let body = json!({"state": "ok", "reviewers": [row]});
+            assert!(reviewers_answer(&body, "favcrm/cadence").is_err(), "{body}");
+        }
+        assert!(reviewers_answer(&json!({"state": "ok"}), "favcrm/cadence").is_err());
+    }
+
+    #[test]
+    fn reviewers_set_receipt_must_echo_the_rows_sent() {
+        let sent = vec![
+            ("Alice".to_string(), "user_a".to_string()),
+            ("bob".to_string(), "user_b".to_string()),
+        ];
+        let receipt = json!({"state": "recorded", "repo": "favcrm/cadence", "reviewers": [
+            {"repo": "favcrm/cadence", "github_login": "alice", "subject_id": "user_a",
+             "recorded_at": "2026-11-01T11:00:00.000Z"},
+            {"repo": "favcrm/cadence", "github_login": "bob", "subject_id": "user_b",
+             "recorded_at": "2026-11-01T11:00:00.000Z"},
+        ]});
+        let doc = set_reviewers_answer(&receipt, "favcrm/cadence", &sent).unwrap();
+        assert_eq!(doc["state"], "recorded");
+        assert_eq!(doc["reviewers"].as_array().unwrap().len(), 2);
+        // Another repo, a shorter set, a swapped principal or a refusal: the
+        // attestation that now stands is not the one asked for.
+        assert!(set_reviewers_answer(&receipt, "favcrm/pm", &sent).is_err());
+        assert!(set_reviewers_answer(&receipt, "favcrm/cadence", &sent[..1]).is_err());
+        let swapped = vec![
+            ("alice".to_string(), "user_b".to_string()),
+            ("bob".to_string(), "user_a".to_string()),
+        ];
+        assert!(set_reviewers_answer(&receipt, "favcrm/cadence", &swapped).is_err());
+        let mut refused = receipt.clone();
+        refused["state"] = json!("refused");
+        assert!(set_reviewers_answer(&refused, "favcrm/cadence", &sent).is_err());
+        let mut no_rows = receipt.clone();
+        no_rows.as_object_mut().unwrap().remove("reviewers");
+        assert!(set_reviewers_answer(&no_rows, "favcrm/cadence", &sent).is_err());
     }
 
     #[test]

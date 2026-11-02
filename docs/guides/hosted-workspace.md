@@ -280,26 +280,40 @@ distinct authenticated principal, and in-chat findings are not automatically
 a gate-counted verdict.
 
 ```sh
-cadence --org acme audit verdict --issue <issue-id> --pr <number> --head <full-sha> \
-  --kind standards --outcome pass --risk auto --file findings.md
+cadence --org acme audit verdict --repo <owner/name> --issue <issue-id> --pr <number> \
+  --head <full-sha> --kind standards --outcome pass --risk auto --file findings.md
 ```
 
-`--kind` is `standards` or `spec`; `--outcome` is `pass` or `revise`, and
-`--title-outcome` / `--section-outcome` default to it. The reviewer is the
-authenticated caller, never an argument, and a second verdict of the same kind
-for the same head returns the first. Read them back under the same org with
-`cadence --org acme audit verdicts --issue <issue-id> --pr <number> --head
-<full-sha>`; a hosted selection answers from the org, never from local notes.
-The merge gate also runs whichever `cadence` you point it at: set `CADENCE_BIN`
-when more than one build is on the host, or a stale client's missing hosted verb
-will read like a gate refusal.
+`--repo` is the repository the verdict is about (default: the cwd checkout's
+github.com origin); the org refuses a repo the project has not declared
+(`repo_not_bound`) and a caller the owner has not attested for it
+(`reviewer_not_bound`). `--kind` is `standards`, `spec-security`, `combined` or
+`browser-qa` (the kinds the merge gate counts; `spec` is retired);
+`--outcome` is `pass` or `revise`, and `--title-outcome` / `--section-outcome`
+default to it. The reviewer is the authenticated caller, never an argument. A
+repeat of the same kind, head and findings returns the latest row with
+`duplicate: true`; a changed outcome appends a correction, and the gate reads
+the latest row per reviewer and kind.
 
-Hosted `audit verdict` and `audit verdicts` exist in some versions, but their
-current identity and native-verdict semantics are not proven equivalent
-(CAD-1542, AOS-473). Preserve the findings and report the blocker rather than
-counting those records as native gate evidence or impersonating a reviewer.
-The repository's approved merge path and any required operator decision remain
-in force; a missing hosted gate is not a pass.
+Read them back under the same org with `cadence --org acme audit verdicts
+--repo <owner/name> --issue <issue-id> --pr <number> --head <full-sha>`; a
+hosted selection answers from the org, never from local notes, and refuses an
+answer naming another repository. The merge gate also runs whichever `cadence`
+you point it at: set `CADENCE_BIN` when more than one build is on the host, or
+a stale client's missing hosted verb will read like a gate refusal.
+
+A hosted verdict counts only on the owner's attestation (AOS-473): the
+workspace owner binds the login to the principal per repository with
+`cadence --org acme audit reviewers set --repo <owner/name> --reviewer
+<github-login>=<subject-id>`, and the gate then counts a hosted document by
+principal and excludes the author by the attested login. An unbound caller's
+verdict is refused (`reviewer_not_bound`) and a row whose repo or binding is
+missing never counts; `cadence --org acme audit reviewers --repo <owner/name>`
+reads the bindings back. Never impersonate a reviewer: the verdict names the
+authenticated caller, and the owner's attestation is the only thing that makes
+that caller count. Where the org cannot answer, the gate refuses; a missing
+hosted read is not a pass, and the repository's approved merge path and any
+required operator decision remain in force.
 
 To give the other teammate an informational pointer, obtain their exact `lag_`
 ID from `agent directory`, then send an explicit FYI:
