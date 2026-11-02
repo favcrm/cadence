@@ -45,7 +45,6 @@ CREATE TABLE IF NOT EXISTS app_social_tool_receipts(\
  install_id TEXT NOT NULL, context_id TEXT NOT NULL, receipt_id TEXT NOT NULL, completed_at REAL NOT NULL,\
  kind TEXT NOT NULL DEFAULT '',\
  PRIMARY KEY(context_id,receipt_id));\
-CREATE INDEX IF NOT EXISTS app_social_tool_receipts_source_order ON app_social_tool_receipts(install_id,context_id,kind,completed_at DESC,receipt_id DESC);\
 CREATE TABLE IF NOT EXISTS app_social_freshness(\
  install_id TEXT NOT NULL, context_id TEXT NOT NULL, handle TEXT NOT NULL, receipt_id TEXT NOT NULL, completed_at REAL NOT NULL,\
  PRIMARY KEY(context_id,handle));\
@@ -368,6 +367,11 @@ pub(crate) fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
             [],
         )?;
     }
+    // Only now: the index names the column the migration above guarantees.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS app_social_tool_receipts_source_order
+          ON app_social_tool_receipts(install_id,context_id,kind,completed_at DESC,receipt_id DESC)",
+    )?;
     // CAD-1303: soft discard marker. Additive; the file schema version stays.
     let draft_columns = conn
         .prepare("PRAGMA table_info(app_social_drafts)")?
@@ -846,28 +850,49 @@ impl RecordStore {
         Ok(self.conn().query_row("SELECT EXISTS(SELECT 1 FROM app_social_tool_receipts WHERE install_id=? AND context_id=? AND receipt_id=?)",params![self.install(),context,receipt],|r|r.get(0))?)
     }
 
-    /// SOC-54: this context's newest SOURCE receipt ids, bounded. The screen
-    /// library uses it as the candidate set, so a read never scans another
-    /// context's history — the work is the caller's own source window, not the
-    /// installation's, and an upload cannot consume it. Rows retained before
-    /// the kind column existed (`''`) stay eligible.
+    /// SOC-54: the candidate source receipts of this context, bounded. Only
+    /// typed source attachments enter, so an upload or caption cannot consume
+    /// the window at any threshold; the saved handles' newest completed read
+    /// joins them, so a context retained before the kind column existed still
+    /// offers its newest page instead of falling out of the library. The
+    /// authoritative kind and ownership checks run on each returned receipt.
     pub fn app_social_tool_receipt_ids(
         &self,
         context: &str,
         limit: usize,
     ) -> Result<Vec<String>> {
         let conn = self.conn();
-        let rows = conn
+        let typed = conn
             .prepare(
                 "SELECT receipt_id FROM app_social_tool_receipts
-                  WHERE install_id=? AND context_id=? AND kind IN ('social.source.posts','')
+                  WHERE install_id=? AND context_id=? AND kind='social.source.posts'
                   ORDER BY completed_at DESC, receipt_id DESC LIMIT ?",
             )?
             .query_map(params![self.install(), context, limit as i64], |r| {
                 r.get::<_, String>(0)
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        let fresh = conn
+            .prepare(
+                "SELECT receipt_id FROM app_social_freshness
+                  WHERE install_id=? AND context_id=?
+                  ORDER BY completed_at DESC, handle LIMIT ?",
+            )?
+            .query_map(params![self.install(), context, limit as i64], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut out = typed;
+        for id in fresh {
+            if out.len() == limit {
+                break;
+            }
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out.truncate(limit);
+        Ok(out)
     }
 
     pub fn app_social_sources_show(&self, context: &str) -> Result<Value> {

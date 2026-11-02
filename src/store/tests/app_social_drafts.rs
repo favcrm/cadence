@@ -159,7 +159,8 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
         .conn()
         .prepare(
             "EXPLAIN QUERY PLAN SELECT receipt_id FROM app_social_tool_receipts
-              WHERE install_id=? AND context_id=? ORDER BY completed_at DESC, receipt_id DESC LIMIT ?",
+              WHERE install_id=? AND context_id=? AND kind='social.source.posts'
+              ORDER BY completed_at DESC, receipt_id DESC LIMIT ?",
         )
         .unwrap()
         .query_map(params!["install-social", "ctx-one", 500i64], |r| {
@@ -168,9 +169,8 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    // The kind-filtered covering index narrows the window to this context's
-    // source reads (plus legacy unknown-kind rows) before the small ORDER BY
-    // sort; the sort is over that window, never the context's whole history.
+    // The kind equality keeps the ordered walk in the covering index: the
+    // window is read in completed_at order, never sorted and never scanned.
     assert!(
         plan.iter()
             .any(|line| line.contains("USING COVERING INDEX app_social_tool_receipts_source_order")),
@@ -179,6 +179,10 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
     assert!(
         !plan.iter().any(|line| line.trim_start().starts_with("SCAN app_social_tool_receipts")),
         "no full scan of the context's attachments: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+        "the ordered walk needs no sort: {plan:?}"
     );
     // The candidate query orders by completed_at; the schema must carry the
     // index that makes that order a walk rather than a sort of the context's
@@ -212,13 +216,53 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
     );
     // The candidate window the screen read is bounded by: this context's own
     // attachments, newest first, and never another context's.
+    // Typed attachments first, then the saved handles' newest read.
     assert_eq!(
         store.app_social_tool_receipt_ids("ctx-one", 500).unwrap(),
-        vec!["receipt-new", "receipt-old"]
+        vec!["receipt-new", "receipt-old", "receipt-other"]
     );
     assert_eq!(
         store.app_social_tool_receipt_ids("ctx-two", 500).unwrap(),
         vec!["receipt-other"]
+    );
+}
+
+#[test]
+fn soc54_receipt_kind_migrates_an_existing_database() {
+    let root = tempfile::tempdir().unwrap();
+    // A store from before the kind column and its index.
+    let store = RecordStore::open(root.path(), "install-old").unwrap();
+    store
+        .app_social_tool_receipt_attach("ctx-one", "legacy-source", 2.0, "social.source.posts")
+        .unwrap();
+    store
+        .app_social_sources_save("ctx-one", 0, &["brandhk".to_owned()], "src-old")
+        .unwrap();
+    store
+        .app_social_freshness_save("ctx-one", "brandhk", "legacy-source", 2.0)
+        .unwrap();
+    store
+        .conn()
+        .execute_batch(
+            "DROP INDEX app_social_tool_receipts_source_order;
+             ALTER TABLE app_social_tool_receipts DROP COLUMN kind;",
+        )
+        .unwrap();
+    drop(store);
+
+    // Reopening must add the column and only then the index — the order that
+    // failed when the index was created inside the shared DDL batch.
+    let reopened = RecordStore::open(root.path(), "install-old").unwrap();
+    assert_eq!(
+        reopened.app_social_tool_receipt_ids("ctx-one", 500).unwrap(),
+        vec!["legacy-source"]
+    );
+    reopened
+        .app_social_tool_receipt_attach("ctx-one", "new-source", 3.0, "social.source.posts")
+        .unwrap();
+    assert_eq!(
+        reopened.app_social_tool_receipt_ids("ctx-one", 500).unwrap(),
+        vec!["new-source", "legacy-source"]
     );
 }
 
