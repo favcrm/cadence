@@ -138,9 +138,16 @@ impl Shared {
             )
             .map_err(|(_, reason)| Error::rejected(reason))?;
             let encoded = base64::engine::general_purpose::STANDARD.encode(preview);
-            // Re-prove the mount after preparing the bytes and before the
-            // reply, so an expiry or revoke that landed meanwhile refuses.
+            // Re-prove the mount AND the asset revision after preparing
+            // the bytes and before the reply: an expiry, revoke or a
+            // revision change that landed meanwhile refuses, exactly as
+            // the provider branch re-checks `app_media_revision`.
             self.media_mount_reprove(params)?;
+            if self.store.app_media_revision(asset_id)? != revision {
+                return Err(Error::rejected(
+                    "media preview reference changed during preparation",
+                ));
+            }
             return Ok(json!({
                 "asset_id": asset_id, "revision": revision,
                 "sha256": imported.sha256,
@@ -1552,10 +1559,11 @@ impl Shared {
     }
 
     /// The closed media-read input union: the bounded catalog page and
-    /// one asset's metadata projection. Both list what this installation
-    /// may see — published rows from any installation plus its OWN
-    /// drafts (CAD-1962). Neither returns bytes or a locator; the
-    /// original transfer is its own door.
+    /// one asset's metadata projection. The store is the workspace, so
+    /// permitted collaborators read the same rows regardless of which
+    /// installation produced them (CAD-1365's cross-install acceptance);
+    /// `lifecycle` is curation, not visibility. Neither input returns
+    /// bytes or a locator — the original transfer is its own door.
     fn media_read_input(
         &self,
         view: &crate::operator_auth::SessionView,
