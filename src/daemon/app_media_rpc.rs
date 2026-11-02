@@ -1004,6 +1004,10 @@ impl Shared {
             action_token,
         } = request;
         let verb = "media original";
+        // Native public membership is refreshed OUTSIDE the runtime and
+        // release guards, exactly as the provider path does, and the
+        // pinned proof is then re-checked inside them.
+        let proof = self.original_public_proof(token, origin, action_token, ctx)?;
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
         workspace::with_runtime_snapshot(&pm, &ctx.install_id, |bundle, files| {
@@ -1019,7 +1023,14 @@ impl Shared {
             // The session and mount proven above are re-proven AFTER the
             // bytes were read and BEFORE any success header: an expiry or
             // revoke that landed during the read refuses the delivery.
-            self.original_mount_current(token, key, origin, action_token, ctx)?;
+            self.original_authority_under_guards(
+                token,
+                key,
+                origin,
+                action_token,
+                ctx,
+                proof.as_ref(),
+            )?;
             Ok(())
         })?;
         let header = json!({
@@ -1027,7 +1038,8 @@ impl Shared {
             "asset_id": imported.asset.id,
             "media_type": imported.media_type,
             "bytes": imported.bytes.len() as u64,
-            "sha256": format!("sha256:{}", imported.sha256),
+            // `artifact_digest` already yields `sha256:<hex>`.
+            "sha256": imported.sha256.clone(),
         });
         let delivery = OriginalDelivery {
             shared: self,
