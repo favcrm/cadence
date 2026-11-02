@@ -14,8 +14,8 @@ import { MASTER } from "../home/master";
 import { ROLES } from "../settings/ModelDefaults";
 import RecruitChat from "./RecruitChat";
 import AgentPage from "./AgentPage";
-import { FirstJobs } from "./AgentTabs";
 import HireSheet from "./HireSheet";
+import ProfileSeat, { ConnectRuntime } from "./ProfileSeat";
 import NewAgentDialog from "./NewAgentDialog";
 import Recruit from "./Recruit";
 import { HireGate, RoleCard } from "./RecruitCards";
@@ -23,7 +23,6 @@ import {
   nextAlias,
   onTeamCount,
   roleOf,
-  runsOnText,
   suggestedRoles,
   useAgentRoles,
 } from "./agentRoles";
@@ -37,7 +36,7 @@ import {
   type AgentFilter,
 } from "./agentView";
 import "./agents.css";
-import type { Agent, AgentRole, AgentsPayload, IssueCard } from "../../lib/types";
+import type { Agent, AgentProfile, AgentRole, AgentsPayload, IssueCard } from "../../lib/types";
 
 /** The toolbar's segmented filters, in the order they read. */
 const TOOLBAR_FILTERS: AgentFilter[] = ["current", "attention", "working", "idle", "stopped", "inbox", "all"];
@@ -84,7 +83,7 @@ export default function Agents({
   const [filter, setFilter] = useState<AgentFilter>("current");
   const [creating, setCreating] = useState(false);
   const [picked, setPicked] = useState<AgentRole | null>(null);
-  const [joined, setJoined] = useState<{ alias: string; role: AgentRole } | null>(null);
+  const [joined, setJoined] = useState<{ profile: AgentProfile; role: AgentRole } | null>(null);
   const roles = useAgentRoles();
   const installed = useQuery(resources.apps);
   const hireBlock = useContext(HireBlock);
@@ -100,8 +99,7 @@ export default function Agents({
     .sort(
       (a, b) =>
         Number(b.alias === MASTER) - Number(a.alias === MASTER) ||
-        Number(b.alias === joined?.alias) - Number(a.alias === joined?.alias) ||
-        agentOrder(a) - agentOrder(b) ||
+                agentOrder(a) - agentOrder(b) ||
         a.alias.localeCompare(b.alias),
     );
   const emptyCopy =
@@ -113,15 +111,15 @@ export default function Agents({
   const agent = allAgents.find((a) => a.alias === open);
   const hosted = roles.data?.install.hosted ?? false;
   const suggestion = suggestedRoles(installed.data ?? [], roles.data?.roles ?? []);
-  const taken = allAgents.map((a) => a.alias);
+  const profiles = payload?.profiles ?? [];
+  const taken = [...allAgents.map((a) => a.alias), ...profiles.map((p) => p.id)];
   const askMaster = onAsk;
-  const hired = (alias: string, role: AgentRole) => {
+  const hired = (profile: AgentProfile, role: AgentRole) => {
     setPicked(null);
-    setJoined({ alias, role });
+    setJoined({ profile, role });
     onRecruit(false);
     onRetry();
   };
-  const placeholder = joined !== null && !allAgents.some((a) => a.alias === joined.alias);
   const tile = (
     <button key="recruit-tile" type="button" className="rc-tile" onClick={() => onRecruit(true)}>
       <span className="plus" aria-hidden="true">＋</span>
@@ -212,20 +210,15 @@ export default function Agents({
       <HireGate reason={hireBlock} />
       {joined && (
         <div className="rc-nudge" role="status">
-          <AgentAvatar slug="custom" look={joined.role.look} size={48} active />
+          <AgentAvatar slug="custom" look={joined.role.look} size={48} still />
           <div>
             <div className="t">
-              {t("{name} joined as {role}")
-                .replace("{name}", () => joined.alias)
+              {t("{name} was added as {role}")
+                .replace("{name}", () => joined.profile.alias)
                 .replace("{role}", () => joined.role.title)}
             </div>
-            <div className="s">
-              {t("Starting on {where}. Give a first job — it opens a thread.").replace(
-                "{where}",
-                () => t(runsOnText(hosted)),
-              )}
-            </div>
-            <FirstJobs alias={joined.alias} tasks={joined.role.first_tasks} />
+            <div className="s">{t("Idle · no runtime")}</div>
+            <ConnectRuntime profile={joined.profile} />
           </div>
         </div>
       )}
@@ -268,28 +261,20 @@ export default function Agents({
             </label>
           </div>
           <div className="rc-seats">
-            {placeholder && joined && (
-              <div className="rc-seat new" aria-label={t("Agent {alias}").replace("{alias}", () => joined.alias)}>
-                <AgentAvatar slug="custom" look={joined.role.look} size={44} active />
-                <div>
-                  <div className="t">{joined.alias}</div>
-                  <div className="s">
-                    {joined.role.title} · {hosted ? t("workspace") : t("this computer")}
-                  </div>
-                </div>
-                <div className="st">
-                  <span className="rc-dot" style={{ "--c": "var(--color-warn)" } as React.CSSProperties} />
-                  {t("Starting…")}
-                </div>
-              </div>
-            )}
             {agents.map((a) => (
               <SeatCard
                 key={a.alias}
                 agent={a}
                 roleLine={roleLine(a, roleOf(a, roles.data)?.title, hosted, t)}
-                isNew={a.alias === joined?.alias}
                 onOpen={() => setOpen(a.alias)}
+              />
+            ))}
+            {profiles.map((profile) => (
+              <ProfileSeat
+                key={`profile-${profile.id}`}
+                profile={profile}
+                roleTitle={roles.data?.roles.find((r) => r.id === profile.catalogue)?.title ?? profile.role}
+                runtimes={allAgents.filter((a) => profile.runtimes.includes(a.alias))}
               />
             ))}
             {tile}

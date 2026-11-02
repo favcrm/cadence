@@ -735,7 +735,11 @@ fn fetch_daemon(state_dir: &Path) -> DaemonSnap {
     let agents = agents_payload_typed(state_dir, list.clone(), jobs.as_ref());
     let agents_fp = list.map(|l| {
         let rows = serde_json::to_value(&agents.agents).expect("agent rows serialize");
-        value_fp(&json!([rows_fp(&l["agents"]), rows_fp(&rows)]))
+        value_fp(&json!([
+            rows_fp(&l["agents"]),
+            rows_fp(&rows),
+            &agents.profiles
+        ]))
     });
     let outcomes = jobs
         .as_ref()
@@ -1710,6 +1714,7 @@ mod tests {
                 ..AgentTotals::default()
             }),
             by_issue: BTreeMap::new(),
+            profiles: vec![],
         }
     }
 
@@ -2345,6 +2350,7 @@ mod tests {
                                 resume: None,
                             }],
                         )]),
+                        profiles: vec![],
                     }
                 },
                 agents_fp: (!failed).then_some(1),

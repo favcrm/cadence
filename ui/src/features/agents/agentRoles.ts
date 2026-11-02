@@ -109,13 +109,6 @@ export function runsOnText(hosted: boolean): string {
   return hosted ? "your AgenticOS workspace" : "this computer";
 }
 
-/** A model source such as `role_default` in words. */
-export function modelSourceText(role: AgentRole): string | null {
-  if ("error" in role.model) return null;
-  const source = role.model.source.replace(/_/g, " ");
-  return `${source} (${role.team_role})`;
-}
-
 /** The edit-job reply in plain words. */
 export function appliesText(applies: string): string {
   if (applies === "next_turn") return "Applies from its next turn";

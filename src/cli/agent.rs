@@ -309,14 +309,16 @@ pub(crate) enum AgentAction {
     },
     /// List the catalogue roles (id, title, job) a hire can use. Read-only.
     Roles,
-    /// List this workspace's reusable agent profiles (hosted orgs). Read-only:
-    /// a profile is a description a session may load, never a credential.
+    /// List this workspace's agent profiles. Read-only: a profile is a
+    /// description a runtime registers against, never a credential.
     Profiles,
-    /// Print one reusable agent profile's portable context (hosted orgs): the
-    /// profile plus the wiki pages under `agents/<id>/{profile,knowledge,memory}`
-    /// the caller's own access allows. Read-only; it authenticates nobody.
+    /// Print one agent profile's context: the profile and the job a runtime
+    /// registered against it (`cadence join <alias> --profile <id>`) is
+    /// briefed with. A hosted org adds the wiki pages under
+    /// `agents/<id>/{profile,knowledge,memory}` the caller's own access allows.
+    /// Read-only; it authenticates nobody.
     Context {
-        /// The profile id the board prints (`ap_…`).
+        /// The profile id the board prints (the alias locally, `ap_…` hosted).
         id: String,
     },
     /// Propose hiring a catalogue role (the master, on its live turn): the
@@ -979,12 +981,12 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
             print_json(&json!({"roles": roles}));
             return Ok(0);
         }
-        // A reusable agent profile is workspace data the hosted board owns; a
-        // local org has no such store, so this refuses instead of inventing one.
-        AgentAction::Profiles | AgentAction::Context { .. } => {
-            return Err(Error::rejected(
-                "agent profiles are a hosted-org read; select the hosted org with `--org <org>`",
-            ));
+        AgentAction::Profiles => {
+            let list = client::rpc(&state_dir, "agent_list", json!({}))?;
+            json!({"profiles": list["profiles"]})
+        }
+        AgentAction::Context { id } => {
+            client::rpc(&state_dir, "agent_profile_context", json!({"id": id}))?
         }
         AgentAction::ProposeHire { role, name, job_file } => {
             // The job is read through the master's command-file rules, never

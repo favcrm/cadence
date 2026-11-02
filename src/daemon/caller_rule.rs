@@ -107,9 +107,14 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
             "authorize_register: agent callers by CAD-149; an unattributed caller needs proven_operator (CAD-431)",
         ),
     ),
-    // CAD-1752: the static role catalogue plus the settings-derived model
-    // per role — a read, like `model_defaults_get`.
+    // CAD-1752: the static role catalogue - a read.
     ("agent_roles", Rule::Read),
+    // CAD-1989: a hire saves a profile; the operator only.
+    (
+        "agent_profile_create",
+        Rule::Handler("operator_connection_on_agent: the operator only; no agent (CAD-1989)"),
+    ),
+    ("agent_profile_context", Rule::Read),
     (
         "agent_instructions_set",
         Rule::Handler("operator_connection_on_agent: the operator only; no agent, not even the target or its PM (CAD-1752)"),

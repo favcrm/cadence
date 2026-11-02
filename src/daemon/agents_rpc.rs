@@ -5,53 +5,15 @@ use super::*;
 impl Shared {
     pub(super) fn rpc_register(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = required_str(params, "alias")?;
-        // CAD-1752: a hire from the role catalogue. The install, not the
-        // caller, picks the runtime: Pi on its launch-default endpoint.
-        // The role is resolved here so the flag cannot be set by naming
-        // an id the daemon does not know.
-        let hired = match optional_str(params, "catalogue") {
-            Some(id) => {
-                // A hire is the operator's act, whatever group the caller
-                // sits in: no agent may recruit, and nothing is written
-                // (no row, no home dir) before that is proven.
-                self.operator_connection_on_agent("catalogue hire", params, peer_pid)
-                    .map_err(|e| {
-                        Error::rejected(format!(
-                            "agent register refused: a catalogue hire is the operator's act ({e})"
-                        ))
-                    })?;
-                if self.store.agent_opt(alias)?.is_some() {
-                    return Err(Error::rejected(format!(
-                        "Agent '{alias}' already exists - pick another alias"
-                    )));
-                }
-                Some(catalogue_hire(params, id)?)
-            }
-            None => None,
-        };
-        if hired.is_none() && !matches!(params.get("look"), None | Some(Value::Null)) {
-            return Err(Error::rejected(
-                "'look' only applies to a catalogue hire - send 'catalogue' with it",
-            ));
-        }
-        let provider = match &hired {
-            Some(_) => "pi",
-            None => required_str(params, "provider")?,
-        };
-        let endpoint = match &hired {
-            Some(_) => registry::default_kind("pi")?,
-            None => {
-                optional_str(params, "endpoint_kind").unwrap_or(registry::DEFAULT_ENDPOINT_KIND)
-            }
-        };
+        let provider = required_str(params, "provider")?;
+        let endpoint =
+            optional_str(params, "endpoint_kind").unwrap_or(registry::DEFAULT_ENDPOINT_KIND);
         let role = optional_str(params, "role").unwrap_or("worker");
-        let caller_team_role = optional_text(params, "team_role")?
-            .or_else(|| hired.as_ref().map(|hire| hire.role.team_role));
+        let caller_team_role = optional_text(params, "team_role")?;
         let model_policy = optional_text(params, "model_policy")?;
         let cwd = optional_str(params, "cwd");
         let sandbox = optional_str(params, "sandbox").unwrap_or("read-only");
-        let caller_instructions = optional_str(params, "instructions")
-            .or_else(|| hired.as_ref().map(|hire| hire.instructions.as_str()));
+        let caller_instructions = optional_str(params, "instructions");
         let agent_params = optional_str(params, "params");
         if registry::is_inbox_kind(endpoint) != registry::is_inbox_provider(provider) {
             return Err(Error::rejected(
@@ -68,17 +30,10 @@ impl Shared {
         }
         // A mailbox never runs a process — its cwd is bookkeeping only,
         // so direct socket callers may omit it (the CLI defaults cwd).
-        // A catalogue hire without a cwd gets a home dir under state,
-        // created below once every refusal has passed.
-        let mut needs_home = false;
-        let mut cwd = match (cwd, endpoint) {
+        let cwd = match (cwd, endpoint) {
             (Some(cwd), _) => std::fs::canonicalize(cwd)
                 .map_err(|_| Error::rejected("Working directory must exist"))?,
             (None, e) if !registry::has_actor(provider, e) => self.state_dir.clone(),
-            (None, _) if hired.is_some() => {
-                needs_home = true;
-                std::path::PathBuf::new()
-            }
             (None, _) => return Err(Error::rejected("Missing 'cwd'")),
         };
         // Enumerated launch params are validated at the door — a bad
@@ -101,32 +56,6 @@ impl Shared {
             ));
         }
         let mut defaulted = false;
-        if let Some(hire) = &hired {
-            let mut obj = match parsed {
-                Value::Object(obj) => obj,
-                Value::Null => serde_json::Map::new(),
-                _ => return Err(Error::rejected("'params' must be a JSON object")),
-            };
-            for key in ["catalogue", "look", "kind"] {
-                if obj.contains_key(key) {
-                    return Err(Error::rejected(format!(
-                        "params '{key}' is set from the catalogue role, not the caller"
-                    )));
-                }
-            }
-            obj.insert("catalogue".to_string(), json!(hire.role.id));
-            obj.insert("look".to_string(), json!(hire.look));
-            obj.insert("kind".to_string(), json!(hire.role.kind));
-            parsed = Value::Object(obj);
-            defaulted = true;
-            // A hire that Pi would refuse at launch is refused here, with
-            // the reason `GET /api/agent-roles` shows, before any home dir or
-            // row exists. An explicit model in params takes the ordinary
-            // path below, which applies the allowlist itself.
-            if parsed.get("model").is_none() {
-                self.role_model(endpoint, caller_team_role.unwrap_or(hire.role.team_role))?;
-            }
-        }
         // CAD-556: `pm.yaml [host] confine_pi_workers` is the pm-level
         // default a bare `join … pi` picks up — an explicit `confine`
         // param (`--confine`/`--no-confine`, or a caller's own params)
@@ -355,14 +284,6 @@ impl Shared {
             parsed
         };
         self.authorize_register(alias, &parsed, peer_pid)?;
-        // The alias was checked free above; should the insert still fail
-        // (a racing register, a params cap), the empty home is removed.
-        let mut new_home = None;
-        if needs_home {
-            let home = crate::adapter::pi::pi_agent_home(&self.state_dir, alias)?;
-            cwd = std::fs::canonicalize(&home)?;
-            new_home = Some(home);
-        }
         let registered = self.store.register_agent(&crate::store::NewAgent {
             alias,
             provider,
@@ -375,14 +296,7 @@ impl Shared {
             team_role,
             model_policy,
         });
-        if let Err(err) = registered {
-            if let Some(home) = new_home {
-                if !matches!(self.store.agent_opt(alias), Ok(Some(_))) {
-                    let _ = std::fs::remove_dir(home);
-                }
-            }
-            return Err(err);
-        }
+        registered?;
         // CAD-559: when `[pi].models.default` filled the launch model,
         // `register_agent` labeled it `explicit` — restamp the real
         // provenance before the row can be read or launched.
@@ -448,6 +362,52 @@ impl Shared {
         }))
     }
 
+    /// CAD-1989: `POST /api/agent-profiles` - a catalogue hire saves a settings
+    /// profile and launches nothing. Operator only, by the connection.
+    pub(super) fn rpc_agent_profile_create(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection_on_agent("agent profile create", params, peer_pid)
+            .map_err(|e| {
+                Error::rejected(format!(
+                    "agent profile create refused: a hire is the operator's act ({e})"
+                ))
+            })?;
+        let alias = required_str(params, "alias")?;
+        let id = required_str(params, "catalogue")?;
+        let role = crate::agent_roles::find(id).ok_or_else(|| {
+            Error::rejected(format!(
+                "Unknown catalogue role '{id}' - one of: {}",
+                crate::agent_roles::ids()
+            ))
+        })?;
+        let look = match optional_text(params, "look")? {
+            None => role.look,
+            Some(look) => crate::agent_roles::canonical_look(look)
+                .ok_or_else(|| Error::rejected(format!("Unknown look '{look}'")))?,
+        };
+        crate::agent_settings::create_catalogue_profile(
+            &self.store,
+            alias,
+            role,
+            look,
+            optional_text(params, "job")?,
+            optional_text(params, "model")?,
+        )
+    }
+
+    /// CAD-1989: the profile and the text a runtime registered against it is
+    /// briefed with - the hosted `agent_profile_context` verb's local twin.
+    pub(super) fn rpc_agent_profile_context(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        crate::agent_settings::profile_context(
+            &self.store,
+            &self.store.agents()?,
+            required_str(params, "id")?,
+        )
+    }
+
     /// CAD-1752: the role catalogue plus what a hire registers on this
     /// install and the model each role would launch on. A read: the
     /// catalogue is static and the model rows come from the same settings
@@ -457,14 +417,7 @@ impl Shared {
         let endpoint = registry::default_kind(provider)?;
         let roles: Vec<Value> = crate::agent_roles::ROLES
             .iter()
-            .map(|role| {
-                let mut row = role.to_json();
-                row["model"] = match self.role_model(endpoint, role.team_role) {
-                    Ok((id, source)) => json!({"id": id, "source": source}),
-                    Err(err) => json!({"error": err.to_string()}),
-                };
-                row
-            })
+            .map(|role| role.to_json())
             .collect();
         Ok(json!({
             "categories": crate::agent_roles::CATEGORIES
@@ -478,63 +431,6 @@ impl Shared {
                 "endpoint_kind": endpoint,
             },
         }))
-    }
-
-    /// The model a worker of `team_role` launches on: the same two steps
-    /// `rpc_register` takes for pi — the defaults layer, else `[pi]` policy.
-    fn role_model(&self, endpoint: &str, team_role: &str) -> Result<(String, String)> {
-        let defaults = self.store.model_defaults()?;
-        let resolved = crate::model_defaults::resolve(crate::model_defaults::ResolveRequest {
-            provider: "pi",
-            endpoint_kind: endpoint,
-            runtime_role: "worker",
-            team_role: Some(team_role),
-            model_policy: None,
-            params: None,
-            config: &defaults.config,
-            revision: defaults.revision,
-        })?;
-        let policy = self.stored_pi_policy()?;
-        let selection = resolved.model_selection.as_ref();
-        let picked = selection
-            .and_then(|sel| sel.get("model"))
-            .and_then(Value::as_str);
-        let (model, source) = match picked {
-            Some(model) => {
-                let source = selection
-                    .and_then(|sel| sel.get("source"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider_default");
-                (model.to_string(), source.to_string())
-            }
-            None => {
-                let (model, platform) =
-                    crate::pi_policy::resolve_model_with_source(policy.as_ref(), "worker", None)?;
-                let source = if platform {
-                    "platform_default"
-                } else {
-                    "pi_policy_default"
-                };
-                (model, source.to_string())
-            }
-        };
-        // The launch admits a worker only on the operator's allowlist - the
-        // platform fallback is exempt at register but not when Pi opens -
-        // and refuses Devin models for a confined worker. Apply both here
-        // so a role that would register and then fence shows its reason.
-        crate::pi_policy::require_allowed(policy.as_ref(), "worker", &model)?;
-        let confined = self
-            .pm_dir()
-            .ok()
-            .filter(|dir| dir.is_dir())
-            .map(|dir| crate::doctor::host::read_host_overrides(&dir))
-            .transpose()
-            .map_err(Error::rejected)?
-            .flatten()
-            .and_then(|overrides| overrides.confine_pi_workers)
-            == Some(true);
-        crate::adapter::pi::refuse_confined_devin("a catalogue hire", confined, &model)?;
-        Ok((model, source))
     }
 
     pub(super) fn rpc_events(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
@@ -1748,40 +1644,4 @@ impl Shared {
                 .event_public(&agent.alias, "inbox_unconsumed", health);
         }
     }
-}
-
-/// CAD-1752: one validated hire from the role catalogue.
-struct CatalogueHire {
-    role: &'static crate::agent_roles::Role,
-    look: &'static str,
-    instructions: String,
-}
-
-/// Resolve a `catalogue` register request. The install picks the runtime,
-/// so a caller naming provider or endpoint kind is refused, and `profile`
-/// (mutually exclusive with instructions) never rides along.
-fn catalogue_hire(params: &Value, id: &str) -> Result<CatalogueHire> {
-    for field in ["provider", "endpoint_kind", "profile"] {
-        if !matches!(params.get(field), None | Some(Value::Null)) {
-            return Err(Error::rejected(format!(
-                "a catalogue hire takes '{field}' from the install, not the caller"
-            )));
-        }
-    }
-    let role = crate::agent_roles::find(id).ok_or_else(|| {
-        Error::rejected(format!(
-            "Unknown catalogue role '{id}' - one of: {}",
-            crate::agent_roles::ids()
-        ))
-    })?;
-    let look = match optional_text(params, "look")? {
-        None => role.look,
-        Some(look) => crate::agent_roles::canonical_look(look)
-            .ok_or_else(|| Error::rejected(format!("Unknown look '{look}'")))?,
-    };
-    Ok(CatalogueHire {
-        role,
-        look,
-        instructions: role.instructions(),
-    })
 }
