@@ -3,7 +3,7 @@ import { api } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import { WriteGate } from "../auth/WriteGate";
-import type { Agent, AgentDetail } from "../../lib/types";
+import type { Agent, AgentDetail, HiredProfile } from "../../lib/types";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
 import { RecoveryBlock } from "./AgentProfile";
 import AgentTabBody, { type TabContext } from "./AgentTabs";
@@ -57,6 +57,7 @@ export default function AgentPage({
   alias,
   observed,
   roles,
+  profiles,
   tab,
   onTab,
   onBack,
@@ -65,6 +66,7 @@ export default function AgentPage({
   alias: string;
   observed?: Agent;
   roles: RolesState;
+  profiles: HiredProfile[];
   tab: AgentTab;
   onTab: (tab: AgentTab) => void;
   onBack: () => void;
@@ -132,7 +134,7 @@ export default function AgentPage({
   const deadHolding = profile ? agentHoldsWorkButDead(profile) : false;
   const params = (a?.params ?? observed?.params) as Record<string, unknown> | undefined;
   const role = profile
-    ? roleOf({ params: params ?? profile.params, catalogue: observed?.catalogue }, roles.data)
+    ? roleOf({ alias }, roles.data, profiles)
     : null;
   const hosted = roles.data?.install.hosted ?? false;
   const badge = profile ? lifecycleBadge(profile, t) : null;

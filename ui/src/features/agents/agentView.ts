@@ -1,6 +1,7 @@
 import { agentOn } from "../../lib/agentOn";
 import type { Agent } from "../../lib/types";
 import { agentIssueIds, type IssueIndex } from "../../lib/scope";
+import type { HiredProfile } from "../../lib/types";
 
 export const AGENT_FILTERS = [
   { value: "current", label: "Current" },
@@ -208,4 +209,16 @@ export function conversationalOnlyCloud(
   a?: Pick<Agent, "provider" | "endpoint_kind"> | null,
 ): boolean {
   return a?.provider === "agenticos-cloud" && a?.endpoint_kind === "cloud";
+}
+
+/** A profile with no runtime is an idle seat: it shows where an idle agent
+ *  would. A profile with runtimes is carried by their own rows. */
+export function profileMatchesFilter(p: HiredProfile, filter: AgentFilter): boolean {
+  return p.runtimes.length === 0 && ["all", "current", "idle"].includes(filter);
+}
+
+export function profileMatchesSearch(p: HiredProfile, query: string): boolean {
+  const terms = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+  const text = [p.alias, p.role, p.team_role, p.catalogue].filter(Boolean).join(" ").toLowerCase();
+  return terms.every((term) => text.includes(term));
 }

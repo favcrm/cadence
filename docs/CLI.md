@@ -441,6 +441,13 @@ checks canonical payload JSON, not a raw-file `sha256sum`. An argv-only master
 permission cannot authorize a Settings mutation or issue another grant.
 App-scoped assistant turns gain no settings authority.
 
+A profile's job (standing instructions) is readable by the operator and by a
+runtime registered against that profile (`agent context <profile>`); other
+agents and members get none (`agent list` omits it, `agent context` refuses).
+One stated exception: a group-root agent can register a member against a
+profile, and so can read that job through `agent show`, because a root's `join`
+needs the job to write the member's briefing.
+
 ### Master recovery and hosted use
 
 `cadence master status [--grant <id>]` reports model selection, configuration

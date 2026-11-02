@@ -1,5 +1,9 @@
 //! CAD-1752: relaunch-per-ticket for a confined catalogue agent.
 //!
+//! Only an agent whose params carry `catalogue` reaches this; a hire is a
+//! profile now (CAD-1989), so CAD-1990 decides whether this is re-keyed to
+//! profile runtimes or removed.
+//!
 //! A Landlock grant is fixed when the process launches, so a confined
 //! agent hired without a repo (cwd = its home dir) cannot be granted a
 //! ticket's worktree while it runs. Instead, between turns, the daemon

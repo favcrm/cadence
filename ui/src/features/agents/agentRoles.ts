@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
-import type { Agent, AgentRole, AgentRolesPayload, AppRow } from "../../lib/types";
+import type { Agent, AgentRole, AgentRolesPayload, AppRow, HiredProfile } from "../../lib/types";
 
 export interface RolesState {
   data: AgentRolesPayload | null;
@@ -39,13 +39,15 @@ export function nextAlias(roleId: string, taken: Iterable<string>): string {
   return `${roleId}-${n}`;
 }
 
-const ALIAS_GRAMMAR = /^[A-Za-z0-9._-]{1,80}$/;
+/** The one alias grammar, the daemon's: lowercase letters, digits and dashes,
+ *  not starting with a dash. */
+const ALIAS_GRAMMAR = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 /** Why a hire name cannot be used, or null. */
 export function aliasProblem(alias: string, taken: Iterable<string>): string | null {
   const name = alias.trim();
   if (!name) return "A name is required.";
-  if (!ALIAS_GRAMMAR.test(name)) return "Use letters, digits, dots, dashes and underscores.";
+  if (!ALIAS_GRAMMAR.test(name)) return "Use lowercase letters, digits and dashes, starting with a letter or digit.";
   for (const other of taken) if (other === name) return "An agent with this name already exists.";
   return null;
 }
@@ -84,17 +86,24 @@ export function categoryLabel(payload: AgentRolesPayload | null, id: string): st
   return payload?.categories.find((c) => c.id === id)?.label ?? id;
 }
 
-/** The catalogue role an agent was hired from, if it carries one. */
-export function roleOf(
-  agent: Pick<Agent, "params" | "catalogue">,
-  payload: AgentRolesPayload | null,
-): AgentRole | null {
-  const id = agent.catalogue ?? agent.params?.catalogue;
-  return typeof id === "string" ? (payload?.roles.find((r) => r.id === id) ?? null) : null;
+/** The profile a runtime is registered against: the one listing its alias. */
+export function profileOf(agent: Pick<Agent, "alias">, profiles: HiredProfile[]): HiredProfile | null {
+  return profiles.find((p) => p.runtimes.includes(agent.alias)) ?? null;
 }
 
-export function onTeamCount(role: AgentRole, agents: Pick<Agent, "params" | "catalogue">[]): number {
-  return agents.filter((a) => (a.catalogue ?? a.params?.catalogue) === role.id).length;
+/** The catalogue role an agent's profile was hired from, if it has one. */
+export function roleOf(
+  agent: Pick<Agent, "alias">,
+  payload: AgentRolesPayload | null,
+  profiles: HiredProfile[],
+): AgentRole | null {
+  const id = profileOf(agent, profiles)?.catalogue;
+  return id ? (payload?.roles.find((r) => r.id === id) ?? null) : null;
+}
+
+/** How many profiles were hired from this role. */
+export function onTeamCount(role: AgentRole, profiles: HiredProfile[]): number {
+  return profiles.filter((p) => p.catalogue === role.id).length;
 }
 
 export function matchesRole(role: AgentRole, category: string, query: string): boolean {
@@ -107,13 +116,6 @@ export function matchesRole(role: AgentRole, category: string, query: string): b
 
 export function runsOnText(hosted: boolean): string {
   return hosted ? "your AgenticOS workspace" : "this computer";
-}
-
-/** A model source such as `role_default` in words. */
-export function modelSourceText(role: AgentRole): string | null {
-  if ("error" in role.model) return null;
-  const source = role.model.source.replace(/_/g, " ");
-  return `${source} (${role.team_role})`;
 }
 
 /** The edit-job reply in plain words. */
