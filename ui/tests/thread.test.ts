@@ -605,4 +605,39 @@ main().catch((e) => {
     }),
   );
   equal(inFlightTurnKey(waiting, "ui-1"), null, "a send with no assistant rows yet has no in-flight run");
+  // A row inside the candidate run that names another send belongs to a
+  // different turn: it is never adopted, even under a matching user row, and
+  // an untagged opener does not launder it.
+  const interleaved = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [
+        entry(1, "operator", "message", "mine", { message: "m-a" }),
+        entry(2, "agent", "thinking", "hers", { message: "m-b" }),
+      ],
+    }),
+  );
+  equal(inFlightTurnKey(interleaved, "m-a"), null, "a row tagged to another send is not adopted under a matching user row");
+  const mixed = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [
+        entry(1, "operator", "message", "mine", { message: "m-a" }),
+        entry(2, "agent", "thinking", "untagged"),
+        entry(3, "agent", "tool_call", "board_read", { message: "m-b" }),
+      ],
+    }),
+  );
+  equal(inFlightTurnKey(mixed, "m-a"), null, "an untagged opener followed by another send's row is not adopted");
+  const sameId = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [
+        entry(1, "operator", "message", "mine", { message: "m-a" }),
+        entry(2, "agent", "thinking", "untagged"),
+        entry(3, "agent", "tool_call", "board_read", { message: "m-a" }),
+      ],
+    }),
+  );
+  equal(inFlightTurnKey(sameId, "m-a"), "e2", "an untagged opener joins rows tagged with the same send");
 }

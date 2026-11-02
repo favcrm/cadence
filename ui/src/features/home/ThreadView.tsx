@@ -553,30 +553,36 @@ function stepLabel(summary: string): string {
   return name.length > 48 ? `${name.slice(0, 45)}…` : name;
 }
 
-/** The line after "Reasoning": the latest tool names, not the call that
- *  opened the turn and not a raw argument blob. A note is used only when
- *  the turn has no tool name. */
+/** The line after "Reasoning": the newest step the open trace leads with,
+ *  and never the call that opened the turn or a raw argument blob. The
+ *  newest item decides: a tool run names its last calls, a reasoning or
+ *  commentary note reads as its own line. Older tool names appear only
+ *  when the newest row has nothing to say. */
 function traceDigest(trace: ThreadItem[]): { summary: string; errors: number } {
-  const names: string[] = [];
   let errors = 0;
-  let note = "";
   for (const item of trace) {
+    if (item.type !== "tools") continue;
+    for (const step of toolSteps(item.entries)) {
+      if (step.error) errors += 1;
+    }
+  }
+  for (let i = trace.length - 1; i >= 0; i--) {
+    const item = trace[i];
     if (item.type === "tools") {
+      const names: string[] = [];
       for (const step of toolSteps(item.entries)) {
-        if (step.error) errors += 1;
         const name = stepLabel(step.summary);
-        if (name === "" || carriesSecret(name)) continue;
-        names.push(name);
+        if (name !== "" && !carriesSecret(name)) names.push(name);
       }
+      if (names.length > 0) return { summary: names.slice(-3).join(", "), errors };
       continue;
     }
     if (item.type !== "thinking" && item.type !== "commentary") continue;
     if (carriesSecret(item.entry.text)) continue;
     const line = stepSummary(item.entry.text);
-    if (line !== "") note = line;
+    if (line !== "") return { summary: line, errors };
   }
-  const tail = names.slice(-3);
-  return { summary: tail.length > 0 ? tail.join(", ") : note, errors };
+  return { summary: "", errors };
 }
 
 /** The tool the turn is on right now, when the newest trace row is a tool.

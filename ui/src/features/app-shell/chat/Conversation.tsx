@@ -1631,22 +1631,32 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     const flightKey = inFlightTurnKey(shown, runningMessage);
     const special = (item: ThreadItem) =>
       directiveByKey.get(item.key) != null || plan.has(item.key) || item.type === "hire";
+    // The send each run belongs to, settled before anything is keyed: an
+    // untagged run adopts the user row before it, in flight or finished.
+    // Completion must not change that identity, or the answer remounts the
+    // head. Counting segments on the adopted id also keeps a split turn's
+    // untagged and tagged segments on distinct keys.
+    const effective = new Map<string, string | null>();
+    for (const run of runs) {
+      if (!run.turn) continue;
+      effective.set(run.key, run.message ?? precedingUserMessage(shown, run.items));
+    }
     const perMessage = new Map<string, number>();
     // Completion is the message's, not a segment's: an answer in any run of
     // a split turn completes the whole turn.
     const answeredByMessage = new Map<string, boolean>();
     for (const run of runs) {
-      if (run.turn && run.message !== null) {
-        perMessage.set(run.message, (perMessage.get(run.message) ?? 0) + 1);
-        if (run.items.some((item) => item.type === "answer")) {
-          answeredByMessage.set(run.message, true);
-        }
+      const message = run.turn ? effective.get(run.key) ?? null : null;
+      if (message === null) continue;
+      perMessage.set(message, (perMessage.get(message) ?? 0) + 1);
+      if (run.turn && run.items.some((item) => item.type === "answer")) {
+        answeredByMessage.set(message, true);
       }
     }
     const seen = new Map<string, number>();
     return runs.map((run) => {
       if (!run.turn) return { kind: "item" as const, run };
-      const message = run.message;
+      const message = effective.get(run.key) ?? null;
       const ordinal = message === null ? 1 : (seen.get(message) ?? 0) + 1;
       if (message !== null) seen.set(message, ordinal);
       const total = message === null ? 1 : (perMessage.get(message) ?? 1);
@@ -1655,21 +1665,16 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       const answerItem = run.items.find((item) => item.type === "answer" && !special(item)) ?? null;
       const owns =
         (flightKey !== null && run.items.some((item) => item.key === flightKey)) ||
-        (message !== null && runningMessage !== null && run.items.some((item) => itemMessage(item) === runningMessage));
-      // Same id the sending placeholder uses, so the head updates in place
-      // when the first untagged step lands instead of mounting a second one.
-      const stable = message ?? (owns ? precedingUserMessage(shown, run.items) : null);
+        (message !== null && message === runningMessage);
       return {
         kind: "turn" as const,
         run,
         cards,
         answerItem,
         owns,
-        key: stable === null ? run.key : ordinal === 1 ? stable : `${stable}#${ordinal}`,
+        key: message === null ? run.key : ordinal === 1 ? message : `${message}#${ordinal}`,
         head: ordinal === 1,
         continued: ordinal < total,
-        // The dots belong to the turn's last segment, and only while it has
-        // no answer anywhere in its own segment.
         // Dots only while the turn's last segment has no answer of either
         // kind: a landed card answer completes the turn too.
         running:
@@ -2034,7 +2039,16 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           const reserveTyping =
             turnState.kind === "sending" ||
             ((turnState.kind === "working" || turnState.kind === "writing") && !typingOwned);
-          const typingKey = turnState.kind === "sending" ? (pendingMessages.at(-1) ?? "typing-tail") : "typing-tail";
+          // The send this turn belongs to, stable from the optimistic row
+          // through the stored operator row: the placeholder keeps that id
+          // while the turn is in flight, including the working state before
+          // the first step lands. Once a run claims the id, that run paints
+          // the head and dots; a still-working turn that already answered
+          // keeps a distinct tail key.
+          const lastUser = [...shown].reverse().find((item) => item.type === "operator" || item.type === "pending");
+          const sendId = (lastUser ? itemMessage(lastUser) : null) ?? pendingMessages.at(-1) ?? null;
+          const claimed = sendId !== null && runViews.some((view) => view.kind === "turn" && view.key === sendId);
+          const typingKey = sendId !== null && !claimed ? sendId : "typing-tail";
           if (reserveTyping && !runViews.some((view) => view.kind === "turn" && view.key === typingKey)) {
             rows.push(
               <Fragment key={typingKey}>

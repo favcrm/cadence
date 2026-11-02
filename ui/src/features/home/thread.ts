@@ -467,16 +467,22 @@ const OPEN_TURN = new Set(["thinking", "commentary", "tools", "hire"]);
  *  an answer. Hosted transcripts often omit the message id on agent rows,
  *  so the run is the contiguous assistant items after the user row. A
  *  working id that matches no user row still adopts that open run when
- *  its own entries are untagged — otherwise the real turn paints as
- *  finished and a second assistant head is appended under it. */
+ *  every tagged row in it names that id — otherwise the real turn paints
+ *  as finished and a second assistant head is appended under it.
+ *
+ *  The run is adopted only when no row in it belongs to another send: a
+ *  queued or interleaved turn must not be marked busy, and must not have
+ *  the placeholder of the send actually running suppressed. */
 export function inFlightTurnKey(items: ThreadItem[], message: string | null): string | null {
   if (message === null || message === "") return null;
-  const openAfter = (index: number): string | null => {
+  const runAfter = (start: number): string | null => {
     let first: string | null = null;
-    for (let i = index + 1; i < items.length; i++) {
+    for (let i = start; i < items.length; i++) {
       const item = items[i];
       if (item.type === "operator" || item.type === "pending") break;
       if (item.type === "answer") return null;
+      const tagged = itemMessage(item);
+      if (tagged !== null && tagged !== message) return null;
       if (first === null && OPEN_TURN.has(item.type)) first = item.key;
     }
     return first;
@@ -484,18 +490,13 @@ export function inFlightTurnKey(items: ThreadItem[], message: string | null): st
   const idx = items.findIndex(
     (item) => (item.type === "operator" || item.type === "pending") && itemMessage(item) === message,
   );
-  if (idx >= 0) return openAfter(idx);
+  if (idx >= 0) return runAfter(idx + 1);
   let lastUser = -1;
   for (let i = 0; i < items.length; i++) {
     if (items[i].type === "operator" || items[i].type === "pending") lastUser = i;
   }
   if (lastUser < 0) return null;
-  const key = openAfter(lastUser);
-  if (key === null) return null;
-  const opener = items.find((item) => item.key === key);
-  const tagged = opener ? itemMessage(opener) : null;
-  if (tagged !== null && tagged !== message) return null;
-  return key;
+  return runAfter(lastUser + 1);
 }
 
 // ---- CAD-551: steps, refusals, and the working row's "what now" ----

@@ -49,7 +49,7 @@ equal([parseSlash("/new"), parseSlash(" /CLEAR "), parseSlash("/new now"), parse
 const inst = (id: string, name: string) => ({ install_id: id, title: name, name, version: "0.1.0", digest: "d", catalog_generation: "g", approved: true, approval: { state: "approved", epoch: 1 }, storage_kind: "workspace", files: [], capabilities: null, connection_slots: [] });
 let crmContext = "ctx-a";
 const ctxs = (id: string) => ({ contexts: [{ id: id === "install-crm" ? crmContext : "ctx-a", install_id: id, revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } }] });
-const ent = (seq: number, role: string, kind: string, text: string, message: string) => ({ seq, role, kind, message, text, created: "2026-10-03T00:00:00Z", payload: null });
+const ent = (seq: number, role: string, kind: string, text: string, message: string | null) => ({ seq, role, kind, message, text, created: "2026-10-03T00:00:00Z", payload: null });
 const conv = (id: string, over: object = {}) => ({ id, title: null, subject: null, is_general: false, ...over });
 const convs: Record<string, any[]> = {
   "install-crm": [conv("c-gen", { is_general: true }), conv("c-camp", { subject: "campaign:cmp-1", title: "Spring launch" })],
@@ -680,6 +680,38 @@ await settle();
 assert(host.querySelector("[data-identity-state]")?.getAttribute("data-identity-state") === "unavailable", "a 503 makes the retained private profile unavailable, not current");
 assert(!host.querySelector("[data-assistant-identity]"), "an unreadable profile does not claim private/workspace ownership from stale data");
 assert(host.querySelector("[data-assistant-name]")?.textContent !== "Poppy", "a failed identity read never displays the stale committed name as current");
+
+// CAD-1993: the pane's send keeps one identity from the working placeholder
+// through the first step, and a turn split by a system row keeps distinct
+// segment keys — one head and one typing row, never two.
+convs["install-crm"].push(conv("c-split", { title: "Split turn" }));
+threads["c-split"] = [ent(1, "operator", "message", "split ask", "m-split")];
+await React.act(async () => { await conversationList("install-crm").refresh(); });
+await settle();
+await pick("Split turn");
+identityUnavailable = false;
+turn = { state: "working", message: "m-split", conversation: "c-split" };
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+const placeholder = host.querySelector(".app-chat-list [data-chat-typing]") as HTMLElement | null;
+assert(placeholder !== null, "a working turn with no stored step paints the send placeholder");
+threads["c-split"].push(ent(2, "agent", "thinking", "plan the split", null));
+await React.act(async () => { await conversationThread("c-split").refresh(); });
+await settle();
+const landed = host.querySelector(".app-chat-list [data-chat-run]") as HTMLElement | null;
+assert(landed !== null, "the first step paints the turn row");
+assert(landed === placeholder, "the head updates in place when the first step lands");
+threads["c-split"].push(ent(3, "system", "message", "system note", null));
+threads["c-split"].push(ent(4, "agent", "tool_call", "Bash: cadence board read", "m-split"));
+await React.act(async () => { await conversationThread("c-split").refresh(); });
+await settle();
+equal(host.querySelectorAll(".app-chat-list [data-chat-run] .turn-head").length, 1, "a split turn paints one head");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "a split turn paints one typing row");
+assert(host.querySelector(".app-chat-list [data-chat-run]") === landed, "the split keeps the head's identity");
+
 await React.act(async () => { root.unmount(); });
 console.log("conversations checks passed");
 }

@@ -344,6 +344,26 @@ for (const density of ["full", "compact"] as const) {
   const initialTyping = renderTurn([], true);
   ok(initialTyping.includes('data-turn-state="running"') && count(initialTyping, 'data-kind="typing"') === 1, "streaming: initial 0-step turn shows typing bubble immediately");
   ok(!initialTyping.includes('data-kind="no-answer"') && !initialTyping.includes('data-kind="turn-trace"'), "streaming: initial 0-step turn has no trace or no-answer line");
+  // The collapsed summary follows the newest trace row, so a reasoning note
+  // that landed after a tool call wins over that tool's name (the open list
+  // already leads with it).
+  const noteAfterTool = renderTurn(
+    threadItems(state([
+      agent(1, "tool_call", "Bash: cadence board read", { tool_use_id: "t9" }),
+      agent(2, "tool_result", "2 issues", { tool_use_id: "t9" }),
+      agent(3, "assistant_text", "Checking the ledger next."),
+    ])),
+    true,
+  );
+  {
+    const summaryAt = noteAfterTool.indexOf("turntrace-summary");
+    const listAt = noteAfterTool.indexOf("turntrace-list");
+    ok(summaryAt >= 0 && listAt > summaryAt, "newest note: summary sits in the trace head");
+    ok(noteAfterTool.slice(summaryAt, listAt).includes("Checking the ledger next."), "newest note: the summary names the newer reasoning, not the older tool");
+    ok(!noteAfterTool.slice(summaryAt, listAt).includes("cadence board read"), "newest note: an older tool name does not win the summary");
+    const list = noteAfterTool.slice(listAt);
+    ok(list.indexOf("Checking the ledger next.") < list.indexOf("cadence board read"), "newest note: the open trace leads with it");
+  }
 
   // A transcript from before `turn_result`: the last worker note reads as the
   // reply, with the quiet earlier-transcript marker.

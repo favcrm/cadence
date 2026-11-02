@@ -596,6 +596,20 @@ const ThreadList = memo(function ThreadList({
   // splash: hosted agent entries often carry no message id, so the anchor
   // misses them and the fallback used to append another head.
   const flightKey = inFlightTurnKey(shown, working?.message ?? null);
+  // A hire proposal paints as flat rows, never as a ThreadTurn, so the
+  // suppression below would leave that still-working turn with no
+  // indicator at all. Keep the fallback activity for a flat run.
+  const flightFlat = (() => {
+    if (flightKey === null) return false;
+    const start = shown.findIndex((item) => item.key === flightKey);
+    if (start < 0) return false;
+    for (let i = start; i < shown.length; i++) {
+      const item = shown[i];
+      if (item.type === "operator" || item.type === "pending") break;
+      if (item.type === "hire") return true;
+    }
+    return false;
+  })();
   if (items.length === 0 && !moreBefore) return null;
   return (
     <>
@@ -618,7 +632,7 @@ const ThreadList = memo(function ThreadList({
         onRetry={onRetry}
         onDiscard={discard}
         activity={(item) => {
-          if (flightKey !== null) return null;
+          if (flightKey !== null && !flightFlat) return null;
           if (!working || activityItem === null || item.key !== activityItem.key) return null;
           const live = <AssistantActivity since={working.since} />;
           // The anchored row shows this turn's own newest entry time. A
