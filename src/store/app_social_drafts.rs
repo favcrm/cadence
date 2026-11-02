@@ -850,12 +850,13 @@ impl RecordStore {
         Ok(self.conn().query_row("SELECT EXISTS(SELECT 1 FROM app_social_tool_receipts WHERE install_id=? AND context_id=? AND receipt_id=?)",params![self.install(),context,receipt],|r|r.get(0))?)
     }
 
-    /// SOC-54: the candidate source receipts of this context, bounded. Only
-    /// typed source attachments enter, so an upload or caption cannot consume
-    /// the window at any threshold; the saved handles' newest completed read
-    /// joins them, so a context retained before the kind column existed still
-    /// offers its newest page instead of falling out of the library. The
-    /// authoritative kind and ownership checks run on each returned receipt.
+    /// SOC-54: the candidate source receipts of this context, bounded. Typed
+    /// source attachments come first, so an upload or caption cannot consume
+    /// the window at any threshold. Unknown-kind rows from before the column
+    /// existed take only the remaining room, and the saved handles' newest
+    /// completed read joins them, so an upgraded install keeps both its older
+    /// retained reads and its newest page. The authoritative kind and ownership
+    /// checks run on each returned receipt.
     pub fn app_social_tool_receipt_ids(
         &self,
         context: &str,
@@ -872,6 +873,25 @@ impl RecordStore {
                 r.get::<_, String>(0)
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Rows retained before the kind column existed cannot be classified
+        // here (the receipt lives in the daemon store), so they get what is
+        // left of the window AFTER the typed reads — never the other way, so a
+        // legacy upload cannot displace a typed source read. The freshness arm
+        // keeps an upgraded install's newest page even when its window is full
+        // of unknown rows.
+        let legacy = if typed.len() < limit {
+            conn.prepare(
+                "SELECT receipt_id FROM app_social_tool_receipts
+                  WHERE install_id=? AND context_id=? AND kind=''
+                  ORDER BY completed_at DESC, receipt_id DESC LIMIT ?",
+            )?
+            .query_map(params![self.install(), context, limit as i64], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         let fresh = conn
             .prepare(
                 "SELECT receipt_id FROM app_social_freshness
@@ -883,7 +903,7 @@ impl RecordStore {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut out = typed;
-        for id in fresh {
+        for id in legacy.into_iter().chain(fresh) {
             if out.len() == limit {
                 break;
             }

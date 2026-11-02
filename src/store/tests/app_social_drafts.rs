@@ -264,6 +264,19 @@ fn soc54_receipt_kind_migrates_an_existing_database() {
         reopened.app_social_tool_receipt_ids("ctx-one", 500).unwrap(),
         vec!["new-source", "legacy-source"]
     );
+    // Typed rows come first; unknown legacy rows take only the remaining room,
+    // so an upgraded install keeps older retained reads behind its typed ones.
+    reopened
+        .app_social_tool_receipt_attach("ctx-one", "legacy-upload", 1.0, "")
+        .unwrap();
+    assert_eq!(
+        reopened.app_social_tool_receipt_ids("ctx-one", 2).unwrap(),
+        vec!["new-source", "legacy-source"]
+    );
+    assert_eq!(
+        reopened.app_social_tool_receipt_ids("ctx-one", 5).unwrap(),
+        vec!["new-source", "legacy-source", "legacy-upload"]
+    );
 }
 
 #[test]
