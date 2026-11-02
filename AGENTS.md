@@ -255,10 +255,12 @@ looking.
   reviewers, refuses the author's own, and voids every verdict when the head
   moves. Read it back with `cadence audit verdicts` and confirm a verdict counts
   before treating a review as landed; in-chat findings are not automatically
-  gate evidence. A hosted `audit verdict` is not the per-PR note the native gate
-  reads (the tenant records artifact reviews), so never count it as one or
-  impersonate a reviewer — see `docs/guides/hosted-workspace.md` ("Reviewing
-  software changes"; CAD-1542, CAD-1981, AOS-473).
+  gate evidence. A hosted verdict counts only when the workspace owner has
+  attested its principal's GitHub login for that repository
+  (`cadence audit reviewers`); the gate counts principals, excludes the author
+  by the attested login, and refuses an unattested, contradictory or ambiguous
+  note — see `docs/guides/hosted-workspace.md` ("Reviewing software changes";
+  AOS-473).
 - When more than one Cadence build is on the host, `CADENCE_BIN` selects the one
   the gate invokes. A hosted-verb refusal can come from the client, the deployed
   service or an operation the tenant does not support: confirm the capability,
