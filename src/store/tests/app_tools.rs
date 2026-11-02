@@ -155,6 +155,7 @@ fn soc54_source_reads_are_selected_before_the_history_bound() {
     // Five newer non-source receipts sit ahead of the three source reads. A
     // bound applied before the kind filter would return nothing here; the
     // filter runs first, so the newest two source reads come back.
+    let all: Vec<String> = rows.iter().map(|(_, id)| id.clone()).collect();
     let ids = |rows: Vec<Value>| -> Vec<String> {
         rows.iter()
             .map(|row| row["id"].as_str().unwrap().to_owned())
@@ -162,23 +163,27 @@ fn soc54_source_reads_are_selected_before_the_history_bound() {
     };
     assert_eq!(
         ids(store
-            .app_tool_source_results_page("install1", 0, 2)
+            .app_tool_source_results_for("install1", &all, 2)
             .unwrap()),
         vec!["tool-src-2", "tool-src-1"]
     );
-    // The next page reaches the oldest source read; the caller's context filter
-    // walks pages, so a context whose reads sit behind another context's must
-    // not be starved by one installation-wide window.
+    // The bound is the caller's window: passing only the oldest candidate
+    // still returns it, and an empty candidate set costs no query at all.
     assert_eq!(
         ids(store
-            .app_tool_source_results_page("install1", 2, 2)
+            .app_tool_source_results_for("install1", &all[0..1], 2)
             .unwrap()),
         vec!["tool-src-0"]
     );
     assert!(store
-        .app_tool_source_results_page("other", 0, 2)
+        .app_tool_source_results_for("install1", &[], 2)
         .unwrap()
         .is_empty());
+    assert!(store
+        .app_tool_source_results_for("other", &all, 2)
+        .unwrap()
+        .is_empty());
+
 }
 
 #[test]

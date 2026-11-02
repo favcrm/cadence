@@ -1423,36 +1423,16 @@ impl Shared {
                 let records =
                     crate::store::app_records::RecordStore::open(&self.state_dir, install)?;
                 // SOC-54: the screen's library is the retained source reads OF
-                // THIS CONTEXT, bounded. The store filters kind before its page
-                // bound, and this loop applies context membership before the
-                // 100-row total — a single installation-wide window would let
-                // another context's reads starve this one. Pages stop at the
-                // total or when the source history is exhausted.
-                const PAGE: usize = 100;
+                // THIS CONTEXT, bounded. The candidate set is this context's
+                // own newest attachments, so a read never walks another
+                // context's history and cannot be slowed or starved by it; the
+                // store then keeps source reads only, newest first, up to 100.
+                const CANDIDATES: usize = 500;
                 const LIMIT: usize = 100;
-                let mut rows: Vec<Value> = Vec::new();
-                let mut offset = 0;
-                loop {
-                    let page = self
-                        .store
-                        .app_tool_source_results_page(install, offset, PAGE)?;
-                    let exhausted = page.len() < PAGE;
-                    for row in page {
-                        if rows.len() == LIMIT {
-                            break;
-                        }
-                        let Some(id) = row["id"].as_str() else {
-                            continue;
-                        };
-                        if records.app_social_tool_receipt_contains(context, id)? {
-                            rows.push(row);
-                        }
-                    }
-                    offset += PAGE;
-                    if exhausted || rows.len() >= LIMIT {
-                        break;
-                    }
-                }
+                let candidates = records.app_social_tool_receipt_ids(context, CANDIDATES)?;
+                let rows = self
+                    .store
+                    .app_tool_source_results_for(install, &candidates, LIMIT)?;
                 Ok(json!({ "results": rows }))
             }
             _ => Err(Error::rejected(

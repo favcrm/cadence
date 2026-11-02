@@ -153,6 +153,16 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
     assert!(store
         .app_social_tool_receipt_contains("ctx-two", "receipt-other")
         .unwrap());
+    // The candidate window the screen read is bounded by: this context's own
+    // attachments, newest first, and never another context's.
+    assert_eq!(
+        store.app_social_tool_receipt_ids("ctx-one", 500).unwrap(),
+        vec!["receipt-new", "receipt-old"]
+    );
+    assert_eq!(
+        store.app_social_tool_receipt_ids("ctx-two", 500).unwrap(),
+        vec!["receipt-other"]
+    );
 }
 
 #[test]

@@ -826,6 +826,29 @@ impl RecordStore {
         Ok(self.conn().query_row("SELECT EXISTS(SELECT 1 FROM app_social_tool_receipts WHERE install_id=? AND context_id=? AND receipt_id=?)",params![self.install(),context,receipt],|r|r.get(0))?)
     }
 
+    /// SOC-54: this context's newest attached receipt ids, bounded. The screen
+    /// library uses it as the candidate set, so a read never scans another
+    /// context's history — the work is the caller's own window, not the
+    /// installation's.
+    pub fn app_social_tool_receipt_ids(
+        &self,
+        context: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let rows = conn
+            .prepare(
+                "SELECT receipt_id FROM app_social_tool_receipts
+                  WHERE install_id=? AND context_id=?
+                  ORDER BY completed_at DESC, receipt_id DESC LIMIT ?",
+            )?
+            .query_map(params![self.install(), context, limit as i64], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn app_social_sources_show(&self, context: &str) -> Result<Value> {
         let row = self.conn().query_row("SELECT revision,handles_json,updated FROM app_social_sources WHERE install_id=? AND context_id=?", params![self.install(), context], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?))).optional()?;
         let (revision, raw, updated) = row.unwrap_or((0, String::from("[]"), 0.0));

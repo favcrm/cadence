@@ -513,31 +513,42 @@ impl Store {
                 .is_some_and(|posts| posts.iter().any(|p| p["id"] == post_id)))
     }
 
-    /// One page of the retained SOURCE reads of an installation, newest
-    /// first (SOC-54). The kind filter runs before the bound, so an upload,
-    /// caption or image receipt can never evict a source read from the screen
-    /// library. A page, not a total: the caller's context membership filter
-    /// runs above this store, so a single installation-wide window would let
-    /// another context's reads starve the one asked for.
-    pub(crate) fn app_tool_source_results_page(
+    /// The newest retained SOURCE reads of an installation among `ids`
+    /// (SOC-54), newest first and bounded. The caller passes the candidate set
+    /// — this context's own attachment window — so the work is bounded by that
+    /// window, not by the installation's whole history, and another context's
+    /// reads can neither starve nor slow this one. Kind is filtered before the
+    /// bound, so uploads or captions never spend it.
+    pub(crate) fn app_tool_source_results_for(
         &self,
         install: &str,
-        offset: usize,
+        ids: &[String],
         limit: usize,
     ) -> Result<Vec<Value>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "SELECT id FROM app_tool_results
+              WHERE install_id=? AND json_extract(result,'$.kind')='social.source.posts'
+                AND id IN ({placeholders})
+              ORDER BY created DESC, id DESC LIMIT ?"
+        );
+        let mut bindings: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 2);
+        bindings.push(&install);
+        for id in ids {
+            bindings.push(id);
+        }
+        let limit = limit as i64;
+        bindings.push(&limit);
         let conn = self.conn();
-        let ids = conn
-            .prepare(
-                "SELECT id FROM app_tool_results
-                  WHERE install_id=? AND json_extract(result,'$.kind')='social.source.posts'
-                  ORDER BY created DESC, id DESC LIMIT ? OFFSET ?",
-            )?
-            .query_map(params![install, limit as i64, offset as i64], |r| {
-                r.get::<_, String>(0)
-            })?
+        let kept = conn
+            .prepare(&sql)?
+            .query_map(bindings.as_slice(), |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(conn);
-        ids.iter().map(|id| self.app_tool_result(id)).collect()
+        kept.iter().map(|id| self.app_tool_result(id)).collect()
     }
 
     pub(crate) fn app_tool_results(&self, install: &str) -> Result<Value> {
