@@ -116,7 +116,7 @@ export function parseScreenDrawerCall(verb: ScreenDrawerVerb, args: ActionArgs):
  *  start, the original download and the image picker. Confirm and schedule
  *  also stay slot verbs until every installed app sends them as calls
  *  (Social Content 0.12.10 still sends slots). */
-export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "publish.destination.use", "publish.destination.remove", "publish.settings.save", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "media.read", "media.publish", "media.chat.attach"] as const;
+export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "publish.destination.use", "publish.destination.remove", "publish.settings.save", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "media.read", "media.publish", "media.import", "media.chat.attach"] as const;
 export const SLOT_VERBS = ["run.start", "publish.draft.confirm", "publish.draft.schedule", "media.original.download", "social.image.pick"] as const;
 /** CAD-1365 — the protected original download slot. Qualified per mount
  *  (screen-media.v1 + media.read + live token); never a generic action verb. */
@@ -125,7 +125,7 @@ export const ORIGINAL_DOWNLOAD_VERB = "media.original.download" as const;
  *  envelope but are NEVER in the generic advertised set: they are
  *  appended per-mount, only to a media-opted-in child whose minted
  *  receipt declares them. */
-export const MEDIA_VERBS = ["media.read", "media.publish", "media.chat.attach"] as const;
+export const MEDIA_VERBS = ["media.read", "media.publish", "media.import", "media.chat.attach"] as const;
 export type MediaVerb = (typeof MEDIA_VERBS)[number];
 export const isMediaVerb = (verb: string): verb is MediaVerb =>
   (MEDIA_VERBS as readonly string[]).includes(verb);
@@ -292,6 +292,17 @@ export function mediaReadArgs(args: ActionArgs): ActionArgs | null {
 }
 const MEDIA_ASSET_ID = /^med-[0-9a-f]{32}$/;
 const MEDIA_REQUEST_ID = /^[A-Za-z0-9_-]{1,128}$/;
+/** CAD-1962 — `media.import` args are EXACTLY `{receipt_id, request_id}`,
+ *  both bounded identifiers. The receipt names a retained image the
+ *  mounting installation owns; the daemon re-proves the mount, the
+ *  declared `media.import` permission and the custody before copying. */
+export function mediaImportArgs(args: ActionArgs): ActionArgs | null {
+  if (Object.keys(args).sort().join() !== "receipt_id,request_id") return null;
+  if (typeof args.receipt_id !== "string" || !MEDIA_REQUEST_ID.test(args.receipt_id)) return null;
+  if (typeof args.request_id !== "string" || !MEDIA_REQUEST_ID.test(args.request_id)) return null;
+  return args;
+}
+
 /** `media.original.download` args are EXACTLY `{asset_id}`, a canonical id. */
 export function mediaChatAttachArgs(args: ActionArgs): ActionArgs | null {
   if (Object.keys(args).sort().join() !== "asset_id,expected_revision") return null;
@@ -654,6 +665,10 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
     if (d.verb === "media.chat.attach") {
       const checked = mediaChatAttachArgs(args);
       return checked ? { v: 2, op: "call", id: d.id, verb: "media.chat.attach", args: checked } : null;
+    }
+    if (d.verb === "media.import") {
+      const checked = mediaImportArgs(args);
+      return checked ? { v: 2, op: "call", id: d.id, verb: "media.import", args: checked } : null;
     }
     if (d.verb === "media.publish") {
       const checked = mediaPublishArgs(args);

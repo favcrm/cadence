@@ -104,9 +104,11 @@ impl Shared {
             },
             |view, input, _ctx| {
                 // The workspace is this daemon's own store — the mount
-                // proved it; no request field selects one. The catalog
-                // is store-wide: same-workspace collaborators read the
-                // same rows regardless of which install produced them.
+                // proved it; no request field selects one. The catalog is
+                // store-wide: same-workspace collaborators read the same
+                // rows regardless of which install produced them, and
+                // draft/published is curation, not visibility (CAD-1365's
+                // cross-install read acceptance pins this).
                 self.media_read_input(view, &input)
             },
         )
@@ -121,10 +123,38 @@ impl Shared {
             .as_i64()
             .filter(|revision| *revision > 0)
             .ok_or_else(|| Error::rejected("media preview needs a positive revision"))?;
-        let image = self.store.app_media_context_image(asset_id)?;
-        if image.asset.revision != revision || image.asset.kind != "image" {
-            return Err(Error::rejected("media preview reference is stale"));
+        if let Some(asset) = self.store.app_media_asset(asset_id)? {
+            if asset.revision != revision || asset.kind != "image" {
+                return Err(Error::rejected("media preview reference is stale"));
+            }
         }
+        if let Some(imported) = self.store.app_media_imported_image(asset_id)? {
+            // Workspace custody: the bytes are this store's own, so the
+            // only authority is the live mount proved above. The digest
+            // and size were re-verified on read.
+            let preview = crate::platform::agenticos_external::image::preview_jpeg(
+                &imported.bytes,
+                &imported.media_type,
+            )
+            .map_err(|(_, reason)| Error::rejected(reason))?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(preview);
+            // Re-prove the mount AND the asset revision after preparing
+            // the bytes and before the reply: an expiry, revoke or a
+            // revision change that landed meanwhile refuses, exactly as
+            // the provider branch re-checks `app_media_revision`.
+            self.media_mount_reprove(params)?;
+            if self.store.app_media_revision(asset_id)? != revision {
+                return Err(Error::rejected(
+                    "media preview reference changed during preparation",
+                ));
+            }
+            return Ok(json!({
+                "asset_id": asset_id, "revision": revision,
+                "sha256": imported.sha256,
+                "media_type": "image/jpeg", "base64": encoded,
+            }));
+        }
+        let image = self.store.app_media_context_image(asset_id)?;
         let preview = crate::platform::agenticos_external::image::preview_jpeg(
             &image.bytes,
             image.media_type,
@@ -143,6 +173,52 @@ impl Shared {
                 "media_type": "image/jpeg", "base64": encoded,
             }))
         })
+    }
+
+    /// Re-prove the live mount behind this media request. Used where a
+    /// preparation step ran outside the runtime snapshot (imported
+    /// custody preview) and the reply must not ride an earlier proof.
+    fn media_mount_reprove(&self, params: &Value) -> Result<()> {
+        let token = required_str(params, "token")?;
+        let action_token = required_str(params, "action_token")?;
+        let key = match params.get("key") {
+            None => "",
+            Some(Value::String(key)) => key.as_str(),
+            Some(_) => {
+                return Err(Error::rejected(
+                    "media image key must be a session key string",
+                ))
+            }
+        };
+        let origin = match params["origin"].as_str() {
+            Some("loopback") => Origin::Loopback,
+            Some("tailnet") => Origin::Tailnet,
+            Some("public") => Origin::Public,
+            _ => {
+                return Err(Error::rejected(
+                    "media image needs a classified session origin",
+                ))
+            }
+        };
+        let (session, _) = self
+            .tool_session(token, key, origin)
+            .ok_or_else(|| Error::rejected("media image needs a live operator session"))?;
+        let ctx = self.tool_context_proven(action_token, &session)?;
+        let context_id = ctx
+            .context_id
+            .as_deref()
+            .ok_or_else(|| Error::rejected("media image needs a mounted active context"))?;
+        // Presence is not liveness: the context must still be the active
+        // one this installation owns. `tool_context_proven` proves the
+        // token and session, not `app_contexts.state`, so an archive that
+        // landed while the preview was being prepared refuses here.
+        let (_, proof) = self.store.app_context_proof(&ctx.install_id, context_id)?;
+        if proof.install_id != ctx.install_id {
+            return Err(Error::rejected(
+                "media image context belongs to another installation",
+            ));
+        }
+        Ok(())
     }
 
     fn with_media_mount_current<T>(
@@ -559,6 +635,96 @@ impl Shared {
                     &request_id,
                     crate::store::now(),
                 )
+            },
+        )
+    }
+
+    /// `app_media_import {action_token, token, key, origin, receipt_id,
+    /// request_id}` — copy ONE retained image this installation holds
+    /// into workspace custody and the shared catalog, as a draft.
+    /// Identical fresh authority chain to `app_media_publish` — operator
+    /// connection, closed fields, real session + public-operator floor,
+    /// the SAME session's consumed mount, live install digest, approved
+    /// status, re-extracted package, active owned context — then the
+    /// declared permission is `media.import`, never implied by
+    /// `media.read` or `media.publish`.
+    ///
+    /// The bytes come from THIS installation's own tool custody: the
+    /// receipt is looked up under the mount's install, never a request
+    /// field, and the stored MIME is re-sniffed against the bytes before
+    /// anything is written. The store copies them into workspace
+    /// custody, so the asset outlives this installation and another app
+    /// in the same workspace can read it.
+    pub(super) fn rpc_app_media_import(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.media_request_proven(
+            "media import",
+            params,
+            peer_pid,
+            (
+                &[
+                    "action_token",
+                    "token",
+                    "key",
+                    "origin",
+                    "receipt_id",
+                    "request_id",
+                ],
+                app_screen_decl::MAY_MEDIA_IMPORT,
+            ),
+            |params| {
+                let receipt_id = required_str(params, "receipt_id")?;
+                if receipt_id.is_empty()
+                    || receipt_id.len() > 128
+                    || !receipt_id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                {
+                    return Err(Error::rejected(
+                        "media import receipt_id must be nonempty ASCII \
+                         letters/digits/hyphen/underscore within 128 bytes",
+                    ));
+                }
+                let request_id = required_str(params, "request_id")?;
+                if request_id.is_empty()
+                    || request_id.len() > 128
+                    || !request_id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                {
+                    return Err(Error::rejected(
+                        "media import request_id must be nonempty ASCII \
+                         letters/digits/hyphen/underscore within 128 bytes",
+                    ));
+                }
+                Ok((receipt_id.to_string(), request_id.to_string()))
+            },
+            |view, (receipt_id, request_id), ctx| {
+                let context = ctx.context_id.as_deref().ok_or_else(|| {
+                    Error::rejected("media import needs a mounted active context")
+                })?;
+                let (declared_mime, _digest, bytes) = self
+                    .store
+                    .app_tool_asset_bytes(&ctx.install_id, &receipt_id)
+                    .map_err(|_| {
+                        Error::rejected(
+                            "media import needs a retained image this installation owns",
+                        )
+                    })?;
+                let media_type = crate::platform::agenticos_external::image::uploaded_image_mime(
+                    &bytes,
+                    &declared_mime,
+                )
+                .map_err(|(_, reason)| Error::rejected(reason))?;
+                self.store
+                    .app_media_import(crate::store::app_media::MediaImport {
+                        install: &ctx.install_id,
+                        context,
+                        creator: &media_actor(view).to_string(),
+                        media_type,
+                        bytes: &bytes,
+                        source_receipt_id: &receipt_id,
+                        request_id: &request_id,
+                    })
             },
         )
     }
@@ -1392,9 +1558,12 @@ impl Shared {
         }
     }
 
-    /// The closed media-read input union and the bounded catalog page.
-    /// `kind:"asset"` is a recognized contract member but NOT admitted —
-    /// detail needs its own custody check and refuses explicitly here.
+    /// The closed media-read input union: the bounded catalog page and
+    /// one asset's metadata projection. The store is the workspace, so
+    /// permitted collaborators read the same rows regardless of which
+    /// installation produced them (CAD-1365's cross-install acceptance);
+    /// `lifecycle` is curation, not visibility. Neither input returns
+    /// bytes or a locator — the original transfer is its own door.
     fn media_read_input(
         &self,
         view: &crate::operator_auth::SessionView,
@@ -1447,8 +1616,8 @@ impl Shared {
             "asset" => {
                 // CAD-1962: one catalog row by id — the same metadata
                 // projection the page emits, never bytes or a locator.
-                // The catalog is store-wide, so an asset another install
-                // produced reads here under the same mount proof.
+                // Store-wide like the page: another installation's row
+                // resolves here too.
                 if input
                     .as_object()
                     .is_some_and(|o| o.keys().any(|k| !matches!(k.as_str(), "kind" | "asset_id")))

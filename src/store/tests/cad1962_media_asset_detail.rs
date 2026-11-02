@@ -13,6 +13,25 @@
 //! are exercised without repeating that fixture.
 
 use super::*;
+use crate::store::app_media::MediaImport;
+
+fn import(
+    s: &Store,
+    media_type: &str,
+    bytes: &[u8],
+    receipt: &str,
+    request: &str,
+) -> crate::error::Result<Value> {
+    s.app_media_import(MediaImport {
+        install: INSTALL_A,
+        context: "ctx-a",
+        creator: OPERATOR,
+        media_type,
+        bytes,
+        source_receipt_id: receipt,
+        request_id: request,
+    })
+}
 
 const INSTALL_A: &str = "install-a";
 const INSTALL_B: &str = "install-b";
@@ -119,4 +138,78 @@ fn detail_refuses_a_row_the_catalog_could_not_have_written() {
         s.app_media_asset(&id).is_err(),
         "a control character in a stored title must refuse the read"
     );
+}
+
+const IMPORT_BYTES: &[u8] = b"not-really-a-png-but-the-store-trusts-the-declared-mime";
+
+#[test]
+fn an_import_copies_bytes_into_workspace_custody_and_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+    let first = import(&s, "image/png", IMPORT_BYTES, "receipt-1", "import-1").unwrap();
+    let asset_id = first["receipt"]["asset_id"].as_str().unwrap().to_owned();
+    assert_eq!(first["receipt"]["lifecycle"], "draft");
+
+    let imported = s.app_media_imported_image(&asset_id).unwrap().unwrap();
+    assert_eq!(
+        imported.source_receipt_id, "receipt-1",
+        "the promoted receipt is retained with the bytes"
+    );
+    assert_eq!(imported.media_type, "image/png");
+    assert_eq!(imported.bytes, IMPORT_BYTES);
+    assert_eq!(imported.asset.install_id, INSTALL_A);
+    assert_eq!(imported.asset.lifecycle, "draft");
+
+    // Identical replay returns the SAME asset, never a second copy.
+    let replay = import(&s, "image/png", IMPORT_BYTES, "receipt-1", "import-1").unwrap();
+    assert_eq!(replay["receipt"]["asset_id"], json!(asset_id));
+    assert_eq!(s.app_media_catalog(20, None).unwrap().0.len(), 1);
+
+    // The same request id with different bytes refuses and reserves nothing.
+    assert!(import(&s, "image/png", b"different-bytes", "receipt-1", "import-1").is_err());
+    // Equal bytes from a DIFFERENT receipt are different provenance, so the
+    // same accepted request id refuses rather than claiming one intent.
+    assert!(import(&s, "image/png", IMPORT_BYTES, "receipt-2", "import-1").is_err());
+    assert_eq!(s.app_media_catalog(20, None).unwrap().0.len(), 1);
+}
+
+#[test]
+fn an_imported_asset_is_a_draft_until_published_and_outlives_its_importer() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+    let created = import(&s, "image/jpeg", IMPORT_BYTES, "receipt-3", "import-2").unwrap();
+    let asset_id = created["receipt"]["asset_id"].as_str().unwrap().to_owned();
+
+    // The catalog is store-wide: another installation reads the row, as
+    // CAD-1365's cross-install acceptance requires. Draft/published is
+    // curation, not a visibility boundary.
+    assert!(s.app_media_asset(&asset_id).unwrap().is_some());
+    assert_eq!(s.app_media_catalog(20, None).unwrap().0.len(), 1);
+
+    // Publishing is the existing curation step; the bytes stay in the
+    // workspace store, not the importer's record store.
+    s.app_media_publish(&asset_id, 1, "publish-1", 20.0)
+        .unwrap();
+    assert_eq!(
+        s.app_media_asset(&asset_id).unwrap().unwrap().lifecycle,
+        "published"
+    );
+    assert_eq!(
+        s.app_media_imported_image(&asset_id)
+            .unwrap()
+            .unwrap()
+            .bytes,
+        IMPORT_BYTES
+    );
+
+    // Tampered custody refuses instead of serving bytes.
+    s.write_tx(|tx| {
+        tx.execute(
+            "UPDATE app_media_imports SET bytes=?1 WHERE asset_id=?2",
+            params![b"tampered".to_vec(), asset_id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(s.app_media_imported_image(&asset_id).is_err());
 }
