@@ -2379,6 +2379,86 @@ mod tests {
     }
 
     #[test]
+    fn cad1922_profile_home_refuses_cadence_home_installation() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let root = fixture.path().join("live");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(MARKER), r#"{"name":"live"}"#).unwrap();
+        let _env = Cad1922SandboxEnv::isolated(&home);
+        std::env::set_var("CADENCE_HOME", &root);
+        std::env::set_var("CADENCE_SANDBOX_ROOT", fixture.path());
+        std::env::set_var("CADENCE_PROFILE", "sandbox:live");
+
+        assert!(!root.join("config").exists());
+        let error = active_home().unwrap_err().to_string();
+        assert!(error.contains("overlap"), "{error}");
+        assert!(error.contains("CADENCE_HOME"), "{error}");
+        assert!(error.contains(&root.display().to_string()), "{error}");
+        assert!(!root.join("config").exists());
+    }
+
+    #[test]
+    fn cad1922_profile_home_accepts_disjoint_sandbox_own_exports() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let base = fixture.path().join("sandboxes");
+        let root = base.join("safe");
+        let production = fixture.path().join("production");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::create_dir_all(root.join("pm")).unwrap();
+        std::fs::create_dir_all(&production).unwrap();
+        std::fs::write(root.join(MARKER), r#"{"name":"safe"}"#).unwrap();
+        let _env = Cad1922SandboxEnv::isolated(&home);
+        std::env::set_var("CADENCE_HOME", &production);
+        std::env::set_var("CADENCE_SANDBOX_ROOT", &base);
+        std::env::set_var("CADENCE_PROFILE", "sandbox:safe");
+        std::env::set_var("CADENCE_STATE_DIR", root.join("state"));
+        std::env::set_var("CADENCE_PM_DIR", root.join("pm"));
+        std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+
+        assert_eq!(active_home().unwrap(), Some(root.clone()));
+        assert!(!root.join("config").exists());
+        assert!(!production.join("config").exists());
+    }
+
+    #[test]
+    fn cad1922_adopt_pins_selected_sandbox_base() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let first_base = fixture.path().join("first");
+        let second_base = fixture.path().join("second");
+        let first_root = first_base.join("smoke");
+        let second_root = second_base.join("smoke");
+        std::fs::create_dir_all(&home).unwrap();
+        for root in [&first_root, &second_root] {
+            std::fs::create_dir_all(root.join("state")).unwrap();
+            std::fs::create_dir_all(root.join("pm")).unwrap();
+            std::fs::write(root.join(MARKER), r#"{"name":"smoke"}"#).unwrap();
+        }
+        let _env = Cad1922SandboxEnv::isolated(&home);
+        std::env::set_var("CADENCE_SANDBOX_ROOT", &second_base);
+        std::env::set_var("CADENCE_PROFILE", "sandbox:smoke");
+
+        // Both bases contain a usable sandbox with this name, so an
+        // unchanged ambient base would select the wrong installation.
+        assert_eq!(active_home().unwrap(), Some(second_root));
+        assert_eq!(
+            adopt(&first_root.join("state")).unwrap().as_deref(),
+            Some("smoke")
+        );
+        assert_eq!(
+            std::env::var_os("CADENCE_SANDBOX_ROOT"),
+            Some(first_base.clone().into_os_string())
+        );
+        assert_eq!(base_dir().unwrap(), first_base);
+        assert_eq!(Sandbox::open("smoke").unwrap().root, first_root);
+        assert_eq!(active_home().unwrap(), Some(first_root));
+    }
+
+    #[test]
     fn cad1922_deleting_guard_refuses_planted_production_marker() {
         let fixture = tempfile::tempdir().unwrap();
         let home = fixture.path().join("home");
