@@ -973,14 +973,22 @@ fn production_dirs(sb: &Sandbox, exported: bool) -> Result<Vec<(&'static str, Pa
     // caller's `$CADENCE_HOME` selects, so an export cannot hide it.
     // `home.rs` resolves the same spellings, but its public defaults
     // follow `$CADENCE_HOME`/`$XDG_CONFIG_HOME`; this guard must not.
-    if let Some(home) = var("HOME") {
-        dirs.push(("the production home", home.join(".cadence")));
-        dirs.push(("the production tracker", home.join("pm")));
-        dirs.push(("the production config dir", home.join(".config/cadence")));
-        // A daemon started without XDG_STATE_HOME lives here even when
-        // this shell sets it.
-        dirs.push(("the production state dir", crate::home::local_state_dir()?));
-    }
+    // The host's defaults must be establishable: an empty inventory is
+    // not proof of isolation. Without `HOME` the production tracker, home
+    // and config cannot be named, so a planted marker at `~/pm` would be
+    // accepted as disposable — refuse instead of guessing.
+    let home = var("HOME").ok_or_else(|| {
+        Error::rejected(
+            "HOME is not set to an absolute path — refusing to judge a sandbox without \
+             the host's production roots",
+        )
+    })?;
+    dirs.push(("the production home", home.join(".cadence")));
+    dirs.push(("the production tracker", home.join("pm")));
+    dirs.push(("the production config dir", home.join(".config/cadence")));
+    // A daemon started without XDG_STATE_HOME lives here even when this
+    // shell sets it.
+    dirs.push(("the production state dir", crate::home::local_state_dir()?));
     // An explicit `CADENCE_HOME` names a real installation too — a system
     // install, a second profile. Sandbox children no longer carry it (the
     // resolver maps their profile to the sandbox root), so naming it here
