@@ -215,6 +215,7 @@ async function main() {
     }));
   });
   await settle();
+
   assert(face.isConnected && rowEl?.isConnected === true, "the assistant face stays mounted when the first untagged step lands");
   assert(host.querySelectorAll('[data-kind="typing"]').length === 1, "the first step does not paint a second typing bubble");
   assert(host.querySelectorAll('[data-kind="turn"][data-turn-state="running"]').length === 1, "the first step does not paint a second assistant head");
@@ -236,6 +237,23 @@ async function main() {
     trace !== null && (bubble.compareDocumentPosition(trace) & Node.DOCUMENT_POSITION_PRECEDING) !== 0,
     "the typing bubble follows the trace",
   );
+  // Completion must not remount the turn either: the send identity comes
+  // from the user row, not from the working state that just cleared.
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [
+        ...state!.entries,
+        { seq: 23, role: "agent", kind: "turn_result", message: null, text: "The board is clear." },
+      ],
+    }));
+    streamMaster.turn = null;
+    streamMaster.queue = [];
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
+  });
+  await settle();
+  assert(face.isConnected, "the assistant face stays mounted when the answer lands");
+  assert(host.querySelectorAll('[data-kind="typing"]').length === 0, "a landed answer clears the typing bubble");
   await React.act(async () => {
     streamMaster.turn = null;
     streamMaster.queue = [];

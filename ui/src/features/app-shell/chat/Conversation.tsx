@@ -38,6 +38,7 @@ import { DayDivider, dayKey, itemCreated } from "../../home/DayDivider";
 import CorrectionReport from "../../wiki/CorrectionReport";
 import {
   addPending,
+  activeSendId,
   discardPending,
   inFlightTurnKey,
   itemMessage,
@@ -273,11 +274,10 @@ function HomeList({
     const ownsFlight = flightKey !== null && run.items.some((item) => item.key === flightKey);
     // The send's own id, not the daemon's working id. Hosted agent rows
     // often carry neither, and the working id can differ from the send.
-    // The empty typing row is keyed by the send, so this run must use
-    // that same id or the assistant head unmounts and splashes.
-    const msg =
-      run.message ??
-      (ownsFlight ? precedingUserMessage(items, run.items) ?? running : null);
+    // The empty typing row is keyed by the send, and this run keeps that
+    // same id after the answer lands or working clears — identity must not
+    // depend on the turn still being in flight, or the head remounts.
+    const msg = run.message ?? (ownsFlight ? activeSendId(items, running) ?? precedingUserMessage(items, run.items) : precedingUserMessage(items, run.items));
     if (msg && !claimedTurns.has(msg)) {
       claimedTurns.add(msg);
       turnKey.set(run.key, `turn:${msg}`);
@@ -1637,9 +1637,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     // head. Counting segments on the adopted id also keeps a split turn's
     // untagged and tagged segments on distinct keys.
     const effective = new Map<string, string | null>();
+    const openSend = activeSendId(shown, runningMessage);
     for (const run of runs) {
       if (!run.turn) continue;
-      effective.set(run.key, run.message ?? precedingUserMessage(shown, run.items));
+      const isFlight = flightKey !== null && run.items.some((item) => item.key === flightKey);
+      const before = precedingUserMessage(shown, run.items);
+      effective.set(run.key, run.message ?? (isFlight ? openSend ?? before : before));
     }
     const perMessage = new Map<string, number>();
     // Completion is the message's, not a segment's: an answer in any run of
@@ -1654,6 +1657,26 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       }
     }
     const seen = new Map<string, number>();
+    // The send the running turn belongs to, taken from the run that opened
+    // it: an untagged run's effective id is the send, even when the
+    // daemon's working id differs. Ownership follows that id across every
+    // segment of a split turn, so the last segment paints the dots and the
+    // first paints the one head.
+    const flightSend = (() => {
+      if (flightKey !== null) {
+        for (const run of runs) {
+          if (!run.turn) continue;
+          if (run.items.some((item) => item.key === flightKey)) return effective.get(run.key) ?? null;
+        }
+      }
+      if (runningMessage !== null) {
+        for (const run of runs) {
+          if (!run.turn) continue;
+          if ((effective.get(run.key) ?? null) === runningMessage) return runningMessage;
+        }
+      }
+      return null;
+    })();
     return runs.map((run) => {
       if (!run.turn) return { kind: "item" as const, run };
       const message = effective.get(run.key) ?? null;
@@ -1665,7 +1688,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       const answerItem = run.items.find((item) => item.type === "answer" && !special(item)) ?? null;
       const owns =
         (flightKey !== null && run.items.some((item) => item.key === flightKey)) ||
-        (message !== null && message === runningMessage);
+        (message !== null && message === flightSend);
       return {
         kind: "turn" as const,
         run,
@@ -2042,11 +2065,25 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           // The send this turn belongs to, stable from the optimistic row
           // through the stored operator row: the placeholder keeps that id
           // while the turn is in flight, including the working state before
-          // the first step lands. Once a run claims the id, that run paints
-          // the head and dots; a still-working turn that already answered
-          // keeps a distinct tail key.
+          // the first step lands. The id comes from the run that owns the
+          // working turn (its declared message, else the user row before
+          // it) — not from the newest user, which may be a queued send
+          // behind it. Once a run claims the id, that run paints the head
+          // and dots; a still-working turn that already answered keeps a
+          // distinct tail key.
+          const flightKeyForTyping = inFlightTurnKey(shown, runningMessage);
+          const flightRun = flightKeyForTyping === null
+            ? null
+            : runs.find((run) => run.turn && run.items.some((item) => item.key === flightKeyForTyping)) ?? null;
+          // The send being worked: the run's declared message, else the open
+          // send (the working id's user row, else the earliest user row since
+          // the last answer). A message queued behind it must not take over.
+          const openSend = activeSendId(shown, runningMessage);
+          const flightSend = flightRun !== null && flightRun.turn
+            ? flightRun.message ?? openSend ?? precedingUserMessage(shown, flightRun.items)
+            : null;
           const lastUser = [...shown].reverse().find((item) => item.type === "operator" || item.type === "pending");
-          const sendId = (lastUser ? itemMessage(lastUser) : null) ?? pendingMessages.at(-1) ?? null;
+          const sendId = flightSend ?? openSend ?? (lastUser ? itemMessage(lastUser) : null) ?? pendingMessages.at(-1) ?? null;
           const claimed = sendId !== null && runViews.some((view) => view.kind === "turn" && view.key === sendId);
           const typingKey = sendId !== null && !claimed ? sendId : "typing-tail";
           if (reserveTyping && !runViews.some((view) => view.kind === "turn" && view.key === typingKey)) {

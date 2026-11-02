@@ -462,6 +462,20 @@ export function rowPaintKey(item: ThreadItem): string {
 
 const OPEN_TURN = new Set(["thinking", "commentary", "tools", "hire"]);
 
+/** The send named by the working id: the user row whose message matches
+ *  it. Null when the daemon reports an id no user row carries — callers
+ *  then fall back to the user row before the run. */
+export function activeSendId(items: ThreadItem[], runningMessage: string | null): string | null {
+  if (runningMessage === null || runningMessage === "") return null;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    if ((item.type === "operator" || item.type === "pending") && itemMessage(item) === runningMessage) {
+      return runningMessage;
+    }
+  }
+  return null;
+}
+
 /** The assistant item that opens the run still in flight for `message`.
  *  Null when that send has no assistant rows yet, or the run already has
  *  an answer. Hosted transcripts often omit the message id on agent rows,
@@ -472,31 +486,39 @@ const OPEN_TURN = new Set(["thinking", "commentary", "tools", "hire"]);
  *
  *  The run is adopted only when no row in it belongs to another send: a
  *  queued or interleaved turn must not be marked busy, and must not have
- *  the placeholder of the send actually running suppressed. */
+ *  the placeholder of the send actually running suppressed. A queued user
+ *  row can sit between the running send and its first assistant rows, so
+ *  an empty matching run falls through to the tail run. */
 export function inFlightTurnKey(items: ThreadItem[], message: string | null): string | null {
   if (message === null || message === "") return null;
-  const runAfter = (start: number): string | null => {
+  const isUser = (item: ThreadItem) => item.type === "operator" || item.type === "pending";
+  // `present` distinguishes "no assistant rows yet" (fall through) from a
+  // run that answered or names another send (refuse, never fall through).
+  const runAfter = (start: number): { key: string | null; present: boolean } => {
     let first: string | null = null;
+    let present = false;
     for (let i = start; i < items.length; i++) {
       const item = items[i];
-      if (item.type === "operator" || item.type === "pending") break;
-      if (item.type === "answer") return null;
+      if (isUser(item)) break;
+      present = true;
+      if (item.type === "answer") return { key: null, present };
       const tagged = itemMessage(item);
-      if (tagged !== null && tagged !== message) return null;
+      if (tagged !== null && tagged !== message) return { key: null, present };
       if (first === null && OPEN_TURN.has(item.type)) first = item.key;
     }
-    return first;
+    return { key: first, present };
   };
-  const idx = items.findIndex(
-    (item) => (item.type === "operator" || item.type === "pending") && itemMessage(item) === message,
-  );
-  if (idx >= 0) return runAfter(idx + 1);
+  const idx = items.findIndex((item) => isUser(item) && itemMessage(item) === message);
+  if (idx >= 0) {
+    const run = runAfter(idx + 1);
+    if (run.present) return run.key;
+  }
   let lastUser = -1;
   for (let i = 0; i < items.length; i++) {
-    if (items[i].type === "operator" || items[i].type === "pending") lastUser = i;
+    if (isUser(items[i])) lastUser = i;
   }
   if (lastUser < 0) return null;
-  return runAfter(lastUser + 1);
+  return runAfter(lastUser + 1).key;
 }
 
 // ---- CAD-551: steps, refusals, and the working row's "what now" ----
