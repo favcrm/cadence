@@ -439,7 +439,7 @@ fn cad2008_unsafe_screen_member_names_are_refused() {
     let mut nested = files.clone();
     nested.insert(
         "screens/main/nested/client.js".to_string(),
-        js_body(1 * KIB),
+        js_body(KIB),
     );
     assert!(
         extract(&nested, "main").is_err(),
@@ -447,21 +447,21 @@ fn cad2008_unsafe_screen_member_names_are_refused() {
     );
 
     let mut traversal = files.clone();
-    traversal.insert("screens/main/../client.js".to_string(), js_body(1 * KIB));
+    traversal.insert("screens/main/../client.js".to_string(), js_body(KIB));
     assert!(
         extract(&traversal, "main").is_err(),
         "a traversal-shaped leaf is refused, never resolved"
     );
 
     let mut undeclared = files.clone();
-    undeclared.insert("screens/main/extra.js".to_string(), js_body(1 * KIB));
+    undeclared.insert("screens/main/extra.js".to_string(), js_body(KIB));
     assert!(
         extract(&undeclared, "main").is_err(),
         "an undeclared leaf beside the declared set refuses"
     );
 
     let mut uppercase = files.clone();
-    uppercase.insert("screens/main/Client.js".to_string(), js_body(1 * KIB));
+    uppercase.insert("screens/main/Client.js".to_string(), js_body(KIB));
     assert!(
         extract(&uppercase, "main").is_err(),
         "an uppercase stem is not the bundle's leaf grammar"
