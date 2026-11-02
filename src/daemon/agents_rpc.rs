@@ -5,13 +5,7 @@ use super::*;
 impl Shared {
     pub(super) fn rpc_register(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = required_str(params, "alias")?;
-        // A profile and a runtime never share a name: two cards with one
-        // alias would be two things to @-mention.
-        if crate::agent_settings::profile_exists(&self.store, alias)? {
-            return Err(Error::rejected(format!(
-                "'{alias}' is already an agent profile - give the runtime another alias"
-            )));
-        }
+        crate::agent_settings::refuse_profile_alias(&self.store, alias)?;
         let provider = required_str(params, "provider")?;
         let endpoint =
             optional_str(params, "endpoint_kind").unwrap_or(registry::DEFAULT_ENDPOINT_KIND);

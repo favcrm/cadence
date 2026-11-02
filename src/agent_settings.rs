@@ -1008,6 +1008,8 @@ fn check_references(
     agents: &[Agent],
 ) -> Result<()> {
     let next_models = ids_of(&overlay.models);
+    let runtime_aliases: Vec<&str> = agents.iter().map(|a| a.alias.as_str()).collect();
+    refuse_runtime_names(profiles, previous, &runtime_aliases)?;
     for profile in profiles {
         if profile.model != "inherit" && !next_models.contains(profile.model.as_str()) {
             return Err(Error::invalid(
@@ -2753,6 +2755,38 @@ pub fn profile_exists(store: &Store, id: &str) -> Result<bool> {
         .any(|profile| profile.id == id))
 }
 
+/// A new runtime may not take an alias a profile holds: two cards with one
+/// name would be two things to @-mention. A runtime row that already holds
+/// the alias is left to the store's duplicate error, so reopening an old
+/// runtime keeps working.
+pub fn refuse_profile_alias(store: &Store, alias: &str) -> Result<()> {
+    if profile_exists(store, alias)? && store.agent_opt(alias)?.is_none() {
+        return Err(Error::rejected(format!(
+            "'{alias}' is already an agent profile - give the runtime another alias"
+        )));
+    }
+    Ok(())
+}
+
+/// A profile saved under a name a runtime already holds is refused.
+fn refuse_runtime_names(
+    profiles: &[Profile],
+    previous: &[Profile],
+    runtime_aliases: &[&str],
+) -> Result<()> {
+    for profile in profiles {
+        if !previous.iter().any(|p| p.id == profile.id)
+            && runtime_aliases.contains(&profile.id.as_str())
+        {
+            return Err(Error::rejected(format!(
+                "'{}' is already an agent - pick another profile id",
+                profile.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Every settings profile with the aliases of the runtimes registered
 /// against it (`params.profile == id`). The job is the operator's to read:
 /// `with_job` is false unless the caller proved it. A body that cannot be
@@ -2932,6 +2966,47 @@ mod inherit_tests {
             inherited_launch_model(None, "pi", "managed", &models, &providers),
             "inherit"
         );
+    }
+
+    #[test]
+    fn a_profile_and_a_runtime_never_share_a_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+        let role = crate::agent_roles::find("developer").unwrap();
+        create_catalogue_profile(&store, "dev-1", role, role.look, None, None).unwrap();
+        // A new runtime may not take the profile's name ...
+        assert!(refuse_profile_alias(&store, "dev-1").is_err());
+        assert!(refuse_profile_alias(&store, "free").is_ok());
+        // ... but a runtime row that already holds it can still be reopened.
+        let cwd = dir.path().to_string_lossy().to_string();
+        store
+            .register_agent(&crate::store::NewAgent {
+                alias: "dev-1",
+                provider: "fake",
+                endpoint_kind: "fake",
+                role: "worker",
+                cwd: &cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        assert!(refuse_profile_alias(&store, "dev-1").is_ok());
+        // Settings save refuses a NEW profile id that a runtime holds.
+        let p = |id: &str| Profile {
+            id: id.to_string(),
+            role: "worker".to_string(),
+            model: "inherit".to_string(),
+            job: "j".to_string(),
+            text: String::new(),
+            catalogue: None,
+            look: None,
+        };
+        assert!(refuse_runtime_names(&[p("rt-9")], &[], &["rt-9"]).is_err());
+        assert!(refuse_runtime_names(&[p("rt-9")], &[p("rt-9")], &["rt-9"]).is_ok());
+        assert!(refuse_runtime_names(&[p("fresh")], &[], &["rt-9"]).is_ok());
     }
 
     #[test]
