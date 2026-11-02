@@ -374,6 +374,15 @@ async function main() {
   assert(interleavedTyping !== null, "the working send paints typing behind an earlier answered run");
   assert(host.querySelectorAll('[data-kind="typing"]').length === 1, "one typing bubble for the interleaved send");
   assert(host.querySelectorAll('[data-chat-typing]').length === 0, "no standalone typing head behind an answered run");
+  const eRun = host.querySelector('[data-item-key="e63"]')?.closest('[data-kind="turn"]') ?? null;
+  assert(eRun !== null, "the answered run is painted");
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
+  });
+  await settle();
+  assert(host.querySelectorAll('[data-kind="turn"]').length > 0, "the transcript stays after the turn clears");
+  const eRunAfter = host.querySelector('[data-item-key="e63"]')?.closest('[data-kind="turn"]') ?? null;
+  assert(eRunAfter === eRun, "the earlier answered run keeps its identity after the working turn clears");
   await React.act(async () => {
     streamMaster.turn = null;
     streamMaster.queue = [];

@@ -297,6 +297,9 @@ function HomeList({
       const run = runs[i];
       if (!run.turn) continue;
       if (run.items.some((item) => item.type === "answer")) continue;
+      // A run explicitly tagged to another send is not the working one,
+      // whatever user row physically precedes it.
+      if (run.items.some((item) => { const t = itemMessage(item); return t !== null && t !== workingSend; })) continue;
       if (sendBefore(items, run.items, queuedSet) === workingSend) return run.key;
     }
     return null;
@@ -320,7 +323,9 @@ function HomeList({
       ?? sendBefore(items, run.items, queuedSet, index < workingIndex ? workingSend : null);
     // Remember the send the transcript, the working move, or a continued
     // segment names. A value guessed from the queue could be wrong.
-    if (remembered === undefined && send !== null && (certain !== null || isWorking)) {
+    // Retain a positional correction for a run before the working one: it
+    // must not be reattributed to the working send once that turn clears.
+    if (remembered === undefined && send !== null && (certain !== null || isWorking || index < workingIndex)) {
       stickySends.current.set(run.key, send);
     }
     if (send && !claimedTurns.has(send)) {
@@ -1728,6 +1733,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         const run = runs[i];
         if (!run.turn) continue;
         if (run.items.some((item) => item.type === "answer")) continue;
+        // A run explicitly tagged to another send is not the working one,
+        // whatever user row physically precedes it.
+        if (run.items.some((item) => { const t = itemMessage(item); return t !== null && t !== workingSend; })) continue;
         if (sendBefore(shown, run.items, queuedSet) === workingSend) return run.key;
       }
       return null;
@@ -1751,7 +1759,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       const evidence = run.message
         ?? (isWorking ? workingSend ?? send : null)
         ?? carry;
-      if (remembered === undefined && send !== null && evidence !== null) {
+      // Retain a positional correction for a run before the working one: it
+      // must not be reattributed to the working send once that turn clears.
+      if (remembered === undefined && send !== null && (evidence !== null || index < workingIndex)) {
         stickySends.current.set(run.key, send);
       }
       effective.set(run.key, send);
