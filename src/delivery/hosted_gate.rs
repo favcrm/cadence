@@ -469,8 +469,12 @@ pub fn approval(
 /// The contract answer is `{state:"in-force", approval_id, source,
 /// recorded_via}`, or another state with a text `reason` and no
 /// `approval_id`. The verb binds the exact `{repo, pr, head}` it was asked;
-/// an answer that also names them must name exactly those, and any key
-/// outside the contract refuses.
+/// an answer that also names them must name exactly those.
+///
+/// Keys outside the contract are ignored, not refused: a newer service may add
+/// an informational field (CAD-1987: `note` on a recorded answer), and the
+/// gate's meaning comes only from the fields checked here. Nothing an extra key
+/// says is echoed — the printed `verified` and `note` are this client's.
 pub(crate) fn approval_answer(
     body: &Value,
     repo: &str,
@@ -481,22 +485,6 @@ pub(crate) fn approval_answer(
     let fields = body
         .as_object()
         .ok_or_else(|| refuse(format!("`{verb}` answer is not an object")))?;
-    const KEYS: [&str; 9] = [
-        "state",
-        "approval_id",
-        "source",
-        "recorded_via",
-        "reason",
-        "repo",
-        "pr",
-        "head",
-        "action",
-    ];
-    if let Some(key) = fields.keys().find(|k| !KEYS.contains(&k.as_str())) {
-        return Err(refuse(format!(
-            "`{verb}` answer carries unexpected {key:?}"
-        )));
-    }
     if fields
         .get("repo")
         .is_some_and(|r| !r.as_str().is_some_and(|r| r.eq_ignore_ascii_case(repo)))
@@ -799,13 +787,25 @@ mod tests {
     }
 
     #[test]
+    fn approval_ignores_an_informational_key_without_echoing_it() {
+        // CAD-1987: a recorded hosted answer carries `note`; refusing the answer
+        // made a correctly recorded approval unreadable by the gate.
+        let mut body = in_force();
+        body["note"] = json!("the tenant records artifact reviews");
+        body["verified"] = json!(true);
+        let (doc, code) = approval_answer(&body, "favcrm/cadence", 7, HEAD).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(doc["state"], "in-force");
+        // An answer's claim never becomes this client's claim.
+        assert_eq!(doc["verified"], false);
+        assert_ne!(doc["note"], json!("the tenant records artifact reviews"));
+    }
+
+    #[test]
     fn approval_refuses_a_malformed_answer() {
-        let mut extra = in_force();
-        extra["verified"] = json!(true);
         let mut not_merge = in_force();
         not_merge["action"] = json!("deploy");
         for body in [
-            extra,
             not_merge,
             json!({"state": "in-force"}),
             json!({"state": "granted", "approval_id": "x"}),
