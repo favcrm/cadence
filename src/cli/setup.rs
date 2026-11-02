@@ -126,7 +126,12 @@ pub(super) fn run(
     let handover = Handover {
         scope,
         hosted_board_url: sign_in.endpoint.clone(),
-        next_command: next_command(scope, &sign_in, &state_dir),
+        next_command: next_command(
+            scope,
+            &sign_in,
+            &state_dir,
+            &cadence_agent::issue::default_dir()?,
+        ),
         board_running: outcomes
             .iter()
             .find(|outcome| outcome.check == "ui")
@@ -331,7 +336,7 @@ fn plan_fact(target: Option<&RemoteTarget>, json: bool, saved: Option<&[String]>
 /// transport failure, a grant that did not match — an approved credential
 /// may already exist server-side. The safe next step is always a truthful
 /// read of this machine, and only a hosted scope names a workspace.
-fn next_command(scope: &str, sign_in: &SignInFact, state_dir: &Path) -> String {
+fn next_command(scope: &str, sign_in: &SignInFact, state_dir: &Path, pm_dir: &Path) -> String {
     // An inherited binding — a pin — refuses `--org` (`org::pin_conflict`),
     // so a pinned shell's next command must read this machine locally and
     // name the exact state dir instead of the workspace.
@@ -349,11 +354,13 @@ fn next_command(scope: &str, sign_in: &SignInFact, state_dir: &Path) -> String {
             return format!("cadence status --org {slug}");
         }
     }
-    // A local handover pins this run's state dir even when it is the
-    // default: a saved remote org, or `CADENCE_ORG`, would otherwise send
-    // a bare `cadence status` to another destination.
+    // A local handover pins this run's state dir and tracker, even when
+    // they are the defaults: a saved remote org, `CADENCE_ORG`, or a saved
+    // local connection with a custom pair would otherwise send a bare
+    // `cadence status` to another destination or read the wrong tracker.
     format!(
-        "cadence status --state-dir {}",
+        "CADENCE_PM_DIR={} cadence status --state-dir {}",
+        shell_quote(&pm_dir.display().to_string()),
         shell_quote(&state_dir.display().to_string())
     )
 }

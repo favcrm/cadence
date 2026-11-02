@@ -711,11 +711,11 @@ fn refuse_home_overlap(sb: &Sandbox) -> Result<()> {
     for (label, dir) in production_dirs(sb, true)? {
         let live = resolved(&dir);
         // A sandbox's own children export its state and tracker, which
-        // sit strictly inside its root; those are the sandbox itself. An
-        // equal path is never exempt — `CADENCE_HOME=<root>` beside a
-        // profile is a contradiction this resolver refuses rather than
-        // guesses.
-        let exported = label.starts_with("the exported ") || label.starts_with("the CADENCE_HOME ");
+        // sit strictly inside its root; those are the sandbox itself. A
+        // `CADENCE_HOME` is never exempt: it names a real installation
+        // even when that installation sits inside the candidate root. An
+        // equal exported path is not exempt either.
+        let exported = label.starts_with("the exported ");
         if exported && live != root && live.starts_with(&root) {
             continue;
         }
@@ -1067,9 +1067,14 @@ fn refuse_overlap(sb: &Sandbox, exported: bool, own_exports_are_ours: bool) -> R
         // inside its own root, as every `CADENCE_HOME=<root>` path is —
         // is the sandbox, not a live cadence. A host-derived default at
         // the same path is still production and still refuses.
+        // Only an export that is exactly one of the sandbox's own dirs is
+        // the sandbox. A `CADENCE_HOME` is never exempt, not even when it
+        // equals the candidate root: it is the name of a real
+        // installation, and a marker that claims it must not authorize a
+        // host-wide write.
         if own_exports_are_ours
-            && (label.starts_with("the exported ") || label.starts_with("the CADENCE_HOME "))
-            && (live.starts_with(&ours[0]) || ours.iter().any(|own| own == &live))
+            && label.starts_with("the exported ")
+            && ours.iter().any(|own| own == &live)
         {
             continue;
         }
@@ -2397,6 +2402,59 @@ mod tests {
         assert!(error.contains("CADENCE_HOME"), "{error}");
         assert!(error.contains(&root.display().to_string()), "{error}");
         assert!(!root.join("config").exists());
+    }
+
+    #[test]
+    fn cad1922_profile_home_refuses_contained_cadence_home_installation() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let root = fixture.path().join("smoke");
+        let production = root.join("config");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(MARKER), r#"{"name":"smoke"}"#).unwrap();
+        let _env = Cad1922SandboxEnv::isolated(&home);
+        std::env::set_var("CADENCE_SANDBOX_ROOT", fixture.path());
+        std::env::set_var("CADENCE_PROFILE", "sandbox:smoke");
+        std::env::set_var("CADENCE_HOME", &production);
+
+        assert!(!production.exists());
+        let error = active_home().unwrap_err().to_string();
+        assert!(error.contains("overlap"), "{error}");
+        assert!(error.contains("CADENCE_HOME"), "{error}");
+        assert!(error.contains(&production.display().to_string()), "{error}");
+        assert!(!production.exists());
+    }
+
+    #[test]
+    fn cad1922_global_gate_refuses_cadence_home_but_accepts_own_state_export() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let root = fixture.path().join("smoke");
+        let state = root.join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(root.join(MARKER), r#"{"name":"smoke","allow_global":true}"#).unwrap();
+        let mut env = Cad1922SandboxEnv::isolated(&home);
+        env.0
+            .push((ALLOW_GLOBAL_ENV, std::env::var_os(ALLOW_GLOBAL_ENV)));
+        std::env::set_var("CADENCE_SANDBOX_ROOT", fixture.path());
+        std::env::set_var("CADENCE_PROFILE", "sandbox:smoke");
+        std::env::set_var(ALLOW_GLOBAL_ENV, "1");
+        std::env::set_var("CADENCE_STATE_DIR", &state);
+        std::env::set_var("CADENCE_HOME", &root);
+
+        let error = refuse_global_unless_allowed("acceptance")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overlap"), "{error}");
+        assert!(error.contains("CADENCE_HOME"), "{error}");
+        assert!(error.contains(&root.display().to_string()), "{error}");
+
+        // Removing production evidence leaves the legitimate exported shell.
+        // The same marker, opt-in, profile and exact state export stay in place.
+        std::env::remove_var("CADENCE_HOME");
+        refuse_global_unless_allowed("acceptance").unwrap();
     }
 
     #[test]
