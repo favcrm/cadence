@@ -15,8 +15,8 @@ import type {
   AgentAccess,
   AgentDetail,
   AgentRegisterBody,
-  AgentProfile,
   AgentProfileBody,
+  HiredProfile,
   AgentRolesPayload,
   InstructionsResult,
   AgentsPayload,
@@ -933,7 +933,7 @@ export const api = {
   /** `POST /api/agent-profiles` (CAD-1989) - a hire saves a profile and
    *  launches nothing. Operator only. */
   createAgentProfile: (body: AgentProfileBody) =>
-    post<{ profile: AgentProfile }>("/api/agent-profiles", body),
+    post<{ profile: HiredProfile }>("/api/agent-profiles", body),
   /** `GET /api/agent-roles` (CAD-1752) — the role catalogue. Any signed-in viewer. */
   agentRoles: () => get<AgentRolesPayload>("/api/agent-roles"),
   /** `POST /api/agents/<alias>/instructions` (CAD-1752) — replace the

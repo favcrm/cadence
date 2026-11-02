@@ -1,10 +1,10 @@
 import { useTranslate } from "../../lib/locale";
-import type { Agent, AgentProfile } from "../../lib/types";
+import type { Agent, HiredProfile } from "../../lib/types";
 import AgentAvatar from "./AgentAvatar";
 import { agentLocation } from "./agentView";
 
 /** How a runtime attaches to a profile, and how it reads the profile back. */
-export function ConnectRuntime({ profile }: { profile: AgentProfile }) {
+export function ConnectRuntime({ profile }: { profile: HiredProfile }) {
   const t = useTranslate();
   return (
     <div className="rc-connect">
@@ -24,7 +24,7 @@ export default function ProfileSeat({
   roleTitle,
   runtimes,
 }: {
-  profile: AgentProfile;
+  profile: HiredProfile;
   roleTitle: string;
   runtimes: Agent[];
 }) {

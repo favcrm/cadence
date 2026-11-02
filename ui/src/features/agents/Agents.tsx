@@ -36,7 +36,7 @@ import {
   type AgentFilter,
 } from "./agentView";
 import "./agents.css";
-import type { Agent, AgentProfile, AgentRole, AgentsPayload, IssueCard } from "../../lib/types";
+import type { Agent, HiredProfile, AgentRole, AgentsPayload, IssueCard } from "../../lib/types";
 
 /** The toolbar's segmented filters, in the order they read. */
 const TOOLBAR_FILTERS: AgentFilter[] = ["current", "attention", "working", "idle", "stopped", "inbox", "all"];
@@ -83,7 +83,7 @@ export default function Agents({
   const [filter, setFilter] = useState<AgentFilter>("current");
   const [creating, setCreating] = useState(false);
   const [picked, setPicked] = useState<AgentRole | null>(null);
-  const [joined, setJoined] = useState<{ profile: AgentProfile; role: AgentRole } | null>(null);
+  const [joined, setJoined] = useState<{ profile: HiredProfile; role: AgentRole } | null>(null);
   const roles = useAgentRoles();
   const installed = useQuery(resources.apps);
   const hireBlock = useContext(HireBlock);
@@ -114,7 +114,7 @@ export default function Agents({
   const profiles = payload?.profiles ?? [];
   const taken = [...allAgents.map((a) => a.alias), ...profiles.map((p) => p.id)];
   const askMaster = onAsk;
-  const hired = (profile: AgentProfile, role: AgentRole) => {
+  const hired = (profile: HiredProfile, role: AgentRole) => {
     setPicked(null);
     setJoined({ profile, role });
     onRecruit(false);

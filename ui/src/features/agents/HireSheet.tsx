@@ -4,7 +4,7 @@ import { ApiError } from "../../lib/apiError";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import { HireBlock } from "../auth/WriteGate";
-import type { AgentProfile, AgentRole, AgentRolesPayload } from "../../lib/types";
+import type { HiredProfile, AgentRole, AgentRolesPayload } from "../../lib/types";
 import AgentAvatar from "./AgentAvatar";
 import { HireGate } from "./RecruitCards";
 import { aliasProblem, categoryLabel } from "./agentRoles";
@@ -40,7 +40,7 @@ export default function HireSheet({
   job?: string;
   taken: string[];
   onClose: () => void;
-  onHired: (profile: AgentProfile, role: AgentRole) => void;
+  onHired: (profile: HiredProfile, role: AgentRole) => void;
 }) {
   const t = useTranslate();
   const hireBlock = useContext(HireBlock);

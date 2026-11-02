@@ -627,11 +627,15 @@ export type Agent = Omit<
 };
 
 /** `GET /api/agents` (the roster beside its snapshot's freshness). */
-export type AgentsPayload = Omit<Api.AgentsResponse, "agents"> & { agents: Agent[] };
+export type AgentsPayload = Omit<Api.AgentsResponse, "agents" | "profiles"> & {
+  agents: Agent[];
+  /** Absent from a board that predates profiles. */
+  profiles?: HiredProfile[];
+};
 
 /** One profile of `GET /api/agents` (CAD-1989): who an agent is, with the
  *  aliases of the runtimes registered against it. */
-export type AgentProfile = Api.AgentProfile;
+export type HiredProfile = Api.AgentProfile;
 
 /** Best-effort destination for a verified app-scoped master turn. This is
  * navigation metadata only; the app route proves its binding independently. */
