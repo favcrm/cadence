@@ -137,9 +137,11 @@ pub(super) fn assemble(
             }
         }
     }
-    // `cadence/<id-lowercase>-` branch prefix → (issue id, owner): a
-    // PR row belongs to the issue's owner for `--group`.
-    let mut branch_issue: Vec<(String, String, Option<String>)> = Vec::new();
+    // `cadence/<id-lowercase>-` branch prefix → (issue id, owner, project):
+    // a PR row belongs to the issue's owner for `--group` and to the
+    // issue's project — exact attribution even when one checkout serves
+    // several projects (CAD-2001).
+    let mut branch_issue: Vec<(String, String, Option<String>, String)> = Vec::new();
     let mut projects_out = Vec::new();
     if let (Some(pm), Some(views)) = (&pm, views) {
         let mut status_of: HashMap<String, String> = HashMap::new();
@@ -149,6 +151,7 @@ pub(super) fn assemble(
                 crate::worktree::layout::issue_branch_prefix(&v.issue.front.id),
                 v.issue.front.id.clone(),
                 v.issue.front.owner.clone(),
+                v.issue.project.clone(),
             ));
         }
         let view_of: HashMap<&str, &board::View> = views
@@ -702,7 +705,14 @@ pub(super) fn assemble(
     // ---- GitHub rows: merge-ready, verdict-less, main CI ----
     let mut main_ci: Vec<Value> = Vec::new();
     for (slug, data) in &gh_repos {
-        let project = slug_project.get(slug).cloned().unwrap_or_default();
+        // Every project registering this repo. One is attribution; a
+        // shared repo names none, so a row is labelled only when its
+        // branch names an issue whose project it can prove (CAD-2001).
+        let claims: &[String] = slug_project.get(slug).map(Vec::as_slice).unwrap_or(&[]);
+        let sole = match claims {
+            [one] => one.clone(),
+            _ => String::new(),
+        };
         for pr in data["prs"].as_array().cloned().unwrap_or_default() {
             let n = pr["number"].as_i64().unwrap_or(0);
             let title = pr["title"].as_str().unwrap_or("");
@@ -719,9 +729,10 @@ pub(super) fn assemble(
             let head_ref = pr["headRefName"].as_str().unwrap_or("").to_lowercase();
             let owner = branch_issue
                 .iter()
-                .find(|(prefix, _, _)| head_ref.starts_with(prefix.as_str()))
-                .and_then(|(_, _, owner)| owner.clone())
+                .find(|(prefix, _, _, _)| head_ref.starts_with(prefix.as_str()))
+                .and_then(|(_, _, owner, _)| owner.clone())
                 .unwrap_or_default();
+            let project = pr_project(&branch_issue, &head_ref, claims);
             let subject = format!("{slug}#{n}");
             // Rollup times for this head (CAD-253): a CheckRun's
             // `completedAt`, a status context's `startedAt`.
@@ -772,11 +783,20 @@ pub(super) fn assemble(
             }
         }
         let clone = slug_clone.get(slug).map(PathBuf::as_path);
-        let (view, rows) = main_ci_view(slug, &project, data, clone, now);
+        // Main CI is a repo fact, not an issue's: a shared repo's CI row
+        // claims no single project, so it stays unlabelled but is still
+        // listed for every project that registers the repo.
+        let (view, rows) = main_ci_view(slug, &sole, data, clone, now);
         if let Some(e) = view["error"].as_str() {
             degraded_notes.push(degraded("github_ci", slug, e));
         }
-        if !view.is_null() && opts.scope.project.as_deref().is_none_or(|k| k == project) {
+        if !view.is_null()
+            && opts
+                .scope
+                .project
+                .as_deref()
+                .is_none_or(|k| claims.iter().any(|claim| claim.as_str() == k))
+        {
             main_ci.push(view);
         }
         needs.extend(rows);
@@ -934,6 +954,41 @@ pub(super) fn assemble(
     }))
 }
 
+/// The project a PR row is attributed to: the project of the issue its
+/// branch names, else the repo's sole claimant, else nothing. On a
+/// shared checkout (several claimants) a branch that proves no project
+/// leaves the row unlabelled — never the last claimant (CAD-2001).
+fn pr_project(
+    branch_issue: &[(String, String, Option<String>, String)],
+    head_ref: &str,
+    claims: &[String],
+) -> String {
+    if let Some(project) = branch_project(branch_issue, head_ref) {
+        return project.to_string();
+    }
+    match claims {
+        [one] => one.clone(),
+        _ => String::new(),
+    }
+}
+
+/// The project a PR's `cadence/<id>-…` branch names: the project of the
+/// issue that branch prefix matches, when every matching issue agrees.
+/// `None` when no branch matches, or when two issues claim one prefix —
+/// a branch then proves nothing and the caller falls back to the repo's
+/// sole claimant, else to no project at all (CAD-2001).
+fn branch_project<'a>(
+    branch_issue: &'a [(String, String, Option<String>, String)],
+    head_ref: &str,
+) -> Option<&'a str> {
+    let mut keys = branch_issue
+        .iter()
+        .filter(|(prefix, _, _, _)| head_ref.starts_with(prefix.as_str()))
+        .map(|(_, _, _, project)| project.as_str());
+    let first = keys.next()?;
+    keys.all(|key| key == first).then_some(first)
+}
+
 /// Keep the oldest rows in stable order and return the overflow count.
 fn cap_oldest(rows: &mut Vec<Item>) -> Option<usize> {
     rows.sort_by_key(|i| std::cmp::Reverse(i.age));
@@ -943,4 +998,61 @@ fn cap_oldest(rows: &mut Vec<Item>) -> Option<usize> {
     let extra = rows.len() - report::NEEDS_ME_CAP;
     rows.truncate(report::NEEDS_ME_CAP);
     Some(extra)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `(prefix, issue id, owner, project)` the way `assemble` builds it.
+    fn branch(prefix: &str, id: &str, project: &str) -> (String, String, Option<String>, String) {
+        (
+            format!("cadence/{prefix}-"),
+            id.to_string(),
+            None,
+            project.to_string(),
+        )
+    }
+
+    /// CAD-2001: a shared checkout's PR is attributed by its branch's
+    /// issue when one proves it, and otherwise left empty — never the
+    /// last project that registered the repo.
+    #[test]
+    fn pr_project_prefers_the_branch_issue_over_a_shared_claim() {
+        let branches = vec![branch("cad-2001", "CAD-2001", "cadence")];
+        // Branch names the issue: exact, whichever repo the PR is on.
+        assert_eq!(
+            pr_project(&branches, "cadence/cad-2001-fix-sessions", &[]),
+            "cadence"
+        );
+        // No branch match, one claimant: the repo's own project.
+        assert_eq!(
+            pr_project(&branches, "release/2026", &["cadence".to_string()]),
+            "cadence"
+        );
+        // No branch match, two claimants: unattributed, not the last one.
+        let shared = vec!["cadence".to_string(), "website".to_string()];
+        assert_eq!(pr_project(&branches, "release/2026", &shared), "");
+        // No branch match and no claimant at all.
+        assert_eq!(pr_project(&branches, "release/2026", &[]), "");
+    }
+
+    /// Two issues sharing a branch prefix prove no single project, so a
+    /// PR on that branch falls back to the repo's sole claimant — and on
+    /// a shared repo stays empty.
+    #[test]
+    fn branch_project_refuses_a_disagreeing_prefix() {
+        let branches = vec![
+            branch("cad-1", "CAD-1", "cadence"),
+            branch("cad-1", "CAD-1-dup", "website"),
+        ];
+        assert_eq!(branch_project(&branches, "cadence/cad-1-x"), None);
+        assert_eq!(
+            pr_project(&branches, "cadence/cad-1-x", &["cadence".to_string()]),
+            "cadence"
+        );
+        // One issue for the prefix: unambiguous.
+        let one = vec![branch("cad-2", "CAD-2", "website")];
+        assert_eq!(branch_project(&one, "cadence/cad-2-y"), Some("website"));
+    }
 }

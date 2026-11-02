@@ -443,6 +443,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                     head,
                     notes_dir,
                     repo,
+                    project,
                 }),
             ..
         } => Some((
@@ -450,16 +451,22 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             *pr,
             head.clone(),
             repo.clone(),
+            project.clone(),
             notes_dir.clone(),
         )),
         _ => None,
     };
-    if let Some((issue, pr, head, repo, notes_dir)) = verdict_args {
+    if let Some((issue, pr, head, repo, project, notes_dir)) = verdict_args {
         let tracker = tracker_pin()?;
         return match org::route(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
-            org::Routed::Local => {
-                audit::verdicts(&issue, pr, &head, repo.as_deref(), notes_dir.as_deref())
-            }
+            org::Routed::Local => audit::verdicts(
+                &issue,
+                pr,
+                &head,
+                repo.as_deref(),
+                project.as_deref(),
+                notes_dir.as_deref(),
+            ),
             org::Routed::Remote(target) => {
                 remote::run(target, cli.command, cli.wake_timeout, cli.state_dir)
             }

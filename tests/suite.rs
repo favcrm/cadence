@@ -225,3 +225,54 @@ fn audit_verdicts_names_its_origin_and_a_local_read_refuses_a_repo() {
     assert!(String::from_utf8_lossy(&scoped.stderr).contains("--repo"));
     assert!(scoped.stdout.is_empty());
 }
+
+// CAD-2001 acceptance, authored by the integrator under the recorded one-time
+// exception; implementers must not edit it. Two projects may register the same
+// checkout, but a cwd-only resolution must refuse rather than pick the first.
+#[test]
+fn a_shared_checkout_is_registered_by_both_projects_and_never_first_matched() {
+    use cadence_agent::issue::{project, project_new, Pm};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let pm = Pm::init(&tmp.path().join("pm")).unwrap();
+    let repo = tmp.path().join("shared");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args);
+        let out = cadence_agent::reaper::output(&mut cmd).unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "synthetic\n").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-q", "-m", "synthetic"]);
+    let repo = repo.canonicalize().unwrap();
+
+    for (key, prefix) in [("alpha", "ALP"), ("beta", "BET")] {
+        let request = project_new::Request {
+            key: key.into(),
+            prefix: Some(prefix.into()),
+            repo: Some(repo.clone()),
+            ..project_new::Request::default()
+        };
+        project_new::run(&pm, &request, "operator", &[]).unwrap();
+    }
+
+    assert_eq!(
+        project::claimants_for_cwd(&pm.dir, &repo),
+        ["alpha", "beta"]
+    );
+    assert_eq!(project::key_for_cwd(&pm.dir, &repo), None);
+    assert_eq!(
+        project::resolve(&pm.dir, Some("alpha"), &repo).unwrap().key,
+        "alpha"
+    );
+    assert_eq!(
+        project::resolve(&pm.dir, Some("beta"), &repo).unwrap().key,
+        "beta"
+    );
+}

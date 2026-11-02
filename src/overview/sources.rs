@@ -262,7 +262,11 @@ pub(super) struct Snapshot<'a> {
     pub(super) pm: Option<issue::Pm>,
     pub(super) projects: Vec<project::Project>,
     pub(super) repo_paths: Vec<(PathBuf, String)>,
-    pub(super) slug_project: HashMap<String, String>,
+    /// GitHub slug → every project claiming it, sorted. One entry is
+    /// attribution; several mean one repository serves several projects
+    /// (CAD-2001), and a row on it is attributed only when a branch or an
+    /// issue names one — never the last claimant.
+    pub(super) slug_project: HashMap<String, Vec<String>>,
     pub(super) slug_clone: HashMap<String, PathBuf>,
     pub(super) has_github: bool,
     pub(super) sources: Cow<'a, DaemonSources>,
@@ -297,7 +301,7 @@ pub(super) fn collect<'a>(
         }
     }
     let mut slugs = Vec::new();
-    let mut slug_project: HashMap<String, String> = HashMap::new();
+    let mut slug_project: HashMap<String, Vec<String>> = HashMap::new();
     let mut repo_paths: Vec<(PathBuf, String)> = Vec::new();
     // Slug → the declared local clone its first-parent log comes from.
     let mut slug_clone: HashMap<String, PathBuf> = HashMap::new();
@@ -310,7 +314,13 @@ pub(super) fn collect<'a>(
             if let Some(remote) = &r.remote {
                 let norm = project::normalize_remote(remote);
                 if let Some(slug) = norm.strip_prefix("github.com/") {
-                    slug_project.insert(slug.to_string(), p.key.clone());
+                    // One repo, one project is the common case; a repo
+                    // several projects register keeps every claimant so
+                    // nothing is silently attributed to the last one.
+                    let claims = slug_project.entry(slug.to_string()).or_default();
+                    if !claims.iter().any(|key| key == &p.key) {
+                        claims.push(p.key.clone());
+                    }
                     slugs.push(slug.to_string());
                     if let Some(path) = &path {
                         slug_clone
@@ -326,6 +336,9 @@ pub(super) fn collect<'a>(
     }
     slugs.sort();
     slugs.dedup();
+    for claims in slug_project.values_mut() {
+        claims.sort();
+    }
 
     // ---- the three sources, concurrently (what `reuse` lacks) ----
     let reused = reuse.as_ref();

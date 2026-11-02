@@ -50,18 +50,18 @@ pub struct StartArgs {
     pub take_over: Option<String>,
 }
 
-/// The project's declared repo roots, canonicalized.
+/// The project's declared repo roots, canonicalized and de-duplicated:
+/// two rows naming one checkout are one repo (CAD-2001).
 pub(crate) fn declared_repos(project: &project::Project) -> Vec<PathBuf> {
-    project
-        .repos
-        .iter()
-        .filter_map(|r| r.path.as_deref())
-        .map(|p| {
-            project::expand_home(p)
-                .canonicalize()
-                .unwrap_or_else(|_| project::expand_home(p))
-        })
-        .collect()
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for path in project.repos.iter().filter_map(|r| r.path.as_deref()) {
+        let expanded = project::expand_home(path);
+        let root = expanded.canonicalize().unwrap_or(expanded);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
 }
 
 fn repo_list(project: &project::Project, candidates: &[PathBuf]) -> String {
@@ -111,6 +111,15 @@ pub(crate) fn resolve_repo(
     if candidates.len() == 1 {
         return worktree::main_root(&candidates[0]);
     }
+    if candidates.is_empty() {
+        // Nothing to pass `--repo` with: the project registers no local
+        // checkout at all, so say that instead of asking for a choice.
+        return Err(Error::rejected(format!(
+            "Project {} declares no repo with a local path — register one in `repos` \
+             in project.yaml before starting work",
+            project.key
+        )));
+    }
     Err(Error::rejected(format!(
         "Which repo does this issue work in? Pass --repo — {}",
         repo_list(project, &candidates)
@@ -128,22 +137,44 @@ pub(crate) struct ResolvedBase {
 }
 
 /// The integration branch configured on the project repo whose checkout
-/// is `root`, if any.
+/// is `root`. `None` when no row for that checkout configures one. Two
+/// rows for the same checkout that name different bases are refused: the
+/// lane base must never depend on which row is read first (CAD-2001).
 pub(crate) fn configured_integration<'a>(
     project: &'a project::Project,
     root: &Path,
-) -> Option<&'a str> {
-    let root = root.canonicalize().ok()?;
-    project.repos.iter().find_map(|repo| {
-        let path = repo.path.as_deref()?;
+) -> Result<Option<&'a str>> {
+    let Ok(root) = root.canonicalize() else {
+        return Ok(None);
+    };
+    let mut bases: Vec<&'a str> = Vec::new();
+    for repo in &project.repos {
+        let Some(path) = repo.path.as_deref() else {
+            continue;
+        };
         let expanded = project::expand_home(path);
-        let canon = expanded.canonicalize().ok()?;
-        if canon == root {
-            repo.base.as_deref()
-        } else {
-            None
+        if expanded.canonicalize().ok().as_deref() != Some(root.as_path()) {
+            continue;
         }
-    })
+        let Some(base) = repo.base.as_deref() else {
+            continue;
+        };
+        if !bases.contains(&base) {
+            bases.push(base);
+        }
+    }
+    match bases.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(*one)),
+        many => Err(Error::rejected(format!(
+            "{} is recorded {} times in project {}'s repos with different bases ({}) — \
+             keep one repos[] row per repo",
+            root.display(),
+            many.len(),
+            project.key,
+            many.join(", ")
+        ))),
+    }
 }
 
 /// Base resolution for a new lane.
@@ -790,7 +821,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         let resolved = resolve_base(
             &root,
             args.base.as_deref(),
-            configured_integration(&project, &root),
+            configured_integration(&project, &root)?,
         )?;
         (resolved.name, resolved.sha, resolved.warning)
     };

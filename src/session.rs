@@ -895,7 +895,14 @@ fn gh_open(
 /// leaves) and names without a `<prefix>-<n>-` issue stem.
 fn worktree_dirs(repos: &[(String, Option<String>, PathBuf)]) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
+    let mut scanned: Vec<&PathBuf> = Vec::new();
     for (_, _, root) in repos {
+        // One checkout two projects register is still one directory
+        // listing (CAD-2001).
+        if scanned.contains(&root) {
+            continue;
+        }
+        scanned.push(root);
         let wt = layout::worktrees_dir(root);
         let Ok(entries) = std::fs::read_dir(&wt) else {
             continue;
@@ -913,6 +920,24 @@ fn worktree_dirs(repos: &[(String, Option<String>, PathBuf)]) -> Vec<(PathBuf, S
         }
     }
     out
+}
+
+/// The project a scanned checkout belongs to: its one claimant, else
+/// `None` when several projects register it (CAD-2001). A stray worktree
+/// on a shared checkout names no single project, and a warning labelled
+/// with the wrong one is worse than an unlabelled warning.
+fn checkout_project(repos: &[(String, Option<String>, PathBuf)], root: &Path) -> Option<String> {
+    let mut keys: Vec<&str> = repos
+        .iter()
+        .filter(|(_, _, path)| path == root)
+        .map(|(key, _, _)| key.as_str())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    match keys.as_slice() {
+        [one] => Some((*one).to_string()),
+        _ => None,
+    }
 }
 
 /// `<prefix>-<num>` issue id out of a `cad-70-review-verb` worktree
@@ -1189,15 +1214,23 @@ enum Focus {
     /// Fleet-wide — `--all`, or (with the note) no project matched the
     /// cwd.
     All(Option<String>),
-    /// `--project`, or the project whose repo holds the cwd.
+    /// `--project`, or the one project whose repo holds the cwd.
     Project(String),
+    /// A cwd claimed by several projects (one checkout, two projects):
+    /// every claimant is judged, so a real failure in either one still
+    /// fails the gate instead of collapsing into the "others" summary
+    /// (CAD-2001). Never folded into `All`: `All` would judge the whole
+    /// fleet, which is not what this checkout names.
+    Ambiguous(Vec<String>),
 }
 
 impl Focus {
     fn covers(&self, project: Option<&str>) -> bool {
         match (self, project) {
+            // Unattributed findings stay in scope — fail closed.
             (Focus::All(_), _) | (_, None) => true,
             (Focus::Project(want), Some(p)) => want == p,
+            (Focus::Ambiguous(keys), Some(p)) => keys.iter().any(|key| key == p),
         }
     }
 
@@ -1205,58 +1238,73 @@ impl Focus {
         match self {
             Focus::All(note) => json!({"project": null, "all": true, "note": note}),
             Focus::Project(p) => json!({"project": p, "all": false}),
+            Focus::Ambiguous(keys) => json!({
+                "project": null,
+                "all": false,
+                "ambiguous": keys,
+                "note": format!(
+                    "the cwd is claimed by {} projects ({}) — judging all of them",
+                    keys.len(),
+                    keys.join(", ")
+                ),
+            }),
         }
     }
 }
 
-/// The project whose declared repo holds `cwd` — `issue`'s own match
-/// (remote first, then checkout path) without `CADENCE_PROJECT`: an
-/// ambient env var must never narrow what the gate judges.
-fn cwd_project(projects: &[project::Project], cwd: &Path) -> Option<String> {
-    let (root, remote) = project::repo_identity(cwd)?;
-    if let Some(remote) = &remote {
-        let hit = projects.iter().find(|p| {
-            p.repos.iter().any(|r| {
-                r.remote
-                    .as_deref()
-                    .is_some_and(|x| project::normalize_remote(x) == *remote)
-            })
-        });
-        if let Some(p) = hit {
-            return Some(p.key.clone());
-        }
+/// The focus a cwd names: its one claimant, every claimant when several
+/// projects register the same checkout, or `None` when nothing claims it.
+/// `issue`'s own match (remote first, then checkout path) without
+/// `CADENCE_PROJECT`: an ambient env var must never narrow what the gate
+/// judges.
+fn cwd_focus(projects: &[project::Project], cwd: &Path) -> Option<Focus> {
+    focus_from_claimants(project::claimants_for(projects, cwd))
+}
+
+/// Claimant keys as a focus. Sorted and deduped: two `repos` rows naming
+/// one checkout are one repository, but two projects naming it are a tie
+/// that names both — never the first or the last one.
+fn focus_from_claimants(mut keys: Vec<String>) -> Option<Focus> {
+    keys.sort();
+    keys.dedup();
+    match keys.len() {
+        0 => None,
+        1 => Some(Focus::Project(keys.remove(0))),
+        _ => Some(Focus::Ambiguous(keys)),
     }
-    projects
-        .iter()
-        .find(|p| {
-            p.repos.iter().any(|r| {
-                r.path.as_deref().is_some_and(|path| {
-                    let path = project::expand_home(path);
-                    path.canonicalize().unwrap_or(path) == root
-                })
-            })
-        })
-        .map(|p| p.key.clone())
 }
 
 /// Alias → project for every agent something attributes: its cwd under
 /// a declared repo checkout (deepest match), else the one project whose
 /// open issues it owns. Anything else stays unattributed.
+///
+/// Two projects can register one checkout (CAD-2001). When the deepest
+/// match is a tie between different projects, the cwd names no single
+/// project: the agent stays unattributed rather than taking the last
+/// equal-depth claimant, because a wrong key moves its findings out of
+/// focus and downgrades a real failure to a warning.
 fn agent_projects(agents: &[Value], sc: &Scope) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for a in agents {
         let alias = a["alias"].as_str().unwrap_or_default();
         let cwd = Path::new(a["cwd"].as_str().unwrap_or_default());
-        let by_cwd = sc
-            .repos
-            .iter()
-            .filter(|(_, _, p)| {
-                // An empty declared path starts_with()s every cwd.
-                !p.as_os_str().is_empty() && !cwd.as_os_str().is_empty() && cwd.starts_with(p)
-            })
-            .max_by_key(|(_, _, p)| p.components().count())
-            .map(|(k, _, _)| k.clone());
-        let key = by_cwd.or_else(|| {
+        // Deepest declared checkout holding the cwd, one entry per
+        // project (several rows may name the same checkout).
+        let mut hits: Vec<(&str, usize)> = Vec::new();
+        for (k, _, p) in &sc.repos {
+            // An empty declared path starts_with()s every cwd.
+            if p.as_os_str().is_empty() || cwd.as_os_str().is_empty() || !cwd.starts_with(p) {
+                continue;
+            }
+            let depth = p.components().count();
+            match hits.iter_mut().find(|entry| entry.0 == k.as_str()) {
+                Some(entry) => entry.1 = entry.1.max(depth),
+                None => hits.push((k.as_str(), depth)),
+            }
+        }
+        let key = if hits.is_empty() {
+            // The cwd names no checkout: the one project whose open
+            // issues this agent owns, never a guess between two.
             let owned: HashSet<&str> = sc
                 .views
                 .iter()
@@ -1267,7 +1315,19 @@ fn agent_projects(agents: &[Value], sc: &Scope) -> HashMap<String, String> {
                 .map(|v| v.issue.project.as_str())
                 .collect();
             (owned.len() == 1).then(|| owned.into_iter().next().unwrap_or_default().to_string())
-        });
+        } else {
+            let deepest = hits.iter().map(|(_, depth)| *depth).max().unwrap_or(0);
+            let mut at_depth = hits
+                .iter()
+                .filter(|(_, depth)| *depth == deepest)
+                .map(|(key, _)| *key);
+            let first = at_depth.next();
+            // A tie names no project; the owned-issue rule is not a
+            // tie-breaker either — it may name a third project.
+            first
+                .filter(|_| at_depth.next().is_none())
+                .map(str::to_string)
+        };
         if let Some(k) = key {
             out.insert(alias.to_string(), k);
         }
@@ -1366,8 +1426,9 @@ fn others_row(out: &[Finding], focus: &Focus) -> Option<Row> {
     per.sort();
     let worst = per.iter().map(|e| e.2).max().unwrap_or(Sev::Ok);
     let here = match focus {
-        Focus::Project(p) => p.as_str(),
-        Focus::All(_) => "",
+        Focus::Project(p) => p.clone(),
+        Focus::Ambiguous(keys) => keys.join(" + "),
+        Focus::All(_) => String::new(),
     };
     let mut row = Row::new("others");
     row.sev = worst.min(Sev::Warn);
@@ -1443,8 +1504,8 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
         }
         Focus::Project(p.clone())
     } else {
-        match cwd_project(&sc.projects, &opts.cwd) {
-            Some(p) => Focus::Project(p),
+        match cwd_focus(&sc.projects, &opts.cwd) {
+            Some(focus) => focus,
             None => Focus::All(Some(format!(
                 "{} is not inside a known project repo — judging every project, as --all",
                 opts.cwd.display()
@@ -1791,11 +1852,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                 .and_then(|id| sc.issue_status.get(&id))
                 .is_some_and(|s| !matches!(s.as_str(), "done" | "dropped"));
             if !has_pr && !open_issue {
-                let project = sc
-                    .repos
-                    .iter()
-                    .find(|(_, _, r)| *r == root)
-                    .map(|(k, _, _)| k.clone());
+                let project = checkout_project(&sc.repos, &root);
                 let rel = layout::rel_dir(&name);
                 recon.push(Finding::new(
                     format!("worktree:{}/{rel}", root.display()),
@@ -1871,6 +1928,11 @@ fn finish_start(rows: Vec<Row>, focus: &Focus, json_out: bool, host_source: Stri
             Focus::Project(p) => {
                 println!("scope: project {p} — other projects summarised; --all for the fleet")
             }
+            Focus::Ambiguous(keys) => println!(
+                "scope: projects {} — one checkout claims them all; \
+                 other projects summarised; --all for the fleet",
+                keys.join(" + ")
+            ),
             Focus::All(None) => println!("scope: every project (--all)"),
             Focus::All(Some(note)) => println!("scope: {}", scrub_line(note)),
         }
@@ -2953,5 +3015,127 @@ mod tests {
             row("drift", "3 merged commit(s) not running", "x").0,
             "drift"
         );
+    }
+
+    /// CAD-2001: one checkout registered by two projects. The focus names
+    /// both and judges both, so a real failure in either stays a failure
+    /// instead of collapsing into the capped "others" summary.
+    #[test]
+    fn a_shared_checkout_focuses_every_claimant() {
+        let keys = |keys: &[&str]| keys.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        assert!(focus_from_claimants(keys(&[])).is_none());
+        assert!(matches!(
+            focus_from_claimants(keys(&["tst"])),
+            Some(Focus::Project(p)) if p == "tst"
+        ));
+        // Two rows naming one project are one repository, not a tie.
+        assert!(matches!(
+            focus_from_claimants(keys(&["tst", "tst"])),
+            Some(Focus::Project(p)) if p == "tst"
+        ));
+        let shared = focus_from_claimants(keys(&["website", "tst"])).unwrap();
+        let Focus::Ambiguous(names) = &shared else {
+            panic!("a shared checkout must name every claimant");
+        };
+        assert_eq!(names, &vec!["tst".to_string(), "website".to_string()]);
+        assert!(shared.covers(Some("tst")));
+        assert!(shared.covers(Some("website")));
+        assert!(!shared.covers(Some("other")));
+        // Unattributed findings stay in scope.
+        assert!(shared.covers(None));
+        assert_eq!(shared.json()["ambiguous"], json!(["tst", "website"]));
+        assert_eq!(shared.json()["all"], json!(false));
+
+        let f = |key: &str, p: Option<&str>, sev| {
+            Finding::new(key.into(), p.map(str::to_string), sev, key.into())
+        };
+        let items = vec![
+            f("fenced:w1", Some("tst"), Sev::Fail),
+            f("fenced:w2", Some("website"), Sev::Fail),
+            f("worktree:/c", Some("third"), Sev::Fail),
+        ];
+        let mut elsewhere = Vec::new();
+        let row = findings_row(
+            "reconcile",
+            items,
+            &shared,
+            &Acks::default(),
+            0,
+            "",
+            &mut elsewhere,
+        );
+        assert!(row.sev == Sev::Fail, "a failure in either project fails");
+        assert_eq!(row.findings.len(), 2);
+        let others = others_row(&elsewhere, &shared).unwrap();
+        assert!(
+            others.sev == Sev::Warn,
+            "another project still caps at warn"
+        );
+        assert!(
+            others.detail.contains("outside tst + website"),
+            "{}",
+            others.detail
+        );
+    }
+
+    /// CAD-2001: an agent whose cwd sits in a shared checkout is not
+    /// attributed to the last equal-depth claimant; one claimant still
+    /// attributes as before.
+    #[test]
+    fn agent_attribution_refuses_a_tied_checkout() {
+        let scope = |repos: Vec<(&str, &str)>, views: Vec<board::View>| Scope {
+            projects: Vec::new(),
+            views,
+            repos: repos
+                .into_iter()
+                .map(|(key, path)| (key.to_string(), None, PathBuf::from(path)))
+                .collect(),
+            issue_status: HashMap::new(),
+        };
+        let agents = vec![
+            json!({"alias": "w1", "cwd": "/repo/.cadence/wt/cad-1-x"}),
+            json!({"alias": "w2", "cwd": "/repo/.cadence/wt/cad-2-y"}),
+        ];
+        // One claimant: unchanged attribution.
+        let owned = agent_projects(&agents, &scope(vec![("tst", "/repo")], Vec::new()));
+        assert_eq!(owned.get("w1"), Some(&"tst".to_string()));
+        // Two projects on one checkout: neither agent is misassigned,
+        // and two rows of the same project are still one project.
+        let owned = agent_projects(
+            &agents,
+            &scope(vec![("tst", "/repo"), ("website", "/repo")], Vec::new()),
+        );
+        assert!(owned.is_empty(), "{owned:?}");
+        // Two repos rows of one project are one repository, not a tie.
+        let owned = agent_projects(
+            &agents,
+            &scope(vec![("tst", "/repo"), ("tst", "/repo")], Vec::new()),
+        );
+        assert_eq!(owned.get("w1"), Some(&"tst".to_string()));
+        // An empty declared path never claims every cwd.
+        let owned = agent_projects(
+            &agents,
+            &scope(vec![("tst", ""), ("website", "/repo")], Vec::new()),
+        );
+        assert_eq!(owned.get("w2"), Some(&"website".to_string()));
+    }
+
+    /// CAD-2001: one checkout two projects register is scanned once, and
+    /// its stray worktrees are not labelled with either project.
+    #[test]
+    fn a_shared_checkout_is_scanned_once_and_unattributed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(layout::worktrees_dir(dir.path()).join("cad-1-x")).unwrap();
+        let repos = vec![
+            ("tst".to_string(), None, dir.path().to_path_buf()),
+            ("website".to_string(), None, dir.path().to_path_buf()),
+        ];
+        assert_eq!(worktree_dirs(&repos).len(), 1, "one listing per checkout");
+        assert_eq!(checkout_project(&repos, dir.path()), None);
+        assert_eq!(
+            checkout_project(&repos[..1], dir.path()),
+            Some("tst".to_string())
+        );
+        assert_eq!(checkout_project(&repos, Path::new("/elsewhere")), None);
     }
 }

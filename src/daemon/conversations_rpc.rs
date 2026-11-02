@@ -70,6 +70,18 @@ fn session_key(thread: Option<&store::Thread>) -> String {
     }
 }
 
+/// Whether an agent's work belongs to project `key`: the project of the
+/// issue it is running, else any project claiming its checkout. A
+/// checkout several projects register (CAD-2001) belongs to each of
+/// them, so its threads stay reachable under either project's filter —
+/// and a turn's own project still decides first.
+fn agent_in_project(key: &str, turn: Option<&str>, claimants: &[String]) -> bool {
+    match turn {
+        Some(turn) => turn == key,
+        None => claimants.iter().any(|claimant| claimant == key),
+    }
+}
+
 impl Shared {
     /// A message's participant: an agent by its uid (live alias, or the
     /// stored label of that uid once removed), the operator by its label,
@@ -316,6 +328,14 @@ impl Shared {
     /// resolved here from the daemon's own rows: the agent's uid from its
     /// alias, the agents whose registered checkout is in the project, and
     /// the project's repos. A client never names a uid or a repo.
+    ///
+    /// "In the project" is the running issue's project when the agent
+    /// carries one, else every project its checkout belongs to — a
+    /// checkout several projects register (CAD-2001) belongs to each of
+    /// them, so its agents' threads stay reachable under either filter.
+    /// The resolved uids are still the agent's own projects only: the
+    /// SQL scope admits pair/operator threads among those uids plus the
+    /// project's task repos, nothing wider.
     fn work_scope(
         &self,
         include_system: bool,
@@ -335,19 +355,26 @@ impl Shared {
             None => (None, None),
             Some(key) => {
                 let repos = self.project_repos_of(key)?;
-                // The authoritative cwd-to-project mapping (remote first,
-                // then the canonical registered checkout root), so a
-                // checkout with no origin still belongs to its project.
+                // Which agents are in the project. The turn in flight
+                // decides first (CAD-1752: the running issue's project);
+                // with no task, every project the agent's checkout
+                // belongs to counts. A checkout two projects register
+                // (CAD-2001) belongs to both — a first-match or a bare
+                // `key_for_cwd` would answer "no project" and drop that
+                // agent's conversations from both lists.
                 let pm_dir = self.pm_dir()?;
+                let projects = crate::issue::project::list(&pm_dir)?;
                 let mut uids = Vec::new();
                 for agent in self.store.agents()? {
-                    let in_project = crate::issue::project::key_for_cwd(
-                        &pm_dir,
-                        std::path::Path::new(&agent.cwd),
-                    )
-                    .as_deref()
-                        == Some(key);
-                    if in_project {
+                    let turn = self.turn_project(&agent).map(|turn| turn.key);
+                    let claimants = match &turn {
+                        Some(_) => Vec::new(),
+                        None => crate::issue::project::claimants_for(
+                            &projects,
+                            std::path::Path::new(&agent.cwd),
+                        ),
+                    };
+                    if agent_in_project(key, turn.as_deref(), &claimants) {
                         uids.push(agent.uid);
                     }
                 }
@@ -1125,5 +1152,23 @@ mod tests {
             2
         );
         assert!(fx.entries_of(&social).is_empty());
+    }
+
+    /// CAD-2001: a checkout two projects register must not drop an
+    /// agent's threads from either project's list, and a running issue's
+    /// project still decides first.
+    #[test]
+    fn work_scope_keeps_agents_on_a_shared_checkout() {
+        let shared = vec!["cadence".to_string(), "website".to_string()];
+        // No turn: every claimant admits the agent.
+        assert!(agent_in_project("cadence", None, &shared));
+        assert!(agent_in_project("website", None, &shared));
+        assert!(!agent_in_project("other", None, &shared));
+        // No checkout claim either: not in the project.
+        assert!(!agent_in_project("cadence", None, &[]));
+        // A running issue's project decides, even when the checkout is
+        // shared with the project being listed.
+        assert!(agent_in_project("cadence", Some("cadence"), &shared));
+        assert!(!agent_in_project("website", Some("cadence"), &shared));
     }
 }
