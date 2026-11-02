@@ -2073,6 +2073,76 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn cad1922_active_trial_and_open_checkout_are_independent_handover_facts() {
+        let offer = OfferRead::Offer(serde_json::json!({
+            "asOf": "2030-01-01T00:00:00Z",
+            "plan": {
+                "label": "Example",
+                "amount": "10.000000",
+                "currency": "USD",
+                "period": "month",
+                "includedCredit": "10.000000",
+                "grantsEnabled": true
+            },
+            "trial": {
+                "state": "active",
+                "eligibility": "used",
+                "deadlineAt": "2030-01-04T00:00:00Z",
+                "credit": "7.000000",
+                "tokenCap": 12345,
+                "terms": null
+            },
+            "subscription": {"state": "none"},
+            "checkout": {
+                "state": "open",
+                "url": "https://checkout.stripe.com/c/pay/cs_fixture",
+                "expiresAt": "2030-01-02T00:00:00Z",
+                "available": false,
+                "blocked": "checkout_open"
+            }
+        }));
+
+        let fact = plan_fact(&offer);
+        assert_eq!(fact.state, "checkout_open");
+        assert_eq!(fact.trial.as_ref().unwrap().state, "trial_active");
+        assert_eq!(
+            fact.subscription.as_ref().unwrap().state,
+            "subscription_none"
+        );
+        assert_eq!(fact.checkout.as_ref().unwrap().state, "checkout_open");
+        assert_eq!(
+            fact.checkout_url.as_deref(),
+            Some("https://checkout.stripe.com/c/pay/cs_fixture")
+        );
+        assert!(
+            fact.detail.contains("Cardless trial active"),
+            "{}",
+            fact.detail
+        );
+        assert!(
+            fact.detail.contains("2030-01-04T00:00:00Z"),
+            "{}",
+            fact.detail
+        );
+        assert!(fact.detail.contains("12345"), "{}", fact.detail);
+        assert!(
+            fact.detail.contains("Checkout is already open"),
+            "{}",
+            fact.detail
+        );
+        assert!(
+            fact.detail.contains("2030-01-02T00:00:00Z"),
+            "{}",
+            fact.detail
+        );
+        assert!(
+            fact.detail.contains("No paid subscription"),
+            "{}",
+            fact.detail
+        );
+    }
+
     fn no_env(_: &str) -> Option<String> {
         None
     }

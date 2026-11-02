@@ -2296,6 +2296,112 @@ fn ls() -> Result<Value> {
 mod tests {
     use super::*;
 
+    struct Cad1922SandboxEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl Cad1922SandboxEnv {
+        fn isolated(home: &Path) -> Self {
+            let names = [
+                "HOME",
+                "CADENCE_HOME",
+                "CADENCE_STATE_DIR",
+                "CADENCE_PM_DIR",
+                "CADENCE_PROFILE",
+                "CADENCE_SANDBOX_ROOT",
+                "XDG_STATE_HOME",
+                "XDG_CONFIG_HOME",
+            ];
+            let saved = Self(
+                names
+                    .iter()
+                    .map(|&name| (name, std::env::var_os(name)))
+                    .collect(),
+            );
+            for name in names {
+                std::env::remove_var(name);
+            }
+            std::env::set_var("HOME", home);
+            saved
+        }
+    }
+
+    impl Drop for Cad1922SandboxEnv {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cad1922_deleting_guard_refuses_planted_production_marker() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = Cad1922SandboxEnv::isolated(&home);
+        std::env::set_var("CADENCE_SANDBOX_ROOT", fixture.path().join("sandboxes"));
+
+        let safe = Sandbox::open("safe").unwrap();
+        std::fs::create_dir_all(safe.state_dir()).unwrap();
+        std::fs::write(safe.marker(), r#"{"name":"safe"}"#).unwrap();
+        require_marker(&safe).unwrap();
+        refuse_production(&safe).unwrap();
+        assert_eq!(
+            owner_of(&safe.state_dir()).unwrap().as_deref(),
+            Some("safe")
+        );
+
+        let planted = Sandbox {
+            name: "pm".into(),
+            base: home.clone(),
+            root: home.join("pm"),
+        };
+        std::fs::create_dir_all(planted.state_dir()).unwrap();
+        std::fs::write(planted.marker(), r#"{"name":"pm"}"#).unwrap();
+        let canary = planted.root.join("ticket-canary");
+        std::fs::write(&canary, b"existing tracker data\n").unwrap();
+        require_marker(&planted).unwrap();
+
+        let error = refuse_production(&planted).unwrap_err().to_string();
+        assert!(error.contains("overlap"), "{error}");
+        assert!(error.contains("production tracker"), "{error}");
+        assert!(
+            error.contains(&planted.root.display().to_string()),
+            "{error}"
+        );
+        let error = owner_of(&planted.state_dir()).unwrap_err().to_string();
+        assert!(error.contains("ungated"), "{error}");
+        assert!(error.contains("overlap"), "{error}");
+        assert_eq!(std::fs::read(&canary).unwrap(), b"existing tracker data\n");
+
+        // The sandbox's own exported shell remains usable for store ownership
+        // and read-only verbs, but exports cannot relax the deleting guard.
+        std::env::set_var("CADENCE_PROFILE", safe.profile());
+        std::env::set_var("CADENCE_STATE_DIR", safe.state_dir());
+        std::env::set_var("CADENCE_PM_DIR", safe.pm_dir());
+        std::env::set_var("XDG_CONFIG_HOME", safe.config_dir());
+        assert_eq!(
+            owner_of(&safe.state_dir()).unwrap().as_deref(),
+            Some("safe")
+        );
+        refuse_production_readonly(&safe).unwrap();
+        let error = refuse_production(&safe).unwrap_err().to_string();
+        assert!(error.contains("overlap"), "{error}");
+        assert!(error.contains("exported"), "{error}");
+
+        // Even a matching forged profile cannot turn the host tracker into
+        // disposable data, including through the read-only exemption.
+        std::env::set_var("CADENCE_PROFILE", planted.profile());
+        let error = refuse_production(&planted).unwrap_err().to_string();
+        assert!(error.contains("production tracker"), "{error}");
+        let error = refuse_production_readonly(&planted)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("production tracker"), "{error}");
+    }
+
     #[test]
     fn state_socket_refuses_a_symlinked_socket() {
         let dir = tempfile::TempDir::new().unwrap();

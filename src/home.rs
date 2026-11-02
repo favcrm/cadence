@@ -1140,6 +1140,117 @@ fn real_home() -> Option<PathBuf> {
 mod guard_tests {
     use super::*;
 
+    struct Cad1922HomeEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl Cad1922HomeEnv {
+        fn isolated(home: &Path) -> Self {
+            let names = [
+                "HOME",
+                "CADENCE_HOME",
+                "CADENCE_STATE_DIR",
+                "CADENCE_PM_DIR",
+                "CADENCE_PROFILE",
+                "CADENCE_SANDBOX_ROOT",
+                "XDG_STATE_HOME",
+                "XDG_CONFIG_HOME",
+            ];
+            let saved = Self(
+                names
+                    .iter()
+                    .map(|&name| (name, std::env::var_os(name)))
+                    .collect(),
+            );
+            for name in names {
+                std::env::remove_var(name);
+            }
+            std::env::set_var("HOME", home);
+            saved
+        }
+    }
+
+    impl Drop for Cad1922HomeEnv {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cad1922_symlinked_consolidated_config_is_refused() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home_root = fixture.path().join("home/.cadence");
+        let redirected = fixture.path().join("redirected-config");
+        std::fs::create_dir_all(&home_root).unwrap();
+        std::fs::create_dir_all(&redirected).unwrap();
+        let config = home_root.join("config");
+
+        // Positive control: a plain path under this home is acceptable.
+        refuse_symlinked_under(&home_root, &config).unwrap();
+        std::os::unix::fs::symlink(&redirected, &config).unwrap();
+
+        let error = refuse_symlinked_under(&home_root, &config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(error.contains(&config.display().to_string()), "{error}");
+        assert!(std::fs::symlink_metadata(&config)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_dir(&redirected).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn cad1922_first_run_config_stays_in_home_with_exported_xdg() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let xdg = fixture.path().join("xdg-config");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let _env = Cad1922HomeEnv::isolated(&home);
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+
+        let selected = layout().unwrap();
+        assert_eq!(selected.source, Source::Fresh);
+        assert_eq!(config_dir().unwrap(), home.join(".cadence/config"));
+        assert!(!xdg.join("cadence").exists());
+    }
+
+    #[test]
+    fn cad1922_exported_absent_legacy_roots_select_legacy() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = Cad1922HomeEnv::isolated(&home);
+        assert_eq!(layout().unwrap().source, Source::Fresh);
+
+        for (name, path) in [
+            ("CADENCE_STATE_DIR", home.join(".local/state/cadence")),
+            ("CADENCE_PM_DIR", home.join("pm")),
+        ] {
+            std::env::remove_var("CADENCE_STATE_DIR");
+            std::env::remove_var("CADENCE_PM_DIR");
+            assert!(
+                !path.exists(),
+                "the export, not a directory, must select legacy"
+            );
+            std::env::set_var(name, &path);
+
+            assert_eq!(layout().unwrap().source, Source::Legacy, "{name}");
+            let chosen = match name {
+                "CADENCE_STATE_DIR" => state_dir().unwrap(),
+                _ => tracker_dir().unwrap(),
+            };
+            assert_eq!(chosen, path, "{name}");
+            assert_eq!(config_dir().unwrap(), home.join(".config/cadence"));
+            assert!(!path.exists(), "resolving {name} must not create its root");
+        }
+    }
+
     #[test]
     fn production_roots_refuse_and_other_dirs_pass() {
         let fake = PathBuf::from("/tmp/c1210-fakehome");
