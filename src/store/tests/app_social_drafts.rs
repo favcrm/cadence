@@ -154,6 +154,31 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
     assert!(store
         .app_social_tool_receipt_contains("ctx-two", "receipt-other")
         .unwrap());
+    // The freshness tier has its own ordered index: the fallback must not sort
+    // a context's whole historical freshness inventory either.
+    let fresh_plan: Vec<String> = store
+        .conn()
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT receipt_id FROM app_social_freshness
+              WHERE install_id=? AND context_id=? ORDER BY completed_at DESC, handle LIMIT ?",
+        )
+        .unwrap()
+        .query_map(params!["install-social", "ctx-one", 500i64], |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        fresh_plan
+            .iter()
+            .any(|line| line.contains("USING INDEX app_social_freshness_source_order")),
+        "the freshness fallback walks its index: {fresh_plan:?}"
+    );
+    assert!(
+        !fresh_plan.iter().any(|line| line.contains("TEMP B-TREE")),
+        "the freshness fallback needs no sort: {fresh_plan:?}"
+    );
     // The plan, not just the index: the candidate query must walk this order.
     let plan: Vec<String> = store
         .conn()

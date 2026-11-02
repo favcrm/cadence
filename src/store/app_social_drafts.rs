@@ -370,7 +370,9 @@ pub(crate) fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
     // Only now: the index names the column the migration above guarantees.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS app_social_tool_receipts_source_order
-          ON app_social_tool_receipts(install_id,context_id,kind,completed_at DESC,receipt_id DESC)",
+          ON app_social_tool_receipts(install_id,context_id,kind,completed_at DESC,receipt_id DESC);
+         CREATE INDEX IF NOT EXISTS app_social_freshness_source_order
+          ON app_social_freshness(install_id,context_id,completed_at DESC,handle);",
     )?;
     // CAD-1303: soft discard marker. Additive; the file schema version stays.
     let draft_columns = conn
@@ -893,8 +895,10 @@ impl RecordStore {
         } else {
             Vec::new()
         };
-        let fresh = conn
-            .prepare(
+        // Only when it can contribute: a full typed window needs no history
+        // sort, and the fallback still exists whenever there is room.
+        let fresh = if typed.len() < limit {
+            conn.prepare(
                 "SELECT receipt_id FROM app_social_freshness
                   WHERE install_id=? AND context_id=?
                   ORDER BY completed_at DESC, handle LIMIT ?",
@@ -902,7 +906,10 @@ impl RecordStore {
             .query_map(params![self.install(), context, limit as i64], |r| {
                 r.get::<_, String>(0)
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         // Freshest page next, BEFORE the unknown rows: otherwise a window full
         // of pre-upgrade uploads would leave the newest read out entirely.
         let mut out = typed;
