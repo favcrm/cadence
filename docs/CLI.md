@@ -220,6 +220,15 @@ and scripts. Prefer `cadence update`; it does their steps in order.
   low-level verified install that `update` calls. `--allow-unattested` rolls
   back to a hand-built release already on disk.
 
+## Root names
+
+The default `cadence --help` lists nouns. Actions sit under them.
+
+- `issue epic propose`, `issue epic approve` and `issue epic reject` write a plan. `plan propose`, `plan approve` and `plan reject` are the same writes. `plan ls` and `plan show` stay: `issue epic ls` and `issue epic show` are the epic board, not the proposal list.
+- `agent join <group> <provider>` adds a worker. `cadence join` still parses.
+- `message send` is the canonical enqueue. `cadence send` still parses.
+- Dispatch stays `cadence dispatch <id> --to <alias>`. It starts an issue, so it is not under `agent`.
+
 ## Finding a command
 
 `cadence commands` and `cadence schema` are offline. They do not open a
@@ -270,9 +279,10 @@ the board owns the ticket and this machine runs it. `--org local` alone
 is the standalone board, not "the local agent".
 
 The hosted binding lives under the `agent` noun:
-`agent connect|watch|assignments|disconnect|reassign`, each taking
-`--org <hosted>`. `local-agent` remains a hidden alias for one release;
-`local-agent report` is still the explicit claim reporter.
+`agent connect|watch|assignments|disconnect|reassign|report|tool`, each taking
+`--org <hosted>`. `agent report` is the explicit claim reporter.
+`agent connect --fyi-only` registers an extra alias and leaves the
+assignment default in place.
 
 `cadence send <alias> --wait[=SECS]` waits for the turn's terminal state
 (the same path as the hidden `message ask`). A remote send is a durable

@@ -167,7 +167,7 @@ requirement for reading or updating the board. Each person has their own saved
 credential and private configuration; never copy the owner's credential, browser
 cookie or another agent's state. A member can approve ordinary CLI/wiki
 collaboration. App lifecycle changes below require a current **human owner**.
-Invitation acceptance, credential consent and local-agent registration are
+Invitation acceptance, credential consent and local agent registration are
 separate actions; installing an app does not perform any of them.
 
 ```sh
@@ -193,11 +193,10 @@ Three IDs have different lifetimes:
 The daemon retains stable agent IDs across disconnect/reconnect. Labels,
 `client_agent_id`, adapter metadata and any of these IDs confer no permission.
 There is one explicitly selected assignment default per member/workspace; extra
-sessions do not race it for claims. For an additional explicit FYI-only alias,
-use the lower-level supported surface:
+sessions do not race it for claims. For an additional explicit FYI-only alias:
 
 ```sh
-cadence --org acme local-agent connect --alias my-reviewer --fyi-only
+cadence --org acme agent connect --alias my-reviewer --fyi-only
 ```
 
 This preserves the assignment default and multiplexes notices on the same
@@ -266,7 +265,7 @@ starting. Load the profile, then use the project's actual integration ref:
 ```sh
 cadence --org acme agent context ap_<profile-id>
 cadence --org acme issue start <issue-id> --repo /absolute/path/to/checkout --profile ap_<profile-id> --base <integration-ref>
-cadence --org acme local-agent report <assignment-id> --state blocked --text "waiting for the owner"
+cadence --org acme agent report <assignment-id> --state blocked --text "waiting for the owner"
 ```
 
 `--profile` claims under `session-<profile-id>` without a daemon and targets
