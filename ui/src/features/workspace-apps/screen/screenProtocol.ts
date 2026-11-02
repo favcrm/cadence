@@ -413,7 +413,8 @@ export interface ScreenSourcePost {
    *  itself. Omitted when the host cannot state it. */
   receipt_id?: string;
 }
-/** SOC-54: one retained read, grouped by the handle it read. `sources`
+/** SOC-54: the retained reads of one handle, merged newest-first (an entry can
+ *  therefore span several reads). `sources`
  *  stays the single newest read (what an older app renders); `collections`
  *  carries every retained standalone read, so a reload shows the library the
  *  owner built instead of only the last page. Run-bound reads are not listed

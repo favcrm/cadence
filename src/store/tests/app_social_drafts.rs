@@ -139,16 +139,20 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
     store
         .app_social_tool_receipt_attach("ctx-two", "receipt-other", 15.0)
         .unwrap();
-    // SOC-54: the library reads the context's whole retained history, newest
-    // first, and never another context's receipts.
-    assert_eq!(
-        store.app_social_tool_receipt_ids("ctx-one").unwrap(),
-        vec!["receipt-new", "receipt-old"]
-    );
-    assert_eq!(
-        store.app_social_tool_receipt_ids("ctx-two").unwrap(),
-        vec!["receipt-other"]
-    );
+    // SOC-54: membership is per context and install — the screen library
+    // resolves source reads host-side and keeps only what this context holds.
+    assert!(store
+        .app_social_tool_receipt_contains("ctx-one", "receipt-old")
+        .unwrap());
+    assert!(store
+        .app_social_tool_receipt_contains("ctx-one", "receipt-new")
+        .unwrap());
+    assert!(!store
+        .app_social_tool_receipt_contains("ctx-two", "receipt-new")
+        .unwrap());
+    assert!(store
+        .app_social_tool_receipt_contains("ctx-two", "receipt-other")
+        .unwrap());
 }
 
 #[test]

@@ -658,6 +658,28 @@ function sourcePost(post, seen, receiptId) {
 		receipt_id: receiptId
 	});
 }
+/** SOC-54: how many bytes the enumeration may add to a PUSH. The frame's
+*  degrade sequence drops the WHOLE `sources` section when a PUSH is too
+*  large, which would cost the app the newest page it already had — so the
+*  history is trimmed rather than allowed to evict it. */
+var COLLECTIONS_BYTES_MAX = 49152;
+/** Trim the enumeration to the wire budget: oldest posts first, from the
+*  handle holding the most, so one profile's long captions cannot drop
+*  another profile entirely. */
+function budgeted(collections) {
+	const out = collections.map((entry) => ({
+		...entry,
+		posts: [...entry.posts]
+	})).filter((entry) => entry.posts.length > 0);
+	const bytes = () => new TextEncoder().encode(JSON.stringify(out)).byteLength;
+	while (out.length > 0 && bytes() > COLLECTIONS_BYTES_MAX) {
+		let richest = 0;
+		for (let i = 1; i < out.length; i += 1) if (out[i].posts.length > out[richest].posts.length) richest = i;
+		out[richest].posts.pop();
+		for (let i = out.length - 1; i >= 0; i -= 1) if (out[i].posts.length === 0) out.splice(i, 1);
+	}
+	return out;
+}
 /** The library, or `null` (omitted: the frame shows it as unavailable)
 *  while no verified read is held. One authoritative latest source
 *  read wins across both provenances — a real run-bound read carries
@@ -709,7 +731,7 @@ function sourcesOf(installation, scopedRuns, extras) {
 		}
 		return [...byHandle.values()].slice(0, LIBRARY_HANDLES_MAX);
 	};
-	const library = collections();
+	const library = budgeted(collections());
 	const latest = latestSourceRun(installation, scopedRuns);
 	const runReceipt = latest && extras?.source && extras.source.runId === latest.id ? extras.source.receipts.find((v) => v.run_id === latest.id && v.result?.kind === "social.source.posts") : void 0;
 	const runRead = latest && runReceipt && typeof runReceipt.result.handle === "string" && HANDLE.test(runReceipt.result.handle) ? {
