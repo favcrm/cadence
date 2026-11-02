@@ -413,9 +413,10 @@ org has no checkout or PROJECT.md), `--name` is required, `issue project ls`
 refuses `--sort`/`--limit`/`--fields`, and `issue ls` filters one `--project`
 per call. Nothing is renamed or deleted remotely. A `project_new` answer
 that is lost, unparsable (empty, 204, non-JSON), missing the requested
-project (a `null`, `{ok:true}` or foreign body) or a 5xx naming no
-pre-forward state is `outcome_unknown`: reconcile with `issue project ls`
-before repeating, since the same key, name and prefix is the same project.
+project (a `null`, `{ok:true}` or foreign body), carrying a missing, invalid
+or different issue-id prefix, or a 5xx naming no pre-forward state is
+`outcome_unknown`: reconcile with `issue project ls` before repeating,
+since the same key, name and prefix is the same project.
 A board that predates CAD-1999 refuses the two registry verbs as an unknown
 verb — the command ends there, with no local fallback.
 

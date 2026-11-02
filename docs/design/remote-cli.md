@@ -163,8 +163,9 @@ only as its tickets' project — with a different name or prefix is `409
 project_exists`, and a prefix another project already uses is `409
 prefix_conflict`. Nothing is renamed or deleted remotely. A `project_new`
 answer that is lost, unparsable (empty, 204, non-JSON), missing the
-requested project (a `null`, `{ok:true}` or foreign body) or a 5xx naming
-no pre-forward state is `outcome_unknown`:
+requested project (a `null`, `{ok:true}` or foreign body), carrying a
+missing, invalid or different issue-id prefix, or a 5xx naming no
+pre-forward state is `outcome_unknown`:
 reconcile with `issue project ls` before repeating, since the same key, name
 and prefix is the same project. `issue ls --project <key>` now crosses the
 wire (the route filters one key; a repeated flag refuses) and reads an empty

@@ -2869,12 +2869,26 @@ fn send_receipt_correlates(
             .is_some_and(|s| !s.is_empty())
 }
 
+/// A hosted issue-id prefix as the registry stores it: 1-16 ASCII
+/// letters/digits starting with a letter (the board normalizes case, so the
+/// shape is what matters; the caller's own spelling is compared
+/// case-insensitively).
+fn valid_hosted_prefix(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 16
+        && value.starts_with(|c: char| c.is_ascii_alphabetic())
+        && value.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 /// CAD-1999: a `project_new` 2xx is usable only when it carries the
 /// requested project back — a `project` object whose `key` and `name` are
-/// exactly the ones sent. Anything less (a `null` or `{ok:true}` body, a
-/// foreign project) cannot establish that THIS create landed, so the outcome
-/// is unknown and is reconciled with `issue project ls`, never called a
-/// failure and never replayed blindly.
+/// exactly the ones sent, and whose `prefix` is a valid stored issue-id
+/// prefix that matches the requested `--prefix` case-insensitively (when
+/// one was sent). Anything less (a `null` or `{ok:true}` body, a foreign
+/// project, a missing/invalid prefix or another project's prefix) cannot
+/// establish that THIS create landed under the intended namespace, so the
+/// outcome is unknown and is reconciled with `issue project ls`, never
+/// called a failure and never replayed blindly.
 fn project_receipt_correlates(receipt: &Value, arguments: &Map<String, Value>) -> bool {
     let project = receipt.get("project").and_then(Value::as_object);
     let bound = |key: &str| {
@@ -2889,7 +2903,17 @@ fn project_receipt_correlates(receipt: &Value, arguments: &Map<String, Value>) -
                         == Some(expected)
             })
     };
-    project.is_some() && bound("key") && bound("name")
+    let prefix_ok = project
+        .and_then(|fields| fields.get("prefix"))
+        .and_then(Value::as_str)
+        .is_some_and(|actual| {
+            valid_hosted_prefix(actual)
+                && arguments
+                    .get("prefix")
+                    .and_then(Value::as_str)
+                    .is_none_or(|requested| actual.eq_ignore_ascii_case(requested))
+        });
+    project.is_some() && bound("key") && bound("name") && prefix_ok
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3067,12 +3091,14 @@ fn call_verb_until_retry(
         }
         // CAD-1999: a project create's 2xx is usable only when it echoes the
         // requested project — a `project` object whose `key` and `name` are
-        // exactly what was sent. A `null`, `{ok:true}`, unrelated or foreign
-        // receipt cannot establish that THIS create landed, so the outcome is
-        // unknown and is reconciled with `issue project ls`, never reported
-        // as a failure and never replayed blindly. A 2xx with no parseable
-        // body (empty, 204, non-JSON) is the same check on a `None` body, so
-        // it is unknown here too.
+        // exactly what was sent and whose `prefix` is a valid stored prefix
+        // matching `--prefix` when one was sent. A `null`, `{ok:true}`,
+        // unrelated or foreign receipt, or a missing/invalid/different
+        // prefix cannot establish that THIS create landed under the intended
+        // namespace, so the outcome is unknown and is reconciled with
+        // `issue project ls`, never reported as a failure and never replayed
+        // blindly. A 2xx with no parseable body (empty, 204, non-JSON) is
+        // the same check on a `None` body, so it is unknown here too.
         if verb == "project_new"
             && (200..300).contains(&status)
             && !body

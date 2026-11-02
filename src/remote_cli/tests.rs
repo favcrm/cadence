@@ -100,24 +100,58 @@ fn project_verbs_are_a_registered_read_and_owner_write() {
 #[test]
 fn project_new_without_a_correlated_receipt_is_unknown_and_not_retried() {
     // CAD-1999: a 2xx proves the create only as the requested project echoed
-    // back. A `null`, `{ok:true}`, foreign or unrelated body cannot establish
-    // that THIS create landed — unknown, reconciled by the registry read,
-    // never a rejection and never a replay. The empty/204/non-JSON answer is
-    // the same check on a `None` body.
+    // back — key, name and a valid prefix that matches the requested
+    // `--prefix`. A `null`, `{ok:true}`, foreign or unrelated body, or a
+    // missing/invalid/different prefix cannot establish that THIS create
+    // landed under the intended namespace — unknown, reconciled by the
+    // registry read, never a rejection and never a replay. The
+    // empty/204/non-JSON answer is the same check on a `None` body.
     let args = || {
+        json!({"key": "ops", "name": "Operations", "prefix": "OPS"})
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    let derived_args = || {
         json!({"key": "ops", "name": "Operations"})
             .as_object()
             .unwrap()
             .clone()
     };
-    for receipt in [
-        Value::Null,
-        json!({"ok": true}),
-        json!({"project": {"key": "other", "name": "Operations"}}),
-        json!({"project": {"key": "ops", "name": "Other"}}),
-        json!({"project": "ops"}),
+    for (receipt, arguments) in [
+        (Value::Null, args()),
+        (json!({"ok": true}), args()),
+        (
+            json!({"project": {"key": "other", "name": "Operations", "prefix": "OPS"}}),
+            args(),
+        ),
+        (
+            json!({"project": {"key": "ops", "name": "Other", "prefix": "OPS"}}),
+            args(),
+        ),
+        (json!({"project": "ops"}), args()),
+        // The stored prefix is missing entirely.
+        (
+            json!({"project": {"key": "ops", "name": "Operations"}}),
+            args(),
+        ),
+        // The stored prefix is another project's namespace.
+        (
+            json!({"project": {"key": "ops", "name": "Operations", "prefix": "OTHER"}}),
+            args(),
+        ),
+        // The stored prefix is not a valid hosted prefix (starts with a digit).
+        (
+            json!({"project": {"key": "ops", "name": "Operations", "prefix": "9X"}}),
+            args(),
+        ),
+        // No requested prefix, but the receipt still must carry a real one.
+        (
+            json!({"project": {"key": "ops", "name": "Operations"}}),
+            derived_args(),
+        ),
     ] {
-        let (out, requests) = run(vec![(200, "", receipt)], "project_new", args(), 10);
+        let (out, requests) = run(vec![(200, "", receipt)], "project_new", arguments, 10);
         let err = out.unwrap_err();
         assert_eq!(err.kind(), "unknown", "{err}");
         let text = err.to_string();
@@ -130,14 +164,49 @@ fn project_new_without_a_correlated_receipt_is_unknown_and_not_retried() {
         );
     }
 
+    // The requested prefix echoed as stored (upper case) is the same project.
     let (out, _) = run(
         vec![(
             200,
             "",
-            json!({"project": {"key": "ops", "name": "Operations"}, "duplicate": false}),
+            json!({"project": {"key": "ops", "name": "Operations", "prefix": "OPS"},
+                "duplicate": false}),
         )],
         "project_new",
         args(),
+        10,
+    );
+    assert!(out.is_ok(), "{:?}", out.err().map(|e| e.to_string()));
+
+    // A caller-typed lower-case --prefix matches the stored upper-case one.
+    let lower = || {
+        json!({"key": "ops", "name": "Operations", "prefix": "ops"})
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    let (out, _) = run(
+        vec![(
+            200,
+            "",
+            json!({"project": {"key": "ops", "name": "Operations", "prefix": "OPS"}}),
+        )],
+        "project_new",
+        lower(),
+        10,
+    );
+    assert!(out.is_ok(), "{:?}", out.err().map(|e| e.to_string()));
+
+    // No --prefix: the board derives it, so any valid stored prefix is
+    // accepted rather than duplicating the board's derivation client-side.
+    let (out, _) = run(
+        vec![(
+            200,
+            "",
+            json!({"project": {"key": "ops", "name": "Operations", "prefix": "OPS"}}),
+        )],
+        "project_new",
+        derived_args(),
         10,
     );
     assert!(out.is_ok(), "{:?}", out.err().map(|e| e.to_string()));
