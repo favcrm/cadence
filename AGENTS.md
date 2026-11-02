@@ -251,14 +251,18 @@ looking.
   not require that daemon. Do not connect a runner blindly when it might claim
   unrelated waiting work. Agent identity is established by the supported
   authenticated path, not by supplying an alias or borrowing a human login.
-- A reviewer files one verdict per exact head with
-  `cadence audit verdict --issue <ID> --pr <n> --head <sha> --kind standards|spec
-  --outcome pass|revise`. The merge gate counts distinct reviewers and refuses
-  the author's own; a new head voids every verdict on the old one. Read them back
-  with `cadence audit verdicts`.
-- When more than one Cadence build is on the host, point the merge gate at the
-  intended one with `CADENCE_BIN`. A refusal saying a hosted verb is "not
-  available on a remote org" names a stale client, not a problem with the PR.
+- Review evidence binds to the exact head: the merge gate counts distinct
+  reviewers, refuses the author's own, and voids every verdict when the head
+  moves. Read it back with `cadence audit verdicts` and confirm a verdict counts
+  before treating a review as landed; in-chat findings are not automatically
+  gate evidence. A hosted `audit verdict` is not the per-PR note the native gate
+  reads (the tenant records artifact reviews), so never count it as one or
+  impersonate a reviewer — see `docs/guides/hosted-workspace.md` ("Reviewing
+  software changes"; CAD-1542, CAD-1981, AOS-473).
+- When more than one Cadence build is on the host, `CADENCE_BIN` selects the one
+  the gate invokes. A hosted-verb refusal can come from the client, the deployed
+  service or an operation the tenant does not support: confirm the capability,
+  report the exact refusal, and do not assume a stale client or bypass the gate.
 - Hosted project work and local software delivery are distinct. If the merge gate
   refuses, report its exact refusal; an exception remains operator-controlled and
   does not grant an agent merge or approval authority.
