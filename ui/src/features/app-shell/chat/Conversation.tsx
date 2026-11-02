@@ -261,6 +261,7 @@ function HomeList({
     for (let i = items.length - 1; i >= 0; i--) {
       const item = items[i];
       if (item.type !== "operator" && item.type !== "pending") continue;
+      if (item.type === "pending" && item.pending.state === "failed") continue;
       const id = itemMessage(item);
       if (id !== null && !queuedSet.has(id)) return id;
     }
@@ -319,7 +320,12 @@ function HomeList({
       (item.type === "operator" || item.type === "pending");
     if (hoist) {
       const msg = itemMessage(item);
-      const send = tailSend ?? msg;
+      const live = item.type === "pending" && item.pending.state === "failed"
+        ? null
+        : msg !== null && !queuedSet.has(msg)
+          ? msg
+          : null;
+      const send = activeSendId(items, running) ?? live ?? tailSend;
       if (!send || !claimedTurns.has(send)) {
         typingTail.current = { key: send ? `turn:${send}` : "typing-tail", node: act.node };
       }
@@ -2138,6 +2144,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           const queuedSet = new Set((masterState.data?.queue ?? []).map((q) => q.message));
           const lastUser = [...shown].reverse().find((item) => {
             if (item.type !== "operator" && item.type !== "pending") return false;
+            if (item.type === "pending" && item.pending.state === "failed") return false;
             const id = itemMessage(item);
             return id === null || !queuedSet.has(id);
           });

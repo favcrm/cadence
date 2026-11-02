@@ -485,6 +485,7 @@ export function sendBefore(items: ThreadItem[], runItems: ThreadItem[], queued: 
   for (let i = idx - 1; i >= 0; i--) {
     const item = items[i];
     if (item.type !== "operator" && item.type !== "pending") continue;
+    if (item.type === "pending" && item.pending.state === "failed") continue;
     const id = itemMessage(item);
     if (id !== null && queued.has(id)) continue;
     return id;
@@ -507,7 +508,11 @@ export function sendBefore(items: ThreadItem[], runItems: ThreadItem[], queued: 
  *  an empty matching run falls through to the tail run. */
 export function inFlightTurnKey(items: ThreadItem[], message: string | null): string | null {
   if (message === null || message === "") return null;
-  const isUser = (item: ThreadItem) => item.type === "operator" || item.type === "pending";
+  // A failed pending row stays visible for Retry/Discard but is not a live
+  // send: it neither bounds nor names the running turn.
+  const isUser = (item: ThreadItem) =>
+    (item.type === "operator" || item.type === "pending")
+    && !(item.type === "pending" && item.pending.state === "failed");
   // `present` distinguishes "no assistant rows yet" (fall through) from a
   // run that answered or names another send (refuse, never fall through).
   const isTurn = (item: ThreadItem) =>

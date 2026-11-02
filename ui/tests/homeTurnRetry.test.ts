@@ -287,6 +287,36 @@ async function main() {
   });
   await settle();
   assert(host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') === queuedTurn, "the placeholder updates in place when the first step lands behind a queued send");
+  // A retained failed send stays visible for Retry but must not name the
+  // working turn or steal its placeholder.
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      pending: [{ message: "ui-failed", text: "failed send", state: "failed", at: 2 }],
+      entries: [
+        ...state!.entries,
+        { seq: 40, role: "operator", kind: "message", message: "ui-c", text: "C ask" },
+      ],
+    }));
+  });
+  await settle();
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: { state: "working", message: "server-fail", conversation: "home-thread" }, queue: [] }));
+  });
+  await settle();
+  const failedTurn = host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') ?? null;
+  assert(failedTurn !== null, "the working placeholder paints past a failed send");
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [
+        ...state!.entries,
+        { seq: 41, role: "agent", kind: "thinking", message: null, text: "C works" },
+      ],
+    }));
+  });
+  await settle();
+  assert(host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') === failedTurn, "a failed send does not steal the working placeholder");
   await React.act(async () => {
     streamMaster.turn = null;
     streamMaster.queue = [];
