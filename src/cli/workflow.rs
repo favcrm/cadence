@@ -140,10 +140,9 @@ pub(super) fn run_workflow(state_dir: &Path, action: WorkflowAction) -> Result<i
                 print_json(&report);
                 return Ok(0);
             }
-            eprintln!(
-                "{}",
-                serde_json::to_string_pretty(&report).unwrap_or_default()
-            );
+            // The report precedes the nonzero status: a closed stderr
+            // must not panic it into success.
+            eprint_line(&serde_json::to_string_pretty(&report).unwrap_or_default());
             return Ok(1);
         }
         WorkflowAction::Ls { project } => {

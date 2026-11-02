@@ -799,17 +799,19 @@ pub fn run(host: &mut dyn Host, spec: &Spec, out: &mut dyn Write) -> Result<Repo
 pub fn cli(dry_run: bool, helper: PathBuf, operator: &str) -> Result<i32> {
     let (uid, euid) = caller_uids();
     if let Err(e) = enforce_root(uid, euid) {
-        eprintln!("cadence agent-uid provision: refused: {e}");
+        // The refusal line precedes exit 2: a closed stderr must not
+        // panic it into success.
+        crate::output::eprint_line(&format!("cadence agent-uid provision: refused: {e}"));
         return Ok(2);
     }
     // The helper source is the setuid bridge the boundary rests on —
     // only an explicit absolute path is trusted. No cwd-relative
     // discovery: under sudo the cwd may be agent-writable.
     if !helper.is_absolute() {
-        eprintln!(
+        crate::output::eprint_line(&format!(
             "cadence agent-uid provision: refused: --helper {} must be an absolute path",
             helper.display()
-        );
+        ));
         return Ok(2);
     }
     let mut host = LiveHost::new();
@@ -821,9 +823,9 @@ pub fn cli(dry_run: bool, helper: PathBuf, operator: &str) -> Result<i32> {
     let op = match host.user(operator) {
         Ok(Some(op)) => op,
         _ => {
-            eprintln!(
+            crate::output::eprint_line(&format!(
                 "cadence agent-uid provision: refused: operator account {operator} does not resolve"
-            );
+            ));
             return Ok(2);
         }
     };

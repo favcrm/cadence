@@ -110,7 +110,7 @@ fn the_project_scoped_gate_verbs_are_registered_with_their_scopes() {
 
 #[test]
 fn a_tenant_that_cannot_serve_a_project_verb_names_the_release_order() {
-    // An older tenant refuses the name (501 / 400 / 409 / 503) rather than
+    // An older tenant refuses the name (501 / 400 / 409) rather than
     // answering, and the client must say so — never read it as "no evidence"
     // and never fall back to the repo-scoped verbs.
     use super::{tenant_cannot_serve, PROJECT_SCOPED_GATE_VERBS};
@@ -128,10 +128,6 @@ fn a_tenant_that_cannot_serve_a_project_verb_names_the_release_order() {
             (
                 409,
                 json!({"ok": false, "error": {"code": "container_required"}}),
-            ),
-            (
-                503,
-                json!({"ok": false, "error": {"code": "capability_unavailable"}}),
             ),
         ] {
             let why = tenant_cannot_serve(verb, status, Some(&body)).expect("a version signal");
@@ -479,8 +475,8 @@ fn answer(mut socket: std::net::TcpStream, status: &str, extra: &str, body: &Val
 
 /// The strict `/__platform/cli/authorize` gate (mirrors
 /// `hostedCadenceCliAuthorizeRequestSchema`): every key required, no key
-/// extra, org and audience pinned to this board, scopes a subset of
-/// `cli.*`, ttl within 1..=300.
+/// extra, org and audience pinned to this board, scopes from the CLI
+/// authorization contract, and ttl within 1..=300.
 fn check_authorize(req: &Request) -> bool {
     req.path == "/__platform/cli/authorize"
         && req.bearer == BRIDGE
@@ -490,8 +486,18 @@ fn check_authorize(req: &Request) -> bool {
         && req.body["audience"].as_str().is_some()
         && req.body["requested_scopes"].as_array().is_some_and(|s| {
             !s.is_empty()
-                && s.iter()
-                    .all(|v| v.as_str().is_some_and(|s| s.starts_with("cli.")))
+                && s.iter().all(|v| {
+                    matches!(
+                        v.as_str(),
+                        Some(
+                            "cli.read"
+                                | "cli.write"
+                                | "settings.read"
+                                | "settings.write"
+                                | "audit.approve"
+                        )
+                    )
+                })
         })
         && req.body["ttl_seconds"]
             .as_u64()
@@ -857,6 +863,9 @@ fn wiki_refuses_forged_authority_before_mint_and_never_uses_cli_relay() {
             };
             let response = if req.path.ends_with("/authorize") {
                 json!({"version": version, "envelope": "h.e.1"})
+            } else if req.body["action"] == "write" {
+                json!({"path": "global/acceptance.md", "rev": "fnv1a:0123456789abcdef",
+                    "committed": true})
             } else {
                 json!({"ok": true})
             };
@@ -1812,6 +1821,243 @@ fn a_lost_response_to_a_team_mutation_is_unknown_not_a_refusal() {
     let text = err.to_string();
     assert!(text.contains("team list"), "{text}");
     assert!(!text.contains("retry later"), "{text}");
+}
+
+// CAD-2009: independently authored by the ticket author; implementers must not edit.
+#[test]
+fn cad2009_lost_responses_to_issue_and_wiki_writes_remain_unknown() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = target(&listener);
+    let server = listener.try_clone().unwrap();
+    let worker = thread::spawn(move || {
+        let mut paths = Vec::new();
+        for _ in 0..6 {
+            let (socket, _) = server.accept().unwrap();
+            let (socket, req) = read_request(socket);
+            paths.push(req.path.clone());
+            match req.path.as_str() {
+                "/__platform/cli/authorize" => answer(
+                    socket,
+                    "200 OK",
+                    "",
+                    &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+                ),
+                "/__platform/wiki/authorize" => answer(
+                    socket,
+                    "200 OK",
+                    "",
+                    &json!({"version": WIKI_VERSION, "envelope": "h.e.1"}),
+                ),
+                "/__platform/cli/call" | "/__platform/wiki/call" => drop(socket),
+                path => panic!("unexpected request: {path}"),
+            }
+        }
+        paths
+    });
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    store_credential(root.path(), &target.endpoint);
+    for (verb, args) in [
+        (
+            "issue_new",
+            json!({"project": "synthetic", "title": "Synthetic"}),
+        ),
+        ("issue_comment", json!({"id": "SYN-1", "body": "Synthetic"})),
+        (
+            "write",
+            json!({"path": "global/synthetic.md", "text": "Synthetic", "if_rev": "none"}),
+        ),
+    ] {
+        let error = call_verb_in(
+            &target,
+            verb,
+            args.as_object().unwrap().clone(),
+            10,
+            root.path(),
+            |_| {},
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), "unknown", "{verb}: {error}");
+    }
+    assert_eq!(
+        worker.join().unwrap(),
+        [
+            "/__platform/cli/authorize",
+            "/__platform/cli/call",
+            "/__platform/cli/authorize",
+            "/__platform/cli/call",
+            "/__platform/wiki/authorize",
+            "/__platform/wiki/call",
+        ]
+    );
+}
+
+// CAD-2009: a reply that proves neither success nor a pre-effect refusal
+// must not be reported as success or a definite rejection.
+#[test]
+fn cad2009_unconfirmed_issue_writes_are_unknown_and_not_replayed() {
+    for (verb, args) in [
+        (
+            "issue_new",
+            json!({"project": "synthetic", "title": "Synthetic"}),
+        ),
+        ("issue_comment", json!({"id": "SYN-1", "body": "Synthetic"})),
+    ] {
+        for (status, body) in [(200, Value::Null), (200, json!({})), (503, json!({}))] {
+            let (result, requests) = run(
+                vec![(status, "", body)],
+                verb,
+                args.as_object().unwrap().clone(),
+                10,
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), "unknown", "{verb} HTTP {status}: {error}");
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+        }
+    }
+}
+
+#[test]
+fn cad2009_project_mutation_capability_failure_remains_unknown() {
+    let body = json!({"ok": false, "error": {"code": "capability_unavailable"}});
+    let args = json!({
+        "project": "synthetic", "issue": "SYN-1", "repo": "example/synthetic",
+        "pr": 7, "head": "0123456789abcdef0123456789abcdef01234567", "source": "synthetic"
+    });
+    let (result, requests) = run(
+        vec![(503, "", body)],
+        "audit_approve_project",
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), "unknown", "{error}");
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+#[test]
+fn cad2009_foreign_issue_receipt_does_not_confirm_a_comment() {
+    let receipt = json!({"issue": {"id": "SYN-2"}, "card": {"id": "SYN-2"}, "warnings": []});
+    let args = json!({"id": "SYN-1", "body": "Synthetic"});
+    let (result, requests) = run(
+        vec![(200, "", receipt)],
+        "issue_comment",
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), "unknown", "{error}");
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+#[test]
+fn cad2009_native_and_tenant_issue_receipts_remain_compatible() {
+    let comment = json!({"id": "SYN-1", "body": "Synthetic"});
+    for receipt in [
+        json!({"issue": {"id": "SYN-1"}, "card": {"id": "SYN-1"}, "warnings": []}),
+        json!({"issue": {"id": "SYN-1"}, "comment": {"body": "Synthetic"}}),
+    ] {
+        let (result, requests) = run(
+            vec![(200, "", receipt.clone())],
+            "issue_comment",
+            comment.as_object().unwrap().clone(),
+            10,
+        );
+        assert_eq!(result.unwrap(), receipt);
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+    let unchanged =
+        json!({"issue": {"id": "SYN-1"}, "card": {"id": "SYN-1", "rev": "same"}, "warnings": []});
+    let args = json!({"ids": ["SYN-1"], "set": ["status=ready"], "if_rev": "same"});
+    let (result, requests) = run(
+        vec![(200, "", unchanged.clone())],
+        "issue_set",
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    assert_eq!(result.unwrap(), unchanged);
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+#[test]
+fn cad2009_policy_receipts_must_match_the_requested_policy() {
+    let args = json!({"project": "synthetic", "visibility": "workspace-visible",
+        "grants": ["users/synthetic"]});
+    let args = args.as_object().unwrap();
+    let tenant = json!({"state": "recorded", "project": "synthetic",
+        "visibility": "workspace-visible", "grants": ["users/synthetic"], "revision": 1});
+    let native = json!({"project": "synthetic", "committed": true, "policy": {
+        "visibility": "workspace_visible", "members": ["users/synthetic"], "version": 1}});
+    assert!(policy_receipt_correlates(&tenant, args));
+    assert!(policy_receipt_correlates(&native, args));
+    let mut wrong_visibility = tenant.clone();
+    wrong_visibility["visibility"] = json!("private");
+    assert!(!policy_receipt_correlates(&wrong_visibility, args));
+    let mut wrong_grants = native.clone();
+    wrong_grants["policy"]["members"] = json!(["users/other"]);
+    assert!(!policy_receipt_correlates(&wrong_grants, args));
+    let empty = json!({"project": "synthetic", "visibility": "workspace-visible", "grants": []});
+    let native_empty = json!({"project": "synthetic", "committed": true,
+        "policy": {"visibility": "workspace_visible", "version": 1}});
+    assert!(policy_receipt_correlates(
+        &native_empty,
+        empty.as_object().unwrap()
+    ));
+}
+
+#[test]
+fn cad2009_tracker_unavailable_before_write_is_definite() {
+    let body = json!({"ok": false, "error": {"code": "tracker_unavailable"}});
+    let args = json!({"id": "SYN-1", "body": "Synthetic"});
+    let (result, requests) = run(
+        vec![(503, "", body)],
+        "issue_comment",
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), "rejected", "{error}");
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+#[test]
+fn cad2009_upload_receipts_bind_destination_and_bytes() {
+    let digest = Sha256::digest(b"abc");
+    let hex = format!("{digest:x}");
+    let path = "global/synthetic.txt";
+    let valid_blob = json!({"path": path, "sha256": hex, "size": 3});
+    let valid_text = json!({"path": path, "kind": "text", "rev": "r1", "size": 3});
+    let valid_native = json!({"path": path, "committed": true, "rev": "r1"});
+    for receipt in [valid_blob, valid_text, valid_native] {
+        assert!(upload_receipt_correlates(&receipt, path, &digest, 3));
+    }
+    for receipt in [
+        json!({"committed": true, "rev": "r1"}),
+        json!({"path": "global/other.txt", "sha256": hex}),
+        json!({"path": path, "kind": "text", "rev": "r1", "size": 3, "sha256": "00"}),
+        json!({"path": path, "kind": "text", "rev": "r1", "size": 3, "sha256": 3}),
+        json!({"path": path, "committed": true, "rev": "r1", "size": 4}),
+    ] {
+        assert!(!upload_receipt_correlates(&receipt, path, &digest, 3));
+    }
+}
+
+#[test]
+fn cad2009_wiki_receipts_accept_server_normalized_paths() {
+    let input = "global/cafe\u{301}.md";
+    let canonical = "global/caf\u{e9}.md";
+    let args = json!({"path": input, "text": "abc"})
+        .as_object()
+        .unwrap()
+        .clone();
+    let receipt = json!({"path": canonical, "rev": "r1", "committed": true});
+    assert!(wiki_write_receipt_correlates(&receipt, &args));
+    let digest = Sha256::digest(b"abc");
+    assert!(upload_receipt_correlates(&receipt, input, &digest, 3));
+    let foreign = json!({"path": "global/other.md", "rev": "r1", "committed": true});
+    assert!(!wiki_write_receipt_correlates(&foreign, &args));
+    assert!(!upload_receipt_correlates(&foreign, input, &digest, 3));
 }
 
 /// A generic 5xx with no worker `state` and no board hop follows a

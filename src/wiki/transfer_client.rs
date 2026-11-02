@@ -313,22 +313,71 @@ fn import_local(
         }
     };
     check_manifest(&manifest)?;
+    // `transfer.rs::receipt` carries this admitted manifest's canonical
+    // digest; computing it here is what makes a foreign or stale receipt
+    // fail instead of passing as this manifest's.
+    let expected_digest = manifest_digest(&manifest)?;
 
-    let mut begin = json!({"op": "begin", "manifest": manifest});
-    if let Some(job) = request.resume {
-        begin["job_id"] = json!(job);
+    // `begin` mints a UUID when the request omits one, and an id the server
+    // minted is the one thing a lost answer cannot recover — replaying would
+    // admit a second job. Send an explicit id instead: `--resume` its
+    // supplied one, a fresh copy a locally minted UUID. The server dedupes an
+    // explicit id against the same owner, root, digest and manifest, so the
+    // requested id is the reconciliation key either way.
+    let requested_job = match request.resume {
+        Some(job) => job.to_string(),
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+    let begin = json!({"op": "begin", "job_id": &requested_job, "manifest": manifest});
+    let receipt = match channel.transfer(&root, begin, true) {
+        Ok(receipt) => receipt,
+        // A lost answer may still have admitted the job under the id this
+        // request named: keep `unknown` and name that id. A definite
+        // refusal recorded nothing and keeps its own verdict.
+        Err(error) if error.kind() == "unknown" => {
+            return Err(begin_unproved(
+                &requested_job,
+                format!("the begin answer was lost: {error}"),
+            ))
+        }
+        Err(error) => return Err(error),
+    };
+    // The answer is read only after the request was dispatched: begin admits
+    // the manifest and publishes no entry. The receipt must name the id this
+    // request asked for — anything else is a foreign body — and the advice
+    // below names that requested id, never one the receipt invented.
+    if identity(&receipt, "job_id") != Some(requested_job.as_str()) {
+        return Err(begin_unproved(
+            &requested_job,
+            "the begin answer omitted or named a different job",
+        ));
     }
-    let receipt = channel.transfer(&root, begin, true)?;
-    let job_id = required_str(&receipt, "job_id")?;
-    let digest = required_str(&receipt, "digest")?;
-    check_token(&job_id, "job id")?;
-    println!(
-        "{}",
-        serde_json::to_string(&json!({"job_id": job_id, "digest": digest, "root": root}))
-            .map_err(|e| Error::rejected(format!("wiki cp receipt: {e}")))?
-    );
+    // `receipt()` echoes the admitted root and canonical digest. Their
+    // absence or a different value is a foreign body.
+    if identity(&receipt, "root") != Some(root.as_str()) {
+        return Err(begin_unproved(
+            &requested_job,
+            "the begin answer omitted or changed its root",
+        ));
+    }
+    if identity(&receipt, "digest") != Some(expected_digest.as_str()) {
+        return Err(begin_unproved(
+            &requested_job,
+            "the begin answer named another manifest digest",
+        ));
+    }
+    let job_id = requested_job.as_str();
+    let receipt_line =
+        serde_json::to_string(&json!({"job_id": job_id, "digest": &expected_digest, "root": root}))
+            .map_err(|e| Error::rejected(format!("wiki cp receipt: {e}")))?;
+    // The receipt precedes the entry sends: a closed stdout must not
+    // panic the transfer into a half-sent, successful-looking exit.
+    crate::output::print_line(&receipt_line);
 
-    let progress = status_received(channel, &root, &job_id)?;
+    // Nothing is published yet — begin admits the manifest and publishes no
+    // entry — so a progress read this client cannot trust is a definite
+    // stop, not a possible write.
+    let progress = status_received(channel, &root, job_id)?;
     let mut failures: Vec<String> = Vec::new();
     for item in &walked {
         let id = entry_id(&item.rel);
@@ -339,17 +388,30 @@ fn import_local(
             if let Err(error) = send_entry(
                 channel,
                 &root,
-                &job_id,
+                job_id,
                 item,
                 &local,
                 entry_progress.received,
             ) {
-                // A dropped chunk is ambiguous: do not finish and do not retry.
-                return Err(Error::rejected(format!(
-                    "wiki cp job {job_id} stopped on '{}': {error} — resume with --resume {job_id}; \
-                     this attempt was not retried",
-                    item.rel
-                )));
+                // A dropped chunk is ambiguous: do not finish and do not
+                // retry. The transport's own kind is kept — an `unknown`
+                // chunk may have staged, so it is not a rejection — and
+                // only the same job can reconcile it.
+                let message = if error.kind() == "unknown" {
+                    format!(
+                        "wiki cp job {job_id} stopped on '{}': {error} — the chunk may or may \
+                         not have been staged; reconcile the same job with `--resume {job_id}` \
+                         before repeating anything; this attempt was not retried",
+                        item.rel
+                    )
+                } else {
+                    format!(
+                        "wiki cp job {job_id} stopped on '{}': {error} — resume with \
+                         --resume {job_id}; this attempt was not retried",
+                        item.rel
+                    )
+                };
+                return Err(write_outcome(error, message));
             }
         }
         match channel.transfer(
@@ -358,33 +420,79 @@ fn import_local(
             true,
         ) {
             Ok(body) => {
-                // One apply. `unresolved` is not terminal: the stage stays,
-                // finish would be refused, and a later resume may apply again.
-                // Do not loop apply or recompute the admitted `if_rev` here.
-                if body["outcome"].as_str() == Some("unresolved") {
-                    let detail = body["error"]
-                        .as_str()
-                        .filter(|text| !text.is_empty())
-                        .unwrap_or("publication is not committed; staged bytes were kept");
-                    let mut notes = vec![detail.to_string()];
-                    notes.extend(failures);
-                    return Err(Error::rejected(format!(
-                        "wiki cp job {job_id} stopped on '{}': unresolved — {}; \
-                         finish was not called; this attempt was not retried — resume with \
-                         --resume {job_id}; admitted if_rev was not recomputed",
-                        item.rel,
-                        notes.join("; ")
-                    )));
+                // One apply. The answer must be this entry's — `entry_id`
+                // is always emitted, and a body naming another job or
+                // entry proves nothing about this one. Do not loop apply
+                // or recompute the admitted `if_rev` here.
+                if identity(&body, "entry_id") != Some(id.as_str())
+                    || !optional_job_id(&body, job_id)
+                {
+                    return Err(unproved(
+                        job_id,
+                        format!("apply '{}' answered for another job or entry", item.rel),
+                    ));
                 }
-                if let Some(why) = entry_failure(&body, &item.rel) {
-                    failures.push(why);
+                match body["outcome"].as_str() {
+                    // The server decided this entry: applied/skipped are
+                    // done, `conflict`/`failed` are its proven refusals.
+                    Some("applied" | "skipped" | "conflict" | "failed") => {
+                        if let Some(why) = entry_failure(&body, &item.rel) {
+                            failures.push(why);
+                        }
+                    }
+                    // `unresolved` is written before `write`, `mkdir` or
+                    // `put_blob`: the publication was attempted and may
+                    // have landed. The stage stays, finish would refuse
+                    // the job, and only the same job can reconcile it.
+                    Some("unresolved") => {
+                        let detail = body["error"]
+                            .as_str()
+                            .filter(|text| !text.is_empty())
+                            .unwrap_or("publication could not be verified; staged bytes were kept");
+                        let mut notes = vec![detail.to_string()];
+                        notes.extend(failures);
+                        return Err(unproved(
+                            job_id,
+                            format!(
+                                "apply '{}' is unresolved — {}; finish was not called and \
+                                 this attempt was not retried; admitted if_rev was not \
+                                 recomputed",
+                                item.rel,
+                                notes.join("; ")
+                            ),
+                        ));
+                    }
+                    // No outcome this contract knows: the reply cannot be
+                    // read, and the publication may have happened. The
+                    // server's already-decided early return carries its
+                    // `outcome` (entry_value), so a body without one is
+                    // never that answer.
+                    _ => {
+                        return Err(unproved(
+                            job_id,
+                            format!("apply '{}' answered no outcome this build knows", item.rel),
+                        ))
+                    }
                 }
             }
             Err(error) => {
-                return Err(Error::rejected(format!(
-                    "wiki cp job {job_id} apply '{}' was not confirmed: {error} — not retried",
-                    item.rel
-                )));
+                // The apply may have committed before the reply was lost:
+                // keep `unknown` as unknown so the caller reconciles the
+                // same job instead of redoing the write.
+                let message = if error.kind() == "unknown" {
+                    format!(
+                        "wiki cp job {job_id} apply '{}' was not confirmed: {error} — this \
+                         attempt was not retried; reconcile that job with `--resume {job_id}` \
+                         before repeating anything",
+                        item.rel
+                    )
+                } else {
+                    format!(
+                        "wiki cp job {job_id} apply '{}' was not confirmed: {error} — not retried",
+                        item.rel
+                    )
+                };
+                return Err(write_outcome(error, message));
             }
         }
     }
@@ -394,21 +502,47 @@ fn import_local(
         json!({"op": "finish", "job_id": job_id, "root": root}),
         true,
     )?;
-    if let Some(why) = job_failure(&finished) {
-        failures.push(why);
+    if identity(&finished, "job_id") != Some(job_id)
+        || identity(&finished, "digest") != Some(expected_digest.as_str())
+        || identity(&finished, "root") != Some(root.as_str())
+    {
+        return Err(unproved(
+            job_id,
+            "finish answered for another job, manifest digest or root",
+        ));
     }
-    println!(
-        "{}",
-        serde_json::to_string(&finished)
-            .map_err(|e| Error::rejected(format!("wiki cp finish: {e}")))?
-    );
+    // `complete` is the server closing the job; `failed`/`partial` are its
+    // proven terminal outcomes (decided entries, or the root error the
+    // receipt carries). Anything else is not this contract's answer, and
+    // finish may still have run — root creation included.
+    match finished["state"].as_str() {
+        Some("complete") => {}
+        Some(state) if state == "failed" || state == "partial" => {
+            failures.push(format!("job state {state}"));
+        }
+        Some(other) => {
+            return Err(unproved(
+                job_id,
+                format!("finish answered job state '{other}'"),
+            ))
+        }
+        None => return Err(unproved(job_id, "finish answered no job state")),
+    }
+    if finished["index"] == "superseded" {
+        failures.push("job destination was superseded; no newer content was overwritten".into());
+    }
+    let receipt = serde_json::to_string(&finished)
+        .map_err(|e| Error::rejected(format!("wiki cp finish: {e}")))?;
+    // The receipt precedes a possible nonzero status: a closed stdout must
+    // not panic the job's own verdict into success.
+    crate::output::print_line(&receipt);
     if request.wait_index {
-        match wait_index(channel, &root, &job_id, deadline) {
-            Ok(body) => println!(
-                "{}",
-                serde_json::to_string(&body)
-                    .map_err(|e| Error::rejected(format!("wiki cp index: {e}")))?
-            ),
+        match wait_index(channel, &root, job_id, deadline) {
+            Ok(body) => {
+                let receipt = serde_json::to_string(&body)
+                    .map_err(|e| Error::rejected(format!("wiki cp index: {e}")))?;
+                crate::output::print_line(&receipt);
+            }
             Err(error) => {
                 failures.push(error.to_string());
             }
@@ -417,15 +551,76 @@ fn import_local(
     if failures.is_empty() {
         Ok(0)
     } else {
-        eprintln!(
-            "{}",
-            serde_json::to_string(&json!({
-                "job_id": job_id,
-                "failures": failures,
-            }))
-            .unwrap_or_else(|_| format!("wiki cp job {job_id} completed with entry failures"))
-        );
+        // The failure report precedes the nonzero status: a closed stderr
+        // must not panic it into success.
+        let report = serde_json::to_string(&json!({
+            "job_id": job_id,
+            "failures": failures,
+        }))
+        .unwrap_or_else(|_| format!("wiki cp job {job_id} completed with entry failures"));
+        crate::output::eprint_line(&report);
         Ok(1)
+    }
+}
+
+/// Keep what the transport said about a write while adding this attempt's
+/// context. A transport `unknown` means the request may have reached the
+/// server, so reporting it as a definite rejection would tell the caller to
+/// redo a write that may already exist; every other kind stays the refusal
+/// this job reported. An op-level answer this client cannot trust goes
+/// through [`unproved`] instead.
+fn write_outcome(error: Error, message: impl Into<String>) -> Error {
+    let message = message.into();
+    if error.kind() == "unknown" {
+        Error::unknown(message)
+    } else {
+        Error::rejected(message)
+    }
+}
+
+/// A transfer op that was already dispatched, answered with a body this
+/// client cannot trust. `transfer.rs` writes `unresolved` before `write`,
+/// `mkdir` or `put_blob`, so a malformed, foreign or unproved answer leaves
+/// publication possibly done. Only the same job can reconcile it:
+/// `--resume <job_id>` re-reads the durable entries and publishes nothing
+/// already decided.
+fn unproved(job_id: &str, detail: impl std::fmt::Display) -> Error {
+    Error::unknown(format!(
+        "wiki cp job {job_id}: {detail} — the publication may or may not have been \
+         recorded; reconcile the same job with `--resume {job_id}` before repeating anything"
+    ))
+}
+
+/// A begin whose answer was lost or cannot be read. The job may or may not
+/// have been admitted under the id this request named, but begin records no
+/// published entry — `transfer.rs` only inserts the job and pins the
+/// manifest. The explicit id is deduped against the same owner, root, digest
+/// and manifest, so `--resume <id>` reconciles it; repeating the copy would
+/// admit a second job.
+fn begin_unproved(job_id: &str, detail: impl std::fmt::Display) -> Error {
+    Error::unknown(format!(
+        "wiki cp job {job_id}: {detail} — the job may or may not have been admitted, but \
+         begin publishes no entry; reconcile the same job with `--resume {job_id}` (the \
+         server dedupes that id against the same manifest) instead of repeating the copy"
+    ))
+}
+
+/// One identity field of a transfer answer. Each proven server shape emits
+/// the fields its callers require — `receipt()` the job id, root and
+/// digest, `entry_value`/`record_publish` the entry id, chunk both ids, and
+/// finish the job id — so an absent or non-string field is a foreign body,
+/// never one to read past.
+fn identity<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
+    body.get(key).and_then(Value::as_str)
+}
+
+/// An apply answer's job id is optional: the server's already-decided
+/// `entry_value` omits it while the publish receipt carries it. A present
+/// value must still name this job.
+fn optional_job_id(body: &Value, job_id: &str) -> bool {
+    match body.get("job_id") {
+        None => true,
+        Some(value) => value.as_str() == Some(job_id),
     }
 }
 
@@ -453,9 +648,23 @@ fn send_entry(
             }),
             true,
         )?;
+        let want_entry = entry_id(&item.rel);
+        if identity(&body, "job_id") != Some(job_id)
+            || identity(&body, "entry_id") != Some(want_entry.as_str())
+        {
+            // Dispatched: a body that names another job or entry cannot be
+            // read as this chunk's acknowledgment.
+            return Err(Error::unknown(format!(
+                "chunk '{}' answered for another job or entry",
+                item.rel
+            )));
+        }
         if body["received"].as_u64() != Some(0) {
-            return Err(Error::rejected(format!(
-                "chunk '{}' did not confirm an empty file — not retried",
+            // Dispatched: the stage may hold these bytes even though the
+            // answer did not confirm an empty file. The caller adds the
+            // same-job reconciliation.
+            return Err(Error::unknown(format!(
+                "chunk '{}' did not confirm an empty file",
                 item.rel
             )));
         }
@@ -515,17 +724,31 @@ fn send_entry(
             }),
             true,
         )?;
+        // Dispatched: a reply that names another job or entry, that this
+        // client cannot read, or that acknowledges other bytes than were
+        // sent leaves the stage possibly ahead. Only the same job can
+        // reconcile it (the caller adds that clause); `status` reports the
+        // durable `received`.
+        let want_entry = entry_id(&item.rel);
+        if identity(&body, "job_id") != Some(job_id)
+            || identity(&body, "entry_id") != Some(want_entry.as_str())
+        {
+            return Err(Error::unknown(format!(
+                "chunk '{}' answered for another job or entry",
+                item.rel
+            )));
+        }
+        let want = offset + n as u64;
         let got = body["received"].as_u64().ok_or_else(|| {
-            Error::rejected(format!(
-                "chunk '{}' did not confirm received bytes — not retried",
+            Error::unknown(format!(
+                "chunk '{}' did not confirm its received bytes",
                 item.rel
             ))
         })?;
-        if got != offset + n as u64 {
-            return Err(Error::rejected(format!(
-                "chunk '{}' confirmed {got} bytes, expected {} — not retried",
-                item.rel,
-                offset + n as u64
+        if got != want {
+            return Err(Error::unknown(format!(
+                "chunk '{}' confirmed {got} bytes where {want} were sent",
+                item.rel
             )));
         }
         offset = got;
@@ -560,22 +783,22 @@ fn export_wiki(
     channel.discover(&root_or_file)?;
     let listed = list_export(channel, &root_or_file, request.recursive)?;
     let digest = plan_digest(&listed);
-    println!(
-        "{}",
-        serde_json::to_string(&json!({
-            "op": "export",
-            "root": root_or_file,
-            "digest": digest,
-            "entries": listed.iter().map(|e| json!({
-                "path": e.path,
-                "kind": e.kind,
-                "rev": e.rev,
-                "size": e.size,
-                "sha256": e.sha256,
-            })).collect::<Vec<_>>(),
-        }))
-        .map_err(|e| Error::rejected(format!("wiki cp export plan: {e}")))?
-    );
+    let plan = serde_json::to_string(&json!({
+        "op": "export",
+        "root": root_or_file,
+        "digest": digest,
+        "entries": listed.iter().map(|e| json!({
+            "path": e.path,
+            "kind": e.kind,
+            "rev": e.rev,
+            "size": e.size,
+            "sha256": e.sha256,
+        })).collect::<Vec<_>>(),
+    }))
+    .map_err(|e| Error::rejected(format!("wiki cp export plan: {e}")))?;
+    // The plan precedes the publication: a closed stdout must not panic
+    // the export into an unexecuted, successful-looking exit.
+    crate::output::print_line(&plan);
     check_export_dest(&dest, &root_or_file, &listed, request.update)?;
     // One no-follow directory fd for the whole publication. Child directories
     // and file names are created relative to it, including an empty source.
@@ -590,11 +813,11 @@ fn export_wiki(
     if failures.is_empty() {
         Ok(0)
     } else {
-        eprintln!(
-            "{}",
-            serde_json::to_string(&json!({"op": "export", "failures": failures}))
-                .unwrap_or_else(|_| "wiki cp export incomplete".to_string())
-        );
+        // The failure report precedes the nonzero status: a closed stderr
+        // must not panic it into success.
+        let report = serde_json::to_string(&json!({"op": "export", "failures": failures}))
+            .unwrap_or_else(|_| "wiki cp export incomplete".to_string());
+        crate::output::eprint_line(&report);
         Ok(1)
     }
 }
@@ -1139,9 +1362,9 @@ struct EntryProgress {
     decided: bool,
 }
 
-/// `pending` and `unresolved` still need apply. `unresolved` means the
-/// publication is not committed and the stage was kept; it is not a
-/// decision, so resume may apply once. Any other outcome is refused.
+/// `pending` needs apply. `unresolved` may already have been published;
+/// resuming the same job asks the server to reconcile its recorded attempt.
+/// Any unrecognized outcome is refused.
 fn outcome_is_decided(outcome: Option<&str>) -> Result<bool> {
     match outcome {
         Some("pending" | "unresolved") => Ok(false),
@@ -1461,6 +1684,10 @@ fn parse_kind(raw: &str) -> Result<String> {
     }
 }
 
+/// The proven failure of one decided entry: a checked conflict, a failed or
+/// conflicting extraction, or the server's own `failed`. `applied` and
+/// `skipped` are success. The caller refuses any other outcome as an
+/// untrusted post-dispatch answer before it gets here.
 fn entry_failure(body: &Value, path: &str) -> Option<String> {
     if body.get("conflict").is_some() {
         return Some(format!("{path}: conflict"));
@@ -1472,14 +1699,11 @@ fn entry_failure(body: &Value, path: &str) -> Option<String> {
         ));
     }
     match body["outcome"].as_str() {
-        Some("applied" | "skipped") => None,
-        Some("conflict" | "failed" | "error") => Some(format!(
+        Some("conflict" | "failed") => Some(format!(
             "{path}: {}",
             body["outcome"].as_str().unwrap_or("failed")
         )),
-        Some(other) => Some(format!("{path}: {other}")),
-        None if body.get("error").is_some() => Some(format!("{path}: error")),
-        None => Some(format!("{path}: apply omitted outcome")),
+        _ => None,
     }
 }
 
@@ -1492,17 +1716,6 @@ fn status_entry_failed(body: &Value) -> bool {
             body["extraction"].as_str(),
             Some("failed" | "empty" | "conflict")
         )
-}
-
-fn job_failure(body: &Value) -> Option<String> {
-    if body["index"] == "superseded" {
-        return Some("job destination was superseded; no newer content was overwritten".into());
-    }
-    match body["state"].as_str() {
-        Some("complete") => None,
-        Some(other) => Some(format!("job state {other}")),
-        None => Some("finish omitted state".to_string()),
-    }
 }
 
 fn source_identity(kind: &str, path: &Path) -> Result<String> {
@@ -2744,5 +2957,101 @@ mod tests {
         assert!(!outside.join("nested").exists());
         assert!(!real.join("nested").exists());
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    // CAD-2009: independently authored by the ticket author.
+    #[test]
+    fn cad2009_unproved_copy_receipts_remain_unknown_without_replay() {
+        struct Uncertain {
+            scenario: u8,
+            entry: String,
+            job_id: Option<String>,
+            operations: Vec<String>,
+        }
+        impl Channel for Uncertain {
+            fn transfer(&mut self, root: &str, op: Value, _write: bool) -> Result<Value> {
+                let name = op["op"].as_str().unwrap();
+                self.operations.push(name.to_string());
+                Ok(match name {
+                    "begin" => {
+                        let job_id = op["job_id"].as_str().unwrap();
+                        uuid::Uuid::parse_str(job_id).unwrap();
+                        self.job_id = Some(job_id.to_string());
+                        if self.scenario == 5 {
+                            return Err(Error::unknown("synthetic lost begin reply"));
+                        }
+                        let manifest: Manifest =
+                            serde_json::from_value(op["manifest"].clone()).unwrap();
+                        let digest = if self.scenario == 3 {
+                            "0".repeat(64)
+                        } else {
+                            manifest_digest(&manifest).unwrap()
+                        };
+                        json!({"job_id": job_id, "digest": digest, "root": root})
+                    }
+                    "status" => json!({
+                        "job_id": self.job_id.as_deref().unwrap(), "root": root,
+                        "entries": [{"entry_id": self.entry, "received": if self.scenario == 0 { 0 } else { 3 }, "outcome": "pending"}],
+                        "next_offset": null
+                    }),
+                    "chunk" => {
+                        json!({"job_id": self.job_id.as_deref().unwrap(), "entry_id": self.entry})
+                    }
+                    "apply" if self.scenario == 1 => {
+                        json!({"entry_id": self.entry, "outcome": "unresolved"})
+                    }
+                    "apply" if self.scenario == 4 => {
+                        json!({"entry_id": self.entry, "job_id": null, "outcome": "applied"})
+                    }
+                    "apply" => json!({"entry_id": self.entry}),
+                    _ => panic!("unexpected transfer operation: {name}"),
+                })
+            }
+            fn discover(&mut self, _path: &str) -> Result<()> {
+                Ok(())
+            }
+            fn current_rev(&mut self, _path: &str) -> Result<String> {
+                panic!("create-only copy must not read a revision")
+            }
+        }
+
+        let cwd = std::env::current_dir().unwrap();
+        let source = tempfile::Builder::new()
+            .prefix("cad2009-")
+            .tempdir_in(cwd)
+            .unwrap();
+        fs::write(source.path().join("note.txt"), b"abc").unwrap();
+        let request = CopyRequest {
+            source: source.path().to_str().unwrap(),
+            dest: "wiki:global/synthetic",
+            recursive: true,
+            update: false,
+            resume: None,
+            wait_index: false,
+        };
+        for scenario in 0..6 {
+            let mut channel = Uncertain {
+                scenario,
+                entry: entry_id("note.txt"),
+                job_id: None,
+                operations: Vec::new(),
+            };
+            let error = import_local(
+                &request,
+                "global/synthetic",
+                &mut channel,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), "unknown", "scenario {scenario}: {error}");
+            let job_id = channel.job_id.as_deref().unwrap();
+            assert!(error.to_string().contains(&format!("--resume {job_id}")));
+            if scenario == 3 || scenario == 5 {
+                assert_eq!(channel.operations, ["begin"]);
+            } else {
+                let last = if scenario == 0 { "chunk" } else { "apply" };
+                assert_eq!(channel.operations, ["begin", "status", last]);
+            }
+        }
     }
 }

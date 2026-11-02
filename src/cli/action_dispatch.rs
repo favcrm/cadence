@@ -379,7 +379,9 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             )?;
             let line = cadence_agent::github_connect::outcome_line(&poll)
                 .unwrap_or_else(|| "The connection did not settle in time.".to_string());
-            eprintln!("{line}");
+            // The outcome line precedes a possible exit 1: a closed stderr
+            // must not panic the verdict into success.
+            eprint_line(&line);
             return Ok(match poll {
                 cadence_agent::github_connect::Poll::Connected(_) => 0,
                 _ => 1,

@@ -1,4 +1,5 @@
 //! Explicit local result custody and one pinned hosted sender. No daemon or credential resolver.
+use super::{eprint_line, print_json};
 use cadence_agent::error::{Error, Result};
 use cadence_agent::remote_enrollment;
 use cadence_agent::remote_result_outbox::{
@@ -179,7 +180,9 @@ fn show_browser_consent(
     no_open: bool,
     open: impl FnOnce(&str) -> std::io::Result<()>,
 ) {
-    eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
+    eprint_line(&format!(
+        "Approve hosted Cadence access at: {url}\nCode: {code}"
+    ));
     if !no_open {
         let _ = open(url);
     }
@@ -311,7 +314,7 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
         if let Some(bound) = continuity {
             output["continuity"] = bound;
         }
-        println!("{output}");
+        print_json(&output);
         return Ok(0);
     }
     let RemoteAction::Result { action } = action else {
@@ -391,7 +394,7 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
             value
         }
     };
-    println!("{output}");
+    print_json(&output);
     Ok(0)
 }
 

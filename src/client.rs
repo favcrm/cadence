@@ -524,9 +524,9 @@ impl MetaBudget {
 
 /// One request/response frame under a single absolute `deadline`
 /// covering connect, the request write and the reply read together.
-/// Only [`MetaBudget`] uses this: a courtesy metadata answer must
-/// degrade inside seconds even when the dependency's listen backlog
-/// is full (a blocking `UnixStream::connect` has no timeout), when the
+/// Used for bounded metadata and issue reads, which must return even
+/// when the dependency's listen backlog is full (a blocking
+/// `UnixStream::connect` has no timeout), when the
 /// peer accepts no bytes (the general path's write is unbounded), or
 /// when the reply trickles (a per-read timeout resets on every byte).
 /// The wire frames are identical to [`rpc_frame_on`]'s; the deadline

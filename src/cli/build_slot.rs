@@ -401,10 +401,10 @@ pub(super) fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Resu
                      must declare a non-empty argv",
                 ));
             }
-            eprintln!(
+            eprint_line(&format!(
                 "slot {token} acquired ({kind}, pid {pid}) — running {}",
                 exec_argv[0]
-            );
+            ));
             use std::os::unix::process::CommandExt;
             let err = std::process::Command::new(&exec_argv[0])
                 .args(&exec_argv[1..])

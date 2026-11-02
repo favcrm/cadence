@@ -21,10 +21,9 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                 print_json(&report);
                 Ok(0)
             } else {
-                eprintln!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).unwrap_or_default()
-                );
+                // The report precedes the nonzero status: a closed stderr
+                // must not panic it into success.
+                eprint_line(&serde_json::to_string_pretty(&report).unwrap_or_default());
                 Ok(1)
             }
         }

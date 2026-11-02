@@ -6,6 +6,8 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -142,6 +144,13 @@ fn read_artifacts(dir: &Path) -> Vec<(String, u64)> {
 }
 
 pub fn load_issue(pm_dir: &Path, project_key: &str, id: &str) -> Result<Issue> {
+    load_issue_with(pm_dir, project_key, id, true)
+}
+
+/// [`load_issue`] with the drawer-only reads optional: a caller that
+/// derives status, links and checks needs the front matter and body
+/// only, never another issue's comment bodies or artifact sizes.
+fn load_issue_with(pm_dir: &Path, project_key: &str, id: &str, detail: bool) -> Result<Issue> {
     model::check_id(id)?;
     let dir = pm_dir.join(project_key).join(id);
     let file = dir.join("issue.md");
@@ -163,8 +172,16 @@ pub fn load_issue(pm_dir: &Path, project_key: &str, id: &str) -> Result<Issue> {
         project: project_key.to_string(),
         front,
         body,
-        comments: read_comments(&dir),
-        artifacts: read_artifacts(&dir),
+        comments: if detail {
+            read_comments(&dir)
+        } else {
+            Vec::new()
+        },
+        artifacts: if detail {
+            read_artifacts(&dir)
+        } else {
+            Vec::new()
+        },
         dir,
     })
 }
@@ -200,6 +217,27 @@ pub(crate) fn collection_parses() -> u64 {
 /// Unparseable issue.md files surface as a lint error — here they are
 /// skipped so one bad file cannot take down the whole board.
 pub fn load_all(pm_dir: &Path, project_key: Option<&str>) -> Result<Vec<Issue>> {
+    load_all_with(pm_dir, project_key, |_| true)
+}
+
+/// [`load_all`] with the drawer-only reads scoped to `detail`: comments
+/// and artifacts are read for that one issue, and for none when it is
+/// `None`. Every other issue carries the front matter and body that
+/// derivation, links and checkbox counts read — the strategy for a
+/// drawer (one id) and for a projected list that cannot emit `counts`.
+pub fn load_all_for_detail(
+    pm_dir: &Path,
+    project_key: Option<&str>,
+    detail: Option<&str>,
+) -> Result<Vec<Issue>> {
+    load_all_with(pm_dir, project_key, |id| detail == Some(id))
+}
+
+fn load_all_with(
+    pm_dir: &Path,
+    project_key: Option<&str>,
+    mut detail: impl FnMut(&str) -> bool,
+) -> Result<Vec<Issue>> {
     let mut issues = Vec::new();
     for project in project::list(pm_dir)? {
         if let Some(only) = project_key {
@@ -222,7 +260,7 @@ pub fn load_all(pm_dir: &Path, project_key: Option<&str>) -> Result<Vec<Issue>> 
                 continue;
             }
             COLLECTION_PARSES.with(|n| n.set(n.get().saturating_add(1)));
-            if let Ok(issue) = load_issue(pm_dir, &project.key, &id) {
+            if let Ok(issue) = load_issue_with(pm_dir, &project.key, &id, detail(&id)) {
                 issues.push(issue);
             }
         }
@@ -356,18 +394,199 @@ pub fn outcomes_from_jobs(jobs: &[Value]) -> JobOutcomes {
     out
 }
 
-/// Live job outcomes from the daemon — an unreachable daemon yields an
-/// empty map, which degrades to pre-job derivation exactly.
-pub fn fetch_job_outcomes(state_dir: &Path) -> JobOutcomes {
-    match crate::client::rpc(state_dir, "job_list", json!({"all": true})) {
-        Ok(list) => outcomes_from_jobs(
-            list["jobs"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .as_slice(),
-        ),
-        Err(_) => JobOutcomes::new(),
+/// Bound on one best-effort `job_list` read. A board read must not
+/// wait the general 700 s call bound on a wedged peer: past this the
+/// job state is reported unavailable and readiness stays unproven.
+pub const JOB_READ_BUDGET: Duration = Duration::from_secs(2);
+
+/// What one `job_list` read established. The distinction is the point:
+/// an empty `jobs` array is a known-empty job table, while an
+/// unreachable, stalled or malformed reply is unknown state that must
+/// not be mistaken for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobState {
+    /// The daemon answered with a well-formed `jobs` array.
+    Known(JobOutcomes),
+    /// The daemon did not answer inside [`JOB_READ_BUDGET`] — transient
+    /// contention, so a retry may succeed.
+    Stalled(String),
+    /// No daemon answered (no socket, refused) — retrying alone does
+    /// not help until one is running.
+    Unavailable(String),
+    /// The daemon answered, but the reply was unusable: no `jobs`
+    /// array, or an issue-bound row whose task summary cannot be read.
+    Malformed(String),
+}
+
+impl JobState {
+    /// A caller that intentionally reads the tracker only — a unit test
+    /// or a caller with no runtime in hand. This is pre-job derivation
+    /// by choice, never a stand-in for an unavailable runtime: only a
+    /// [`Self::Known`] from an actual `job_list` may stand for an empty
+    /// job table on a decision path.
+    pub fn tracker_only() -> Self {
+        Self::Known(JobOutcomes::new())
+    }
+
+    /// True only for a well-formed daemon answer (an empty list counts).
+    pub fn is_known(&self) -> bool {
+        matches!(self, Self::Known(_))
+    }
+
+    /// Why the state is unknown — `None` when it is known.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Known(_) => None,
+            Self::Stalled(why) | Self::Unavailable(why) | Self::Malformed(why) => {
+                Some(why.as_str())
+            }
+        }
+    }
+
+    /// `known` | `unavailable` | `malformed` — the wire state name.
+    /// A stalled read is unavailable state too; its `reason` says it
+    /// was the bound that expired.
+    pub fn state_name(&self) -> &'static str {
+        match self {
+            Self::Known(_) => "known",
+            Self::Stalled(_) | Self::Unavailable(_) => "unavailable",
+            Self::Malformed(_) => "malformed",
+        }
+    }
+
+    /// The outcomes to derive with. Unknown state contributes no job
+    /// outcome — the caller must not read that as "no job exists".
+    pub fn outcomes(&self) -> &JobOutcomes {
+        static EMPTY: LazyLock<JobOutcomes> = LazyLock::new(JobOutcomes::new);
+        match self {
+            Self::Known(jobs) => jobs,
+            Self::Stalled(_) | Self::Unavailable(_) | Self::Malformed(_) => &EMPTY,
+        }
+    }
+
+    /// The outcomes a decision needs — or the refusal when the state is
+    /// not authoritative. Only a stalled read is transient (`busy`,
+    /// exit 75); an absent daemon and a malformed reply are standing
+    /// local failures (`internal`, exit 70), never a retryable
+    /// contention. `what` names the decision, so the message says
+    /// which path refused and why.
+    pub fn require(&self, what: &str) -> Result<()> {
+        match self {
+            Self::Known(_) => Ok(()),
+            Self::Stalled(why) => Err(Error::busy_coded(
+                "job_state_unavailable",
+                format!("{what} needs authoritative job state: {why} — retry"),
+            )),
+            Self::Unavailable(why) => Err(Error::internal(format!(
+                "{what} needs authoritative job state: {why}"
+            ))),
+            Self::Malformed(why) => Err(Error::internal(format!(
+                "{what} needs authoritative job state: the daemon's job_list reply was \
+                 malformed ({why}) — refusing to guess"
+            ))),
+        }
+    }
+
+    /// `{"state": …}` for a list/detail document; `reason` only when
+    /// the state is unknown.
+    pub fn json(&self) -> Value {
+        match self {
+            Self::Known(_) => json!({"state": self.state_name()}),
+            Self::Stalled(why) | Self::Unavailable(why) | Self::Malformed(why) => {
+                json!({"state": self.state_name(), "reason": why})
+            }
+        }
+    }
+}
+
+/// The task states a `job_list` count map may name — the store's task
+/// vocabulary (`store::plans` transitions and `is_task_terminal`). A
+/// state outside it is schema drift, and deriving a board status from
+/// it would be a guess.
+const TASK_STATES: &[&str] = &[
+    "draft",
+    "blocked",
+    "dispatched",
+    "running",
+    "revising",
+    "review",
+    "verified",
+    "done",
+    "failed",
+    "cancelled",
+];
+
+/// The first unusable issue-bound row in a `job_list` reply, if any.
+///
+/// The daemon emits every row as an object with `issue` always present
+/// (a string when bound, null when unbound) and `tasks` as a
+/// state→count object (`{}` when the job has no tasks). A job bound to
+/// no issue is legitimate and its tasks are irrelevant to the board; a
+/// row with no `issue` property at all is schema drift, not proof of
+/// that. A *bound* row whose task summary cannot be read would
+/// otherwise derive as "no job outcome" — the same shape as a
+/// known-empty job table — so it is malformed instead: a missing or
+/// non-object `tasks`, an unknown task state, or a count that is not a
+/// non-negative integer.
+fn malformed_job_row(jobs: &[Value]) -> Option<String> {
+    for (index, job) in jobs.iter().enumerate() {
+        let Some(row) = job.as_object() else {
+            return Some(format!("job row {index} is not an object"));
+        };
+        let issue = match row.get("issue") {
+            // `Job::to_json` always emits the key (string or null); a
+            // row without it is schema drift, not proof of an unbound
+            // job.
+            None => return Some(format!("job row {index} has no issue binding")),
+            Some(Value::Null) => continue,
+            // The writer (`create_job` -> `model::check_id`) rejects an
+            // empty id, so "" is legacy data only; the store's own
+            // reads normalize it to unbound (`NULLIF`/`COALESCE`), so
+            // the board matches that meaning rather than degrading.
+            Some(Value::String(issue)) if issue.is_empty() => continue,
+            Some(Value::String(issue)) => issue,
+            Some(_) => return Some(format!("job row {index} has a non-string issue")),
+        };
+        let Some(tasks) = row.get("tasks").and_then(Value::as_object) else {
+            return Some(format!("issue {issue}'s job has no usable tasks summary"));
+        };
+        for (state, count) in tasks {
+            if !TASK_STATES.contains(&state.as_str()) {
+                return Some(format!(
+                    "issue {issue}'s job has an unknown task state '{state}'"
+                ));
+            }
+            if count.as_i64().is_none_or(|n| n < 0) {
+                return Some(format!(
+                    "issue {issue}'s job has an invalid task count for '{state}'"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Live job state from the daemon under [`JOB_READ_BUDGET`]. An
+/// unreachable daemon, a spent deadline or a malformed reply — no
+/// `jobs` array, or an issue-bound row whose task summary cannot be
+/// read — is reported as unknown, never as an empty job table.
+pub fn fetch_job_state(state_dir: &Path) -> JobState {
+    match crate::client::rpc_deadline(state_dir, "job_list", json!({"all": true}), JOB_READ_BUDGET)
+    {
+        Ok(reply) => match reply["jobs"].as_array() {
+            Some(jobs) => match malformed_job_row(jobs) {
+                Some(why) => JobState::Malformed(why),
+                None => JobState::Known(outcomes_from_jobs(jobs)),
+            },
+            None => JobState::Malformed("job_list reply carried no jobs array".to_string()),
+        },
+        // A spent deadline is the bounded read's own busy answer; say
+        // so rather than surfacing the transport's metadata wording.
+        Err(error) if error.kind() == "busy" => JobState::Stalled(format!(
+            "daemon did not answer job_list within {}s",
+            JOB_READ_BUDGET.as_secs()
+        )),
+        Err(error) => JobState::Unavailable(error.to_string()),
     }
 }
 
@@ -437,7 +656,24 @@ pub fn views(notes_dir: &Path, issues: Vec<Issue>) -> Vec<View> {
 
 /// Compute views for a set of issues (usually everything under the PM
 /// dir so cross-project links resolve) against the daemon's job state.
+/// Unknown job state never asserts readiness: `ready` stays false
+/// because the "unblocked" half cannot be proven.
+pub fn views_with_job_state(notes_dir: &Path, issues: Vec<Issue>, state: &JobState) -> Vec<View> {
+    views_inner(notes_dir, issues, state.outcomes(), state.is_known())
+}
+
+/// Compute views for a set of issues (usually everything under the PM
+/// dir so cross-project links resolve) against the daemon's job state.
 pub fn views_with_jobs(notes_dir: &Path, issues: Vec<Issue>, jobs: &JobOutcomes) -> Vec<View> {
+    views_inner(notes_dir, issues, jobs, true)
+}
+
+fn views_inner(
+    notes_dir: &Path,
+    issues: Vec<Issue>,
+    jobs: &JobOutcomes,
+    jobs_known: bool,
+) -> Vec<View> {
     // One pass over the notes dir for every issue's chain and status.
     let mut notes_of = notes::index(notes_dir);
     // Children edges decide containers before statuses derive.
@@ -540,7 +776,10 @@ pub fn views_with_jobs(notes_dir: &Path, issues: Vec<Issue>, jobs: &JobOutcomes)
             // job-blocked issue is neither ready nor cleanly movable.
             let blocked =
                 issue.front.blocked_by.iter().any(|b| !done(b)) || blocked_reason.is_some();
-            let ready = cadence_core::issue::leaf_ready(&status, blocked);
+            // Readiness is a positive claim: without authoritative job
+            // state the "not job-blocked" half is unproven, so it is
+            // never asserted — the caller reports the degraded state.
+            let ready = jobs_known && cadence_core::issue::leaf_ready(&status, blocked);
             let blocks = blocks_of.get(&id).cloned().unwrap_or_default();
             let duplicates = duplicates_of.get(&id).cloned().unwrap_or_default();
             let (checks_done, checks_total) = parse::checkbox_progress(&issue.body);

@@ -1991,3 +1991,342 @@ mod cad2081_workflow_verdicts {
         refused(&f, case, "cannot read the workspace identity map");
     }
 }
+
+// CAD-2009: independently authored by the ticket author; implementers must not edit.
+#[test]
+fn cad2009_broken_org_registry_never_routes_implicit_work_to_local_tracker() {
+    use std::os::unix::fs::symlink;
+    use std::process::{Command, Output};
+
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("config");
+    let state = home.path().join("state");
+    let tracker = home.path().join("pm");
+    let issue = tracker.join("synthetic").join("SYN-1");
+    let notes = home.path().join("notes");
+    std::fs::create_dir_all(&issue).unwrap();
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::create_dir_all(config.join("cadence")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        tracker.join("pm.yaml"),
+        format!("schema: 1\nnotes_dir: '{}'\n", notes.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        tracker.join("synthetic").join("project.yaml"),
+        "key: synthetic\nprefix: SYN\n",
+    )
+    .unwrap();
+    std::fs::write(
+        issue.join("issue.md"),
+        "---\nid: SYN-1\ntitle: Synthetic issue\nstatus: ready\npriority: P2\ncreated: '2026-01-01T00:00:00Z'\n---\n\nSynthetic.\n",
+    )
+    .unwrap();
+
+    let run = |prefix: &[&str]| -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.env_clear()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_STATE_HOME", &state)
+            .env("PATH", "/usr/bin:/bin")
+            .args(prefix)
+            .args(["issue", "ls", "--json"]);
+        cadence_agent::reaper::output(&mut cmd).unwrap()
+    };
+    let local = |out: Output| {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(body["issues"][0]["id"], "SYN-1");
+    };
+    local(run(&[]));
+
+    symlink("missing-registry", config.join("cadence").join("orgs.json")).unwrap();
+    let refused = run(&[]);
+    assert!(
+        !refused.status.success(),
+        "broken registry selected the local tracker"
+    );
+    assert!(!String::from_utf8_lossy(&refused.stdout).contains("SYN-1"));
+
+    // An explicitly pinned local instance does not depend on the saved selection.
+    local(run(&["--state-dir", state.to_str().unwrap()]));
+
+    std::fs::remove_file(config.join("cadence").join("orgs.json")).unwrap();
+    std::fs::write(config.join("cadence").join("orgs.json"), "{invalid").unwrap();
+    let refused = run(&[]);
+    assert!(
+        !refused.status.success(),
+        "invalid registry selected the local tracker"
+    );
+    assert!(!String::from_utf8_lossy(&refused.stdout).contains("SYN-1"));
+
+    let dangling_root = home.path().join("dangling-config");
+    symlink("missing-root", &dangling_root).unwrap();
+    let dangling_parent = home.path().join("config-with-dangling-parent");
+    std::fs::create_dir(&dangling_parent).unwrap();
+    symlink("missing-parent", dangling_parent.join("cadence")).unwrap();
+    symlink("missing-default-config", home.path().join(".config")).unwrap();
+    for config_root in [Some(&dangling_root), Some(&dangling_parent), None] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.env_clear()
+            .env("HOME", home.path())
+            .env("XDG_STATE_HOME", &state)
+            .env("PATH", "/usr/bin:/bin")
+            .args(["issue", "ls", "--json"]);
+        if let Some(root) = config_root {
+            cmd.env("XDG_CONFIG_HOME", root);
+        }
+        let refused = cadence_agent::reaper::output(&mut cmd).unwrap();
+        assert!(
+            !refused.status.success(),
+            "broken config ancestor selected local"
+        );
+        assert!(!String::from_utf8_lossy(&refused.stdout).contains("SYN-1"));
+    }
+
+    let real_config = home.path().join("real-config");
+    let linked_config = home.path().join("linked-config");
+    std::fs::create_dir(&real_config).unwrap();
+    symlink(&real_config, &linked_config).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.env_clear()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", &linked_config)
+        .env("XDG_STATE_HOME", &state)
+        .env("PATH", "/usr/bin:/bin")
+        .args(["issue", "ls", "--json"]);
+    local(cadence_agent::reaper::output(&mut cmd).unwrap());
+}
+
+// CAD-2009: a consumer closing stdout must not turn a refusal into success.
+#[test]
+fn cad2009_closed_stdout_preserves_offline_app_check_refusal() {
+    use std::os::unix::net::UnixStream;
+    use std::process::{Command, Stdio};
+
+    let home = tempfile::tempdir().unwrap();
+    let command = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.env_clear()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .args(["app", "check", "https://example.invalid/package"]);
+        cmd
+    };
+    let normal = cadence_agent::reaper::output(&mut command()).unwrap();
+    assert_eq!(normal.status.code(), Some(3));
+    let report: serde_json::Value = serde_json::from_slice(&normal.stdout).unwrap();
+    assert_eq!(report["ok"], false);
+
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    let mut closed = command();
+    let writer: std::os::fd::OwnedFd = writer.into();
+    closed.stdout(Stdio::from(writer)).stderr(Stdio::piped());
+    let output = cadence_agent::reaper::spawn(&mut closed)
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "closed stdout changed the refusal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    let writer: std::os::fd::OwnedFd = writer.into();
+    let mut closed_stderr = command();
+    closed_stderr
+        .env("CADENCE_JSON", "invalid-format")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(writer));
+    let output = cadence_agent::reaper::spawn(&mut closed_stderr)
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["ok"], false);
+}
+
+#[test]
+fn cad2009_org_list_respects_requested_json_format() {
+    use std::process::Command;
+
+    let home = tempfile::tempdir().unwrap();
+    let run = |format: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.env_clear()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .env("CADENCE_JSON", format)
+            .args(["org", "list"]);
+        cadence_agent::reaper::output(&mut cmd).unwrap()
+    };
+    let compact = run("compact");
+    let pretty = run("pretty");
+    assert!(compact.status.success());
+    assert!(pretty.status.success());
+    let compact_text = String::from_utf8(compact.stdout).unwrap();
+    let pretty_text = String::from_utf8(pretty.stdout).unwrap();
+    assert_eq!(compact_text.lines().count(), 1);
+    assert!(pretty_text.lines().count() > 1);
+    let compact_value: serde_json::Value = serde_json::from_str(&compact_text).unwrap();
+    let pretty_value: serde_json::Value = serde_json::from_str(&pretty_text).unwrap();
+    assert_eq!(compact_value, pretty_value);
+}
+
+// CAD-2009: independently authored by the ticket author; implementers must not edit.
+#[test]
+fn cad2009_unavailable_job_snapshot_never_claims_blocked_issue_is_ready() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::process::Command;
+
+    fn accept_request(listener: UnixListener) -> UnixStream {
+        let mut descriptor = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: descriptor points to one initialized pollfd for this call.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 5_000) };
+        assert_eq!(ready, 1, "CLI did not connect to the synthetic daemon");
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        stream
+    }
+
+    let home = tempfile::Builder::new()
+        .prefix("cad2009-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let tracker = home.path().join("pm");
+    let state = home.path().join("state");
+    let notes = home.path().join("notes");
+    let issue = tracker.join("synthetic").join("SYN-1");
+    std::fs::create_dir_all(&issue).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        tracker.join("pm.yaml"),
+        format!("schema: 1\nnotes_dir: '{}'\n", notes.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        tracker.join("synthetic").join("project.yaml"),
+        "key: synthetic\nprefix: SYN\n",
+    )
+    .unwrap();
+    std::fs::write(
+        issue.join("issue.md"),
+        "---\nid: SYN-1\ntitle: Synthetic issue\nstatus: ready\npriority: P2\ncreated: '2026-01-01T00:00:00Z'\n---\n\nSynthetic.\n",
+    )
+    .unwrap();
+    let run = |ready: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.env_clear()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_STATE_HOME", home.path().join("xdg-state"))
+            .env("CADENCE_STATE_DIR", &state)
+            .env("CADENCE_PM_DIR", &tracker)
+            .env("PATH", "/usr/bin:/bin")
+            .args(["issue", "ls", "--json"]);
+        if ready {
+            cmd.arg("--ready");
+        }
+        cadence_agent::reaper::output(&mut cmd).unwrap()
+    };
+
+    let socket = state.join("cadence.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let daemon = std::thread::spawn(move || {
+        let mut stream = accept_request(listener);
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], "job_list");
+        let response = serde_json::json!({"ok": true, "result": {"jobs": [{
+            "id": "synthetic-job", "issue": "SYN-1", "state": "open",
+            "created": "2026-01-02", "tasks": {"blocked": 1}
+        }]}});
+        writeln!(stream, "{response}").unwrap();
+    });
+    let known = run(true);
+    daemon.join().unwrap();
+    assert!(
+        known.status.success(),
+        "{}",
+        String::from_utf8_lossy(&known.stderr)
+    );
+    let known: serde_json::Value = serde_json::from_slice(&known.stdout).unwrap();
+    assert_eq!(known["job_state"]["state"], "known");
+    assert!(known["issues"].as_array().unwrap().is_empty());
+    std::fs::remove_file(&socket).unwrap();
+
+    let listener = UnixListener::bind(&socket).unwrap();
+    let daemon = std::thread::spawn(move || {
+        let mut stream = accept_request(listener);
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        let response = serde_json::json!({"ok": true, "result": {"jobs": [{
+            "id": "synthetic-job", "issue": "SYN-1", "state": "open",
+            "created": "2026-01-02", "tasks": "not-a-task-summary"
+        }]}});
+        writeln!(stream, "{response}").unwrap();
+    });
+    let malformed = run(false);
+    daemon.join().unwrap();
+    assert!(
+        malformed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&malformed.stderr)
+    );
+    let malformed: serde_json::Value = serde_json::from_slice(&malformed.stdout).unwrap();
+    assert_eq!(malformed["job_state"]["state"], "malformed");
+    assert_eq!(malformed["issues"][0]["ready"], false);
+    std::fs::remove_file(&socket).unwrap();
+
+    let unknown = run(true);
+    assert!(
+        !unknown.status.success(),
+        "unknown job state must not produce an authoritative ready list"
+    );
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("job state"),
+        "the refusal must explain that job state is unavailable"
+    );
+    let offline = run(false);
+    assert!(
+        offline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&offline.stdout).unwrap();
+    assert_eq!(body["job_state"]["state"], "unavailable");
+    let issue = body["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "SYN-1")
+        .expect("offline reads still return the tracker issue");
+    assert_eq!(issue["ready"], false);
+}

@@ -373,7 +373,9 @@ pub(crate) fn stop_group(state_dir: &Path, group: &str) -> Result<i32> {
             })
             .unwrap_or(false);
         if is_inbox {
-            eprintln!("stop {alias}: skipped (inbox — durable mailbox)");
+            // A closed stderr must not abort the sweep and report success:
+            // the remaining agents would stay running.
+            eprint_line(&format!("stop {alias}: skipped (inbox — durable mailbox)"));
             skipped.push(json!({"alias": alias}));
             continue;
         }

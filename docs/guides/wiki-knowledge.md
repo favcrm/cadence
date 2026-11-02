@@ -171,12 +171,15 @@ The command hashes the source and refuses symlinks, special files, and
 internal paths before it mutates the wiki. It prints the job id and digest
 before entry writes. Repeat the same source and `--resume JOB_ID` after an
 interruption. Resume reuses the admitted manifest and its destination revisions;
-it does not read those revisions again. An empty directory is admitted with no
-entries, and finish creates that root. `--update` pins the destination's
-current revisions and replaces changed bytes. Without it, identical content
-can be skipped, but changed existing pages are create-only. A partial job
-exits nonzero and names the job id. `--wait-index` polls that job's own
-status until the index is covered, the job fails, or the command deadline
+it does not read those revisions again. The client chooses the job id before
+`begin`; if its response is lost or unusable, the error names that same id.
+Inspect or resume that job rather than starting a fresh copy blindly.
+An empty directory is admitted with no entries, and finish creates that root.
+`--update` pins the destination's current revisions and replaces changed
+bytes. Without it, identical content can be skipped, but changed existing
+pages are create-only. A partial job exits nonzero and names the job id.
+`--wait-index` polls that job's own status until the index is covered, the job
+fails, or the command deadline
 passes. It does not refresh the global index.
 
 Matching working-tree bytes alone are not proof of publication. If the desired

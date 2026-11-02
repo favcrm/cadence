@@ -160,8 +160,8 @@ pub fn run_epic(action: &EpicAction, state_dir: &std::path::Path) -> Result<i32>
     }
     // Every project loads so cross-project children count.
     let issues = board::load_all(&pm.dir, None)?;
-    let jobs = board::fetch_job_outcomes(state_dir);
-    let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    let jobs = board::fetch_job_state(state_dir);
+    let views = board::views_with_job_state(&pm.config.notes_dir(), issues, &jobs);
     let now = crate::issue::time::now_epoch();
     let by_id: std::collections::HashMap<String, &board::View> = views
         .iter()

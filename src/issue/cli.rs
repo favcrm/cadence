@@ -976,9 +976,10 @@ impl PolicyVisibility {
     }
 }
 
-pub(crate) fn print_json(value: &Value) {
-    println!("{}", crate::output::json_text(value).unwrap_or_default());
-}
+/// The library verbs print through the same closed-consumer rule and
+/// JSON policy as the binary: a closed stdout or stderr never turns a
+/// verb's own exit code into a panic.
+pub(crate) use crate::output::{eprint_line, print_json};
 
 fn open_pm() -> Result<Pm> {
     Pm::open_default()

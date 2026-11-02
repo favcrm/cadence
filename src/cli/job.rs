@@ -361,7 +361,9 @@ pub(super) fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
             // the work and what state it is in, and exit 4 so a script
             // sees the two outcomes differently.
             if let Some(line) = duplicate_dispatch_line(&out) {
-                println!("{line}");
+                // The line precedes the exit-4 retry verdict: a closed
+                // stdout must not panic it into success.
+                print_line(&line);
                 return Ok(4);
             }
             print_json(&out);

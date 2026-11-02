@@ -12,6 +12,12 @@
 //!   state dir + tracker already are, no cloud identity asserted.
 //! - `--org` beats `CADENCE_ORG` beats the saved `selected`; absent all
 //!   three the resolved org is `local`.
+//! - A genuinely absent registry is standalone local use. A *broken* one —
+//!   an unusable declared config root, a dangling symlink (at the registry
+//!   or in a config-root directory above it), an unreadable parent or file,
+//!   a malformed `orgs.json` — refuses selection before any local state is
+//!   used; it never falls back to ambient local roots. A symlinked config
+//!   root that resolves to a directory stays usable.
 //! - A managed caller (`CADENCE_ALIAS`) keeps its inherited local daemon
 //!   and never consults the registry. `--org` is accepted only when it
 //!   matches the hosted org on that alias's single running kickoff
@@ -26,6 +32,7 @@
 //! are removed per the CAD-1019 PM direction; the on-disk `orgs.json` shape
 //! is unchanged so a later CAD-657 merge does not fork the format.
 
+use super::{eprint_line, print_json};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs::{File, OpenOptions};
@@ -83,10 +90,21 @@ struct RegistryFile {
 
 impl RegistryFile {
     fn path() -> Result<PathBuf> {
-        // The same hosted config root as the credentials: `<home>/config`
-        // for a first run, `$XDG_CONFIG_HOME/cadence` (else
-        // `~/.config/cadence`) for an existing installation.
-        Ok(cadence_agent::home::config_dir()?.join("orgs.json"))
+        // Use the same first-run or legacy config root as hosted credentials.
+        let root = cadence_agent::home::config_dir()?;
+        if !root.is_absolute()
+            || root.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(Error::rejected(
+                "the config root must be absolute with no . or ..",
+            ));
+        }
+        Ok(root.join("orgs.json"))
     }
     /// Exclusive flock: every read-modify-write is one locked snapshot, so a
     /// `login` racing a `switch` cannot interleave a stale default.
@@ -163,17 +181,21 @@ impl RegistryFile {
 }
 
 /// The saved default org, if the registry is already there. A missing
-/// file is "no saved org". This does not create the directory, the
-/// registry, or the lock, and it never changes the selection.
+/// registry is "no saved org"; a broken one — an unusable config root, a
+/// dangling symlink, an unreadable or malformed file — refuses rather than
+/// pretending nothing was ever selected. This does not create the
+/// directory, the registry, or the lock, and it never changes the
+/// selection.
 pub(super) fn selected_org_readonly() -> Result<Option<String>> {
-    let path = match RegistryFile::path() {
-        Ok(path) => path,
-        Err(_) => return Ok(None),
+    let Some(path) = selection_registry_path()? else {
+        return Ok(None);
     };
-    if !path.exists() {
+    if !registry_present(&path)? {
         return Ok(None);
     }
-    Ok(read_registry(&path)?.selected.map(|selected| selected.org))
+    Ok(read_present_registry(&path)?
+        .selected
+        .map(|selected| selected.org))
 }
 
 /// Read and validate `orgs.json` at `path` — the body of
@@ -196,6 +218,14 @@ fn read_registry_raw(path: &Path) -> Result<(Registry, Option<Vec<u8>>)> {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((Registry::default(), None))
+        }
+        // `O_NOFOLLOW` refuses any symlink, dangling or not. Name that
+        // plainly: a link is a registry this process will not read, never
+        // "no registry".
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(Error::rejected(
+                "org registry must not be a symbolic link; refusing destination selection",
+            ))
         }
         Err(e) => return Err(e.into()),
     };
@@ -411,7 +441,7 @@ pub(super) fn run(action: OrgAction) -> Result<i32> {
             view(&c, true)
         }
     };
-    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    print_json(&out);
     Ok(0)
 }
 
@@ -676,7 +706,10 @@ fn settle_managed(
     }
     let state_dir = cadence_agent::client::state_dir()?;
     let target = hosted_assignment_target(&state_dir, &alias, selector)?;
-    eprintln!("cadence org={} remote={}", target.org, target.endpoint);
+    eprint_line(&format!(
+        "cadence org={} remote={}",
+        target.org, target.endpoint
+    ));
     Ok(Selected::Remote(target))
 }
 
@@ -685,7 +718,9 @@ fn settle_managed(
 ///
 /// `None` keeps the GitHub device flow anonymous — the owner then chooses the
 /// workspace explicitly — so a missing or unrenewable login never blocks the
-/// flow and never invents a workspace.
+/// flow and never invents a workspace. A broken registry (unusable config
+/// root, dangling symlink, unreadable or malformed file) is not "no saved
+/// login" and refuses instead.
 pub(super) fn saved_login_token(auth_dir: Option<&Path>) -> Result<Option<String>> {
     let Some(org) = selected_org_readonly()? else {
         return Ok(None);
@@ -693,11 +728,14 @@ pub(super) fn saved_login_token(auth_dir: Option<&Path>) -> Result<Option<String
     if org == LOCAL_ORG {
         return Ok(None);
     }
-    let file = match RegistryFile::path() {
-        Ok(path) if path.exists() => RegistryFile::open()?,
-        _ => return Ok(None),
+    let Some(path) = selection_registry_path()? else {
+        return Ok(None);
     };
-    let registry = file.read()?;
+    if !registry_present(&path)? {
+        return Ok(None);
+    }
+    let file = RegistryFile::open()?;
+    let registry = present_registry(file.read_snapshot()?)?;
     let Some(conn) = select(&registry, Some(org.as_str()))? else {
         return Ok(None);
     };
@@ -797,7 +835,10 @@ fn settle(
             // The destination is the issuer-verified endpoint recorded at
             // login — `remote_cli` refuses to send this org's credential
             // anywhere else, and there is no local fallback.
-            eprintln!("cadence org={} remote={}", conn.selection.org, endpoint);
+            eprint_line(&format!(
+                "cadence org={} remote={}",
+                conn.selection.org, endpoint
+            ));
             Ok(Selected::Remote(cadence_agent::remote_cli::RemoteTarget {
                 identity: None,
                 org: conn.selection.org,
@@ -810,41 +851,123 @@ fn settle(
 
 /// The registry a settlement reads. `Locked` keeps the exclusive-lock read
 /// every other verb uses. `ReadOnly` answers a pure read through the same shape
-/// checks without taking or creating `orgs.lock`, and fails closed: that read
-/// opens `O_NOFOLLOW`, so a dangling symlink, a permission error and a non-file
-/// all refuse — only a genuine `NotFound` is "no registry". A config root this
-/// process declared but cannot use (a relative `XDG_CONFIG_HOME`, a `HOME` that
-/// is not absolute) is a broken selection, not an absent one, so it refuses
-/// too; with neither `HOME` nor `XDG_CONFIG_HOME` set there is nowhere a
-/// registry could be kept, and a local read still answers.
+/// checks without taking or creating `orgs.lock`. Both fail closed: only a
+/// genuinely absent first-use path is "no registry" — a dangling symlink
+/// (including one in the config root above the registry), a permission error
+/// and a non-file all refuse. A config root this process declared but cannot
+/// use (a relative `XDG_CONFIG_HOME`, a `HOME` that is not absolute) is a
+/// broken selection, not an absent one, so it refuses too; with neither `HOME`
+/// nor `XDG_CONFIG_HOME` set there is nowhere a registry could be kept, and a
+/// local read still answers.
 fn read_selection_registry(mode: RegistryMode) -> Result<Option<Registry>> {
-    let resolved = RegistryFile::path();
+    let Some(path) = selection_registry_path()? else {
+        return Ok(None);
+    };
+    // The presence gate is shared: a broken config root must refuse before a
+    // read-only verb can treat it as "no registry" too.
+    if !registry_present(&path)? {
+        return Ok(None);
+    }
     match mode {
-        // Unchanged for every other verb: an unplaceable registry path is "no
-        // registry", and so is one `exists()` does not report; opening it
-        // takes the write lock.
-        RegistryMode::Locked => {
-            if !resolved.as_ref().is_ok_and(|path| path.exists()) {
-                return Ok(None);
-            }
-            RegistryFile::open()?.read().map(Some)
+        // Unchanged for every other verb: a genuinely absent registry creates
+        // nothing — not the directory, not the lock — while a present one is
+        // read under the exclusive write lock.
+        RegistryMode::Locked => Ok(Some(present_registry(
+            RegistryFile::open()?.read_snapshot()?,
+        )?)),
+        RegistryMode::ReadOnly => Ok(Some(read_present_registry(&path)?)),
+    }
+}
+
+/// The registry path this process would use, or `None` when it declared no
+/// config root at all (`XDG_CONFIG_HOME`, else `HOME`) — nowhere a registry
+/// could be kept, so a local caller still answers. A root this process did
+/// declare but that cannot hold an absolute registry path is a broken
+/// selection and refuses here, before any local state is materialized.
+fn selection_registry_path() -> Result<Option<PathBuf>> {
+    match RegistryFile::path() {
+        Ok(path) => Ok(Some(path)),
+        Err(_) if !config_root_declared() => Ok(None),
+        Err(e) => Err(Error::rejected(format!(
+            "cannot locate the org registry: {e}"
+        ))),
+    }
+}
+
+/// Whether `orgs.json` is there, decided without following the registry
+/// itself, without turning an I/O failure into "absent", and without writing
+/// anything.
+///
+/// A single `symlink_metadata(path)` is not enough: it reports `NotFound` for
+/// everything *below* a dangling symlink too, so a `XDG_CONFIG_HOME`, a
+/// `HOME/.config` or a `cadence` directory that is a link to a missing target
+/// would read as first use and let selection fall back to ambient local state.
+/// When `path` itself is missing, the parent chain decides: the first ancestor
+/// that exists must be a usable directory. A real directory — or a symlink to
+/// one, which keeps a legitimately relocated config root working — means every
+/// missing component below it is genuinely absent, so this is first use. A
+/// dangling symlink, a non-directory or an unreadable component is a broken
+/// selection and refuses. `read_registry_raw` then refuses a symlink at the
+/// registry itself through `O_NOFOLLOW`.
+fn registry_present(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(inspect_refused(&e.to_string())),
+    }
+    for ancestor in path.ancestors().skip(1) {
+        let metadata = match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => metadata,
+            // This component does not exist; the next ancestor up decides
+            // whether that is first use or a dangling link above it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(inspect_refused(&e.to_string())),
+        };
+        let shown = ancestor.display();
+        if metadata.is_dir() {
+            return Ok(false);
         }
-        // `raw` is `Some` on every successful read, so its presence is exactly
-        // "a registry exists" — no second stat, no stat/open race.
-        RegistryMode::ReadOnly => {
-            let path = match resolved {
-                Ok(path) => path,
-                Err(_) if !config_root_declared() => return Ok(None),
-                Err(e) => {
-                    return Err(Error::rejected(format!(
-                        "cannot locate the org registry: {e}"
-                    )))
-                }
-            };
-            let (registry, raw) = read_registry_raw(&path)?;
-            Ok(raw.map(|_| registry))
+        if !metadata.file_type().is_symlink() {
+            return Err(inspect_refused(&format!("{shown} is not a directory")));
+        }
+        // A symlinked config root is legitimate when it resolves to a
+        // directory; a dangling, looping or non-directory target is broken.
+        match std::fs::metadata(ancestor) {
+            Ok(target) if target.is_dir() => return Ok(false),
+            Ok(_) => return Err(inspect_refused(&format!("{shown} is not a directory"))),
+            Err(e) => return Err(inspect_refused(&format!("{shown} cannot be followed: {e}"))),
         }
     }
+    // Every ancestor was missing. The filesystem root always exists, so this
+    // is reachable only for a relative path, which `RegistryFile::path`
+    // never produces; a relative path cannot hold a registry this process
+    // would trust either.
+    Ok(false)
+}
+
+fn inspect_refused(detail: &str) -> Error {
+    Error::rejected(format!("cannot inspect the org registry: {detail}"))
+}
+
+/// The registry [`registry_present`] just reported as there is gone. That is a
+/// race with a concurrent removal, not first use, so it refuses instead of
+/// answering "no registry" and quietly falling back to ambient local state.
+fn vanished_registry() -> Error {
+    Error::rejected(
+        "org registry disappeared while selecting a destination; refusing destination selection",
+    )
+}
+
+/// The registry behind a presence check that already passed.
+fn present_registry(snapshot: (Registry, Option<Vec<u8>>)) -> Result<Registry> {
+    match snapshot {
+        (registry, Some(_)) => Ok(registry),
+        (_, None) => Err(vanished_registry()),
+    }
+}
+
+fn read_present_registry(path: &Path) -> Result<Registry> {
+    present_registry(read_registry_raw(path)?)
 }
 
 /// Whether this process said where its config lives — `XDG_CONFIG_HOME`, else
@@ -906,7 +1029,7 @@ pub(super) fn route(
 fn local_resolved(org: &str, state_dir: PathBuf, tracker_dir: PathBuf) -> Result<Resolved> {
     std::env::set_var("CADENCE_STATE_DIR", &state_dir);
     std::env::set_var("CADENCE_PM_DIR", &tracker_dir);
-    eprintln!("cadence org={org} local={}", state_dir.display());
+    eprint_line(&format!("cadence org={org} local={}", state_dir.display()));
     Ok(Resolved::Local(state_dir))
 }
 
@@ -968,8 +1091,10 @@ fn maintenance_pins(state: Option<&Path>, tracker: Option<&Path>) -> bool {
 }
 
 /// `Some(name)` when `CADENCE_ORG` names a stored remote connection.
-/// `local`, a local connection, an unknown name, or a missing registry are
-/// not remote. A present but unreadable registry fails closed.
+/// `local`, a local connection, an unknown name, or a genuinely missing
+/// registry are not remote. A present but unreadable registry, a dangling
+/// symlink and an unusable config root fail closed: "cannot tell" is never
+/// "not remote", which would quietly route local maintenance.
 fn remote_org_env() -> Result<Option<String>> {
     let Some(name) = std::env::var("CADENCE_ORG").ok() else {
         return Ok(None);
@@ -977,10 +1102,13 @@ fn remote_org_env() -> Result<Option<String>> {
     if name == LOCAL_ORG {
         return Ok(None);
     }
-    let registry = match RegistryFile::path() {
-        Ok(path) if path.exists() => read_registry(&path)?,
-        _ => return Ok(None),
+    let Some(path) = selection_registry_path()? else {
+        return Ok(None);
     };
+    if !registry_present(&path)? {
+        return Ok(None);
+    }
+    let registry = read_present_registry(&path)?;
     Ok(registry
         .connections
         .iter()
@@ -1082,10 +1210,18 @@ fn resolve_local_maintenance(
     }
     let org_env = std::env::var("CADENCE_ORG").ok();
     // Read-only: no write lock, no lock file, no created directory — the
-    // updater never mutates the registry to reach its local install.
-    let registry = match RegistryFile::path() {
-        Ok(path) if path.exists() => read_registry(&path)?,
-        _ => Registry::default(),
+    // updater never mutates the registry to reach its local install. Only a
+    // genuinely missing registry means "no rows"; a broken one refuses before
+    // any local state is chosen.
+    let registry = match selection_registry_path()? {
+        Some(path) => {
+            if registry_present(&path)? {
+                read_present_registry(&path)?
+            } else {
+                Registry::default()
+            }
+        }
+        None => Registry::default(),
     };
     match org.or(org_env.as_deref()) {
         // A deliberate selector is honored or refused — never ignored.

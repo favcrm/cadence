@@ -44,7 +44,9 @@ pub(super) fn run_upgrade(state_dir: &Path, args: UpgradeArgs) -> Result<i32> {
     // CAD-379: an unattested install is said on stderr too, where a human
     // reads it; stdout stays the JSON report.
     if let Some(warning) = report["warning"].as_str() {
-        eprintln!("warning: {warning}");
+        // The warning precedes a possible restart spawn: a closed stderr
+        // must not skip the restart and report success.
+        eprint_line(&format!("warning: {warning}"));
     }
     let command = upgrade::restart_command(args.as_identity.as_deref());
     if !args.restart {

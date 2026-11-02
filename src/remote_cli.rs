@@ -91,15 +91,19 @@ const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 ///
 /// The cli.write half (`issue_new`/`issue_comment`/`issue_set`/
 /// `issue_attach`/`issue_review`/`project_policy`/`project_new`/
-/// `message_send`/`team_*`) rides the same envelope — the
-/// caller's authority never travels as a request field, only inside the
-/// verified, single-use envelope. A failed or ambiguous call is never retried
-/// by the client: the wake retry is the only loop, and it fires only on a
-/// pre-forward `waking` verdict. Anything else — a timeout, a dropped
-/// connection, a 5xx after forward — stays explicitly unresolved: the
-/// mutation may or may not have landed, so reconcile before blindly
-/// re-issuing. For `project_policy`, reconcile by reading the project record;
-/// a refusal is final. For `message_send`, the caller-chosen `message` id in
+/// `message_send`/`team_*`, platform calls, the settings write operations and
+/// the audit writes) rides the same envelope — the caller's authority never
+/// travels as a request field, only inside the verified, single-use envelope.
+/// A failed or ambiguous call is never retried by the client: the wake retry
+/// is the only loop, and it fires only on a pre-forward `waking` verdict.
+/// Every mutation is classified once in [`cli_effect`] / [`wiki_effect`]
+/// (with its reconciliation read), so a timeout, a dropped connection, a 5xx
+/// after forward, or a 2xx without a receipt stays explicitly unresolved.
+/// A 2xx must also carry the verb's own correlated receipt; a malformed or
+/// foreign receipt is the same unknown outcome, never a false success. The
+/// wiki `write` action is classified the same way on its own surface. A proven
+/// pre-effect refusal keeps its definite verdict. For `message_send`, the
+/// caller-chosen `message` id in
 /// `arguments` is the reconciliation key: `message_read` returns the
 /// principal's own durable message by id, and resubmitting the same id
 /// dedupes server-side — never a blind replay. A 2xx proves the enqueue
@@ -246,44 +250,199 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
     }
 }
 
-/// The four team mutations: the Worker commits them in the same D1 batch
-/// that records the receipt, so a lost or ambiguous answer follows a
-/// possible commit exactly as a lost send answer does. The two read-only
-/// team verbs (`team_list`, `team_invites`) change nothing.
-fn team_mutation_verb(verb: &str) -> bool {
-    matches!(
-        verb,
-        "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove"
-    )
+/// What one attempted hosted call can change, and — for a mutation — the read
+/// that reconciles an answer which does not prove its effect.
+///
+/// The classification is total: [`cli_effect`] names every verb in
+/// [`REMOTE_VERBS`], [`wiki_effect`] every action in [`WIKI_ACTIONS`], and an
+/// unlisted name fails closed as a possible mutation, so no call that may have
+/// been applied can be reported as a definite refusal. A read changes nothing,
+/// so its lost answer proves nothing ran.
+#[derive(Clone, Copy)]
+enum Effect {
+    Read,
+    Mutation { reconcile: &'static str },
 }
 
-/// A verb that can change server state. When the answer to one of these is
-/// lost or ambiguous, the mutation may already have landed, so the outcome
-/// is unknown and the caller must reconcile with a read before repeating it
-/// — never a plain refusal, and never a bare retry.
+impl Effect {
+    fn is_mutation(self) -> bool {
+        matches!(self, Self::Mutation { .. })
+    }
+
+    /// The read that reconciles a mutation whose answer was lost or did not
+    /// prove the write; `None` for a read, which has no effect to reconcile.
+    fn reconciliation(self) -> Option<&'static str> {
+        match self {
+            Self::Mutation { reconcile } => Some(reconcile),
+            Self::Read => None,
+        }
+    }
+}
+
+/// One mutating effect: the verb can change durable state, and `reconcile` is
+/// the read a caller runs before repeating it when the answer is lost or does
+/// not prove the write.
+fn mutation(reconcile: &'static str) -> Effect {
+    Effect::Mutation { reconcile }
+}
+
+// Reconciliation guidance for every mutation this build can send: what the
+// caller reads before repeating a write whose answer was lost, post-forward or
+// unusable. A note never claims the write failed and never invites a blind
+// retry.
+const RECONCILE_SEND: &str = "the send may or may not have been recorded";
+const RECONCILE_ISSUE_NEW: &str = "the ticket may or may not have been created — read `issue ls` for the same project (and `issue show` the id or title) before filing it again";
+const RECONCILE_ISSUE_COMMENT: &str = "the comment may or may not have been recorded — read `issue show` for the same issue before repeating it";
+const RECONCILE_ISSUE_SET: &str = "the edit may or may not have been applied — read `issue show` for the same issue (a new rev proves it) before repeating it";
+const RECONCILE_ISSUE_ATTACH: &str = "the attachment may or may not have been recorded — inspect the same issue and artifact before repeating it";
+const RECONCILE_ISSUE_REVIEW: &str = "the verdict may or may not have been recorded — read the same issue before repeating it; a reviewer holds one verdict per revision";
+const RECONCILE_ISSUE_MESSAGE_SEND: &str = "the message may or may not have been stored — repeat `issue say` with the same \
+    --message, --to, --from and text: an identical retry reports `duplicate` and stores \
+    nothing new, and any difference is refused as a conflict";
+const RECONCILE_ISSUE_MESSAGES_READ: &str = "the read point may or may not have moved — repeating the same call is safe, because \
+    it only moves forward";
+const RECONCILE_PROJECT_POLICY: &str = "the recorded policy may or may not have been written — read the project's recorded policy again before repeating it";
+const RECONCILE_PROJECT_NEW: &str = "the project may or may not have been registered — read `issue project ls` with the same explicit --org before repeating it; the same key, name and prefix is the same project";
+const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have run and been charged — replay the same command; the relayed key returns the door's recorded outcome instead of running it a second time";
+const RECONCILE_DELIVERY_POLICY: &str = "the project's delivery inputs may or may not have been recorded — read the project's delivery policy again before repeating it";
+const RECONCILE_TEAM: &str =
+    "the team change may or may not have been applied — inspect `team list` or \
+     `team invites` with the same explicit --org before repeating it";
+const RECONCILE_SETTINGS: &str = "the settings change may or may not have been applied — read `settings agents snapshot` (and `history`) before repeating it";
+const RECONCILE_AUDIT_APPROVE: &str = "the approval may or may not have been recorded — read `audit approval` for the same repo and head before repeating it";
+const RECONCILE_AUDIT_APPROVE_PROJECT: &str = "the approval may or may not have been recorded — read `audit approval` for the same issue, repo and head before repeating it";
+const RECONCILE_AUDIT_VERDICT: &str = "the verdict may or may not have been recorded — read `audit verdicts` for the same head before repeating it";
+const RECONCILE_AUDIT_REVIEWERS: &str = "the attestation may or may not have been recorded — read `audit reviewers` for the same repo before repeating it";
+const RECONCILE_AUDIT_REVIEWERS_PROJECT: &str = "the project's eligibility map may or may not have been recorded — read `audit reviewers` for the same project before repeating it";
+const RECONCILE_AUDIT_IDENTITIES: &str = "the identity attestations may or may not have been recorded — read `audit identities` before repeating it";
+const RECONCILE_WIKI_WRITE: &str = "the wiki write may or may not have been recorded — read the same path with `cadence wiki cat` (or resume the transfer job with `wiki cp --resume <job_id>`) before repeating it";
+const RECONCILE_WIKI_UPLOAD: &str = "the upload may or may not have been recorded — list the parent path with `cadence wiki ls` before uploading it again";
+const RECONCILE_UNKNOWN: &str =
+    "the action may or may not have been applied — read the same resource before repeating it";
+
+/// The effect of one allowlisted CLI verb. Every name in [`REMOTE_VERBS`] is
+/// classified here: the reads are listed explicitly, so a verb cannot become a
+/// read by omission, and the fallback is a possible mutation rather than a
+/// read — a name this table does not know must never turn a lost answer into a
+/// definite refusal. (An unlisted name is refused before any request anyway.)
 ///
-/// `message_send` is the historical member of this set; the team mutations
-/// join it for the reason above. `project_new` is idempotent for the same
-/// key, name and prefix, but a lost answer still leaves the caller unsure
-/// whether the project exists, so the note sends it to `issue project ls`
-/// first.
+/// The team mutations commit in the same D1 batch that records their receipt;
+/// the issue writes, `project_policy`, `delivery_policy_set`, the settings
+/// write operations and the audit writes each change durable state. A lost or
+/// ambiguous answer to any of them follows a possible commit, exactly as a
+/// lost send answer does.
+fn cli_effect(verb: &str) -> Effect {
+    match verb {
+        // cli.read: answered from state, changing none of it.
+        "status"
+        | "my_work"
+        | "agent_list"
+        | "agent_show"
+        | "agent_roles"
+        | "agent_profile_list"
+        | "agent_profile_context"
+        | "issue_ls"
+        | "issue_show"
+        | "issue_history"
+        | "issue_messages"
+        | "issue_artifact"
+        | "message_read"
+        | "message_inbox"
+        | "team_list"
+        | "team_invites"
+        | "master_status"
+        | "delivery_policy"
+        | "audit_approval"
+        | "audit_verdicts"
+        | "audit_scope"
+        | "audit_reviewers"
+        | "audit_approval_project"
+        | "audit_verdicts_project"
+        | "audit_reviewers_project"
+        | "audit_identities"
+        | "project_ls" => Effect::Read,
+        // cli.write: every one of these can change durable state.
+        "issue_new" => mutation(RECONCILE_ISSUE_NEW),
+        "issue_comment" => mutation(RECONCILE_ISSUE_COMMENT),
+        "issue_set" => mutation(RECONCILE_ISSUE_SET),
+        "issue_attach" => mutation(RECONCILE_ISSUE_ATTACH),
+        "issue_review" => mutation(RECONCILE_ISSUE_REVIEW),
+        "issue_message_send" => mutation(RECONCILE_ISSUE_MESSAGE_SEND),
+        "issue_messages_read" => mutation(RECONCILE_ISSUE_MESSAGES_READ),
+        "project_policy" => mutation(RECONCILE_PROJECT_POLICY),
+        "project_new" => mutation(RECONCILE_PROJECT_NEW),
+        "platform_call" => mutation(RECONCILE_PLATFORM_CALL),
+        "message_send" => mutation(RECONCILE_SEND),
+        // `settings_agents` is refined per operation by [`call_effect`]; without
+        // the operation this is a write, the same fail-closed default
+        // [`settings_op_scope`] takes.
+        "settings_agents" => mutation(RECONCILE_SETTINGS),
+        "delivery_policy_set" => mutation(RECONCILE_DELIVERY_POLICY),
+        "audit_approve" => mutation(RECONCILE_AUDIT_APPROVE),
+        "audit_approve_project" => mutation(RECONCILE_AUDIT_APPROVE_PROJECT),
+        "audit_verdict" | "audit_verdict_project" => mutation(RECONCILE_AUDIT_VERDICT),
+        "audit_reviewers_set" => mutation(RECONCILE_AUDIT_REVIEWERS),
+        "audit_reviewers_project_set" => mutation(RECONCILE_AUDIT_REVIEWERS_PROJECT),
+        "audit_identities_set" => mutation(RECONCILE_AUDIT_IDENTITIES),
+        "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => {
+            mutation(RECONCILE_TEAM)
+        }
+        _ => mutation(RECONCILE_UNKNOWN),
+    }
+}
+
+/// The effect of one wiki action. `write` is the only mutating action — a text
+/// put or a transfer `begin`/`chunk`/`apply`/`finish`; `enumerate`, `read` and
+/// `job_status` (status/export) change nothing.
+fn wiki_effect(action: &str) -> Effect {
+    match action {
+        "enumerate" | "read" | "job_status" => Effect::Read,
+        "write" => mutation(RECONCILE_WIKI_WRITE),
+        _ => mutation(RECONCILE_UNKNOWN),
+    }
+}
+
+/// The effect of one call on its surface. Settings operations have distinct
+/// scopes, while platform catalogue discovery is a read and a tool call can
+/// change state. Unknown operations fail closed as writes.
+fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> Effect {
+    match surface {
+        Surface::Cli if verb == REMOTE_SETTINGS_VERB => {
+            let operation = arguments
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if settings_op_scope(operation) == "settings.write" {
+                mutation(RECONCILE_SETTINGS)
+            } else {
+                Effect::Read
+            }
+        }
+        Surface::Cli
+            if verb == "platform_call"
+                && arguments.get("operation").and_then(Value::as_str) == Some("tools") =>
+        {
+            Effect::Read
+        }
+        Surface::Cli => cli_effect(verb),
+        Surface::Wiki => wiki_effect(verb),
+    }
+}
+
+/// A CLI verb that can change server state. When the answer to one of these is
+/// lost or ambiguous, the mutation may already have landed, so the outcome is
+/// unknown and the caller must reconcile with a read before repeating it —
+/// never a plain refusal, and never a bare retry.
 fn mutating_cli_verb(verb: &str) -> bool {
-    matches!(
-        verb,
-        "message_send"
-            | "issue_attach"
-            | "issue_review"
-            | "issue_message_send"
-            | "issue_messages_read"
-            | "audit_verdict"
-            | "audit_reviewers_set"
-            | "audit_verdict_project"
-            | "audit_approve_project"
-            | "audit_reviewers_project_set"
-            | "audit_identities_set"
-            | "project_new"
-            | "platform_call"
-    ) || team_mutation_verb(verb)
+    cli_effect(verb).is_mutation()
+}
+
+/// The read that reconciles a hosted mutation whose answer was lost or did not
+/// prove the write; `None` for a read. Crate-private so the verb-specific
+/// receipt checks outside this module (`delivery::hosted_gate`) name the same
+/// guidance as the transport classification here.
+pub(crate) fn mutation_reconcile(verb: &str) -> Option<&'static str> {
+    cli_effect(verb).reconciliation()
 }
 
 /// The read a caller must run before repeating a mutating verb whose answer
@@ -291,40 +450,15 @@ fn mutating_cli_verb(verb: &str) -> bool {
 /// the next step is a read of the same workspace, never a blind retry.
 /// `message_send` reconciles on its own stable id; the team mutations
 /// reconcile with the directory read.
+///
+/// Production code reads the note from the [`Effect`] it already classified
+/// (so `settings_agents` is judged by its operation and the wiki surface keeps
+/// its own note); this per-verb view is what the tests assert.
+#[cfg(test)]
 fn lost_mutation_note(verb: &str) -> &'static str {
-    if verb == "message_send" {
-        "the send may or may not have been recorded"
-    } else if verb == "issue_message_send" {
-        "the message may or may not have been stored — repeat `issue say` with the same \
-         --message, --to, --from and text: an identical retry reports `duplicate` and stores \
-         nothing new, and any difference is refused as a conflict"
-    } else if verb == "issue_messages_read" {
-        "the read point may or may not have moved — repeating the same call is safe, because \
-         it only moves forward"
-    } else if verb == "issue_attach" {
-        "the attachment may or may not have been recorded — inspect the same issue and artifact before repeating it"
-    } else if verb == "audit_reviewers_set" {
-        "the attestation may or may not have been recorded — read `audit reviewers` for the same repo before repeating it"
-    } else if verb == "audit_reviewers_project_set" {
-        "the project's eligibility map may or may not have been recorded — read `audit reviewers` for the same project before repeating it"
-    } else if verb == "audit_identities_set" {
-        "the identity attestations may or may not have been recorded — read `audit identities` before repeating it"
-    } else if verb == "audit_approve_project" {
-        "the approval may or may not have been recorded — read `audit approval` for the same issue, repo and head before repeating it"
-    } else if verb == "audit_verdict" || verb == "audit_verdict_project" {
-        "the verdict may or may not have been recorded — read `audit verdicts` for the same head before repeating it"
-    } else if verb == "platform_call" {
-        "the tool call may or may not have run and been charged — replay the same \
-         command; the relayed key returns the door's recorded outcome instead of \
-         running it a second time"
-    } else if verb == "issue_review" {
-        "the verdict may or may not have been recorded — read the same issue before repeating it; a reviewer holds one verdict per revision"
-    } else if verb == "project_new" {
-        "the project may or may not have been registered — read `issue project ls` with the same explicit --org before repeating it; the same key, name and prefix is the same project"
-    } else {
-        "the team change may or may not have been applied — inspect `team list` or \
-         `team invites` with the same explicit --org before repeating it"
-    }
+    // Callers only ask about a mutation; a read has no effect to reconcile,
+    // and says so rather than inventing one.
+    mutation_reconcile(verb).unwrap_or("nothing was changed — this verb is a read")
 }
 
 /// The board refused the call at its own gate, before the verb reached the
@@ -335,6 +469,243 @@ fn board_gate_refused(body: Option<&Value>) -> bool {
     body.and_then(|b| b.pointer("/error/hop"))
         .and_then(Value::as_str)
         == Some("board")
+}
+
+/// A 5xx that follows a possible commit, for a mutation. Three answers prove
+/// the call ran before the verb: a worker `state` (`waking`, `wake_failed`,
+/// `board_unreachable`, `runtime_unavailable`), the board's own gate refusal,
+/// and a `501 not_implemented` for a verb the tenant does not serve. The
+/// platform's explicit uncertainty codes (`mutation_outcome_uncertain`,
+/// `invite_email_uncertain`) keep their own decoded message, which names the
+/// code. Every other 5xx may hide a committed write behind an unanswerable
+/// reply, so the outcome is unknown — never availability ("retry later").
+fn post_forward_failure(status: u16, body: Option<&Value>) -> bool {
+    status >= 500
+        && status != 501
+        && body.and_then(|b| b["state"].as_str()).is_none()
+        && !board_gate_refused(body)
+        && !tracker_unavailable_before_verb(body)
+        && !matches!(
+            refusal_fields(body).0,
+            Some("mutation_outcome_uncertain" | "invite_email_uncertain")
+        )
+}
+
+/// A `503 tracker_unavailable` is the native route's `pm_at` refusal: the
+/// tracker is opened before any verb runs (`src/ui/cli_route.rs:360`), and the
+/// only other emitter in this build is the `issue_history` log read
+/// (`:552`). A write that answers it therefore proves nothing was attempted.
+/// The hosted relay forwards to that same route and the tenant uses its own
+/// `capability_unavailable`, so the code cannot arrive post-effect here; a
+/// future transport that reused it after forwarding would need this exclusion
+/// removed.
+fn tracker_unavailable_before_verb(body: Option<&Value>) -> bool {
+    refusal_fields(body).0 == Some("tracker_unavailable")
+}
+
+/// A usable success body for a write is a JSON object: every hosted mutation
+/// answers a receipt object, so an absent, `null` or non-object 2xx body proves
+/// nothing about the write it answered.
+fn is_object_body(body: Option<&Value>) -> bool {
+    body.is_some_and(Value::is_object)
+}
+
+/// The issue-write receipt, correlated by the issue it names. The two surfaces
+/// answer two proven variants:
+///
+/// - native `write_reply` (`src/ui/cli_route.rs`): `{issue, card, warnings}`
+///   for `issue_new`, `issue_comment` and `issue_set`;
+/// - tenant `apps/api/src/tenant-board/cli.ts`: `{issue, card, warnings}` for
+///   `issue_new` (L683) and `issue_set` (L748), but
+///   `{comment, issue}` for `issue_comment` (L767-770) — no card, no warnings.
+///
+/// A reply whose `issue.id` is not the ticket this call wrote cannot prove the
+/// write landed, whatever else it carries.
+fn issue_receipt_correlates(verb: &str, reply: &Value, arguments: &Map<String, Value>) -> bool {
+    let issue_id = reply.pointer("/issue/id").and_then(Value::as_str);
+    let card_id = reply.pointer("/card/id").and_then(Value::as_str);
+    let object = |key: &str| reply.get(key).is_some_and(Value::is_object);
+    let same = |sent: Option<&str>| {
+        issue_id.zip(sent).is_some_and(|(got, want)| {
+            !got.is_empty() && !want.is_empty() && got.eq_ignore_ascii_case(want)
+        })
+    };
+    if !object("issue") || issue_id.is_none_or(str::is_empty) {
+        return false;
+    }
+    match verb {
+        // The server allocates the id, so a create is bound by the project and
+        // title that were sent (both contracts trim the title) and by a card
+        // that names the same ticket.
+        "issue_new" => {
+            let sent_title = arguments
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim);
+            let title = reply
+                .pointer("/card/title")
+                .and_then(Value::as_str)
+                .map(str::trim);
+            object("card")
+                && card_id == issue_id
+                && reply.pointer("/card/project").and_then(Value::as_str)
+                    == arguments.get("project").and_then(Value::as_str)
+                && sent_title.is_some()
+                && title == sent_title
+        }
+        // Either variant must name the ticket the comment was sent to.
+        "issue_comment" => {
+            (object("comment") || object("card"))
+                && same(arguments.get("id").and_then(Value::as_str))
+        }
+        // An edit may legitimately be a no-op that keeps the revision, so only
+        // the ticket identity is required — never `rev != if_rev`.
+        "issue_set" => {
+            object("card")
+                && card_id == issue_id
+                && same(
+                    arguments
+                        .get("ids")
+                        .and_then(|ids| ids.get(0))
+                        .and_then(Value::as_str),
+                )
+        }
+        _ => false,
+    }
+}
+
+/// `project_policy` answers one of two proven success shapes: the tenant's
+/// `{state:"recorded", project, visibility, grants, revision}` and the native
+/// receipt must match the project, visibility and grants that were sent.
+fn policy_receipt_correlates(reply: &Value, arguments: &Map<String, Value>) -> bool {
+    let Some(project) = arguments.get("project").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(visibility) = arguments.get("visibility").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(grants) = arguments.get("grants").and_then(Value::as_array) else {
+        return false;
+    };
+    if reply["project"].as_str() != Some(project) {
+        return false;
+    }
+    let tenant = reply["state"].as_str() == Some("recorded")
+        && reply["revision"].as_u64().is_some()
+        && reply["visibility"].as_str() == Some(visibility)
+        && reply["grants"].as_array() == Some(grants);
+    let native_visibility = match visibility {
+        "workspace-visible" => "workspace_visible",
+        "private" => "private",
+        _ => return false,
+    };
+    let members = reply.pointer("/policy/members");
+    let native = reply["committed"].as_bool() == Some(true)
+        && reply
+            .pointer("/policy/version")
+            .and_then(Value::as_u64)
+            .is_some()
+        && reply.pointer("/policy/visibility").and_then(Value::as_str) == Some(native_visibility)
+        && members.map_or(grants.is_empty(), |value| value.as_array() == Some(grants));
+    tenant || native
+}
+
+/// Wiki servers return NFC paths even when a caller supplied decomposed text.
+fn wiki_path_matches(requested: &str, received: Option<&str>) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    !requested.is_empty() && received.is_some_and(|path| requested.nfc().eq(path.chars()))
+}
+
+/// A text `wiki write` receipt names the page it wrote: the tenant answers
+/// `{kind:"text", path, rev, size}` and the daemon's `wiki_write` answers the
+/// committed record (`committed: true` and its `rev`). A reply that does not
+/// echo the written path proves nothing. A transfer `write` op has its own
+/// `{job_id,…}`/`{outcome,…}` receipts and is not checked here.
+fn wiki_write_receipt_correlates(reply: &Value, arguments: &Map<String, Value>) -> bool {
+    let path = arguments.get("path").and_then(Value::as_str);
+    let echoes = path.is_some_and(|path| wiki_path_matches(path, reply["path"].as_str()));
+    let committed = reply
+        .get("rev")
+        .and_then(Value::as_str)
+        .is_some_and(|rev| !rev.is_empty())
+        || reply.get("committed").and_then(Value::as_bool) == Some(true);
+    echoes && committed
+}
+
+/// Does a lowercase/uppercase hex digest string name exactly `digest`? Compared
+/// pairwise, so the check allocates nothing.
+fn hex_digest_matches(hex: &str, digest: &[u8]) -> bool {
+    hex.len() == digest.len() * 2
+        && hex
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(digest)
+            .all(|(pair, byte)| {
+                let hi = (pair[0] as char).to_digit(16);
+                let lo = (pair[1] as char).to_digit(16);
+                matches!((hi, lo), (Some(hi), Some(lo)) if (hi * 16 + lo) as u8 == *byte)
+            })
+}
+
+/// A `write_blob` upload receipt must name the bytes and the path this call
+/// sent. Four legitimate success shapes are proven by the two surfaces:
+///
+/// - tenant text source (`worker/wiki-routes.ts`): `{path, kind:"text", rev,
+///   size}` — no digest, but `size` is the decoded text's byte length;
+/// - tenant blob: `{path, kind:"blob", sha256, size, mime, rev, status}`;
+/// - native text source (`src/ui/wiki.rs` relays `wiki_write`): `{rev,
+///   committed:true}`;
+/// - native blob (`wiki_put_blob`): `{rev, sha256}`.
+///
+/// A path the reply states must be the sent path. A digest it states is
+/// authoritative: a present but malformed or different digest, and a present
+/// `size` that is not an integer equal to the sent byte length, are
+/// contradictory evidence — unknown even when another success marker also
+/// matches. Truly absent optional fields stay absent (the tenant text variant
+/// has no digest; a native reply has no size). Absent a digest, one of the
+/// remaining bindings (text size+rev, native committed write) must match.
+/// Every proven upload reply names the written path, so a pathless or
+/// foreign-path receipt proves nothing.
+fn upload_receipt_correlates(
+    reply: &Value,
+    logical_path: &str,
+    expected_sha256: &[u8],
+    expected_size: u64,
+) -> bool {
+    if !wiki_path_matches(logical_path, reply["path"].as_str()) {
+        return false;
+    }
+    // A field the reply carries is authoritative: a present but malformed or
+    // mismatched `sha256`/`size` is contradictory evidence, never "absent", so
+    // no other success marker may override it. Truly absent optional fields
+    // stay absent (the tenant text variant has no digest; a native reply has no
+    // size).
+    let digest = match reply.get("sha256") {
+        Some(value) => match value.as_str() {
+            Some(stated) if hex_digest_matches(stated, expected_sha256) => true,
+            _ => return false,
+        },
+        None => false,
+    };
+    if let Some(size) = reply.get("size") {
+        if size.as_u64() != Some(expected_size) {
+            return false;
+        }
+    }
+    let text = reply.get("kind").and_then(Value::as_str) == Some("text")
+        && reply.get("size").is_some()
+        && reply
+            .get("rev")
+            .and_then(Value::as_str)
+            .is_some_and(|rev| !rev.is_empty());
+    let committed = reply.get("committed").and_then(Value::as_bool) == Some(true)
+        && reply
+            .get("rev")
+            .and_then(Value::as_str)
+            .is_some_and(|rev| !rev.is_empty());
+    digest || text || committed
 }
 
 /// CAD-2001: the project-scoped review-evidence verbs. Every one carries an
@@ -394,10 +765,20 @@ fn tenant_cannot_serve(verb: &str, status: u16, body: Option<&Value>) -> Option<
         400 => matches!(code, Some("invalid_request" | "unknown_verb")),
         404 => matches!(code, Some("unknown_verb" | "not_implemented")),
         409 => true,
-        503 => matches!(
-            code,
-            Some("capability_unavailable" | "not_implemented" | "unknown_verb")
-        ),
+        // A tenant that predates the verb answers 503 for a capability it does
+        // not have. For a *mutation* the same code is not proof the verb never
+        // ran: the tenant wraps a hub RPC that threw *after* the write in
+        // `503 capability_unavailable` (`apps/api/src/tenant-board/cli.ts`,
+        // `setProjectAccess`/`setProjectEligibility` catches). A read keeps the
+        // release-order refusal; a write is left to the mutation classifier,
+        // which reports an unknown outcome.
+        503 => {
+            !mutating_cli_verb(verb)
+                && matches!(
+                    code,
+                    Some("capability_unavailable" | "not_implemented" | "unknown_verb")
+                )
+        }
         _ => false,
     };
     if !cannot_serve {
@@ -1643,17 +2024,12 @@ fn call_once(
     if !arguments.is_empty() {
         body["arguments"] = Value::Object(arguments.clone());
     }
-    // CAD-1568: a mutating verb's transport failure after the call was
-    // attempted is outcome-unknown, not a rejection — the mutation may
-    // have landed, so the caller must reconcile by idempotency key, never
-    // assume nothing landed. `message_send` reconciles on `arguments.message`;
-    // the team mutations reconcile with a read (`team list` / `team invites`).
-    // A platform call is mutating only when it runs a tool: listing the
-    // catalog changes nothing, so a lost answer there is not a possible charge.
-    let mutating = matches!(surface, Surface::Cli)
-        && mutating_cli_verb(verb)
-        && (verb != "platform_call"
-            || arguments.get("operation").and_then(Value::as_str) == Some("call"));
+    // A mutation's transport failure after the call was attempted is
+    // outcome-unknown, not a rejection — the write may have landed, so the
+    // caller must reconcile with the verb's own read, never assume nothing
+    // landed. This covers the CLI writes and the wiki `write` action alike:
+    // the surface decides, not a CLI-only verb list.
+    let effect = call_effect(surface, verb, arguments);
     post(
         &target.endpoint,
         &format!("{relay}/call"),
@@ -1662,8 +2038,11 @@ fn call_once(
         request_timeout(deadline, CALL_TIMEOUT)?,
     )
     .map_err(|e| {
-        if mutating && e.kind() != "unknown" {
-            Error::unknown(format!("{e} — {}", lost_mutation_note(verb)))
+        if effect.is_mutation() && e.kind() != "unknown" {
+            Error::unknown(format!(
+                "{e} — {}",
+                effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+            ))
         } else {
             e
         }
@@ -1717,7 +2096,7 @@ fn upload_once(
             format!("multipart/form-data; boundary={boundary}"),
         )
         .send(&body[..])
-        .map_err(|_| reject("remote request failed"))?;
+        .map_err(|_| upload_outcome_unknown("remote request failed"))?;
     let status = response.status().as_u16();
     let retry_after = response
         .headers()
@@ -1729,9 +2108,10 @@ fn upload_once(
         .into_body()
         .as_reader()
         .take(MAX_BODY + 1)
-        .read_to_end(&mut bytes)?;
+        .read_to_end(&mut bytes)
+        .map_err(|_| upload_outcome_unknown("the upload answer could not be read"))?;
     if bytes.len() as u64 > MAX_BODY {
-        return Err(reject("remote response too large"));
+        return Err(upload_outcome_unknown("remote response too large"));
     }
     Ok((status, retry_after, serde_json::from_slice(&bytes).ok()))
 }
@@ -2017,6 +2397,10 @@ fn upload_file_in(
     wake_timeout: u64,
     note: impl Fn(&str),
 ) -> Result<Value> {
+    // The sent bytes are fixed for the whole command. The digest is computed
+    // lazily, once: a preflight, capability or deadline refusal before the
+    // first dispatched upload never hashes them, and a wake retry reuses it.
+    let mut expected = None;
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(wake_timeout))
         .ok_or_else(|| reject("invalid wake timeout"))?;
@@ -2075,17 +2459,54 @@ fn upload_file_in(
                 "remote command deadline elapsed during session renewal",
             ));
         }
+        // Digest the bytes immediately before the first dispatched upload —
+        // every refusal above returns without hashing — and reuse it on a wake
+        // retry.
+        let (expected_sha256, expected_size) =
+            expected.get_or_insert_with(|| (Sha256::digest(bytes), bytes.len() as u64));
         let (status, retry_after, body) =
             upload_once(target, &cred, logical_path, file_name, bytes, deadline)?;
         // A refusal names the status and the contract's error code only: the
         // raw body could carry anything, so it is never echoed.
         let conflict = status == 409 && body.as_ref().is_some_and(|b| b.get("conflict").is_some());
+        // The upload is a mutation: a 5xx with no pre-forward proof, or a 2xx
+        // without an object receipt, may follow a stored blob. Its outcome is
+        // unknown — the caller lists the parent path before uploading again.
+        // A `state`, the board's gate refusal and a 501 stay pre-effect.
+        let after_forward = post_forward_failure(status, body.as_ref());
+        let unusable_success = (200..300).contains(&status) && !is_object_body(body.as_ref());
         if !(200..300).contains(&status) && status != 503 && !conflict {
             // CAD-1434: the gateway envelope is `{ok:false,error:{code}}`; the
             // decoder reads it (the old top-level read always fell through).
+            if after_forward {
+                return Err(upload_outcome_unknown(&format!(
+                    "the relay answered HTTP {status}"
+                )));
+            }
             return Err(refusal_error(status, body.as_ref()));
         }
+        if unusable_success {
+            return Err(upload_outcome_unknown(
+                "remote answer was not a usable receipt",
+            ));
+        }
+        // The receipt must name the bytes and path this call sent: the digest
+        // of the exact bytes, the tenant text variant's size plus rev, or the
+        // native committed write. A 2xx without one proves nothing.
+        if (200..300).contains(&status)
+            && !body.as_ref().is_some_and(|reply| {
+                upload_receipt_correlates(reply, logical_path, &expected_sha256[..], *expected_size)
+            })
+        {
+            return Err(upload_outcome_unknown(
+                "remote answer carried no receipt for the bytes and path sent",
+            ));
+        }
         match classify(status, retry_after, body) {
+            Verdict::Done(Err(error)) if after_forward => {
+                return Err(upload_outcome_unknown(&error.to_string()));
+            }
+            Verdict::Done(Err(error)) => return Err(error),
             Verdict::Done(result) => return result,
             Verdict::Conflict(_) => return Err(reject("remote upload conflicted")),
             Verdict::Waking(wait) => {
@@ -2383,19 +2804,38 @@ fn refusal_error(status: u16, body: Option<&Value>) -> Error {
 
 /// The answer to a mutating verb whose reply was ambiguous: the write may
 /// already have committed, so the outcome is unknown and the caller
-/// reconciles with a read for the same explicit `--org` before repeating
-/// it. It never advises a bare retry, and it never claims the write failed.
-/// `correlation` is the bounded board correlation the refusal may carry.
-fn ambiguous_mutation_error(status: u16, correlation: Option<String>) -> Error {
+/// reconciles with the verb's own read before repeating it. It never advises
+/// a bare retry, and it never claims the write failed. `correlation` is the
+/// bounded board correlation the refusal may carry.
+fn ambiguous_mutation_error(status: u16, correlation: Option<String>, reconcile: &str) -> Error {
     let mut text = format!(
         "the remote action may already have committed (outcome_unknown, HTTP {status}); \
-         inspect `team list` or `team invites` with the same explicit --org before \
-         repeating the mutation. Nothing was retried; saved credentials are kept"
+         {reconcile}. Nothing was retried; saved credentials are kept"
     );
     if let Some(correlation) = correlation {
         text.push_str(&correlation);
     }
     Error::unknown(text)
+}
+
+/// A 2xx that cannot be a receipt for the write it answered — no JSON body at
+/// all, or a body that is not an object. The call may have committed, so the
+/// outcome is unknown: the caller reconciles with the verb's own read rather
+/// than replaying the write or reading the empty answer as a success.
+fn unusable_success_error(status: u16, reconcile: &str) -> Error {
+    Error::unknown(format!(
+        "the remote answered HTTP {status} without a usable success body — the outcome is \
+         unknown; {reconcile}. Nothing was retried; saved credentials are kept"
+    ))
+}
+
+/// A wiki upload whose request was sent but whose answer was lost, oversized
+/// or unreadable: the blob may already be stored, so the outcome is unknown
+/// and the caller lists the parent path before uploading again.
+fn upload_outcome_unknown(detail: &str) -> Error {
+    Error::unknown(format!(
+        "{detail} — {RECONCILE_WIKI_UPLOAD}. Nothing was retried"
+    ))
 }
 
 /// CAD-1568: actionable text for a verb's typed refusals, keyed on the
@@ -3404,6 +3844,11 @@ fn call_verb_until_retry(
         wiki_transfer_shape(verb, &arguments)?;
     }
     team_argument_shape(verb, &arguments)?;
+    // What this call can change, and the read that reconciles an answer which
+    // does not prove the effect. Fixed for the whole call (the wake retry only
+    // ever follows a pre-forward `waking` verdict), so a lost or unusable
+    // answer is classified once, the same way on every surface.
+    let effect = call_effect(surface, verb, &arguments);
     let budget_over = || -> Error {
         Error::busy_coded(
             "waking",
@@ -3488,7 +3933,7 @@ fn call_verb_until_retry(
                 {
                     return Err(Error::unknown(format!(
                         "remote tool returned no usable receipt — {}",
-                        lost_mutation_note(verb)
+                        effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
                     )));
                 }
                 Some("tools")
@@ -3586,72 +4031,52 @@ fn call_verb_until_retry(
                 ));
             }
         }
-        // CAD-1999: a project create's 2xx is usable only when it echoes the
-        // requested project — a `project` object whose `key` and `name` are
-        // exactly what was sent and whose `prefix` is a valid stored prefix
-        // matching `--prefix` when one was sent. A `null`, `{ok:true}`,
-        // unrelated or foreign receipt, or a missing/invalid/different
-        // prefix cannot establish that THIS create landed under the intended
-        // namespace, so the outcome is unknown and is reconciled with
-        // `issue project ls`, never reported as a failure and never replayed
-        // blindly. A 2xx with no parseable body (empty, 204, non-JSON) is
-        // the same check on a `None` body, so it is unknown here too.
-        if verb == "project_new"
+        // A 2xx is a success only when it carries a JSON object: an absent,
+        // null or non-object body cannot be a receipt for the write it
+        // answered. The call may have committed, so the outcome is unknown —
+        // never a false success, never a rejection, never a replay. (The
+        // verbs with a required correlated receipt check their own shape
+        // above, before this.)
+        if effect.is_mutation() && (200..300).contains(&status) && !is_object_body(body.as_ref()) {
+            return Err(unusable_success_error(
+                status,
+                effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN),
+            ));
+        }
+        // A 2xx object is a receipt only when it names what this call wrote —
+        // the tenant's own reply contract, mirrored by the native route. A
+        // malformed or foreign receipt cannot prove the write landed, so it is
+        // the same unknown outcome a lost answer is, never a false success.
+        let receipt_missing = effect.is_mutation()
             && (200..300).contains(&status)
-            && !body
-                .as_ref()
-                .is_some_and(|receipt| project_receipt_correlates(receipt, &arguments))
-        {
+            && body.as_ref().is_some_and(|reply| match verb {
+                "issue_new" | "issue_comment" | "issue_set" => {
+                    !issue_receipt_correlates(verb, reply, &arguments)
+                }
+                "project_policy" => !policy_receipt_correlates(reply, &arguments),
+                "project_new" => !project_receipt_correlates(reply, &arguments),
+                "write" if matches!(surface, Surface::Wiki) && arguments.contains_key("text") => {
+                    !wiki_write_receipt_correlates(reply, &arguments)
+                }
+                _ => false,
+            });
+        if receipt_missing {
             return Err(Error::unknown(format!(
-                "remote project create returned no correlated receipt; {}",
-                lost_mutation_note(verb)
+                "remote `{verb}` returned no correlated receipt — outcome is unknown; {}",
+                effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
             )));
         }
         let refusal_code = refusal_fields(body.as_ref()).0.map(str::to_owned);
-        // CAD-1568: a 5xx carrying a worker `state` is a pre-forward
-        // verdict (waking handled below, wake_failed/unavailable = nothing
-        // ran). A 5xx with no `state` may come from the container *after*
-        // the send was attempted — outcome unknown, reconcile by
-        // `arguments.message`, never a blind resubmission.
-        let send_outcome_unknown = verb == "message_send"
-            && status >= 500
-            && body.as_ref().and_then(|b| b["state"].as_str()).is_none();
-        // A team mutation is answered by the Worker itself, in the same D1
-        // batch that records the receipt. A 5xx with no `state` therefore
-        // follows a possible commit: the platform's own explicit
-        // uncertainty codes say so, and a bare one may hide a committed
-        // write behind an unanswerable reply. The board's gate refusal
-        // (`hop: board`) is decided before the verb ran, so it stays a
-        // definite refusal. The platform's explicit uncertainty codes keep
-        // their own decoded message, which names the code.
-        let team_mutation_unknown = team_mutation_verb(verb)
-            && status >= 500
-            && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
-            && !board_gate_refused(body.as_ref())
-            && !matches!(
-                refusal_code.as_deref(),
-                Some("mutation_outcome_uncertain" | "invite_email_uncertain")
-            );
-        let artifact_outcome_unknown = matches!(
-            verb,
-            "issue_attach" | "issue_review" | "issue_message_send" | "issue_messages_read"
-        ) && status >= 500
-            && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
-            && !board_gate_refused(body.as_ref());
-        // CAD-1999: a project create is answered by the tenant Worker from
-        // its own storage. A 5xx naming no pre-forward `state` may follow a
-        // committed project, so it is unknown — reconciled with
-        // `issue project ls`, never reported as a refusal that invites a
-        // blind retry. A 5xx that names a pre-forward state, or a board gate
-        // refusal (`hop: board`), is decided before the verb ran and stays
-        // definite. (An unusable 2xx is answered by the receipt check
-        // above, before this verdict.)
-        let project_create_unknown = verb == "project_new"
-            && status >= 500
-            && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
-            && !board_gate_refused(body.as_ref());
-        // An in-progress replay or explicit uncertain outcome can still be
-        // charged; a lost reply may also follow a funded dispatch.
+        // A 5xx with no pre-forward proof may come from the platform *after*
+        // the mutation was attempted: the write may have landed behind an
+        // unanswerable reply, so it is an unknown outcome, never availability
+        // ("retry later") and never a refusal. A worker `state`, the board's
+        // gate refusal and a 501 not-implemented are proven pre-effect and
+        // keep their own verdict; the platform's explicit uncertainty codes
+        // keep their decoded message, which names the code.
+        let after_forward = effect.is_mutation() && post_forward_failure(status, body.as_ref());
+        // A funded platform call may still be in progress or uncertain on
+        // a same-key replay; preserve its dedicated reconciliation guidance.
         let platform_outcome_unknown = platform_operation == Some("call")
             && !board_gate_refused(body.as_ref())
             && ((status == 409
@@ -3703,31 +4128,18 @@ fn call_verb_until_retry(
             }
         }
         match classify(status, retry_after, body) {
-            Verdict::Done(Err(_e)) if team_mutation_unknown => {
-                return Err(ambiguous_mutation_error(status, unknown_correlation));
-            }
-            Verdict::Done(Err(_e)) if project_create_unknown => {
-                return Err(Error::unknown(format!(
-                    "the project create was not confirmed (outcome_unknown, HTTP {status}); {}",
-                    lost_mutation_note(verb)
-                )));
-            }
             Verdict::Done(Err(_e)) if platform_outcome_unknown => {
                 return Err(Error::unknown(format!(
                     "remote platform call returned HTTP {status} — {}",
-                    lost_mutation_note(verb)
+                    effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
                 )));
             }
-            Verdict::Done(Err(e)) if artifact_outcome_unknown => {
-                return Err(Error::unknown(format!(
-                    "{e} — {}",
-                    lost_mutation_note(verb)
-                )));
-            }
-            Verdict::Done(Err(e)) if send_outcome_unknown => {
-                return Err(Error::unknown(format!(
-                    "{e} — the send may or may not have been recorded"
-                )));
+            Verdict::Done(Err(_e)) if after_forward => {
+                return Err(ambiguous_mutation_error(
+                    status,
+                    unknown_correlation,
+                    effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN),
+                ));
             }
             Verdict::Done(Err(e)) => {
                 return Err(message_family_refusal(

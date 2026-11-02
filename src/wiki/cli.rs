@@ -6,7 +6,7 @@
 //! tmp from); `cat` on a blob reads the verified blob bytes directly
 //! once the daemon's ACL check passes.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
@@ -212,7 +212,7 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
                     Ok(0)
                 }
                 Some("text") => {
-                    print!("{}", out["text"].as_str().unwrap_or(""));
+                    crate::output::print_text(out["text"].as_str().unwrap_or(""));
                     Ok(0)
                 }
                 Some("blob") if *meta => {
@@ -227,7 +227,9 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
                     let bytes = std::fs::read(&blob).map_err(|e| {
                         Error::rejected(format!("cannot read blob {}: {e}", blob.display()))
                     })?;
-                    std::io::stdout().write_all(&bytes)?;
+                    // Raw blob bytes: a reader that stopped early already
+                    // has what it asked for, so it is not a failed read.
+                    crate::output::write_stdout(&bytes)?;
                     Ok(0)
                 }
                 Some("dir") => Err(Error::rejected(format!(

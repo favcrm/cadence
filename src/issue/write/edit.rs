@@ -222,9 +222,14 @@ pub fn patch_issue(
     if patch.status.is_some() {
         // A derived status is not file-writable: roll-up containers,
         // job-bound and note-driven issues refuse with the reason.
+        // Proving "file-authoritative" needs the job table; without it
+        // the gate cannot clear a job-derived status and must refuse.
         let issues = board::load_all(&pm.dir, None)?;
-        let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
-        let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+        let jobs = state_dir
+            .map(board::fetch_job_state)
+            .unwrap_or_else(board::JobState::tracker_only);
+        jobs.require(&format!("patching {id}'s status"))?;
+        let views = board::views_with_job_state(&pm.config.notes_dir(), issues, &jobs);
         let src = views
             .iter()
             .find(|v| v.issue.front.id == id)

@@ -738,8 +738,15 @@ fn run_inner_with_selected(
     // whose file was never moved off backlog/ready — but whose notes
     // or job derive doing|review — must still reach the probe, else a
     // merged PR strands it at review forever.
-    let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
-    let mut views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    //
+    // Unknown job state narrows candidacy (a job-derived `doing`
+    // cannot widen), which is the safe direction — but the report
+    // names it, so a stranded ticket is diagnosable instead of
+    // silent. A tracker-only caller keeps pre-job derivation.
+    let jobs = state_dir
+        .map(board::fetch_job_state)
+        .unwrap_or_else(board::JobState::tracker_only);
+    let mut views = board::views_with_job_state(&pm.config.notes_dir(), issues, &jobs);
     // CAD-1241 continuation: rotate the natural-ordered board so the
     // sweep starts strictly after `cursor` and wraps once to the head.
     // A bounded tick then spends its budget on the NEXT batch instead
@@ -1043,6 +1050,7 @@ fn run_inner_with_selected(
         "cleanup_deferred": cleanup_deferred,
         "cursor": last_classified,
         "history": history_state,
+        "jobs": jobs.json(),
         "rows": rows,
         "done": done,
         "held": held,

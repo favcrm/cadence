@@ -189,6 +189,11 @@ endpoint. Credentials are stored at
 `$XDG_CONFIG_HOME/cadence/remote-auth/cli-<slug>.json` (0600), bound to
 the verified workspace ID and endpoint, and never sent to another host.
 
+An absent org registry permits standalone local operation. A registry that
+cannot be inspected or parsed, or is a symbolic link, refuses implicit
+destination selection instead of silently selecting local state. Explicit
+local state bindings and managed callers keep their existing routing.
+
 ### Advanced custom issuer trust
 
 The credential directory is created by login itself (0700, owner-only).
@@ -263,18 +268,18 @@ The gateway's real refusal shapes (AOS-243):
   proven session loss.
 - A `401 unauthorized` with no reason means the bearer did not resolve, but the
   server cannot say whether it expired or was revoked.
-- `503` means waking or unavailable. Without JSON, the HTTP status still
-  classifies the refusal: `401` is uncertain, `403` is authorization, and any
-  other `5xx` is availability. No server reason or correlation is inferred.
-- One exception: a dispatched mutation verb whose answer is lost, or that
-  answers with a bare `5xx`, is `outcome_unknown` and not availability. The
-  platform records a membership write and its receipt in the same batch, so a
-  `5xx` can follow a write that already committed. This covers `message_send`
-  and the four team mutations (`team_invite`, `team_revoke_invite`,
-  `team_set_role`, `team_remove`); the two team reads commit nothing and stay
-  availability. A `5xx` carrying the platform's own state marker is not a
-  bare one, and a refusal raised by the board's gate before the verb ran is
-  decided before anything was written, so neither is ambiguous.
+- `503` can mean waking or unavailable. Without JSON, `401` is uncertain,
+  `403` is authorization, and a read's `5xx` is availability; no server
+  reason or correlation is inferred.
+- A dispatched mutation whose answer is lost, whose `2xx` body is not an
+  object, or whose bare `5xx` lacks proof of a pre-forward refusal is
+  `outcome_unknown`. This includes hosted issue, wiki, team, settings and
+  audit mutations. A response can be lost after a write committed. A
+  pre-forward state marker, a board-gate refusal, or `501` remains a refusal;
+  checked `409` conflicts still mean not written.
+- An issue, wiki upload, delivery or audit receipt that fails the
+  operation's correlation checks is also `outcome_unknown`, not proof that
+  nothing was recorded.
 - A `503` whose safe `error.code` is `mutation_outcome_uncertain` or
   `invite_email_uncertain` is the platform stating that a mutation may already
   have committed. It is its own category, not availability.
@@ -284,8 +289,8 @@ The gateway's real refusal shapes (AOS-243):
 | `authorization` | `401` with an allowlisted policy reason (`scope_not_granted`, `grant_narrowed`, `binding_mismatch`); `403` with `insufficient_scope` (container path or scope denial); or any `403` with `forbidden` or no safe code | Not a login problem. Read-only diagnosis (below): check the workspace role and target path. Not retried |
 | `authentication` | A terminal session code: `invalid_token`, `invalid_grant`, `session_expired`, `session_revoked`, `lineage_terminal` | `cadence login` again, once. The only case that names login as the known remedy |
 | `uncertain` | `401` with no reason, `envelope_invalid`, or a non-JSON `401` | Not confirmed expiry or revocation. Run the read-only diagnosis before any login. Not retried |
-| `outcome_unknown` | The platform's `mutation_outcome_uncertain` or `invite_email_uncertain`; or a lost answer or a bare `5xx` on a dispatched mutation verb (`message_send`, `team_invite`, `team_revoke_invite`, `team_set_role`, `team_remove`) | The action may have committed. Reconcile with a read for the same explicit `--org` — `team list` or `team invites` for a team mutation, `message_read` for a send — then decide. Never replay the mutation with a fresh envelope first. Not retried |
-| `availability` | any other `5xx` (except a dispatched mutation verb — that is `outcome_unknown`), or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
+| `outcome_unknown` | The platform's `mutation_outcome_uncertain` or `invite_email_uncertain`; or a lost, unusable or unproven `5xx` answer to a dispatched mutation | The action may have committed. Reconcile with a read for the same explicit `--org`, such as `issue show`, `wiki cat`, `team list`, or `audit verdicts`, then decide. Never replay blindly. Not retried |
+| `availability` | A read's `5xx`, a proven pre-forward unavailable response, or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
 | `unknown` | Any other answer. A `400`/`409`/`413`/`422` keeps its safe code, such as `payload_too_large` | Report the status and code. Not retried |
 
 ### Where a write or upload is refused (AOS-243)
@@ -410,12 +415,12 @@ under-lock check; without it, local `issue set` keeps its existing
 unconditional behavior.
 
 A wake retry is the only automatic retry — it fires only on the
-pre-forward `waking` verdict. A timeout, dropped connection or error
-after forward is an explicitly unresolved outcome: the mutation may or
-may not have landed, so reconcile with `issue show`/`issue log` rather
-than re-issuing blindly. A 200 confirms the write was accepted — not
-that the tracker survived a later hard loss; durability is a hosted
-operational concern outside this client feature.
+pre-forward `waking` verdict. A timeout, dropped connection, unusable
+success response or unproven error after forward leaves the mutation
+unresolved. Reconcile with `issue show`/`issue log` rather than re-issuing
+blindly. An accepted receipt does not prove that the tracker survived a
+later hard loss; durability is a hosted operational concern outside this
+client feature.
 
 Each collaborating writer enrolls independently: a separate
 `XDG_CONFIG_HOME` (or separate account/machine) per identity, its own

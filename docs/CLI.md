@@ -666,6 +666,18 @@ ignored.
 a separate `--json` when stdout is already JSON, and they are refused
 on a table.
 
+For live local `issue ls` and `issue show`, JSON includes `job_state.state`:
+`known`, `unavailable`, or `malformed`. When job state is not known,
+readiness is not asserted; the unfiltered tracker read remains available.
+`issue ls --ready` and `--blocked` refuse rather than report an authoritative
+filtered list. Text output warns on stderr. Historical `--at` reads keep
+their historical derivation without consulting the daemon. Job and approval
+probes use bounded deadlines.
+
+`CADENCE_JSON=pretty` or `compact` also controls JSON from org commands,
+hosted answers and offline result receipts. Raw text and byte streams retain
+their own formats.
+
 With `--watch`, machine mode writes one compact JSON value per line and
 no terminal-control bytes, including when `CADENCE_JSON=pretty`. A
 terminal watch without JSON still redraws the table in place.

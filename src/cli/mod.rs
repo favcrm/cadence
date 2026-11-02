@@ -555,7 +555,7 @@ pub(crate) fn send_message(
     // CAD-251: a stale mailbox still accepted the message — say so on
     // stderr so stdout stays the JSON receipt.
     if let Some(warning) = receipt["warning"].as_str() {
-        eprintln!("warning: {warning}");
+        eprint_line(&format!("warning: {warning}"));
     }
     Ok((receipt, false))
 }
@@ -871,12 +871,15 @@ pub(crate) fn stamp_agent_projects(list: &mut Value) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn print_json(value: &Value) {
-    println!(
-        "{}",
-        cadence_agent::output::json_text(value).unwrap_or_default()
-    );
-}
+// The one closed-consumer rule for every stream, shared with the
+// library's verbs and defined beside the JSON policy: a reader that
+// stops early (`cadence … | head -1`) is not a command failure, so the
+// write is dropped and the verb's own exit code still decides the
+// status. Re-exported so every `cli` submodule keeps its bare
+// `print_json`/`print_line`/`eprint_line` calls.
+pub(crate) use cadence_agent::output::{
+    eprint_line, eprint_text, print_json, print_line, print_text, write_stdout,
+};
 
 /// Sort/limit/fields on `out[key]` — the shared list-grammar tail for
 /// daemon-RPC payloads, which already arrive as JSON. `names` is the
@@ -994,7 +997,7 @@ fn permission_replay(state_dir: &Path, cli: &Cli) -> Option<i32> {
     match cadence_agent::master_perm::classify(&argv, &cwd, &[], std::slice::from_ref(&state_dir)) {
         cadence_agent::master_perm::Class::Allowlisted => return None,
         cadence_agent::master_perm::Class::Never { why } => {
-            eprintln!("{why} — a grant or a rule cannot allow it");
+            eprint_line(&format!("{why} — a grant or a rule cannot allow it"));
             return Some(1);
         }
         _ => {}
@@ -1008,22 +1011,22 @@ fn permission_replay(state_dir: &Path, cli: &Cli) -> Option<i32> {
             let stdout = out["stdout"].as_str().unwrap_or("");
             let stderr = out["stderr"].as_str().unwrap_or("");
             if !stdout.is_empty() {
-                print!("{stdout}");
+                print_text(stdout);
                 if !stdout.ends_with('\n') {
-                    println!();
+                    print_text("\n");
                 }
             }
             if !stderr.is_empty() {
-                eprint!("{stderr}");
+                eprint_text(stderr);
                 if !stderr.ends_with('\n') {
-                    eprintln!();
+                    eprint_text("\n");
                 }
             }
             Some(out["code"].as_i64().unwrap_or(1) as i32)
         }
         Ok(_) => None,
         Err(e) => {
-            eprintln!("{e}");
+            eprint_line(&e.to_string());
             Some(1)
         }
     }
