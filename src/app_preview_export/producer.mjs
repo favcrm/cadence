@@ -1,4 +1,4 @@
-// src/lib/conditionalGet.ts
+//#region src/lib/conditionalGet.ts
 /** Bounded validators, scoped to this tab's current operator credential.
 * 304 is useful only with a matching in-memory representation; no disk cache.
 */
@@ -55,7 +55,8 @@ var ConditionalGet = class {
 		};
 	}
 };
-// src/lib/sessionKey.ts
+//#endregion
+//#region src/lib/sessionKey.ts
 /**
 * The operator session's second credential (CAD-313, review round 2 of
 * PR #249). The board's HttpOnly cookie alone is no session: every
@@ -98,11 +99,13 @@ function sessionKey() {
 	} catch {}
 	return null;
 }
-// src/lib/privateSession.ts
+//#endregion
+//#region src/lib/privateSession.ts
 var generation = 0;
 var privateSessionGeneration = () => generation;
 new ConditionalGet((input, init) => fetch(input, init), () => `${sessionKey() ?? ""}:${privateSessionGeneration()}`);
-// src/features/workspace-apps/screen/screenProtocol.ts
+//#endregion
+//#region src/features/workspace-apps/screen/screenProtocol.ts
 /** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the
 *  port. `call` verbs run directly: the install's own config and drafts, and
 *  (CAD-1918, operator decision) the app's own publish confirmation and
@@ -388,7 +391,8 @@ function shapeFor(push, level) {
 	}
 	return pushBytes(v2) <= 131072 ? v2 : null;
 }
-// src/features/workspace-apps/screen/screenProjection.ts
+//#endregion
+//#region src/features/workspace-apps/screen/screenProjection.ts
 var ID_MAX = 128;
 var isId = (value) => value.length > 0 && value.length <= ID_MAX;
 function isZone(timezone) {
@@ -800,7 +804,8 @@ function screenProjection(installation, tag, contextId, contexts, runs, effects,
 	if (!shapeFor(projection, false)) throw new Error("The screen projection exceeds its message limit");
 	return projection;
 }
-// scripts/app-fixtures/producer.ts
+//#endregion
+//#region scripts/app-fixtures/producer.ts
 var MAX_INPUT = 1048576;
 var MAX_OUTPUT = 8388608;
 var CONTRACT = "app-screen-projection-fixtures/8";
@@ -1009,5 +1014,6 @@ main().catch((error) => {
 	process.stderr.write(`fixture producer refused: ${String(error?.message ?? "error").slice(0, 512)}\n`);
 	process.exitCode = 1;
 });
+//#endregion
 
 //# sourceMappingURL=producer.mjs.map
