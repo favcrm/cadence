@@ -314,10 +314,13 @@ function HomeList({
     // animation; anything at or below the mount seq is history.
     const live = item.type === "pending" || Number(item.key.slice(1)) > liveAfter;
     const act = activity?.(item) ?? null;
+    // A fallback row belongs to no carrier: hoist it into the stable list
+    // whatever row it rides, including a system row, so the first step can
+    // replace it in place instead of remounting the head.
     const hoist =
       act?.kind === "row" &&
-      act.position === "after" &&
-      (item.type === "operator" || item.type === "pending");
+      (act.fallback === true ||
+        (act.position === "after" && (item.type === "operator" || item.type === "pending")));
     if (hoist) {
       const msg = itemMessage(item);
       const live = item.type === "pending" && item.pending.state === "failed"
@@ -332,7 +335,7 @@ function HomeList({
     }
     return (
       <li key={rowPaintKey(item)} className={`min-w-0 space-y-2${live ? " msg-in" : ""}`}>
-        {act?.kind === "row" && act.position === "before" ? act.node : null}
+        {act?.kind === "row" && act.position === "before" && !hoist ? act.node : null}
         <ThreadItemView item={item} readOnly={readOnly} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={onDiscard} activity={act?.kind === "header" ? act.node : undefined} />
         {item.type === "answer" && <CorrectionReport question={visibleQuestion(items, items.indexOf(item))} answer={item.entry.text} />}
         {act?.kind === "row" && act.position === "after" && !hoist ? act.node : null}

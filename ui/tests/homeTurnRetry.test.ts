@@ -317,6 +317,38 @@ async function main() {
   });
   await settle();
   assert(host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') === failedTurn, "a failed send does not steal the working placeholder");
+  // A fallback carried by a system row must still hoist into the stable
+  // list, so the first step replaces it rather than remounting the head.
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      pending: [],
+      entries: [
+        ...state!.entries,
+        { seq: 50, role: "operator", kind: "message", message: "ui-d", text: "D ask" },
+        { seq: 51, role: "system", kind: "message", message: null, text: "system note" },
+      ],
+    }));
+  });
+  await settle();
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: { state: "working", message: "server-d", conversation: "home-thread" }, queue: [] }));
+  });
+  await settle();
+  const systemTurn = host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') ?? null;
+  assert(systemTurn !== null, "the working placeholder paints over a system carrier");
+  assert(systemTurn.closest("li")?.querySelector('[data-kind="system"]') === null, "the fallback is not nested under the system row");
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [
+        ...state!.entries,
+        { seq: 52, role: "agent", kind: "thinking", message: null, text: "D works" },
+      ],
+    }));
+  });
+  await settle();
+  assert(host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') === systemTurn, "the first step replaces the system-carried placeholder in place");
   await React.act(async () => {
     streamMaster.turn = null;
     streamMaster.queue = [];
