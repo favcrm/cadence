@@ -2,6 +2,7 @@ use crate::store::{
     app_records::RecordStore,
     app_social_drafts::{DraftSource, EffectStage, GenerationStart, SocialDraftEdit},
 };
+use rusqlite::params;
 use serde_json::json;
 
 #[test]
@@ -153,6 +154,38 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
     assert!(store
         .app_social_tool_receipt_contains("ctx-two", "receipt-other")
         .unwrap());
+    // The plan, not just the index: the candidate query must walk this order.
+    let plan: Vec<String> = store
+        .conn()
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT receipt_id FROM app_social_tool_receipts
+              WHERE install_id=? AND context_id=? ORDER BY completed_at DESC, receipt_id DESC LIMIT ?",
+        )
+        .unwrap()
+        .query_map(params!["install-social", "ctx-one", 500i64], |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter().any(|line| line.contains("app_social_tool_receipts_order")),
+        "candidate order uses its index: {plan:?}"
+    );
+    // The candidate query orders by completed_at; the schema must carry the
+    // index that makes that order a walk rather than a sort of the context's
+    // whole history, including on a database opened before this index existed.
+    assert!(
+        store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='app_social_tool_receipts_order'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+            == 1
+    );
     // The candidate window the screen read is bounded by: this context's own
     // attachments, newest first, and never another context's.
     assert_eq!(

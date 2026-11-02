@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS app_social_source_requests(\
 CREATE TABLE IF NOT EXISTS app_social_tool_receipts(\
  install_id TEXT NOT NULL, context_id TEXT NOT NULL, receipt_id TEXT NOT NULL, completed_at REAL NOT NULL,\
  PRIMARY KEY(context_id,receipt_id));\
+CREATE INDEX IF NOT EXISTS app_social_tool_receipts_order ON app_social_tool_receipts(install_id,context_id,completed_at DESC,receipt_id DESC);\
 CREATE TABLE IF NOT EXISTS app_social_freshness(\
  install_id TEXT NOT NULL, context_id TEXT NOT NULL, handle TEXT NOT NULL, receipt_id TEXT NOT NULL, completed_at REAL NOT NULL,\
  PRIMARY KEY(context_id,handle));\
