@@ -463,6 +463,107 @@ async function sessionOver(
 }
 
 describe("HostedSession admission", () => {
+  it("never replays a different UTF-16 string as the same text and preserves paired Unicode retries", async () => {
+    const { database } = sessionDatabase();
+    const scopes = new OperationScopes(sqlStore(database));
+    const submissions: Array<{ text: string; operationId: string }> = [];
+    const accepted = new Set<string>();
+    const session = await sessionOver(
+      {
+        submit: async (text, options) => {
+          submissions.push({ text, operationId: options.operationId });
+          const first = !accepted.has(options.operationId);
+          accepted.add(options.operationId);
+          return { accepted: first, operationId: options.operationId };
+        },
+        prompt: async () => {
+          throw new Error("ask is not part of this case");
+        },
+      },
+      scopes,
+      sqlStore(database),
+    );
+    try {
+      for (const [index, unpaired] of ["\ud800", "\udfff"].entries()) {
+        const operationId = `op-unpaired-${index}`;
+        const malformed = `text ${unpaired} end`;
+        const replacement = "text \ufffd end";
+        const before = submissions.length;
+        const first = await session.submit(malformed, operationId, LEDGER).then(
+          (value) => ({ admitted: true as const, value }),
+          () => ({ admitted: false as const }),
+        );
+        if (first.admitted) {
+          expect(first.value).toBe(true);
+          expect(submissions.slice(before)).toEqual([{ text: malformed, operationId }]);
+          await expect(session.submit(replacement, operationId, LEDGER)).rejects.toThrow();
+          expect(submissions.slice(before)).toEqual([{ text: malformed, operationId }]);
+        } else {
+          // Refusing malformed text at first admission is also safe: it must
+          // neither reach the engine nor reserve the id of a valid operation.
+          expect(submissions.length).toBe(before);
+          expect(await session.submit(replacement, operationId, LEDGER)).toBe(true);
+        }
+      }
+
+      const paired = "text \ud83d\ude80 end";
+      expect(await session.submit(paired, "op-paired", LEDGER)).toBe(true);
+      expect(await session.submit(paired, "op-paired", LEDGER)).toBe(false);
+      expect(submissions.filter(({ operationId }) => operationId === "op-paired")).toEqual([
+        { text: paired, operationId: "op-paired" },
+        { text: paired, operationId: "op-paired" },
+      ]);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("refuses a replacement-character retry of a legacy Home entry with an unpaired surrogate", async () => {
+    const { database } = sessionDatabase();
+    const scripted = scriptedModels("acknowledged", { gate: false });
+    const storage = await SqliteStorage.open(sqliteFacade(database), { prefix: "pi_" });
+    const harness = await Harness.open(
+      storage,
+      { models: scripted.models, registry: createRegistry() },
+      BACKGROUND_CONTEXT,
+    );
+    try {
+      const conversation = await harness.root(BACKGROUND_CONTEXT, {
+        agent: { model: { provider: "scripted", modelId: "scripted" } },
+      });
+      const operationId = "op-legacy-unpaired";
+      const original = "text \ud800 end";
+      const legacy = await conversation.submit(
+        { type: "input", requestId: operationId, content: original, entry: operationEntry(operationId) },
+        BACKGROUND_CONTEXT,
+      );
+      expect((await legacy.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      const scopes = new OperationScopes(sqlStore(database));
+      let engineCalls = 0;
+      const session = await sessionOver(
+        {
+          submit: async (_text, options) => {
+            engineCalls += 1;
+            return { accepted: false, operationId: options.operationId };
+          },
+          prompt: async () => {
+            throw new Error("ask is not part of this case");
+          },
+          pi: async () => harness,
+        },
+        scopes,
+        sqlStore(database),
+      );
+      await expect(session.submit("text \ufffd end", operationId)).rejects.toThrow();
+      expect(engineCalls).toBe(0);
+      expect(guardRows(database)).toEqual([]);
+      expect(scripted.requests).toEqual([original]);
+    } finally {
+      await harness.close(BACKGROUND_CONTEXT);
+      database.close();
+    }
+  });
+
   it("refuses a changed app scope or text before the engine sees it", async () => {
     const { database } = sessionDatabase();
     const scopes = new OperationScopes(sqlStore(database));

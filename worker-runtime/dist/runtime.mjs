@@ -56340,9 +56340,9 @@ var OPERATION_ID_MAX = 200;
 var OPERATION_TEXT_MAX = 1e6;
 var CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
 var APP_PART = /^[A-Za-z0-9_-]{1,128}$/;
-var DIGEST_DOMAIN = "cadence.operation.envelope.v1\x00";
+var DIGEST_DOMAIN = "cadence.operation.envelope.v2\x00";
 function textDigest(text) {
-  return createHash("sha256").update(DIGEST_DOMAIN, "utf8").update(text, "utf8").digest("hex");
+  return createHash("sha256").update(DIGEST_DOMAIN, "utf8").update(JSON.stringify(text), "utf8").digest("hex");
 }
 var DIGEST = /^[0-9a-f]{64}$/;
 function requirePart(value, label, pattern) {

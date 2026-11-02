@@ -68,22 +68,21 @@ const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
 const APP_PART = /^[A-Za-z0-9_-]{1,128}$/;
 
 /** Domain separation, so this digest can never equal one made for other data. */
-const DIGEST_DOMAIN = "cadence.operation.envelope.v1\u0000";
+const DIGEST_DOMAIN = "cadence.operation.envelope.v2\u0000";
 
 /**
  * The digest one operation's text is bound by.
  *
  * The guard must recognise a changed text under a repeated operation id, but it
  * must not retain the text itself: the engine already stores the transcript,
- * and its own reset and compaction lifecycle governs that copy. A SHA-256
- * digest over a domain-separated, UTF-8 encoding keeps the exact-match check
- * (a changed text cannot collide in practice) while leaving nothing readable
- * behind in this table.
+ * and its own reset and compaction lifecycle governs that copy. JSON string
+ * encoding preserves unpaired UTF-16 surrogates that UTF-8 would replace, so
+ * distinct strings remain distinct before the domain-separated SHA-256 digest.
  */
 function textDigest(text: string): string {
   return createHash("sha256")
     .update(DIGEST_DOMAIN, "utf8")
-    .update(text, "utf8")
+    .update(JSON.stringify(text), "utf8")
     .digest("hex");
 }
 

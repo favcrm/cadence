@@ -105,8 +105,12 @@ text or metadata — so the runtime owns the check: the first admission of an
 operation id records a SHA-256 digest of its text and its app scope in the
 session object's `tenant_operation_scopes` table, an identical retry is the
 same operation, and a retry that changes the text or the scope is refused
-before the engine is asked. The text itself is never copied into that table, so
-the guard leaves no readable message behind when the engine's own reset or
+before the engine is asked. Text is hashed as a JSON string so distinct UTF-16
+strings, including unpaired surrogates, cannot collapse to the same UTF-8
+replacement character. Rows written by the earlier candidate digest refuse
+replay rather than being silently reinterpreted. The text itself is never
+copied into that table, so the guard leaves no readable message behind when the
+engine's own reset or
 compaction retires its copy; the rows are kept because they are the operation
 ids' bindings, and dropping one would let a replay be re-bound. A refused
 admission writes nothing, and the binding is the session's SQLite, not one
