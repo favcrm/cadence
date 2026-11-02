@@ -167,3 +167,61 @@ fn audit_verdicts_respect_the_invocations_organization() {
     assert!(String::from_utf8_lossy(&conflict.stderr).contains("--org conflicts"));
     assert!(!String::from_utf8_lossy(&conflict.stdout).contains("synthetic-reviewer"));
 }
+
+// AOS-473: the verdicts document names its origin, and a local read never
+// pretends to be repo-scoped. The gate applies its attested counting rule only
+// to a document that says `hosted`; a local document (or an older client's,
+// which has no marker) keeps today's rule, so the marker has to be real.
+#[test]
+fn audit_verdicts_names_its_origin_and_a_local_read_refuses_a_repo() {
+    use std::process::{Command, Output};
+
+    let home = tempfile::tempdir().unwrap();
+    let notes = home.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    let head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    std::fs::write(
+        notes.join("20261102-120000-synthetic-verdict.md"),
+        format!(
+            "# Verdict: CAD-998 Standards review — pass\n\
+             > Issue: CAD-998\n\
+             > From: synthetic-reviewer\n\n\
+             ## Verdict\n\
+             pass — PR #5, head {head}\n\n\
+             Risk: auto\n"
+        ),
+    )
+    .unwrap();
+
+    let run = |extra: &[&str]| -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.env_clear()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .args([
+                "audit", "verdicts", "--issue", "CAD-998", "--pr", "5", "--head", head,
+            ])
+            .arg("--notes-dir")
+            .arg(&notes)
+            .args(extra);
+        cadence_agent::reaper::output(&mut cmd).unwrap()
+    };
+
+    let local = run(&[]);
+    assert!(
+        local.status.success(),
+        "local audit failed: {}",
+        String::from_utf8_lossy(&local.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&local.stdout).unwrap();
+    assert_eq!(doc["origin"], "local");
+    assert_eq!(doc["verdicts"][0]["reviewer"], "synthetic-reviewer");
+
+    // A local note names no repository: asking for one is a refusal, never a
+    // silently unfiltered answer.
+    let scoped = run(&["--repo", "favcrm/cadence"]);
+    assert!(!scoped.status.success(), "a local read honoured --repo");
+    assert!(String::from_utf8_lossy(&scoped.stderr).contains("--repo"));
+    assert!(scoped.stdout.is_empty());
+}

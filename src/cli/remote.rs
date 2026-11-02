@@ -1794,13 +1794,18 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                     risk,
                     file,
                     text,
+                    repo,
                 }),
             ..
         } => {
             let head = super::audit::full_head(head)?;
-            if kind != "standards" && kind != "spec" {
+            // AOS-473: the kinds the merge gate counts. `spec` is retired: the
+            // service refuses it, and a hosted Spec verdict under a name the
+            // gate never counts would refuse every two-review hosted PR.
+            if !["standards", "spec-security", "combined", "browser-qa"].contains(&kind.as_str()) {
                 return Err(Error::usage(
-                    "audit verdict --kind is `standards` or `spec`; nothing was sent",
+                    "audit verdict --kind is `standards`, `spec-security`, `combined` or \
+                     `browser-qa`; nothing was sent",
                 ));
             }
             if outcome != "pass" && outcome != "revise" {
@@ -1845,9 +1850,11 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                     "verdict text exceeds the 16 KB cap — trim it; nothing was sent",
                 ));
             }
+            let repo = repo_or_origin(repo)?;
             let recorded = hosted_gate::verdict(
                 target,
                 wake_timeout,
+                &repo,
                 issue.trim(),
                 *pr,
                 &head,
@@ -1861,20 +1868,47 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             printed((recorded, 0))
         }
         Commands::Audit {
-            action: Some(AuditAction::Verdicts {
-                issue, pr, head, ..
-            }),
+            action:
+                Some(AuditAction::Verdicts {
+                    issue,
+                    pr,
+                    head,
+                    repo,
+                    ..
+                }),
             ..
         } => {
             let head = super::audit::full_head(head)?;
+            let repo = repo_or_origin(repo)?;
             printed(hosted_gate::verdicts(
                 target,
                 wake_timeout,
+                &repo,
                 issue.trim(),
                 *pr,
                 &head,
             )?)
         }
+        Commands::Audit {
+            action: Some(AuditAction::Reviewers { repo, action }),
+            ..
+        } => match action {
+            None => printed(hosted_gate::reviewers(
+                target,
+                wake_timeout,
+                &repo_or_origin(repo)?,
+            )?),
+            Some(super::audit::ReviewersAction::Set { repo, reviewer }) => {
+                // The attestation is the workspace owner's own act: the stored
+                // login is not an agent's to spend (the CAD-1586 rule).
+                refuse_managed(target, "audit reviewers set")?;
+                let pairs = super::audit::reviewer_pairs(reviewer)?;
+                printed((
+                    hosted_gate::set_reviewers(target, wake_timeout, repo, &pairs)?,
+                    0,
+                ))
+            }
+        },
         Commands::Audit {
             action: Some(AuditAction::Scope { issue }),
             ..
