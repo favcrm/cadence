@@ -254,14 +254,18 @@ fn soc54_receipt_kind_migrates_an_existing_database() {
     // failed when the index was created inside the shared DDL batch.
     let reopened = RecordStore::open(root.path(), "install-old").unwrap();
     assert_eq!(
-        reopened.app_social_tool_receipt_ids("ctx-one", 500).unwrap(),
+        reopened
+            .app_social_tool_receipt_ids("ctx-one", 500)
+            .unwrap(),
         vec!["legacy-source"]
     );
     reopened
         .app_social_tool_receipt_attach("ctx-one", "new-source", 3.0, "social.source.posts")
         .unwrap();
     assert_eq!(
-        reopened.app_social_tool_receipt_ids("ctx-one", 500).unwrap(),
+        reopened
+            .app_social_tool_receipt_ids("ctx-one", 500)
+            .unwrap(),
         vec!["new-source", "legacy-source"]
     );
     // Typed rows come first; unknown legacy rows take only the remaining room,
@@ -269,13 +273,18 @@ fn soc54_receipt_kind_migrates_an_existing_database() {
     reopened
         .app_social_tool_receipt_attach("ctx-one", "legacy-upload", 1.0, "")
         .unwrap();
+    // Even when unknown rows are newer than the initialised receipt, the
+    // newest read keeps its place: window 2 is the typed read + freshness.
+    reopened
+        .app_social_tool_receipt_attach("ctx-one", "legacy-newer", 9.0, "")
+        .unwrap();
     assert_eq!(
         reopened.app_social_tool_receipt_ids("ctx-one", 2).unwrap(),
         vec!["new-source", "legacy-source"]
     );
     assert_eq!(
         reopened.app_social_tool_receipt_ids("ctx-one", 5).unwrap(),
-        vec!["new-source", "legacy-source", "legacy-upload"]
+        vec!["new-source", "legacy-source", "legacy-newer", "legacy-upload"]
     );
 }
 

@@ -854,9 +854,10 @@ impl RecordStore {
     /// source attachments come first, so an upload or caption cannot consume
     /// the window at any threshold. Unknown-kind rows from before the column
     /// existed take only the remaining room, and the saved handles' newest
-    /// completed read joins them, so an upgraded install keeps both its older
-    /// retained reads and its newest page. The authoritative kind and ownership
-    /// checks run on each returned receipt.
+    /// completed read comes next, and unknown legacy rows take only what is
+    /// left — so an upgraded install keeps its newest page even when unknown
+    /// rows fill the allowance, plus as much older history as fits. The
+    /// authoritative kind and ownership checks run on each returned receipt.
     pub fn app_social_tool_receipt_ids(
         &self,
         context: &str,
@@ -902,8 +903,10 @@ impl RecordStore {
                 r.get::<_, String>(0)
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Freshest page next, BEFORE the unknown rows: otherwise a window full
+        // of pre-upgrade uploads would leave the newest read out entirely.
         let mut out = typed;
-        for id in legacy.into_iter().chain(fresh) {
+        for id in fresh.into_iter().chain(legacy) {
             if out.len() == limit {
                 break;
             }

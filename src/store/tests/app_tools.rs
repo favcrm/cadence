@@ -192,7 +192,9 @@ fn soc54_source_reads_are_selected_before_the_history_bound() {
         "the id probe uses the primary key at production cardinality: {plan:?}"
     );
     assert!(
-        !plan.iter().any(|line| line.contains("app_tool_results_install")),
+        !plan
+            .iter()
+            .any(|line| line.contains("app_tool_results_install")),
         "the plan must not prefer the installation index: {plan:?}"
     );
     assert_eq!(
@@ -217,7 +219,6 @@ fn soc54_source_reads_are_selected_before_the_history_bound() {
         .app_tool_source_results_for("other", &all, 2)
         .unwrap()
         .is_empty());
-
 }
 
 #[test]
