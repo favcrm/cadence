@@ -283,9 +283,13 @@ function HomeList({
     const runningSend = isFlight ? activeSendId(items, running) : null;
     const certain = run.message ?? runningSend ?? carry;
     const msg: string | null = run.message ?? remembered ?? runningSend ?? carry ?? sendBefore(items, run.items, queuedSet);
-    // Only a send the transcript, the move it opened, or the working id
-    // names is remembered; a value guessed from the queue could be wrong.
-    if (certain !== null && remembered === undefined) stickySends.current.set(run.key, certain);
+    // Remember the send the transcript, the move's opener, or the working
+    // id names. A flight run whose daemon id matches no user row still
+    // adopts its nearest non-queued user row, and that adoption must
+    // survive the queue changing around it.
+    if (remembered === undefined && msg !== null && (certain !== null || isFlight)) {
+      stickySends.current.set(run.key, msg);
+    }
     if (msg && !claimedTurns.has(msg)) {
       claimedTurns.add(msg);
       turnKey.set(run.key, `turn:${msg}`);
@@ -1668,9 +1672,13 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       const runningSend = isFlight ? activeSendId(shown, runningMessage) : null;
       const certain = run.message ?? runningSend ?? carry;
       const send: string | null = run.message ?? remembered ?? runningSend ?? carry ?? sendBefore(shown, run.items, queuedSet);
-      // Only a send the transcript, the move it opened, or the working id
-      // names is remembered; a value guessed from the queue could be wrong.
-      if (certain !== null && remembered === undefined) stickySends.current.set(run.key, certain);
+      // Remember the send the transcript, the move's opener, or the working
+      // id names. A flight run whose daemon id matches no user row still
+      // adopts its nearest non-queued user row, and that adoption must
+      // survive the queue changing around it.
+      if (remembered === undefined && send !== null && (certain !== null || isFlight)) {
+        stickySends.current.set(run.key, send);
+      }
       effective.set(run.key, send);
       carry = run.items.some((item) => item.type === "answer") ? null : send;
     }

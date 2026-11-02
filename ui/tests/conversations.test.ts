@@ -796,6 +796,45 @@ assert(coldRuns[1].querySelector(".turn-head") !== null, "the new send paints it
 assert(coldRuns[1].querySelector('[data-kind="typing"]') !== null, "the new send's run owns the typing bubble");
 assert(coldRuns[0].querySelector('[data-kind="typing"]') === null, "the historical run is not typing for the new send");
 equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head follows cold history");
+// A differing daemon id whose rows are untagged must keep the adopted send
+// when the queue changes; otherwise the queued send steals the identity.
+convs["install-crm"].push(conv("c-split2", { title: "Split turn two" }));
+threads["c-split2"] = [
+  ent(1, "operator", "message", "mismatch ask", "m-split"),
+  ent(2, "operator", "message", "queued behind", "m-next"),
+  ent(3, "agent", "thinking", "mismatched work", null),
+];
+queue = [{ message: "m-next", conversation: "c-split2" }];
+turn = { state: "working", message: "server-split", conversation: "c-split2" };
+await React.act(async () => { await conversationList("install-crm").refresh(); });
+await settle();
+await pick("Split turn two");
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+const mismatchRun = host.querySelector(".app-chat-list [data-chat-run]") as HTMLElement | null;
+assert(mismatchRun !== null, "the mismatched working id still paints the run");
+threads["c-split2"].push(ent(4, "agent", "turn_result", "mismatched answer", null));
+turn = null;
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+queue = [];
+turn = { state: "working", message: "m-next", conversation: "c-split2" };
+threads["c-split2"].push(ent(5, "agent", "thinking", "queued work starts", null));
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+assert(host.querySelector(".app-chat-list [data-chat-run]") === mismatchRun, "an answered run keeps its adopted send when the queued send starts");
+assert(mismatchRun.querySelector('[data-kind="typing"]') === null, "the answered run is not typing for the queued send");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "only the queued send types");
+assert(host.querySelectorAll(".app-chat-list [data-chat-typing]").length === 0, "no standalone typing head follows the adopted run");
 
 await React.act(async () => { root.unmount(); });
 console.log("conversations checks passed");
