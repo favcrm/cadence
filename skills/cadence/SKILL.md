@@ -469,9 +469,9 @@ the queue is durable and `inbox --wait` blocks instead of polling.
 When someone new is joining a workspace, start from their goal, not from an
 install. Ask which they need:
 
-- **The shared board only** — the invitation link, sign in with the address
-  that received it, then **Open app**. No install, credential or agent
-  registration is involved.
+- **The shared board only** — open the invitation link, sign in with the
+  address that received it, choose **Join company**, then **Open app**. No
+  install, CLI credential or agent registration is involved.
 - **Cadence on their own computer** — install on that machine, then
   `cadence login <slug>`. Consent picks what this connection may use; the saved
   command default is separate and changes only with `--use`.

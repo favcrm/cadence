@@ -141,9 +141,10 @@ cadence --org acme team list
 
 The teammate can accept the invitation and use the shared board without
 installing anything. They open the invitation link from the email, sign in with
-the address that received it, and choose **Open app**. The board then shows the
-workspaces they belong to; picking one opens that workspace's board. Nothing on
-this path creates a credential, registers an agent or installs a CLI.
+the address that received it, choose **Join company** to accept, then choose
+**Open app**. The board then shows the workspaces they belong to; picking one
+opens that workspace's board. Nothing on this path creates a credential,
+registers an agent or installs a CLI.
 
 If the browser cannot join, the cause changes the next step:
 
@@ -152,9 +153,12 @@ If the browser cannot join, the cause changes the next step:
 - **Expired, revoked or already used** — ask a workspace owner to invite that
   address again.
 - **No matching workspace** — the invitation was not accepted under this
-  account, the workspace is archived, or a `--org <slug>` hint named a
-  workspace this account does not belong to. An invitation does not create
-  membership by itself; an owner can check `cadence --org <slug> team list`.
+  account, the workspace is archived, or the slug hint supplied to `cadence
+  login <slug>` names a workspace this account does not belong to. An
+  invitation does not create membership by itself; ask an owner to check
+  `cadence --org <slug> team list`. If the login hint is wrong, restart
+  `cadence login` without a hint to choose an eligible workspace, or use the
+  correct slug.
 
 ### Connect a computer (optional)
 
