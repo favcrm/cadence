@@ -66,6 +66,7 @@ import { agentOn } from "../../lib/agentOn";
 import SinceCard from "./SinceCard";
 import {
   discardPending,
+  inFlightTurnKey,
   lastSeq,
   newMessageId,
   openStep,
@@ -538,6 +539,7 @@ const ThreadList = memo(function ThreadList({
   liveAfter,
   onRetry,
   working,
+  queued,
   stale,
 }: {
   items: ThreadItem[];
@@ -558,6 +560,8 @@ const ThreadList = memo(function ThreadList({
   /** The live turn: its own `message` id picks the row the activity
    *  belongs to; `since` drives the elapsed clock. Null otherwise. */
   working: { message: string | null; since: number | null } | null;
+  /** Messages still queued behind the running turn: a run's send skips them. */
+  queued: string[];
   /** CAD-1782: the thread stream is down, so these rows are a snapshot. */
   stale: boolean;
 }) {
@@ -590,6 +594,25 @@ const ThreadList = memo(function ThreadList({
   const fallbackItem =
     working && anchorItem === null && shown.length > 0 ? shown[shown.length - 1] : null;
   const activityItem = anchorItem ?? fallbackItem;
+  // Once this send already has reasoning or tool rows, those rows ARE the
+  // turn. A second empty assistant (face, "now", dots) under them is the
+  // splash: hosted agent entries often carry no message id, so the anchor
+  // misses them and the fallback used to append another head.
+  const flightKey = inFlightTurnKey(shown, working?.message ?? null);
+  // A hire proposal paints as flat rows, never as a ThreadTurn, so the
+  // suppression below would leave that still-working turn with no
+  // indicator at all. Keep the fallback activity for a flat run.
+  const flightFlat = (() => {
+    if (flightKey === null) return false;
+    const start = shown.findIndex((item) => item.key === flightKey);
+    if (start < 0) return false;
+    for (let i = start; i < shown.length; i++) {
+      const item = shown[i];
+      if (item.type === "operator" || item.type === "pending") break;
+      if (item.type === "hire") return true;
+    }
+    return false;
+  })();
   if (items.length === 0 && !moreBefore) return null;
   return (
     <>
@@ -607,11 +630,13 @@ const ThreadList = memo(function ThreadList({
         readOnly={readOnly}
         liveAfter={liveAfter}
         running={working?.message ?? null} /* null while a send is only submitting */
+        queued={queued}
         legacyTranscript={!items.some((item) => item.type === "answer")}
         onOpenIssue={onOpenIssue}
         onRetry={onRetry}
         onDiscard={discard}
         activity={(item) => {
+          if (flightKey !== null && !flightFlat) return null;
           if (!working || activityItem === null || item.key !== activityItem.key) return null;
           const live = <AssistantActivity since={working.since} />;
           // The anchored row shows this turn's own newest entry time. A
@@ -639,6 +664,9 @@ const ThreadList = memo(function ThreadList({
             anchorItem === null || item.type === "operator" || item.type === "pending";
           return {
             kind: "row",
+            // One assistant turn: face, "now", and the typing bubble. HomeList
+            // paints it as its own row under the message, and keeps that row's
+            // key when the real steps arrive, so the head does not splash.
             node: needsTypingTurn ? <ThreadTurn items={[]} running /> : <AssistantNameRow at={at} live={live} />,
             position: below ? "after" : "before",
             ...(anchorItem === null ? { fallback: true as const } : {}),
@@ -1433,6 +1461,7 @@ function MasterHome({
               liveAfter={liveAfter.current ?? 0}
               onRetry={onRetrySend}
               working={workingActivity}
+              queued={(master.data?.queue ?? []).map((q) => q.message)}
               stale={streamReconnecting && activeTurn}
             />
             {cmds.map((c) => (

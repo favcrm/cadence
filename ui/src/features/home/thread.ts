@@ -450,6 +450,103 @@ export function itemMessage(item: ThreadItem): string | null {
   return item.entry.message ?? null;
 }
 
+/** React key for a user row. The optimistic pending row and the stored
+ *  operator entry share one message id; one key keeps that row (and the
+ *  typing block under it) from unmounting and rising in again when the
+ *  send is acknowledged. */
+export function rowPaintKey(item: ThreadItem): string {
+  const message = itemMessage(item);
+  if ((item.type === "operator" || item.type === "pending") && message) return `user:${message}`;
+  return item.key;
+}
+
+const OPEN_TURN = new Set(["thinking", "commentary", "tools", "hire"]);
+
+/** The send named by the working id: the user row whose message matches
+ *  it. Null when the daemon reports an id no user row carries — callers
+ *  then fall back to the user row before the run. */
+export function activeSendId(items: ThreadItem[], runningMessage: string | null): string | null {
+  if (runningMessage === null || runningMessage === "") return null;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    if ((item.type === "operator" || item.type === "pending") && itemMessage(item) === runningMessage) {
+      return runningMessage;
+    }
+  }
+  return null;
+}
+
+/** The send a run belongs to: the nearest user row before it, skipping
+ *  messages still queued behind the running turn. A queued row can sit
+ *  between the working send and its first assistant rows. */
+export function sendBefore(items: ThreadItem[], runItems: ThreadItem[], queued: ReadonlySet<string>, skip: string | null = null): string | null {
+  const idx = items.indexOf(runItems[0]);
+  if (idx < 0) return null;
+  for (let i = idx - 1; i >= 0; i--) {
+    const item = items[i];
+    if (item.type !== "operator" && item.type !== "pending") continue;
+    if (item.type === "pending" && item.pending.state === "failed") continue;
+    const id = itemMessage(item);
+    if (id !== null && (queued.has(id) || id === skip)) continue;
+    return id;
+  }
+  return null;
+}
+
+/** The assistant item that opens the run still in flight for `message`.
+ *  Null when that send has no assistant rows yet, or the run already has
+ *  an answer. Hosted transcripts often omit the message id on agent rows,
+ *  so the run is the contiguous assistant items after the user row. A
+ *  working id that matches no user row still adopts that open run when
+ *  every tagged row in it names that id — otherwise the real turn paints
+ *  as finished and a second assistant head is appended under it.
+ *
+ *  The run is adopted only when no row in it belongs to another send: a
+ *  queued or interleaved turn must not be marked busy, and must not have
+ *  the placeholder of the send actually running suppressed. A queued user
+ *  row can sit between the running send and its first assistant rows, so
+ *  an empty matching run falls through to the tail run. */
+export function inFlightTurnKey(items: ThreadItem[], message: string | null): string | null {
+  if (message === null || message === "") return null;
+  // A failed pending row stays visible for Retry/Discard but is not a live
+  // send: it neither bounds nor names the running turn.
+  const isUser = (item: ThreadItem) =>
+    (item.type === "operator" || item.type === "pending")
+    && !(item.type === "pending" && item.pending.state === "failed");
+  // `present` distinguishes "no assistant rows yet" (fall through) from a
+  // run that answered or names another send (refuse, never fall through).
+  const isTurn = (item: ThreadItem) =>
+    OPEN_TURN.has(item.type) || item.type === "answer" || item.type === "artifact";
+  const runAfter = (start: number): { key: string | null; present: boolean } => {
+    let first: string | null = null;
+    let present = false;
+    for (let i = start; i < items.length; i++) {
+      const item = items[i];
+      if (isUser(item)) break;
+      // A system or other non-turn row is transparent: it neither proves a
+      // run exists nor carries a send's provenance.
+      if (!isTurn(item)) continue;
+      present = true;
+      if (item.type === "answer") return { key: null, present };
+      const tagged = itemMessage(item);
+      if (tagged !== null && tagged !== message) return { key: null, present };
+      if (first === null && OPEN_TURN.has(item.type)) first = item.key;
+    }
+    return { key: first, present };
+  };
+  const idx = items.findIndex((item) => isUser(item) && itemMessage(item) === message);
+  if (idx >= 0) {
+    const run = runAfter(idx + 1);
+    if (run.present) return run.key;
+  }
+  let lastUser = -1;
+  for (let i = 0; i < items.length; i++) {
+    if (isUser(items[i])) lastUser = i;
+  }
+  if (lastUser < 0) return null;
+  return runAfter(lastUser + 1).key;
+}
+
 // ---- CAD-551: steps, refusals, and the working row's "what now" ----
 
 /** A tool call that runs `cadence artifact put` (not text that merely names

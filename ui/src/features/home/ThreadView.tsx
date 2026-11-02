@@ -33,10 +33,14 @@ export function time(created: string | null | undefined): string {
  */
 /** The tool rows themselves, with no disclosure of their own (CAD-1881):
  *  standalone groups own the `steps-head`, a turn's trace lists them flat
- *  under its single 44px head. */
-function ToolRows({ entries }: { entries: ThreadEntry[] }) {
+ *  under its single head. A turn trace asks for newest-first so the row
+ *  under "Reasoning" is the latest call, not the one that opened the turn. */
+function ToolRows({ entries, newestFirst = false }: { entries: ThreadEntry[]; newestFirst?: boolean }) {
   const t = useTranslate();
-  const steps = useMemo(() => toolSteps(entries), [entries]);
+  const steps = useMemo(() => {
+    const paired = toolSteps(entries);
+    return newestFirst ? paired.slice().reverse() : paired;
+  }, [entries, newestFirst]);
   return (
     <ul className="steps-inner">
       {steps.map((s, i) => (
@@ -55,7 +59,7 @@ function ToolRows({ entries }: { entries: ThreadEntry[] }) {
           >
             {s.call.kind === "tool_result" ? "←" : !s.done ? "◌" : s.refused ? "⊘" : s.error ? "✕" : "✓"}
           </span>
-          <span className="num min-w-0 break-all flex-1">{s.summary}</span>
+          <span className="num min-w-0 flex-1 truncate" title={s.summary}>{s.summary}</span>
           {s.refused && <span className="step-tag text-warn shrink-0">{t("refused")}</span>}
           {s.error && !s.refused && <span className="step-tag text-fail shrink-0">{t("error")}</span>}
           {s.result && s.call.kind === "tool_call" && (
@@ -541,6 +545,65 @@ function traceElapsed(from: string | null | undefined, to: string | null | undef
   return `${Math.floor(secs / 60)}m ${secs % 60}s`;
 }
 
+/** Tool name without its JSON arguments: `board_list_issues {"limit":50}`
+ *  reads as `board_list_issues` on the trace head. */
+function stepLabel(summary: string): string {
+  const cut = summary.indexOf(" {");
+  const name = (cut > 0 ? summary.slice(0, cut) : summary).trim();
+  return name.length > 48 ? `${name.slice(0, 45)}…` : name;
+}
+
+/** The line after "Reasoning": the newest step the open trace leads with,
+ *  and never the call that opened the turn or a raw argument blob. The
+ *  newest item decides: a tool run names its last calls, a reasoning or
+ *  commentary note reads as its own line. Older tool names appear only
+ *  when the newest row has nothing to say. */
+function traceDigest(trace: ThreadItem[]): { summary: string; errors: number } {
+  let errors = 0;
+  for (const item of trace) {
+    if (item.type !== "tools") continue;
+    for (const step of toolSteps(item.entries)) {
+      if (step.error) errors += 1;
+    }
+  }
+  for (let i = trace.length - 1; i >= 0; i--) {
+    const item = trace[i];
+    if (item.type === "tools") {
+      const names: string[] = [];
+      for (const step of toolSteps(item.entries)) {
+        const name = stepLabel(step.summary);
+        if (name !== "" && !carriesSecret(name)) names.push(name);
+      }
+      if (names.length > 0) return { summary: names.slice(-3).join(", "), errors };
+      continue;
+    }
+    if (item.type !== "thinking" && item.type !== "commentary") continue;
+    if (carriesSecret(item.entry.text)) continue;
+    const line = stepSummary(item.entry.text);
+    if (line !== "") return { summary: line, errors };
+  }
+  return { summary: "", errors };
+}
+
+/** The tool the turn is on right now, when the newest trace row is a tool.
+ *  A later reasoning note means the tool has finished, so the bubble goes
+ *  back to "Thinking…" instead of naming a call that already returned. */
+function runningTool(trace: ThreadItem[]): string {
+  for (let i = trace.length - 1; i >= 0; i--) {
+    const item = trace[i];
+    if (item.type === "tools") {
+      const steps = toolSteps(item.entries);
+      for (let s = steps.length - 1; s >= 0; s--) {
+        const name = stepLabel(steps[s].summary);
+        if (name !== "" && !carriesSecret(name)) return name;
+      }
+      continue;
+    }
+    if (item.type === "thinking" || item.type === "commentary") return "";
+  }
+  return "";
+}
+
 /** The newest stored stamp in a turn — its head's time when it has no answer. */
 function lastCreated(items: ThreadItem[]): string | null {
   for (let i = items.length - 1; i >= 0; i--) {
@@ -556,13 +619,11 @@ function lastCreated(items: ThreadItem[]): string | null {
   return null;
 }
 
-/** Three typing dots: the only streaming affordance. The transport sends
- *  whole entries, never token deltas, so there is no skeleton and no
- *  fabricated answer body to show while a turn works. The row is not its
- *  own live region: it mounts inside the thread's `role="log"` list, which
- *  already announces the addition, so a second `role="status"` here would
- *  announce the same row twice. */
-function TypingDots() {
+/** Three typing dots plus the current step. The transport sends whole
+ *  entries, never token deltas, so there is no skeleton and no fabricated
+ *  answer body. The row is not its own live region: it mounts inside the
+ *  thread's `role="log"` list, which already announces the addition. */
+function TypingDots({ label }: { label: string }) {
   const t = useTranslate();
   const actor = useAssistantActor();
   return (
@@ -572,6 +633,7 @@ function TypingDots() {
         <i />
         <i />
       </span>
+      <span className="typing-step">{label}</span>
       <span className="sr-only">{`${displayName(actor.read, actor.scope, t)} ${t("is typing")}`}</span>
     </div>
   );
@@ -585,12 +647,14 @@ function TurnTrace({
   steps,
   running,
   summary,
+  errors,
   elapsed,
 }: {
   items: ThreadItem[];
   steps: number;
   running: boolean;
   summary: string;
+  errors: number;
   elapsed: string | null;
 }) {
   const t = useTranslate();
@@ -610,19 +674,26 @@ function TurnTrace({
           ›
         </span>
         <span className="turntrace-title shrink-0">{title}</span>
-        {summary !== "" && <span className="turntrace-summary num truncate min-w-0">· {summary}</span>}
-        <span className="turntrace-count num shrink-0">
+        {summary !== "" && (
+          <span className="turntrace-summary num truncate min-w-0" title={summary}>
+            · {summary}
+          </span>
+        )}
+        <span className="turntrace-count num shrink-0" data-warn={errors > 0 || undefined}>
           {steps} {steps === 1 ? t("step") : t("steps")}
+          {errors > 0 ? ` · ${errors} ${errors === 1 ? t("error") : t("errors")}` : ""}
         </span>
       </button>
       <div className="steps-body" id={id} inert={!open} aria-hidden={!open}>
         <div className="turntrace-wrap">
           <ol className="turntrace-list">
-            {items.map((item) => {
+            {/* Newest first. A long run used to open on the first call, so
+                the steps actually in progress sat below the fold. */}
+            {[...items].reverse().map((item) => {
               if (item.type === "tools") {
                 return (
                   <li key={item.key} className="turntrace-item" data-item-key={item.key}>
-                    <ToolRows entries={item.entries} />
+                    <ToolRows entries={item.entries} newestFirst />
                   </li>
                 );
               }
@@ -767,7 +838,6 @@ export function ThreadTurn({
   head = true,
   continued = false,
   copy = true,
-  answered,
 }: {
   items: ThreadItem[];
   running?: boolean;
@@ -781,15 +851,11 @@ export function ThreadTurn({
   after?: ReactNode;
   /** False for a continuation segment: one head per turn, on its first run. */
   head?: boolean;
-  /** True for an earlier segment of a turn whose answer lands later: it must
-   *  not claim the turn returned no answer. */
+  /** True for an earlier segment of a split turn; the answer lands on a later one. */
   continued?: boolean;
   /** False in a pane that copies from its header: refused directives stay
    *  inert, with no control in the row. */
   copy?: boolean;
-  /** A terminal answer exists even when it renders outside this body (a
-   *  declared card or frame), so the turn is not answerless. */
-  answered?: boolean;
 }) {
   const t = useTranslate();
   const actor = useAssistantActor();
@@ -810,9 +876,6 @@ export function ThreadTurn({
   // Streaming is a turn the host says is running AND that has no answer yet:
   // a turn whose answer already landed keeps its finished look.
   const streaming = running && shown === null;
-  const failure = shown ? turnFailure(shown.entry, t) : null;
-  const hasAnswer = answered ?? (shown !== null && (shown.entry.text.trim() !== "" || failure !== null));
-  const noAnswer = !streaming && !hasAnswer && !continued;
   const steps = trace.reduce(
     (count, item) => count + (item.type === "tools" ? toolSteps(item.entries).length : 1),
     0,
@@ -820,10 +883,11 @@ export function ThreadTurn({
   const intro = trace.find((item) => item.type === "thinking") ?? trace[0];
   const introEntry =
     intro === undefined ? undefined : intro.type === "tools" ? intro.entries[0] : intro.entry;
-  const summary =
-    introEntry && !carriesSecret(introEntry.text) ? stepSummary(introEntry.text) : "";
+  const digest = traceDigest(trace);
   const elapsed = streaming ? null : traceElapsed(introEntry?.created, shown?.entry.created);
   const headAt = shown?.entry.created ?? lastCreated(items);
+  const tool = runningTool(trace);
+  const typingLabel = tool !== "" ? `${t("Running")} ${tool}` : t("Thinking…");
   return (
     <div className="turn min-w-0" data-kind="turn" data-turn-state={streaming ? "running" : "complete"} data-turn-continued={continued || undefined}>
       {head && (
@@ -834,27 +898,23 @@ export function ThreadTurn({
           {copy && shown && shown.entry.text.trim() !== "" && <CopyControl text={shown.entry.text} />}
         </div>
       )}
-      {/* The typing bubble is the loading state. It leads, so a running
-          turn is not a full-width "Thinking…" bar with the dots buried
-          under it. The trace stays a quiet disclosure beneath. */}
-      {streaming && <TypingDots />}
       {trace.length > 0 && (
         <TurnTrace
           items={trace}
           steps={steps}
           running={streaming}
-          summary={summary}
+          summary={digest.summary}
+          errors={digest.errors}
           elapsed={elapsed}
         />
       )}
+      {/* Dots, then the current step. Under the trace once steps exist,
+          so the disclosure names the turn and the bubble names what is
+          running now. */}
+      {streaming && <TypingDots label={typingLabel} />}
       {shown && (
         <div data-item-key={shown.key}>
           <AnswerSurface entry={shown.entry} density={density} onOpenIssue={onOpenIssue} earlier={legacy !== null} />
-        </div>
-      )}
-      {noAnswer && (
-        <div className="noanswer" data-kind="no-answer">
-          {t("No answer returned")}
         </div>
       )}
       {artifacts.length > 0 && (

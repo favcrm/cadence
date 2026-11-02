@@ -192,8 +192,202 @@ async function main() {
   const typingIndex = listItems.findIndex((row) => row.contains(typingRows[0]));
   const operatorIndex = listItems.findIndex((row) => row.querySelector('[data-chat-message="user"]'));
   assert(typingIndex === listItems.length - 1 && operatorIndex >= 0 && typingIndex > operatorIndex, "the typing bubble trails the operator's message");
+  const face = typingTurn.querySelector(".assistant-face");
+  assert(face !== null, "the submitting turn paints one assistant face");
+  const rowEl = typingTurn.parentElement;
+  // The first stored step often has no message id, and the daemon's working
+  // id is not the send id. The face has to stay mounted across that handoff.
   await React.act(async () => {
-    resources.masterThread.write((state) => ({ ...state!, pending: [] }));
+    streamMaster.turn = { state: "working", message: "server-id", conversation: "home-thread" };
+    streamMaster.queue = [];
+    resources.masterThread.write((state) => ({
+      ...state!,
+      pending: [],
+      entries: [
+        ...state!.entries,
+        { seq: 20, role: "operator", kind: "message", message: "ui-submitting", text: "While the POST is in flight" },
+        { seq: 21, role: "agent", kind: "thinking", message: null, text: "Reading the board." },
+      ],
+    }));
+    resources.masterState.write(() => ({
+      alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true,
+      turn: { state: "working", message: "server-id", conversation: "home-thread" }, queue: [],
+    }));
+  });
+  await settle();
+
+  assert(face.isConnected && rowEl?.isConnected === true, "the assistant face stays mounted when the first untagged step lands");
+  assert(host.querySelectorAll('[data-kind="typing"]').length === 1, "the first step does not paint a second typing bubble");
+  assert(host.querySelectorAll('[data-kind="turn"][data-turn-state="running"]').length === 1, "the first step does not paint a second assistant head");
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [
+        ...state!.entries,
+        { seq: 22, role: "agent", kind: "tool_call", message: null, text: "Bash: cadence board read" },
+      ],
+    }));
+  });
+  await settle();
+  assert(face.isConnected, "the assistant face stays mounted when the tool call lands");
+  const bubble = host.querySelector('[data-kind="typing"]');
+  assert(bubble !== null && bubble.textContent?.includes("Running Bash: cadence board read") === true, "the typing bubble names the tool now running");
+  const trace = host.querySelector('[data-kind="turn-trace"]');
+  assert(
+    trace !== null && (bubble.compareDocumentPosition(trace) & Node.DOCUMENT_POSITION_PRECEDING) !== 0,
+    "the typing bubble follows the trace",
+  );
+  // Completion must not remount the turn either: the send identity comes
+  // from the user row, not from the working state that just cleared.
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [
+        ...state!.entries,
+        { seq: 23, role: "agent", kind: "turn_result", message: null, text: "The board is clear." },
+      ],
+    }));
+    streamMaster.turn = null;
+    streamMaster.queue = [];
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
+  });
+  await settle();
+  assert(face.isConnected, "the assistant face stays mounted when the answer lands");
+  assert(host.querySelectorAll('[data-kind="typing"]').length === 0, "a landed answer clears the typing bubble");
+  // A mismatched working id with a send queued behind it: the placeholder
+  // belongs to the send being worked, not to the newest queued row.
+  streamMaster.turn = { state: "working", message: "server-a", conversation: "home-thread" };
+  streamMaster.queue = [{ message: "ui-b", conversation: "home-thread" }];
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      pending: [],
+      entries: [
+        ...state!.entries,
+        { seq: 30, role: "operator", kind: "message", message: "ui-a", text: "A ask" },
+        { seq: 31, role: "operator", kind: "message", message: "ui-b", text: "B queued" },
+      ],
+    }));
+  });
+  await settle();
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: { state: "working", message: "server-a", conversation: "home-thread" }, queue: [{ message: "ui-b", conversation: "home-thread" }] }));
+  });
+  await settle();
+  const queuedTurn = host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') ?? null;
+  assert(queuedTurn !== null, "the working placeholder paints with a queued send behind it");
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [
+        ...state!.entries,
+        { seq: 32, role: "agent", kind: "thinking", message: null, text: "A works" },
+      ],
+    }));
+  });
+  await settle();
+  assert(host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') === queuedTurn, "the placeholder updates in place when the first step lands behind a queued send");
+  // A retained failed send stays visible for Retry but must not name the
+  // working turn or steal its placeholder.
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      pending: [{ message: "ui-failed", text: "failed send", state: "failed", at: 2 }],
+      entries: [
+        ...state!.entries,
+        { seq: 40, role: "operator", kind: "message", message: "ui-c", text: "C ask" },
+      ],
+    }));
+  });
+  await settle();
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: { state: "working", message: "server-fail", conversation: "home-thread" }, queue: [] }));
+  });
+  await settle();
+  const failedTurn = host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') ?? null;
+  assert(failedTurn !== null, "the working placeholder paints past a failed send");
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [
+        ...state!.entries,
+        { seq: 41, role: "agent", kind: "thinking", message: null, text: "C works" },
+      ],
+    }));
+  });
+  await settle();
+  assert(host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') === failedTurn, "a failed send does not steal the working placeholder");
+  // A fallback carried by a system row must still hoist into the stable
+  // list, so the first step replaces it rather than remounting the head.
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      pending: [],
+      entries: [
+        ...state!.entries,
+        { seq: 50, role: "operator", kind: "message", message: "ui-d", text: "D ask" },
+        { seq: 51, role: "system", kind: "message", message: "m-system", text: "system note" },
+      ],
+    }));
+  });
+  await settle();
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: { state: "working", message: "server-d", conversation: "home-thread" }, queue: [] }));
+  });
+  await settle();
+  const systemTurn = host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') ?? null;
+  assert(systemTurn !== null, "the working placeholder paints over a system carrier");
+  assert(systemTurn.closest("li")?.querySelector('[data-kind="system"]') === null, "the fallback is not nested under the system row");
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [
+        ...state!.entries,
+        { seq: 52, role: "agent", kind: "thinking", message: null, text: "D works" },
+      ],
+    }));
+  });
+  await settle();
+  assert(host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') === systemTurn, "the first step replaces the system-carried placeholder in place");
+  // An answered run between the working send and its own steps must not hide
+  // the running send: the adopted id is the evidence, not the helper alone.
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      pending: [],
+      entries: [
+        ...state!.entries,
+        { seq: 60, role: "operator", kind: "message", message: "ui-e", text: "E ask" },
+        { seq: 61, role: "operator", kind: "message", message: "ui-f", text: "F ask" },
+        { seq: 62, role: "agent", kind: "thinking", message: null, text: "E works" },
+        { seq: 63, role: "agent", kind: "turn_result", message: null, text: "E answer" },
+        { seq: 64, role: "agent", kind: "thinking", message: null, text: "F works" },
+      ],
+    }));
+  });
+  await settle();
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: { state: "working", message: "ui-f", conversation: "home-thread" }, queue: [] }));
+  });
+  await settle();
+  const interleavedTyping = host.querySelector('[data-kind="typing"]')?.closest('[data-kind="turn"]') ?? null;
+  assert(interleavedTyping !== null, "the working send paints typing behind an earlier answered run");
+  assert(host.querySelectorAll('[data-kind="typing"]').length === 1, "one typing bubble for the interleaved send");
+  assert(host.querySelectorAll('[data-chat-typing]').length === 0, "no standalone typing head behind an answered run");
+  const eRun = host.querySelector('[data-item-key="e63"]')?.closest('[data-kind="turn"]') ?? null;
+  assert(eRun !== null, "the answered run is painted");
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
+  });
+  await settle();
+  assert(host.querySelectorAll('[data-kind="turn"]').length > 0, "the transcript stays after the turn clears");
+  const eRunAfter = host.querySelector('[data-item-key="e63"]')?.closest('[data-kind="turn"]') ?? null;
+  assert(eRunAfter === eRun, "the earlier answered run keeps its identity after the working turn clears");
+  await React.act(async () => {
+    streamMaster.turn = null;
+    streamMaster.queue = [];
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
+    resources.masterThread.write((state) => ({ ...state!, pending: state!.pending.filter((row) => row.state === "failed") }));
   });
   await settle();
   assert(host.querySelectorAll('[data-kind="typing"]').length === 0, "the typing bubble clears once the send settles out of submitting");

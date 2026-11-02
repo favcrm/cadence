@@ -49,7 +49,7 @@ equal([parseSlash("/new"), parseSlash(" /CLEAR "), parseSlash("/new now"), parse
 const inst = (id: string, name: string) => ({ install_id: id, title: name, name, version: "0.1.0", digest: "d", catalog_generation: "g", approved: true, approval: { state: "approved", epoch: 1 }, storage_kind: "workspace", files: [], capabilities: null, connection_slots: [] });
 let crmContext = "ctx-a";
 const ctxs = (id: string) => ({ contexts: [{ id: id === "install-crm" ? crmContext : "ctx-a", install_id: id, revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } }] });
-const ent = (seq: number, role: string, kind: string, text: string, message: string) => ({ seq, role, kind, message, text, created: "2026-10-03T00:00:00Z", payload: null });
+const ent = (seq: number, role: string, kind: string, text: string, message: string | null) => ({ seq, role, kind, message, text, created: "2026-10-03T00:00:00Z", payload: null });
 const conv = (id: string, over: object = {}) => ({ id, title: null, subject: null, is_general: false, ...over });
 const convs: Record<string, any[]> = {
   "install-crm": [conv("c-gen", { is_general: true }), conv("c-camp", { subject: "campaign:cmp-1", title: "Spring launch" })],
@@ -680,6 +680,205 @@ await settle();
 assert(host.querySelector("[data-identity-state]")?.getAttribute("data-identity-state") === "unavailable", "a 503 makes the retained private profile unavailable, not current");
 assert(!host.querySelector("[data-assistant-identity]"), "an unreadable profile does not claim private/workspace ownership from stale data");
 assert(host.querySelector("[data-assistant-name]")?.textContent !== "Poppy", "a failed identity read never displays the stale committed name as current");
+
+// CAD-1993: the pane's send keeps one identity from the working placeholder
+// through the first step, and a turn split by a system row keeps distinct
+// segment keys — one head and one typing row, never two.
+convs["install-crm"].push(conv("c-split", { title: "Split turn" }));
+threads["c-split"] = [ent(1, "operator", "message", "split ask", "m-split")];
+await React.act(async () => { await conversationList("install-crm").refresh(); });
+await settle();
+await pick("Split turn");
+identityUnavailable = false;
+turn = { state: "working", message: "m-split", conversation: "c-split" };
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+const placeholder = host.querySelector(".app-chat-list [data-chat-typing]") as HTMLElement | null;
+assert(placeholder !== null, "a working turn with no stored step paints the send placeholder");
+// A queued message after the working send must not take over the
+// placeholder's key: the first step still has to update this row.
+threads["c-split"].push(ent(2, "operator", "message", "queued behind", "m-next"));
+queue = [{ message: "m-next", conversation: "c-split" }];
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+assert(placeholder.isConnected, "a newer queued send leaves the working placeholder mounted");
+threads["c-split"].push(ent(3, "agent", "thinking", "plan the split", null));
+await React.act(async () => { await conversationThread("c-split").refresh(); });
+await settle();
+const landed = host.querySelector(".app-chat-list [data-chat-run]") as HTMLElement | null;
+assert(landed !== null, "the first step paints the turn row");
+assert(landed === placeholder, "the head updates in place when the first step lands");
+// Completion must not rename the run to the queued send either.
+threads["c-split"].push(ent(4, "agent", "turn_result", "Split answer.", null));
+turn = null;
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+assert(host.querySelector(".app-chat-list [data-chat-run]") === landed, "the head survives completion past a queued send");
+// The queued send starting must not re-attribute the answered run to it.
+queue = [];
+turn = { state: "working", message: "m-next", conversation: "c-split" };
+threads["c-split"].push(ent(5, "agent", "thinking", "B starts", null));
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+assert(host.querySelector(".app-chat-list [data-chat-run]") === landed, "the answered run keeps its identity when the queued send starts");
+equal(host.querySelectorAll(".app-chat-list [data-chat-run] .turn-head").length, 2, "each send paints its own head");
+assert(landed.querySelector('[data-turn-state="running"]') === null, "the answered run is not marked running for the new send");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "only the new send is typing");
+// The daemon's working id differs from the send id and a system row
+// splits the untagged run: ownership follows the adopted send, so the
+// last segment paints the dots and no second head appears.
+threads["c-split"] = [
+  ent(1, "operator", "message", "split ask", "m-split"),
+  ent(2, "agent", "thinking", "plan the split", null),
+  ent(3, "system", "message", "system note", null),
+  ent(4, "agent", "tool_call", "Bash: cadence board read", null),
+];
+turn = { state: "working", message: "server-split", conversation: "c-split" };
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+equal(host.querySelectorAll(".app-chat-list [data-chat-run] .turn-head").length, 1, "a split turn paints one head");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "a split turn paints one typing row");
+equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head follows a split turn");
+assert(host.querySelector(".app-chat-list [data-chat-run]") === landed, "the split keeps the head's identity");
+// A system row between the working send and a queued message is transparent:
+// the real run is still adopted, so there is one head and one typing row.
+threads["c-split"] = [
+  ent(1, "operator", "message", "split ask", "m-split"),
+  ent(2, "system", "message", "system note", null),
+  ent(3, "operator", "message", "queued behind", "m-next"),
+  ent(4, "agent", "thinking", "plan the split", null),
+];
+turn = { state: "working", message: "m-split", conversation: "c-split" };
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+equal(host.querySelectorAll(".app-chat-list [data-chat-run] .turn-head").length, 1, "a system-only gap paints one head");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "a system-only gap paints one typing row");
+equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "a system-only gap appends no standalone typing head");
+// A conversation opened cold: completed untagged history must keep its own
+// send, and the working send must own the typing bubble.
+threads["c-split"] = [
+  ent(1, "operator", "message", "old ask", "m-old"),
+  ent(2, "agent", "thinking", "old work", null),
+  ent(3, "agent", "turn_result", "old answer", null),
+  ent(4, "operator", "message", "new ask", "m-next"),
+  ent(5, "agent", "thinking", "new work", null),
+];
+turn = { state: "working", message: "m-next", conversation: "c-split" };
+await pick("General");
+await pick("Split turn");
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+const coldRuns = Array.from(host.querySelectorAll(".app-chat-list [data-chat-run]")) as HTMLElement[];
+equal(coldRuns.length, 2, "cold history and the new send paint two runs");
+assert(coldRuns[0].querySelector(".turn-head") !== null, "the historical run keeps its head");
+assert(coldRuns[1].querySelector(".turn-head") !== null, "the new send paints its own head");
+assert(coldRuns[1].querySelector('[data-kind="typing"]') !== null, "the new send's run owns the typing bubble");
+assert(coldRuns[0].querySelector('[data-kind="typing"]') === null, "the historical run is not typing for the new send");
+equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head follows cold history");
+// A differing daemon id whose rows are untagged must keep the adopted send
+// when the queue changes; otherwise the queued send steals the identity.
+convs["install-crm"].push(conv("c-split2", { title: "Split turn two" }));
+threads["c-split2"] = [
+  ent(1, "operator", "message", "mismatch ask", "m-split"),
+  ent(2, "operator", "message", "queued behind", "m-next"),
+  ent(3, "agent", "thinking", "mismatched work", null),
+];
+queue = [{ message: "m-next", conversation: "c-split2" }];
+turn = { state: "working", message: "server-split", conversation: "c-split2" };
+await React.act(async () => { await conversationList("install-crm").refresh(); });
+await settle();
+await pick("Split turn two");
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+const mismatchRun = host.querySelector(".app-chat-list [data-chat-run]") as HTMLElement | null;
+assert(mismatchRun !== null, "the mismatched working id still paints the run");
+threads["c-split2"].push(ent(4, "agent", "turn_result", "mismatched answer", null));
+turn = null;
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+queue = [];
+turn = { state: "working", message: "m-next", conversation: "c-split2" };
+threads["c-split2"].push(ent(5, "agent", "thinking", "queued work starts", null));
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+assert(host.querySelector(".app-chat-list [data-chat-run]") === mismatchRun, "an answered run keeps its adopted send when the queued send starts");
+assert(mismatchRun.querySelector('[data-kind="typing"]') === null, "the answered run is not typing for the queued send");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "only the queued send types");
+assert(host.querySelectorAll(".app-chat-list [data-chat-typing]").length === 0, "no standalone typing head follows the adopted run");
+// A later queued send must not rekey the one already running.
+threads["c-split2"].push(ent(6, "operator", "message", "third ask", "m-third"));
+queue = [{ message: "m-third", conversation: "c-split2" }];
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+const runningRun = host.querySelectorAll(".app-chat-list [data-chat-run]")[1] as HTMLElement | undefined;
+assert(runningRun !== undefined, "the running send has its own run");
+queue = [];
+turn = { state: "working", message: "m-third", conversation: "c-split2" };
+threads["c-split2"].push(ent(7, "agent", "thinking", "third works", null));
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+assert(host.querySelectorAll(".app-chat-list [data-chat-run]")[1] === runningRun, "the running send keeps its identity when another starts");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "only the newest send types");
+// Before any step exists, a mismatched daemon id plus a queued user must
+// still key the placeholder to the send being worked.
+convs["install-crm"].push(conv("c-split3", { title: "Split turn three" }));
+threads["c-split3"] = [
+  ent(1, "operator", "message", "mismatch ask", "m-split"),
+  ent(2, "operator", "message", "queued behind", "m-next"),
+];
+queue = [{ message: "m-next", conversation: "c-split3" }];
+turn = { state: "working", message: "server-split", conversation: "c-split3" };
+await React.act(async () => { await conversationList("install-crm").refresh(); });
+await settle();
+await pick("Split turn three");
+await React.act(async () => {
+  await conversationThread("c-split3").refresh();
+  await resources.masterConversation("c-split3").refresh();
+});
+await settle();
+const noOpener = host.querySelector(".app-chat-list [data-chat-typing]") as HTMLElement | null;
+assert(noOpener !== null, "a mismatched working id paints the placeholder before any step");
+threads["c-split3"].push(ent(3, "agent", "thinking", "mismatched work", null));
+await React.act(async () => { await conversationThread("c-split3").refresh(); });
+await settle();
+assert(host.querySelector(".app-chat-list [data-chat-run]") === noOpener, "the placeholder updates in place when the mismatched first step lands");
+
 await React.act(async () => { root.unmount(); });
 console.log("conversations checks passed");
 }
