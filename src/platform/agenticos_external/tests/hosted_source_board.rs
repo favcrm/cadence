@@ -1344,11 +1344,12 @@ fn cad1303_discard_is_operator_only_refuses_in_use_and_stale_and_hides_for_good(
     drop(stop);
 }
 
-/// CAD-1923: a draft from a source receipt that a newer fetch replaced is
-/// refused with the stable `stale_source` code, over RPC and on the board
-/// relay, so the app can tell it from an unknown failure.
+/// SOC-54: the library keeps posts an earlier fetch proved, so a retained
+/// read backs a draft after a newer fetch replaced the handle's freshness —
+/// on RPC and on the board relay. The refusal that remains is a receipt whose
+/// profile is no longer a saved source (`source_not_saved`, CAD-1923 renamed).
 #[test]
-fn cad1923_a_stale_source_receipt_is_refused_with_a_code_on_the_board_path() {
+fn soc54_a_retained_read_backs_a_draft_until_its_profile_is_removed() {
     let (mut stop, root, state) = boot_daemon(door_1303);
     let op = |method: &str, params: Value| operator(&state, method, params);
     let fixture = social_fixture(root.path());
@@ -1436,9 +1437,23 @@ fn cad1923_a_stale_source_receipt_is_refused_with_a_code_on_the_board_path() {
             "source":{"kind":"tool_receipt","receipt_id":receipt,"post_id":"post-1"}})
     };
 
-    let error = rpc("app_social_draft_create", create(&old, "d-1923-rpc")).unwrap_err();
-    assert_eq!(error.code(), Some("stale_source"), "{error}");
-    let mut body = create(&old, "d-1923-http");
+    // The newer fetch replaced the handle's freshness; the earlier retained
+    // read still backs a draft, because the library keeps what it proved.
+    rpc("app_social_draft_create", create(&old, "soc54-old-rpc"))
+        .expect("an older retained read is still a source");
+    rpc("app_social_draft_create", create(&new, "soc54-new-rpc"))
+        .expect("the newest read is a source too");
+
+    // Removing the profile from Settings withdraws that authority; the code is
+    // stable over RPC and on the board relay.
+    let records = crate::store::app_records::RecordStore::open(&state, &install).unwrap();
+    records
+        .app_social_sources_save(&context, 1, &[], "src-1923-clear")
+        .unwrap();
+    let error = rpc("app_social_draft_create", create(&new, "soc54-unsaved-rpc"))
+        .expect_err("a receipt whose profile is no longer a source must refuse");
+    assert_eq!(error.code(), Some("source_not_saved"), "{error}");
+    let mut body = create(&new, "soc54-unsaved-http");
     body["action_token"] = action.clone();
     let mut response = agent
         .post(format!("{base}/api/app-social-drafts/create"))
@@ -1456,12 +1471,19 @@ fn cad1923_a_stale_source_receipt_is_refused_with_a_code_on_the_board_path() {
     let reply: Value = response.body_mut().read_json().unwrap_or(Value::Null);
     assert_eq!(
         (status, reply["code"].as_str()),
-        (400, Some("stale_source")),
+        (400, Some("source_not_saved")),
         "{reply}"
     );
 
-    // The latest receipt still drafts.
-    rpc("app_social_draft_create", create(&new, "d-1923-new")).unwrap();
+    // Restored: the retained read works again, but a post it never returned
+    // is still refused.
+    records
+        .app_social_sources_save(&context, 2, &["juicysuite_crm".to_owned()], "src-1923-back")
+        .unwrap();
+    rpc("app_social_draft_create", create(&old, "soc54-restored")).unwrap();
+    let mut foreign = create(&old, "soc54-foreign-post");
+    foreign["source"]["post_id"] = json!("post-not-in-this-read");
+    rpc("app_social_draft_create", foreign).expect_err("a post outside the receipt must refuse");
     drop(stop);
 }
 

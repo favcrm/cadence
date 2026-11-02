@@ -814,7 +814,12 @@ impl Shared {
                         &self.state_dir,
                         &ctx.install_id,
                     )?;
-                    scoped.app_social_tool_receipt_attach(context, receipt_id, completed)?;
+                    scoped.app_social_tool_receipt_attach(
+                        context,
+                        receipt_id,
+                        completed,
+                        existing["result"]["kind"].as_str().unwrap_or(""),
+                    )?;
                     scoped.app_social_generation_complete_request(request_id, receipt_id)?;
                     if existing["result"]["kind"] == "social.source.posts" {
                         let handle = existing["result"]["handle"]
@@ -1327,6 +1332,7 @@ impl Shared {
                             context,
                             required_str(&receipt, "id")?,
                             created,
+                            receipt["result"]["kind"].as_str().unwrap_or(""),
                         )?;
                 }
             }
@@ -1422,16 +1428,18 @@ impl Shared {
                 self.store.app_context_proof(install, context)?;
                 let records =
                     crate::store::app_records::RecordStore::open(&self.state_dir, install)?;
-                let visible = records.app_social_freshness_receipts(context)?;
-                let mut results = self.store.app_tool_results(install)?;
-                if let Some(rows) = results["results"].as_array_mut() {
-                    rows.retain(|row| {
-                        row["id"]
-                            .as_str()
-                            .is_some_and(|id| visible.iter().any(|allowed| allowed == id))
-                    });
-                }
-                Ok(results)
+                // SOC-54: the screen's library is the retained source reads OF
+                // THIS CONTEXT, bounded. The candidate set is this context's
+                // own newest attachments, so a read never walks another
+                // context's history and cannot be slowed or starved by it; the
+                // store then keeps source reads only, newest first, up to 100.
+                const CANDIDATES: usize = 500;
+                const LIMIT: usize = 100;
+                let candidates = records.app_social_tool_receipt_ids(context, CANDIDATES)?;
+                let rows = self
+                    .store
+                    .app_tool_source_results_for(install, &candidates, LIMIT)?;
+                Ok(json!({ "results": rows }))
             }
             _ => Err(Error::rejected(
                 "app tool result takes exactly receipt_id or install_id",

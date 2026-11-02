@@ -2,6 +2,7 @@ use crate::store::{
     app_records::RecordStore,
     app_social_drafts::{DraftSource, EffectStage, GenerationStart, SocialDraftEdit},
 };
+use rusqlite::params;
 use serde_json::json;
 
 #[test]
@@ -130,14 +131,193 @@ fn social_source_profiles_normalize_and_compare_and_swap() {
     store
         .app_social_freshness_save("ctx-one", "kiva.wood", "receipt-stale", 12.0)
         .unwrap();
-    assert_eq!(
-        store.app_social_freshness_receipts("ctx-one").unwrap(),
-        vec!["receipt-new", "receipt-other"]
-    );
+    store
+        .app_social_tool_receipt_attach("ctx-one", "receipt-new", 20.0, "social.source.posts")
+        .unwrap();
+    store
+        .app_social_tool_receipt_attach("ctx-one", "receipt-old", 10.0, "social.source.posts")
+        .unwrap();
+    store
+        .app_social_tool_receipt_attach("ctx-two", "receipt-other", 15.0, "social.source.posts")
+        .unwrap();
+    // SOC-54: membership is per context and install — the screen library
+    // resolves source reads host-side and keeps only what this context holds.
     assert!(store
-        .app_social_freshness_receipts("ctx-two")
+        .app_social_tool_receipt_contains("ctx-one", "receipt-old")
+        .unwrap());
+    assert!(store
+        .app_social_tool_receipt_contains("ctx-one", "receipt-new")
+        .unwrap());
+    assert!(!store
+        .app_social_tool_receipt_contains("ctx-two", "receipt-new")
+        .unwrap());
+    assert!(store
+        .app_social_tool_receipt_contains("ctx-two", "receipt-other")
+        .unwrap());
+    // The freshness tier has its own ordered index: the fallback must not sort
+    // a context's whole historical freshness inventory either.
+    let fresh_plan: Vec<String> = store
+        .conn()
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT receipt_id FROM app_social_freshness
+              WHERE install_id=? AND context_id=? ORDER BY completed_at DESC, handle LIMIT ?",
+        )
         .unwrap()
-        .is_empty());
+        .query_map(params!["install-social", "ctx-one", 500i64], |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        fresh_plan
+            .iter()
+            .any(|line| line.contains("USING INDEX app_social_freshness_source_order")),
+        "the freshness fallback walks its index: {fresh_plan:?}"
+    );
+    assert!(
+        !fresh_plan.iter().any(|line| line.contains("TEMP B-TREE")),
+        "the freshness fallback needs no sort: {fresh_plan:?}"
+    );
+    // The plan, not just the index: the candidate query must walk this order.
+    let plan: Vec<String> = store
+        .conn()
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT receipt_id FROM app_social_tool_receipts
+              WHERE install_id=? AND context_id=? AND kind='social.source.posts'
+              ORDER BY completed_at DESC, receipt_id DESC LIMIT ?",
+        )
+        .unwrap()
+        .query_map(params!["install-social", "ctx-one", 500i64], |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    // The kind equality keeps the ordered walk in the covering index: the
+    // window is read in completed_at order, never sorted and never scanned.
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("USING COVERING INDEX app_social_tool_receipts_source_order")),
+        "the candidate window is read through its kind index: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line
+            .trim_start()
+            .starts_with("SCAN app_social_tool_receipts")),
+        "no full scan of the context's attachments: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+        "the ordered walk needs no sort: {plan:?}"
+    );
+    // The candidate query orders by completed_at; the schema must carry the
+    // index that makes that order a walk rather than a sort of the context's
+    // whole history, including on a database opened before this index existed.
+    assert!(
+        store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='app_social_tool_receipts_source_order'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+            == 1
+    );
+    // SOC-54: an upload cannot evict a source read from the candidate window.
+    // Three newer uploads and one older source, window 3 — the source must
+    // still be a candidate, because the window selects on kind.
+    store
+        .app_social_tool_receipt_attach("ctx-one", "up-1", 31.0, "social.uploaded_image")
+        .unwrap();
+    store
+        .app_social_tool_receipt_attach("ctx-one", "up-2", 32.0, "social.uploaded_image")
+        .unwrap();
+    store
+        .app_social_tool_receipt_attach("ctx-one", "up-3", 33.0, "social.uploaded_image")
+        .unwrap();
+    assert_eq!(
+        store.app_social_tool_receipt_ids("ctx-one", 2).unwrap(),
+        vec!["receipt-new", "receipt-old"]
+    );
+    // The candidate window the screen read is bounded by: this context's own
+    // attachments, newest first, and never another context's.
+    // Typed attachments first, then the saved handles' newest read.
+    assert_eq!(
+        store.app_social_tool_receipt_ids("ctx-one", 500).unwrap(),
+        vec!["receipt-new", "receipt-old", "receipt-other"]
+    );
+    assert_eq!(
+        store.app_social_tool_receipt_ids("ctx-two", 500).unwrap(),
+        vec!["receipt-other"]
+    );
+}
+
+#[test]
+fn soc54_receipt_kind_migrates_an_existing_database() {
+    let root = tempfile::tempdir().unwrap();
+    // A store from before the kind column and its index.
+    let store = RecordStore::open(root.path(), "install-old").unwrap();
+    store
+        .app_social_tool_receipt_attach("ctx-one", "legacy-source", 2.0, "social.source.posts")
+        .unwrap();
+    store
+        .app_social_sources_save("ctx-one", 0, &["brandhk".to_owned()], "src-old")
+        .unwrap();
+    store
+        .app_social_freshness_save("ctx-one", "brandhk", "legacy-source", 2.0)
+        .unwrap();
+    store
+        .conn()
+        .execute_batch(
+            "DROP INDEX app_social_tool_receipts_source_order;
+             ALTER TABLE app_social_tool_receipts DROP COLUMN kind;",
+        )
+        .unwrap();
+    drop(store);
+
+    // Reopening must add the column and only then the index — the order that
+    // failed when the index was created inside the shared DDL batch.
+    let reopened = RecordStore::open(root.path(), "install-old").unwrap();
+    assert_eq!(
+        reopened
+            .app_social_tool_receipt_ids("ctx-one", 500)
+            .unwrap(),
+        vec!["legacy-source"]
+    );
+    reopened
+        .app_social_tool_receipt_attach("ctx-one", "new-source", 3.0, "social.source.posts")
+        .unwrap();
+    assert_eq!(
+        reopened
+            .app_social_tool_receipt_ids("ctx-one", 500)
+            .unwrap(),
+        vec!["new-source", "legacy-source"]
+    );
+    // Typed rows come first; unknown legacy rows take only the remaining room,
+    // so an upgraded install keeps older retained reads behind its typed ones.
+    reopened
+        .app_social_tool_receipt_attach("ctx-one", "legacy-upload", 1.0, "")
+        .unwrap();
+    // Even when unknown rows are newer than the initialised receipt, the
+    // newest read keeps its place: window 2 is the typed read + freshness.
+    reopened
+        .app_social_tool_receipt_attach("ctx-one", "legacy-newer", 9.0, "")
+        .unwrap();
+    assert_eq!(
+        reopened.app_social_tool_receipt_ids("ctx-one", 2).unwrap(),
+        vec!["new-source", "legacy-source"]
+    );
+    assert_eq!(
+        reopened.app_social_tool_receipt_ids("ctx-one", 5).unwrap(),
+        vec![
+            "new-source",
+            "legacy-source",
+            "legacy-newer",
+            "legacy-upload"
+        ]
+    );
 }
 
 #[test]
@@ -523,7 +703,7 @@ fn uploaded_receipt_is_context_scoped_and_image_updates_are_revision_checked() {
     let root = tempfile::tempdir().unwrap();
     let store = RecordStore::open(root.path(), "install-social").unwrap();
     store
-        .app_social_tool_receipt_attach("ctx-one", "up-image", 1.0)
+        .app_social_tool_receipt_attach("ctx-one", "up-image", 1.0, "social.uploaded_image")
         .unwrap();
     assert!(store
         .app_social_tool_receipt_contains("ctx-one", "up-image")

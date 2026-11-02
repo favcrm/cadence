@@ -208,11 +208,38 @@ impl Shared {
                         "source receipt is not retained in this context",
                     ));
                 }
-                if !records.app_social_freshness_contains(context, receipt_id)? {
-                    // CAD-1923: coded so the app can clone it as a manual-source draft.
+                // SOC-54: the library keeps posts an earlier fetch proved, so
+                // any retained read backs a draft — not only the handle's newest
+                // one. Three facts are the whole authority: the receipt is this
+                // install's `social.source.posts` read, its handle is still a
+                // saved source in this context, and the selected post is in it.
+                let receipt = self
+                    .store
+                    .app_tool_result(receipt_id)
+                    .unwrap_or(Value::Null);
+                if receipt["install_id"].as_str() != Some(install)
+                    || receipt["result"]["kind"].as_str() != Some("social.source.posts")
+                {
+                    return Err(Error::rejected(
+                        "source receipt is not retained for this installation",
+                    ));
+                }
+                let handle = receipt["result"]["handle"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_start_matches('@')
+                    .to_ascii_lowercase();
+                let saved = records.app_social_sources_show(context)?;
+                if handle.is_empty()
+                    || !saved["handles"].as_array().is_some_and(|handles| {
+                        handles.iter().any(|h| h.as_str() == Some(handle.as_str()))
+                    })
+                {
+                    // Removed from Settings after the post was fetched.
                     return Err(Error::invalid(
-                        "stale_source",
-                        "source receipt is not the latest successful fetch for a saved handle",
+                        "source_not_saved",
+                        "that profile is no longer a saved source",
                     ));
                 }
                 let post = post_id
@@ -370,7 +397,12 @@ impl Shared {
                 media_type: mime,
                 bytes: &bytes,
             })?;
-        records.app_social_tool_receipt_attach(context, &id, crate::store::now())?;
+        records.app_social_tool_receipt_attach(
+            context,
+            &id,
+            crate::store::now(),
+            result["kind"].as_str().unwrap_or(""),
+        )?;
         Ok(json!({
             "asset_id": id,
             "mime": mime,
@@ -524,7 +556,12 @@ impl Shared {
                         let id = required_str(&receipt, "id")?;
                         let completed = receipt["created_at"].as_f64().unwrap_or(0.0);
                         if matches!(state.as_str(), "pending" | "uncertain") {
-                            records.app_social_tool_receipt_attach(&context, id, completed)?;
+                            records.app_social_tool_receipt_attach(
+                                &context,
+                                id,
+                                completed,
+                                receipt["result"]["kind"].as_str().unwrap_or(""),
+                            )?;
                             records.app_social_generation_complete_request(&request, id)?;
                             intent["state"] = json!("completed");
                             intent["receipt_id"] = json!(id);
