@@ -326,7 +326,7 @@ async function main() {
       entries: [
         ...state!.entries,
         { seq: 50, role: "operator", kind: "message", message: "ui-d", text: "D ask" },
-        { seq: 51, role: "system", kind: "message", message: null, text: "system note" },
+        { seq: 51, role: "system", kind: "message", message: "m-system", text: "system note" },
       ],
     }));
   });

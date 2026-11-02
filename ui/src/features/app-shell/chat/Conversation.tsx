@@ -323,11 +323,14 @@ function HomeList({
         (act.position === "after" && (item.type === "operator" || item.type === "pending")));
     if (hoist) {
       const msg = itemMessage(item);
-      const live = item.type === "pending" && item.pending.state === "failed"
-        ? null
-        : msg !== null && !queuedSet.has(msg)
-          ? msg
-          : null;
+      // Only a live user row can name the send; a system carrier's message
+      // id belongs to some other identity (a briefing, a notice).
+      const live = (item.type === "operator" || item.type === "pending")
+        && !(item.type === "pending" && item.pending.state === "failed")
+        && msg !== null
+        && !queuedSet.has(msg)
+        ? msg
+        : null;
       const send = activeSendId(items, running) ?? live ?? tailSend;
       if (!send || !claimedTurns.has(send)) {
         typingTail.current = { key: send ? `turn:${send}` : "typing-tail", node: act.node };
