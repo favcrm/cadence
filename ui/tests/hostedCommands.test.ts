@@ -6,6 +6,7 @@ import type * as ReactDOM from "react-dom/client";
 import type * as HomeModule from "../src/features/home/Home";
 import type * as Locale from "../src/lib/locale";
 import type * as Stores from "../src/lib/resources";
+import type * as Identity from "../src/features/assistant/AssistantIdentity";
 declare function require<T>(name: string): T;
 const { Window } = require<typeof HappyDOM>("happy-dom");
 const win = new Window({ url: "http://localhost/" });
@@ -28,6 +29,7 @@ const { createRoot } = require<typeof ReactDOM>("react-dom/client");
 const Home = require<typeof HomeModule>("../src/features/home/Home").default;
 const { LocaleProvider } = require<typeof Locale>("../src/lib/locale");
 const { resources } = require<typeof Stores>("../src/lib/resources");
+const { AssistantAboutButton, AssistantActorProvider, useConversationActor } = require<typeof Identity>("../src/features/assistant/AssistantIdentity");
 const { setImmediate: nextTurn } = require<{ setImmediate: () => Promise<void> }>("node:timers/promises");
 
 const master = {
@@ -37,6 +39,14 @@ const master = {
   session: { id: "home-thread", messages: null, streaming: false, compacting: false },
   commands: [] as string[], turn: null, queue: [], queued: 0,
 };
+// Another conversation on a hosted board, served a different model from Home.
+const paneMaster = {
+  ...master, model: "pane/model", model_label: "pane/model",
+  actor_identity: {
+    scope: "personal", conversation_id: "app-a",
+    identity: { name: "Ada", tone: null, look: "robot", revision: 1 },
+  },
+};
 const requests: string[] = [];
 let stopAnswer: unknown = null;
 const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { "Content-Type": "application/json" } });
@@ -45,6 +55,7 @@ globalThis.fetch = async (input, init) => {
   if (url.pathname.endsWith("/stream")) return streamFixture(url.href, master as never, init?.signal);
   requests.push(`${init?.method ?? "GET"} ${url.pathname}`);
   if (url.pathname === "/api/threads/master") return json({ thread: { id: "home-thread", alias: "master" }, conversation: "home-thread", entries: [], more_before: false });
+  if (url.pathname === "/api/master/state" && url.searchParams.get("conversation") === "app-a") return json(paneMaster);
   if (url.pathname === "/api/master/state") return json(master);
   if (url.pathname === "/api/agents") return json({ daemon: "reachable", agents: [{ alias: "master", state: "running" }], totals: null });
   if (url.pathname === "/api/meta") return json({ operator: true, read_only: false });
@@ -178,6 +189,24 @@ async function main() {
   assert(typed.some((text) => text.includes("Stopped.")) && typed.some((text) => text.includes("A queued message was withdrawn too")), "the typed stop's notice is not overwritten by its answer");
   stopAnswer = null;
   (master as { turn: unknown }).turn = null;
+
+  // About in another conversation names that conversation's model, not Home's.
+  await React.act(async () => { root.render(null); });
+  await settle();
+  function Pane() {
+    const actor = useConversationActor({ data: paneMaster, status: "ready" } as never, false, "app-a", null);
+    return React.createElement(AssistantActorProvider, { actor, children: React.createElement(AssistantAboutButton) });
+  }
+  await React.act(async () => { root.render(React.createElement(LocaleProvider, null, React.createElement(Pane))); });
+  await settle();
+  await React.act(async () => { host.querySelector<HTMLButtonElement>(".assistant-about-trigger")?.click(); });
+  await settle();
+  const paneModel = document.body.querySelector("[data-assistant-model]")?.textContent ?? "";
+  assert(paneModel.includes("pane/model") && !paneModel.includes("deepseek"), `About reads the pane's own conversation (got "${paneModel}")`);
+  await React.act(async () => {
+    document.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true }) as unknown as Event);
+  });
+  await settle();
 
   // A native board keeps everything, whatever its provider's partial list says.
   await React.act(async () => { root.render(null); });

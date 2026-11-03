@@ -29,7 +29,7 @@ import { useTranslate } from "../../lib/locale";
 import { sessionKey } from "../../lib/sessionKey";
 import { privateSessionGeneration } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
-import { useQuery, useResource } from "../../lib/useResource";
+import { useQuery } from "../../lib/useResource";
 import type { MasterState } from "../../lib/types";
 import type { ResourceState } from "../../lib/cache";
 import Button from "../../ui/Button";
@@ -79,6 +79,8 @@ export interface AssistantActorValue {
   /** Avatar fallback key only; it never chooses the actor's profile or scope. */
   alias: string;
   read: IdentityRead;
+  /** The model this pane's own conversation reports, for About. */
+  model?: string;
   personal: PersonalLookRequest | null;
   workspace: {
     canEdit: boolean;
@@ -125,6 +127,7 @@ export function useConversationActor(
       ? readConversationIdentity(current.data, conversation)
       : { scope: null, read: { state: "loading" } };
   const live = view.read;
+  const model = view.scope === null ? undefined : current.data?.model_label ?? current.data?.model;
   const [saved, setSaved] = useState<{ identity: IdentityRecord; before: string; scope: string } | null>(null);
   const [pending, setPending] = useState<{ look: AvatarLook; scope: string } | null>(null);
   const scopeKey = `${sessionKey() ?? ""}:${privateSessionGeneration()}:${conversation ?? ""}:${view.scope ?? ""}`;
@@ -197,11 +200,12 @@ export function useConversationActor(
     scope: view.scope,
     alias: view.scope === "workspace" ? WORKSPACE_ALIAS : view.scope === "personal" && read.state === "ready" ? (current.data?.alias ?? "assistant") : "",
     read,
+    ...(model ? { model } : {}),
     personal: view.scope === "personal" && sendPersonalRequest !== null && read.state === "ready"
       ? { requestLook, pendingLook: pending?.scope === scopeKey ? pending.look : null }
       : null,
     workspace: view.scope === "workspace" ? { canEdit, save } : null,
-  }), [view.scope, current.data?.alias, read, sendPersonalRequest, requestLook, pending, scopeKey, canEdit, save]);
+  }), [view.scope, current.data?.alias, read, model, sendPersonalRequest, requestLook, pending, scopeKey, canEdit, save]);
 }
 
 /** The actor's real avatar (the canonical AgentAvatar artwork). While the
@@ -291,8 +295,7 @@ function focusables(root: HTMLElement | null): HTMLElement[] {
 }
 
 function AssistantAboutDialog({ actor, onClose }: { actor: AssistantActorValue; onClose: () => void }) {
-  const master = useResource(resources.masterState).data;
-  const model = master?.model_label ?? master?.model;
+  const model = actor.model;
   const t = useTranslate();
   const titleId = useId();
   const panelRef = useRef<HTMLElement | null>(null);
