@@ -246,7 +246,7 @@ fn display_material_resolves_an_imported_asset_for_consumers() {
 }
 
 #[test]
-fn a_pinned_library_image_resolves_by_its_own_bytes_for_either_provenance() {
+fn a_pinned_imported_library_image_resolves_by_its_own_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let s = Store::open(&dir.path().join("t.sqlite3")).unwrap();
     let created = import(&s, "image/png", IMPORT_BYTES, "receipt-p", "import-p").unwrap();

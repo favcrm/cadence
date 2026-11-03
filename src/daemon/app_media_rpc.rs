@@ -398,6 +398,14 @@ impl Shared {
         read: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let Some(receiver) = self.image_receiver_scope(caller, message_id)? else {
+            // Unstamped chat has no receiver install to admit. Provider
+            // bytes fall back to the producer's binding receipt; imported
+            // bytes have no producer, so the admission here is the same one
+            // the catalog already gave — the pinned resolver read a
+            // verified workspace asset whose revision and byte digest match
+            // the message's own refs. There is no install to bind because
+            // the asset deliberately outlives the installation that
+            // imported it.
             return read();
         };
         let pm = self.pm_at(&self.pm_dir()?)?;
