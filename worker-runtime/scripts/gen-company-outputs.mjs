@@ -3,9 +3,8 @@
  * Generate the hosted copy of the `company-outputs` skill from its one source,
  * `skills/company-outputs/`. Hosted has no filesystem to install guidance into,
  * so the same text travels in the runtime bundle: `SKILL.md` is the body and
- * the references load on demand. test/company-outputs.test.ts fails on drift.
- *
- *   bun scripts/gen-company-outputs.mjs
+ * the references load on demand. `bun run build` regenerates this file, so CI's
+ * clean-dist check fails a skill edit that did not rebuild the runtime.
  */
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
@@ -14,9 +13,9 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = join(here, "..", "..", "skills", "company-outputs");
-export const target = join(here, "..", "src", "company-outputs.generated.ts");
+const target = join(here, "..", "src", "company-outputs.generated.ts");
 
-export function renderCompanyOutputs() {
+function renderCompanyOutputs() {
   const text = readFileSync(join(source, "SKILL.md"), "utf8");
   const parsed = /^---\nname: (.+)\ndescription: (.+)\n---\n\n([\s\S]*)$/.exec(text);
   if (!parsed) throw new Error("company-outputs SKILL.md: unexpected frontmatter");
@@ -42,6 +41,4 @@ export const COMPANY_OUTPUTS_SKILL = ${JSON.stringify(skill, null, 2)} as unknow
 `;
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  writeFileSync(target, renderCompanyOutputs());
-}
+writeFileSync(target, renderCompanyOutputs());

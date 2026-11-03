@@ -1,13 +1,6 @@
-import { readFileSync } from "node:fs";
 import { expect, test } from "bun:test";
-// @ts-expect-error The generator is a plain build script with no declarations.
-import { renderCompanyOutputs, target } from "../scripts/gen-company-outputs.mjs";
 import { COMPANY_OUTPUTS_SKILL } from "../src/company-outputs.generated.ts";
 import { companyOutputSkills } from "../src/profile.ts";
-
-test("the hosted skill is generated from the one source", () => {
-  expect(readFileSync(target, "utf8")).toBe(renderCompanyOutputs());
-});
 
 test("every reference the skill names is carried, and none points into a repository", () => {
   const skill = COMPANY_OUTPUTS_SKILL as unknown as {
