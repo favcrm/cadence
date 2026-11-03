@@ -271,6 +271,61 @@ fn new_request_key(prefix: &str) -> Result<String> {
     Ok(format!("{prefix}-{hex}"))
 }
 
+fn prepare_unknown(target: &RemoteTarget, slug: &str, request_key: &str) -> Error {
+    Error::unknown(format!(
+        "web prepare outcome is unknown for workspace {} and request key {request_key}; \
+         inspect `cadence web status {slug} --org {}`. Reconcile using the same workspace, \
+         site, content and --spa setting so the saved key is retained; do not retry blindly",
+        target.org, target.org
+    ))
+}
+
+fn prepare_error(error: Error, target: &RemoteTarget, slug: &str, request_key: &str) -> Error {
+    if error.kind() == "unknown" {
+        prepare_unknown(target, slug, request_key)
+    } else {
+        error
+    }
+}
+
+fn prepare_envelope(
+    response: remote_cli::WebResponse,
+    target: &RemoteTarget,
+    slug: &str,
+    request_key: &str,
+) -> Result<Value> {
+    let body = response.body.as_ref();
+    if (200..300).contains(&response.status)
+        && body.is_some_and(|body| body["ok"] == true && body["data"].is_object())
+    {
+        return remote_cli::web_envelope(response);
+    }
+    let code = body
+        .and_then(|body| body.pointer("/error/code"))
+        .and_then(Value::as_str);
+    if body.is_some_and(|body| body["ok"] == false)
+        && matches!(
+            (response.status, code),
+            (
+                400,
+                Some("validation_failed" | "digest_mismatch" | "file_digest_mismatch")
+            ) | (401, Some("unauthorized"))
+                | (403, Some("forbidden"))
+                | (
+                    409,
+                    Some(
+                        "slug_reserved" | "slug_taken" | "request_key_conflict" | "asset_conflict"
+                    )
+                )
+                | (410, Some("upload_expired"))
+                | (413, Some("payload_too_large"))
+        )
+    {
+        return remote_cli::web_envelope(response);
+    }
+    Err(prepare_unknown(target, slug, request_key))
+}
+
 fn is_id(value: &str, prefix: &str) -> bool {
     value.strip_prefix(prefix).is_some_and(|rest| {
         (8..=80).contains(&rest.len())
@@ -352,23 +407,20 @@ pub fn prepare_frozen(
         &[("content-type", "application/json".to_string())],
         Some(&serde_json::to_vec(&body).map_err(|e| Error::internal(e.to_string()))?),
         wake_timeout,
-    )?;
-    let created = remote_cli::web_envelope(created)?;
+    )
+    .map_err(|error| prepare_error(error, target, name, &request_key))?;
+    let created = prepare_envelope(created, target, name, &request_key)?;
     let site_id = created["siteId"].as_str().unwrap_or_default().to_string();
     let upload_id = created["uploadId"].as_str().unwrap_or_default().to_string();
-    if !is_id(&site_id, "site_") || !is_id(&upload_id, "upl_") {
-        return Err(reject(
-            "the host upload reply was not a valid site/upload id",
-        ));
+    if !is_id(&site_id, "site_")
+        || !is_id(&upload_id, "upl_")
+        || created["manifestDigest"].as_str() != Some(site.digest.as_str())
+    {
+        return Err(prepare_unknown(target, name, &request_key));
     }
-    let missing: Vec<String> = created["missingPaths"]
+    let missing = created["missingPaths"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+        .ok_or_else(|| prepare_unknown(target, name, &request_key))?;
     record.intents[index].site_id = Some(site_id.clone());
     record.intents[index].upload_id = Some(upload_id.clone());
     save_pending(target, &identity, &mut record)?;
@@ -377,10 +429,13 @@ pub fn prepare_frozen(
     // upload, so the host decides what remains via a fresh create reply.
     let by_path: std::collections::BTreeMap<&str, &web_publish::FrozenFile> =
         site.files.iter().map(|f| (f.path.as_str(), f)).collect();
-    for path in &missing {
-        let file = by_path.get(path.as_str()).ok_or_else(|| {
-            reject("the host requested a path that is not in the frozen manifest")
-        })?;
+    for path in missing {
+        let path = path
+            .as_str()
+            .ok_or_else(|| prepare_unknown(target, name, &request_key))?;
+        let file = by_path
+            .get(path)
+            .ok_or_else(|| prepare_unknown(target, name, &request_key))?;
         let uploaded = remote_cli::web_request(
             target,
             "web.prepare",
@@ -396,8 +451,12 @@ pub fn prepare_frozen(
             ],
             Some(&file.bytes),
             wake_timeout,
-        )?;
-        remote_cli::web_envelope(uploaded)?;
+        )
+        .map_err(|error| prepare_error(error, target, name, &request_key))?;
+        let receipt = prepare_envelope(uploaded, target, name, &request_key)?;
+        if receipt["path"] != path || receipt["verified"] != true {
+            return Err(prepare_unknown(target, name, &request_key));
+        }
     }
 
     let finalized = remote_cli::web_request(
@@ -408,17 +467,18 @@ pub fn prepare_frozen(
         &[("x-workspace-id", target.org_id.clone())],
         None,
         wake_timeout,
-    )?;
-    let release = remote_cli::web_envelope(finalized)?;
+    )
+    .map_err(|error| prepare_error(error, target, name, &request_key))?;
+    let release = prepare_envelope(finalized, target, name, &request_key)?;
     let release_id = release["releaseId"]
         .as_str()
         .unwrap_or_default()
         .to_string();
-    if !is_id(&release_id, "rel_") || release["state"] != "ready" {
-        return Err(reject("the host finalize reply was not a ready release"));
-    }
-    if release["manifestDigest"].as_str() != Some(site.digest.as_str()) {
-        return Err(reject("the host finalized a different manifest digest"));
+    if !is_id(&release_id, "rel_")
+        || release["state"] != "ready"
+        || release["manifestDigest"].as_str() != Some(site.digest.as_str())
+    {
+        return Err(prepare_unknown(target, name, &request_key));
     }
     // Only a verified finalize reaches this point: record the release, close
     // the intent, then report success.
@@ -484,6 +544,9 @@ pub fn request_action(
     } else {
         None
     };
+    // An existing open intent may already have crossed the network, even if
+    // this invocation cannot send. Its original key must remain recoverable.
+    let previously_open = existing.is_some();
     let index = match existing {
         Some(index) => index,
         None => {
@@ -527,8 +590,10 @@ pub fn request_action(
     let action = match create_action_reconciled(
         target,
         &site_id,
+        &site_slug,
         &payload,
         &intent.request_key,
+        previously_open,
         wake_timeout,
     ) {
         Ok(action) => action,
@@ -539,6 +604,9 @@ pub fn request_action(
         }
         Err(ActionCreateFailure::Unknown(error)) => return Err(error),
     };
+    if !action_matches(&intent, &action) {
+        return Err(action_unknown(target, &intent.slug, &intent.request_key));
+    }
     let action_id = action["actionId"].as_str().unwrap_or_default().to_string();
     if is_id(&action_id, "act_") {
         record.intents[index].action_id = Some(action_id.clone());
@@ -662,8 +730,10 @@ fn definite_action_refusal(response: &remote_cli::WebResponse) -> bool {
 fn create_action_reconciled(
     target: &RemoteTarget,
     site_id: &str,
+    slug: &str,
     payload: &[u8],
     request_key: &str,
+    previously_open: bool,
     wake_timeout: u64,
 ) -> std::result::Result<Value, ActionCreateFailure> {
     let path = format!("/v1/web-sites/sites/{site_id}/actions");
@@ -678,30 +748,33 @@ fn create_action_reconciled(
             wake_timeout,
         )
     };
-    let mut failure = None;
+    let mut uncertain = previously_open;
     for _ in 0..2 {
         match send() {
-            Ok(response) if definite_action_refusal(&response) => {
+            Ok(response) if definite_action_refusal(&response) && !uncertain => {
                 return Err(ActionCreateFailure::DefiniteRefusal(
                     remote_cli::web_envelope(response)
                         .expect_err("validated refusal envelope must be an error"),
                 ));
             }
-            Ok(response) if response.status < 500 => match remote_cli::web_envelope(response) {
-                Ok(action) => return Ok(action),
-                Err(error) => failure = Some(error),
-            },
-            Ok(_) | Err(_) => {}
+            Ok(response) if definite_action_refusal(&response) => break,
+            Ok(response) if (200..300).contains(&response.status) => {
+                if let Ok(action) = remote_cli::web_envelope(response) {
+                    return Ok(action);
+                }
+                uncertain = true;
+            }
+            Err(error) if error.kind() != "unknown" && !uncertain => {
+                return Err(ActionCreateFailure::DefiniteRefusal(error));
+            }
+            Ok(_) | Err(_) => uncertain = true,
         }
     }
-    Err(ActionCreateFailure::Unknown(failure.unwrap_or_else(|| {
-        Error::busy_coded(
-            "unknown",
-            format!(
-                "the action outcome is unknown; `cadence web status` will show it for request key {request_key}. No new key was sent"
-            ),
-        )
-    })))
+    Err(ActionCreateFailure::Unknown(action_unknown(
+        target,
+        slug,
+        request_key,
+    )))
 }
 
 /// Print an action without implying success. `approvalUrl` is null on the host
@@ -715,43 +788,23 @@ fn terminal_action_state(state: Option<&str>) -> Option<&'static str> {
     }
 }
 
-/// Read back an action only through its known id and require the complete
-/// immutable intent binding to match before trusting its state.
-fn read_known_action(
-    target: &RemoteTarget,
-    intent: &Intent,
-    action_id: &str,
-    wake_timeout: u64,
-) -> Result<Value> {
-    if !is_id(action_id, "act_") {
-        return Err(reject("the pending action id is invalid; nothing was sent"));
-    }
-    let site_id = intent
-        .site_id
-        .as_deref()
-        .ok_or_else(|| reject("the pending action has no site binding; nothing was sent"))?;
-    let response = remote_cli::web_request(
-        target,
-        "web.read",
-        "GET",
-        &format!("/v1/web-sites/actions/{action_id}"),
-        &[("x-workspace-id", target.org_id.clone())],
-        None,
-        wake_timeout,
-    )?;
-    if response.status != 200 {
-        return Err(Error::busy_coded(
-            "unknown",
-            "the known action could not be safely reconciled; its intent remains open",
-        ));
-    }
-    let action = remote_cli::web_envelope(response)?;
-    if action["actionId"].as_str() != Some(action_id)
-        || action["siteId"].as_str() != Some(site_id)
-        || action["operation"].as_str() != Some(intent.kind.as_str())
-        || action["releaseId"].as_str().map(str::to_owned) != intent.release_id
-        || action["expectedRevision"].as_i64() != intent.expected_revision
-        || !matches!(
+fn action_unknown(target: &RemoteTarget, slug: &str, request_key: &str) -> Error {
+    Error::unknown(format!(
+        "the web action outcome is unknown for workspace {} and request key {request_key}; \
+         inspect `cadence web status {slug} --org {}` before retrying. No different key was sent",
+        target.org, target.org
+    ))
+}
+
+fn action_matches(intent: &Intent, action: &Value) -> bool {
+    action["actionId"]
+        .as_str()
+        .is_some_and(|id| is_id(id, "act_"))
+        && action["siteId"].as_str() == intent.site_id.as_deref()
+        && action["operation"].as_str() == Some(intent.kind.as_str())
+        && action["releaseId"].as_str() == intent.release_id.as_deref()
+        && action["expectedRevision"].as_i64() == intent.expected_revision
+        && matches!(
             action["state"].as_str(),
             Some(
                 "awaiting_approval"
@@ -763,10 +816,40 @@ fn read_known_action(
                     | "expired"
             )
         )
-    {
-        return Err(reject(
-            "the host action does not match its saved intent; nothing was sent",
-        ));
+}
+
+/// Read back an action only through its known id and require the complete
+/// immutable intent binding to match before trusting its state.
+fn read_known_action(
+    target: &RemoteTarget,
+    intent: &Intent,
+    action_id: &str,
+    wake_timeout: u64,
+) -> Result<Value> {
+    if !is_id(action_id, "act_") {
+        return Err(reject("the pending action id is invalid; nothing was sent"));
+    }
+    intent
+        .site_id
+        .as_deref()
+        .ok_or_else(|| reject("the pending action has no site binding; nothing was sent"))?;
+    let response = remote_cli::web_request(
+        target,
+        "web.read",
+        "GET",
+        &format!("/v1/web-sites/actions/{action_id}"),
+        &[("x-workspace-id", target.org_id.clone())],
+        None,
+        wake_timeout,
+    )
+    .map_err(|_| action_unknown(target, &intent.slug, &intent.request_key))?;
+    if response.status != 200 {
+        return Err(action_unknown(target, &intent.slug, &intent.request_key));
+    }
+    let action = remote_cli::web_envelope(response)
+        .map_err(|_| action_unknown(target, &intent.slug, &intent.request_key))?;
+    if action["actionId"].as_str() != Some(action_id) || !action_matches(intent, &action) {
+        return Err(action_unknown(target, &intent.slug, &intent.request_key));
     }
     Ok(action)
 }

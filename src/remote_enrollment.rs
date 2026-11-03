@@ -483,6 +483,15 @@ struct ContinuityBindReply {
     credential_kind: String,
 }
 
+fn continuity_unknown(dir: &Path) -> Error {
+    Error::unknown(format!(
+        "hosted continuity binding is unknown; retain the pending key in {} and reconcile \
+         with `cadence remote enrollment bind-continuity --enrollment-dir {}`",
+        dir.display(),
+        dir.display()
+    ))
+}
+
 /// Bind a browser child while its short-lived bearer and original owner consent
 /// are still live. A private pending seed is durable before either HTTP request;
 /// a lost bind response never manufactures a bound lineage.
@@ -546,14 +555,23 @@ pub fn bind_browser(dir: &Path) -> Result<ContinuityInfo> {
     );
     let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(key.sign(proof.as_bytes()).as_ref());
-    let reply: ContinuityBindReply = serde_json::from_value(post_continuity(
-        &enrollment.issuer,
-        "/v1/hosted-cadence/continuity/bind",
-        &enrollment.child_token,
-        json!({"version":CONTINUITY_VERSION,"challengeId":challenge.challenge_id,
+    let reply: ContinuityBindReply = serde_json::from_value(
+        post_continuity(
+            &enrollment.issuer,
+            "/v1/hosted-cadence/continuity/bind",
+            &enrollment.child_token,
+            json!({"version":CONTINUITY_VERSION,"challengeId":challenge.challenge_id,
         "publicKey":public,"signature":signature}),
-    )?)
-    .map_err(|_| reject("Invalid hosted continuity bind response"))?;
+        )
+        .map_err(|error| {
+            if error.kind() == "unknown" {
+                continuity_unknown(dir)
+            } else {
+                error
+            }
+        })?,
+    )
+    .map_err(|_| continuity_unknown(dir))?;
     if reply.version != CONTINUITY_VERSION
         || !continuity_lineage_id(&reply.lineage_id)
         || !continuity_minted(&reply.key_id, "key_")
@@ -566,18 +584,18 @@ pub fn bind_browser(dir: &Path) -> Result<ContinuityInfo> {
         || reply.agent_id != enrollment.agent_id
         || reply.credential_kind != "child"
     {
-        return Err(reject("Issuer continuity bind did not match browser child"));
+        return Err(continuity_unknown(dir));
     }
-    require_trusted_issuer(dir, &enrollment.issuer)?;
-    enrollment.valid(now()?)?;
+    require_trusted_issuer(dir, &enrollment.issuer).map_err(|_| continuity_unknown(dir))?;
+    enrollment
+        .valid(now().map_err(|_| continuity_unknown(dir))?)
+        .map_err(|_| continuity_unknown(dir))?;
     continuity.state = ContinuityState::Bound;
     continuity.lineage_id = Some(reply.lineage_id);
     continuity.key_id = Some(reply.key_id);
     continuity.generation = Some(reply.generation);
-    save_continuity_locked(dir, &continuity).map_err(|_| {
-        reject("Hosted continuity bind may be committed remotely; local save uncertain; retry with `cadence remote enrollment bind-continuity --enrollment-dir <same-enrollment-dir>`")
-    })?;
-    continuity.info()
+    save_continuity_locked(dir, &continuity).map_err(|_| continuity_unknown(dir))?;
+    continuity.info().map_err(|_| continuity_unknown(dir))
 }
 
 /// Metadata only; the local key never leaves the protected record.
@@ -922,16 +940,26 @@ fn cli_session_post_with(
     }
     let timeout = request_deadline.saturating_duration_since(Instant::now());
     let url = format!("{issuer}{path}");
-    let (status, bytes, correlation) = send(&url, bearer, access.as_ref(), &body, timeout)?;
+    let after_send = |error: Error| {
+        if path == "/v1/hosted-cadence/cli-session/revoke" {
+            Error::unknown(
+                "remote device revocation may have committed; local authority is retained",
+            )
+        } else {
+            error
+        }
+    };
+    let (status, bytes, correlation) =
+        send(&url, bearer, access.as_ref(), &body, timeout).map_err(after_send)?;
     if (300..400).contains(&status) {
-        return Err(reject("Hosted issuer redirect refused"));
+        return Err(after_send(reject("Hosted issuer redirect refused")));
     }
     if bytes.len() as u64 > MAX_RESPONSE {
-        return Err(reject("Hosted issuer response too large"));
+        return Err(after_send(reject("Hosted issuer response too large")));
     }
     let value = serde_json::from_slice(&bytes)
-        .map_err(|_| reject("Invalid hosted CLI session response"))?;
-    confirm_login_access_ingress(dir, &issuer, &access)?;
+        .map_err(|_| after_send(reject("Invalid hosted CLI session response")))?;
+    confirm_login_access_ingress(dir, &issuer, &access).map_err(after_send)?;
     Ok(IssuerAnswer {
         status,
         body: value,
@@ -1183,6 +1211,13 @@ pub fn web_issuer_request(
     let agent = issuer_agent(config);
     let url = format!("{issuer}{path}");
     let auth = format!("Bearer {bearer}");
+    let failed_response = |message: &str| {
+        if matches!(method, "POST" | "PUT") {
+            Error::unknown("the hosted web mutation may have committed; reconcile its saved intent before retrying")
+        } else {
+            reject(message)
+        }
+    };
     let response = match (method, body) {
         ("GET", _) => {
             let mut request = agent.get(&url).header("Authorization", &auth);
@@ -1218,10 +1253,10 @@ pub fn web_issuer_request(
         }
         _ => return Err(reject("Publish Web method refused")),
     }
-    .map_err(|_| reject("Hosted Publish Web request failed"))?;
+    .map_err(|_| failed_response("Hosted Publish Web request failed"))?;
     let status = response.status().as_u16();
     if (300..400).contains(&status) {
-        return Err(reject("Hosted issuer redirect refused"));
+        return Err(failed_response("Hosted issuer redirect refused"));
     }
     let mut bytes = Vec::new();
     let limit = web_response_limit(path);
@@ -1229,11 +1264,24 @@ pub fn web_issuer_request(
         .into_body()
         .as_reader()
         .take(limit + 1)
-        .read_to_end(&mut bytes)?;
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            if method == "GET" {
+                error.into()
+            } else {
+                failed_response("Hosted issuer response could not be read")
+            }
+        })?;
     if bytes.len() as u64 > limit {
-        return Err(reject("Hosted issuer response too large"));
+        return Err(failed_response("Hosted issuer response too large"));
     }
-    confirm_login_access_ingress(dir, &issuer, &access)?;
+    confirm_login_access_ingress(dir, &issuer, &access).map_err(|error| {
+        if method == "GET" {
+            error
+        } else {
+            failed_response("Hosted issuer authorization pin changed")
+        }
+    })?;
     Ok((status, serde_json::from_slice(&bytes).ok()))
 }
 
@@ -1825,6 +1873,23 @@ fn save(dir: &Path, record: &Enrollment) -> Result<()> {
     save_locked(dir, record)
 }
 
+fn enrollment_unknown(dir: &Path, org: &str) -> Error {
+    Error::unknown(format!(
+        "hosted enrollment outcome is unknown for workspace {org}; inspect the original \
+         enrollment directory {} and consult the issuer owner before retrying. \
+         A one-time credential may have been issued and its secret may not be recoverable",
+        dir.display()
+    ))
+}
+
+fn enrollment_error(error: Error, dir: &Path, org: &str) -> Error {
+    if error.kind() == "unknown" {
+        enrollment_unknown(dir, org)
+    } else {
+        error
+    }
+}
+
 fn post(issuer: &str, path: &str, bearer: &str, body: Value) -> Result<Value> {
     post_with_access(issuer, path, bearer, body, None)
 }
@@ -1861,19 +1926,27 @@ fn post_with_access(
     }
     let response = request
         .send_json(body)
-        .map_err(|_| reject("Issuer enrollment request failed"))?;
+        .map_err(|_| Error::unknown("issuer enrollment outcome is unknown"))?;
     if response.status() != 200 {
-        return Err(reject("Issuer refused hosted enrollment"));
+        return Err(if (400..500).contains(&response.status().as_u16()) {
+            reject("Issuer refused hosted enrollment")
+        } else {
+            Error::unknown("issuer enrollment outcome is unknown")
+        });
     }
     let mut body = response.into_body();
     let mut bytes = Vec::new();
     body.as_reader()
         .take(MAX_RESPONSE + 1)
-        .read_to_end(&mut bytes)?;
+        .read_to_end(&mut bytes)
+        .map_err(|_| Error::unknown("issuer enrollment response was interrupted"))?;
     if bytes.len() as u64 > MAX_RESPONSE {
-        return Err(reject("Issuer response too large"));
+        return Err(Error::unknown(
+            "issuer enrollment response exceeded its bound",
+        ));
     }
-    serde_json::from_slice(&bytes).map_err(|_| reject("Invalid issuer response"))
+    serde_json::from_slice(&bytes)
+        .map_err(|_| Error::unknown("issuer enrollment response was unusable"))
 }
 
 #[derive(Clone, Copy)]
@@ -1958,6 +2031,14 @@ fn continuity_refusal(status: u16, bytes: &[u8]) -> ContinuityRefusal {
 /// Only continuity has structured issuer refusals. Other hosted enrollment
 /// calls retain their existing error behavior and never inspect these codes.
 fn post_continuity(issuer: &str, path: &str, bearer: &str, body: Value) -> Result<Value> {
+    let bind = path == "/v1/hosted-cadence/continuity/bind";
+    let uncertain = || {
+        if bind {
+            Error::unknown("hosted continuity binding may have committed")
+        } else {
+            ContinuityRefusal::Uncertain.error()
+        }
+    };
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(20)))
         .http_status_as_error(false)
@@ -1968,13 +2049,21 @@ fn post_continuity(issuer: &str, path: &str, bearer: &str, body: Value) -> Resul
         .post(format!("{issuer}{path}"))
         .header("Authorization", format!("Bearer {bearer}"))
         .send_json(body)
-        .map_err(|_| ContinuityRefusal::Uncertain.error())?;
+        .map_err(|_| uncertain())?;
     let status = response.status().as_u16();
     if (300..400).contains(&status) {
-        return Err(reject("Hosted continuity issuer redirect refused"));
+        return Err(if bind {
+            uncertain()
+        } else {
+            reject("Hosted continuity issuer redirect refused")
+        });
     }
     if status != 200 && !matches!(status, 401 | 403 | 409 | 503) {
-        return Err(ContinuityRefusal::Invalid.error());
+        return Err(if bind {
+            uncertain()
+        } else {
+            ContinuityRefusal::Invalid.error()
+        });
     }
     let mut bytes = Vec::new();
     response
@@ -1982,19 +2071,51 @@ fn post_continuity(issuer: &str, path: &str, bearer: &str, body: Value) -> Resul
         .as_reader()
         .take(MAX_RESPONSE + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| ContinuityRefusal::Uncertain.error())?;
+        .map_err(|_| uncertain())?;
     if bytes.len() as u64 > MAX_RESPONSE {
-        return Err(ContinuityRefusal::Invalid.error());
+        return Err(if bind {
+            uncertain()
+        } else {
+            ContinuityRefusal::Invalid.error()
+        });
     }
     if status != 200 {
-        return Err(continuity_refusal(status, &bytes).error());
+        let refusal = continuity_refusal(status, &bytes);
+        return Err(
+            if bind
+                && matches!(
+                    refusal,
+                    ContinuityRefusal::Uncertain | ContinuityRefusal::Invalid
+                )
+            {
+                uncertain()
+            } else {
+                refusal.error()
+            },
+        );
     }
-    serde_json::from_slice(&bytes).map_err(|_| ContinuityRefusal::Invalid.error())
+    serde_json::from_slice(&bytes).map_err(|_| {
+        if bind {
+            uncertain()
+        } else {
+            ContinuityRefusal::Invalid.error()
+        }
+    })
 }
 
 #[cfg(test)]
 fn post_public(issuer: &str, path: &str, body: Value) -> Result<(u16, Value)> {
     post_public_with_access(issuer, path, body, None)
+}
+
+fn device_token_unknown(dir: &Path, org: Option<&str>) -> Error {
+    Error::unknown(format!(
+        "hosted device token outcome is unknown for workspace {}; inspect the original \
+         authority directory {} and consult the issuer owner before requesting new consent. \
+         A one-time credential may have been issued and its secret may not be recoverable",
+        org.unwrap_or("selected during consent"),
+        dir.display()
+    ))
 }
 
 fn post_public_with_access(
@@ -2028,24 +2149,38 @@ fn post_public_with_access(
             .header("CF-Access-Client-Id", &access.client_id)
             .header("CF-Access-Client-Secret", &access.client_secret);
     }
+    let failed_response = |message: &str| {
+        if path == "/v1/hosted-cadence/device/token" {
+            Error::unknown("hosted device token outcome is unknown")
+        } else {
+            reject(message)
+        }
+    };
     let response = request
         .send_json(body)
-        .map_err(|_| reject("Hosted browser request failed"))?;
+        .map_err(|_| failed_response("Hosted browser request failed"))?;
     let status = response.status().as_u16();
     if (300..400).contains(&status) {
-        return Err(reject("Hosted issuer redirect refused"));
+        return Err(failed_response("Hosted issuer redirect refused"));
     }
     let mut bytes = Vec::new();
     response
         .into_body()
         .as_reader()
         .take(MAX_RESPONSE + 1)
-        .read_to_end(&mut bytes)?;
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            if path == "/v1/hosted-cadence/device/token" {
+                failed_response("Hosted issuer response could not be read")
+            } else {
+                error.into()
+            }
+        })?;
     if bytes.len() as u64 > MAX_RESPONSE {
-        return Err(reject("Hosted issuer response too large"));
+        return Err(failed_response("Hosted issuer response too large"));
     }
-    let value =
-        serde_json::from_slice(&bytes).map_err(|_| reject("Invalid hosted browser response"))?;
+    let value = serde_json::from_slice(&bytes)
+        .map_err(|_| failed_response("Invalid hosted browser response"))?;
     Ok((status, value))
 }
 fn exact_fields(value: &Value, required: &[&str], optional: &[&str]) -> bool {
@@ -2206,14 +2341,26 @@ fn enroll_browser_with(
             return Err(reject("Hosted browser authorization expired; start again"));
         }
         confirm_access_ingress(dir, &issuer, &access)?;
-        let (status, response) = runtime.post_public(
-            &issuer,
-            "/v1/hosted-cadence/device/token",
-            json!({"device_code":device,"code_verifier":verifier}),
-            access.as_ref(),
-        )?;
+        let (status, response) = runtime
+            .post_public(
+                &issuer,
+                "/v1/hosted-cadence/device/token",
+                json!({"device_code":device,"code_verifier":verifier}),
+                access.as_ref(),
+            )
+            .map_err(|error| {
+                if error.kind() == "unknown" {
+                    device_token_unknown(dir, Some(org))
+                } else {
+                    error
+                }
+            })?;
         if runtime.now() >= deadline {
-            return Err(reject("Hosted browser authorization expired; start again"));
+            return Err(if status == 400 {
+                reject("Hosted browser authorization expired; start again")
+            } else {
+                device_token_unknown(dir, Some(org))
+            });
         }
         if status == 200 {
             break response;
@@ -2223,11 +2370,15 @@ fn enroll_browser_with(
             (400, Some("slow_down")) => interval = interval.saturating_add(5).min(30),
             (400, Some("access_denied")) => return Err(reject("Hosted browser consent denied")),
             (400, Some("expired_token")) => return Err(reject("Hosted device code expired")),
-            _ => return Err(reject("Hosted browser grant refused; start again")),
+            (400, Some("invalid_grant" | "invalid_request")) => {
+                return Err(reject("Hosted browser grant refused"))
+            }
+            _ => return Err(device_token_unknown(dir, Some(org))),
         }
     };
-    browser_grant(&grant, org, &audience)?;
-    confirm_access_ingress(dir, &issuer, &access)?;
+    browser_grant(&grant, org, &audience).map_err(|_| device_token_unknown(dir, Some(org)))?;
+    confirm_access_ingress(dir, &issuer, &access)
+        .map_err(|_| device_token_unknown(dir, Some(org)))?;
     enroll_child_locked(
         &issuer,
         org,
@@ -2985,14 +3136,26 @@ fn login_device_flow_with(
             return Err(expired());
         }
         confirm_login_access_ingress(dir, &issuer, &access)?;
-        let (status, response) = runtime.post_public(
-            &issuer,
-            "/v1/hosted-cadence/device/token",
-            json!({"device_code":device,"code_verifier":verifier}),
-            access.as_ref(),
-        )?;
+        let (status, response) = runtime
+            .post_public(
+                &issuer,
+                "/v1/hosted-cadence/device/token",
+                json!({"device_code":device,"code_verifier":verifier}),
+                access.as_ref(),
+            )
+            .map_err(|error| {
+                if error.kind() == "unknown" {
+                    device_token_unknown(dir, org.or(hint))
+                } else {
+                    error
+                }
+            })?;
         if runtime.now() >= deadline {
-            return Err(expired());
+            return Err(if status == 400 {
+                expired()
+            } else {
+                device_token_unknown(dir, org.or(hint))
+            });
         }
         if status == 200 {
             break response;
@@ -3002,11 +3165,16 @@ fn login_device_flow_with(
             (400, Some("slow_down")) => interval = interval.saturating_add(5).min(30),
             (400, Some("access_denied")) => return Err(reject("Hosted browser consent denied")),
             (400, Some("expired_token")) => return Err(reject("Hosted device code expired")),
-            _ => return Err(reject("Hosted browser grant refused; start again")),
+            (400, Some("invalid_grant" | "invalid_request")) => {
+                return Err(reject("Hosted browser grant refused"))
+            }
+            _ => return Err(device_token_unknown(dir, org.or(hint))),
         }
     };
-    let grant = login_grant(&grant, org, hint, &issuer, &requested)?;
-    confirm_login_access_ingress(dir, &issuer, &access)?;
+    let grant = login_grant(&grant, org, hint, &issuer, &requested)
+        .map_err(|_| device_token_unknown(dir, org.or(hint)))?;
+    confirm_login_access_ingress(dir, &issuer, &access)
+        .map_err(|_| device_token_unknown(dir, org.or(hint)))?;
     Ok(grant)
 }
 
@@ -3046,27 +3214,31 @@ fn enroll_locked(
         service_token,
         json!({"version":VERSION,"organization_id":org,"audience":audience,
             "requested_capabilities":requested}),
-    )?;
-    let at = now()?;
+    )
+    .map_err(|error| enrollment_error(error, dir, org))?;
+    let at = now().map_err(|_| enrollment_unknown(dir, org))?;
     let principal = &exchange["principal"];
     let bridge = &exchange["credential"];
-    if field(&exchange, "version")? != VERSION
-        || field(&exchange, "organization_id")? != org
-        || field(&exchange, "audience")? != audience
-        || field(principal, "kind")? != "service"
-        || field(principal, "current_role")? != "member"
-        || !id(field(principal, "subject_id")?)
-        || !id(field(principal, "provisioned_by")?)
-        || exchange["capabilities"] != json!(requested)
-        || field(bridge, "token_type")? != "Bearer"
-        || field(bridge, "renewal")? != "reexchange"
-        || !token(field(bridge, "access_token")?, "hct_")
-        || !id(field(bridge, "credential_id")?)
-        || timestamp(bridge, "issued_at")? > at
-        || timestamp(bridge, "expires_at")? <= at
-        || timestamp(bridge, "expires_at")? - timestamp(bridge, "issued_at")? > 300
-    {
-        return Err(reject("Issuer grant did not match service credential"));
+    let valid = (|| -> Result<bool> {
+        Ok(field(&exchange, "version")? == VERSION
+            && field(&exchange, "organization_id")? == org
+            && field(&exchange, "audience")? == audience
+            && field(principal, "kind")? == "service"
+            && field(principal, "current_role")? == "member"
+            && id(field(principal, "subject_id")?)
+            && id(field(principal, "provisioned_by")?)
+            && exchange["capabilities"] == json!(requested)
+            && field(bridge, "token_type")? == "Bearer"
+            && field(bridge, "renewal")? == "reexchange"
+            && token(field(bridge, "access_token")?, "hct_")
+            && id(field(bridge, "credential_id")?)
+            && timestamp(bridge, "issued_at")? <= at
+            && timestamp(bridge, "expires_at")? > at
+            && timestamp(bridge, "expires_at")? - timestamp(bridge, "issued_at")? <= 300)
+    })()
+    .map_err(|_| enrollment_unknown(dir, org))?;
+    if !valid {
+        return Err(enrollment_unknown(dir, org));
     }
     enroll_child_locked(
         issuer,
@@ -3106,62 +3278,66 @@ fn enroll_child_locked(
                 "client_agent_id":client_agent,"role":"implementer",
             "requested_capabilities":["results.submit"]}]}),
         access,
-    )?;
-    let enrolled_at = now()?;
-    let agents = enrollment["agents"]
-        .as_array()
-        .ok_or_else(|| reject("Invalid issuer enrollment"))?;
-    if agents.len() != 1 {
-        return Err(reject("Invalid issuer enrollment"));
-    }
-    let child = &agents[0];
-    let child_credential = &child["credential"];
-    let record = Enrollment {
-        version: field(&enrollment, "version")?.into(),
-        issuer: issuer.to_owned(),
-        organization_id: field(&enrollment, "organization_id")?.into(),
-        audience: field(&enrollment, "audience")?.into(),
-        subject_id: field(child, "principal_subject_id")?.into(),
-        bridge_id: field(&enrollment, "bridge_id")?.into(),
-        agent_id: field(child, "agent_id")?.into(),
-        client_agent_id: field(child, "client_agent_id")?.into(),
-        credential_id: field(child_credential, "credential_id")?.into(),
-        role: field(child, "role")?.into(),
-        capabilities: serde_json::from_value(child["capabilities"].clone())
-            .map_err(|_| reject("Invalid child capabilities"))?,
-        expires_at: timestamp(child_credential, "expires_at")?,
-        child_token: field(child_credential, "access_token")?.into(),
-        source: match source {
-            ChildSource::Service(_) => EnrollmentSource::Service,
-            ChildSource::Browser(_) => EnrollmentSource::Browser,
-        },
-        service_token: match source {
-            ChildSource::Service(credential) => Some(credential.to_owned()),
-            ChildSource::Browser(_) => None,
-        },
-    };
-    if record.organization_id != org
-        || record.audience != audience
-        || record.subject_id != field(&grant["principal"], "subject_id")?
-        || record.client_agent_id != client_agent
-        || field(child, "organization_id")? != org
-        || field(child, "audience")? != audience
-        || field(child, "bridge_id")? != record.bridge_id
-        || field(child_credential, "token_type")? != "Bearer"
-        || field(child_credential, "renewal")? != "reexchange"
-        || timestamp(child_credential, "issued_at")? > enrolled_at
-        || record.expires_at <= enrolled_at
-        || record.expires_at - timestamp(child_credential, "issued_at")? > 300
-        || record.expires_at > timestamp(bridge, "expires_at")?
-        || record.credential_id == field(bridge, "credential_id")?
-        || record.child_token == field(bridge, "access_token")?
-    {
-        return Err(reject("Issuer child did not match bridge grant"));
-    }
-    record.valid(now()?)?;
-    require_trusted_issuer(dir, &record.issuer)?;
-    save_locked(dir, &record)?;
-    Ok(record.info())
+    )
+    .map_err(|error| enrollment_error(error, dir, org))?;
+    (|| -> Result<EnrollmentInfo> {
+        let enrolled_at = now()?;
+        let agents = enrollment["agents"]
+            .as_array()
+            .ok_or_else(|| reject("Invalid issuer enrollment"))?;
+        if agents.len() != 1 {
+            return Err(reject("Invalid issuer enrollment"));
+        }
+        let child = &agents[0];
+        let child_credential = &child["credential"];
+        let record = Enrollment {
+            version: field(&enrollment, "version")?.into(),
+            issuer: issuer.to_owned(),
+            organization_id: field(&enrollment, "organization_id")?.into(),
+            audience: field(&enrollment, "audience")?.into(),
+            subject_id: field(child, "principal_subject_id")?.into(),
+            bridge_id: field(&enrollment, "bridge_id")?.into(),
+            agent_id: field(child, "agent_id")?.into(),
+            client_agent_id: field(child, "client_agent_id")?.into(),
+            credential_id: field(child_credential, "credential_id")?.into(),
+            role: field(child, "role")?.into(),
+            capabilities: serde_json::from_value(child["capabilities"].clone())
+                .map_err(|_| reject("Invalid child capabilities"))?,
+            expires_at: timestamp(child_credential, "expires_at")?,
+            child_token: field(child_credential, "access_token")?.into(),
+            source: match source {
+                ChildSource::Service(_) => EnrollmentSource::Service,
+                ChildSource::Browser(_) => EnrollmentSource::Browser,
+            },
+            service_token: match source {
+                ChildSource::Service(credential) => Some(credential.to_owned()),
+                ChildSource::Browser(_) => None,
+            },
+        };
+        if record.organization_id != org
+            || record.audience != audience
+            || record.subject_id != field(&grant["principal"], "subject_id")?
+            || record.client_agent_id != client_agent
+            || field(child, "organization_id")? != org
+            || field(child, "audience")? != audience
+            || field(child, "bridge_id")? != record.bridge_id
+            || field(child_credential, "token_type")? != "Bearer"
+            || field(child_credential, "renewal")? != "reexchange"
+            || timestamp(child_credential, "issued_at")? > enrolled_at
+            || record.expires_at <= enrolled_at
+            || record.expires_at - timestamp(child_credential, "issued_at")? > 300
+            || record.expires_at > timestamp(bridge, "expires_at")?
+            || record.credential_id == field(bridge, "credential_id")?
+            || record.child_token == field(bridge, "access_token")?
+        {
+            return Err(reject("Issuer child did not match bridge grant"));
+        }
+        record.valid(now()?)?;
+        require_trusted_issuer(dir, &record.issuer)?;
+        save_locked(dir, &record)?;
+        Ok(record.info())
+    })()
+    .map_err(|_| enrollment_unknown(dir, org))
 }
 
 #[cfg(test)]

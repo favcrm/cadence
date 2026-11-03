@@ -3837,3 +3837,1672 @@ mod cad2009_finite_output_acceptance {
         assert!(writer.failures > 0);
     }
 }
+
+// CAD-2009: independently authored acceptance; implementers must not weaken it.
+// The real packaged CLI, saved-login reader, TLS agent, request body and reply
+// classifier run unchanged. Only the remote service is a disposable simulator.
+#[cfg(all(feature = "test-seam", target_os = "linux"))]
+mod cad2009_hosted_app_acceptance {
+    use serde_json::{json, Value};
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::net::TcpListener;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
+    use std::process::{Command, Output, Stdio};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    const ORG: &str = "cad2009-synthetic";
+    const WORKSPACE: &str = "ws_cad2009_synthetic";
+    const ENDPOINT: &str = "https://lc.cadencecloud.app";
+    const OP: &str = "00000000-0000-4000-8000-000000002009";
+    const TOKEN: &str = "hct_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    const INSTALL: &str = "install_synthetic";
+    const LISTING: &str = "synthetic-app";
+    const VERSION: &str = "1.2.3";
+    const GENERATION: &str = "synthetic-generation-1";
+
+    fn digest(old: bool) -> String {
+        format!("sha256:{}", if old { "b" } else { "a" }.repeat(64))
+    }
+
+    // Real producer: contracts/src/marketplace.ts::hostedAppReviewSchema.
+    fn review() -> Value {
+        json!({
+            "readiness": {"ready": true, "reason": null},
+            "structural": {"added": [], "removed": [], "changed": []},
+            "access": {"connections": {"added": [], "removed": []}, "capabilities": {}},
+            "compatibility": {
+                "schema": 1, "ok": true, "compatible": true, "unmet": null,
+                "declared": false, "core": null, "contracts": {},
+                "host": {"core": "1.0.0", "contracts": {}}, "checks": []
+            },
+            "notes": [], "secret_warnings": []
+        })
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Mutation {
+        Install,
+        Update,
+        Revoke,
+        Reconcile,
+    }
+
+    impl Mutation {
+        fn suffix(self) -> &'static str {
+            match self {
+                Self::Reconcile => "/operations/00000000-0000-4000-8000-000000002009/reconcile",
+                Self::Revoke => "/revoke",
+                _ => "/action",
+            }
+        }
+
+        // Exact closed request envelopes from hosted-cadence/app-lifecycle.ts
+        // and contracts/src/{marketplace,hosted-app-lifecycle}.ts.
+        fn body(self) -> Value {
+            if matches!(self, Self::Reconcile) {
+                return json!({});
+            }
+            if matches!(self, Self::Revoke) {
+                return json!({"install_id": INSTALL, "expected_digest": digest(true),
+                    "expected_generation": GENERATION, "operation_id": OP});
+            }
+            let mut action = json!({"listing_id": LISTING, "version": VERSION,
+                "digest": digest(false), "intent": "apply", "operation_id": OP});
+            if matches!(self, Self::Update) {
+                action["install_id"] = json!(INSTALL);
+                action["expected_digest"] = json!(digest(true));
+                action["expected_generation"] = json!(GENERATION);
+            }
+            json!({"action": action, "review": review()})
+        }
+
+        // Real release-check producer's proposed() response. The CLI consumes
+        // this file through checked_review(), rather than bypassing that guard.
+        fn checked(self) -> Value {
+            let update = matches!(self, Self::Update);
+            json!({"ok": true, "data": {
+                "state": "proposed", "operation": if update { "update" } else { "install" },
+                "listing_id": LISTING, "version": VERSION, "digest": digest(false),
+                "install_id": if update { Some(INSTALL) } else { None },
+                "expected_digest": if update { Some(digest(true)) } else { None },
+                "expected_generation": if update { Some(GENERATION) } else { None },
+                "catalogue": {"id": LISTING, "version": VERSION, "digest": digest(false)},
+                "review": review()
+            }})
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReceiptFault {
+        None,
+        MissingHeader,
+        ForeignHeader,
+        ForeignOperation,
+        ForeignWorkspace,
+        ForeignKind,
+        ForeignConsentDigest,
+        ForeignActor,
+        ForeignRefusalOperation,
+        ForeignRefusalKind,
+        ForeignInstall,
+        ForeignInstallDigest,
+        ForeignGeneration,
+        StillApproved,
+        MissingInstallation,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReceiptDisposition {
+        RefusedNotStarted,
+        CancelledBeforeDispatch,
+        ExpiredUnknown,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum RefusalFault {
+        ForeignHeader,
+        MalformedHeader,
+        MissingMessage,
+        NonStringMessage,
+        EmptyMessage,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum ReconcileFault {
+        None,
+        IncompleteEnvelope,
+        ForeignOperation,
+        ForeignWorkspace,
+        MissingHeader,
+        ForeignHeader,
+        MissingVersion,
+        ForeignVersion,
+        MissingKind,
+        InvalidKind,
+        MissingConsent,
+        MissingActor,
+        IncompleteConsent,
+        MalformedConsentDigest,
+        MissingInstallation,
+        MissingInstallationVersion,
+        ForeignInstallationApp,
+        ForeignInstallationDigest,
+        RevokeStillApproved,
+        RefusalOnSuccess,
+        MissingUpdatedAt,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum Reply {
+        Dropped,
+        NonJson,
+        Truncated,
+        Oversized,
+        Redirect,
+        UnprovedJson,
+        ProducerUncertain,
+        RevokeReceipt(ReceiptFault),
+        RevokeTerminal(ReceiptDisposition, ReceiptFault),
+        ReconcileReceipt(&'static str, ReconcileFault),
+        ReconcileTerminal(ReceiptDisposition),
+        ReconcilePending,
+        PreEffect503(&'static str, bool),
+        PreEffect503Fault(&'static str, RefusalFault),
+        Unproved503(&'static str),
+    }
+
+    // Exact successful operation-view envelope from the pre-retirement CLI
+    // producer, not the browser-only route. Installation is a complete
+    // appInstallationRowSchema row, and every request pin is represented.
+    fn successful_revoke_receipt() -> Value {
+        json!({
+            "ok": true,
+            "data": {
+                "version": "hosted-app-lifecycle.v1",
+                "operation_id": OP,
+                "workspace_id": WORKSPACE,
+                "app": LISTING,
+                "kind": "revoke",
+                "state": "succeeded",
+                "consent": {
+                    "actor_id": "user_cad2009_synthetic",
+                    "digest": digest(true),
+                    "artifact_sha256": null,
+                    "artifact_version": null,
+                    "at": 1
+                },
+                "installation": {
+                    "installId": INSTALL,
+                    "app": LISTING,
+                    "title": "Synthetic app",
+                    "version": VERSION,
+                    "digest": digest(true),
+                    "generation": GENERATION,
+                    "storageKind": "workspace",
+                    "source": null,
+                    "catalogue": null,
+                    "project": null,
+                    "installedAt": null,
+                    "approval": {
+                        "state": "unapproved",
+                        "approvedBy": null,
+                        "approvedAt": null,
+                        "epoch": 1
+                    },
+                    "capabilities": [],
+                    "connectionSlots": []
+                },
+                "refusal": null,
+                "updated_at": 2
+            }
+        })
+    }
+
+    fn successful_reconcile_receipt(kind: &str) -> Value {
+        assert!(matches!(kind, "install" | "update" | "revoke"));
+        let mut receipt = successful_revoke_receipt();
+        receipt["data"]["kind"] = json!(kind);
+        // Recovery is available to a different current owner; the receipt
+        // must retain the creator rather than falsely restamping the caller.
+        receipt["data"]["consent"]["actor_id"] = json!("user_previous_owner");
+        if kind != "revoke" {
+            receipt["data"]["consent"]["artifact_sha256"] = json!("a".repeat(64));
+            receipt["data"]["consent"]["artifact_version"] = json!(VERSION);
+            receipt["data"]["installation"]["approval"]["state"] = json!("approved");
+            receipt["data"]["installation"]["catalogue"] = json!({
+                "id": LISTING, "version": VERSION, "digest": digest(true)
+            });
+        }
+        receipt
+    }
+    fn terminal_revoke_receipt(disposition: ReceiptDisposition) -> Value {
+        let mut receipt = successful_revoke_receipt();
+        receipt["data"]["state"] = json!("refused");
+        receipt["data"]["installation"] = Value::Null;
+        receipt["data"]["refusal"] = match disposition {
+            ReceiptDisposition::RefusedNotStarted => json!({
+                "version": "hosted-app-mutation.v1",
+                "operation_id": OP,
+                "operation": "revoke",
+                "outcome": "refused",
+                "mutation": "not_started",
+                "code": "native_precondition_refused"
+            }),
+            ReceiptDisposition::CancelledBeforeDispatch => Value::Null,
+            ReceiptDisposition::ExpiredUnknown => json!({
+                "version": "hosted-app-mutation.v1",
+                "operation_id": OP,
+                "operation": "revoke",
+                "outcome": "expired",
+                "mutation": "unknown",
+                "code": "dispatch_expired"
+            }),
+        };
+        receipt
+    }
+    fn private_file(path: &Path, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    // No sleep/polling loop and no pipe deadlock. pidfd also avoids signalling a
+    // reused PID. A timed-out subprocess is killed and reaped before failing.
+    fn bounded_output(command: &mut Command) -> Output {
+        let mut stdout = tempfile::tempfile().unwrap();
+        let mut stderr = tempfile::tempfile().unwrap();
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout.try_clone().unwrap()))
+            .stderr(Stdio::from(stderr.try_clone().unwrap()));
+        let mut child = cadence_agent::reaper::spawn(command).unwrap();
+        // SAFETY: pidfd_open receives this process's still-unreaped child PID.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("pidfd_open is required for bounded acceptance: {error}");
+        }
+        // SAFETY: fd is a new owned descriptor returned by pidfd_open.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+        let mut descriptor = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: descriptor points to exactly one initialized pollfd.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 15_000) };
+        if ready != 1 || descriptor.revents & libc::POLLIN == 0 {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("subprocess failed to finish within the acceptance deadline: {command:?}");
+        }
+        let status = child.wait().unwrap();
+        fn collected(file: &mut File) -> Vec<u8> {
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut bytes = Vec::new();
+            file.take(262_145).read_to_end(&mut bytes).unwrap();
+            assert!(
+                bytes.len() <= 262_144,
+                "unexpectedly large subprocess output"
+            );
+            bytes
+        }
+        Output {
+            status,
+            stdout: collected(&mut stdout),
+            stderr: collected(&mut stderr),
+        }
+    }
+
+    struct Fixture {
+        root: tempfile::TempDir,
+        tls: Arc<rustls::ServerConfig>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let openssl = |args: &[&str]| {
+                let mut command = Command::new("openssl");
+                command.current_dir(root.path()).args(args);
+                let output = bounded_output(&mut command);
+                assert!(
+                    output.status.success(),
+                    "fixture PKI failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            openssl(&[
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-nodes",
+                "-keyout",
+                "ca.key",
+                "-out",
+                "ca.pem",
+                "-days",
+                "2",
+                "-subj",
+                "/CN=CAD-2009 disposable CA",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+                "-addext",
+                "keyUsage=critical,keyCertSign,cRLSign",
+            ]);
+            openssl(&[
+                "req",
+                "-new",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-nodes",
+                "-keyout",
+                "leaf.key",
+                "-out",
+                "leaf.csr",
+                "-subj",
+                "/CN=lc.cadencecloud.app",
+            ]);
+            private_file(&root.path().join("leaf.ext"), b"subjectAltName=DNS:lc.cadencecloud.app\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n");
+            openssl(&[
+                "x509",
+                "-req",
+                "-in",
+                "leaf.csr",
+                "-CA",
+                "ca.pem",
+                "-CAkey",
+                "ca.key",
+                "-CAcreateserial",
+                "-days",
+                "2",
+                "-extfile",
+                "leaf.ext",
+                "-out",
+                "leaf.pem",
+            ]);
+            for name in ["ca.pem", "ca.key", "leaf.key"] {
+                fs::set_permissions(root.path().join(name), fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+            let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
+                File::open(root.path().join("leaf.pem")).unwrap(),
+            ))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+            let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+                File::open(root.path().join("leaf.key")).unwrap(),
+            ))
+            .unwrap()
+            .unwrap();
+            let tls = Arc::new(
+                rustls::ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap(),
+            );
+            let fixture = Self { root, tls };
+            let config = fixture.root.path().join("config/cadence");
+            fs::create_dir_all(config.join("remote-auth")).unwrap();
+            fs::set_permissions(
+                config.join("remote-auth"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            private_file(&config.join("orgs.json"), &serde_json::to_vec(&json!({
+                "selected": {"org": ORG}, "connections": [{"selection": {"org": ORG},
+                    "destination": {"mode": "remote", "endpoint": ENDPOINT, "org_id": WORKSPACE}}]
+            })).unwrap());
+            fixture.credential(true);
+            fixture
+        }
+
+        fn credential(&self, issuer_pin: bool) {
+            let path = self
+                .root
+                .path()
+                .join(format!("config/cadence/remote-auth/cli-{ORG}.json"));
+            if path.exists() {
+                fs::remove_file(&path).unwrap();
+            }
+            let expires = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600;
+            let mut credential = json!({"version": "hosted-cadence-auth.v1",
+                "organization_id": WORKSPACE, "organization_slug": ORG, "audience": ENDPOINT,
+                "subject_id": "user_cad2009_synthetic", "capabilities": ["cli.read", "cli.write"],
+                "access_token": TOKEN, "expires_at": expires});
+            if issuer_pin {
+                credential["issuer"] = json!("https://issuer.board.localhost");
+            }
+            private_file(&path, &serde_json::to_vec(&credential).unwrap());
+        }
+
+        fn command(&self, mutation: Mutation, address: std::net::SocketAddr) -> Command {
+            let review_path = self.root.path().join("review.json");
+            if review_path.exists() {
+                fs::remove_file(&review_path).unwrap();
+            }
+            private_file(
+                &review_path,
+                &serde_json::to_vec(&mutation.checked()).unwrap(),
+            );
+            let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+            command
+                .env_clear()
+                .current_dir(self.root.path())
+                .env("HOME", self.root.path())
+                .env("XDG_CONFIG_HOME", self.root.path().join("config"))
+                .env("XDG_STATE_HOME", self.root.path().join("state"))
+                .env("CADENCE_TEST_TLS_CA", self.root.path().join("ca.pem"))
+                .env("CADENCE_TEST_TLS_CONNECT", address.to_string())
+                .env("CADENCE_JSON", "compact")
+                .args(["--org", ORG, "app", "catalog"]);
+            match mutation {
+                Mutation::Install => {
+                    command.args(["release-install", LISTING]);
+                }
+                Mutation::Update => {
+                    command.args(["release-update", INSTALL, LISTING]);
+                }
+                Mutation::Reconcile => {
+                    command.args(["reconcile", OP]);
+                    return command;
+                }
+                Mutation::Revoke => {
+                    command.args(["release-revoke", INSTALL]);
+                }
+            }
+            command.args([
+                "--operation-id",
+                OP,
+                "--digest",
+                &digest(matches!(mutation, Mutation::Revoke)),
+            ]);
+            if !matches!(mutation, Mutation::Revoke) {
+                command
+                    .args(["--version", VERSION, "--review"])
+                    .arg(review_path);
+            }
+            if !matches!(mutation, Mutation::Install) {
+                command.args(["--expected-generation", GENERATION]);
+            }
+            if matches!(mutation, Mutation::Update) {
+                command.args(["--expected-digest", &digest(true)]);
+            }
+            command
+        }
+
+        fn exercise(&self, mutation: Mutation, reply: Reply) -> (Output, Vec<Value>) {
+            let (output, _requests, effects) = self.exercise_counted(mutation, reply);
+            (output, effects)
+        }
+
+        fn exercise_counted(
+            &self,
+            mutation: Mutation,
+            reply: Reply,
+        ) -> (Output, Vec<Value>, Vec<Value>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (mut stop, wake) = UnixStream::pair().unwrap();
+            let tls = Arc::clone(&self.tls);
+            let worker = thread::spawn(move || {
+                let mut requests = Vec::new();
+                let mut effects = Vec::new();
+                let deadline = Instant::now() + Duration::from_secs(20);
+                loop {
+                    let mut descriptors = [
+                        libc::pollfd {
+                            fd: listener.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: wake.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    let remaining = deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis();
+                    assert!(remaining > 0, "fixture exceeded its finite deadline");
+                    // SAFETY: descriptors is an initialized two-element pollfd array.
+                    let ready = unsafe {
+                        libc::poll(descriptors.as_mut_ptr(), 2, remaining.min(20_000) as i32)
+                    };
+                    assert!(ready > 0, "fixture did not finish before its deadline");
+                    // Drain connections already queued before honouring stop, so an
+                    // automatic replay cannot hide behind subprocess termination.
+                    if descriptors[0].revents & libc::POLLIN != 0 {
+                        let (tcp, _) = listener.accept().unwrap();
+                        tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                        tcp.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                        let conn = rustls::ServerConnection::new(Arc::clone(&tls)).unwrap();
+                        let mut stream = rustls::StreamOwned::new(conn, tcp);
+                        let mut header = Vec::new();
+                        while !header.ends_with(b"\r\n\r\n") {
+                            assert!(header.len() < 16_384, "oversized request header");
+                            let mut byte = [0];
+                            stream.read_exact(&mut byte).unwrap();
+                            header.push(byte[0]);
+                        }
+                        let header = String::from_utf8(header).unwrap();
+                        let mut lines = header.split("\r\n");
+                        assert_eq!(lines.next().unwrap(), format!(
+                            "POST /__platform/hosted-cadence/{WORKSPACE}/app-installations{} HTTP/1.1", mutation.suffix()));
+                        let mut length = None;
+                        let mut authorization = None;
+                        for line in lines.filter(|line| !line.is_empty()) {
+                            let (name, value) = line.split_once(':').unwrap();
+                            if name.eq_ignore_ascii_case("content-length") {
+                                length = Some(value.trim().parse::<usize>().unwrap());
+                            }
+                            if name.eq_ignore_ascii_case("authorization") {
+                                authorization = Some(value.trim().to_owned());
+                            }
+                            assert!(
+                                !name.eq_ignore_ascii_case("transfer-encoding"),
+                                "fixture expects the existing send_json content-length framing"
+                            );
+                        }
+                        assert_eq!(
+                            authorization.as_deref(),
+                            Some(format!("Bearer {TOKEN}").as_str())
+                        );
+                        let length = length.expect("missing request body length");
+                        assert!(length <= 131_072);
+                        let mut bytes = vec![0; length];
+                        stream.read_exact(&mut bytes).unwrap();
+                        let body: Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(
+                            body,
+                            mutation.body(),
+                            "the actual CLI must dispatch the exact supported envelope"
+                        );
+                        requests.push(body.clone());
+                        // The two proven /action refusals occur before any
+                        // authoritative effect. Every existing negative case
+                        // still commits before replying. For reconcile, the
+                        // synthetic effect models a journal cancel/observe
+                        // whose response is lost, not an app mutation.
+                        if !matches!(
+                            reply,
+                            Reply::PreEffect503(_, _)
+                                | Reply::ReconcileTerminal(_)
+                                | Reply::ReconcilePending
+                                | Reply::PreEffect503Fault(_, _)
+                                | Reply::RevokeTerminal(
+                                    ReceiptDisposition::RefusedNotStarted
+                                        | ReceiptDisposition::CancelledBeforeDispatch,
+                                    _
+                                )
+                        ) {
+                            effects.push(body);
+                        }
+                        if matches!(reply, Reply::Dropped) {
+                            continue;
+                        }
+                        let (status, bytes, advertised, extra) = match reply {
+                            Reply::NonJson => (200, b"not-json".to_vec(), 8, String::new()),
+                            Reply::Truncated => (200, b"{\"ok\":".to_vec(), 64, String::new()),
+                            Reply::Oversized => {
+                                (200, vec![b'x'; 1_048_577], 1_048_577, String::new())
+                            }
+                            Reply::Redirect => (
+                                307,
+                                b"{}".to_vec(),
+                                2,
+                                format!("Location: {ENDPOINT}/must-not-follow\r\n"),
+                            ),
+                            Reply::UnprovedJson => {
+                                let bytes = br#"{"ok":true,"data":{}}"#.to_vec();
+                                let length = bytes.len();
+                                (200, bytes, length, String::new())
+                            }
+                            Reply::ProducerUncertain => {
+                                // hosted-app-installations.ts fail(202, "outcome_uncertain", ...).
+                                let bytes = serde_json::to_vec(&json!({"ok": false, "error": {
+                                    "code": "outcome_uncertain", "message": "Read and reconcile this operation before another app change."
+                                }})).unwrap();
+                                let length = bytes.len();
+                                (202, bytes, length, String::new())
+                            }
+                            Reply::RevokeReceipt(fault) | Reply::RevokeTerminal(_, fault) => {
+                                assert!(matches!(mutation, Mutation::Revoke));
+                                let mut receipt = match reply {
+                                    Reply::RevokeTerminal(disposition, _) => {
+                                        terminal_revoke_receipt(disposition)
+                                    }
+                                    _ => successful_revoke_receipt(),
+                                };
+                                match fault {
+                                    ReceiptFault::ForeignOperation => {
+                                        receipt["data"]["operation_id"] =
+                                            json!("00000000-0000-4000-8000-000000009999");
+                                    }
+                                    ReceiptFault::ForeignWorkspace => {
+                                        receipt["data"]["workspace_id"] = json!("ws_foreign");
+                                    }
+                                    ReceiptFault::ForeignKind => {
+                                        receipt["data"]["kind"] = json!("install");
+                                    }
+                                    ReceiptFault::ForeignConsentDigest => {
+                                        receipt["data"]["consent"]["digest"] = json!(digest(false));
+                                    }
+                                    ReceiptFault::ForeignActor => {
+                                        receipt["data"]["consent"]["actor_id"] =
+                                            json!("user_foreign");
+                                    }
+                                    ReceiptFault::ForeignRefusalOperation => {
+                                        receipt["data"]["refusal"]["operation_id"] =
+                                            json!("00000000-0000-4000-8000-000000009999");
+                                    }
+                                    ReceiptFault::ForeignRefusalKind => {
+                                        receipt["data"]["refusal"]["operation"] = json!("install");
+                                    }
+                                    ReceiptFault::ForeignInstall => {
+                                        receipt["data"]["installation"]["installId"] =
+                                            json!("install_foreign");
+                                    }
+                                    ReceiptFault::ForeignInstallDigest => {
+                                        receipt["data"]["installation"]["digest"] =
+                                            json!(digest(false));
+                                    }
+                                    ReceiptFault::ForeignGeneration => {
+                                        receipt["data"]["installation"]["generation"] =
+                                            json!("foreign-generation");
+                                    }
+                                    ReceiptFault::StillApproved => {
+                                        receipt["data"]["installation"]["approval"]["state"] =
+                                            json!("approved");
+                                    }
+                                    ReceiptFault::MissingInstallation => {
+                                        receipt["data"]["installation"] = Value::Null;
+                                    }
+                                    ReceiptFault::None
+                                    | ReceiptFault::MissingHeader
+                                    | ReceiptFault::ForeignHeader => {}
+                                }
+                                let extra = match fault {
+                                    ReceiptFault::MissingHeader => String::new(),
+                                    ReceiptFault::ForeignHeader => format!(
+                                        "X-Hosted-App-Operation-Id: {}\r\n",
+                                        "00000000-0000-4000-8000-000000009999"
+                                    ),
+                                    _ => format!("X-Hosted-App-Operation-Id: {OP}\r\n"),
+                                };
+                                let bytes = serde_json::to_vec(&receipt).unwrap();
+                                let length = bytes.len();
+                                (200, bytes, length, extra)
+                            }
+                            Reply::PreEffect503(code, _) | Reply::PreEffect503Fault(code, _) => {
+                                assert!(matches!(mutation, Mutation::Install | Mutation::Update));
+                                assert!(matches!(
+                                    code,
+                                    "release_unavailable" | "check_unavailable"
+                                ));
+                                let message = if code == "release_unavailable" {
+                                    "This app release could not be verified. Nothing was changed."
+                                } else {
+                                    "The release review was incomplete."
+                                };
+                                let mut body = json!({
+                                    "ok": false,
+                                    "error": {"code": code, "message": message}
+                                });
+                                match reply {
+                                    Reply::PreEffect503Fault(_, RefusalFault::MissingMessage) => {
+                                        body["error"].as_object_mut().unwrap().remove("message");
+                                    }
+                                    Reply::PreEffect503Fault(_, RefusalFault::NonStringMessage) => {
+                                        body["error"]["message"] = json!(7);
+                                    }
+                                    Reply::PreEffect503Fault(_, RefusalFault::EmptyMessage) => {
+                                        body["error"]["message"] = json!("");
+                                    }
+                                    _ => {}
+                                }
+                                let bytes = serde_json::to_vec(&body).unwrap();
+                                let length = bytes.len();
+                                let extra = match reply {
+                                    Reply::PreEffect503(_, false) => String::new(),
+                                    Reply::PreEffect503Fault(_, RefusalFault::ForeignHeader) => {
+                                        format!(
+                                            "X-Hosted-App-Operation-Id: {}\r\n",
+                                            "00000000-0000-4000-8000-000000009999"
+                                        )
+                                    }
+                                    Reply::PreEffect503Fault(_, RefusalFault::MalformedHeader) => {
+                                        // Valid HTTP value, invalid operation identifier.
+                                        "X-Hosted-App-Operation-Id: invalid.operation.id\r\n"
+                                            .to_string()
+                                    }
+                                    _ => format!("X-Hosted-App-Operation-Id: {OP}\r\n"),
+                                };
+                                (503, bytes, length, extra)
+                            }
+                            Reply::Unproved503(code) => {
+                                let bytes = serde_json::to_vec(&json!({
+                                    "ok": false,
+                                    "error": {
+                                        "code": code,
+                                        "message": "The authoritative response was lost."
+                                    }
+                                }))
+                                .unwrap();
+                                let length = bytes.len();
+                                (
+                                    503,
+                                    bytes,
+                                    length,
+                                    format!("X-Hosted-App-Operation-Id: {OP}\r\n"),
+                                )
+                            }
+                            Reply::ReconcileReceipt(kind, fault) => {
+                                assert!(matches!(mutation, Mutation::Reconcile));
+                                let mut receipt = successful_reconcile_receipt(kind);
+                                match fault {
+                                    ReconcileFault::IncompleteEnvelope => {
+                                        receipt = json!({"ok": true, "data": {
+                                            "operation_id": OP,
+                                            "workspace_id": WORKSPACE,
+                                            "state": "succeeded"
+                                        }});
+                                    }
+                                    ReconcileFault::ForeignOperation => {
+                                        receipt["data"]["operation_id"] =
+                                            json!("00000000-0000-4000-8000-000000009999");
+                                    }
+                                    ReconcileFault::ForeignWorkspace => {
+                                        receipt["data"]["workspace_id"] = json!("ws_foreign");
+                                    }
+                                    ReconcileFault::MissingVersion => {
+                                        receipt["data"].as_object_mut().unwrap().remove("version");
+                                    }
+                                    ReconcileFault::ForeignVersion => {
+                                        receipt["data"]["version"] = json!("unrelated-protocol.v1");
+                                    }
+                                    ReconcileFault::MissingKind => {
+                                        receipt["data"].as_object_mut().unwrap().remove("kind");
+                                    }
+                                    ReconcileFault::InvalidKind => {
+                                        receipt["data"]["kind"] = json!("unrelated-mutation");
+                                    }
+                                    ReconcileFault::MissingConsent => {
+                                        receipt["data"].as_object_mut().unwrap().remove("consent");
+                                    }
+                                    ReconcileFault::MissingActor => {
+                                        receipt["data"]["consent"]
+                                            .as_object_mut()
+                                            .unwrap()
+                                            .remove("actor_id");
+                                    }
+                                    ReconcileFault::IncompleteConsent => {
+                                        receipt["data"]["consent"] = json!({
+                                            "actor_id": "user_previous_owner",
+                                            "digest": digest(true)
+                                        });
+                                    }
+                                    ReconcileFault::MalformedConsentDigest => {
+                                        receipt["data"]["consent"]["digest"] =
+                                            json!("not-a-digest");
+                                    }
+                                    ReconcileFault::MissingInstallation => {
+                                        receipt["data"]["installation"] = Value::Null;
+                                    }
+                                    ReconcileFault::MissingInstallationVersion => {
+                                        receipt["data"]["installation"]
+                                            .as_object_mut()
+                                            .unwrap()
+                                            .remove("version");
+                                    }
+                                    ReconcileFault::ForeignInstallationApp => {
+                                        receipt["data"]["installation"]["app"] =
+                                            json!("foreign-app");
+                                    }
+                                    ReconcileFault::ForeignInstallationDigest => {
+                                        receipt["data"]["installation"]["digest"] =
+                                            json!(digest(false));
+                                    }
+                                    ReconcileFault::RevokeStillApproved => {
+                                        assert_eq!(kind, "revoke");
+                                        receipt["data"]["installation"]["approval"]["state"] =
+                                            json!("approved");
+                                    }
+                                    ReconcileFault::RefusalOnSuccess => {
+                                        receipt["data"]["refusal"] = json!({
+                                            "version": "hosted-app-mutation.v1",
+                                            "operation_id": OP,
+                                            "operation": kind,
+                                            "outcome": "refused",
+                                            "mutation": "not_started",
+                                            "code": "native_precondition_refused"
+                                        });
+                                    }
+                                    ReconcileFault::MissingUpdatedAt => {
+                                        receipt["data"]
+                                            .as_object_mut()
+                                            .unwrap()
+                                            .remove("updated_at");
+                                    }
+                                    ReconcileFault::None
+                                    | ReconcileFault::MissingHeader
+                                    | ReconcileFault::ForeignHeader => {}
+                                }
+                                let extra = match fault {
+                                    ReconcileFault::MissingHeader => String::new(),
+                                    ReconcileFault::ForeignHeader => format!(
+                                        "X-Hosted-App-Operation-Id: {}\r\n",
+                                        "00000000-0000-4000-8000-000000009999"
+                                    ),
+                                    _ => format!("X-Hosted-App-Operation-Id: {OP}\r\n"),
+                                };
+                                let bytes = serde_json::to_vec(&receipt).unwrap();
+                                let length = bytes.len();
+                                (200, bytes, length, extra)
+                            }
+                            Reply::ReconcileTerminal(_) | Reply::ReconcilePending => {
+                                assert!(matches!(mutation, Mutation::Reconcile));
+                                let (mut receipt, status) = match reply {
+                                    Reply::ReconcileTerminal(disposition) => {
+                                        (terminal_revoke_receipt(disposition), 200)
+                                    }
+                                    Reply::ReconcilePending => {
+                                        let mut receipt = successful_reconcile_receipt("revoke");
+                                        receipt["data"]["state"] = json!("dispatched");
+                                        receipt["data"]["installation"] = Value::Null;
+                                        receipt["data"]["refusal"] = Value::Null;
+                                        (receipt, 202)
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                receipt["data"]["consent"]["actor_id"] =
+                                    json!("user_previous_owner");
+                                let bytes = serde_json::to_vec(&receipt).unwrap();
+                                let length = bytes.len();
+                                (
+                                    status,
+                                    bytes,
+                                    length,
+                                    format!("X-Hosted-App-Operation-Id: {OP}\r\n"),
+                                )
+                            }
+                            Reply::Dropped => unreachable!(),
+                        };
+                        // Existing unusable-response cases omit the header;
+                        // new controls select their explicit correlation header.
+                        let _ = write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {advertised}\r\nConnection: close\r\n{extra}\r\n");
+                        let _ = stream.write_all(&bytes);
+                        let _ = stream.flush();
+                    } else if descriptors[1].revents != 0 {
+                        break;
+                    } else {
+                        panic!("unexpected fixture socket readiness");
+                    }
+                }
+                (requests, effects)
+            });
+            let output = bounded_output(&mut self.command(mutation, address));
+            stop.write_all(b"x").unwrap();
+            let (requests, effects) = worker.join().unwrap();
+            (output, requests, effects)
+        }
+    }
+
+    fn assert_unknown(output: &Output, mutation: Mutation, reply: Reply) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{mutation:?}/{reply:?}: stdout={stdout}; stderr={stderr}"
+        );
+        // main.rs emits the error object after the operation-id diagnostic.
+        let start = stderr
+            .find('{')
+            .expect("unknown must have a structured CLI diagnostic");
+        let error: Value = serde_json::from_str(&stderr[start..]).unwrap();
+        assert_eq!(error["kind"], "unknown", "{mutation:?}/{reply:?}: {error}");
+        let guidance = format!("{stderr}\n{stdout}").to_lowercase();
+        assert!(
+            guidance.contains(OP),
+            "lost recovery operation identity: {guidance}"
+        );
+        assert!(
+            guidance.contains(&format!("--org {ORG}")),
+            "recovery must pin the same selected workspace: {guidance}"
+        );
+        assert!(
+            guidance.contains("app catalog operation"),
+            "missing operation readback guidance: {guidance}"
+        );
+        assert!(
+            guidance.contains("reconcile"),
+            "missing reconciliation guidance: {guidance}"
+        );
+        assert!(
+            guidance.contains("never redispatch")
+                || guidance.contains("do not redispatch")
+                || guidance.contains("do not retry"),
+            "missing no-blind-replay warning: {guidance}"
+        );
+    }
+
+    // Independently authored CAD-2009 registration persistence acceptance.
+
+    #[test]
+    fn cad2009_register_issued_session_protected_save_is_unknown_without_new_consent() {
+        const ISSUED_WORKSPACE: &str = "ws_registration_issued";
+        const ISSUED_SLUG: &str = "lc";
+        const SESSION: &str = "hcs_00000000-0000-4000-8000-000000002009";
+        let fixture = Fixture::new();
+        let authority = fixture.root.path().join("registration-authority");
+        fs::create_dir(&authority).unwrap();
+        fs::set_permissions(&authority, fs::Permissions::from_mode(0o700)).unwrap();
+        private_file(
+            &authority.join("trusted-issuer"),
+            format!("{ENDPOINT}\n").as_bytes(),
+        );
+        let sentinel = fixture.root.path().join("protected-credential-target");
+        private_file(
+            &sentinel,
+            b"must not overwrite this protected destination\n",
+        );
+        let protected = authority.join(format!("cli-{ISSUED_SLUG}.json"));
+        std::os::unix::fs::symlink(&sentinel, &protected).unwrap();
+        let registry = fixture.root.path().join("config/cadence/orgs.json");
+        let registry_before = fs::read(&registry).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (mut stop, wake) = UnixStream::pair().unwrap();
+        let tls = Arc::clone(&fixture.tls);
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut requests = Vec::new();
+            let mut issued = 0usize;
+            loop {
+                let mut descriptors = [
+                    libc::pollfd {
+                        fd: listener.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: wake.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis();
+                assert!(remaining > 0, "registration fixture deadline");
+                // SAFETY: descriptors is an initialized two-element pollfd array.
+                let ready = unsafe {
+                    libc::poll(descriptors.as_mut_ptr(), 2, remaining.min(20_000) as i32)
+                };
+                assert!(ready > 0, "registration fixture did not terminate");
+                if descriptors[0].revents & libc::POLLIN != 0 {
+                    let (tcp, _) = listener.accept().unwrap();
+                    tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                    tcp.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                    let connection = rustls::ServerConnection::new(Arc::clone(&tls)).unwrap();
+                    let mut stream = rustls::StreamOwned::new(connection, tcp);
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        assert!(header.len() < 16_384, "oversized registration header");
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).unwrap();
+                        header.push(byte[0]);
+                    }
+                    let header = String::from_utf8(header).unwrap();
+                    let mut lines = header.split("\r\n");
+                    let first = lines.next().unwrap();
+                    let path = first
+                        .strip_prefix("POST ")
+                        .unwrap()
+                        .strip_suffix(" HTTP/1.1")
+                        .unwrap()
+                        .to_owned();
+                    let length = lines
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                        .unwrap();
+                    assert!(length <= 65_536);
+                    let mut bytes = vec![0; length];
+                    stream.read_exact(&mut bytes).unwrap();
+                    let body: Value = serde_json::from_slice(&bytes).unwrap();
+                    requests.push(path.clone());
+                    let (status, reply) = match path.as_str() {
+                        "/v1/hosted-cadence/device/code" => {
+                            assert_eq!(
+                                requests.len(),
+                                1,
+                                "new consent was requested after issuance"
+                            );
+                            assert_eq!(body["cli_session"], "renewable");
+                            assert!(body.get("organization_id").is_none());
+                            assert!(body.get("organization_slug").is_none());
+                            assert!(body["code_challenge"]
+                                .as_str()
+                                .is_some_and(|value| value.len() == 43));
+                            (
+                                200,
+                                json!({
+                                    "version":"hosted-cadence-device.v1",
+                                    "device_code":format!("hcd_{}", "D".repeat(43)),
+                                    "user_code":"K7PM-2QNF",
+                                    "verification_uri":format!("{ENDPOINT}/device/hosted-cadence"),
+                                    "verification_uri_complete":format!("{ENDPOINT}/device/hosted-cadence?code=K7PM-2QNF"),
+                                    "expires_in":600,"interval":5
+                                }),
+                            )
+                        }
+                        "/v1/hosted-cadence/device/token" => {
+                            assert_eq!(body["device_code"], format!("hcd_{}", "D".repeat(43)));
+                            assert!(body["code_verifier"]
+                                .as_str()
+                                .is_some_and(|value| value.len() == 43));
+                            issued += 1;
+                            if issued > 1 {
+                                (400, json!({"error":"invalid_grant"}))
+                            } else {
+                                let at = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs();
+                                (
+                                    200,
+                                    json!({
+                                        "version":"hosted-cadence-auth.v1",
+                                        "organization_id":ISSUED_WORKSPACE,"organization_slug":ISSUED_SLUG,
+                                        "audience":ENDPOINT,
+                                        "principal":{"kind":"user","subject_id":"user_registration_issued","current_role":"owner"},
+                                        "capabilities":["cli.read","cli.write"],
+                                        "credential":{"credential_id":"hcp_registration_issued","access_token":TOKEN,
+                                            "token_type":"Bearer","issued_at":at,"expires_at":at+120,"renewal":"reexchange"},
+                                        "cli_session":{"session_id":SESSION,"refresh_token":format!("hcr_{}", "R".repeat(43)),
+                                            "generation":1,"device_label":"cadence-cli",
+                                            "idle_expires_at":at+2_592_000,"absolute_expires_at":at+7_776_000}
+                                    }),
+                                )
+                            }
+                        }
+                        _ => panic!("unexpected post-issuance operation: {path}"),
+                    };
+                    let bytes = serde_json::to_vec(&reply).unwrap();
+                    write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
+                    stream.write_all(&bytes).unwrap();
+                    stream.flush().unwrap();
+                } else if descriptors[1].revents != 0 {
+                    break;
+                } else {
+                    panic!("unexpected registration socket readiness");
+                }
+            }
+            (issued, requests)
+        });
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        command
+            .env_clear()
+            .current_dir(fixture.root.path())
+            .env("HOME", fixture.root.path())
+            .env("XDG_CONFIG_HOME", fixture.root.path().join("config"))
+            .env("XDG_STATE_HOME", fixture.root.path().join("state"))
+            .env("CADENCE_TEST_TLS_CA", fixture.root.path().join("ca.pem"))
+            .env("CADENCE_TEST_TLS_CONNECT", address.to_string())
+            .env("CADENCE_JSON", "compact")
+            .args([
+                "register",
+                "--issuer",
+                ENDPOINT,
+                "--name",
+                "Prefilled Name",
+                "--slug",
+                "prefill-only",
+                "--no-open",
+                "--use",
+                "--json",
+                "--auth-dir",
+            ])
+            .arg(&authority);
+        let output = bounded_output(&mut command);
+        stop.write_all(b"x").unwrap();
+        let (issued, requests) = worker.join().unwrap();
+        assert_eq!(
+            issued, 1,
+            "the one-shot session was not issued exactly once"
+        );
+        assert_eq!(requests, ["/v1/hosted-cadence/device/code", "/v1/hosted-cadence/device/token"],
+        "registration must neither request fresh consent nor replay/renew/revoke the issued grant");
+        assert!(
+            fs::symlink_metadata(&protected)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "destination guard was bypassed"
+        );
+        assert_eq!(fs::read_link(&protected).unwrap(), sentinel);
+        assert_eq!(
+            fs::read(&sentinel).unwrap(),
+            b"must not overwrite this protected destination\n"
+        );
+        assert_eq!(
+            fs::read(&registry).unwrap(),
+            registry_before,
+            "failed persistence changed the saved selection"
+        );
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let start = stderr.find('{').expect("missing structured CLI error");
+        let error: Value =
+            serde_json::from_str(&stderr[start..]).expect("invalid structured CLI error");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "stdout={stdout}; stderr={stderr}"
+        );
+        assert_eq!(
+            error["kind"], "unknown",
+            "issued-session persistence loss is not a pre-effect rejection"
+        );
+        let report: Value =
+            serde_json::from_str(&stdout).expect("--json must emit exactly one JSON document");
+        assert_eq!(report["authenticated"], false);
+        assert_eq!(report["credential_stored"], false);
+        assert_ne!(
+            report["registered"],
+            json!(false),
+            "a local save refusal cannot disprove remote registration"
+        );
+        for rendered in [report.to_string(), error.to_string()] {
+            assert!(
+                rendered.contains(ISSUED_WORKSPACE),
+                "missing actual issuer-selected workspace: {rendered}"
+            );
+            assert!(
+                rendered.contains(authority.to_str().unwrap()),
+                "missing actual protected authority directory: {rendered}"
+            );
+            assert!(
+                rendered.to_lowercase().contains("issued"),
+                "lost issued-session fact: {rendered}"
+            );
+            assert!(
+                rendered.to_lowercase().contains("reconcil"),
+                "missing reconciliation guidance: {rendered}"
+            );
+        }
+        assert!(!stdout.contains(TOKEN) && !stderr.contains(TOKEN));
+        assert!(
+            !stdout.contains(&format!("hcr_{}", "R".repeat(43)))
+                && !stderr.contains(&format!("hcr_{}", "R".repeat(43)))
+        );
+    }
+
+    #[test]
+    fn cad2009_hosted_app_matching_historical_cli_revoke_receipt_is_success() {
+        let fixture = Fixture::new();
+        let mutation = Mutation::Revoke;
+        let (output, requests, effects) =
+            fixture.exercise_counted(mutation, Reply::RevokeReceipt(ReceiptFault::None));
+        assert_eq!(
+            requests,
+            vec![mutation.body()],
+            "exactly one original request"
+        );
+        assert_eq!(
+            effects,
+            vec![mutation.body()],
+            "exactly one original effect"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: Value = serde_json::from_slice(&output.stdout)
+            .expect("the complete confirmed receipt must be printed as JSON");
+        assert_eq!(receipt, successful_revoke_receipt());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("\"kind\":\"unknown\""));
+    }
+
+    #[test]
+    fn cad2009_hosted_app_foreign_or_unusable_revoke_receipts_remain_unknown() {
+        let fixture = Fixture::new();
+        for fault in [
+            ReceiptFault::MissingHeader,
+            ReceiptFault::ForeignHeader,
+            ReceiptFault::ForeignOperation,
+            ReceiptFault::ForeignWorkspace,
+            ReceiptFault::ForeignKind,
+            ReceiptFault::ForeignConsentDigest,
+            ReceiptFault::ForeignActor,
+            ReceiptFault::ForeignInstall,
+            ReceiptFault::ForeignInstallDigest,
+            ReceiptFault::ForeignGeneration,
+            ReceiptFault::StillApproved,
+            ReceiptFault::MissingInstallation,
+        ] {
+            let mutation = Mutation::Revoke;
+            let reply = Reply::RevokeReceipt(fault);
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(requests, vec![mutation.body()], "{fault:?}: no replay");
+            assert_eq!(
+                effects,
+                vec![mutation.body()],
+                "{fault:?}: original effect retained"
+            );
+            assert_unknown(&output, mutation, reply);
+        }
+    }
+
+    #[test]
+    fn cad2009_hosted_app_proven_action_503_refusals_remain_definite() {
+        let fixture = Fixture::new();
+        for mutation in [Mutation::Install, Mutation::Update] {
+            for code in ["release_unavailable", "check_unavailable"] {
+                // Historical human CLI replies include the header; current
+                // tenant reviewed() refusals may return before adding one.
+                for include_header in [false, true] {
+                    let reply = Reply::PreEffect503(code, include_header);
+                    let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                    assert_eq!(
+                        requests,
+                        vec![mutation.body()],
+                        "{mutation:?}/{code}: one request, not a local bypass"
+                    );
+                    assert!(
+                        effects.is_empty(),
+                        "{mutation:?}/{code}: source-proven refusal must precede the effect"
+                    );
+                    assert_eq!(
+                        output.status.code(),
+                        Some(3),
+                        "{mutation:?}/{code}/{include_header}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let body: Value = serde_json::from_slice(&output.stdout)
+                        .expect("the original definite refusal must remain inspectable");
+                    assert_eq!(body["ok"], false);
+                    assert_eq!(body["error"]["code"], code);
+                    assert!(
+                        !String::from_utf8_lossy(&output.stderr).contains("\"kind\":\"unknown\"")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_hosted_app_unproved_503s_and_reconcile_journal_failures_stay_unknown() {
+        let fixture = Fixture::new();
+        for mutation in [Mutation::Install, Mutation::Update, Mutation::Revoke] {
+            for code in [
+                "capability_unavailable",
+                "owner_unavailable",
+                "temporary_backend_failure",
+            ] {
+                let reply = Reply::Unproved503(code);
+                let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                assert_eq!(
+                    requests,
+                    vec![mutation.body()],
+                    "{mutation:?}/{code}: no replay"
+                );
+                assert_eq!(
+                    effects,
+                    vec![mutation.body()],
+                    "{mutation:?}/{code}: a lost acknowledgement can follow commit"
+                );
+                assert_unknown(&output, mutation, reply);
+            }
+        }
+        // The two /action-only proof codes must not become a global whitelist.
+        // In particular, current reconcile can persist cancel/observe and then
+        // emit capability_unavailable/owner_unavailable when its reply is lost.
+        for code in [
+            "capability_unavailable",
+            "owner_unavailable",
+            "release_unavailable",
+            "check_unavailable",
+        ] {
+            let mutation = Mutation::Reconcile;
+            let reply = Reply::Unproved503(code);
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(requests, vec![json!({})], "reconcile/{code}: no replay");
+            assert_eq!(
+                effects,
+                vec![json!({})],
+                "reconcile/{code}: journal effect committed before lost acknowledgement"
+            );
+            assert_unknown(&output, mutation, reply);
+        }
+    }
+    #[test]
+    fn cad2009_hosted_app_correlated_terminal_revoke_refusals_exit_three() {
+        let fixture = Fixture::new();
+        for disposition in [
+            ReceiptDisposition::RefusedNotStarted,
+            ReceiptDisposition::CancelledBeforeDispatch,
+        ] {
+            let mutation = Mutation::Revoke;
+            let reply = Reply::RevokeTerminal(disposition, ReceiptFault::None);
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(
+                requests,
+                vec![mutation.body()],
+                "{disposition:?}: one request"
+            );
+            assert!(
+                effects.is_empty(),
+                "{disposition:?}: no app effect was started"
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "{disposition:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let receipt: Value = serde_json::from_slice(&output.stdout)
+                .expect("the complete correlated refusal must remain inspectable");
+            assert_eq!(receipt, terminal_revoke_receipt(disposition));
+            assert_eq!(receipt["data"]["operation_id"], OP);
+            assert_eq!(receipt["data"]["workspace_id"], WORKSPACE);
+            assert_eq!(receipt["data"]["consent"]["digest"], digest(true));
+        }
+    }
+
+    #[test]
+    fn cad2009_hosted_app_uncorrelated_terminal_revoke_refusals_stay_unknown() {
+        let fixture = Fixture::new();
+        for disposition in [
+            ReceiptDisposition::RefusedNotStarted,
+            ReceiptDisposition::CancelledBeforeDispatch,
+        ] {
+            for fault in [
+                ReceiptFault::MissingHeader,
+                ReceiptFault::ForeignHeader,
+                ReceiptFault::ForeignOperation,
+                ReceiptFault::ForeignWorkspace,
+                ReceiptFault::ForeignKind,
+                ReceiptFault::ForeignConsentDigest,
+                ReceiptFault::ForeignActor,
+            ] {
+                let mutation = Mutation::Revoke;
+                let reply = Reply::RevokeTerminal(disposition, fault);
+                let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                assert_eq!(
+                    requests,
+                    vec![mutation.body()],
+                    "{disposition:?}/{fault:?}: no replay"
+                );
+                assert!(
+                    effects.is_empty(),
+                    "{disposition:?}/{fault:?}: refused original effect"
+                );
+                assert_unknown(&output, mutation, reply);
+            }
+        }
+        // Even a structurally valid not-started marker must name this
+        // operation and this mutation, not a different command's refusal.
+        for fault in [
+            ReceiptFault::ForeignRefusalOperation,
+            ReceiptFault::ForeignRefusalKind,
+        ] {
+            let mutation = Mutation::Revoke;
+            let reply = Reply::RevokeTerminal(ReceiptDisposition::RefusedNotStarted, fault);
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(requests, vec![mutation.body()], "{fault:?}: no replay");
+            assert!(effects.is_empty());
+            assert_unknown(&output, mutation, reply);
+        }
+    }
+
+    #[test]
+    fn cad2009_hosted_app_correlated_expired_revoke_is_unknown_not_refused() {
+        let fixture = Fixture::new();
+        let mutation = Mutation::Revoke;
+        let reply = Reply::RevokeTerminal(ReceiptDisposition::ExpiredUnknown, ReceiptFault::None);
+        let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+        assert_eq!(
+            requests,
+            vec![mutation.body()],
+            "one original request, no replay"
+        );
+        assert_eq!(
+            effects,
+            vec![mutation.body()],
+            "expiry is not proof of no original effect"
+        );
+        assert_unknown(&output, mutation, reply);
+    }
+    #[test]
+    fn cad2009_hosted_app_proof_codes_need_correlated_usable_refusal_envelopes() {
+        let fixture = Fixture::new();
+        for mutation in [Mutation::Install, Mutation::Update] {
+            for code in ["release_unavailable", "check_unavailable"] {
+                for fault in [
+                    RefusalFault::ForeignHeader,
+                    RefusalFault::MalformedHeader,
+                    RefusalFault::MissingMessage,
+                    RefusalFault::NonStringMessage,
+                    RefusalFault::EmptyMessage,
+                ] {
+                    let reply = Reply::PreEffect503Fault(code, fault);
+                    let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                    assert_eq!(
+                        requests,
+                        vec![mutation.body()],
+                        "{mutation:?}/{code}/{fault:?}: exactly one original request"
+                    );
+                    assert!(
+                        effects.is_empty(),
+                        "{mutation:?}/{code}/{fault:?}: source refused before effect"
+                    );
+                    // Knowing the source refused is fixture ground truth, not
+                    // evidence the client can recover from a foreign/unusable
+                    // response. The CLI must not claim definite rejection.
+                    assert_unknown(&output, mutation, reply);
+                }
+            }
+        }
+    }
+    #[test]
+    fn cad2009_hosted_app_reconcile_accepts_complete_receipts_for_another_owner() {
+        let fixture = Fixture::new();
+        for kind in ["install", "update", "revoke"] {
+            let mutation = Mutation::Reconcile;
+            let reply = Reply::ReconcileReceipt(kind, ReconcileFault::None);
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(
+                requests,
+                vec![json!({})],
+                "{kind}: exactly one reconcile request"
+            );
+            assert_eq!(
+                effects,
+                vec![json!({})],
+                "{kind}: one journal observation, no replay"
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{kind}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let receipt: Value = serde_json::from_slice(&output.stdout)
+                .expect("the complete confirmed reconciliation must remain inspectable");
+            assert_eq!(receipt, successful_reconcile_receipt(kind));
+            assert_eq!(
+                receipt["data"]["consent"]["actor_id"],
+                "user_previous_owner"
+            );
+        }
+    }
+
+    #[test]
+    fn cad2009_hosted_app_reconcile_rejects_incomplete_or_incoherent_success_receipts() {
+        let fixture = Fixture::new();
+        for fault in [
+            ReconcileFault::IncompleteEnvelope,
+            ReconcileFault::ForeignOperation,
+            ReconcileFault::ForeignWorkspace,
+            ReconcileFault::MissingHeader,
+            ReconcileFault::ForeignHeader,
+            ReconcileFault::MissingVersion,
+            ReconcileFault::ForeignVersion,
+            ReconcileFault::MissingKind,
+            ReconcileFault::InvalidKind,
+            ReconcileFault::MissingConsent,
+            ReconcileFault::MissingActor,
+            ReconcileFault::IncompleteConsent,
+            ReconcileFault::MalformedConsentDigest,
+            ReconcileFault::MissingInstallation,
+            ReconcileFault::MissingInstallationVersion,
+            ReconcileFault::ForeignInstallationApp,
+            ReconcileFault::ForeignInstallationDigest,
+            ReconcileFault::RevokeStillApproved,
+            ReconcileFault::RefusalOnSuccess,
+            ReconcileFault::MissingUpdatedAt,
+        ] {
+            let mutation = Mutation::Reconcile;
+            let reply = Reply::ReconcileReceipt("revoke", fault);
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(requests, vec![json!({})], "{fault:?}: no reconcile replay");
+            assert_eq!(
+                effects,
+                vec![json!({})],
+                "{fault:?}: original journal custody retained"
+            );
+            assert_unknown(&output, mutation, reply);
+        }
+    }
+    #[test]
+    fn cad2009_hosted_app_reconcile_preserves_an_earlier_owners_definite_refusals() {
+        let fixture = Fixture::new();
+        for disposition in [
+            ReceiptDisposition::CancelledBeforeDispatch,
+            ReceiptDisposition::RefusedNotStarted,
+        ] {
+            let mutation = Mutation::Reconcile;
+            let reply = Reply::ReconcileTerminal(disposition);
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(
+                requests,
+                vec![json!({})],
+                "{disposition:?}: one receipt read"
+            );
+            assert!(
+                effects.is_empty(),
+                "{disposition:?}: no original mutation redispatched"
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "{disposition:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut expected = terminal_revoke_receipt(disposition);
+            expected["data"]["consent"]["actor_id"] = json!("user_previous_owner");
+            let actual: Value = serde_json::from_slice(&output.stdout)
+                .expect("the complete earlier-owner refusal remains inspectable");
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn cad2009_hosted_app_reconcile_keeps_earlier_owner_expiry_and_pending_unknown() {
+        let fixture = Fixture::new();
+        for reply in [
+            Reply::ReconcileTerminal(ReceiptDisposition::ExpiredUnknown),
+            Reply::ReconcilePending,
+        ] {
+            let mutation = Mutation::Reconcile;
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(
+                requests,
+                vec![json!({})],
+                "{reply:?}: no reconciliation replay"
+            );
+            assert!(
+                effects.is_empty(),
+                "{reply:?}: never redispatch the original app mutation"
+            );
+            assert_unknown(&output, mutation, reply);
+        }
+    }
+    #[test]
+    fn cad2009_hosted_app_effectful_unusable_replies_are_unknown_and_not_replayed() {
+        let fixture = Fixture::new();
+        for mutation in [Mutation::Install, Mutation::Update, Mutation::Revoke] {
+            for reply in [
+                Reply::Dropped,
+                Reply::NonJson,
+                Reply::Truncated,
+                Reply::Oversized,
+                Reply::Redirect,
+                Reply::UnprovedJson,
+                Reply::ProducerUncertain,
+            ] {
+                let (output, effects) = fixture.exercise(mutation, reply);
+                assert_eq!(
+                    effects,
+                    vec![mutation.body()],
+                    "{mutation:?}/{reply:?}: mutation retried or never dispatched"
+                );
+                assert_unknown(&output, mutation, reply);
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_hosted_app_missing_human_issuer_pin_is_definitely_pre_dispatch() {
+        let fixture = Fixture::new();
+        fixture.credential(false);
+        let (output, effects) = fixture.exercise(Mutation::Revoke, Reply::Dropped);
+        assert!(
+            effects.is_empty(),
+            "a locally refused credential dispatched an effect"
+        );
+        assert_eq!(output.status.code(), Some(3));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let start = stderr.find('{').expect("missing local refusal diagnostic");
+        let error: Value = serde_json::from_str(&stderr[start..]).unwrap();
+        assert_eq!(error["kind"], "rejected");
+        assert!(
+            error["error"].as_str().unwrap().contains("issuer"),
+            "wrong local refusal: {error}"
+        );
+    }
+}

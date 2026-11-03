@@ -553,9 +553,11 @@ Notify requires an explicit operation key (1–120 units), text (1–4000 UTF-16
 code units), at most 16 total references (each 1–200 units), and a bounded
 request. Retain its operation ID/receipt. Identical intent under the same
 sender/workspace/audience/key/recipient returns the same notice; changed intent
-under that key conflicts. A missing response means unknown outcome, not a new
-operation. An FYI receipt means **stored**, an event ACK means **native custody**,
-a claim means **claimed**, and only the domain report says **running/result**.
+under that key conflicts. A missing or unproved response is an unknown outcome
+(exit 1), not a new operation. Inspect the same workspace and use only that
+identical operation identity and content for recovery. An FYI receipt means
+**stored**, an event ACK means **native custody**, a claim means **claimed**, and
+only the domain report says **running/result**.
 None proves exactly-once external effects or supplies send/deploy approval.
 
 Sources: [`cli/remote.rs`](../../src/cli/remote.rs),

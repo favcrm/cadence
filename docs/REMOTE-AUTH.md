@@ -294,6 +294,28 @@ The gateway's real refusal shapes (AOS-243):
   workspace before repeating an upload that could add another version. The
   native CLI route's `tracker_unavailable` proof does not apply to this
   separate upload endpoint or wiki uploads.
+- Hosted local-assignment writes use a separate protocol: authorization can be
+  rechecked after a report, claim or reassignment commits. A post-dispatch
+  `401` or `403` therefore does not prove rejection. Inspect `cadence agent
+  status` in the same selected workspace and retain the assignment, claim,
+  generation and operation identifiers before deciding whether to retry.
+- Hosted app release mutations retain the caller's operation UUID. On an
+  unproved response, inspect `app catalog operation` or `reconcile` for that
+  UUID in the same workspace; do not create a new operation blindly.
+- A lost device-token or enrollment response may follow one-time credential
+  issuance. If registration or login receives a session but cannot save it,
+  the CLI reports the issued session and the original authority directory;
+  `register --json` reports `registered: null` when the outcome is unknown.
+  Inspect that directory and consult the issuer owner; a lost secret is not
+  assumed recoverable. An unconfirmed logout keeps the local session and names
+  the exact session for same-session recovery.
+- Publish Web retains its original workspace, request key and intent before
+  dispatch. An unproved upload or action remains unknown; inspect `cadence web
+  status` and reconcile with the original intent, not a different key. A later
+  refusal before dispatch does not settle an earlier uncertain action.
+- A result outbox's `local_pending` state proves local custody only, not remote
+  absence. Inspect the original command and destination before any retry; a
+  remote status or reconciliation route is not assumed to exist.
 - A response whose safe `error.code` is `mutation_outcome_uncertain` or
   `invite_email_uncertain` states that a mutation may already have committed.
   It takes precedence over a contradictory waking marker and is never retried.
@@ -347,11 +369,12 @@ issuer's `invalid_token` (401) and `invalid_grant` (400) ask for a fresh login.
 Any other answer keeps the saved login and the pending operation for a later
 retry, with no consent prompt.
 
-A mutation whose outcome is unknown — a dropped connection after dispatch, a
-`5xx` after forward, or the platform's own `mutation_outcome_uncertain` /
-`invite_email_uncertain` — is never replayed automatically. Reconcile with a
-read (`issue show`, `wiki ls`, `team list`, `team invites`) before repeating
-the write.
+Generic hosted CLI mutations whose outcome is unknown are not replayed
+automatically. Reconcile with a read (`issue show`, `wiki ls`, `team list`,
+`team invites`) before repeating the write. Publish Web action creation is a
+separate idempotent protocol: it may resend the identical body and request key
+once to recover the same action, never a new key. If still unknown, inspect
+the saved intent in the same workspace before deciding what to do.
 
 ### Hosted credential status (CAD-1434)
 

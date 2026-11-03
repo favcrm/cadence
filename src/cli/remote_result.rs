@@ -257,18 +257,24 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
                 )?;
                 if *bind_continuity {
                     let bound = remote_enrollment::bind_browser(enrollment_dir).map_err(|error| {
-                        Error::rejected(format!(
+                        let message = format!(
                             "Browser child enrollment was saved, but continuity did not complete: {error}"
-                        ))
+                        );
+                        if error.kind() == "unknown" {
+                            Error::unknown(message)
+                        } else {
+                            Error::rejected(message)
+                        }
                     })?;
                     if bound.organization_id() != enrolled.organization_id()
                         || bound.audience() != enrolled.audience()
                         || bound.subject_id() != enrolled.subject_id()
                         || bound.agent_id() != enrolled.agent_id()
                     {
-                        return Err(Error::rejected(
-                            "Browser enrollment changed before continuity bind",
-                        ));
+                        return Err(Error::unknown(format!(
+                            "Browser enrollment changed after continuity binding; inspect the original enrollment directory {} before retrying",
+                            enrollment_dir.display()
+                        )));
                     }
                     continuity = Some(json!({"lineage":bound.lineage_id(),
                         "generation":bound.generation(),"state":"locally_bound",

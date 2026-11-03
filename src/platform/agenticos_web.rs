@@ -351,8 +351,7 @@ impl PlatformAdapter for AgenticosWebAdapter {
         true
     }
 
-    /// Plain `execute` has no account, so it cannot select the saved login;
-    /// the gate always calls `execute_for_account` for this adapter.
+    /// Plain `execute` has no account, so it cannot select the saved login.
     fn execute(
         &self,
         _credential: &[u8],
@@ -375,6 +374,18 @@ impl PlatformAdapter for AgenticosWebAdapter {
     ) -> std::result::Result<Value, String> {
         self.run(account, tool, input)
             .map_err(|error| error.to_string())
+    }
+
+    fn execute_for_account_with_outcome(
+        &self,
+        account: &str,
+        _credential: &[u8],
+        tool: &str,
+        input: &Value,
+        _idempotency_key: &str,
+        _expected_hash: Option<&str>,
+    ) -> Result<Value> {
+        self.run(account, tool, input)
     }
 }
 

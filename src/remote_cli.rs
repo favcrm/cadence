@@ -4636,6 +4636,13 @@ pub fn logout(dir: &Path, target: &RemoteTarget) -> Result<i32> {
         .issuer
         .as_deref()
         .ok_or_else(|| reject("renewable session issuer missing"))?;
+    let unknown = || {
+        Error::unknown(format!(
+            "remote revocation of session {} for org {} is unknown; local authority is retained. \
+             Reconcile by retrying `cadence auth logout --org {}` with this same saved session",
+            session.session_id, target.org, target.org
+        ))
+    };
     let (status, body) = crate::remote_enrollment::cli_session_post(
         dir,
         issuer,
@@ -4643,16 +4650,26 @@ pub fn logout(dir: &Path, target: &RemoteTarget) -> Result<i32> {
         &session.refresh_token,
         serde_json::json!({"version":SESSION_VERSION,"session_id":session.session_id}),
         deadline.min(Instant::now() + RENEWAL_WAIT),
-    )?;
+    )
+    .map_err(|error| {
+        if error.kind() == "unknown" {
+            unknown()
+        } else {
+            error
+        }
+    })?;
+    if matches!(status, 400 | 401 | 403) {
+        return Err(reject(
+            "remote device revocation was refused; local authority retained",
+        ));
+    }
     if status != 200
         || !exact_object(&body, &["version", "status", "session_id"])
         || body["version"] != SESSION_VERSION
         || body["status"] != "revoked"
         || body["session_id"] != session.session_id
     {
-        return Err(reject(
-            "remote device revocation was not confirmed; local authority retained",
-        ));
+        return Err(unknown());
     }
     let path = dir.join(format!("cli-{}.json", target.org));
     let meta = fs::symlink_metadata(&path)?;

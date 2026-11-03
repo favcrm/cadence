@@ -26,6 +26,14 @@ pub(super) fn show_register_code(url: &str, code: &str, no_open: bool) -> Result
     open_login_url(url, no_open);
     Ok(())
 }
+fn issued_session_persistence_error(workspace: &str, dir: &Path, error: Error) -> Error {
+    Error::unknown(format!(
+        "a remote session was issued for workspace {workspace}, but local registration \
+         could not be confirmed in {}: {error}. Inspect that directory and \
+         reconcile with the issuer owner before requesting new consent",
+        dir.display()
+    ))
+}
 
 fn show_workspace_handover(slug: &str, stored: &Value, explicit_auth_dir: bool) {
     let selected = stored.get("selected").and_then(Value::as_bool);
@@ -73,8 +81,10 @@ fn report_register_error(error: &Error, json: bool) {
         return;
     }
     print_json(&serde_json::json!({
-        "registered": false,
+        "registered": (error.kind() != "unknown").then_some(false),
         "authenticated": false,
+        "credential_stored": false,
+        "kind": error.kind(),
         "code": error.code(),
         "message": error.to_string()
     }));
@@ -334,6 +344,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 *use_,
                 || grant.save_credential(&dir),
             )
+            .map_err(|error| issued_session_persistence_error(&grant.organization_id, &dir, error))
             .inspect_err(|error| report_register_error(error, *json))?;
             if *json {
                 print_json(&serde_json::json!({
@@ -455,7 +466,10 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 &grant.organization_id,
                 *use_,
                 || grant.save_credential(&dir),
-            )?;
+            )
+            .map_err(|error| {
+                issued_session_persistence_error(&grant.organization_id, &dir, error)
+            })?;
             cadence_agent::output::print_format_line(format_args!(
                 "Signed in to {} ({})",
                 grant.slug, grant.endpoint

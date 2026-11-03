@@ -10,6 +10,7 @@
 //! agents over one authenticated outbound workspace event stream.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -277,6 +278,44 @@ fn attempt_key(issue: &str, action: &str, target: Option<&str>) -> String {
 
 fn assignment_prefix(org: &str) -> String {
     format!("/__platform/hosted-cadence/{org}/local-assignments")
+}
+
+fn assignment_unknown(org: &str, path: &str, body: Option<&Value>) -> Error {
+    let prefix = assignment_prefix(org);
+    let assignment = path
+        .strip_prefix(&prefix)
+        .and_then(|tail| tail.strip_prefix('/'))
+        .and_then(|tail| tail.split('/').next())
+        .filter(|id| prefixed_id(id, "hla_"));
+    let mut message = match assignment {
+        Some(id) => format!("hosted assignment {id} in workspace {org} may have changed"),
+        None => format!("hosted coordination in workspace {org} may have changed"),
+    };
+    for key in ["operation_id", "idempotency_key", "claim_id"] {
+        if let Some(value) = body
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| hosted_id(value))
+        {
+            message.push_str("; ");
+            message.push_str(key);
+            message.push('=');
+            message.push_str(value);
+        }
+    }
+    if let Some(generation) = body
+        .and_then(|value| value.get("expected_generation"))
+        .and_then(Value::as_u64)
+    {
+        write!(&mut message, "; expected_generation={generation}")
+            .expect("writing to a String cannot fail");
+    }
+    message.push_str(
+        "; the outcome is unknown. Inspect `cadence agent status` in the same \
+         selected workspace and reconcile the original assignment and operation \
+         before deciding whether to retry; do not replay blindly",
+    );
+    Error::unknown(message)
 }
 
 fn slug(name: Option<&str>) -> Result<String> {
@@ -783,6 +822,33 @@ impl<H: CoordHttp> Coordinator<H> {
             self.ensure_active()?;
         }
         let reply = self.http.send(method, path, body)?;
+        if method == "POST" {
+            let code = reply.body.get("code").and_then(Value::as_str);
+            return match (reply.status, code) {
+                (200 | 201, _) => Ok(reply.body),
+                (400, Some("invalid_request")) => Err(Error::invalid(
+                    "invalid_request",
+                    "the board refused this request body as invalid; nothing was recorded",
+                )),
+                (404, Some("not_found")) => Err(Error::invalid(
+                    "api_missing",
+                    "the requested hosted assignment was not found",
+                )),
+                (413, Some("payload_too_large")) => Err(Error::invalid(
+                    "payload_too_large",
+                    "the board refused this request body as too large",
+                )),
+                (
+                    409,
+                    Some("idempotency_conflict" | "hosted_execution_unavailable" | "not_claimable"),
+                ) => Err(explain_409(&reply.body)),
+                (409, Some("fenced")) if path.ends_with("/report") => Err(Error::unknown_coded(
+                    "fenced",
+                    assignment_unknown(&self.org_id, path, body).to_string(),
+                )),
+                _ => Err(assignment_unknown(&self.org_id, path, body)),
+            };
+        }
         if (300..400).contains(&reply.status) {
             return Err(Error::invalid(
                 "redirect",
@@ -906,8 +972,14 @@ impl<H: CoordHttp> Coordinator<H> {
             }
             Ok(body)
         })?;
-        let value = self.exchange("POST", &self.base(), Some(&body))?;
-        let assignment = self.parse_owned(&value)?;
+        let path = self.base();
+        let value = self.exchange("POST", &path, Some(&body))?;
+        let assignment = self
+            .parse_owned(&value)
+            .map_err(|_| assignment_unknown(&self.org_id, &path, Some(&body)))?;
+        if assignment.issue_id != issue || assignment.target.as_deref() != target {
+            return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
+        }
         let key = attempt_key(issue, action, target);
         self.with_ledger(|ledger| {
             if let Some(attempt) = ledger.attempts.get_mut(&key) {
@@ -1052,11 +1124,8 @@ impl<H: CoordHttp> Coordinator<H> {
         if let Some(profile) = profile {
             body["profile_id"] = json!(profile);
         }
-        let value = match self.exchange(
-            "POST",
-            &format!("{}/{}/claim", self.base(), assignment.assignment_id),
-            Some(&body),
-        ) {
+        let path = format!("{}/{}/claim", self.base(), assignment.assignment_id);
+        let value = match self.exchange("POST", &path, Some(&body)) {
             Ok(value) => value,
             // A board that predates profile claims refuses the extra field as
             // an invalid body before any effect. The profile is descriptive,
@@ -1074,33 +1143,28 @@ impl<H: CoordHttp> Coordinator<H> {
                     "expected_generation": assignment.generation,
                     "client_agent_id": client_agent_id,
                 });
-                self.exchange(
-                    "POST",
-                    &format!("{}/{}/claim", self.base(), assignment.assignment_id),
-                    Some(&retry),
-                )?
+                self.exchange("POST", &path, Some(&retry))?
             }
             Err(error) => return Err(error),
         };
-        let claimed = self.parse_owned(&value)?;
+        let claimed = self
+            .parse_owned(&value)
+            .map_err(|_| assignment_unknown(&self.org_id, &path, Some(&body)))?;
         if expected_profile
             && profile.is_some_and(|profile| {
                 value.get("profile_id").and_then(Value::as_str) != Some(profile)
             })
         {
-            return Err(Error::rejected(
-                "claim response did not record the profile this claim named",
-            ));
+            return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
         }
         if claimed.assignment_id != assignment.assignment_id
             || claimed.generation != assignment.generation
             || claimed.issue_id != assignment.issue_id
             || claimed.client_agent_id.as_deref() != Some(client_agent_id)
+            || claimed.claim_id.is_none()
             || claimed.state != "running"
         {
-            return Err(Error::rejected(
-                "claim response named a different assignment",
-            ));
+            return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
         }
         // The board's answer is the row this client would run, so its work kind
         // is authoritative here — not only the observation that was claimed.
@@ -1751,17 +1815,20 @@ impl<H: CoordHttp> Coordinator<H> {
             text,
             head,
         )?;
-        match self.exchange(
-            "POST",
-            &format!("{}/{assignment}/report", self.base()),
-            Some(&body),
-        ) {
+        let path = format!("{}/{assignment}/report", self.base());
+        match self.exchange("POST", &path, Some(&body)) {
             Ok(value) => {
-                let reported = self.parse_owned(&value)?;
-                if reported.assignment_id != assignment {
-                    return Err(Error::rejected(
-                        "report response named a different assignment",
-                    ));
+                let reported = self
+                    .parse_owned(&value)
+                    .map_err(|_| assignment_unknown(&self.org_id, &path, Some(&body)))?;
+                if reported.assignment_id != assignment
+                    || reported.claim_id.as_deref() != Some(claim_id)
+                    || reported.generation != generation
+                    || reported.state != state
+                    || text.is_some_and(|text| reported.text.as_deref() != Some(text))
+                    || head.is_some_and(|head| reported.reported_head_sha.as_deref() != Some(head))
+                {
+                    return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
                 }
                 // A resume report replaces the row this client will run, so a
                 // kind it cannot serve must stop it before any worktree.
@@ -1830,6 +1897,11 @@ impl<H: CoordHttp> Coordinator<H> {
                         }
                     }
                     Ok(())
+                })
+                .map_err(|local| {
+                    Error::unknown(format!(
+                        "{error}; local fencing could not be recorded: {local}"
+                    ))
                 })?;
                 Err(error)
             }
@@ -2334,16 +2406,17 @@ impl<H: CoordHttp> Coordinator<H> {
         } else {
             body["target"] = json!(target);
         }
-        let value = self.exchange(
-            "POST",
-            &format!("{}/{assignment}/reassign", self.base()),
-            Some(&body),
-        )?;
-        let updated = self.parse_owned(&value)?;
-        if updated.assignment_id != assignment {
-            return Err(Error::rejected(
-                "reassign response named a different assignment",
-            ));
+        let path = format!("{}/{assignment}/reassign", self.base());
+        let value = self.exchange("POST", &path, Some(&body))?;
+        let updated = self
+            .parse_owned(&value)
+            .map_err(|_| assignment_unknown(&self.org_id, &path, Some(&body)))?;
+        if updated.assignment_id != assignment
+            || generation.checked_add(1) != Some(updated.generation)
+            || target.is_some_and(|target| updated.target.as_deref() != Some(target))
+            || (cancel && updated.state != "cancelled")
+        {
+            return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
         }
         // Reassignment hands this client the row it will start.
         if let Some(refusal) = updated.work_kind_refusal() {
@@ -2762,5 +2835,463 @@ mod assignment_contract_tests {
             .unwrap();
         assert_eq!(error.code(), Some("unsupported_work_kind"));
         assert_eq!(calls.get(), 1, "the reassign was sent before the refusal");
+    }
+}
+
+// Independently authored CAD-2009 acceptance; implementers must not weaken it.
+// Runs only synthetic loopback HTTP through real BoardHttp and Coordinator.
+#[cfg(all(test, unix))]
+mod cad2009_assignment_acceptance {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
+
+    const ORG: &str = "ws_synthetic";
+    const ID: &str = "hla_00000000-0000-4000-8000-000000000001";
+    const CLAIM: &str = "hlc_00000000-0000-4000-8000-000000000002";
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TEXT: &str = "Independent synthetic result";
+
+    #[derive(Clone, Copy, Debug)]
+    enum Mutation {
+        Report,
+        Reassign,
+        Cancel,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum Answer {
+        Lost,
+        Unauthorized,
+        Forbidden,
+        ReloadUnavailable,
+        InvalidJson,
+        Truncated,
+    }
+
+    fn original() -> Value {
+        json!({
+            "version": VERSION, "assignment_id": ID, "organization_id": ORG,
+            "issue_id": "SYN-1", "action": "dispatch", "execution": "local",
+            "state": "running", "generation": 1, "claim_id": CLAIM,
+            "target": "user_target", "created_by_subject_id": "user_caller",
+            "client_agent_id": "local_selected_actor", "guidance": null,
+            "reported_head_sha": null, "text": null
+        })
+    }
+
+    fn committed(mutation: Mutation) -> Value {
+        let mut value = original();
+        match mutation {
+            Mutation::Report => {
+                value["state"] = json!("result");
+                value["text"] = json!(TEXT);
+                value["reported_head_sha"] = json!(SHA);
+            }
+            Mutation::Reassign | Mutation::Cancel => {
+                value["generation"] = json!(2);
+                value["claim_id"] = Value::Null;
+                value["client_agent_id"] = Value::Null;
+                value["state"] = json!(if matches!(mutation, Mutation::Cancel) {
+                    "cancelled"
+                } else {
+                    "queued"
+                });
+                if matches!(mutation, Mutation::Reassign) {
+                    value["target"] = json!("user_next");
+                }
+            }
+        }
+        value
+    }
+
+    #[derive(Debug)]
+    struct Request {
+        method: String,
+        path: String,
+        body: Vec<u8>,
+    }
+
+    fn request(stream: &TcpStream) -> Request {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let fields: Vec<_> = line.split_whitespace().collect();
+        assert_eq!(fields.len(), 3, "invalid synthetic request line");
+        let method = fields[0].to_owned();
+        let path = fields[1].to_owned();
+        let mut length = 0;
+        let mut header_bytes = line.len();
+        loop {
+            line.clear();
+            assert_ne!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "incomplete HTTP headers"
+            );
+            header_bytes += line.len();
+            assert!(header_bytes <= 16_384, "unbounded HTTP headers");
+            if line == "\r\n" {
+                break;
+            }
+            let (name, value) = line.split_once(':').expect("HTTP header");
+            if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse::<usize>().unwrap();
+            }
+            assert!(
+                !name.eq_ignore_ascii_case("transfer-encoding"),
+                "fixture expects ureq's finite JSON body"
+            );
+        }
+        assert!(length <= 8192, "producer request body bound");
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        Request { method, path, body }
+    }
+
+    fn response(mut stream: &TcpStream, status: u16, body: &[u8], length: usize) {
+        write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").unwrap();
+        stream.write_all(body).unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn verify_mutation(request: &Request, mutation: Mutation) {
+        assert_eq!(request.method, "POST");
+        let suffix = if matches!(mutation, Mutation::Report) {
+            "report"
+        } else {
+            "reassign"
+        };
+        assert_eq!(
+            request.path,
+            format!("{}/{ID}/{suffix}", assignment_prefix(ORG))
+        );
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        // Exact current producer keys, not a source-text or error-echo check.
+        let expected = match mutation {
+            Mutation::Report => json!({"version": VERSION, "organization_id": ORG,
+                "expected_generation": 1, "claim_id": CLAIM, "state": "result",
+                "text": TEXT, "reported_head_sha": SHA}),
+            Mutation::Reassign | Mutation::Cancel => {
+                let operation = body["operation_id"].as_str().expect("durable operation id");
+                assert!(!operation.is_empty() && operation.encode_utf16().count() <= 120);
+                let mut expected = json!({"version": VERSION, "organization_id": ORG,
+                    "expected_generation": 1, "operation_id": operation});
+                if matches!(mutation, Mutation::Cancel) {
+                    expected["cancel"] = json!(true);
+                } else {
+                    expected["target"] = json!("user_next");
+                }
+                expected
+            }
+        };
+        assert_eq!(body, expected);
+    }
+
+    struct Fixture {
+        endpoint: String,
+        done: UnixStream,
+        worker: std::thread::JoinHandle<(usize, usize)>,
+    }
+
+    impl Fixture {
+        fn start(mutation: Mutation, answer: Answer, read_only: bool) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let (done, completion) = UnixStream::pair().unwrap();
+            let worker = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut posts = 0;
+                let mut gets = 0;
+                let mut state = original();
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(
+                        !remaining.is_zero(),
+                        "client did not complete bounded fixture work"
+                    );
+                    let mut fds = [
+                        libc::pollfd {
+                            fd: listener.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: completion.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // SAFETY: both descriptors are live and the array is writable for poll.
+                    let ready = unsafe {
+                        libc::poll(
+                            fds.as_mut_ptr(),
+                            2,
+                            remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
+                        )
+                    };
+                    if ready < 0 {
+                        assert_eq!(
+                            std::io::Error::last_os_error().kind(),
+                            std::io::ErrorKind::Interrupted
+                        );
+                        continue;
+                    }
+                    assert!(ready > 0, "fixture deadline elapsed");
+                    // Drain queued requests before honoring completion: a replay is not hidden
+                    // by a racing client return. Every connection closes; there is no pool race.
+                    if fds[0].revents & libc::POLLIN != 0 {
+                        let (stream, _) = listener.accept().unwrap();
+                        let req = request(&stream);
+                        assert!(posts + gets < 8, "automatic replay exceeded fixture budget");
+                        if req.method == "POST" {
+                            posts += 1;
+                            verify_mutation(&req, mutation);
+                            // The independent synthetic producer commits before choosing its
+                            // response. GET below reads this state, not the submitted JSON.
+                            state = committed(mutation);
+                            match answer {
+                                Answer::Lost => {}
+                                Answer::Unauthorized => response(
+                                    &stream,
+                                    401,
+                                    br#"{"ok":false,"code":"unauthorized"}"#,
+                                    34,
+                                ),
+                                Answer::Forbidden => {
+                                    let bytes = br#"{"ok":false,"code":"forbidden"}"#;
+                                    response(&stream, 403, bytes, bytes.len());
+                                }
+                                Answer::ReloadUnavailable => {
+                                    let bytes = br#"{"ok":false,"code":"capability_unavailable"}"#;
+                                    response(&stream, 503, bytes, bytes.len());
+                                }
+                                Answer::InvalidJson => response(&stream, 200, b"{", 1),
+                                Answer::Truncated => response(&stream, 200, b"{", 100),
+                            }
+                        } else {
+                            gets += 1;
+                            assert_eq!(req.method, "GET");
+                            assert_eq!(req.path, assignment_prefix(ORG));
+                            assert!(req.body.is_empty());
+                            if read_only {
+                                let bytes = br#"{"ok":false,"code":"unauthorized"}"#;
+                                response(&stream, 401, bytes, bytes.len());
+                            } else {
+                                let bytes = serde_json::to_vec(
+                                    &json!({"version": VERSION, "assignments": [state.clone()]}),
+                                )
+                                .unwrap();
+                                response(&stream, 200, &bytes, bytes.len());
+                            }
+                        }
+                        stream.shutdown(Shutdown::Both).unwrap();
+                    } else if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                        return (posts, gets);
+                    } else {
+                        panic!("unexpected fixture poll events");
+                    }
+                }
+            });
+            Self {
+                endpoint,
+                done,
+                worker,
+            }
+        }
+
+        fn finish(mut self) -> (usize, usize) {
+            self.done.write_all(b"done").unwrap();
+            self.worker.join().expect("bounded synthetic producer")
+        }
+    }
+
+    struct ObservedHttp {
+        inner: http::BoardHttp,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+    impl CoordHttp for ObservedHttp {
+        fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Reply> {
+            self.calls.lock().unwrap().push(method.to_owned());
+            self.inner.send(method, path, body)
+        }
+    }
+
+    fn coordinator(
+        endpoint: &str,
+        dir: &Path,
+        bearer: String,
+    ) -> (Coordinator<ObservedHttp>, Arc<Mutex<Vec<String>>>) {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let http = http::BoardHttp::from_parts(
+            endpoint.to_owned(),
+            ORG.to_owned(),
+            bearer,
+            dir.to_path_buf(),
+            Some("user_target".into()),
+            Some("https://issuer.board.localhost".into()),
+        );
+        let coord = Coordinator::open(
+            ObservedHttp {
+                inner: http,
+                calls: calls.clone(),
+            },
+            ORG.to_owned(),
+            dir.to_path_buf(),
+            Some("user_target".into()),
+            Some("https://issuer.board.localhost".into()),
+            endpoint.to_owned(),
+        )
+        .unwrap();
+        let assignment = parse_assignment(&original()).unwrap();
+        coord.remember_discovered(&assignment).unwrap();
+        coord.reserve_kickoff(&assignment).unwrap();
+        (coord, calls)
+    }
+
+    fn invoke(coord: &mut Coordinator<ObservedHttp>, mutation: Mutation) -> Result<Value> {
+        match mutation {
+            Mutation::Report => coord.report(ID, "result", Some(TEXT), Some(SHA)),
+            Mutation::Reassign => coord.reassign(ID, Some("user_next"), false),
+            Mutation::Cancel => coord.reassign(ID, None, true),
+        }
+    }
+
+    fn exercise(mutation: Mutation) {
+        for answer in [
+            Answer::Lost,
+            Answer::Unauthorized,
+            Answer::Forbidden,
+            Answer::ReloadUnavailable,
+            Answer::InvalidJson,
+            Answer::Truncated,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let fixture = Fixture::start(mutation, answer, false);
+            let (mut coord, calls) = coordinator(
+                &fixture.endpoint,
+                dir.path(),
+                format!("hct_{}", "a".repeat(43)),
+            );
+            let outcome = invoke(&mut coord, mutation);
+            // Reconcile explicitly by READ in the same workspace, never by replay.
+            let readback = coord.status();
+            let counts = fixture.finish();
+            assert_eq!(
+                counts,
+                (1, 1),
+                "{mutation:?} / {answer:?}: exactly one POST and one explicit GET"
+            );
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec!["POST", "GET"],
+                "no hidden coordinator replay"
+            );
+            // Coordinator::status serializes Assignment::to_json, which adds
+            // profile_id: null; keep the producer wire fixture unchanged.
+            let mut expected_readback = committed(mutation);
+            expected_readback["profile_id"] = Value::Null;
+            assert_eq!(readback.unwrap()["assignments"], json!([expected_readback]));
+            let error = outcome.expect_err("unproved mutation response must not be success");
+            assert_eq!(
+                error.kind(),
+                "unknown",
+                "{mutation:?} / {answer:?}: {error}"
+            );
+            let guidance = error.to_string();
+            let lower = guidance.to_lowercase();
+            assert!(
+                guidance.contains(ORG) && guidance.contains(ID),
+                "reconciliation must pin the same workspace AND assignment: {guidance}"
+            );
+            assert!(
+                lower.contains("check")
+                    || lower.contains("inspect")
+                    || lower.contains("reconcil")
+                    || lower.contains("status"),
+                "missing read/reconciliation direction: {guidance}"
+            );
+            assert!(
+                lower.contains("retry") || lower.contains("replay"),
+                "must warn against blind replay: {guidance}"
+            );
+            for false_claim in [
+                "nothing was recorded",
+                "nothing was stored",
+                "nothing was sent",
+                "not written",
+                "nothing ran locally",
+            ] {
+                assert!(
+                    !lower.contains(false_claim),
+                    "post-commit false certainty: {guidance}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_report_lost_and_postcommit_answers_require_reconciliation() {
+        exercise(Mutation::Report);
+    }
+    #[test]
+    fn cad2009_reassign_lost_and_postcommit_answers_require_reconciliation() {
+        exercise(Mutation::Reassign);
+    }
+    #[test]
+    fn cad2009_cancel_lost_and_postcommit_answers_require_reconciliation() {
+        exercise(Mutation::Cancel);
+    }
+
+    #[test]
+    fn cad2009_assignment_predispatch_credential_refusal_is_not_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Fixture::start(Mutation::Report, Answer::Lost, false);
+        let (mut coord, calls) = coordinator(
+            &fixture.endpoint,
+            dir.path(),
+            "invalid-synthetic-credential".into(),
+        );
+        let outcome = invoke(&mut coord, Mutation::Report);
+        assert_eq!(
+            fixture.finish(),
+            (0, 0),
+            "credential validation must precede HTTP"
+        );
+        assert_eq!(*calls.lock().unwrap(), vec!["POST"]);
+        assert_eq!(
+            outcome.unwrap_err().kind(),
+            "rejected",
+            "a proven local refusal must retain certainty"
+        );
+    }
+
+    #[test]
+    fn cad2009_assignment_readonly_authorization_failure_is_not_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Fixture::start(Mutation::Report, Answer::Unauthorized, true);
+        let (mut coord, calls) = coordinator(
+            &fixture.endpoint,
+            dir.path(),
+            format!("hct_{}", "a".repeat(43)),
+        );
+        let outcome = coord.status();
+        assert_eq!(fixture.finish(), (0, 1));
+        assert_eq!(*calls.lock().unwrap(), vec!["GET"]);
+        assert_eq!(
+            outcome.unwrap_err().kind(),
+            "rejected",
+            "read-only refusal is not an uncertain mutation"
+        );
     }
 }

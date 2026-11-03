@@ -80,11 +80,12 @@ cadence --org <workspace> app catalog reconcile <uuid>
 
 A current owner can discover/reconcile a pending operation even after its creator
 leaves. Recovery observes the native catalog or cancels an undispatched preparation;
-it never repeats a mutation. `prepared`/`dispatched` do not mean executed. Exit 5
-means unresolved; exit 3 means refusal/unavailable. A lost response does not
-authorize retrying with a new UUID. The same operation binds the same actor,
-release, old installation pins, and checked review; changed input conflicts.
-Installation grants no send/deploy, worker registration, or run approval.
+it never repeats a mutation. `prepared`/`dispatched` do not mean executed. An
+unconfirmed mutation exits 1 (unknown); a read reporting an unresolved operation
+exits 5, and a definite refusal exits 3. A lost response does not authorize retrying
+with a new UUID. The same operation binds the same actor, release, old installation
+pins, and checked review; changed input conflicts. Installation grants no
+send/deploy, worker registration, or run approval.
 Native install/run/business records remain native-owned; this is not their migration.
 
 ## Offline byte validation: `cadence app check`

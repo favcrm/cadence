@@ -285,6 +285,28 @@ pub trait PlatformAdapter: Send + Sync {
         Err("this platform has no connected-read door".into())
     }
 
+    /// Preserve a protocol's typed outcome where its adapter can establish one.
+    /// Existing adapters retain their string-error contract.
+    fn execute_for_account_with_outcome(
+        &self,
+        account: &str,
+        credential: &[u8],
+        tool: &str,
+        input: &Value,
+        idempotency_key: &str,
+        expected_hash: Option<&str>,
+    ) -> crate::error::Result<Value> {
+        self.execute_for_account(
+            account,
+            credential,
+            tool,
+            input,
+            idempotency_key,
+            expected_hash,
+        )
+        .map_err(crate::error::Error::internal)
+    }
+
     /// Reviewed discovery metadata. Legacy adapters default unavailable.
     fn connection_descriptor(&self) -> Option<super::connections::ProviderDescriptor> {
         None
