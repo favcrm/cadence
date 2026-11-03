@@ -89,9 +89,18 @@ async function main() {
 
   await mount(true);
   assert(box() !== null, "the composer is on the page");
-  const chip = host.querySelector<HTMLButtonElement>(".master-chips .chip-btn");
-  assert(chip?.disabled === true && !chip.textContent?.includes("▾"), "a hosted model chip is a read-out");
+  assert(host.querySelector(".master-chips .chip-btn") === null, "a hosted board shows no model chip");
   assert(!requests.some((r) => r.includes("/api/master/models")), "a hosted chip reads no model list");
+
+  const about = host.querySelector<HTMLButtonElement>('[aria-label^="About"]');
+  assert(about, "the About button is on the page");
+  await React.act(async () => { about.click(); });
+  await settle();
+  assert(document.body.querySelector("[data-assistant-model]")?.textContent?.includes("deepseek/flash"), "About shows the model");
+  await React.act(async () => {
+    document.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true }) as unknown as Event);
+  });
+  await settle();
 
   await type("/");
   assert(menu().length === 1 && menu()[0].includes("help"), `a hosted menu offers help alone (got ${menu().length})`);

@@ -29,7 +29,7 @@ import { useTranslate } from "../../lib/locale";
 import { sessionKey } from "../../lib/sessionKey";
 import { privateSessionGeneration } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
-import { useQuery } from "../../lib/useResource";
+import { useQuery, useResource } from "../../lib/useResource";
 import type { MasterState } from "../../lib/types";
 import type { ResourceState } from "../../lib/cache";
 import Button from "../../ui/Button";
@@ -291,6 +291,8 @@ function focusables(root: HTMLElement | null): HTMLElement[] {
 }
 
 function AssistantAboutDialog({ actor, onClose }: { actor: AssistantActorValue; onClose: () => void }) {
+  const master = useResource(resources.masterState).data;
+  const model = master?.model_label ?? master?.model;
   const t = useTranslate();
   const titleId = useId();
   const panelRef = useRef<HTMLElement | null>(null);
@@ -396,6 +398,12 @@ function AssistantAboutDialog({ actor, onClose }: { actor: AssistantActorValue; 
             <dt>{t("Belongs to")}</dt>
             <dd>{actor.scope === null ? t("Unavailable") : actor.scope === "workspace" ? t("This workspace") : t("You")}</dd>
           </div>
+          {model && (
+            <div data-assistant-model>
+              <dt>{t("Model")}</dt>
+              <dd className="break-words">{model}</dd>
+            </div>
+          )}
         </dl>
 
         {actor.scope === "personal" ? (
