@@ -720,7 +720,6 @@ pre {
   font-weight: 500;
 }
 .turn-time {
-  margin-left: auto;
   font-family: "IBM Plex Mono", monospace;
 }
 /* The turn's one disclosure: same mechanics as the steps group (the grid
@@ -841,23 +840,16 @@ pre {
 /* The answer: one surface, the Markdown measure, and only the chrome the
    turn owns. Tables wrap inside that measure, a blockquote reads as the
    one staged callout, code and issue links as quiet chips. */
+/* The answer is plain text under the turn head, where the typing row was,
+   so the turn does not change shape when it lands. Failures keep their short
+   tinted bubble (.answer-fail). */
 .answer {
-  display: inline-block;
-  width: fit-content;
+  display: block;
   min-width: 0;
   max-width: min(100%, 40rem);
   margin-top: .25rem;
-  padding: 1.125rem 1.375rem;
-  border-radius: .375rem 1.1rem 1.1rem 1.1rem;
-  background: var(--color-ink-850);
-  border: 0;
   text-align: left;
   overflow-wrap: anywhere;
-}
-/* One short paragraph stays a bubble. A list, table, or second paragraph
-   keeps the reading padding. */
-.answer:not(:has(.answer-body :is(ul, ol, pre, table, blockquote, h1, h2, h3, h4, h5, h6, p ~ p))) {
-  padding: .65rem 1rem;
 }
 .answer-head {
   display: flex;
@@ -970,6 +962,20 @@ pre {
   border: 0;
   background: none;
 }
+/* Fenced code is one surface, not a chip per line. A long block scrolls in
+   place and hands the wheel back to the conversation at its ends. */
+.answer .issue-reader pre code,
+.chat-bubble.issue-reader pre code {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+.answer .issue-reader .codeblock pre,
+.chat-bubble.issue-reader .codeblock pre {
+  max-block-size: 32rem;
+  overscroll-behavior: auto;
+}
 .answer .issue-reader button.lnk {
   display: inline-flex;
   align-items: center;
@@ -999,9 +1005,6 @@ pre {
   width: fit-content;
   max-width: min(100%, 34rem);
   margin-top: .15rem;
-  padding: .65rem .95rem;
-  border-radius: .375rem 1.1rem 1.1rem 1.1rem;
-  background: var(--color-ink-850);
 }
 .typing-step {
   min-width: 0;
@@ -1976,6 +1979,10 @@ pre {
 .chip-btn {
   cursor: pointer;
 }
+/* A status or label in words, not an id: the body face, not the mono. */
+.chip-sans {
+  font-family: inherit;
+}
 .chip-btn:not(:disabled):hover {
   border-color: var(--color-edge-hover);
   color: var(--color-ink-100);
@@ -2337,12 +2344,7 @@ button.project-focus-preview:hover { color: var(--color-accent); }
    at the end of the sheet so it wins against the base prose rules. */
 @media (max-width: 1023.98px) {
   .answer {
-    display: block;
-    width: auto;
     max-width: none;
-    padding: 0;
-    border-radius: 0;
-    background: transparent;
   }
   .chat-bubble.issue-reader,
   .app-chat-list li .chat-bubble.issue-reader:not([data-chat-message="user"] .chat-bubble) {

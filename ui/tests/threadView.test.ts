@@ -305,6 +305,7 @@ for (const density of ["full", "compact"] as const) {
     ok(answerAt >= 0 && complete.indexOf("turn-copy") < answerAt, "turn: Copy is in the head, not on the answer");
     ok(!complete.slice(answerAt).includes("turn-copy"), "turn: the answer bubble has no Copy control");
   }
+  ok(complete.includes(">Thought for 4s<") && !renderTurn(completeItems).includes(">Finished<"), "turn: a timed finish keeps its elapsed title");
   ok(count(complete, "answer-copy") === 0, "turn: no Answer kicker copy");
   ok(complete.includes("<table>") && complete.includes(">PILOT-1<"), "turn: answer Markdown table");
   ok(!complete.includes("| id | title |"), "turn: no literal Markdown pipes");
@@ -319,12 +320,14 @@ for (const density of ["full", "compact"] as const) {
   );
   const running = renderTurn(runningItems, true);
   ok(running.includes('data-turn-state="running"'), "streaming: running state");
-  ok(running.includes("Thinking…"), "streaming: the trace says it is thinking");
+  ok(running.includes(">Working<"), "streaming: the trace title says it is working");
+  ok(running.split("Thinking…").length <= 2, "streaming: Thinking… never appears twice");
   {
     const summaryAt = running.indexOf("turntrace-summary");
     const listAt = running.indexOf("turntrace-list");
     ok(summaryAt >= 0 && listAt > summaryAt, "streaming: the summary sits in the trace head");
-    ok(running.slice(summaryAt, listAt).includes("Bash: cadence board read"), "streaming: the summary is the latest step");
+    ok(running.slice(summaryAt, listAt).includes("Bash"), "streaming: the summary is the latest step");
+    ok(!running.slice(summaryAt, listAt).includes("cadence board read"), "streaming: a tool's arguments stay out of the closed summary");
     ok(!running.slice(summaryAt, listAt).includes("Reading the board"), "streaming: the summary is not the first note");
     const list = running.slice(listAt);
     ok(list.indexOf("Bash: cadence board read") < list.indexOf("Reading the board"), "streaming: the open trace leads with the latest step");
@@ -336,11 +339,11 @@ for (const density of ["full", "compact"] as const) {
   }
   ok(count(running, 'data-kind="typing"') === 1, "streaming: one typing row");
   ok(running.indexOf('data-kind="turn-trace"') < running.indexOf('data-kind="typing"'), "streaming: the typing bubble follows the trace");
-  ok(running.includes("Running Bash: cadence board read"), "streaming: the typing bubble names the latest step");
+  ok(running.includes("Running bash"), "streaming: the typing bubble names the latest step");
   ok(count(running, "<i></i>") === 3, "streaming: exactly three dots");
   ok(!running.includes('data-kind="answer"'), "streaming: no answer body");
   ok(!running.toLowerCase().includes("skeleton"), "streaming: no skeleton");
-  ok(!running.includes("data-assistant-activity") && !running.includes("Working"), "streaming: no status chip");
+  ok(!running.includes("data-assistant-activity") && !running.includes('class="chip'), "streaming: no status chip");
   const initialTyping = renderTurn([], true);
   ok(initialTyping.includes('data-turn-state="running"') && count(initialTyping, 'data-kind="typing"') === 1, "streaming: initial 0-step turn shows typing bubble immediately");
   ok(!initialTyping.includes('data-kind="no-answer"') && !initialTyping.includes('data-kind="turn-trace"'), "streaming: initial 0-step turn has no trace or no-answer line");
@@ -359,10 +362,44 @@ for (const density of ["full", "compact"] as const) {
     const summaryAt = noteAfterTool.indexOf("turntrace-summary");
     const listAt = noteAfterTool.indexOf("turntrace-list");
     ok(summaryAt >= 0 && listAt > summaryAt, "newest note: summary sits in the trace head");
-    ok(noteAfterTool.slice(summaryAt, listAt).includes("Checking the ledger next."), "newest note: the summary names the newer reasoning, not the older tool");
-    ok(!noteAfterTool.slice(summaryAt, listAt).includes("cadence board read"), "newest note: an older tool name does not win the summary");
+    ok(!noteAfterTool.slice(summaryAt, listAt).includes("Checking the ledger next."), "newest note: note text stays out of the closed summary");
+    ok(noteAfterTool.slice(summaryAt, listAt).includes("Bash"), "newest note: the summary still names the tool");
+    ok(!noteAfterTool.slice(summaryAt, listAt).includes("cadence board read"), "newest note: no tool argument in the closed summary");
     const list = noteAfterTool.slice(listAt);
     ok(list.indexOf("Checking the ledger next.") < list.indexOf("cadence board read"), "newest note: the open trace leads with it");
+  }
+
+  // CAD-2013: the chip shows a friendly label, and the raw id stays in its tooltip.
+  {
+    const MasterChips = require("../src/features/home/MasterChips").default;
+    const chip = renderToStaticMarkup(
+      createElement(MasterChips, { master: { model: "live/model-2", model_label: "Live Model 2", live: true }, readOnly: false }),
+    );
+    ok(chip.includes(">Live Model 2") || chip.includes("Live Model 2<"), "chip: the label is what it shows");
+    ok(chip.includes('title="live/model-2 '), "chip: the raw id stays in the tooltip when the session sends a label");
+  }
+
+  // CAD-2013: what the closed summary may never show, and which title a turn earns.
+  {
+    const closed = (html: string) => html.slice(html.indexOf("turntrace-summary"), html.indexOf("turntrace-list"));
+    const ended = (...rows: ThreadEntry[]) => threadItems(state([...rows, agent(90, "turn_result", "Done.")]));
+    const noted = closed(renderTurn(ended(agent(1, "tool_call", "Bash: ls"), agent(2, "assistant_text", "The password in the file is hunter2"))));
+    ok(!noted.includes("hunter2"), "summary: a note's text never reaches it");
+    const paged = renderTurn(ended(agent(1, "tool_result", "Found API KEY in /home/u/.env line 3")));
+    ok(!paged.slice(paged.indexOf("turntrace-title"), paged.indexOf("turntrace-list")).includes("API KEY"), "summary: a result whose call was paged out never reaches it");
+    const pagedRunning = renderTurn(threadItems(state([agent(1, "tool_result", "Found API KEY in /home/u/.env")])), true);
+    ok(!pagedRunning.includes("Running found"), "typing row: tool output is not a tool name");
+    const noSeparator = closed(renderTurn(ended(agent(1, "tool_call", "cat /home/u/.ssh/id_rsa --token=abc123"))));
+    ok(noSeparator.includes("Cat") && !noSeparator.includes("id_rsa") && !noSeparator.includes("abc123"), "summary: only the tool's own word, with no separator to cut at");
+    const several = closed(renderTurn(ended(
+      agent(1, "tool_call", "a_one: x"), agent(2, "assistant_text", "note"), agent(3, "tool_call", "b_two: y"), agent(4, "tool_call", "c_three: z"), agent(5, "tool_call", "d_four: w"), agent(6, "tool_call", "d_four: v"),
+    )));
+    ok(several.includes("D four, C three, B two") && !several.includes("A one"), "summary: three distinct tools across the whole turn, newest first");
+    const notesOnly = renderTurn(threadItems(state([agent(1, "assistant_text", "Only a note"), agent(90, "turn_result", "Done.")])));
+    ok(!notesOnly.includes("turntrace-summary"), "summary: a trace of notes alone has none");
+    ok(renderTurn(threadItems(state([agent(1, "tool_call", "Bash: ls"), agent(90, "turn_result", "Done.")]))).includes(">Finished<"), "title: an untimed turn with an answer finished");
+    ok(!renderTurn(threadItems(state([agent(1, "tool_call", "Bash: ls")]))).includes(">Finished<"), "title: a segment with no answer never claims to have finished");
+    ok(renderTurn(threadItems(state([agent(1, "tool_call", "Bash: ls"), { ...agent(90, "turn_result", ""), payload: { status: "failed", error: "x" } }]))).includes(">Stopped<"), "title: a failed turn stopped");
   }
 
   // A transcript from before `turn_result`: the last worker note reads as the

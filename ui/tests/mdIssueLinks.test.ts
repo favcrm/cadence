@@ -31,7 +31,7 @@ const blocks: Record<string, string> = {
 };
 for (const [name, md] of Object.entries(blocks)) {
   const html = render(md);
-  equal(/<pre><code[^>]*>/.test(html), true, `${name}: renders a code block`);
+  equal(/<pre[^>]*><code[^>]*>/.test(html), true, `${name}: renders a code block`);
   equal(html.includes("CAD-12"), true, `${name}: id is present`);
   equal(linked(html), false, `${name}: no link button`);
   equal(html.includes("["), false, `${name}: no markdown link syntax leaks`);

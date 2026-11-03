@@ -383,6 +383,8 @@ Object.assign(zhTW, {
   "Favorites": "我的最愛",
   "Installed": "已安裝",
   "Version": "版本",
+  "Rendered": "預覽",
+  "View": "檢視",
   "Recently removed": "最近移除",
   "Project apps": "專案應用程式",
   "Needs attention": "需要處理",
@@ -1500,6 +1502,7 @@ Object.assign(zhTW, {
   "The release could not be read.": "未能讀取所選版本。",
   // The worker-transcript turn: one head, one folded trace, the answer surface.
   "Reasoning": "思考",
+  "Finished": "已完成",
   "Thought for": "思考了",
   "Thinking…": "思考中…",
   "Worker note": "工作紀錄",

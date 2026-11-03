@@ -2,7 +2,7 @@
 
 Install public workflow guidance with `cadence skill install company-outputs`, then inspect `cadence skill status` for per-skill file/content/link state. It installs the separate company-outputs workflow and this supporting guidance, not company-private profiles, renderer scripts/images or an agent profile. There is no `agents/profiles/business-analyst/` starter catalog or new profile-based invocation. Guidance is not enforcement or an authority grant. Use already authorised workers by their actual aliases; do not invent profiles, permissions or commands.
 
-The reusable request process belongs to `company-outputs/SKILL.md`: understand/propose/confirm, then execute/author/check. This [`SKILL.md`](SKILL.md) supplies conditional document-operation and safety guidance. Tender analysis and commercial inputs apply only when relevant; nonfinancial work does not require a tender, price book or quotation.
+The reusable request process belongs to `company-outputs/SKILL.md`: find the standard, confirm when the stakes need it, produce and check. This [`SKILL.md`](SKILL.md) supplies conditional document-operation and safety guidance. Tender analysis and commercial inputs apply only when relevant; nonfinancial work does not require a tender, price book or quotation.
 
 Local installation is not access for every actor. Codex can discover the canonical skill directory and Claude/Cursor/Copilot use links; real foreign provider entries are left alone. Native Pi disables skills, confined agents may lack operator-home access and remote workers need an accessible approved copy or supplied task guidance. Do not weaken confinement, alter auth or claim hosted installation. Existing contexts are not silently reloaded.
 

@@ -27,6 +27,7 @@ import {
 import { masterState, operationStatus } from "./master.ts";
 import { defaultModel, meteredBinding, withDefaultModel } from "./model.ts";
 import {
+  companyOutputSkills,
   operationalSkills,
   runtimeHealthSkills,
   runtimeProfile,
@@ -121,7 +122,7 @@ export class HostedSession<
         // the same refusal and live authorization an application tool gets.
         this.registry.install(
           authorizeExtension(
-            await skills([operationalSkills, runtimeHealthSkills]),
+            await skills([operationalSkills, runtimeHealthSkills, companyOutputSkills]),
             authority,
           ),
         );

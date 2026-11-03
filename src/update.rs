@@ -737,25 +737,20 @@ fn fmt_epoch(secs: f64) -> String {
     crate::issue::time::basic(secs as i64)
 }
 
-/// The linked release's version string: the running process's own when
-/// the link points at it, else reconstructed from a verified CI
-/// manifest, else `None` (the caller prints the sha alone).
+/// A release's version string, known only when `sha` is this running
+/// process: a manifest records no version, and the running build's version
+/// says nothing about another commit (CAD-2007). `None`: the caller prints
+/// the sha alone.
 fn version_of(layout: &Layout, sha: &str) -> Option<String> {
     let binary = layout.binary(sha);
-    if let (Ok(me), Ok(target)) = (std::env::current_exe(), std::fs::canonicalize(&binary)) {
-        if std::fs::canonicalize(&me).is_ok_and(|me| me == target) {
-            return Some(format!(
-                "{}+{}",
-                env!("CARGO_PKG_VERSION"),
-                crate::overview::BUILD_COMMIT
-            ));
-        }
-    }
-    let manifest = layout.release_dir(sha).join(upgrade::MANIFEST);
-    let text = std::fs::read_to_string(manifest).ok()?;
-    let manifest: Value = serde_json::from_str(&text).ok()?;
-    (manifest["source_sha"].as_str() == Some(sha))
-        .then(|| format!("{}+{sha}", env!("CARGO_PKG_VERSION")))
+    let me = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
+    (std::fs::canonicalize(&binary).ok()? == me).then(|| {
+        format!(
+            "{}+{}",
+            env!("CARGO_PKG_VERSION"),
+            crate::overview::BUILD_COMMIT
+        )
+    })
 }
 
 /// `cadence update --check`: resolve the newest green main build, the
@@ -878,8 +873,8 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
                  or use `cadence update --rollback` for an intended rollback"
             )),
             Ok(None) | Err(_) => refusals.push(format!(
-                "{builds}: cannot prove target is newer than current: GitHub gave no ancestry \
-                 answer. Refusing rather than guessing — retry or approve a newer staging \
+                "{builds}: cannot prove target is newer than current: the release source gave no \
+                 ancestry answer. Refusing rather than guessing — retry or approve a newer staging \
                  candidate, or use `cadence update --rollback` for an intended rollback"
             )),
         }
@@ -1991,6 +1986,56 @@ mod tests {
         let err = run(&host, &Options::default()).unwrap_err().to_string();
         assert!(err.contains("schema"), "{err}");
         assert!(!host.installed(NEW));
+    }
+
+    /// CAD-2007: a retained manifest proves which commit a binary came
+    /// from, not its version. The running build's own version must never
+    /// be attached to another commit: v0.3.12 printed `0.3.12+059448e7`
+    /// for a commit whose binary reports 0.3.11.
+    #[test]
+    fn a_target_version_is_never_borrowed_from_the_running_build() {
+        let borrowed = format!("{}+{NEW}", env!("CARGO_PKG_VERSION"));
+        let retained = |manifest: Option<&str>| {
+            let host = Host::new(src(NEW, "behind", 33), 33);
+            let dir = host.layout.release_dir(NEW);
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(body) = manifest {
+                std::fs::write(dir.join(upgrade::MANIFEST), body).unwrap();
+            }
+            host
+        };
+        let matching = format!(r#"{{"source_sha":"{NEW}"}}"#);
+        let other = format!(r#"{{"source_sha":"{OLD}"}}"#);
+        for manifest in [
+            Some(matching.as_str()),
+            Some(other.as_str()),
+            Some("not json"),
+            None,
+        ] {
+            let report = check(&retained(manifest)).unwrap();
+            assert_eq!(report.target_version, None, "manifest {manifest:?}");
+            let text = report.lines().join("\n");
+            assert!(!text.contains(&borrowed), "{text}");
+            assert!(
+                report
+                    .lines()
+                    .iter()
+                    .any(|line| line == &format!("available: {NEW}")),
+                "the target must print as its sha alone: {text}"
+            );
+        }
+    }
+
+    /// CAD-2007: the default source is the owned catalogue, which never asks
+    /// GitHub, so a refusal must not name GitHub as the one that failed. A
+    /// build outside the candidate's recorded history reaches this arm.
+    #[test]
+    fn an_unproven_ancestry_refusal_does_not_blame_github() {
+        let mut source = src(NEW, "behind", 33);
+        source.compare = Ok(None);
+        let text = check(&Host::new(source, 33)).unwrap().lines().join("\n");
+        assert!(text.contains("cannot prove target is newer"), "{text}");
+        assert!(!text.contains("GitHub"), "{text}");
     }
 
     #[test]

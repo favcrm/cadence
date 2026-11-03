@@ -193,15 +193,17 @@ docs/       working docs — the context-manifest set stays tracked
 
 For proposals, quotations, reports and letters, give the drafting agent
 [`skills/company-outputs/SKILL.md`](skills/company-outputs/SKILL.md).
-It confirms the proposed solution before authoring, then applies one exact
-Cadence template version: guidelines and reference files for an authoring
-pack, or the existing quotation/invoice DOCX, calculation and export path.
+It finds the company's standard, asks only for what it cannot look up, confirms
+a plan when the stakes need it, and applies one exact Cadence template version:
+guidelines and reference files for an authoring pack, or the quotation/invoice
+calculation and export path. It also covers saving a good result as a template.
 There is no parallel company-profile registry. When a deliverable has a
 visual standard, the skill conditionally loads shared document-design
 guidance: inspect an authoring pack's actual references, keep a short style
-guide in that pack's guidelines, and compare the authored output. A
-quotation or invoice keeps the approved DOCX as its presentation
-standard; a reference pack may inform review only. That guidance
+guide in that pack's guidelines, and compare the authored output. An
+issuable quotation or invoice keeps its approved template as the presentation
+standard, with an HTML view allowed for drafts; a reference pack may inform
+review only. That guidance
 adds no renderer and no PDF service. An authoring pack has no
 DOCX source, prices or PDF export; the user prints or exports the final PDF.
 `cadence skill install` installs

@@ -22,20 +22,37 @@ import { EMPTY_THREAD, applyEarlier, fetchEarlier, reduceFrame, resumeSeq, threa
  * snapshot on every connection makes the bar live before replayed entries;
  * TCP open alone cannot enable actions against a cached previous turn.
  */
+/** A thread stream's link. `connecting` is the first attempt of this
+ *  subscription: it is not live yet, but nothing has gone wrong either. */
+export type StreamLink = "live" | "connecting" | SseErrorState;
+
+/** How long a first attempt may stay silent before it counts as an outage: a
+ *  stream that hangs must not read as healthy forever. */
+const FIRST_CONNECT_GRACE_MS = 5000;
+
 export function useThreadStream(
   store: Resource<ThreadState>,
   url: string | null,
   enabled: boolean,
-  onLink: (state: "live" | SseErrorState) => void,
+  onLink: (state: StreamLink) => void,
   onSnapshot?: () => void,
+  graceMs: number = FIRST_CONNECT_GRACE_MS,
 ): void {
   useEffect(() => {
     if (!enabled || url === null) {
       onLink("live");
       return;
     }
-    onLink("reconnecting");
+    onLink("connecting");
     let active = true;
+    // Until this subscription has been live or has failed, an open is still
+    // its first attempt, not a reconnect.
+    let settled = false;
+    const grace = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      onLink("reconnecting");
+    }, graceMs);
     const sub = streamInto(store, (data, event) => {
       if (event.type === "master") {
         const snapshot = JSON.parse(event.data) as MasterState;
@@ -56,6 +73,8 @@ export function useThreadStream(
           resources.masterState.write(() => snapshot);
         }
         onSnapshot?.();
+        settled = true;
+        clearTimeout(grace);
         onLink("live");
         return data ?? EMPTY_THREAD;
       }
@@ -76,13 +95,15 @@ export function useThreadStream(
       // resuming below them would re-request the same hidden page on every
       // (re)connect.
       lastEventId: String(resumeSeq(store.get().data) ?? 0),
-      onOpen: () => onLink("reconnecting"),
+      onOpen: () => onLink(settled ? "reconnecting" : "connecting"),
       onError: (state) => {
+        settled = true;
+        clearTimeout(grace);
         onLink(state);
         if (state === "stopped") void store.refresh();
       },
     });
-    return () => { active = false; sub.close(); };
+    return () => { active = false; clearTimeout(grace); sub.close(); };
     // Both callbacks are stable at the call sites; the stream must not
     // reopen when a parent re-renders.
     // eslint-disable-next-line react-hooks/exhaustive-deps

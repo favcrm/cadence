@@ -247,6 +247,16 @@ export function turnState(
   return { kind: "idle" };
 }
 
+/** The header's word for an agent state when this surface has no turn of its
+ *  own. `running` is a live session with nothing to do, which is how a hosted
+ *  board reports itself between turns; `busy` is real work elsewhere. A state
+ *  not listed here returns null: it is shown as it is, never as healthy. */
+export function restingStatus(state: string): "Available" | "Working" | null {
+  if (state === "idle" || state === "running") return "Available";
+  if (state === "busy") return "Working";
+  return null;
+}
+
 // ---- CAD-574: the model/effort dropdowns ----
 
 import type { MasterModels } from "../../lib/types";

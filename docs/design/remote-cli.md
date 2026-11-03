@@ -127,7 +127,8 @@ login. Two consequences:
 ## Verb allowlist (v1)
 
 Reads: `issue ls`, `issue show`, `issue history`, `agent list`,
-`agent show`, `message read`, `message inbox`, `team list`, `status`.
+`agent show`, `message read`, `message inbox`, `team list`,
+`issue project ls`, `status`.
 Writes shipped by CAD-1179: `issue new`, `issue comment`, `issue set`
 (frontmatter fields only — status/priority/owner/component/title/tags/
 type/milestone/size; body edits are not part of the field vocabulary).
@@ -143,7 +144,33 @@ Human Owner only (`role_at_issue=owner` and `principal_kind=user`); a
 member or an owner-role agent is refused before a write. The native policy
 commit records `Actor: users/<handle>` from that verified Owner, not the
 container's ambient alias. Local CLI writes retain their existing actor
-resolution. `issue project add` and `issue project ls` stay local.
+resolution. `issue project add` and `issue project set-remote` stay local.
+CAD-1999: `project new` maps to `project_new` (cli.write, live human owner
+only) and `issue project ls` maps to `project_ls` (cli.read). A hosted
+project exists before any ticket does — the tenant board keeps its own
+registry, and `project_ls` also reports the projects that exist only as
+their tickets' key (for those, `name` is the key). `project_new` arguments
+are exactly `{key, name, prefix?}`: `key` is 1-32 lowercase letters, digits
+or hyphens, `name` is the required human label (1-200 bytes, kept distinct
+from the key), and `prefix` is the issue-id prefix (1-16 letters/digits
+starting with a letter; upper-cased; derived from the key when absent —
+letters/digits, up to 16, starting with a letter, else `ISSUE`; a local
+project keeps its own 1-8 character default of the key's first three
+letters/digits). The body is `{project: {key, name, prefix, issues},
+duplicate}`; repeating the same key, name and prefix is the same project
+(`duplicate: true`), while a key already registered — or already present
+only as its tickets' project — with a different name or prefix is `409
+project_exists`, and a prefix another project already uses is `409
+prefix_conflict`. Nothing is renamed or deleted remotely. A `project_new`
+answer that is lost, unparsable (empty, 204, non-JSON), missing the
+requested project (a `null`, `{ok:true}` or foreign body), carrying a
+missing, invalid or different issue-id prefix, or a 5xx naming no
+pre-forward state is `outcome_unknown`:
+reconcile with `issue project ls` before repeating, since the same key, name
+and prefix is the same project. `issue ls --project <key>` now crosses the
+wire (the route filters one key; a repeated flag refuses) and reads an empty
+registered project as an empty list. `issue project add` still cannot
+register a repo or components remotely.
 `message send`/`send` (CAD-1568) map to `message_send` (cli.write):
 a durable coordination enqueue to the hosted master for a verified human
 workspace owner. The recipient fence is the canonical `master` agent
@@ -229,10 +256,18 @@ actor); `issue set` without a nonempty `--if-rev`, with `--force` (the hosted
 route accepts no force field), or naming more than
 one ticket (revisions are per-ticket — the hosted route checks it under
 the tracker lock via `set_fields_if_rev`, and a stale token answers the
-conflict payload rather than writing). `project_policy` is not retried
-after a refusal, a conflict, or an ambiguous failure — the same wake-only
-retry as the other writes. A malformed project key is rejected by the
-tracker key grammar before any path join. Remote `send`/`message send`
+conflict payload rather than writing). `project_new` refuses `--repo`,
+`--goal`, `--agent` and `--issue` (they register a checkout and seed a
+PROJECT.md a hosted org has no path to) and requires a nonempty `--name` of
+at most 200 bytes; a managed caller (`CADENCE_ALIAS`/grant-bound) refuses
+before the request, because a project create is the live owner's own act and
+the stored login is not an agent's to spend. `issue project ls` refuses
+`--sort`/`--limit`/`--fields` (the route returns the registry as it is), and
+`issue ls` refuses more than one `--project` (the route filters a single key).
+`project_policy` is not retried after a refusal, a conflict, or an ambiguous
+failure — the same wake-only retry as the other writes. A malformed project
+key is rejected by the tracker key grammar before any path join. Remote
+`send`/`message send`
 without `--message`, or with `--ready`/`--force`, `--nudge`,
 `--priority`/`--supersedes`, `--reply-to` or `--task` (local-endpoint,
 steering and routing surfaces a remote caller cannot carry) refuse before

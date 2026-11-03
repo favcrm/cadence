@@ -173,10 +173,12 @@ pub(crate) enum AuditAction {
     /// so the join is the evidence. `--project` is required: a repo never
     /// selects a project. A hosted verb: a local org has no attestations and
     /// refuses rather than answering an empty list.
+    #[command(subcommand_negates_reqs = true)]
     Reviewers {
-        /// Project key whose eligibility map is read.
-        #[arg(long)]
-        project: String,
+        /// Project key whose eligibility map is read. Required unless a
+        /// subcommand is given: `set` names its own (CAD-2005).
+        #[arg(long, required = true)]
+        project: Option<String>,
         #[command(subcommand)]
         action: Option<ReviewersAction>,
     },
@@ -458,7 +460,7 @@ pub(super) fn reviewer_subjects(rows: &[String]) -> Result<Vec<String>> {
                  Nothing was sent"
             )));
         }
-        if subject.is_empty() || subject.chars().any(char::is_control) {
+        if subject.is_empty() || subject.chars().any(|c| c.is_control() || c.is_whitespace()) {
             return Err(Error::usage(format!(
                 "--reviewer {row:?} is not a workspace principal id; nothing was sent"
             )));

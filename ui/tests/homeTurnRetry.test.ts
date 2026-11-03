@@ -29,6 +29,28 @@ const Home = require<typeof HomeModule>("../src/features/home/Home").default;
 const { LocaleProvider } = require<typeof Locale>("../src/lib/locale");
 const { resources } = require<typeof Stores>("../src/lib/resources");
 const { setImmediate: nextTurn } = require<{ setImmediate: () => Promise<void> }>("node:timers/promises");
+// CAD-2012: history must never carry the rise-in class, not even on the first
+// loaded render, whose class a later render removes before any DOM read.
+const classesEverSet: string[] = [];
+{
+  const proto = win.Element.prototype as unknown as { setAttribute(name: string, value: string): void };
+  const setAttribute = proto.setAttribute;
+  proto.setAttribute = function (name: string, value: string) {
+    if (name === "class") classesEverSet.push(String(value));
+    return setAttribute.call(this, name, value);
+  };
+  const className = Object.getOwnPropertyDescriptor(win.Element.prototype, "className");
+  if (className?.set) {
+    const set = className.set;
+    Object.defineProperty(win.Element.prototype, "className", { ...className, set(value: string) { classesEverSet.push(String(value)); set.call(this, value); } });
+  }
+}
+// A stream that has opened but has not yet sent its first frame.
+let holdStream = false;
+// What the state read answers, when a case needs it to agree with the stream.
+let servedState: unknown = null;
+// What a hosted board's state read answers while a case holds its working flag.
+let hostedStateRead: unknown = null;
 const posts: Record<string, unknown>[] = [];
 // The stream's own master frame: the fixture emits it on open, so a turn the
 // test wants the stream to report must be in this object, not only the store.
@@ -44,7 +66,10 @@ const entries: ThreadEntry[] = [{ seq: 1, role: "operator", kind: "message", mes
 const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { "Content-Type": "application/json" } });
 globalThis.fetch = async (input, init) => {
   const url = new URL(String(input), "http://localhost");
-  if (url.pathname.endsWith("/stream")) return streamFixture(url.href, streamMaster as never, init?.signal);
+  if (url.pathname.endsWith("/stream")) {
+    if (holdStream) return new Response(new ReadableStream<Uint8Array>({ start(controller) { init?.signal?.addEventListener("abort", () => controller.close(), { once: true }); } }), { headers: { "Content-Type": "text/event-stream" } });
+    return streamFixture(url.href, streamMaster as never, init?.signal);
+  }
   if (url.pathname === "/api/threads/master/messages") {
     posts.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
     return json({ message: posts.at(-1)?.message, state: "queued", duplicate: false });
@@ -53,7 +78,9 @@ globalThis.fetch = async (input, init) => {
     commands.push(JSON.parse(String(init?.body)) as { command?: string; message?: string });
     return json({ ok: true, state: "stopped" });
   }
+  if (url.pathname === "/api/master/state" && hostedStateRead !== null) return json(hostedStateRead);
   if (url.pathname === "/api/threads/master") return json({ thread: { id: "home-thread", alias: "master" }, entries, more_before: false });
+  if (url.pathname === "/api/master/state" && servedState !== null) return json(servedState);
   if (url.pathname === "/api/master/state") return json({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] });
   if (url.pathname === "/api/agents") return json({ daemon: "reachable", agents: [{ alias: "master", state: "idle" }], totals: null });
   if (url.pathname === "/api/meta") return json({ operator: true, read_only: false });
@@ -75,6 +102,7 @@ async function main() {
     await settle();
   };
   await render(false);
+  assert(!classesEverSet.some((value) => value.includes("msg-in")), "stored history does not rise in on the first loaded render");
   entries.push({ seq: 2, role: "agent", kind: "turn_result", message: "turn-b", text: "Turn B failed", created: new Date().toISOString(), payload: { status: "failed", error: "Turn B failed" } });
   await React.act(async () => {
     resources.masterThread.write((state) => ({ ...state!, entries: [...entries], pending: [{ message: "transport-a", text: "Do not retry A", state: "failed", at: 1, refs: [{ kind: "issue", id: "CAD-A" }], attachments: [{ id: "file-a" }], conversation: "other-home" }] }));
@@ -231,7 +259,7 @@ async function main() {
   await settle();
   assert(face.isConnected, "the assistant face stays mounted when the tool call lands");
   const bubble = host.querySelector('[data-kind="typing"]');
-  assert(bubble !== null && bubble.textContent?.includes("Running Bash: cadence board read") === true, "the typing bubble names the tool now running");
+  assert(bubble !== null && bubble.textContent?.includes("Running bash") === true, "the typing bubble names the tool now running");
   const trace = host.querySelector('[data-kind="turn-trace"]');
   assert(
     trace !== null && (bubble.compareDocumentPosition(trace) & Node.DOCUMENT_POSITION_PRECEDING) !== 0,
@@ -392,6 +420,94 @@ async function main() {
   await settle();
   assert(host.querySelectorAll('[data-kind="typing"]').length === 0, "the typing bubble clears once the send settles out of submitting");
 
+  // CAD-2011: a hosted board reports its running turn with no message id and
+  // its agent rows carry none either. That is still one live turn: no second
+  // head, no finished look, and no interim note promoted to an answer.
+  const hostedState = (turn: unknown) => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "cadence", endpoint_kind: "durable_object", live: true, turn, queue: [] }) as never;
+  const hostedTurn = { state: "working", message: null, conversation: "home-thread", app_origin: null, summary: null, since: null };
+  await React.act(async () => {
+    resources.masterState.write(() => hostedState(hostedTurn));
+    resources.masterThread.write((state) => ({
+      ...state!,
+      pending: [],
+      entries: [
+        { seq: 70, role: "operator", kind: "message", message: "ui-hosted", text: "Hosted ask" },
+        { seq: 71, role: "agent", kind: "tool_call", text: "catalog_search: website" },
+        { seq: 72, role: "agent", kind: "tool_result", text: "ok" },
+        { seq: 73, role: "agent", kind: "assistant_text", text: "Checking drafts as well" },
+      ],
+    }));
+  });
+  await settle();
+  assert(host.querySelectorAll(".turn-head").length === 1, `a hosted working turn paints one head (got ${host.querySelectorAll(".turn-head").length})`);
+  const hostedHead = host.querySelector(".turn-head");
+  assert(host.querySelector('[data-kind="turn"]')?.getAttribute("data-turn-state") === "running", "the hosted run paints as running, not finished");
+  assert(host.querySelectorAll('[data-kind="typing"]').length === 1, "the hosted run has one typing row");
+  assert(host.querySelector('[data-kind="answer"]') === null && !host.textContent?.includes("Earlier transcript"), "an interim note stays in the trace while the hosted turn runs");
+  // The answer usually arrives a read before the working flag clears.
+  hostedStateRead = hostedState(hostedTurn);
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [...state!.entries, { seq: 74, role: "agent", kind: "turn_result", text: "Hosted answer" }],
+    }));
+  });
+  await settle();
+  assert(host.querySelectorAll(".turn-head").length === 1, `no second head while the flag catches up (got ${host.querySelectorAll(".turn-head").length})`);
+  hostedStateRead = null;
+  await React.act(async () => { resources.masterState.write(() => hostedState(null)); });
+  await settle();
+  assert(host.querySelectorAll(".turn-head").length === 1 && host.querySelectorAll('[data-kind="answer"]').length === 1, "the answer lands under the one head");
+  assert(host.querySelector(".turn-head") === hostedHead, "the answer lands under the same head, not a remounted one");
+
+
+  // CAD-2012: reloading during a running turn is a first connection, not an
+  // outage: no banner at any point, and Stop only once the stream is live.
+  await React.act(async () => { root.render(null); });
+  await settle();
+  const runningState = { alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: { state: "working", message: "turn-b", conversation: "home-thread" }, queue: [] };
+  streamMaster.turn = runningState.turn;
+  await React.act(async () => { resources.masterState.write(() => runningState as never); });
+  classesEverSet.length = 0;
+  holdStream = true;
+  servedState = runningState;
+  await render(false);
+  assert(host.querySelector('[aria-label="Stop this turn"]') === null, "no Stop until the stream has proved the turn is current");
+  assert(host.querySelector('[data-kind="typing"], [data-kind="turn"]') !== null, "the reloaded thread is painted");
+  assert(!classesEverSet.some((value) => value.includes("streambanner")), "reloading mid-turn shows no reconnecting banner");
+  assert(!host.textContent?.includes("reconnecting…"), "reloading mid-turn shows no reconnecting text in the header");
+  assert(!classesEverSet.some((value) => value.includes("msg-in")), "reloaded history does not rise in");
+  holdStream = false;
+  await React.act(async () => { root.render(null); });
+  await settle();
+  await render(false);
+  assert(host.querySelector('[aria-label="Stop this turn"]') !== null, "Stop returns once the stream is live");
+  holdStream = true;
+  // A queued message's Cancel waits for the same proof.
+  await React.act(async () => { root.render(null); });
+  await settle();
+  const queuedState = { ...runningState, turn: null, queue: [{ message: "turn-b", conversation: "home-thread" }] };
+  const publishQueued = async () => {
+    await React.act(async () => {
+      resources.masterState.write(() => queuedState as never);
+      resources.masterThread.write((state) => ({ ...state!, entries: [...entries], pending: [] }));
+    });
+    await settle();
+  };
+  const cancelNow = () => Array.from(host.querySelectorAll<HTMLButtonElement>("button")).some((button) => button.textContent === "Cancel");
+  streamMaster.turn = null;
+  streamMaster.queue = queuedState.queue;
+  servedState = queuedState;
+  await render(false);
+  await publishQueued();
+  assert(host.querySelector('[data-turn-bar][data-state="queued"]') !== null, "the queued message is what the bar is showing");
+  assert(!cancelNow(), "no Cancel until the stream has proved the queue is current");
+  await React.act(async () => { root.render(null); });
+  await settle();
+  holdStream = false;
+  await render(false);
+  await publishQueued();
+  assert(cancelNow(), "Cancel returns once the stream is live");
 
   await React.act(async () => { root.unmount(); });
   await win.happyDOM.close();
