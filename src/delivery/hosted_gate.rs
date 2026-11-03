@@ -831,7 +831,9 @@ const VERDICT_KINDS: [&str; 6] = [
 /// one document shape from both origins. The binding is part of the evidence:
 /// a row whose repo is not the requested one, whose `reviewer_id` or
 /// `github_login` is empty, or whose login is not a GitHub login, proves
-/// nothing and refuses the whole answer.
+/// nothing and refuses the whole answer. A `workflow-oidc` row (CAD-2081) is
+/// the one shape with no login; it carries its run fields instead. Whether its
+/// principal may count is the gate's allowlist, not this reader's.
 fn verdict_entry(row: &Value, repo: &str, verb: &str) -> Result<Value> {
     let kind = row_text(row, "kind", verb)?;
     if !VERDICT_KINDS.contains(&kind) {
@@ -846,28 +848,65 @@ fn verdict_entry(row: &Value, repo: &str, verb: &str) -> Result<Value> {
             short(row)
         )));
     }
-    let login = row_text(row, "github_login", verb)?;
-    if !valid_login(login) {
-        return Err(refuse(format!(
-            "`{verb}` row names github_login {login:?}, which is not a GitHub login"
-        )));
-    }
+    // CAD-2081: where the reviewer identity came from. The row contract is the
+    // tenant's `projectVerdictEntry`; this is its one reader. A row without the
+    // field is an owner-attested one, as before.
+    let identity_source = match row.get("identity_source") {
+        None | Some(Value::Null) => "owner-attested",
+        Some(Value::String(s)) if s == "owner-attested" || s == "workflow-oidc" => s.as_str(),
+        Some(other) => {
+            return Err(refuse(format!(
+                "`{verb}` row names identity_source {}",
+                short(other)
+            )))
+        }
+    };
+    let workflow = identity_source == "workflow-oidc";
+    let login = if workflow {
+        // A workflow principal is not a person: it has no login, and a row
+        // that names one is contradicting itself.
+        if row.get("github_login").is_some_and(|v| !v.is_null()) {
+            return Err(refuse(format!(
+                "`{verb}` workflow row names a github_login: {}",
+                short(row)
+            )));
+        }
+        None
+    } else {
+        let login = row_text(row, "github_login", verb)?;
+        if !valid_login(login) {
+            return Err(refuse(format!(
+                "`{verb}` row names github_login {login:?}, which is not a GitHub login"
+            )));
+        }
+        Some(login)
+    };
     let risk = row["risk"]
         .as_str()
         .ok_or_else(|| refuse(format!("`{verb}` row has no risk: {}", short(row))))?;
-    Ok(json!({
+    let mut entry = json!({
         "name": row_text(row, "name", verb)?,
         "stamp": row_text(row, "stamp", verb)?,
         "reviewer": row_text(row, "reviewer", verb)?,
         "reviewer_id": row_text(row, "reviewer_id", verb)?,
-        "github_login": login,
         "repo": repo,
         "kind": kind,
         "outcome": row_text(row, "outcome", verb)?,
         "title_outcome": row_text(row, "title_outcome", verb)?,
         "section_outcome": row_text(row, "section_outcome", verb)?,
         "risk": risk,
-    }))
+        "identity_source": identity_source,
+    });
+    if let Some(login) = login {
+        entry["github_login"] = json!(login);
+    }
+    if workflow {
+        // The run that filed it, so the evidence names a job, not just a name.
+        for field in ["run_id", "run_attempt", "workflow_sha", "jti"] {
+            entry[field] = json!(row_text(row, field, verb)?);
+        }
+    }
+    Ok(entry)
 }
 
 /// The answer must be a hosted document about exactly this project, issue,

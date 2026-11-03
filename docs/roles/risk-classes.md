@@ -10,7 +10,7 @@ Goal: autonomous delivery. Routine PRs merge without a human; only substantial c
 5. **Size or contention:** more than 1500 changed lines (excluding fixtures and lockfile churn), a third review round, or an unresolved reviewer–author disagreement.
 6. **Outward or fleet-wide actions** (see also `docs/CHARTER.md` non-goals): releases, tags, repo settings, anything posted publicly other than the PR merge itself; a `daemon restart` that is not `--when-idle`; killing processes cadence did not start; any `--force`.
 
-7. **The rules and the gates themselves:** `docs/roles/*`, `docs/CHARTER.md`, `cadence-review.toml`, `src/review.rs`, `scripts/**`, and any change to who approves what, to a gate, or to this file. A PR that rewrites the rules can never approve itself. Scripts stay human by default; the only path exceptions are in [Script allowlist (auto-eligible)](#script-allowlist-auto-eligible).
+7. **The rules and the gates themselves:** `docs/roles/*`, `docs/CHARTER.md`, `cadence-review.toml`, `src/review.rs`, `scripts/**`, and any change to who approves what, to a gate, or to this file. `docs/roles/review-workflow-principals.toml` is the allowlist of workflow review principals the gate counts (CAD-2081); it is read from the PR's base, so a PR can never add its own reviewer. A PR that rewrites the rules can never approve itself. Scripts stay human by default; the only path exceptions are in [Script allowlist (auto-eligible)](#script-allowlist-auto-eligible).
 
 ### Script allowlist (auto-eligible)
 

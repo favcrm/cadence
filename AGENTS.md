@@ -132,7 +132,20 @@ the code you just wrote.
   neither head binding nor that Browser QA ran. A verdict filed under the
   author's identity still refuses under the exception, so a same-login
   session posts its findings as a PR comment and files no verdict. A second
-  attested human is not required. A workflow-issued reviewer identity is a proposal, not shipped.
+  attested human is not required.
+- **Workflow-issued reviews (CAD-2081).** The gate also counts a hosted row whose
+  `identity_source` is `workflow-oidc`, but only when its principal is in
+  `docs/roles/review-workflow-principals.toml` read from the PR's base and the
+  row's kind is the one kind that principal may fill; an unlisted principal, a
+  wrong kind or a non-pass row refuses and counts for nothing. Such a row has no
+  login, so the author-login checks do not apply to it. Standards plus
+  Spec/security from the two workflow principals satisfy the two-review
+  requirement. This proves a fresh GitHub-hosted job ran workflow code that was
+  on `main`, filed for the head that was live; it does not prove good judgement
+  or resistance to a prompt injected through the diff, and a session holding
+  admin can still rewrite the workflow or sign directly until agents lose admin.
+  There is no Browser QA workflow: a `ui/` PR still needs a Browser QA verdict
+  from a session, and refuses without it. The exception path is unchanged.
 - One fresh-session review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
   path that does not (trust boundary, identity, secrets, `ui/**`) needs

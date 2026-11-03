@@ -78,6 +78,18 @@ advisory links, standards and spec-security, plus browser-qa for a `ui/`
 change; ends at `EXCEPTION_ENDS` in
 `scripts/delivery-gate`, 2026-11-10).
 
+CAD-2081: the gate also counts a hosted row with `identity_source:
+"workflow-oidc"` (run fields `run_id`, `run_attempt`, `workflow_sha`, `jti`; no
+`github_login`). Such a row counts only when its `reviewer_id` is listed in
+`docs/roles/review-workflow-principals.toml` at the PR's base with the row's
+kind, and a workflow row that is not a pass always refuses. `identity_source`
+alone is never enough. This proves a fresh runner executed trusted workflow code
+and filed for a live head; it does not prove the quality of the review, and a
+session holding admin can still tamper until agents lose admin. Browser QA has no
+workflow, so a `ui/` change still needs that verdict from a session. The row
+shape is written by the tenant (`projectVerdictEntry`) and read in one place,
+`verdict_entry` in `src/delivery/hosted_gate.rs`.
+
 The document says where it came from (AOS-473): `origin` is `local` for the
 note parse and `hosted` for the org's record, and the merge gate applies the
 attested rule only to `hosted`. A hosted read takes `--project` and `--repo`

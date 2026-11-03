@@ -98,6 +98,10 @@ DEFAULT_NOTES_DIR = "/var/www/agent-notes"
 GATE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "delivery-gate")
 DEFAULT_GATE_KEY = "~/.config/cadence/delivery-gate/signing_key"  # CAD-1925
 ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
+# CAD-2081: the workflow principals whose rows count without a login, and the one
+# kind each may fill. Read at the PR's base, like the lists above.
+WORKFLOW_PRINCIPALS_FILE = "docs/roles/review-workflow-principals.toml"
+WORKFLOW_KINDS = ("standards", "spec-security")
 # The review standard is a fresh-session review (AGENTS.md "Review", CAD-1946), which
 # this gate cannot yet enforce. Refusals for a missing or shared reviewer point at
 # the temporary exception and the standard.
@@ -647,6 +651,49 @@ def read_identities():
             f"{detail}" + stale_cli_hint(detail))
 
 
+def workflow_principals(toml_text):
+    """`principal -> kind` from the allowlist text, or None when it is missing or
+    malformed. An entry for any kind but a Standards or Spec/security review is
+    malformed, so one bad line fails the whole list closed."""
+    if toml_text is None:
+        return None
+    try:
+        table = tomllib.loads(toml_text)["principals"]
+    except (tomllib.TOMLDecodeError, KeyError, TypeError):
+        return None
+    if not isinstance(table, dict) or not all(
+            isinstance(k, str) and k and v in WORKFLOW_KINDS for k, v in table.items()):
+        return None
+    return dict(table)
+
+
+def is_workflow_row(n):
+    return n.get("identity_source") == "workflow-oidc"
+
+
+def workflow_reason(n, hosted):
+    """Why a workflow-issued row cannot count, or "" when it can (CAD-2081).
+
+    `identity_source` is only a claim. The row counts when its PRINCIPAL is in
+    the allowlist read from the PR's base and the kind is the one that
+    principal may fill. It has no login, so no login-based check applies."""
+    principal = (n.get("reviewer_id") or "").strip()
+    allowed = hosted.get("workflow_principals")
+    if allowed is None:
+        return (f"workflow verdict {n['name']} cannot count: cannot read "
+                f"{WORKFLOW_PRINCIPALS_FILE} at the base (fail closed)")
+    if (n.get("repo") or "").strip().lower() != hosted["repo"].lower():
+        return (f"workflow verdict {n['name']} cannot count: it names repo "
+                f"{n.get('repo')!r}, not the PR's repo {hosted['repo']}")
+    if principal not in allowed:
+        return (f"workflow verdict {n['name']} cannot count: principal {principal or '(none)'} is "
+                f"not in {WORKFLOW_PRINCIPALS_FILE} at the base")
+    if n["kind"] != allowed[principal]:
+        return (f"workflow verdict {n['name']} cannot count: principal {principal} may file only "
+                f"{allowed[principal]}, not {n['kind']}")
+    return ""
+
+
 def reviewer_key(v, hosted):
     """The identity a verdict counts as. A hosted row counts the attested
     principal (`reviewer_id`), never the login string: two logins for one
@@ -738,8 +785,9 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
         for n in notes:
             if n["outcome"] == "pass":
                 continue
-            if n["stamp"] and any(p["stamp"] > n["stamp"] for p in passes):
-                continue  # superseded by a later pass of this reviewer
+            if (n["stamp"] and not is_workflow_row(n)
+                    and any(p["stamp"] > n["stamp"] for p in passes)):
+                continue  # superseded by a later pass of this reviewer; a workflow row is final
             why = "" if n["stamp"] else "; the file name has no stamp, so it cannot be ordered"
             reasons.append(
                 f"verdict by {who or '(no reviewer)'} on this head is not a pass "
@@ -781,7 +829,20 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
                 f"hosted verdict {n['name']} has no reviewer_id to count by" if hosted is not None
                 else f"verdict note has no 'From:' reviewer: {n['name']}")
             continue
-        if hosted is not None:
+        if hosted is not None and (is_workflow_row(n) or who in (hosted.get("workflow_principals") or {})):
+            # CAD-2081: a workflow row skips the login-based checks because it has no
+            # login. The allowlisted principal is the identity, so a row from it that
+            # does not say it came from the workflow is refused, not counted by login.
+            if not is_workflow_row(n):
+                reasons.append(f"verdict {n['name']} names workflow principal {who} but is not a "
+                               "workflow-issued row; it counts for nothing")
+                continue
+            why = workflow_reason(n, hosted)
+            if why:
+                reasons.append(why)
+            else:
+                counted.append(n)
+        elif hosted is not None:
             unbound = unbound_reason(n, hosted)
             if unbound:
                 reasons.append(unbound)
@@ -814,6 +875,8 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
         # satisfy no count at all.
         by_login = {}
         for n in counted:
+            if is_workflow_row(n):
+                continue  # no login, so no person to share a slot
             by_login.setdefault((n.get("github_login") or "").strip().lower(), set()).add(identity(n))
         shared = {login: ids for login, ids in by_login.items() if len(ids) > 1}
         if shared:
@@ -843,7 +906,8 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
         if std and spec and not two:
             reasons.append(f"the Standards and Spec/security verdicts come from the same reviewer; two distinct reviewers are required{REVIEW_STANDARD_HINT}")
     if need_qa and not by("browser-qa"):
-        reasons.append(f"a ui/ change needs a pass Browser QA verdict for {issue} pinned to this head, from someone other than the author")
+        reasons.append(f"a ui/ change needs a pass Browser QA verdict for {issue} pinned to this head, from someone other than the author; "
+                       "the review workflows file only Standards and Spec/security, so they cannot supply it")
     return reasons, counted
 
 
@@ -1289,6 +1353,11 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     report.append("reviews required: " + ("one (diff is on the one-review list)" if one else "two (Standards and Spec/security)"))
     need_qa = any(p.startswith("ui/") for p in paths)
 
+    # CAD-2081: the workflow principals, read at the PR's base like the list above.
+    rc, wf_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                          f"repos/{repo}/contents/{WORKFLOW_PRINCIPALS_FILE}?ref={base_oid}"])
+    wf_principals = workflow_principals(wf_text if rc == 0 and base_oid else None)
+
     # Ticket and verdicts.
     m = re.match(r"\s*([A-Z][A-Z0-9]*-\d+)\b", view.get("title") or "")
     issue = m.group(1) if m else None
@@ -1382,17 +1451,20 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             # is the owner's, and the CAD-1946 exception needs no verdicts, so a
             # caller with nothing to count is never refused over it.
             identities = {}
-            if verdicts:
+            # CAD-2081: workflow rows have no login to resolve, so a document of
+            # only those needs no read of the owner's map.
+            if any(not is_workflow_row(v) for v in verdicts):
                 try:
                     identities = read_identities()
                 except RuntimeError as e:
                     reasons.append(str(e))
             hosted = {"repo": repo, "project": hosted_project,
                       "author_login": author_login,
-                      "author_principal": identities.get(author_login.lower(), "")}
+                      "author_principal": identities.get(author_login.lower(), ""),
+                      "workflow_principals": wf_principals}
             report.append(f"verdict origin: hosted ({repo}, project {hosted_project}); "
                           "counting attested principals")
-            if verdicts:
+            if any(not is_workflow_row(v) for v in verdicts):
                 report.append("PR author principal: "
                               + (hosted["author_principal"]
                                  or f"unattested ({author_login or 'no login'})"))
@@ -1641,7 +1713,58 @@ def self_test():
         return {"repo": "o/r", "project": "p", "author_login": author_login,
                 "author_principal": author_principal}
 
+    def wrow(name, principal, kind, outcome="pass"):
+        r = row(name, principal, None, kind, outcome)
+        del r["github_login"]
+        r.update({"reviewer": principal, "identity_source": "workflow-oidc", "run_id": "1",
+                  "run_attempt": "1", "workflow_sha": "a" * 40, "jti": "j" * 12})
+        return r
+
+    wf = {"svc_std": "standards", "svc_spec": "spec-security"}
+
+    def hosted_wf(**kw):
+        h = hosted("author", "usr_author")
+        h["workflow_principals"] = kw.get("allow", wf)
+        return h
+
+    # Workflow cases carry no login and need no author principal.
+    wf_cases = [
+        ("two allowlisted workflow rows count",
+         [wrow("s.md", "svc_std", "standards"), wrow("p.md", "svc_spec", "spec-security")],
+         False, None, 2),
+        ("an unlisted principal refuses and counts for nothing",
+         [wrow("s.md", "svc_std", "standards"), wrow("p.md", "svc_other", "spec-security")],
+         False, "not in docs/roles/review-workflow-principals.toml", 1),
+        ("a listed principal on the wrong kind refuses",
+         [wrow("s.md", "svc_std", "spec-security"), wrow("p.md", "svc_spec", "spec-security")],
+         False, "may file only standards", 1),
+        ("identity_source on an unlisted principal does not count",
+         [wrow("c.md", "svc_forged", "combined")], True, "not in docs/roles", 0),
+        ("an unreadable allowlist refuses every workflow row",
+         [wrow("s.md", "svc_std", "standards"), wrow("p.md", "svc_spec", "spec-security")],
+         False, "cannot read docs/roles", 0),
+        ("a listed principal without identity_source counts for nothing",
+         [dict(row("s.md", "svc_std", "someone", "standards"))], True, "not a workflow-issued row", 0),
+        ("a workflow revise refuses",
+         [wrow("s.md", "svc_std", "standards"), wrow("p.md", "svc_spec", "spec-security", "revise")],
+         False, "is not a pass", 1),
+        ("a workflow revise is not superseded by a later pass",
+         [wrow("s.md", "svc_std", "standards", "revise"),
+          dict(wrow("t.md", "svc_std", "standards"), stamp="20261103-000100"),
+          wrow("p.md", "svc_spec", "spec-security")],
+         False, "is not a pass", 2),
+        ("one workflow principal cannot be both reviews",
+         [wrow("s.md", "svc_std", "standards"), wrow("p.md", "svc_std", "spec-security")],
+         False, "may file only standards", 1),
+        ("a ui/ change still needs Browser QA after two workflow passes",
+         [wrow("s.md", "svc_std", "standards"), wrow("p.md", "svc_spec", "spec-security")],
+         False, "Browser QA", 2, True),
+    ]
+    owner_row = row("o.md", "usr_other", "reviewer")
+
     cases = [
+        ("an owner-attested row is unaffected by the allowlist",
+         hosted_wf(), owner_row, None),
         ("same principal under another login refuses",
          hosted("author", "usr_author"), row("a.md", "usr_author", "author2"),
          "not independent"),
@@ -1660,6 +1783,17 @@ def self_test():
             detail = "; ".join(reasons) or f"counted {len(counted)}"
         else:
             ok = bool(reasons) and not counted and any(expected in r for r in reasons)
+            detail = "; ".join(reasons) or "no refusal"
+        print(f"{'ok  ' if ok else 'FAIL'} {label}: {detail}")
+        failures += 0 if ok else 1
+    for label, rows, one, expected, n_counted, *qa in wf_cases:
+        h = hosted_wf(allow=None if "unreadable" in label else wf)
+        reasons, counted = check_reviews(rows, one, bool(qa), {"author"}, "CAD-1", h)
+        if expected is None:
+            ok = not reasons and len(counted) == n_counted
+            detail = "; ".join(reasons) or f"counted {len(counted)}"
+        else:
+            ok = any(expected in r for r in reasons) and len(counted) == n_counted
             detail = "; ".join(reasons) or "no refusal"
         print(f"{'ok  ' if ok else 'FAIL'} {label}: {detail}")
         failures += 0 if ok else 1
