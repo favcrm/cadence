@@ -493,36 +493,39 @@ fn board_gate_refused(body: Option<&Value>) -> bool {
         == Some("board")
 }
 
-/// A 5xx that follows a possible commit, for a mutation. Three answers prove
-/// the call ran before the verb: a worker `state` (`waking`, `wake_failed`,
-/// `board_unreachable`, `runtime_unavailable`), the board's own gate refusal,
-/// and a `501 not_implemented` for a verb the tenant does not serve. The
-/// platform's explicit uncertainty codes (`mutation_outcome_uncertain`,
-/// `invite_email_uncertain`) keep their own decoded message, which names the
-/// code. Every other 5xx may hide a committed write behind an unanswerable
-/// reply, so the outcome is unknown — never availability ("retry later").
-fn post_forward_failure(status: u16, body: Option<&Value>) -> bool {
-    status >= 500
-        && status != 501
-        && body.and_then(|b| b["state"].as_str()).is_none()
-        && !board_gate_refused(body)
-        && !tracker_unavailable_before_verb(body)
-        && !matches!(
-            refusal_fields(body).0,
-            Some("mutation_outcome_uncertain" | "invite_email_uncertain")
-        )
+/// The explicitly uncertain answers take precedence over any wake hint: a
+/// contradictory response cannot prove the write was not forwarded.
+fn explicit_mutation_uncertainty(body: Option<&Value>) -> Option<&str> {
+    match refusal_fields(body).0 {
+        Some(code @ ("mutation_outcome_uncertain" | "invite_email_uncertain")) => Some(code),
+        _ => None,
+    }
 }
 
-/// A `503 tracker_unavailable` is the native route's `pm_at` refusal: the
-/// tracker is opened before any verb runs (`src/ui/cli_route.rs:360`), and the
-/// only other emitter in this build is the `issue_history` log read
-/// (`:552`). A write that answers it therefore proves nothing was attempted.
-/// The hosted relay forwards to that same route and the tenant uses its own
-/// `capability_unavailable`, so the code cannot arrive post-effect here; a
-/// future transport that reused it after forwarding would need this exclusion
-/// removed.
-fn tracker_unavailable_before_verb(body: Option<&Value>) -> bool {
-    refusal_fields(body).0 == Some("tracker_unavailable")
+/// Only the documented 503 waking response proves a worker has not forwarded
+/// the call. Other state strings and statuses do not establish that boundary.
+fn worker_waking(status: u16, body: Option<&Value>) -> bool {
+    status == 503
+        && body.and_then(|b| b["state"].as_str()) == Some("waking")
+        && explicit_mutation_uncertainty(body).is_none()
+}
+
+/// A 5xx after a possible commit is unknown unless the response proves it
+/// preceded the write. The native CLI tracker's refusal is such proof only
+/// for the CLI route, not for the separate wiki upload endpoint.
+fn post_forward_failure(status: u16, body: Option<&Value>, cli_route: bool) -> bool {
+    status >= 500
+        && status != 501
+        && !worker_waking(status, body)
+        && !board_gate_refused(body)
+        && !(cli_route && tracker_unavailable_before_verb(status, body))
+        && explicit_mutation_uncertainty(body).is_none()
+}
+
+/// The native CLI route opens its tracker before executing a verb and answers
+/// HTTP 503 `tracker_unavailable` when that open fails.
+fn tracker_unavailable_before_verb(status: u16, body: Option<&Value>) -> bool {
+    status == 503 && refusal_fields(body).0 == Some("tracker_unavailable")
 }
 
 /// A usable success body for a write is a JSON object: every hosted mutation
@@ -3335,6 +3338,9 @@ fn upload_artifact_in(
         }
         let (status, retry_after, body) =
             artifact_upload_once(target, &cred, upload, &request_id, deadline)?;
+        if explicit_mutation_uncertainty(body.as_ref()).is_some() {
+            return Err(artifact_outcome_unknown());
+        }
         if status == 501 || (status == 404 && body.is_none()) {
             return Err(reject(artifact_tenant_too_old(
                 "artifact put",
@@ -3345,8 +3351,7 @@ fn upload_artifact_in(
         // A board gate or the documented waking response is pre-forward.
         // Other 5xx replies may hide a committed upload; the native CLI
         // tracker's refusal codes do not prove anything for this endpoint.
-        let pre_forward = board_gate_refused(body.as_ref())
-            || (status == 503 && body.as_ref().and_then(|b| b["state"].as_str()) == Some("waking"));
+        let pre_forward = board_gate_refused(body.as_ref()) || worker_waking(status, body.as_ref());
         if status >= 500 && !pre_forward {
             return Err(artifact_outcome_unknown());
         }
@@ -3582,14 +3587,18 @@ fn upload_file_in(
             expected.get_or_insert_with(|| (Sha256::digest(bytes), bytes.len() as u64));
         let (status, retry_after, body) =
             upload_once(target, &cred, logical_path, file_name, bytes, deadline)?;
+        if let Some(code) = explicit_mutation_uncertainty(body.as_ref()) {
+            return Err(upload_outcome_unknown(&format!(
+                "the relay reported {code}"
+            )));
+        }
         // A refusal names the status and the contract's error code only: the
         // raw body could carry anything, so it is never echoed.
         let conflict = status == 409 && body.as_ref().is_some_and(|b| b.get("conflict").is_some());
         // The upload is a mutation: a 5xx with no pre-forward proof, or a 2xx
         // without an object receipt, may follow a stored blob. Its outcome is
         // unknown — the caller lists the parent path before uploading again.
-        // A `state`, the board's gate refusal and a 501 stay pre-effect.
-        let after_forward = post_forward_failure(status, body.as_ref());
+        let after_forward = post_forward_failure(status, body.as_ref(), false);
         let unusable_success = (200..300).contains(&status) && !is_object_body(body.as_ref());
         if !(200..300).contains(&status) && status != 503 && !conflict {
             // CAD-1434: the gateway envelope is `{ok:false,error:{code}}`; the
@@ -5036,6 +5045,16 @@ fn call_verb_until_retry(
         }
         let (status, retry_after, body) =
             call_once(target, &cred, surface, verb, &arguments, deadline)?;
+        if effect.is_mutation() {
+            if let Some(code) = explicit_mutation_uncertainty(body.as_ref()) {
+                return Err(Error::unknown(format!(
+                    "the remote action may already have committed \
+                     (outcome_unknown, HTTP {status}, reason {code}); {}. \
+                     Nothing was retried; saved credentials are kept",
+                    effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+                )));
+            }
+        }
         let platform_operation = (verb == "platform_call")
             .then(|| arguments.get("operation").and_then(Value::as_str))
             .flatten();
@@ -5197,16 +5216,16 @@ fn call_verb_until_retry(
         // A 5xx with no pre-forward proof may come from the platform *after*
         // the mutation was attempted: the write may have landed behind an
         // unanswerable reply, so it is an unknown outcome, never availability
-        // ("retry later") and never a refusal. A worker `state`, the board's
-        // gate refusal and a 501 not-implemented are proven pre-effect and
-        // keep their own verdict; the platform's explicit uncertainty codes
-        // keep their decoded message, which names the code.
-        let after_forward = effect.is_mutation() && post_forward_failure(status, body.as_ref());
+        // ("retry later") and never a refusal. Only a documented waking
+        // response, the board's gate refusal, a CLI tracker refusal or a
+        // 501 not-implemented are treated as pre-effect.
+        let after_forward = effect.is_mutation()
+            && post_forward_failure(status, body.as_ref(), matches!(surface, Surface::Cli));
         // A funded platform call may still be in progress or uncertain on
         // a same-key replay; preserve its dedicated reconciliation guidance.
         let platform_outcome_unknown = platform_operation == Some("call")
             && !board_gate_refused(body.as_ref())
-            && !tracker_unavailable_before_verb(body.as_ref())
+            && !tracker_unavailable_before_verb(status, body.as_ref())
             && ((status == 409
                 && matches!(
                     refusal_code.as_deref(),

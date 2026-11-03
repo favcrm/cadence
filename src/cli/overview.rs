@@ -23,10 +23,10 @@ pub(super) fn run_overview(
         let view = cadence_agent::overview::overview_with(state_dir, &pm_dir, &opts)
             .map_err(Error::rejected)?;
         if json {
-            println!(
-                "{}",
-                cadence_agent::output::observation_body(&view, watch.is_some())?
-            );
+            let body = cadence_agent::output::observation_body(&view, watch.is_some())?;
+            if !cadence_agent::output::stream_line(&body) {
+                return Ok(0);
+            }
         } else {
             print_overview(&view);
         }

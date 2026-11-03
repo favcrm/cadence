@@ -2959,6 +2959,112 @@ fn cad2009_tracker_unavailable_before_write_is_definite() {
     assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
 }
 
+// CAD-2009: independently authored by the fresh-session Standards reviewer.
+#[test]
+fn cad2009_unproved_issue_write_5xx_markers_are_unknown_without_replay() {
+    let args = json!({"id": "SYN-1", "body": "Synthetic guard acceptance"});
+    for (status, body) in [
+        (503, json!({"state": "mystery"})),
+        (500, json!({"state": "waking"})),
+        (
+            500,
+            json!({"ok": false, "error": {"code": "tracker_unavailable"}}),
+        ),
+    ] {
+        let (result, requests) = run(
+            vec![(status, "", body.clone())],
+            "issue_comment",
+            args.as_object().unwrap().clone(),
+            10,
+        );
+        let error = result.expect_err("an unproved 5xx cannot confirm a write or its refusal");
+        assert_eq!(error.kind(), "unknown", "HTTP {status} {body}: {error}");
+        let text = error.to_string();
+        assert!(text.contains("issue show"), "HTTP {status} {body}: {text}");
+        assert!(
+            !text.contains("retry later"),
+            "HTTP {status} {body}: {text}"
+        );
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "HTTP {status} {body}: an unproved write must not be replayed"
+        );
+    }
+}
+
+// The recognized pre-forward wake keeps its authorized retry and fresh envelope.
+#[test]
+fn cad2009_proven_issue_write_wake_still_retries_to_correlated_success() {
+    let args = json!({"id": "SYN-1", "body": "Synthetic guard acceptance"});
+    let receipt = json!({
+        "issue": {"id": "SYN-1"},
+        "comment": {"body": "Synthetic guard acceptance"}
+    });
+    let (result, requests) = run(
+        vec![
+            (503, "", json!({"state": "waking", "retry_after_s": 0})),
+            (200, "", receipt.clone()),
+        ],
+        "issue_comment",
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    assert_eq!(
+        result.expect("a proven pre-forward wake may retry"),
+        receipt
+    );
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 2);
+    assert_eq!(hits(&requests, "/__platform/cli/authorize"), 2);
+    let envelopes: Vec<&str> = requests
+        .iter()
+        .filter(|request| request["path"] == json!("/__platform/cli/call"))
+        .map(|request| request["body"]["envelope"].as_str().unwrap())
+        .collect();
+    assert_ne!(
+        envelopes[0], envelopes[1],
+        "a wake retry must mint a fresh envelope"
+    );
+}
+
+// CAD-2009: independently authored by the fresh-session Standards reviewer.
+#[test]
+fn cad2009_explicit_issue_write_uncertainty_overrides_a_wake_hint() {
+    let args = json!({"id": "SYN-1", "body": "Synthetic uncertainty acceptance"});
+    let receipt = json!({
+        "issue": {"id": "SYN-1"},
+        "comment": {"body": "Synthetic uncertainty acceptance"}
+    });
+    let (result, requests) = run(
+        vec![
+            (
+                503,
+                "",
+                json!({
+                    "state": "waking",
+                    "retry_after_s": 0,
+                    "error": {"code": "mutation_outcome_uncertain"}
+                }),
+            ),
+            // A forbidden replay gets a valid answer so the failure is bounded.
+            (200, "", receipt),
+        ],
+        "issue_comment",
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "explicit mutation uncertainty must prevent a wake replay"
+    );
+    let error = result.expect_err("explicit mutation uncertainty cannot confirm a comment");
+    assert_eq!(error.kind(), "unknown", "{error}");
+    let text = error.to_string();
+    assert!(text.contains("issue show"), "{text}");
+    assert!(!text.contains("retry later"), "{text}");
+}
+
 #[test]
 fn cad2009_upload_receipts_bind_destination_and_bytes() {
     let digest = Sha256::digest(b"abc");

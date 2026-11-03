@@ -266,25 +266,27 @@ pub(crate) fn resume_sweep(state_dir: &Path, aliases: &[String]) -> Value {
     for alias in aliases {
         let r = resume_one(state_dir, alias);
         if r["resumed"].as_bool() == Some(true) {
-            eprintln!("resume {alias}: up");
+            cadence_agent::output::eprint_format_line(format_args!("resume {alias}: up"));
             resumed.push(r);
         } else if r["skipped"].is_string() {
-            eprintln!(
+            cadence_agent::output::eprint_format_line(format_args!(
                 "resume {alias}: skipped ({})",
                 r["skipped"].as_str().unwrap_or("")
-            );
+            ));
             skipped.push(r);
         } else if r["fenced"].as_bool() == Some(true) {
-            eprintln!(
+            cadence_agent::output::eprint_format_line(format_args!(
                 "resume {alias}: FENCED — {}",
                 r["hint"]
                     .as_str()
                     .unwrap_or("reconcile its unknown messages")
-            );
+            ));
             fenced.push(r);
         } else {
             let reason = r["error"].as_str().unwrap_or("unknown");
-            eprintln!("resume {alias}: FAILED — {reason}");
+            cadence_agent::output::eprint_format_line(format_args!(
+                "resume {alias}: FAILED — {reason}"
+            ));
             failed.push(r);
         }
     }
@@ -375,17 +377,24 @@ pub(crate) fn stop_group(state_dir: &Path, group: &str) -> Result<i32> {
         if is_inbox {
             // A closed stderr must not abort the sweep and report success:
             // the remaining agents would stay running.
-            eprint_line(&format!("stop {alias}: skipped (inbox — durable mailbox)"));
+            cadence_agent::output::eprint_format_line(format_args!(
+                "stop {alias}: skipped (inbox — durable mailbox)"
+            ));
             skipped.push(json!({"alias": alias}));
             continue;
         }
         match client::rpc(state_dir, "agent_stop", json!({"alias": alias})) {
             Ok(r) => {
-                eprintln!("stop {alias}: {}", r["state"].as_str().unwrap_or("ok"));
+                cadence_agent::output::eprint_format_line(format_args!(
+                    "stop {alias}: {}",
+                    r["state"].as_str().unwrap_or("ok")
+                ));
                 stopped.push(json!({"alias": alias, "state": r["state"]}));
             }
             Err(e) => {
-                eprintln!("stop {alias}: FAILED — {e}");
+                cadence_agent::output::eprint_format_line(format_args!(
+                    "stop {alias}: FAILED — {e}"
+                ));
                 failed.push(json!({"alias": alias, "error": e.to_string()}));
             }
         }

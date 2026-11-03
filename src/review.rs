@@ -1848,10 +1848,13 @@ pub fn run(opts: &Options) -> Result<i32> {
     });
 
     if opts.json {
-        println!("{}", crate::output::json_text(&report)?);
+        crate::output::print_line(&crate::output::json_text(&report)?);
     } else {
-        println!("report: {}", md_path.display());
-        println!("verdict: {verdict} — {}", reasons.join("; "));
+        crate::output::print_format_line(format_args!("report: {}", md_path.display()));
+        crate::output::print_format_line(format_args!(
+            "verdict: {verdict} — {}",
+            reasons.join("; ")
+        ));
     }
     Ok(if merge_restore_error.is_some() {
         2

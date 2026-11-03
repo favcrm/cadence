@@ -12,13 +12,17 @@ mod issues;
 mod providers;
 
 pub(super) fn show_login_code(url: &str, code: &str, no_open: bool) -> Result<()> {
-    eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
+    cadence_agent::output::eprint_format_line(format_args!(
+        "Approve hosted Cadence access at: {url}\nCode: {code}"
+    ));
     open_login_url(url, no_open);
     Ok(())
 }
 
 pub(super) fn show_register_code(url: &str, code: &str, no_open: bool) -> Result<()> {
-    eprintln!("Complete registration and approve this CLI at: {url}\nDevice code: {code}");
+    cadence_agent::output::eprint_format_line(format_args!(
+        "Complete registration and approve this CLI at: {url}\nDevice code: {code}"
+    ));
     open_login_url(url, no_open);
     Ok(())
 }
@@ -68,15 +72,12 @@ fn report_register_error(error: &Error, json: bool) {
     if !json {
         return;
     }
-    println!(
-        "{}",
-        serde_json::json!({
-            "registered": false,
-            "authenticated": false,
-            "code": error.code(),
-            "message": error.to_string()
-        })
-    );
+    print_json(&serde_json::json!({
+        "registered": false,
+        "authenticated": false,
+        "code": error.code(),
+        "message": error.to_string()
+    }));
 }
 
 /// Open one server-selected browser URL through the host opener. The URL
@@ -109,14 +110,14 @@ pub(crate) fn run() -> Result<i32> {
     // CAD-1432: the master's help is bounded and refuses malformed or
     // disallowed forms with a usage error, so it runs before the others.
     if let Some(text) = help::master_help(&argv) {
-        print!("{}", text?);
+        cadence_agent::output::print_text(&text?);
         return Ok(0);
     }
     // CAD-1432: the master never gets the unfiltered legacy help; its
     // leading-global or aliased help forms fall through to the Clap parser.
     if !cadence_agent::master::caller_is_master() {
         if let Some(text) = help::help_section(&argv) {
-            print!("{text}");
+            cadence_agent::output::print_text(&text);
             return Ok(0);
         }
     }
@@ -335,23 +336,20 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             )
             .inspect_err(|error| report_register_error(error, *json))?;
             if *json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "registered": true,
-                        "authenticated": true,
-                        "slug": grant.slug,
-                        "endpoint": grant.endpoint,
-                        "organization_id": grant.organization_id,
-                        "expires_at": grant.expires_at,
-                        "credential_stored": true
-                    })
-                );
+                print_json(&serde_json::json!({
+                    "registered": true,
+                    "authenticated": true,
+                    "slug": grant.slug,
+                    "endpoint": grant.endpoint,
+                    "organization_id": grant.organization_id,
+                    "expires_at": grant.expires_at,
+                    "credential_stored": true
+                }));
             } else {
-                println!(
+                cadence_agent::output::print_format_line(format_args!(
                     "Registered and signed in to {} ({})",
                     grant.slug, grant.endpoint
-                );
+                ));
                 show_workspace_handover(&grant.slug, &stored, auth_dir.is_some());
             }
             return Ok(0);
@@ -458,7 +456,10 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 *use_,
                 || grant.save_credential(&dir),
             )?;
-            println!("Signed in to {} ({})", grant.slug, grant.endpoint);
+            cadence_agent::output::print_format_line(format_args!(
+                "Signed in to {} ({})",
+                grant.slug, grant.endpoint
+            ));
             show_workspace_handover(&grant.slug, &stored, auth_dir.is_some());
             return Ok(0);
         }

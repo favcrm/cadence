@@ -680,6 +680,11 @@ probes use bounded deadlines.
 hosted answers and offline result receipts. Raw text and byte streams retain
 their own formats.
 
+Audit, review and runner reports retain their command's result when a consumer
+closes stdout or stderr. Event and job-event followers stop reading when an
+output write finds a closed consumer. An unconverted output panic cannot
+prove an interrupted command succeeded, so its fallback is nonzero.
+
 With `--watch`, machine mode writes one compact JSON value per line and
 no terminal-control bytes, including when `CADENCE_JSON=pretty`. A
 terminal watch without JSON still redraws the table in place.

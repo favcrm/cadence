@@ -188,9 +188,7 @@ pub(super) fn print_json(
         let k = r.class.clone().unwrap_or_else(|| "unknown".into());
         by_class[k] = json!(by_class[&k].as_u64().unwrap_or(0) + 1);
     }
-    println!(
-        "{}",
-        crate::output::json_text(&json!({
+    crate::output::print_json(&json!({
             "schema": "cadence.audit/1",
             "repo": repo.display().to_string(),
             "default_ref": default_ref,
@@ -210,9 +208,7 @@ pub(super) fn print_json(
                 },
                 "by_class": by_class,
             },
-        }))
-        .unwrap_or_default()
-    );
+    }));
 }
 
 pub(super) fn render_text(

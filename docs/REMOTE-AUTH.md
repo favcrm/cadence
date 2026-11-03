@@ -275,8 +275,10 @@ The gateway's real refusal shapes (AOS-243):
   object, or whose bare `5xx` lacks proof of a pre-forward refusal is
   `outcome_unknown`. This includes hosted issue, wiki, team, settings and
   audit mutations. A response can be lost after a write committed. A
-  pre-forward state marker, a board-gate refusal, or `501` remains a refusal;
-  checked `409` conflicts still mean not written.
+  documented `503` waking response, a board-gate refusal, the native CLI
+  route's `503 tracker_unavailable`, or `501` remains pre-effect; checked
+  `409` conflicts still mean not written. Other state strings and a waking
+  marker on a different status do not prove the call was unforwarded.
 - An issue, wiki upload, team, settings, delivery or audit receipt that fails
   the operation's correlation checks is also `outcome_unknown`, not proof
   that nothing was recorded. Team and settings writes require a receipt
@@ -291,10 +293,10 @@ The gateway's real refusal shapes (AOS-243):
   A lost or unproved answer is unknown: inspect `artifact find` in the same
   workspace before repeating an upload that could add another version. The
   native CLI route's `tracker_unavailable` proof does not apply to this
-  separate upload endpoint.
-- A `503` whose safe `error.code` is `mutation_outcome_uncertain` or
-  `invite_email_uncertain` is the platform stating that a mutation may already
-  have committed. It is its own category, not availability.
+  separate upload endpoint or wiki uploads.
+- A response whose safe `error.code` is `mutation_outcome_uncertain` or
+  `invite_email_uncertain` states that a mutation may already have committed.
+  It takes precedence over a contradictory waking marker and is never retried.
 
 | Category | When | Next action |
 | --- | --- | --- |

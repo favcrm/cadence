@@ -74,9 +74,14 @@ fn call(
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(wake_timeout))
         .ok_or_else(|| refuse("invalid wake timeout"))?;
-    match crate::remote_cli::call_verb(target, verb, args, deadline, wake_timeout, |line| {
-        eprintln!("{line}")
-    })? {
+    match crate::remote_cli::call_verb(
+        target,
+        verb,
+        args,
+        deadline,
+        wake_timeout,
+        crate::output::eprint_line,
+    )? {
         RemoteAnswer::Ok(body) => Ok(body),
         RemoteAnswer::Conflict(body) => Err(refuse(format!(
             "`{verb}` answered a conflict: {}",

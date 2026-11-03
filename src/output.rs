@@ -99,30 +99,40 @@ pub fn observation_body<T: Serialize + ?Sized>(
     }
 }
 
-/// The closed-consumer rule every CLI stream shares: a reader that
-/// stops early (`cadence … | head -1`) makes the next write fail with
-/// EPIPE, which is not a command failure — the verb's own exit code
-/// still decides the status, so the write is dropped. Any other fault
-/// (ENOSPC, EIO) is a real one and is returned.
-fn write_parts(stream: &mut dyn std::io::Write, parts: &[&[u8]]) -> std::io::Result<()> {
+/// Return whether the consumer is still open. Finite commands ignore a closed
+/// consumer and retain their own status; streaming commands stop before their
+/// next read. Other I/O errors remain errors.
+fn write_parts(stream: &mut dyn std::io::Write, parts: &[&[u8]]) -> std::io::Result<bool> {
     for part in parts {
         match stream.write_all(part) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(false),
             Err(error) => return Err(error),
         }
     }
     match stream.flush() {
-        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-        other => other,
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(error) => Err(error),
+        Ok(()) => Ok(true),
     }
 }
 
-/// Write to one stream, keeping a closed consumer quiet and every other
-/// fault as loud as the `println!` this replaces.
-fn emit(stream: &mut dyn std::io::Write, label: &str, parts: &[&[u8]]) {
-    if let Err(error) = write_parts(stream, parts) {
-        panic!("failed printing to {label}: {error}");
+fn emit(stream: &mut dyn std::io::Write, label: &str, parts: &[&[u8]]) -> bool {
+    match write_parts(stream, parts) {
+        Ok(open) => open,
+        Err(error) => panic!("failed printing to {label}: {error}"),
+    }
+}
+
+fn emit_format_line(stream: &mut dyn std::io::Write, label: &str, args: std::fmt::Arguments<'_>) {
+    let result = stream
+        .write_fmt(args)
+        .and_then(|()| stream.write_all(b"\n"))
+        .and_then(|()| stream.flush());
+    match result {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("failed printing to {label}: {error}"),
     }
 }
 
@@ -130,7 +140,7 @@ fn emit(stream: &mut dyn std::io::Write, label: &str, parts: &[&[u8]]) {
 /// closed consumer is `Ok(())` — the bytes it stopped reading are not a
 /// write failure; any other fault is returned for the caller to report.
 pub fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {
-    write_parts(&mut std::io::stdout().lock(), &[bytes])
+    write_parts(&mut std::io::stdout().lock(), &[bytes]).map(|_| ())
 }
 
 /// `text` verbatim on stdout — no newline is added or removed.
@@ -161,10 +171,34 @@ pub fn eprint_line(text: &str) {
     );
 }
 
+/// Formatted stdout line without allocating an intermediate string.
+pub fn print_format_line(args: std::fmt::Arguments<'_>) {
+    emit_format_line(&mut std::io::stdout().lock(), "stdout", args);
+}
+
+/// Formatted stderr line without allocating an intermediate string.
+pub fn eprint_format_line(args: std::fmt::Arguments<'_>) {
+    emit_format_line(&mut std::io::stderr().lock(), "stderr", args);
+}
+
 /// One JSON document on stdout under [`json_text`]'s policy, with
 /// [`print_line`]'s newline and closed-consumer rule.
 pub fn print_json<T: Serialize + ?Sized>(value: &T) {
     print_line(&json_text(value).unwrap_or_default());
+}
+
+/// One line for a read-only follower. `false` means its consumer closed.
+pub fn stream_line(text: &str) -> bool {
+    emit(
+        &mut std::io::stdout().lock(),
+        "stdout",
+        &[text.as_bytes(), b"\n"],
+    )
+}
+
+/// One JSON record for a read-only follower. `false` means its consumer closed.
+pub fn stream_json<T: Serialize + ?Sized>(value: &T) -> bool {
+    stream_line(&json_text(value).unwrap_or_default())
 }
 
 #[cfg(test)]

@@ -79,13 +79,13 @@ pub(super) fn run(target: &RemoteTarget, action: &AppAction) -> Result<i32> {
     };
     // Printed before the network boundary so even a lost/non-JSON reply retains recovery identity.
     if let Some(id) = operation_id {
-        eprintln!(
+        cadence_agent::output::eprint_format_line(format_args!(
             "operation_id={id}; if uncertain, read/reconcile this ID, never redispatch blindly"
-        );
+        ));
     }
     let reply = cadence_agent::hosted_app_cli::request(target, method, &suffix, body.as_ref())?;
     if let Some(id) = &reply.operation_id {
-        eprintln!("operation_id={id}");
+        cadence_agent::output::eprint_format_line(format_args!("operation_id={id}"));
     }
     if let CatalogAction::Show { install_id } = action {
         if reply.status == 200 && reply.body["ok"] == true && reply.body["data"]["state"] == "ready"

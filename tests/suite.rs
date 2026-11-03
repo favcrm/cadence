@@ -2463,3 +2463,582 @@ fn cad2009_unavailable_job_snapshot_never_claims_blocked_issue_is_ready() {
         .expect("offline reads still return the tracker issue");
     assert_eq!(issue["ready"], false);
 }
+
+// CAD-2009: independently authored by the fresh-session Spec/security reviewer.
+// Implementers must not edit or weaken these acceptance checks.
+#[cfg(unix)]
+mod cad2009_closed_output_acceptance {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    use serde_json::{json, Value};
+
+    fn cli(home: &Path, state: &Path, tracker: &Path) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_STATE_HOME", home.join("xdg-state"))
+            .env("CADENCE_STATE_DIR", state)
+            .env("CADENCE_PM_DIR", tracker)
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdin(Stdio::null());
+        command
+    }
+
+    fn closed_stream() -> Stdio {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        Stdio::from(writer)
+    }
+
+    fn project_fixture(home: &Path) {
+        let tracker = home.join("pm");
+        let notes = home.join("notes");
+        std::fs::create_dir_all(tracker.join("synthetic")).unwrap();
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::create_dir_all(home.join("state")).unwrap();
+        std::fs::write(
+            tracker.join("pm.yaml"),
+            format!("schema: 1\nnotes_dir: '{}'\n", notes.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            tracker.join("synthetic/project.yaml"),
+            "key: synthetic\nprefix: SYN\n",
+        )
+        .unwrap();
+    }
+
+    fn git(home: &Path, repo: &Path, args: &[&str]) -> String {
+        let mut command = Command::new("git");
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "-c",
+                "user.name=Synthetic",
+                "-c",
+                "user.email=synthetic@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .stdin(Stdio::null());
+        let output = cadence_agent::reaper::output(&mut command).unwrap();
+        assert!(
+            output.status.success(),
+            "fixture git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn cad2009_flagged_audit_keeps_exit_one_with_closed_stdout() {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-audit-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        project_fixture(home.path());
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(home.path(), &repo, &["init", "-q", "-b", "main"]);
+        git(
+            home.path(),
+            &repo,
+            &["commit", "--allow-empty", "-q", "-m", "Synthetic root"],
+        );
+        git(
+            home.path(),
+            &repo,
+            &[
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "Synthetic other (#2)",
+            ],
+        );
+        let other = git(home.path(), &repo, &["rev-parse", "HEAD"]);
+        git(
+            home.path(),
+            &repo,
+            &[
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "Synthetic self review (#1)",
+            ],
+        );
+        let flagged = git(home.path(), &repo, &["rev-parse", "HEAD"]);
+
+        let report = home.path().join("merge-report.json");
+        let mut statuses = serde_json::Map::new();
+        statuses.insert(
+            flagged.clone(),
+            json!({"statuses": [{
+                "context": "qa-verdict", "state": "success",
+                "creator": {"login": "synthetic-self"},
+                "created_at": "2025-12-31T23:59:00Z"
+            }]}),
+        );
+        statuses.insert(
+            other.clone(),
+            json!({"statuses": [{
+                "context": "qa-verdict", "state": "success",
+                "creator": {"login": "synthetic-reviewer"},
+                "created_at": "2025-12-31T23:59:00Z"
+            }]}),
+        );
+        std::fs::write(
+            &report,
+            serde_json::to_vec(&json!({
+                "prs": [
+                    {
+                        "number": 1,
+                        "title": "Synthetic self review",
+                        "mergedBy": {"login": "synthetic-self"},
+                        "mergeCommit": {"oid": flagged},
+                        "headRefOid": flagged,
+                        "mergedAt": "2026-01-01T00:00:00Z"
+                    },
+                    {
+                        "number": 2,
+                        "title": "Synthetic other",
+                        "mergedBy": {"login": "synthetic-merger"},
+                        "mergeCommit": {"oid": other},
+                        "headRefOid": other,
+                        "mergedAt": "2026-01-01T00:00:00Z"
+                    }
+                ],
+                "statuses": statuses
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let command = |json_mode: bool| {
+            let mut command = cli(
+                home.path(),
+                &home.path().join("state"),
+                &home.path().join("pm"),
+            );
+            command
+                .current_dir(&repo)
+                .arg("audit")
+                .arg("--repo")
+                .arg(&repo)
+                .arg("--notes-dir")
+                .arg(home.path().join("notes"))
+                .arg("--merge-report")
+                .arg(&report);
+            if json_mode {
+                command.arg("--json");
+            }
+            command
+        };
+
+        let baseline = cadence_agent::reaper::output(&mut command(true)).unwrap();
+        assert_eq!(baseline.status.code(), Some(1), "{baseline:?}");
+        let body: Value = serde_json::from_slice(&baseline.stdout).unwrap();
+        assert_eq!(body["schema"], "cadence.audit/1");
+        assert_eq!(body["summary"]["flagged"], 1);
+        assert!(body["merges"].as_array().unwrap().iter().any(|row| {
+            row["pr"] == 1
+                && row["flags"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|flag| flag == "reviewer==merger")
+        }));
+
+        for json_mode in [false, true] {
+            let mut command = command(json_mode);
+            command.stdout(closed_stream()).stderr(Stdio::piped());
+            let output = cadence_agent::reaper::spawn(&mut command)
+                .unwrap()
+                .wait_with_output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "closed stdout changed flagged audit status (json={json_mode}): {output:?}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains("Broken pipe"),
+                "closed audit output must remain quiet: {output:?}"
+            );
+        }
+    }
+
+    // Exercise the real CLI launch/wait/status path, not daemon recipe execution.
+    // The isolated RPC peer supplies a terminal runner receipt; it runs no recipe.
+    fn terminal_runner(home: &Path, close_stderr: bool) -> (std::process::Output, Vec<String>) {
+        let state = home.join("state");
+        let listener = UnixListener::bind(state.join("cadence.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (mut completed, completion) = UnixStream::pair().unwrap();
+        let log = home.join("runner.log");
+        std::fs::write(&log, b"synthetic runner output\n").unwrap();
+        let server_log = log.clone();
+        let server = std::thread::spawn(move || {
+            let mut methods = Vec::new();
+            loop {
+                let mut descriptors = [
+                    libc::pollfd {
+                        fd: listener.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: completion.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                // SAFETY: descriptors contains exactly two initialized pollfd values.
+                let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, 5_000) };
+                assert!(
+                    ready > 0,
+                    "runner fixture received neither a request nor CLI completion"
+                );
+                if descriptors[0].revents & libc::POLLIN != 0 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(stream.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    let result = match methods.len() {
+                        0 => {
+                            assert_eq!(method, "slot_launch");
+                            assert_eq!(request["params"]["project"], "synthetic");
+                            assert_eq!(request["params"]["recipe"], "synthetic-check");
+                            json!({
+                                "runner_id": "synthetic-runner",
+                                "kind": "check",
+                                "head_sha": "0123456789abcdef0123456789abcdef01234567",
+                                "digest": "synthetic-intent",
+                                "log_path": server_log
+                            })
+                        }
+                        1 => {
+                            assert_eq!(method, "slot_runner");
+                            assert_eq!(request["params"]["runner_id"], "synthetic-runner");
+                            json!({"state": "exited", "exit_code": 37, "signal": null})
+                        }
+                        _ => panic!("unexpected additional runner request: {request}"),
+                    };
+                    methods.push(method.to_string());
+                    writeln!(stream, "{}", json!({"ok": true, "result": result})).unwrap();
+                } else if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                    return methods;
+                } else {
+                    panic!("unexpected runner fixture poll events");
+                }
+            }
+        });
+        let mut command = cli(home, &state, &home.join("pm"));
+        command.current_dir(home).args([
+            "build-slot",
+            "launch",
+            "synthetic-check",
+            "--project",
+            "synthetic",
+            "--wait-secs",
+            "0",
+        ]);
+        command.stdout(Stdio::piped());
+        if close_stderr {
+            command.stderr(closed_stream());
+        } else {
+            command.stderr(Stdio::piped());
+        }
+        // reaper::output deliberately overwrites both stream configurations.
+        // Use spawn so the deliberately closed stderr actually reaches the CLI.
+        let output = cadence_agent::reaper::spawn(&mut command)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        completed.write_all(b"done").unwrap();
+        let methods = server.join().unwrap();
+        std::fs::remove_file(state.join("cadence.sock")).unwrap();
+        (output, methods)
+    }
+
+    #[test]
+    fn cad2009_terminal_runner_keeps_its_status_with_closed_stderr() {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-slot-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        project_fixture(home.path());
+        for close_stderr in [false, true] {
+            let (output, methods) = terminal_runner(home.path(), close_stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(37),
+                "closed stderr={close_stderr}: {output:?}"
+            );
+            assert_eq!(methods, ["slot_launch", "slot_runner"]);
+            assert_eq!(output.stdout, b"synthetic runner output\n");
+        }
+    }
+
+    #[test]
+    fn cad2009_successful_trailer_read_stays_quiet_with_closed_stdout() {
+        let home = tempfile::tempdir().unwrap();
+        project_fixture(home.path());
+        let issue = home.path().join("pm/synthetic/SYN-1");
+        std::fs::create_dir_all(&issue).unwrap();
+        std::fs::write(
+            issue.join("issue.md"),
+            "---\nid: SYN-1\ntitle: Synthetic\nstatus: ready\npriority: P2\ncreated: '2026-01-01T00:00:00Z'\n---\n\nSynthetic.\n",
+        )
+        .unwrap();
+        let command = || {
+            let mut command = cli(
+                home.path(),
+                &home.path().join("state"),
+                &home.path().join("pm"),
+            );
+            command
+                .current_dir(home.path())
+                .args(["issue", "trailer", "SYN-1"]);
+            command
+        };
+        let baseline = cadence_agent::reaper::output(&mut command()).unwrap();
+        assert_eq!(baseline.status.code(), Some(0), "{baseline:?}");
+        assert_eq!(baseline.stdout, b"Issue: SYN-1\n");
+        let mut command = command();
+        command.stdout(closed_stream()).stderr(Stdio::piped());
+        let output = cadence_agent::reaper::spawn(&mut command)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(
+            output.stderr.is_empty(),
+            "successful closed output must be quiet: {output:?}"
+        );
+    }
+}
+
+// CAD-2009: independently authored by the fresh-session Spec/security reviewer.
+// Implementers must not edit or weaken these acceptance checks.
+#[cfg(unix)]
+mod cad2009_follow_closed_stdout_acceptance {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    use serde_json::{json, Value};
+
+    fn run_case(home: &Path, job_events: bool, after: Option<i64>) {
+        let state = home.join("state");
+        let tracker = home.join("pm");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&tracker).unwrap();
+        let listener = UnixListener::bind(state.join("cadence.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (mut completed, completion) = UnixStream::pair().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            loop {
+                let mut descriptors = [
+                    libc::pollfd {
+                        fd: listener.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: completion.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                // SAFETY: descriptors contains exactly two initialized pollfd values.
+                let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, 5_000) };
+                assert!(
+                    ready > 0,
+                    "event fixture received neither a request nor CLI completion"
+                );
+                if descriptors[0].revents & libc::POLLIN != 0 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(stream.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    if job_events {
+                        assert_eq!(request["method"], "job_events");
+                        assert_eq!(request["params"]["job"], "synthetic-job");
+                    } else {
+                        assert_eq!(request["method"], "agent_events");
+                        assert_eq!(request["params"]["alias"], "SYNTHETIC");
+                    }
+                    let response = match requests.len() {
+                        0 => {
+                            match after {
+                                None => assert_eq!(request["params"]["tail"], true),
+                                Some(cursor) => {
+                                    assert_eq!(request["params"]["after"], cursor);
+                                    assert_eq!(request["params"]["wait"], 25);
+                                }
+                            }
+                            json!({"ok": true, "result": {
+                                "events": [{
+                                    "seq": 1,
+                                    "kind": "synthetic-event",
+                                    "at": 1,
+                                    "data": {}
+                                }],
+                                "cursor": 1,
+                                "has_older": false
+                            }})
+                        }
+                        1 => {
+                            assert_eq!(request["params"]["after"], 1);
+                            // A regression gets a final refusal instead of
+                            // hanging forever. The test still requires exit 0
+                            // and exactly one request, so this cannot pass it.
+                            json!({"ok": false, "error": {
+                                "kind": "internal",
+                                "message": "synthetic second-page sentinel"
+                            }})
+                        }
+                        _ => panic!("unexpected additional event request: {request}"),
+                    };
+                    requests.push(request);
+                    writeln!(stream, "{response}").unwrap();
+                } else if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                    return requests;
+                } else {
+                    panic!("unexpected event fixture poll events");
+                }
+            }
+        });
+
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_STATE_HOME", home.join("xdg-state"))
+            .env("CADENCE_STATE_DIR", &state)
+            .env("CADENCE_PM_DIR", &tracker)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(home);
+        if job_events {
+            command.args(["job", "events", "synthetic-job", "--follow"]);
+        } else {
+            command.args(["events", "SYNTHETIC", "--follow"]);
+        }
+        if let Some(cursor) = after {
+            command.arg("--after").arg(cursor.to_string());
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(writer))
+            .stderr(Stdio::piped());
+        // reaper::output would overwrite the deliberately closed stdout.
+        let output = cadence_agent::reaper::spawn(&mut command)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        completed.write_all(b"done").unwrap();
+        let requests = server.join().unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "closed stdout must terminate the read-only follower successfully \
+             (job_events={job_events}, after={after:?}): {output:?}"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "closed stdout must terminate the follower quietly \
+             (job_events={job_events}, after={after:?}): {output:?}"
+        );
+        assert_eq!(
+            requests.len(),
+            1,
+            "the follower requested another page after its first output encountered EPIPE \
+             (job_events={job_events}, after={after:?}): {requests:?}"
+        );
+    }
+
+    #[test]
+    fn cad2009_events_follow_stops_after_closed_initial_tail_output() {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-events-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        run_case(home.path(), false, None);
+    }
+
+    #[test]
+    fn cad2009_events_follow_stops_after_closed_explicit_cursor_output() {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-events-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        run_case(home.path(), false, Some(0));
+    }
+
+    #[test]
+    fn cad2009_job_events_follow_stops_after_closed_initial_tail_output() {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-events-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        run_case(home.path(), true, None);
+    }
+
+    #[test]
+    fn cad2009_job_events_follow_stops_after_closed_explicit_cursor_output() {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-events-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        run_case(home.path(), true, Some(0));
+    }
+}

@@ -335,7 +335,7 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
         IssueAction::Trailer { id } => {
             let pm = open_pm()?;
             let issue = board::find_issue(&pm.dir, id)?;
-            println!("Issue: {}", issue.front.id);
+            crate::output::print_format_line(format_args!("Issue: {}", issue.front.id));
             Ok(0)
         }
         IssueAction::Retro { id, json } => {

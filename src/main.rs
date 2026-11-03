@@ -57,11 +57,9 @@ fn main() {
             cli::eprint_line(&serde_json::to_string_pretty(&err).unwrap_or_default());
             code
         }
-        // The consumer stopped reading before the verb returned a
-        // failure, so the run stands: nothing said otherwise. A verb
-        // whose failure verdict follows its report must print through
-        // the `cli` writers, which absorb EPIPE and return that verdict.
-        Err(payload) if closed_consumer_panic(payload.as_ref()) => 0,
+        // An unconverted writer interrupted the command before its result
+        // was known. Unwind resources, but never infer a successful outcome.
+        Err(payload) if closed_consumer_panic(payload.as_ref()) => 1,
         // Every other panic is a real fault: the default hook already
         // reported it, and resuming keeps the default exit status.
         Err(payload) => std::panic::resume_unwind(payload),

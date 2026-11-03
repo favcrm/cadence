@@ -484,10 +484,10 @@ pub(super) fn run_status(
     loop {
         let view = status_view(state_dir, group, all, placement)?;
         if json {
-            println!(
-                "{}",
-                cadence_agent::output::observation_body(&view, watch.is_some())?
-            );
+            let body = cadence_agent::output::observation_body(&view, watch.is_some())?;
+            if !cadence_agent::output::stream_line(&body) {
+                return Ok(0);
+            }
         } else {
             print_status_table(&view);
         }

@@ -291,7 +291,9 @@ pub(super) fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
                 Some(cursor) => *cursor,
                 None => {
                     let page = rpc("job_events", json!({"job": job, "tail": true}))?;
-                    print_json(&page);
+                    if !cadence_agent::output::stream_json(&page) {
+                        return Ok(0);
+                    }
                     if !*follow {
                         return Ok(0);
                     }
@@ -308,8 +310,8 @@ pub(super) fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
                     .get("events")
                     .and_then(Value::as_array)
                     .is_some_and(Vec::is_empty);
-                if !empty || !*follow {
-                    print_json(&page);
+                if (!empty || !*follow) && !cadence_agent::output::stream_json(&page) {
+                    return Ok(0);
                 }
                 cursor = page.get("cursor").and_then(Value::as_i64).unwrap_or(cursor);
                 if !*follow {

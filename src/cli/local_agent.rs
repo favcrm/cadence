@@ -189,7 +189,9 @@ pub(super) fn run(
                     std::time::Duration::from_secs(35),
                 )?;
                 if previous.as_ref() != Some(&value) {
-                    print_json(&value);
+                    if !cadence_agent::output::stream_json(&value) {
+                        return Ok(0);
+                    }
                     previous = Some(value);
                 }
             }
@@ -241,9 +243,9 @@ pub(super) fn run(
             if *state == "result" {
                 // The assignment ends here; the ticket does not move on its own.
                 // Say the next step instead of leaving the session to infer it.
-                eprintln!(
+                eprint_line(
                     "cadence: assignment complete — close the ticket with \
-                     `cadence issue set <ID> status=done` once the work is accepted"
+                     `cadence issue set <ID> status=done` once the work is accepted",
                 );
             }
             value
