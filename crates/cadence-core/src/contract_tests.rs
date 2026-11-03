@@ -67,3 +67,29 @@ fn unknown_operation_is_refused_as_an_invalid_command() {
         serde_json::from_slice(&crate::evaluate(&serde_json::to_vec(&known).unwrap())).unwrap();
     assert_eq!(response["ok"], true, "{response}");
 }
+
+// CAD-2081 acceptance, authored from the ticket by someone other than the implementer:
+// the shared evaluator keeps `src/delivery/` human even when the trusted lists forget it,
+// like the script's own prefix list does.
+#[test]
+fn the_gates_own_directory_needs_the_operator_even_when_the_lists_forget_it() {
+    use crate::delivery_requirements::{change, classify, default_resolved, TrustedLists};
+    let roles = root().join("../../docs/roles");
+    let risk = std::fs::read_to_string(roles.join("risk-paths.toml")).unwrap();
+    assert!(
+        risk.contains("\"src/delivery/**\", "),
+        "the real list names it"
+    );
+    let risk = risk.replace("\"src/delivery/**\", ", "");
+    let one = std::fs::read_to_string(roles.join("one-review-paths.toml")).unwrap();
+    let lists = TrustedLists {
+        risk_paths: Some(&risk),
+        one_review: Some(&one),
+    };
+    let needs_operator = |path: &str| {
+        let changes = [change("M", "100644", "100644", path)];
+        classify(&default_resolved(), &changes, 1, &lists).operator_approval
+    };
+    assert!(needs_operator("src/delivery/hosted_gate.rs"));
+    assert!(!needs_operator("docs/guides/x.md"));
+}

@@ -71,18 +71,30 @@ def cadence():
     if ARGS[:3] == ["issue", "show", "CAD-1"]:
         names = " ".join(v["name"] for v in S["verdicts"])
         body = f"{S['head']}\nBase branch: {S['base']}\nGreen CI run: {RUN_URL}\n{names}\n"
+        if S.get("class") == "consequential":
+            body += "Delivery class: consequential\nPolicy digest: sha256:" + "0" * 64 + "\n"
         out({"id": "CAD-1", "project": "cadence", "owner": None, "claim": None,
              "comments": [{"body": body}]})
     if ARGS[:2] == ["delivery", "requirements"]:
         digest = "sha256:" + "0" * 64
+        kind = S.get("class", "strict")
+        if kind == "consequential":
+            req = {"class": "consequential", "activation": "active", "reviews": 1,
+                   "review_kind": "combined", "security_capable": False,
+                   "operator_approval": False, "browser_qa": False, "full_checks": True}
+        elif kind == "strict1":
+            req = {"class": "strict", "activation": "no_profile", "reviews": 1,
+                   "review_kind": "combined", "security_capable": False,
+                   "operator_approval": False, "browser_qa": False, "full_checks": True}
+        else:
+            req = {"class": "strict", "activation": "no_profile", "reviews": 2,
+                   "review_kind": "standards_and_spec", "security_capable": False,
+                   "operator_approval": False, "browser_qa": False, "full_checks": True}
+        req.update({"policy_digest": digest, "reasons": []})
         out({"issue": "CAD-1", "project": "cadence", "repo": S["repo"].lower(), "pr": S["pr"],
              "head": S["head"], "base": S["base_oid"], "base_ref": S["base"],
              "merge_base": S["base_oid"], "policy_digest": digest, "origin": "hosted",
-             "requirements": {"class": "strict", "activation": "no_profile", "reviews": 2,
-                              "review_kind": "standards_and_spec", "security_capable": False,
-                              "operator_approval": False, "browser_qa": False,
-                              "full_checks": True, "policy_digest": digest, "reasons": []},
-             "readiness": None})
+             "requirements": req, "readiness": None})
     if ARGS[:2] == ["audit", "verdicts"]:
         if ARGS[ARGS.index("--project") + 1] != "cadence":
             fail("stub cadence: verdicts read without the ticket's project", 3)
