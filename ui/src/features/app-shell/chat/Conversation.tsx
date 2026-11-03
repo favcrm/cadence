@@ -42,6 +42,7 @@ import {
   activeSendId,
   discardPending,
   sendBefore,
+  failWithdrawn,
   inFlightTurnKey,
   unnamedTurnAnswered,
   itemMessage,
@@ -1275,7 +1276,21 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     if (!canControlTurns) return;
     const origin = { key: composerKey, visit: visitRef.current, frame: frameToken };
     void api
-      .masterCommand(command, undefined, undefined, message)
+      // A hosted board reaches a conversation only by naming it; unnamed means Home.
+      .masterCommand(command, undefined, undefined, message, hosted && convId !== null ? convId : undefined)
+      .then((r) => {
+        if (!r.withdrawn?.length) return;
+        const withdrawn = r.withdrawn;
+        const state = store.get().data;
+        if (state) {
+          store.write((current) =>
+            failWithdrawn(current ?? state, withdrawn, t("Withdrawn when the turn was stopped. Retry to send it again."), newMessageId),
+          );
+        }
+        if (!state || withdrawn.some((id) => !state.pending.some((row) => row.message === id))) {
+          setComposerNotice("A queued message was withdrawn too. Send it again if you still need it.");
+        }
+      })
       .catch((e: unknown) => {
         const current =
           composerKeyRef.current === origin.key && visitRef.current === origin.visit && frameRef.current === origin.frame;

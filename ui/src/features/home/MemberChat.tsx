@@ -2,10 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
+import { displayUiNotice } from "../../lib/uiNotice";
 import type { ThreadRef } from "../../lib/types";
 import SharedComposer from "../app-shell/chat/Composer";
 import Conversation from "../app-shell/chat/Conversation";
 import { tailTop } from "./dock";
+import { useDockHeight } from "./useDockHeight";
 import { memberHistory, memberThreadStore, memberWrite, sendToAssistant } from "./memberThread";
 import { initialFollow, motionBehavior, onSend, type Follow } from "./scrollFollow";
 import {
@@ -222,6 +224,17 @@ export default function MemberChat({
     if (!el) return;
     el.scrollTo({ top: tailTop(el.scrollHeight, el.clientHeight), behavior: motionBehavior(false, kind) });
   }, []);
+  // The dock grows with its note, and the thread's bottom padding follows it.
+  const dockRef = useRef<HTMLDivElement | null>(null);
+  const keepDockTail = useCallback(
+    (onTail: boolean) => {
+      // Nothing unpins `follow` here, so only the reader's position counts:
+      // someone reading history stays where they are while they type.
+      if (onTail) scrollPanel("jump");
+    },
+    [scrollPanel],
+  );
+  useDockHeight(dockRef, scrollRef, keepDockTail);
   const engage = useCallback(() => {
     const next = onSend(follow.current);
     follow.current = next.state;
@@ -385,14 +398,24 @@ export default function MemberChat({
             />
           </div>
 
-          {sendNote !== null && (
-            <div className="text-micro text-ink-500 px-1 pb-1" role="status">{sendNote}</div>
-          )}
-          <div className="chatdock" data-chat-dock>
+          <div className="chatdock" ref={dockRef} data-chat-dock>
+            {/* Inside the dock: it is absolutely placed, so a note before it
+                would sit behind the composer. */}
+            {sendNote !== null && (
+              <div className="text-micro text-ink-500 px-1 pb-1" role="status">{sendNote}</div>
+            )}
             <SharedComposer
               density="full"
               storeKey={`member-assist:${scope}`}
               block={readOnly ? t("The board is read-only.") : null}
+              // A `/` command is not sent here, and Enter must not look dead.
+              onNotice={(notice) =>
+                setSendNote(
+                  typeof notice !== "string" && notice.key.startsWith("Unsupported command")
+                    ? t("Commands aren't available in this chat, so this wasn't sent. To send it as a message, start with something other than /.")
+                    : displayUiNotice(notice, t),
+                )
+              }
               onSend={({ body }) => {
                 void sendToAssistant(scope, body).then((receipt) => {
                   // The actual receipt decides the note: a queued-but-

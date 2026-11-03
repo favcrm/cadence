@@ -504,6 +504,26 @@ export function unnamedTurnAnswered(items: ThreadItem[]): boolean {
   return false;
 }
 
+/** Stopping a hosted turn withdraws what was queued behind it. Those rows have
+ *  no stored entry to retire them, so they would say "sending" forever: they
+ *  become failed rows, which keep the text and offer Retry and Discard. Each
+ *  gets a fresh id, because the engine answers a repeated id with the withdrawn
+ *  submission, so a Retry under the old one would run nothing. */
+export function failWithdrawn(
+  state: ThreadState,
+  withdrawn: readonly string[],
+  error: string,
+  newId: () => string,
+): ThreadState {
+  if (withdrawn.length === 0) return state;
+  return {
+    ...state,
+    pending: state.pending.map((row) =>
+      withdrawn.includes(row.message) ? { ...row, message: newId(), state: "failed" as const, error } : row,
+    ),
+  };
+}
+
 /** The assistant item that opens the run still in flight for `message`.
  *  Null when that send has no assistant rows yet, or the run already has
  *  an answer. Hosted transcripts often omit the message id on agent rows,

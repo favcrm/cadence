@@ -1,4 +1,4 @@
-import { masterModelsOptions, pickLanded, restingStatus } from "../src/features/home/master";
+import { masterModelsOptions, offeredCommands, pickLanded, restingStatus, SLASH_COMMANDS } from "../src/features/home/master";
 import type { MasterModels } from "../src/lib/types";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
@@ -72,5 +72,15 @@ equal(restingStatus("idle"), "Available", "idle is available");
 equal(restingStatus("running"), "Available", "a live session between turns is available");
 equal(restingStatus("busy"), "Working", "busy is real work, never available");
 equal(restingStatus("waiting_input"), null, "an unlisted state is not rounded up to healthy");
+
+// CAD-2027: a hosted board offers what it says it can run, and help.
+{
+  const names = (hosted: boolean | null, advertised?: string[]) => offeredCommands(hosted, advertised).map((c) => c.name);
+  equal(names(true, []), ["help"], "a hosted board advertising nothing offers help alone");
+  equal(names(true), ["help"], "a hosted board whose state is unread offers help alone");
+  equal(names(true, ["stop", "new", "forged"]), ["help", "new", "stop"], "a hosted board offers known verbs it advertises");
+  equal(names(false, []).length, SLASH_COMMANDS.length, "a native board keeps the full list whatever its provider advertises");
+  equal(names(null, []).length, SLASH_COMMANDS.length, "an unknown board keeps the full list");
+}
 
 console.log("master models checks passed");

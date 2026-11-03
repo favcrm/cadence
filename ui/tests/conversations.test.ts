@@ -75,6 +75,8 @@ let holdReconnect = false;
 let disconnectTranscript: (() => void) | null = null;
 let heldOperations: Array<(response: Response) => void> | null = null;
 const commandPosts: unknown[] = [];
+const commandSearches: string[] = [];
+let commandAnswer: unknown = null;
 // Set inside a check to hold one send in flight (pending state "sending").
 let deferSend: ((resolve: (r: Response) => void) => void) | null = null;
 const messagePosts: any[] = [];
@@ -146,7 +148,9 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     : json(masterSnapshot(url.searchParams.get("conversation") ?? "home-thread"));
   if (url.pathname === "/api/master/command") {
     commandPosts.push(JSON.parse(String(init!.body)));
+    commandSearches.push(url.search);
     if (hostedIdentity) { turn = null; queue = []; }
+    if (commandAnswer !== null) return json(commandAnswer);
     return json({ command: "x", ok: true, result: {} });
   }
   if (url.pathname === "/api/crm-send/list") return json({ sends: [] });
@@ -661,9 +665,19 @@ turn = { state: "working", message: "m-gen", conversation: "c-gen", summary: "cu
 await React.act(async () => { await resources.masterConversation("c-gen").refresh(); });
 await settle();
 assert(bar() === null && stopButton(), "a hosted app shows its own working turn while Home is idle");
+conversationThread("c-gen").write((state) => ({ ...state!, pending: [{ message: "m-queued", text: "queued behind it", state: "sent", at: 1 }] }));
+commandAnswer = { ok: true, result: "Stopped.", withdrawn: ["m-queued"] };
 await React.act(async () => { stopButton()!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle();
+commandAnswer = null;
 equal(commandPosts.at(-1), { command: "stop", message: "m-gen" }, "hosted Stop controls the selected app message");
+{
+  const row = conversationThread("c-gen").get().data?.pending.find((p) => p.text === "queued behind it");
+  equal(row?.state, "failed", "the app pane hands back a message Stop withdrew");
+  assert(row?.message !== "m-queued", "the handed-back row has a fresh id");
+  conversationThread("c-gen").write((state) => ({ ...state!, pending: [] }));
+}
+assert((commandSearches.at(-1) ?? "").startsWith("?conversation=") && !commandSearches.at(-1)?.includes("home-thread"), `hosted Stop names its conversation, not Home (got ${commandSearches.at(-1)})`);
 assert(!stopButton(), "Stop refreshes the selected hosted conversation after the operation ends");
 turn = { state: "working", message: "m-other", conversation: "c-camp" };
 queue = [{ message: "m-gen", conversation: "c-gen" }];

@@ -1408,8 +1408,8 @@ export const api = {
     post<MasterIdentityUpdateResult>("/api/master/identity", body),
   /** `POST /api/master/command` — an allowlisted session verb (CAD-551);
    *  operator-only, 400 `unknown_command` outside the board's set. */
-  masterCommand: (command: string, arg?: string, wait?: number, message?: string) =>
-    post<MasterCommandResult>("/api/master/command", {
+  masterCommand: (command: string, arg?: string, wait?: number, message?: string, conversation?: string) =>
+    post<MasterCommandResult>(`/api/master/command${conversation ? `?conversation=${encodeURIComponent(conversation)}` : ""}`, {
       command,
       ...(arg ? { arg } : {}),
       ...(wait !== undefined ? { wait } : {}),
