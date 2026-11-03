@@ -140,7 +140,7 @@ the code you just wrote.
   file at the row's `workflow_sha` is byte-identical to the one on the PR's base
   (a re-run keeps the original commit's workflow for up to 30 days, so a
   since-fixed workflow cannot still file a pass; an unreachable commit refuses).
-  An unlisted principal, a wrong kind, a base that is not main or a non-pass row
+  An unlisted principal, a wrong kind, a PR whose current base is not main, a row without a `base_sha` or a non-pass row
   refuses and counts for nothing. Such a row has no
   login, so the author-login checks do not apply to it. Standards plus
   Spec/security from the two workflow principals satisfy the two-review

@@ -102,9 +102,6 @@ ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
 # kind each may fill. Read at the PR's base, like the lists above.
 WORKFLOW_PRINCIPALS_FILE = "docs/roles/review-workflow-principals.toml"
 WORKFLOW_KINDS = ("standards", "spec-security")
-# The writer's name for the base a workflow row reviewed against (CAD-2081); the
-# one place to change it if the tenant renames it. Rust passes it through.
-WORKFLOW_ROW_BASE_FIELD = "base_ref"
 # The review standard is a fresh-session review (AGENTS.md "Review", CAD-1946), which
 # this gate cannot yet enforce. Refusals for a missing or shared reviewer point at
 # the temporary exception and the standard.
@@ -724,12 +721,15 @@ def workflow_reason(n, hosted):
     if n["kind"] != entry["kind"]:
         return (f"workflow verdict {n['name']} cannot count: principal {principal} may file only "
                 f"{entry['kind']}, not {n['kind']}")
-    # The writer may add the base ref the review ran against; when it is
-    # present it must be main. Absent counts as before.
-    base_ref = n.get(WORKFLOW_ROW_BASE_FIELD)
-    if base_ref is not None and base_ref not in ("main", "refs/heads/main"):
-        return (f"workflow verdict {n['name']} cannot count: it reviewed a base of "
-                f"{base_ref!r}, not main")
+    # The tenant files only for a base of main and records the base commit it saw
+    # as `base_sha`. A row without one proves nothing, and a PR retargeted since
+    # the filing no longer has the base the review ran against: judge the CURRENT
+    # base, never the row.
+    if not FULL_SHA.fullmatch(n.get("base_sha") or ""):
+        return f"workflow verdict {n['name']} cannot count: it records no base_sha"
+    if hosted.get("pr_base") != "main":
+        return (f"workflow verdict {n['name']} cannot count: the PR's base is now "
+                f"{hosted.get('pr_base')!r}, not main")
     why = hosted["workflow_file"](n.get("workflow_sha"), entry["workflow"])
     if why:
         return f"workflow verdict {n['name']} cannot count: {why}"
@@ -1503,7 +1503,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             hosted = {"repo": repo, "project": hosted_project,
                       "author_login": author_login,
                       "author_principal": identities.get(author_login.lower(), ""),
-                      "workflow_principals": wf_principals,
+                      "workflow_principals": wf_principals, "pr_base": base,
                       "workflow_file": lambda sha, path: workflow_file_reason(base_oid, sha, path)}
             report.append(f"verdict origin: hosted ({repo}, project {hosted_project}); "
                           "counting attested principals")
@@ -1760,16 +1760,18 @@ def self_test():
         r = row(name, principal, None, kind, outcome)
         del r["github_login"]
         r.update({"reviewer": principal, "identity_source": "workflow-oidc", "run_id": "1",
-                  "run_attempt": "1", "workflow_sha": "a" * 40, "jti": "j" * 12})
+                  "run_attempt": "1", "workflow_sha": "a" * 40, "jti": "j" * 12,
+                  "base_sha": "e" * 40})
         return r
 
     wf = {"svc_std": {"kind": "standards", "workflow": ".github/workflows/review-standards.yml"},
           "svc_spec": {"kind": "spec-security", "workflow": ".github/workflows/review-spec.yml"}}
 
-    def hosted_wf(allow=wf, same=lambda sha, path: ""):
+    def hosted_wf(allow=wf, same=lambda sha, path: "", pr_base="main"):
         h = hosted("author", "usr_author")
         h["workflow_principals"] = allow
         h["workflow_file"] = same
+        h["pr_base"] = pr_base
         return h
 
     def drifted(sha, path):
@@ -1819,14 +1821,13 @@ def self_test():
          [wrow("s.md", "svc_std", "standards"), wrow("p.md", "svc_spec", "spec-security")],
          False, "cannot be compared", 0, False,
          lambda sha, path: f"workflow commit {sha} is not in this checkout, so {path} there cannot be compared"),
-        ("a workflow row reviewing a base other than main refuses",
-         [dict(wrow("s.md", "svc_std", "standards"), base_ref="staging"),
+        ("a retargeted PR refuses two good workflow rows",
+         [wrow("s.md", "svc_std", "standards"), wrow("p.md", "svc_spec", "spec-security")],
+         False, "is now 'staging', not main", 0, False, None, "staging"),
+        ("a workflow row missing base_sha refuses",
+         [{k: v for k, v in wrow("s.md", "svc_std", "standards").items() if k != "base_sha"},
           wrow("p.md", "svc_spec", "spec-security")],
-         False, "not main", 1),
-        ("a workflow row reviewing main still counts",
-         [dict(wrow("s.md", "svc_std", "standards"), base_ref="main"),
-          wrow("p.md", "svc_spec", "spec-security")],
-         False, None, 2),
+         False, "records no base_sha", 1),
     ]
     owner_row = row("o.md", "usr_other", "reviewer")
 
@@ -1857,7 +1858,8 @@ def self_test():
     for label, rows, one, expected, n_counted, *extra in wf_cases:
         qa = extra[0] if extra else False
         h = hosted_wf(allow=None if "unreadable" in label else wf,
-                      **({"same": extra[1]} if len(extra) > 1 else {}))
+                      **({"same": extra[1]} if len(extra) > 1 and extra[1] else {}),
+                      **({"pr_base": extra[2]} if len(extra) > 2 else {}))
         reasons, counted = check_reviews(rows, one, qa, {"author"}, "CAD-1", h)
         if expected is None:
             ok = not reasons and len(counted) == n_counted

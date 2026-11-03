@@ -902,14 +902,11 @@ fn verdict_entry(row: &Value, repo: &str, verb: &str) -> Result<Value> {
     }
     if workflow {
         // The run that filed it, so the evidence names a job, not just a name.
-        for field in ["run_id", "run_attempt", "workflow_sha", "jti"] {
+        // `base_sha` is the base commit the tenant read when it filed; the
+        // tenant refuses to file for any base but main.
+        for field in ["run_id", "run_attempt", "workflow_sha", "jti", "base_sha"] {
             entry[field] = json!(row_text(row, field, verb)?);
         }
-    }
-    // CAD-2081: the base the review ran against, when the writer records one.
-    // The gate refuses a workflow row whose base is not main; absent is as before.
-    if workflow && row.get("base_ref").is_some_and(|v| !v.is_null()) {
-        entry["base_ref"] = json!(row_text(row, "base_ref", verb)?);
     }
     Ok(entry)
 }
