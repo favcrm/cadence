@@ -689,8 +689,9 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     }
     let tracker = tracker_pin()?;
     // Local maintenance and read-only skill discovery ignore a saved remote
-    // default. Deliberate remote selectors refuse before transport; `dev`
-    // and skill reads also refuse a remote environment selector beside a pin.
+    // default. Deliberate remote selectors refuse before transport; `dev`,
+    // `setup` and skill reads also refuse a remote environment selector beside a pin.
+    // Managed callers keep their original resolver and permission checks.
     let resolved = if matches!(cli.command, Commands::Update { .. }) {
         org::resolve_update(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
     } else if matches!(cli.command, Commands::Dev { .. }) {
@@ -701,12 +702,15 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         // never routes a saved remote default over the allowlist, and
         // refuses a remote `--org`/`CADENCE_ORG` instead of ignoring it.
         org::resolve_setup(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
-    } else if matches!(
-        cli.command,
-        Commands::Skill {
-            action: SkillAction::Status | SkillAction::Show { .. }
-        }
-    ) {
+    } else if std::env::var_os("CADENCE_ALIAS").is_none()
+        && std::env::var_os("CADENCE_GRANT_TOKEN").is_none()
+        && matches!(
+            cli.command,
+            Commands::Skill {
+                action: SkillAction::Status | SkillAction::Show { .. }
+            }
+        )
+    {
         org::resolve_skill_read(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
     } else {
         org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
