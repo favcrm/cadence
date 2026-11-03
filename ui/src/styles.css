@@ -970,6 +970,20 @@ pre {
   border: 0;
   background: none;
 }
+/* Fenced code is one surface, not a chip per line. A long block scrolls in
+   place and hands the wheel back to the conversation at its ends. */
+.answer .issue-reader pre code,
+.chat-bubble.issue-reader pre code {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+.answer .issue-reader .codeblock pre,
+.chat-bubble.issue-reader .codeblock pre {
+  max-block-size: 32rem;
+  overscroll-behavior: auto;
+}
 .answer .issue-reader button.lnk {
   display: inline-flex;
   align-items: center;

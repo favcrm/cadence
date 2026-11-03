@@ -54,7 +54,9 @@
 .cv-iconbtn { display: inline-grid; place-items: center; width: 1.75rem; height: 1.75rem; border-radius: 6px; color: var(--color-ink-400); }
 .cv-iconbtn:hover { color: var(--color-ink-100); background: var(--color-ink-800); }
 .cv-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; flex: 1 0 100%; min-width: 0; }
-.cv-tools .vers { margin-right: auto; }
+.cv-pick { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin-right: auto; min-width: 0; }
+.vers.cv-view button { font-family: var(--font-sans); }
+.vers button:disabled { opacity: 0.5; cursor: default; }
 
 .arttype { display: grid; place-items: center; flex-shrink: 0; width: 36px; height: 40px; border-radius: 6px; border: 1px solid var(--color-ink-700); background: var(--color-ink-875); color: var(--color-accent); font: 600 9px/1 var(--font-mono); letter-spacing: 0.05em; }
 .artbadge { display: inline-flex; align-items: center; padding: 1px 7px; border-radius: 9999px; background: color-mix(in srgb, var(--color-accent) 16%, transparent); color: var(--color-accent); font: 500 var(--text-micro) var(--font-sans); }
@@ -90,6 +92,11 @@
 .cv-csv th, .cv-csv td { padding: 4px 10px; border-bottom: 1px solid var(--color-ink-800); text-align: left; white-space: nowrap; max-width: 28rem; overflow: hidden; text-overflow: ellipsis; }
 .cv-csv th { position: sticky; top: 0; z-index: 1; background: var(--color-ink-850); color: var(--color-ink-100); font-weight: 600; }
 .cv-csv tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--color-ink-850) 50%, transparent); }
+/* An HTML artifact's source: the code surface fills the body and scrolls both ways. */
+.cv-source { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+.cv-source .codeblock { display: flex; flex: 1; flex-direction: column; min-height: 0; margin: 0; }
+.cv-source pre { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.cv-source code { display: block; width: max-content; color: var(--color-ink-200); font: var(--text-label)/1.6 var(--font-mono); white-space: pre; }
 .canvas-frame { flex: 1; width: 100%; min-height: 20rem; border: 0; background: white; }
 .canvas-pdf { display: grid; gap: 6px; align-content: start; }
 .canvas-image { max-width: 100%; height: auto; }
