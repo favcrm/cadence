@@ -511,17 +511,13 @@ impl Shared {
             || !matches!(display.media_type.as_str(), "image/png" | "image/jpeg")
         {
             return Err(Error::rejected(
-                "media chat attach needs a current PNG or JPEG original",
+                "media chat attach needs a current PNG or JPEG image",
             ));
         }
         let title = display.asset.title;
         let sha256 = display.sha256;
         let media_type = display.media_type;
-        let proof = if self.store.app_media_imported_image(asset_id)?.is_some() {
-            None
-        } else {
-            Some(self.store.app_media_original(asset_id)?)
-        };
+        let proof = display.original;
         let preview =
             crate::platform::agenticos_external::image::preview_jpeg(&display.bytes, &media_type)
                 .map_err(|(_, reason)| Error::rejected(reason))?;

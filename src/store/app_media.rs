@@ -116,14 +116,17 @@ pub(crate) struct MediaImport<'a> {
 }
 
 /// Display material for one catalog asset, whichever provenance it has:
-/// imported workspace custody or a provider-produced original. Callers
-/// that only need to show or attach the asset use this instead of
-/// resolving `app_media_asset_origins` themselves.
+/// imported workspace custody or a provider-produced original, together
+/// with the original proof when one exists. One read per attach, so the
+/// bytes and the proof cannot come from two different snapshots.
 pub(crate) struct DisplayImage {
     pub asset: MediaAsset,
     pub media_type: String,
     pub sha256: String,
     pub bytes: Vec<u8>,
+    /// The provider-produced original, when the bytes are provider bytes.
+    /// Imported custody carries no producing run, so this is `None` there.
+    pub original: Option<crate::store::app_media::MediaOriginalProof>,
 }
 
 /// One imported workspace image: the catalog row plus the verified
@@ -684,6 +687,7 @@ impl Store {
                 media_type: imported.media_type,
                 sha256: imported.sha256,
                 bytes: imported.bytes,
+                original: None,
             }));
         }
         if self.app_media_asset(asset_id)?.is_none() {
@@ -695,6 +699,7 @@ impl Store {
             media_type: image.original.media_type.clone(),
             sha256: image.original.sha256.clone(),
             bytes: image.bytes,
+            original: Some(image.original),
         }))
     }
 
