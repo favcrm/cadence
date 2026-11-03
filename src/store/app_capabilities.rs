@@ -133,6 +133,23 @@ pub(crate) struct AppCapabilityClaim<'a> {
     pub call_id: &'a str,
 }
 
+/// CAD-2042: the first page of run-bound source reads. The order matches the
+/// partial index, so `LIMIT` stops the index walk.
+pub(crate) const SOURCE_PAGE_FIRST_SQL: &str = "SELECT id,created,run_id
+   FROM app_capability_results
+  WHERE install_id=? AND context_id=? AND source_post_read=1
+    AND rowid<=?
+  ORDER BY created DESC,id DESC LIMIT ?";
+
+/// CAD-2042: the continuation page. The cursor is one composite row value so
+/// that `(created,id)<(?,?)` is an index range start, not a disjunction
+/// evaluated while walking the scope from its newest entry.
+pub(crate) const SOURCE_PAGE_AFTER_SQL: &str = "SELECT id,created,run_id
+   FROM app_capability_results
+  WHERE install_id=? AND context_id=? AND source_post_read=1
+    AND rowid<=? AND (created,id)<(?,?)
+  ORDER BY created DESC,id DESC LIMIT ?";
+
 impl Store {
     /// Reserve the one paid operation for this run slot before provider I/O.
     /// A failed/uncertain result can only retry the same operation and key.
@@ -550,25 +567,14 @@ impl Store {
             return Ok(Vec::new());
         }
         let conn = self.conn();
-        let sql = match after {
-            Some(_) => {
-                "SELECT id,created,run_id FROM app_capability_results
-                  WHERE install_id=? AND context_id=? AND source_post_read=1
-                    AND rowid<=? AND (created<? OR (created=? AND id<?))
-                  ORDER BY created DESC,id DESC LIMIT ?"
-            }
-            None => {
-                "SELECT id,created,run_id FROM app_capability_results
-                  WHERE install_id=? AND context_id=? AND source_post_read=1
-                    AND rowid<=?
-                  ORDER BY created DESC,id DESC LIMIT ?"
-            }
-        };
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(match after {
+            Some(_) => SOURCE_PAGE_AFTER_SQL,
+            None => SOURCE_PAGE_FIRST_SQL,
+        })?;
         let rows = match after {
             Some((at, id)) => stmt
                 .query_map(
-                    params![install, context, fence, at, at, id, limit as i64],
+                    params![install, context, fence, at, id, limit as i64],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?,

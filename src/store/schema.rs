@@ -1640,6 +1640,23 @@ impl Store {
                             "CREATE INDEX IF NOT EXISTS app_capability_results_source
                                ON app_capability_results(install_id,context_id,created,id)
                                WHERE source_post_read=1;
+                             -- CAD-2042: a connection from an older binary may
+                             -- still insert through its old column list. Mark
+                             -- that row from its own run so no later writer can
+                             -- create a receipt the page cannot see.
+                             CREATE TRIGGER IF NOT EXISTS app_capability_results_source_scope
+                             AFTER INSERT ON app_capability_results
+                             WHEN NEW.source_post_read=0
+                              AND json_extract(NEW.result,'$.kind')='social.source.posts'
+                             BEGIN
+                               UPDATE app_capability_results
+                                  SET source_post_read=1,
+                                      install_id=(SELECT a.install_id FROM app_runs a
+                                                   WHERE a.id=NEW.run_id),
+                                      context_id=(SELECT a.context_id FROM app_runs a
+                                                   WHERE a.id=NEW.run_id)
+                                WHERE id=NEW.id;
+                             END;
                              DELETE FROM app_schema_progress
                                WHERE name='cad2042-source-scope';
                              UPDATE schema_version SET version=62;",

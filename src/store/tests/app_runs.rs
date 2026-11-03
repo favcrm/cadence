@@ -1926,16 +1926,13 @@ fn cad2042_source_page_reads_an_ordered_scoped_index_range() {
 
     let plan: Vec<String> = s
         .conn()
-        .prepare(
-            "EXPLAIN QUERY PLAN
-             SELECT id,created,run_id FROM app_capability_results
-              WHERE install_id=? AND context_id=? AND source_post_read=1
-                AND rowid<=? AND (created<? OR (created=? AND id<?))
-              ORDER BY created DESC,id DESC LIMIT ?",
-        )
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            crate::store::app_capabilities::SOURCE_PAGE_AFTER_SQL
+        ))
         .unwrap()
         .query_map(
-            params![install, &context_id, fence, 0.0f64, 0.0f64, "zzzz", 5i64],
+            params![install, &context_id, fence, 0.0f64, "zzzz", 5i64],
             |row| row.get::<_, String>(3),
         )
         .unwrap()
@@ -1950,12 +1947,16 @@ fn cad2042_source_page_reads_an_ordered_scoped_index_range() {
         !plan_text.contains("TEMP B-TREE"),
         "the page must not sort scoped history before LIMIT: {plan_text}"
     );
+    assert!(
+        plan_text.contains("(created,id)<(?,?)"),
+        "the cursor must be one composite index bound: {plan_text}"
+    );
 }
 
 /// CAD-2042: the batched backfill resumes from its durable cursor after an
-/// interruption, and the version/index only commit once every row was
-/// considered. Simulates a crash after the DDL/progress step by rewinding the
-/// version and clearing what the backfill would have written.
+/// interruption. Simulates a crash between batches: rows before the cursor
+/// were committed, rows after it were not, and the index/version never
+/// committed.
 #[test]
 fn cad2042_interrupted_backfill_resumes_and_converges() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1965,22 +1966,30 @@ fn cad2042_interrupted_backfill_resumes_and_converges() {
         // A plain connection: the store's own authorizer refuses fixture DDL.
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-        conn.execute(
-            "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated,context_id)
-             VALUES('r-resume','install-resume',1,'sha256:bundle','{}','sha256:snap','lead','req-resume','succeeded',1.0,1.0,'ctx-resume')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema)
-             VALUES('c-resume','r-resume','s1','','','source','cr-resume','sha256:b','sha256:i','{\"kind\":\"social.source.posts\"}','sha256:d',1.0,2)",
-            [],
-        )
-        .unwrap();
+        for i in 0..2 {
+            conn.execute(
+                "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated,context_id)
+                 VALUES(?1,'install-resume',1,'sha256:bundle','{}','sha256:snap','lead',?2,'succeeded',1.0,1.0,'ctx-resume')",
+                rusqlite::params![format!("r-resume-{i}"), format!("req-resume-{i}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema)
+                 VALUES(?1,?2,'s1','','','source',?3,'sha256:b','sha256:i','{\"kind\":\"social.source.posts\"}','sha256:d',1.0,2)",
+                rusqlite::params![format!("c-resume-{i}"), format!("r-resume-{i}"), format!("cr-resume-{i}")],
+            )
+            .unwrap();
+        }
         conn.execute_batch(
             "DROP INDEX IF EXISTS app_capability_results_source;
-             UPDATE app_capability_results SET source_post_read=0, install_id=NULL, context_id=NULL WHERE id='c-resume';
-             INSERT OR REPLACE INTO app_schema_progress(name,cursor) VALUES('cad2042-source-scope',0);
+             UPDATE app_capability_results
+                SET source_post_read=1, install_id='install-resume', context_id='ctx-resume'
+              WHERE id='c-resume-0';
+             UPDATE app_capability_results
+                SET source_post_read=0, install_id=NULL, context_id=NULL
+              WHERE id='c-resume-1';
+             INSERT OR REPLACE INTO app_schema_progress(name,cursor)
+               SELECT 'cad2042-source-scope', rowid FROM app_capability_results WHERE id='c-resume-0';
              UPDATE schema_version SET version=61;",
         )
         .unwrap();
@@ -1989,38 +1998,33 @@ fn cad2042_interrupted_backfill_resumes_and_converges() {
     // No rollout lease in a fixture: the schema-test constructor skips the
     // operator gate while still running the real migration blocks.
     let reopened = Store::open_for_schema_tests(&path).unwrap();
-    let (version, flag, install, context, progress): (
-        i64,
-        i64,
-        Option<String>,
-        Option<String>,
-        i64,
-    ) = reopened
-        .conn()
-        .query_row(
-            "SELECT (SELECT version FROM schema_version),
-                    source_post_read, install_id, context_id,
-                    (SELECT COUNT(*) FROM app_schema_progress WHERE name='cad2042-source-scope')
-               FROM app_capability_results WHERE id='c-resume'",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
+    let conn = reopened.conn();
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, 62, "the resumed upgrade finishes");
-    assert_eq!(flag, 1, "the interrupted row is backfilled");
-    assert_eq!(install.as_deref(), Some("install-resume"));
-    assert_eq!(context.as_deref(), Some("ctx-resume"));
+    let rows: Vec<(String, i64, Option<String>, Option<String>)> = conn
+        .prepare("SELECT id,source_post_read,install_id,context_id FROM app_capability_results ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for (id, flag, install, context) in &rows {
+        assert_eq!(*flag, 1, "{id} is flagged after the resume");
+        assert_eq!(install.as_deref(), Some("install-resume"), "{id}");
+        assert_eq!(context.as_deref(), Some("ctx-resume"), "{id}");
+    }
+    let progress: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM app_schema_progress WHERE name='cad2042-source-scope'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(progress, 0, "the progress row is cleared on completion");
-    let indexes: Vec<String> = reopened
-        .conn()
+    let indexes: Vec<String> = conn
         .prepare("PRAGMA index_list(app_capability_results)")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(1))
@@ -2033,4 +2037,39 @@ fn cad2042_interrupted_backfill_resumes_and_converges() {
             .any(|name| name == "app_capability_results_source"),
         "the page index is recreated: {indexes:?}"
     );
+}
+
+/// CAD-2042: a connection from a pre-v62 binary inserts through the old column
+/// list. The v62 trigger must mark that row from its own run, or the page
+/// would silently omit history written after the upgrade.
+#[test]
+fn cad2042_pre_v62_writer_still_produces_a_pageable_receipt() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("oldwriter.sqlite3");
+    drop(Store::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+    conn.execute(
+        "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated,context_id)
+         VALUES('r-old','install-old',1,'sha256:bundle','{}','sha256:snap','lead','req-old','succeeded',1.0,1.0,'ctx-old')",
+        [],
+    )
+    .unwrap();
+    // Exactly the pre-v62 column list: no install/context/marker columns.
+    conn.execute(
+        "INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema)
+         VALUES('c-old','r-old','s1','','','source','cr-old','sha256:b','sha256:i','{\"kind\":\"social.source.posts\"}','sha256:d',1.0,2)",
+        [],
+    )
+    .unwrap();
+    let row: (i64, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT source_post_read,install_id,context_id FROM app_capability_results WHERE id='c-old'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, 1, "the trigger marks a source read");
+    assert_eq!(row.1.as_deref(), Some("install-old"));
+    assert_eq!(row.2.as_deref(), Some("ctx-old"));
 }
