@@ -231,7 +231,6 @@ function JobSummary({ text }: { text: string }) {
 function JobExcerpt({ c }: { c: TabContext }) {
   const t = useTranslate();
   const text = c.detail?.agent.instructions ?? c.role?.instructions ?? null;
-  if (!text && c.detailNotServed) return null;
   return text ? (
     <JobSummary text={text} />
   ) : (
@@ -307,7 +306,7 @@ function Overview({ c }: { c: TabContext }) {
           <Chips items={["cadence"]} planned={["Per-agent MCP"]} />
         </Panel>
         <Panel title="Model & usage" link="settings" onTab={c.onTab}>
-          {c.profile ? <ProfileBlock agent={c.profile} /> : <Note>{t("Loading agent details…")}</Note>}
+          {c.profile ? <ProfileBlock agent={c.profile} /> : <Note>{t(c.detailFailed ? "Agent details are unavailable." : "Loading agent details…")}</Note>}
         </Panel>
       </aside>
     </div>
@@ -443,19 +442,21 @@ function History({ c }: { c: TabContext }) {
   const rows = [...inbox, ...events].filter((r) => filter === "all" || r.group === filter);
   return (
     <div className="ap-body">
-      <div className="rc-cats" role="group" aria-label={t("Filter history")}>
-        {HISTORY_FILTERS.map((f) => (
-          <button
-            key={f.id}
-            type="button"
-            className="rc-cat"
-            aria-pressed={filter === f.id}
-            onClick={() => setFilter(f.id)}
-          >
-            {t(f.label)}
-          </button>
-        ))}
-      </div>
+      {!c.detailNotServed && (
+        <div className="rc-cats" role="group" aria-label={t("Filter history")}>
+          {HISTORY_FILTERS.map((f) => (
+            <button
+              key={f.id}
+              type="button"
+              className="rc-cat"
+              aria-pressed={filter === f.id}
+              onClick={() => setFilter(f.id)}
+            >
+              {t(f.label)}
+            </button>
+          ))}
+        </div>
+      )}
       {detail && (
         <p className="text-micro text-ink-500">
           {t("{running} running · {queued} queued · {unknown} unknown")
@@ -524,10 +525,10 @@ function Job({ c }: { c: TabContext }) {
       setSaving(false);
     }
   };
-  if (c.detailNotServed && c.role) {
-    return <Note>{t("This agent was hired as {role}.").replace("{role}", () => c.role!.title)}</Note>;
+  if (c.detailNotServed) {
+    if (c.role?.instructions) return <JobSummary text={c.role.instructions} />;
+    return <Note>{c.role ? t("This agent was hired as {role}.").replace("{role}", () => c.role!.title) : t("This board has no job text for this agent.")}</Note>;
   }
-  if (c.detailNotServed) return <Note>{t(NOT_RECORDED)}</Note>;
   if (c.detailFailed && !c.detail) return <Note>{t("Agent details are unavailable.")}</Note>;
   if (!c.detail) return <Note>{t("Loading agent details…")}</Note>;
   if (served === null) {
@@ -738,7 +739,7 @@ function Settings({ c }: { c: TabContext }) {
   return (
     <div className="ap-body">
       <Panel title="Model, effort & usage" onTab={c.onTab}>
-        {profile ? <ProfileBlock agent={profile} /> : <Note>{t("Loading agent details…")}</Note>}
+        {profile ? <ProfileBlock agent={profile} /> : <Note>{t(c.detailFailed ? "Agent details are unavailable." : "Loading agent details…")}</Note>}
       </Panel>
       <Panel title="Runtime" onTab={c.onTab}>
         {a ? (
@@ -778,7 +779,7 @@ function Settings({ c }: { c: TabContext }) {
             ))}
           </dl>
         ) : c.detailNotServed ? (
-          <Note>{t(NOT_RECORDED)}</Note>
+          <Note>{t("This board doesn’t report runtime details.")}</Note>
         ) : c.detailFailed ? (
           <Note>{t("Agent details are unavailable.")}</Note>
         ) : (

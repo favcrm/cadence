@@ -124,8 +124,9 @@ export default function AgentPage({
       .then((d) => live && setDetail(d))
       .catch((e) => {
         if (!live) return;
-        // A 501 is this board's permanent answer, not a failed read to retry.
-        if (e instanceof ApiError && e.status === 501) setNotServed(true);
+        // The board's own "not implemented" is permanent, not a failed read to
+        // retry. Another 501, such as an outdated daemon, is an ordinary failure.
+        if (e instanceof ApiError && e.status === 501 && e.code === "not_implemented") setNotServed(true);
         else setErr(String(e.message ?? e));
       });
     return () => {
@@ -203,6 +204,7 @@ export default function AgentPage({
           ["Hired", hiredText(figures?.hired_at)],
         ];
 
+  const unread = err !== null || (notServed && observed === undefined);
   const ctx: TabContext = {
     alias,
     profile,
@@ -217,8 +219,10 @@ export default function AgentPage({
     onOpenIssue,
     onTab,
     onSaved: () => setRetry((n) => n + 1),
-    detailFailed: err !== null,
-    detailNotServed: notServed,
+    // Without a roster row nothing is known about the agent, so this reads as
+    // the failure it is: the board's "not recorded" is only about a known agent.
+    detailFailed: unread,
+    detailNotServed: notServed && observed !== undefined,
   };
 
   const cloudCards = (
@@ -281,10 +285,17 @@ export default function AgentPage({
           {t("Loading agent details…")}
         </p>
       )}
-      {err && (
+      {unread && (
         <p role="status" className="text-label text-ink-500 mb-3">
           {t("Some details aren’t available on this board.")}{" "}
-          <button type="button" className="lnk" onClick={() => setRetry((r) => r + 1)}>
+          <button
+            type="button"
+            className="lnk"
+            onClick={() => {
+              setRetry((r) => r + 1);
+              if (!observed) onRetryRoster();
+            }}
+          >
             {t("Retry")}
           </button>
         </p>
@@ -452,7 +463,7 @@ export default function AgentPage({
           <div className="ap-sub">
             <span>
               {categoryText ??
-                `${a?.role ?? observed?.role ?? t("Agent")} · ${a?.provider ?? observed?.provider ?? t("Loading provider")}${profile ? ` / ${profile.endpoint_kind}` : ""}`}
+                `${a?.role ?? observed?.role ?? t("Agent")} · ${a?.provider ?? observed?.provider ?? (unread || notServed ? t("Provider not reported") : t("Loading provider"))}${profile ? ` / ${profile.endpoint_kind}` : ""}`}
             </span>
             {badge && (
               <>

@@ -132,6 +132,7 @@ const issues: IssueCard[] = [
 ] as IssueCard[];
 let failDetail = true;
 let detailNotServed = false;
+let detailNotServedCode = "not_implemented";
 let releaseDetail: (() => void) | null = null;
 let holdDetail = false;
 const reads: string[] = [];
@@ -155,7 +156,7 @@ globalThis.fetch = async (input, init) => {
       releaseDetail = resolve;
     });
   if (detailNotServed)
-    return new Response(JSON.stringify({ ok: false, error: { code: "not_implemented", message: "This isn't available in this workspace." } }), {
+    return new Response(JSON.stringify({ ok: false, error: { code: detailNotServedCode, message: "This isn't available in this workspace." } }), {
       status: 501,
     });
   if (failDetail)
@@ -653,6 +654,32 @@ async function main() {
     assert(!page.includes("Loading agent details"), `the ${section} section does not stick on loading on a 501 board`);
     assert(!page.includes("No events yet.") && !page.includes("No results yet."), `the ${section} section claims no empty history on a 501 board`);
   }
+  // Only a known agent reads as "not recorded". Without a roster row nothing is
+  // known, so a 501 claims nothing about its work, on any section.
+  const unknownClaims = ["Nothing right now", "Nothing queued", "Nothing needs attention", "Loading agent details", "Loading provider", "No events yet.", "No results yet.", NOT_RECORDED];
+  for (const [alias, roster, label] of [
+    ["dev", failedRoster, "failed roster"],
+    ["nobody", liveRoster, "unknown alias"],
+  ] as const) {
+    for (const section of ["work", "settings", "history", "job"] as const) {
+      await mountServed(alias, section, roster);
+      const page = servedHost.textContent ?? "";
+      for (const claim of unknownClaims)
+        assert(!page.includes(claim), `${label}, ${section}, 501: claims nothing it cannot know: ${claim}`);
+      assert(page.includes("Some details aren’t available"), `${label}, ${section}, 501: reports that details are missing`);
+    }
+  }
+  await mountServed("dev", "history", liveRoster);
+  assert(servedHost.textContent?.includes(NOT_RECORDED), "a known agent's history says it isn't recorded");
+  assert(!servedHost.querySelector(".rc-cats"), "no filters over a history the board doesn't keep");
+  await mountServed("dev", "settings", liveRoster);
+  assert(servedHost.textContent?.includes("doesn’t report runtime details"), "the runtime section says what is actually missing");
+  // A 501 for another reason, such as an outdated daemon, is an ordinary failure.
+  detailNotServedCode = "unsupported_daemon";
+  await mountServed("dev", "history", liveRoster);
+  assert(!servedHost.textContent?.includes(NOT_RECORDED), "another 501 does not claim the board keeps no history");
+  assert(servedHost.textContent?.includes("Some details aren’t available") && servedHost.textContent?.includes("Retry"), "another 501 keeps its Retry");
+  detailNotServedCode = "not_implemented";
   await mountServed("nobody", "overview", liveRoster);
   assert(servedHost.querySelector(".ag-chat-gate")?.textContent?.includes("No agent named nobody"), "an unknown agent on a 501 board is still reported as missing");
   detailNotServed = false;
